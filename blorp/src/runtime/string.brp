@@ -3,265 +3,265 @@
 -- Its validated length counts bytes, including embedded NUL and UTF-8 bytes.
 -- Only a transferred, uniquely owned root may mutate or grow its storage.
 pure func string_runtime() -> String:
-	raw
-		|#include <stdatomic.h>
-		|#include <stddef.h>
-		|#include <stdint.h>
-		|#include <stdio.h>
-		|#include <stdlib.h>
-		|#include <string.h>
-		|/* RFC 3629 section 4 byte ranges. Validate counted buffers before publication. */
-		|uint8_t blorp_utf8_is_valid(const char *bytes,size_t length) {
-		|size_t position=0;
-		|while(position<length){
-		|const unsigned char lead=(unsigned char)bytes[position];
-		|if(lead<=0x7f){position++;continue;}
-		|size_t width;
-		|unsigned char second_min=0x80,second_max=0xbf;
-		|if(lead>=0xc2&&lead<=0xdf){width=2;}
-		|else if(lead>=0xe0&&lead<=0xef){
-		|width=3;
-		|/* E0 excludes overlongs; ED excludes surrogate encodings. */
-		|if(lead==0xe0){second_min=0xa0;}
-		|if(lead==0xed){second_max=0x9f;}
-		|}else if(lead>=0xf0&&lead<=0xf4){
-		|width=4;
-		|/* F0 excludes overlongs; F4 excludes scalars above U+10FFFF. */
-		|if(lead==0xf0){second_min=0x90;}
-		|if(lead==0xf4){second_max=0x8f;}
-		|}else{return 0;}
-		|if(length-position<width){return 0;}
-		|const unsigned char second=(unsigned char)bytes[position+1];
-		|if(second<second_min||second>second_max){return 0;}
-		|for(size_t offset=2;offset<width;offset++){
-		|const unsigned char continuation=(unsigned char)bytes[position+offset];
-		|if(continuation<0x80||continuation>0xbf){return 0;}
-		|}
-		|position+=width;
-		|}
-		|return 1;
-		|}
-		|struct blorp_string {
-		|atomic_size_t references;
-		|int64_t length;
-		|size_t capacity; /* Byte capacity, excluding the trailing NUL. */
-		|char bytes[];
-		|};
-		|static size_t blorp_string_maximum_capacity(void) {
-		|const size_t storage_limit=SIZE_MAX-sizeof(struct blorp_string)-1;
-		|return (uintmax_t)storage_limit>(uintmax_t)INT64_MAX?(size_t)INT64_MAX:storage_limit;
-		|}
-		|/* Every String has at least this much capacity. Most Strings are short and
-		| * are appended to soon after they are made, and a String made exactly
-		| * full reallocates on its first append; in a self-compile that was about
-		| * three of every four unique appends. Most first growths start below 32
-		| * bytes, and 32 is the largest power of two within the peak memory limit:
-		| * minimums of 48 and 64 measured about 1.5% and 3% more peak memory. */
-		|enum {BLORP_STRING_MINIMUM_CAPACITY=32};
-		|/* Growth doubles the current capacity, so it must never be zero. */
-		|_Static_assert(BLORP_STRING_MINIMUM_CAPACITY>0,"String capacity doubling requires a positive minimum");
-		|/* The one String constructor: unique, with unwritten bytes. The caller
-		| * writes the bytes and the trailing NUL. */
-		|static struct blorp_string *blorp_string_allocate(int64_t length) {
-		|if(length<0||(uintmax_t)length>(uintmax_t)blorp_string_maximum_capacity()){abort();}
-		|const size_t capacity=(size_t)length<BLORP_STRING_MINIMUM_CAPACITY?BLORP_STRING_MINIMUM_CAPACITY:(size_t)length;
-		|struct blorp_string *result=blorp_memory_allocate(sizeof *result+capacity+1);
-		|if(result==NULL){abort();}
-		|atomic_init(&result->references,1);
-		|result->length=length;
-		|result->capacity=capacity;
-		|return result;
-		|}
-		|/* Precondition: the counted bytes already contain valid UTF-8. */
-		|struct blorp_string *blorp_string_from_bytes(const char *bytes,int64_t length) {
-		|struct blorp_string *result=blorp_string_allocate(length);
-		|memcpy(result->bytes,bytes,(size_t)length);
-		|result->bytes[length]='\0';
-		|return result;
-		|}
-		|/* Int64 decimal needs at most one sign and 19 digits. */
-		|enum {BLORP_INT64_DECIMAL_CAPACITY=20};
-		|/* Writes value's decimal form at the end of buffer and returns its first
-		| * byte; *length receives the byte count. The digits are not NUL-terminated.
-		| * The magnitude is taken in uint64_t because negating INT64_MIN is undefined. */
-		|static const char *blorp_int64_decimal(int64_t value,char buffer[BLORP_INT64_DECIMAL_CAPACITY],int64_t *length) {
-		|uint64_t magnitude=value<0?0u-(uint64_t)value:(uint64_t)value;
-		|char *const end=buffer+BLORP_INT64_DECIMAL_CAPACITY;
-		|char *start=end;
-		|do {*--start=(char)('0'+magnitude%10u);magnitude/=10u;} while(magnitude!=0u);
-		|if(value<0){*--start='-';}
-		|*length=(int64_t)(end-start);
-		|return start;
-		|}
-		|struct blorp_string *blorp_int_to_string(int64_t value) {
-		|char buffer[BLORP_INT64_DECIMAL_CAPACITY];
-		|int64_t length;
-		|const char *digits=blorp_int64_decimal(value,buffer,&length);
-		|return blorp_string_from_bytes(digits,length);
-		|}
-		|int64_t blorp_string_length(const struct blorp_string *value) {
-		|return value->length;
-		|}
-		|uint8_t blorp_string_byte_at(const struct blorp_string *value,int64_t index,int64_t *result) {
-		|if(index<0||index>=value->length){return (uint8_t)0;}
-		|*result=(int64_t)(unsigned char)value->bytes[index];
-		|return (uint8_t)1;
-		|}
-		|enum {BLORP_UNICODE_SCALAR_MAX=0x10ffff,BLORP_SURROGATE_FIRST=0xd800,BLORP_SURROGATE_LAST=0xdfff,BLORP_UTF8_SCALAR_CAPACITY=4};
-		|uint8_t blorp_string_from_codepoint(int64_t scalar,struct blorp_string **result) {
-		|if(scalar<0||scalar>BLORP_UNICODE_SCALAR_MAX||(scalar>=BLORP_SURROGATE_FIRST&&scalar<=BLORP_SURROGATE_LAST)){return (uint8_t)0;}
-		|const uint32_t codepoint=(uint32_t)scalar;
-		|char bytes[BLORP_UTF8_SCALAR_CAPACITY];
-		|int64_t length;
-		|/* RFC 3629: 0xxxxxxx, 110xxxxx 10xxxxxx, 1110xxxx + 2 continuations,
-		| * or 11110xxx + 3 continuations; each continuation carries six bits. */
-		|if(codepoint<=0x7f){
-		|length=1;bytes[0]=(char)codepoint;
-		|}else if(codepoint<=0x7ff){
-		|length=2;bytes[0]=(char)(0xc0|(codepoint>>6));bytes[1]=(char)(0x80|(codepoint&0x3f));
-		|}else if(codepoint<=0xffff){
-		|length=3;bytes[0]=(char)(0xe0|(codepoint>>12));bytes[1]=(char)(0x80|((codepoint>>6)&0x3f));bytes[2]=(char)(0x80|(codepoint&0x3f));
-		|}else{
-		|length=4;bytes[0]=(char)(0xf0|(codepoint>>18));bytes[1]=(char)(0x80|((codepoint>>12)&0x3f));bytes[2]=(char)(0x80|((codepoint>>6)&0x3f));bytes[3]=(char)(0x80|(codepoint&0x3f));
-		|}
-		|*result=blorp_string_from_bytes(bytes,length);
-		|return (uint8_t)1;
-		|}
-		|void blorp_string_retain(struct blorp_string *value) {
-		|atomic_fetch_add_explicit(&value->references,1,memory_order_relaxed);
-		|}
-		|void blorp_string_release(struct blorp_string *value) {
-		|if(atomic_fetch_sub_explicit(&value->references,1,memory_order_acq_rel)==1){
-		|blorp_memory_release(value);
-		|}
-		|}
-		|/* A literal's String is shared by every evaluation of its site and lives for
-		| * the whole run. Its count starts at this base and each live reference adds
-		| * one; no program holds half the address space in references, so the count
-		| * never reaches 1 (copy-on-write copies) or 0 (release frees) and never
-		| * overflows. Retain, release and uniqueness tests need no special case. */
-		|#define BLORP_STRING_LITERAL_REFERENCES (SIZE_MAX/2)
-		|/* One per emitted literal site, zero-initialized: no String yet. */
-		|struct blorp_string_literal_site {
-		|struct blorp_string *value;
-		|#if BLORP_MEMORY_DIAGNOSTICS
-		|struct blorp_string_literal_site *next; /* Registry link, set with value. */
-		|#endif
-		|};
-		|#if BLORP_MEMORY_DIAGNOSTICS
-		|static struct blorp_string_literal_site *blorp_string_literal_sites;
-		|#endif
-		|/* Single-threaded: Blorp has no threads. Concurrency must publish value
-		| * with a compare-exchange whose loser frees its copy. */
-		|struct blorp_string *blorp_string_literal(struct blorp_string_literal_site *site,const char *bytes,int64_t length) {
-		|if(site->value==NULL){
-		|site->value=blorp_string_from_bytes(bytes,length);
-		|atomic_store_explicit(&site->value->references,BLORP_STRING_LITERAL_REFERENCES,memory_order_relaxed);
-		|#if BLORP_MEMORY_DIAGNOSTICS
-		|site->next=blorp_string_literal_sites;
-		|blorp_string_literal_sites=site;
-		|#endif
-		|}
-		|blorp_string_retain(site->value);
-		|return site->value;
-		|}
-		|#if BLORP_MEMORY_DIAGNOSTICS
-		|/* Every program value is dead at exit, so each literal must be back at its
-		| * base; drift is an ownership bug the base would otherwise hide. Frees every
-		| * literal so accounting balances. Returns the exit status to report. */
-		|int blorp_string_literals_finish(int requested_exit_status) {
-		|size_t unbalanced=0;
-		|for(struct blorp_string_literal_site *site=blorp_string_literal_sites;site!=NULL;site=site->next){
-		|if(atomic_load_explicit(&site->value->references,memory_order_relaxed)!=BLORP_STRING_LITERAL_REFERENCES){unbalanced++;}
-		|blorp_memory_release(site->value);
-		|site->value=NULL;
-		|}
-		|blorp_string_literal_sites=NULL;
-		|if(!blorp_memory_strict||unbalanced==0){return requested_exit_status;}
-		|fprintf(stderr,"blorp: leak check: unbalanced string literals: %zu\n",unbalanced);
-		|return BLORP_STRICT_LEAK_EXIT_STATUS;
-		|}
-		|#else
-		|#define blorp_string_literals_finish(requested_exit_status) (requested_exit_status)
-		|#endif
-		|
+    raw
+        |#include <stdatomic.h>
+        |#include <stddef.h>
+        |#include <stdint.h>
+        |#include <stdio.h>
+        |#include <stdlib.h>
+        |#include <string.h>
+        |/* RFC 3629 section 4 byte ranges. Validate counted buffers before publication. */
+        |uint8_t blorp_utf8_is_valid(const char *bytes,size_t length) {
+        |size_t position=0;
+        |while(position<length){
+        |const unsigned char lead=(unsigned char)bytes[position];
+        |if(lead<=0x7f){position++;continue;}
+        |size_t width;
+        |unsigned char second_min=0x80,second_max=0xbf;
+        |if(lead>=0xc2&&lead<=0xdf){width=2;}
+        |else if(lead>=0xe0&&lead<=0xef){
+        |width=3;
+        |/* E0 excludes overlongs; ED excludes surrogate encodings. */
+        |if(lead==0xe0){second_min=0xa0;}
+        |if(lead==0xed){second_max=0x9f;}
+        |}else if(lead>=0xf0&&lead<=0xf4){
+        |width=4;
+        |/* F0 excludes overlongs; F4 excludes scalars above U+10FFFF. */
+        |if(lead==0xf0){second_min=0x90;}
+        |if(lead==0xf4){second_max=0x8f;}
+        |}else{return 0;}
+        |if(length-position<width){return 0;}
+        |const unsigned char second=(unsigned char)bytes[position+1];
+        |if(second<second_min||second>second_max){return 0;}
+        |for(size_t offset=2;offset<width;offset++){
+        |const unsigned char continuation=(unsigned char)bytes[position+offset];
+        |if(continuation<0x80||continuation>0xbf){return 0;}
+        |}
+        |position+=width;
+        |}
+        |return 1;
+        |}
+        |struct blorp_string {
+        |atomic_size_t references;
+        |int64_t length;
+        |size_t capacity; /* Byte capacity, excluding the trailing NUL. */
+        |char bytes[];
+        |};
+        |static size_t blorp_string_maximum_capacity(void) {
+        |const size_t storage_limit=SIZE_MAX-sizeof(struct blorp_string)-1;
+        |return (uintmax_t)storage_limit>(uintmax_t)INT64_MAX?(size_t)INT64_MAX:storage_limit;
+        |}
+        |/* Every String has at least this much capacity. Most Strings are short and
+        | * are appended to soon after they are made, and a String made exactly
+        | * full reallocates on its first append; in a self-compile that was about
+        | * three of every four unique appends. Most first growths start below 32
+        | * bytes, and 32 is the largest power of two within the peak memory limit:
+        | * minimums of 48 and 64 measured about 1.5% and 3% more peak memory. */
+        |enum {BLORP_STRING_MINIMUM_CAPACITY=32};
+        |/* Growth doubles the current capacity, so it must never be zero. */
+        |_Static_assert(BLORP_STRING_MINIMUM_CAPACITY>0,"String capacity doubling requires a positive minimum");
+        |/* The one String constructor: unique, with unwritten bytes. The caller
+        | * writes the bytes and the trailing NUL. */
+        |static struct blorp_string *blorp_string_allocate(int64_t length) {
+        |if(length<0||(uintmax_t)length>(uintmax_t)blorp_string_maximum_capacity()){abort();}
+        |const size_t capacity=(size_t)length<BLORP_STRING_MINIMUM_CAPACITY?BLORP_STRING_MINIMUM_CAPACITY:(size_t)length;
+        |struct blorp_string *result=blorp_memory_allocate(sizeof *result+capacity+1);
+        |if(result==NULL){abort();}
+        |atomic_init(&result->references,1);
+        |result->length=length;
+        |result->capacity=capacity;
+        |return result;
+        |}
+        |/* Precondition: the counted bytes already contain valid UTF-8. */
+        |struct blorp_string *blorp_string_from_bytes(const char *bytes,int64_t length) {
+        |struct blorp_string *result=blorp_string_allocate(length);
+        |memcpy(result->bytes,bytes,(size_t)length);
+        |result->bytes[length]='\0';
+        |return result;
+        |}
+        |/* Int64 decimal needs at most one sign and 19 digits. */
+        |enum {BLORP_INT64_DECIMAL_CAPACITY=20};
+        |/* Writes value's decimal form at the end of buffer and returns its first
+        | * byte; *length receives the byte count. The digits are not NUL-terminated.
+        | * The magnitude is taken in uint64_t because negating INT64_MIN is undefined. */
+        |static const char *blorp_int64_decimal(int64_t value,char buffer[BLORP_INT64_DECIMAL_CAPACITY],int64_t *length) {
+        |uint64_t magnitude=value<0?0u-(uint64_t)value:(uint64_t)value;
+        |char *const end=buffer+BLORP_INT64_DECIMAL_CAPACITY;
+        |char *start=end;
+        |do {*--start=(char)('0'+magnitude%10u);magnitude/=10u;} while(magnitude!=0u);
+        |if(value<0){*--start='-';}
+        |*length=(int64_t)(end-start);
+        |return start;
+        |}
+        |struct blorp_string *blorp_int_to_string(int64_t value) {
+        |char buffer[BLORP_INT64_DECIMAL_CAPACITY];
+        |int64_t length;
+        |const char *digits=blorp_int64_decimal(value,buffer,&length);
+        |return blorp_string_from_bytes(digits,length);
+        |}
+        |int64_t blorp_string_length(const struct blorp_string *value) {
+        |return value->length;
+        |}
+        |uint8_t blorp_string_byte_at(const struct blorp_string *value,int64_t index,int64_t *result) {
+        |if(index<0||index>=value->length){return (uint8_t)0;}
+        |*result=(int64_t)(unsigned char)value->bytes[index];
+        |return (uint8_t)1;
+        |}
+        |enum {BLORP_UNICODE_SCALAR_MAX=0x10ffff,BLORP_SURROGATE_FIRST=0xd800,BLORP_SURROGATE_LAST=0xdfff,BLORP_UTF8_SCALAR_CAPACITY=4};
+        |uint8_t blorp_string_from_codepoint(int64_t scalar,struct blorp_string **result) {
+        |if(scalar<0||scalar>BLORP_UNICODE_SCALAR_MAX||(scalar>=BLORP_SURROGATE_FIRST&&scalar<=BLORP_SURROGATE_LAST)){return (uint8_t)0;}
+        |const uint32_t codepoint=(uint32_t)scalar;
+        |char bytes[BLORP_UTF8_SCALAR_CAPACITY];
+        |int64_t length;
+        |/* RFC 3629: 0xxxxxxx, 110xxxxx 10xxxxxx, 1110xxxx + 2 continuations,
+        | * or 11110xxx + 3 continuations; each continuation carries six bits. */
+        |if(codepoint<=0x7f){
+        |length=1;bytes[0]=(char)codepoint;
+        |}else if(codepoint<=0x7ff){
+        |length=2;bytes[0]=(char)(0xc0|(codepoint>>6));bytes[1]=(char)(0x80|(codepoint&0x3f));
+        |}else if(codepoint<=0xffff){
+        |length=3;bytes[0]=(char)(0xe0|(codepoint>>12));bytes[1]=(char)(0x80|((codepoint>>6)&0x3f));bytes[2]=(char)(0x80|(codepoint&0x3f));
+        |}else{
+        |length=4;bytes[0]=(char)(0xf0|(codepoint>>18));bytes[1]=(char)(0x80|((codepoint>>12)&0x3f));bytes[2]=(char)(0x80|((codepoint>>6)&0x3f));bytes[3]=(char)(0x80|(codepoint&0x3f));
+        |}
+        |*result=blorp_string_from_bytes(bytes,length);
+        |return (uint8_t)1;
+        |}
+        |void blorp_string_retain(struct blorp_string *value) {
+        |atomic_fetch_add_explicit(&value->references,1,memory_order_relaxed);
+        |}
+        |void blorp_string_release(struct blorp_string *value) {
+        |if(atomic_fetch_sub_explicit(&value->references,1,memory_order_acq_rel)==1){
+        |blorp_memory_release(value);
+        |}
+        |}
+        |/* A literal's String is shared by every evaluation of its site and lives for
+        | * the whole run. Its count starts at this base and each live reference adds
+        | * one; no program holds half the address space in references, so the count
+        | * never reaches 1 (copy-on-write copies) or 0 (release frees) and never
+        | * overflows. Retain, release and uniqueness tests need no special case. */
+        |#define BLORP_STRING_LITERAL_REFERENCES (SIZE_MAX/2)
+        |/* One per emitted literal site, zero-initialized: no String yet. */
+        |struct blorp_string_literal_site {
+        |struct blorp_string *value;
+        |#if BLORP_MEMORY_DIAGNOSTICS
+        |struct blorp_string_literal_site *next; /* Registry link, set with value. */
+        |#endif
+        |};
+        |#if BLORP_MEMORY_DIAGNOSTICS
+        |static struct blorp_string_literal_site *blorp_string_literal_sites;
+        |#endif
+        |/* Single-threaded: Blorp has no threads. Concurrency must publish value
+        | * with a compare-exchange whose loser frees its copy. */
+        |struct blorp_string *blorp_string_literal(struct blorp_string_literal_site *site,const char *bytes,int64_t length) {
+        |if(site->value==NULL){
+        |site->value=blorp_string_from_bytes(bytes,length);
+        |atomic_store_explicit(&site->value->references,BLORP_STRING_LITERAL_REFERENCES,memory_order_relaxed);
+        |#if BLORP_MEMORY_DIAGNOSTICS
+        |site->next=blorp_string_literal_sites;
+        |blorp_string_literal_sites=site;
+        |#endif
+        |}
+        |blorp_string_retain(site->value);
+        |return site->value;
+        |}
+        |#if BLORP_MEMORY_DIAGNOSTICS
+        |/* Every program value is dead at exit, so each literal must be back at its
+        | * base; drift is an ownership bug the base would otherwise hide. Frees every
+        | * literal so accounting balances. Returns the exit status to report. */
+        |int blorp_string_literals_finish(int requested_exit_status) {
+        |size_t unbalanced=0;
+        |for(struct blorp_string_literal_site *site=blorp_string_literal_sites;site!=NULL;site=site->next){
+        |if(atomic_load_explicit(&site->value->references,memory_order_relaxed)!=BLORP_STRING_LITERAL_REFERENCES){unbalanced++;}
+        |blorp_memory_release(site->value);
+        |site->value=NULL;
+        |}
+        |blorp_string_literal_sites=NULL;
+        |if(!blorp_memory_strict||unbalanced==0){return requested_exit_status;}
+        |fprintf(stderr,"blorp: leak check: unbalanced string literals: %zu\n",unbalanced);
+        |return BLORP_STRICT_LEAK_EXIT_STATUS;
+        |}
+        |#else
+        |#define blorp_string_literals_finish(requested_exit_status) (requested_exit_status)
+        |#endif
+        |
 
 
 STRING_SLICE_RUNTIME: String =
-	raw
-		|/* RFC 3629: a continuation byte has the leading bits 10xxxxxx. */
-		|enum { BLORP_UTF8_CONTINUATION_MASK=0xc0, BLORP_UTF8_CONTINUATION_TAG=0x80 };
-		|uint8_t blorp_string_slice(
-		|    const struct blorp_string *value,int64_t start,int64_t end,
-		|    struct blorp_string **result
-		|) {
-		|    if(start<0||end<start||end>value->length){
-		|        return (uint8_t)0;
-		|    }
-		|    if(start<value->length&&
-		|       ((unsigned char)value->bytes[start]&BLORP_UTF8_CONTINUATION_MASK)==BLORP_UTF8_CONTINUATION_TAG){
-		|        return (uint8_t)0;
-		|    }
-		|    if(end<value->length&&
-		|       ((unsigned char)value->bytes[end]&BLORP_UTF8_CONTINUATION_MASK)==BLORP_UTF8_CONTINUATION_TAG){
-		|        return (uint8_t)0;
-		|    }
-		|    *result=blorp_string_from_bytes(value->bytes+start,end-start);
-		|    return (uint8_t)1;
-		|}
-		|
+    raw
+        |/* RFC 3629: a continuation byte has the leading bits 10xxxxxx. */
+        |enum { BLORP_UTF8_CONTINUATION_MASK=0xc0, BLORP_UTF8_CONTINUATION_TAG=0x80 };
+        |uint8_t blorp_string_slice(
+        |    const struct blorp_string *value,int64_t start,int64_t end,
+        |    struct blorp_string **result
+        |) {
+        |    if(start<0||end<start||end>value->length){
+        |        return (uint8_t)0;
+        |    }
+        |    if(start<value->length&&
+        |       ((unsigned char)value->bytes[start]&BLORP_UTF8_CONTINUATION_MASK)==BLORP_UTF8_CONTINUATION_TAG){
+        |        return (uint8_t)0;
+        |    }
+        |    if(end<value->length&&
+        |       ((unsigned char)value->bytes[end]&BLORP_UTF8_CONTINUATION_MASK)==BLORP_UTF8_CONTINUATION_TAG){
+        |        return (uint8_t)0;
+        |    }
+        |    *result=blorp_string_from_bytes(value->bytes+start,end-start);
+        |    return (uint8_t)1;
+        |}
+        |
 
 
 -- Counted output preserves embedded NUL and UTF-8 bytes; the String is borrowed.
 -- One counted request; a short transfer stops before LF, including EINTR.
 -- Void conveys no delivery status, and the caller retains its String owner.
 STRING_PRINT_ERROR_RUNTIME: String =
-	|uint8_t blorp_string_print_error(const struct blorp_string *value) {
-	|    const size_t length = (size_t)value->length;
-	|    if (fwrite(value->bytes, 1, length, stderr) != length) return (uint8_t)0;
-	|    (void)fputc('\n', stderr);
-	|    return (uint8_t)0;
-	|}
-	|
+    |uint8_t blorp_string_print_error(const struct blorp_string *value) {
+    |    const size_t length = (size_t)value->length;
+    |    if (fwrite(value->bytes, 1, length, stderr) != length) return (uint8_t)0;
+    |    (void)fputc('\n', stderr);
+    |    return (uint8_t)0;
+    |}
+    |
 
 
 pure func string_print_runtime() -> String:
-	raw
-		|uint8_t blorp_string_print(const struct blorp_string *value) {
-		|(void)fwrite(value->bytes,1,(size_t)value->length,stdout);
-		|(void)fputc('\n',stdout);
-		|return (uint8_t)0;
-		|}
-		|
+    raw
+        |uint8_t blorp_string_print(const struct blorp_string *value) {
+        |(void)fwrite(value->bytes,1,(size_t)value->length,stdout);
+        |(void)fputc('\n',stdout);
+        |return (uint8_t)0;
+        |}
+        |
 
 
 -- Strict counted ASCII decimal; the String is borrowed and failure allocates nothing.
 pure func string_parse_int_runtime() -> String:
-	raw
-		|uint8_t blorp_string_parse_int(const struct blorp_string *value,int64_t *result) {
-		|int64_t position=0;
-		|uint8_t negative=0;
-		|uint64_t magnitude=0;
-		|if(value->length==0){return (uint8_t)0;}
-		|if(value->bytes[0]=='-'||value->bytes[0]=='+'){
-		|negative=(uint8_t)(value->bytes[0]=='-');position=1;
-		|}
-		|if(position==value->length){return (uint8_t)0;}
-		|const uint64_t limit=(uint64_t)INT64_MAX+(uint64_t)negative;
-		|for(;position<value->length;position++){
-		|const unsigned char byte=(unsigned char)value->bytes[position];
-		|if(byte<'0'||byte>'9'){return (uint8_t)0;}
-		|const uint64_t digit=(uint64_t)(byte-'0');
-		|if(magnitude>(limit-digit)/UINT64_C(10)){return (uint8_t)0;}
-		|magnitude=magnitude*UINT64_C(10)+digit;
-		|}
-		|*result=negative?(magnitude==(uint64_t)INT64_MAX+UINT64_C(1)?INT64_MIN:-(int64_t)magnitude):(int64_t)magnitude;
-		|return (uint8_t)1;
-		|}
-		|
+    raw
+        |uint8_t blorp_string_parse_int(const struct blorp_string *value,int64_t *result) {
+        |int64_t position=0;
+        |uint8_t negative=0;
+        |uint64_t magnitude=0;
+        |if(value->length==0){return (uint8_t)0;}
+        |if(value->bytes[0]=='-'||value->bytes[0]=='+'){
+        |negative=(uint8_t)(value->bytes[0]=='-');position=1;
+        |}
+        |if(position==value->length){return (uint8_t)0;}
+        |const uint64_t limit=(uint64_t)INT64_MAX+(uint64_t)negative;
+        |for(;position<value->length;position++){
+        |const unsigned char byte=(unsigned char)value->bytes[position];
+        |if(byte<'0'||byte>'9'){return (uint8_t)0;}
+        |const uint64_t digit=(uint64_t)(byte-'0');
+        |if(magnitude>(limit-digit)/UINT64_C(10)){return (uint8_t)0;}
+        |magnitude=magnitude*UINT64_C(10)+digit;
+        |}
+        |*result=negative?(magnitude==(uint64_t)INT64_MAX+UINT64_C(1)?INT64_MIN:-(int64_t)magnitude):(int64_t)magnitude;
+        |return (uint8_t)1;
+        |}
+        |
 
 
 -- Counted equality borrows both inputs, including bytes following embedded NUL.
 pure func string_equals_runtime() -> String:
-	|static uint8_t blorp_string_equals(const struct blorp_string *left,const struct blorp_string *right){return left->length==right->length&&(left->length==0||memcmp(left->bytes,right->bytes,(size_t)left->length)==0);}
-	|
+    |static uint8_t blorp_string_equals(const struct blorp_string *left,const struct blorp_string *right){return left->length==right->length&&(left->length==0||memcmp(left->bytes,right->bytes,(size_t)left->length)==0);}
+    |
