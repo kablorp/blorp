@@ -31,11 +31,11 @@ The Makefile's explicit component selection (`COMPONENT_SOURCES` in
 it) runs through ordinary target TestSuite entries, one program per listed
 directory (its phase), with C11 `-O0` linking and strict native memory checks.
 The Blorp test driver that `make` builds runs it and the e2e selection.
-The first native e2e selection runs the selected real-main cases and process-runtime
+The native e2e selection runs the real-main cases and process-runtime
 lifecycle checks through ordinary Blorp TestSuites, with exact output, strict
 accounting and ASan/UBSan checks. `test-e2e` uses an already-built diagnostic Blorp
-compiler. Unported unit/runtime/grammar/tooling and remaining native e2e cases
-are DEFERRED, with their sources preserved; they receive no PASS credit, and
+compiler. Unported unit/runtime/grammar/tooling suites
+are DEFERRED (the e2e directory has none), with their sources preserved; they receive no PASS credit, and
 `test-components` prints how many each top directory holds.
 
 ## Blorp seed build
@@ -67,7 +67,7 @@ The cache was `$XDG_CACHE_HOME/blorp/blorp2-bootstrap` before the rename to Blor
 directory is no longer read and can be deleted.
 
 The `example` target uses the newly built Blorp compiler. `test` builds Blorp and
-runs its explicit self-hosted component and first native e2e selections; `test-components` uses an
+runs its explicit self-hosted component and native e2e selections; `test-components` uses an
 already-built Blorp compiler. Unported suites are deferred.
 Run the isolated behavioral shell tests with
 `bash blorp/test/tooling/test_bootstrap.sh`; they use fake transport,
@@ -82,9 +82,9 @@ published seed assets.
 B builds **C**, and C compiles the source again, all linked at `-O0` through
 `test-compiler`/`link-test-compiler`. `--prove` requires B/C source-C identity,
 A/B exit/stdout/stderr/emitted-C parity for every fixture, and B's explicit
-self-hosted components and first native e2e selection. It exits 0 for that bounded
-proof, 1 at a failed stage, and 2 for setup failure. Remaining native e2e cases
-and full resource qualification are DEFERRED; a successful fixpoint result
+self-hosted components and native e2e selection. It exits 0 for that bounded
+proof, 1 at a failed stage, and 2 for setup failure. Full resource
+qualification is DEFERRED; a successful fixpoint result
 claims only the named selection.
 `--frontier` reports the first failed rung of the same source/component ladder
 and exits 0 except for setup failures. The old per-file parse inventory is

@@ -100,7 +100,7 @@ Commands, from the repository root:
 
 ```bash
 make -C blorp compiler                  # build the compiler from the pinned seed
-make -C blorp test                      # components, deferrals report and first native e2e
+make -C blorp test                      # components, deferrals report and native e2e
 make -C blorp test-target-components TARGET_COMPONENT_SOURCES=<paths>   # one suite
 scripts/blorp-fixpoint --prove          # A builds B, B builds C, B == C
 bash blorp/test/tooling/test_bootstrap.sh   # bootstrap resolver and Makefile recipes
@@ -122,7 +122,7 @@ Target component suites declare an ordinary `tests: TestSuite` constant in the
 suite file itself.
 `make -C blorp test` builds Blorp, runs the explicit component selection
 (`COMPONENT_SOURCES` in [test/e2e/self_hosted.brp](test/e2e/self_hosted.brp))
-through its ordinary TestSuite entries, and runs the first self-hosted native
+through its ordinary TestSuite entries, and runs the self-hosted native
 e2e selection. `test-components` and `test-target-components` run that selection
 with an already-built Blorp compiler; `TARGET_COMPONENT_SOURCES=<paths>` makes
 `test-target-components` run exactly those suites instead. Unported
@@ -135,7 +135,7 @@ the bytes clearer, such as CRLF or malformed indentation. Using multiline
 literals in tests does not add them to the pilot's input grammar.
 
 **End-to-end.** Sources remain under [test/e2e/](test/e2e/), with programs in
-[test/e2e/fixtures/](test/e2e/fixtures/). `make -C blorp test-e2e` runs the first selected native cases and process-runtime
+[test/e2e/fixtures/](test/e2e/fixtures/). `make -C blorp test-e2e` runs the native cases and process-runtime
 checks. Its approved orchestration entry is an ordinary `main(args)` that
 constructs Blorp `TestSuite`s and calls `test.run_suite`. Make builds it once per
 invocation with the compiler under test and passes a mode (`components`,
@@ -143,8 +143,6 @@ invocation with the compiler under test and passes a mode (`components`,
 component modes, the link libraries as argv; the driver makes its own e2e work
 directory with `fs.with_temporary_directory`. This narrow entry exception
 does not authorize alternate fixture mains or assertion frameworks.
-The older driver depends on additional process/filesystem/bytes APIs; its
-remaining cases are DEFERRED.
 Port bounded suites incrementally through ordinary target TestSuites and real
 fixture mains. Existing fixture parity checks compare compiler outputs only;
 they do not establish native execution. Keep artifacts under ignored `build/`.
