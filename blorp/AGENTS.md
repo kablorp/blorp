@@ -119,7 +119,9 @@ in shell. CI runs it after `make -C blorp test`; porting it to a Blorp
 program is a separate change.
 Every compiler source module has a unit suite under
 [test/unit/](test/unit/), in the `test_<stage>/` folder that mirrors the module's
-folder under `src/`. Grammar cases live under
+folder under `src/`: a module `src/<dir>/<name>.brp` has its suite in
+`test/unit/test_<dir>/`, and a module that has a folder of its own
+(`src/syntax/lex.brp` is `test/unit/test_syntax/test_lex/`) gets a subfolder. Grammar cases live under
 [test/test_grammar/](test/test_grammar/) and change with the EBNF.
 Target component suites declare an ordinary `tests: TestSuite` constant in the
 suite file itself.

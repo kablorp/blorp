@@ -5,7 +5,7 @@ pattern matching, traits and value semantics. Its compiler is written in
 Blorp, compiles itself and emits C. Memory is managed by reference counting:
 there is no garbage collector and no shared mutable state.
 
-The compiler is in [`src/`](src/), one folder per phase. Programs compile
+The compiler is in [`src/`](src/): `syntax/` is the front end shared with the formatter, `compile/` holds one folder per phase, `format/` is the formatter. Programs compile
 against [`standard_library/`](standard_library/), whose
 [README](standard_library/README.md) owns its API contracts. Tests are in
 [`test/`](test/), and [`grammar.ebnf`](grammar.ebnf) is the formal grammar.
@@ -1007,8 +1007,13 @@ lex -> parse -> load -> namespace -> check -> specialize -> lower -> own -> veri
 Load drives lexing and parsing of each module, and checking begins by
 building the namespace.
 
-`src/` has one folder per phase, plus `utils` for modules several phases share
-and `runtime` for the C fragments `emit` embeds. A folder imports only earlier
+`src/` has four folders. `syntax/` is the front end both tools share: the
+lexer, the parser, and the token, source and name tables they build.
+`compile/` has one folder per phase after parsing, plus `runtime` for the C
+fragments `emit` embeds. `format/` is the formatter. `utils/` holds helpers
+with no Blorp knowledge. `syntax/` imports only `utils/`; `compile/` and
+`format/` import `syntax/` and `utils/`, and `format/` never imports
+`compile/`. Inside `compile/`, a folder imports only earlier
 folders; compiler imports are relative paths, and bare paths name library
 modules. Only the shell is impure: it reads modules with `fs.read_text`,
 prints diagnostics and writes the output with `fs.write_text`. Everything in
@@ -1019,7 +1024,7 @@ returns a new one or its first error.
 [`src/format`](src/format/format.brp) is not a phase: the
 [formatter](#formatting) lexes and parses one file with the front end and
 prints its tree, taking comments, blank lines and literal spellings from the
-source between tokens. It imports only `lex`, `parse` and `utils`.
+source between tokens. It imports only `syntax/` and `utils/`.
 
 The output is replaced atomically, as by
 [`write_text`](standard_library/README.md#the-fs-module): a symlinked output
@@ -1030,30 +1035,30 @@ the output may already be new.
 
 ### Phases
 
-1. **Lex** ([`lex`](src/lex/lex.brp)) turns one module's bytes into tokens with
+1. **Lex** ([`lex`](src/syntax/lex.brp)) turns one module's bytes into tokens with
    byte spans. It extends the shared name table, minting one `NameId` per
    identifier spelling; identifier tokens carry only that id, and reserved
    words and punctuation become keyword and symbol tokens, so later phases
    never compare spellings. Layout becomes NEWLINE, INDENT and DEDENT tokens.
-2. **Parse** ([`parse`](src/parse/parse.brp)) builds each module's syntax, each
+2. **Parse** ([`parse`](src/syntax/parse.brp)) builds each module's syntax, each
    node with its span; direct and UFCS calls stay distinct. It recognises
    contextual words such as `fixed` by the ids the name seed gives them.
-   [`assemble.brp`](src/parse/assemble.brp) seals the modules and name table
+   [`assemble.brp`](src/compile/assemble.brp) seals the modules and name table
    into an opaque `ParsedProgram`, issues declaration ids once (functions,
    records, unions and owner-qualified variants) and fixes the module
    dependency order, rejecting import cycles.
-3. **Load** ([`load`](src/load/load.brp)) reads the root, `_base.brp`, the
+3. **Load** ([`load`](src/compile/load/load.brp)) reads the root, `_base.brp`, the
    prelude and every imported module once per logically normalized path
    (symlinks are not resolved), lexes and parses each, and publishes the
    `ParsedProgram` with the source inventory diagnostics render from.
-4. **Namespace** ([`namespace`](src/namespace/namespace.brp)), the first step
+4. **Namespace** ([`namespace`](src/compile/namespace/namespace.brp)), the first step
    of checking, gives each module one frozen scope in dependency order: its
    declarations, its imports and, for a user module, the prelude. A spelling
    denotes at most one entity per space: functions and constructors share the
    value space, types have their own, and an alias claims both.
-   [`builtins.brp`](src/namespace/builtins.brp) validates the foundation and
+   [`builtins.brp`](src/compile/namespace/builtins.brp) validates the foundation and
    designates `Bool`, `Option` and `Result` by name and exact constructors.
-5. **Check** ([`check`](src/check/check.brp)) validates every declaration,
+5. **Check** ([`check`](src/compile/check/check.brp)) validates every declaration,
    reachable or not, and publishes a `CheckedProgram` or a `CheckFailure`. It
    accepts declarations, constant annotations, signatures, traits and
    implementations, then constants and bodies, with expression-local
@@ -1061,9 +1066,9 @@ the output may already be new.
    substitution, every local read a function-owned `BindingId`, and every
    constructor its union and variant ids; matches are proved exhaustive.
    Operators become trait calls, Dict literals calls, and interpolation String
-   concatenation. [`render.brp`](src/check/render.brp) turns a failure into
+   concatenation. [`render.brp`](src/compile/check/render.brp) turns a failure into
    diagnostics.
-6. **Specialize** ([`specialize`](src/specialize/specialize.brp)) expands the
+6. **Specialize** ([`specialize`](src/compile/specialize/specialize.brp)) expands the
    call graph reachable from `main` into concrete instances, one per
    declaration and complete list of type arguments, phantom ones included. Its
    `SpecializedProgram` holds those functions and the record, union and List
@@ -1071,12 +1076,12 @@ the output may already be new.
    reaches later phases. It also decides representation: unmanaged, a managed
    String, List or record root, a boxed union, or an inline union with owned
    children.
-7. **Lower** ([`lower`](src/lower/lower.brp)) publishes ordered value
+7. **Lower** ([`lower`](src/compile/lower/lower.brp)) publishes ordered value
    definitions with function-owned `ValueId`s, separate from the bindings that
    name them. Matches become selection graphs over typed places that enter one
    shared body per arm; bound matches and `if` become joins with typed carried
    values, and loops carry values through their headers.
-8. **Own** ([`own`](src/own/own.brp)) inserts reference counting: acquisitions,
+8. **Own** ([`own`](src/compile/own/own.brp)) inserts reference counting: acquisitions,
    drops, borrows and transfers, each obligation named by an `OwnerId`. Every
    stored managed occurrence gets its own obligation, and an argument stays
    alive until the call's result owner exists. A managed parameter is owned
@@ -1084,12 +1089,12 @@ the output may already be new.
    String `+`, `append_int`) or another owned parameter, and a call moves the
    caller's owner there at its last use. These labels change where a program
    copies, never what it computes.
-9. **Verify** ([`verify`](src/verify/verify.brp)) checks the ownership IR
+9. **Verify** ([`verify`](src/compile/verify/verify.brp)) checks the ownership IR
    independently and alone produces a `VerifiedProgram`. It rejects dead or
    wrong owners, invalid borrows, undischarged obligations, calls that disagree
    with their callee's labels and malformed selection graphs, and checks the
    entrypoint conventions. It never repairs the IR.
-10. **Emit** ([`emit`](src/emit/emit.brp)) projects the verified program to C
+10. **Emit** ([`emit`](src/compile/emit/emit.brp)) projects the verified program to C
    without repeating any check; retains and releases are exactly the explicit
    operations.
 

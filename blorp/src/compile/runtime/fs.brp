@@ -1,0 +1,1140 @@
+-- The C half of the fs library (standard_library/fs.brp). A native reports a
+-- failure as an Int code that fs.brp decodes: a named kind has the positive
+-- code below, and any other errno is sent negated, so OtherOs keeps the
+-- platform's own number. The two tables agree only by the tests that name
+-- each code as a literal, in test/runtime/fs_suite.brp and the fs e2e example.
+-- Paths are never reported; the library pairs each code with the caller's path.
+
+
+import:
+    ../../utils/text: concat
+    ./list: list_root_allocation, list_slot_store
+
+
+-- Emitted once for the whole program, however many fs operations it calls.
+-- A helper that every operation calls is `static inline`. One that only some
+-- call has external linkage: clang reports an unused static function, inline
+-- or not, so a program that calls one operation would fail under -Werror. The
+-- fragment opens with a blank line because the fragment before it, the
+-- aggregates, does not end with one, and an #include must start its line.
+FS_HELPERS_RUNTIME: String =
+    raw
+        |
+        |#include <errno.h>
+        |#include <fcntl.h>
+        |#include <limits.h>
+        |#include <sys/stat.h>
+        |#include <unistd.h>
+        |enum {BLORP_FS_FAILED=0,BLORP_FS_SUCCEEDED=1};
+        |enum {
+        |BLORP_FS_NOT_FOUND=1,BLORP_FS_PERMISSION_DENIED=2,BLORP_FS_ALREADY_EXISTS=3,
+        |BLORP_FS_NOT_A_DIRECTORY=4,BLORP_FS_IS_A_DIRECTORY=5,BLORP_FS_DIRECTORY_NOT_EMPTY=6,
+        |BLORP_FS_NOT_A_REGULAR_FILE=7,BLORP_FS_READ_ONLY_FILESYSTEM=8,BLORP_FS_NO_SPACE=9,
+        |BLORP_FS_FILE_TOO_LARGE=10,BLORP_FS_CROSSES_DEVICES=11,BLORP_FS_PATH_CONTAINS_NUL=12,
+        |BLORP_FS_INVALID_UTF8=13,BLORP_FS_CHANGED_DURING_REMOVAL=14
+        |};
+        |enum {
+        |BLORP_FS_ENTRY_ABSENT=0,BLORP_FS_ENTRY_FILE=1,BLORP_FS_ENTRY_DIRECTORY=2,
+        |BLORP_FS_ENTRY_SYMLINK=3,BLORP_FS_ENTRY_OTHER=4
+        |};
+        |/* Repeats a call that a signal interrupted. Never used for close: Linux has already
+        | * released the descriptor, and on XNU a retry could close another one. */
+        |#define BLORP_FS_RETRY(result,call) do{(result)=(call);}while((result)<0&&errno==EINTR)
+        |/* macOS fails a single read or write of more than INT_MAX bytes with EINVAL. */
+        |enum {BLORP_FS_REQUEST_MAXIMUM=1<<30};
+        |/* Every String ends in a NUL, so once no NUL is embedded its bytes are the C path.
+        | * next_lines and close take no path, so this has external linkage. */
+        |int blorp_fs_has_nul(const struct blorp_string *path){
+        |return memchr(path->bytes,'\0',(size_t)path->length)!=NULL;
+        |}
+        |/* OtherOs: an errno with no named kind, sent negated so that it keeps its number. */
+        |static inline int64_t blorp_fs_other_os_code(int number){
+        |return -(int64_t)number;
+        |}
+        |/* The code of a named kind, or any other errno negated. An operation whose errno
+        | * means something else (EEXIST from rmdir) maps that errno itself first. */
+        |static inline int64_t blorp_fs_errno_code(int number){
+        |switch(number){
+        |case ENOENT:return BLORP_FS_NOT_FOUND;
+        |case EACCES:case EPERM:return BLORP_FS_PERMISSION_DENIED;
+        |case EEXIST:return BLORP_FS_ALREADY_EXISTS;
+        |case ENOTDIR:return BLORP_FS_NOT_A_DIRECTORY;
+        |case EISDIR:return BLORP_FS_IS_A_DIRECTORY;
+        |case ENOTEMPTY:return BLORP_FS_DIRECTORY_NOT_EMPTY;
+        |case EROFS:return BLORP_FS_READ_ONLY_FILESYSTEM;
+        |case ENOSPC:case EDQUOT:return BLORP_FS_NO_SPACE;
+        |case EFBIG:case EOVERFLOW:return BLORP_FS_FILE_TOO_LARGE;
+        |case EXDEV:return BLORP_FS_CROSSES_DEVICES;
+        |default:return blorp_fs_other_os_code(number);
+        |}
+        |}
+        |/* The entry code of a mode from lstat or fstatat, which do not follow a link. Only
+        | * entry_kind and list_directory call it, so it has external linkage. */
+        |int64_t blorp_fs_kind_of_mode(mode_t mode){
+        |if(S_ISREG(mode)){return BLORP_FS_ENTRY_FILE;}
+        |if(S_ISDIR(mode)){return BLORP_FS_ENTRY_DIRECTORY;}
+        |if(S_ISLNK(mode)){return BLORP_FS_ENTRY_SYMLINK;}
+        |return BLORP_FS_ENTRY_OTHER;
+        |}
+        |/* A NUL-terminated copy of `length` bytes. Only some operations call this and the
+        | * next helper, so both have external linkage. */
+        |char *blorp_fs_copy_path(const char *bytes,size_t length){
+        |char *copy=blorp_memory_allocate(length+1);
+        |if(copy==NULL){abort();}
+        |memcpy(copy,bytes,length);
+        |copy[length]='\0';
+        |return copy;
+        |}
+        |/* `directory` and `name` joined by one '/', unless the directory already ends in one. */
+        |char *blorp_fs_join_path(const char *directory,const char *name){
+        |const size_t directory_length=strlen(directory),name_length=strlen(name);
+        |const size_t separator=directory_length>0&&directory[directory_length-1]=='/'?0:1;
+        |char *joined=blorp_memory_allocate(directory_length+separator+name_length+1);
+        |if(joined==NULL){abort();}
+        |memcpy(joined,directory,directory_length);
+        |if(separator==1){joined[directory_length]='/';}
+        |memcpy(joined+directory_length+separator,name,name_length+1);
+        |return joined;
+        |}
+        |/* The next buffer capacity, or 0 once the buffer holds the largest String. Only
+        | * read_text and next_lines call this and the next helper, so both have external
+        | * linkage. */
+        |size_t blorp_fs_grown_capacity(size_t capacity,size_t maximum){
+        |if(capacity>=maximum){return 0;}
+        |return capacity>maximum/2?maximum:capacity*2;
+        |}
+        |/* IsADirectory for an open directory, which no read can take, and otherwise 0, or
+        | * the fstat's failure code. */
+        |int64_t blorp_fs_refuse_directory(int descriptor){
+        |struct stat status;
+        |int examined;
+        |BLORP_FS_RETRY(examined,fstat(descriptor,&status));
+        |if(examined<0){return blorp_fs_errno_code(errno);}
+        |return S_ISDIR(status.st_mode)?BLORP_FS_IS_A_DIRECTORY:0;
+        |}
+        |/* A descriptor arrives as an Int. One outside int's range names no open file, so
+        | * it is refused as EBADF without a system call, and the cast never truncates.
+        | * Only next_lines and close call this. */
+        |int blorp_fs_is_descriptor(int64_t descriptor){
+        |return descriptor>=0&&descriptor<=INT_MAX;
+        |}
+        |
+
+
+-- Reads to end of file, so a file that changes size is read as it is, and a
+-- FIFO or device is read as far as its writer goes.
+FS_READ_TEXT_RUNTIME: String =
+    raw
+        |enum {BLORP_FS_READ_INITIAL_CAPACITY=4096};
+        |/* Reads the open descriptor to end of file into a fresh buffer. Returns 0, or the
+        | * failure code with nothing allocated. A file of exactly the largest String's
+        | * length is also refused: no allocation could hold it. The caller closes. */
+        |static int64_t blorp_fs_read_descriptor(int descriptor,char **contents,size_t *length){
+        |const int64_t refused=blorp_fs_refuse_directory(descriptor);
+        |if(refused!=0){return refused;}
+        |size_t capacity=BLORP_FS_READ_INITIAL_CAPACITY,used=0;
+        |char *buffer=blorp_memory_allocate(capacity);
+        |if(buffer==NULL){abort();}
+        |for(;;){
+        |if(used==capacity){
+        |const size_t grown_capacity=blorp_fs_grown_capacity(capacity,blorp_string_maximum_capacity());
+        |if(grown_capacity==0){blorp_memory_release(buffer);return BLORP_FS_FILE_TOO_LARGE;}
+        |char *grown=blorp_memory_resize(buffer,grown_capacity);
+        |if(grown==NULL){abort();}
+        |buffer=grown;
+        |capacity=grown_capacity;
+        |}
+        |size_t request=capacity-used;
+        |if(request>BLORP_FS_REQUEST_MAXIMUM){request=BLORP_FS_REQUEST_MAXIMUM;}
+        |ssize_t received;
+        |BLORP_FS_RETRY(received,read(descriptor,buffer+used,request));
+        |if(received<0){
+        |const int64_t failure=blorp_fs_errno_code(errno);
+        |blorp_memory_release(buffer);
+        |return failure;
+        |}
+        |if(received==0){break;}
+        |used+=(size_t)received;
+        |}
+        |*contents=buffer;
+        |*length=used;
+        |return 0;
+        |}
+        |uint8_t blorp_fs_read_text(const struct blorp_string *path,struct blorp_string **text,int64_t *error){
+        |if(blorp_fs_has_nul(path)){*error=BLORP_FS_PATH_CONTAINS_NUL;return BLORP_FS_FAILED;}
+        |int descriptor;
+        |BLORP_FS_RETRY(descriptor,open(path->bytes,O_RDONLY|O_CLOEXEC));
+        |if(descriptor<0){*error=blorp_fs_errno_code(errno);return BLORP_FS_FAILED;}
+        |char *contents=NULL;
+        |size_t length=0;
+        |const int64_t failure=blorp_fs_read_descriptor(descriptor,&contents,&length);
+        |(void)close(descriptor);
+        |if(failure!=0){*error=failure;return BLORP_FS_FAILED;}
+        |if(!blorp_utf8_is_valid(contents,length)){
+        |blorp_memory_release(contents);
+        |*error=BLORP_FS_INVALID_UTF8;
+        |return BLORP_FS_FAILED;
+        |}
+        |*text=blorp_string_from_bytes(contents,(int64_t)length);
+        |blorp_memory_release(contents);
+        |return BLORP_FS_SUCCEEDED;
+        |}
+        |
+
+
+-- Replaces the file atomically: the text goes into a new file beside the
+-- target, which is flushed and then renamed over it, so a reader sees the old
+-- contents or the new. A link is followed to its final target, which is
+-- replaced in its own directory, so the link survives (D4). The flush orders
+-- the contents before the rename without forcing them to stable storage (D5).
+-- Every failure before the rename removes the new file and leaves the target
+-- as it was; only the directory flush can fail after it.
+FS_WRITE_TEXT_RUNTIME: String =
+    raw
+        |/* The prelude's _DARWIN_C_SOURCE reveals F_BARRIERFSYNC. Without it the flush would
+        | * have no barrier to call, so a hidden declaration stops the build here. */
+        |#if defined(__APPLE__) && !defined(F_BARRIERFSYNC)
+        |#error fs.write_text needs F_BARRIERFSYNC: define _DARWIN_C_SOURCE before any header
+        |#endif
+        |/* A temporary name is taken only by a file that an earlier process with the same pid
+        | * left when it crashed, one for each write it had in flight, and every attempt takes
+        | * the next counter value. 100 attempts outlast any such run of leftovers and still
+        | * bound the work in a directory where every exclusive create fails. */
+        |enum {BLORP_FS_TEMPORARY_ATTEMPTS=100};
+        |/* ".blorp-tmp-", a pid, '-', a 64-bit counter and the NUL: at most 53 bytes, so the
+        | * name never holds the base name and always fits NAME_MAX. */
+        |enum {BLORP_FS_TEMPORARY_NAME_BYTES=64};
+        |/* One counter for every thread, so two writes never try the same name. */
+        |static _Atomic uint64_t blorp_fs_temporary_counter;
+        |/* The file a write replaces or creates, and the directory that holds it, both
+        | * allocated. `replaces` is set when the file exists; `status` then holds the owner
+        | * and mode the new file takes. */
+        |struct blorp_fs_write_target{char *directory;char *path;uint8_t replaces;struct stat status;};
+        |/* Where a path's last component starts: just after its last '/', or at 0. */
+        |static size_t blorp_fs_base_start(const char *path,size_t length){
+        |while(length>0&&path[length-1]!='/'){length--;}
+        |return length;
+        |}
+        |/* The text before the last '/': "/" when that slash is the first byte, and "." when
+        | * there is none. */
+        |static char *blorp_fs_directory_part(const char *path,size_t base_start){
+        |if(base_start==0){return blorp_fs_copy_path(".",1);}
+        |return blorp_fs_copy_path(path,base_start==1?1:base_start-1);
+        |}
+        |/* realpath's answer, copied so that every path here is released the same way. */
+        |static int64_t blorp_fs_real_path(const char *path,char **resolved){
+        |char *answer=realpath(path,NULL);
+        |if(answer==NULL){return blorp_fs_errno_code(errno);}
+        |*resolved=blorp_fs_copy_path(answer,strlen(answer));
+        |free(answer);
+        |return 0;
+        |}
+        |/* A path that names nothing yet: the file is created in its parent's real directory. */
+        |static int64_t blorp_fs_new_target(const char *path,size_t length,struct blorp_fs_write_target *target){
+        |const size_t base_start=blorp_fs_base_start(path,length);
+        |char *parent=blorp_fs_directory_part(path,base_start);
+        |const int64_t failure=blorp_fs_real_path(parent,&target->directory);
+        |blorp_memory_release(parent);
+        |if(failure!=0){return failure;}
+        |target->path=blorp_fs_join_path(target->directory,path+base_start);
+        |target->replaces=0;
+        |return 0;
+        |}
+        |/* A file being replaced must be a regular file this process may open for writing,
+        | * although rename alone would replace a read-only one. There is no O_TRUNC, so the
+        | * check changes nothing, and O_NONBLOCK keeps a FIFO swapped in since the lstat from
+        | * blocking. The owner and mode come from the opened descriptor. */
+        |static int64_t blorp_fs_check_replaced(const char *path,struct stat *status){
+        |if(S_ISDIR(status->st_mode)){return BLORP_FS_IS_A_DIRECTORY;}
+        |if(!S_ISREG(status->st_mode)){return BLORP_FS_NOT_A_REGULAR_FILE;}
+        |int descriptor;
+        |BLORP_FS_RETRY(descriptor,open(path,O_WRONLY|O_NONBLOCK|O_CLOEXEC));
+        |if(descriptor<0){return blorp_fs_errno_code(errno);}
+        |int examined;
+        |BLORP_FS_RETRY(examined,fstat(descriptor,status));
+        |const int64_t failure=examined<0?blorp_fs_errno_code(errno):0;
+        |(void)close(descriptor);
+        |return failure;
+        |}
+        |/* A path ending in '/' names a directory, which write_text never writes. stat
+        | * with the slash kept says what is there, following a final link as POSIX
+        | * resolves such a path: a directory is IsADirectory, nothing is ENOENT and a
+        | * file is ENOTDIR. The mode decides, not success alone: on macOS 15 a slashed
+        | * link to a file resolves to the file without ENOTDIR. Nothing is created. */
+        |static int64_t blorp_fs_slashed_target_failure(const char *path){
+        |struct stat status;
+        |int examined;
+        |BLORP_FS_RETRY(examined,stat(path,&status));
+        |if(examined<0){return blorp_fs_errno_code(errno);}
+        |return S_ISDIR(status.st_mode)?BLORP_FS_IS_A_DIRECTORY:BLORP_FS_NOT_A_DIRECTORY;
+        |}
+        |/* Which file the write replaces or creates. A link is followed with realpath, so a
+        | * dangling link is NotFound and a loop is OtherOs(ELOOP). */
+        |static int64_t blorp_fs_resolve_target(const char *path,size_t length,struct blorp_fs_write_target *target){
+        |if(length==0){return BLORP_FS_NOT_FOUND;}
+        |if(path[length-1]=='/'){return blorp_fs_slashed_target_failure(path);}
+        |int examined;
+        |BLORP_FS_RETRY(examined,lstat(path,&target->status));
+        |if(examined<0){return errno==ENOENT?blorp_fs_new_target(path,length,target):blorp_fs_errno_code(errno);}
+        |int64_t failure=0;
+        |if(S_ISLNK(target->status.st_mode)){
+        |failure=blorp_fs_real_path(path,&target->path);
+        |if(failure!=0){return failure;}
+        |BLORP_FS_RETRY(examined,lstat(target->path,&target->status));
+        |if(examined<0){failure=blorp_fs_errno_code(errno);}
+        |}else{
+        |target->path=blorp_fs_copy_path(path,length);
+        |}
+        |if(failure==0){failure=blorp_fs_check_replaced(target->path,&target->status);}
+        |if(failure!=0){blorp_memory_release(target->path);return failure;}
+        |const size_t resolved_length=strlen(target->path);
+        |target->directory=blorp_fs_directory_part(target->path,blorp_fs_base_start(target->path,resolved_length));
+        |target->replaces=1;
+        |return 0;
+        |}
+        |/* An empty file under a fresh name in `directory`. When every attempt finds the name
+        | * taken, the failure is OtherOs(EEXIST): AlreadyExists would describe the caller's
+        | * path, which a write is allowed to replace. */
+        |static int64_t blorp_fs_create_temporary(const char *directory,mode_t mode,char **temporary,int *descriptor){
+        |for(int attempt=0;attempt<BLORP_FS_TEMPORARY_ATTEMPTS;attempt++){
+        |const unsigned long long counter=(unsigned long long)atomic_fetch_add(&blorp_fs_temporary_counter,1);
+        |char name[BLORP_FS_TEMPORARY_NAME_BYTES];
+        |(void)snprintf(name,sizeof name,".blorp-tmp-%ld-%llu",(long)getpid(),counter);
+        |char *path=blorp_fs_join_path(directory,name);
+        |int opened;
+        |BLORP_FS_RETRY(opened,open(path,O_WRONLY|O_CREAT|O_EXCL|O_CLOEXEC,mode));
+        |if(opened>=0){*temporary=path;*descriptor=opened;return 0;}
+        |const int saved=errno;
+        |blorp_memory_release(path);
+        |if(saved!=EEXIST){return blorp_fs_errno_code(saved);}
+        |}
+        |return blorp_fs_other_os_code(EEXIST);
+        |}
+        |/* The owner first, because chown may clear the set-id bits that the mode restores.
+        | * Both come before any byte, so a private file's contents never sit in a file others
+        | * can read. Only the owner may give a file away, so on EPERM the group alone is
+        | * copied, which a member of that group may do; otherwise a shared 0660 file would
+        | * take this process's group with the old group's bits. EPERM from that too leaves
+        | * this process's owner and group. */
+        |static int64_t blorp_fs_copy_owner_and_mode(int descriptor,const struct stat *status){
+        |int changed;
+        |BLORP_FS_RETRY(changed,fchown(descriptor,status->st_uid,status->st_gid));
+        |if(changed<0&&errno==EPERM){BLORP_FS_RETRY(changed,fchown(descriptor,(uid_t)-1,status->st_gid));}
+        |if(changed<0&&errno!=EPERM){return blorp_fs_errno_code(errno);}
+        |BLORP_FS_RETRY(changed,fchmod(descriptor,(mode_t)(status->st_mode&07777)));
+        |return changed<0?blorp_fs_errno_code(errno):0;
+        |}
+        |/* POSIX lets a write of a regular file return 0 only for an empty request, so a
+        | * write that makes no progress is reported as EIO rather than repeated forever. */
+        |static int64_t blorp_fs_write_all(int descriptor,const char *bytes,size_t length){
+        |size_t done=0;
+        |while(done<length){
+        |size_t request=length-done;
+        |if(request>BLORP_FS_REQUEST_MAXIMUM){request=BLORP_FS_REQUEST_MAXIMUM;}
+        |ssize_t written;
+        |BLORP_FS_RETRY(written,write(descriptor,bytes+done,request));
+        |if(written<0){return blorp_fs_errno_code(errno);}
+        |if(written==0){return blorp_fs_other_os_code(EIO);}
+        |done+=(size_t)written;
+        |}
+        |return 0;
+        |}
+        |/* Orders the contents before the rename that publishes them. macOS's fsync does not
+        | * order the drive's writes, and F_BARRIERFSYNC adds the barrier that does, without
+        | * F_FULLFSYNC's cache flush; a file system without it gets fsync. A failed flush is
+        | * final: the kernel may already have dropped the pages it could not write. */
+        |static int blorp_fs_flush_file(int descriptor){
+        |int flushed;
+        |#ifdef __APPLE__
+        |BLORP_FS_RETRY(flushed,fcntl(descriptor,F_BARRIERFSYNC));
+        |if(flushed!=-1||errno!=ENOTSUP){return flushed;}
+        |#endif
+        |BLORP_FS_RETRY(flushed,fsync(descriptor));
+        |return flushed;
+        |}
+        |/* Everything between creating the new file and renaming it. Its descriptor is closed
+        | * exactly once, and a failed close fails the write. */
+        |static int64_t blorp_fs_fill_temporary(int descriptor,const struct blorp_fs_write_target *target,const struct blorp_string *text){
+        |int64_t failure=target->replaces?blorp_fs_copy_owner_and_mode(descriptor,&target->status):0;
+        |if(failure==0){failure=blorp_fs_write_all(descriptor,text->bytes,(size_t)text->length);}
+        |if(failure==0&&blorp_fs_flush_file(descriptor)<0){failure=blorp_fs_errno_code(errno);}
+        |if(close(descriptor)<0&&failure==0){failure=blorp_fs_errno_code(errno);}
+        |return failure;
+        |}
+        |/* Orders the rename before later writes. A file system that cannot flush a directory
+        | * (EINVAL, ENOTSUP) has nothing to order. Any other failure is reported, although the
+        | * target already holds the new contents. */
+        |static int64_t blorp_fs_flush_directory(const char *directory){
+        |int descriptor;
+        |BLORP_FS_RETRY(descriptor,open(directory,O_RDONLY|O_DIRECTORY|O_CLOEXEC));
+        |if(descriptor<0){return blorp_fs_errno_code(errno);}
+        |int flushed;
+        |BLORP_FS_RETRY(flushed,fsync(descriptor));
+        |const int64_t failure=flushed<0&&errno!=EINVAL&&errno!=ENOTSUP?blorp_fs_errno_code(errno):0;
+        |(void)close(descriptor);
+        |return failure;
+        |}
+        |/* Creates, fills and renames the new file. Until the rename succeeds, a failure
+        | * removes it, ignoring the unlink's own error, and the target is unchanged. */
+        |static int64_t blorp_fs_replace(const struct blorp_fs_write_target *target,const struct blorp_string *text){
+        |char *temporary=NULL;
+        |int descriptor=-1;
+        |int64_t failure=blorp_fs_create_temporary(target->directory,target->replaces?0600:0666,&temporary,&descriptor);
+        |if(failure!=0){return failure;}
+        |failure=blorp_fs_fill_temporary(descriptor,target,text);
+        |if(failure==0){
+        |int renamed;
+        |BLORP_FS_RETRY(renamed,rename(temporary,target->path));
+        |if(renamed<0){failure=blorp_fs_errno_code(errno);}
+        |}
+        |if(failure!=0){(void)unlink(temporary);}
+        |blorp_memory_release(temporary);
+        |return failure!=0?failure:blorp_fs_flush_directory(target->directory);
+        |}
+        |uint8_t blorp_fs_write_text(const struct blorp_string *path,const struct blorp_string *text,int64_t *error){
+        |if(blorp_fs_has_nul(path)){*error=BLORP_FS_PATH_CONTAINS_NUL;return BLORP_FS_FAILED;}
+        |struct blorp_fs_write_target target={.directory=NULL,.path=NULL};
+        |int64_t failure=blorp_fs_resolve_target(path->bytes,(size_t)path->length,&target);
+        |if(failure==0){
+        |failure=blorp_fs_replace(&target,text);
+        |blorp_memory_release(target.directory);
+        |blorp_memory_release(target.path);
+        |}
+        |if(failure!=0){*error=failure;return BLORP_FS_FAILED;}
+        |return BLORP_FS_SUCCEEDED;
+        |}
+        |
+
+
+-- lstat: a link is not followed. A missing path, or a file used as a
+-- directory, is the absent kind rather than a failure.
+FS_ENTRY_KIND_RUNTIME: String =
+    raw
+        |uint8_t blorp_fs_entry_kind(const struct blorp_string *path,int64_t *kind,int64_t *error){
+        |if(blorp_fs_has_nul(path)){*error=BLORP_FS_PATH_CONTAINS_NUL;return BLORP_FS_FAILED;}
+        |struct stat status;
+        |int examined;
+        |BLORP_FS_RETRY(examined,lstat(path->bytes,&status));
+        |if(examined<0){
+        |const int saved=errno;
+        |if(saved==ENOENT||saved==ENOTDIR){*kind=BLORP_FS_ENTRY_ABSENT;return BLORP_FS_SUCCEEDED;}
+        |*error=blorp_fs_errno_code(saved);
+        |return BLORP_FS_FAILED;
+        |}
+        |*kind=blorp_fs_kind_of_mode(status.st_mode);
+        |return BLORP_FS_SUCCEEDED;
+        |}
+        |
+
+
+-- Reads the directory once, through the one descriptor it opens, and gives each
+-- entry but `.` and `..` as one String: its entry code in the first byte, then
+-- its name, so names and kinds cannot disagree in count (D17). The kind comes
+-- from d_type, and only an entry the file system leaves unknown is examined,
+-- without following a link. An entry removed while it is read is left out.
+-- One name that is not UTF-8 fails the whole listing (D8). Names are sorted by
+-- their bytes, so a listing does not depend on the file system's order.
+private FS_LIST_DIRECTORY_SUPPORT: String =
+    raw
+        |#include <dirent.h>
+        |/* The prelude's _DEFAULT_SOURCE reveals d_type's codes on glibc. Without them every
+        | * entry would need an fstatat, so a hidden declaration stops the build here. */
+        |#ifndef DT_UNKNOWN
+        |#error fs.list_directory needs the DT_ codes: define _DEFAULT_SOURCE before any header
+        |#endif
+        |enum {BLORP_FS_LIST_INITIAL_CAPACITY=16};
+        |/* The entries read so far, each a String the List will take. */
+        |struct blorp_fs_listed{struct blorp_string **entries;size_t count;size_t capacity;};
+        |static void blorp_fs_release_listed(struct blorp_fs_listed *listed){
+        |for(size_t index=0;index<listed->count;index++){blorp_string_release(listed->entries[index]);}
+        |blorp_memory_release(listed->entries);
+        |}
+        |/* The entry's code byte, then its name. */
+        |static void blorp_fs_add_listed(struct blorp_fs_listed *listed,int64_t kind,const char *name,size_t length){
+        |if(listed->count==listed->capacity){
+        |if(listed->capacity>SIZE_MAX/2/sizeof *listed->entries){abort();}
+        |const size_t capacity=listed->capacity==0?BLORP_FS_LIST_INITIAL_CAPACITY:listed->capacity*2;
+        |struct blorp_string **grown=blorp_memory_resize(listed->entries,capacity*sizeof *grown);
+        |if(grown==NULL){abort();}
+        |listed->entries=grown;
+        |listed->capacity=capacity;
+        |}
+        |struct blorp_string *entry=blorp_string_allocate((int64_t)length+1);
+        |entry->bytes[0]=(char)kind;
+        |memcpy(entry->bytes+1,name,length+1);
+        |listed->entries[listed->count++]=entry;
+        |}
+        |/* Byte order of the names after each code byte: memcmp over the shorter name, and
+        | * then the shorter name first. */
+        |static int blorp_fs_compare_listed(const void *left,const void *right){
+        |const struct blorp_string *first=*(struct blorp_string *const *)left;
+        |const struct blorp_string *second=*(struct blorp_string *const *)right;
+        |const size_t first_length=(size_t)first->length-1,second_length=(size_t)second->length-1;
+        |const int order=memcmp(first->bytes+1,second->bytes+1,first_length<second_length?first_length:second_length);
+        |if(order!=0){return order;}
+        |return first_length<second_length?-1:first_length>second_length?1:0;
+        |}
+        |/* The entry's code from its d_type, examining only an unknown one. An entry that
+        | * has gone since it was read is the absent code. */
+        |static int64_t blorp_fs_listed_kind(DIR *directory,const struct dirent *entry,int64_t *kind){
+        |switch(entry->d_type){
+        |case DT_REG:*kind=BLORP_FS_ENTRY_FILE;return 0;
+        |case DT_DIR:*kind=BLORP_FS_ENTRY_DIRECTORY;return 0;
+        |case DT_LNK:*kind=BLORP_FS_ENTRY_SYMLINK;return 0;
+        |case DT_UNKNOWN:break;
+        |default:*kind=BLORP_FS_ENTRY_OTHER;return 0;
+        |}
+        |struct stat status;
+        |int examined;
+        |BLORP_FS_RETRY(examined,fstatat(dirfd(directory),entry->d_name,&status,AT_SYMLINK_NOFOLLOW));
+        |if(examined<0){
+        |if(errno==ENOENT){*kind=BLORP_FS_ENTRY_ABSENT;return 0;}
+        |return blorp_fs_errno_code(errno);
+        |}
+        |*kind=blorp_fs_kind_of_mode(status.st_mode);
+        |return 0;
+        |}
+        |/* readdir returns NULL both at the end and on a failure, which only errno tells
+        | * apart, so errno is cleared before each call. EINTR is retried here because
+        | * BLORP_FS_RETRY tests for a negative result. The caller closes. */
+        |static int64_t blorp_fs_read_listed(DIR *directory,struct blorp_fs_listed *listed){
+        |for(;;){
+        |struct dirent *entry;
+        |do{errno=0;entry=readdir(directory);}while(entry==NULL&&errno==EINTR);
+        |if(entry==NULL){return errno==0?0:blorp_fs_errno_code(errno);}
+        |const char *name=entry->d_name;
+        |if(strcmp(name,".")==0||strcmp(name,"..")==0){continue;}
+        |int64_t kind=BLORP_FS_ENTRY_ABSENT;
+        |const int64_t failure=blorp_fs_listed_kind(directory,entry,&kind);
+        |if(failure!=0){return failure;}
+        |if(kind==BLORP_FS_ENTRY_ABSENT){continue;}
+        |const size_t length=strlen(name);
+        |if(!blorp_utf8_is_valid(name,length)){return BLORP_FS_INVALID_UTF8;}
+        |blorp_fs_add_listed(listed,kind,name,length);
+        |}
+        |}
+        |/* fdopendir leaves the descriptor open when it fails, so it is closed here; once
+        | * fdopendir succeeds, only closedir closes it, once and without a retry. */
+        |static int64_t blorp_fs_list_entries(const char *path,struct blorp_fs_listed *listed){
+        |int descriptor;
+        |BLORP_FS_RETRY(descriptor,open(path,O_RDONLY|O_DIRECTORY|O_CLOEXEC));
+        |if(descriptor<0){return blorp_fs_errno_code(errno);}
+        |DIR *directory=fdopendir(descriptor);
+        |if(directory==NULL){
+        |const int saved=errno;
+        |(void)close(descriptor);
+        |return blorp_fs_errno_code(saved);
+        |}
+        |const int64_t failure=blorp_fs_read_listed(directory,listed);
+        |(void)closedir(directory);
+        |if(failure==0&&listed->count>1){qsort(listed->entries,listed->count,sizeof *listed->entries,blorp_fs_compare_listed);}
+        |return failure;
+        |}
+        |
+
+
+-- The listing's entry point, for the emitter's List[String] C type. The List
+-- takes each entry's String without a copy, and nothing is published on a
+-- failure.
+pure func fs_list_directory_runtime(string_list_type: String) -> String:
+    FS_LIST_DIRECTORY_SUPPORT
+        .concat(
+            "uint8_t blorp_fs_list_directory(const struct blorp_string *path,${string_list_type} *listing,int64_t *error){\n",
+        )
+        .concat(
+            "if(blorp_fs_has_nul(path)){*error=BLORP_FS_PATH_CONTAINS_NUL;return BLORP_FS_FAILED;}\n",
+        )
+        .concat("struct blorp_fs_listed listed={.entries=NULL,.count=0,.capacity=0};\n")
+        .concat("const int64_t failure=blorp_fs_list_entries(path->bytes,&listed);\n")
+        .concat(
+            "if(failure!=0){blorp_fs_release_listed(&listed);*error=failure;return BLORP_FS_FAILED;}\n",
+        )
+        .concat(list_root_allocation(string_list_type, "result", "listed.count"))
+        .concat(
+            "\nfor(size_t index=0;index<listed.count;index++){${list_slot_store("result", "index", "listed.entries[index]")}}\n",
+        )
+        .concat(
+            "blorp_memory_release(listed.entries);\n*listing=result;\nreturn BLORP_FS_SUCCEEDED;\n}\n",
+        )
+
+
+-- One mkdir, so a path that exists is AlreadyExists whatever it names.
+FS_CREATE_DIRECTORY_RUNTIME: String =
+    raw
+        |uint8_t blorp_fs_create_directory(const struct blorp_string *path,int64_t *error){
+        |if(blorp_fs_has_nul(path)){*error=BLORP_FS_PATH_CONTAINS_NUL;return BLORP_FS_FAILED;}
+        |int made;
+        |BLORP_FS_RETRY(made,mkdir(path->bytes,0777));
+        |if(made<0){*error=blorp_fs_errno_code(errno);return BLORP_FS_FAILED;}
+        |return BLORP_FS_SUCCEEDED;
+        |}
+        |
+
+
+-- Creates each missing directory along the path, from the left. A component
+-- that already exists is passed if it resolves to a directory, so a link to a
+-- directory is walked through, and another process creating a component first
+-- is no failure. Slashes alone name the root, which always exists.
+FS_CREATE_DIRECTORIES_RUNTIME: String =
+    raw
+        |/* One component, `prefix` being the path up to its end. One that exists counts
+        | * only if it resolves to a directory: anything else is NotADirectory when more
+        | * components follow, and AlreadyExists, a dangling link included, when it is the
+        | * last. */
+        |static int64_t blorp_fs_create_component(const char *prefix,int last){
+        |int made;
+        |BLORP_FS_RETRY(made,mkdir(prefix,0777));
+        |if(made==0){return 0;}
+        |if(errno!=EEXIST){return blorp_fs_errno_code(errno);}
+        |struct stat status;
+        |int examined;
+        |BLORP_FS_RETRY(examined,stat(prefix,&status));
+        |if(examined==0&&S_ISDIR(status.st_mode)){return 0;}
+        |return last?BLORP_FS_ALREADY_EXISTS:BLORP_FS_NOT_A_DIRECTORY;
+        |}
+        |/* Walks a copy of the path, ending it with a NUL after each component in turn.
+        | * Leading, repeated and trailing slashes only separate components. */
+        |uint8_t blorp_fs_create_directories(const struct blorp_string *path,int64_t *error){
+        |if(blorp_fs_has_nul(path)){*error=BLORP_FS_PATH_CONTAINS_NUL;return BLORP_FS_FAILED;}
+        |const size_t length=(size_t)path->length;
+        |if(length==0){*error=BLORP_FS_NOT_FOUND;return BLORP_FS_FAILED;}
+        |char *walked=blorp_memory_allocate(length+1);
+        |if(walked==NULL){abort();}
+        |memcpy(walked,path->bytes,length+1);
+        |int64_t failure=0;
+        |size_t end=0;
+        |for(;;){
+        |while(end<length&&walked[end]=='/'){end++;}
+        |if(end==length){break;}
+        |while(end<length&&walked[end]!='/'){end++;}
+        |size_t next=end;
+        |while(next<length&&walked[next]=='/'){next++;}
+        |walked[end]='\0';
+        |failure=blorp_fs_create_component(walked,next==length);
+        |walked[end]=path->bytes[end];
+        |if(failure!=0){break;}
+        |}
+        |blorp_memory_release(walked);
+        |if(failure!=0){*error=failure;return BLORP_FS_FAILED;}
+        |return BLORP_FS_SUCCEEDED;
+        |}
+        |
+
+
+-- unlink. macOS refuses a directory with EPERM, which would read as
+-- PermissionDenied, so after EPERM an lstat that shows a directory makes it
+-- IsADirectory, the kind Linux's EISDIR already maps to.
+FS_REMOVE_FILE_RUNTIME: String =
+    raw
+        |uint8_t blorp_fs_remove_file(const struct blorp_string *path,int64_t *error){
+        |if(blorp_fs_has_nul(path)){*error=BLORP_FS_PATH_CONTAINS_NUL;return BLORP_FS_FAILED;}
+        |int removed;
+        |BLORP_FS_RETRY(removed,unlink(path->bytes));
+        |if(removed==0){return BLORP_FS_SUCCEEDED;}
+        |const int saved=errno;
+        |if(saved==EPERM){
+        |struct stat status;
+        |int examined;
+        |BLORP_FS_RETRY(examined,lstat(path->bytes,&status));
+        |if(examined==0&&S_ISDIR(status.st_mode)){*error=BLORP_FS_IS_A_DIRECTORY;return BLORP_FS_FAILED;}
+        |}
+        |*error=blorp_fs_errno_code(saved);
+        |return BLORP_FS_FAILED;
+        |}
+        |
+
+
+-- rmdir. POSIX lets a directory that is not empty give EEXIST as well as
+-- ENOTEMPTY; both are DirectoryNotEmpty.
+FS_REMOVE_DIRECTORY_RUNTIME: String =
+    raw
+        |uint8_t blorp_fs_remove_directory(const struct blorp_string *path,int64_t *error){
+        |if(blorp_fs_has_nul(path)){*error=BLORP_FS_PATH_CONTAINS_NUL;return BLORP_FS_FAILED;}
+        |int removed;
+        |BLORP_FS_RETRY(removed,rmdir(path->bytes));
+        |if(removed==0){return BLORP_FS_SUCCEEDED;}
+        |*error=errno==EEXIST?BLORP_FS_DIRECTORY_NOT_EMPTY:blorp_fs_errno_code(errno);
+        |return BLORP_FS_FAILED;
+        |}
+        |
+
+
+-- rename, which replaces a file, or an empty directory, at the destination. As
+-- for rmdir, a destination directory that is not empty may give EEXIST.
+FS_RENAME_RUNTIME: String =
+    raw
+        |uint8_t blorp_fs_rename(const struct blorp_string *source,const struct blorp_string *destination,int64_t *error){
+        |if(blorp_fs_has_nul(source)||blorp_fs_has_nul(destination)){*error=BLORP_FS_PATH_CONTAINS_NUL;return BLORP_FS_FAILED;}
+        |int renamed;
+        |BLORP_FS_RETRY(renamed,rename(source->bytes,destination->bytes));
+        |if(renamed==0){return BLORP_FS_SUCCEEDED;}
+        |*error=errno==EEXIST?BLORP_FS_DIRECTORY_NOT_EMPTY:blorp_fs_errno_code(errno);
+        |return BLORP_FS_FAILED;
+        |}
+        |
+
+
+-- Removes a directory and everything in it, never through a link and never
+-- past the device it starts on. Only a real directory is a root: a file, or a
+-- link to anything, is NotADirectory (D20). A final `.` or `..`, which rmdir
+-- could never remove as named, is refused before any system call (D21). A
+-- mount point, inside the tree or as the root, is CrossesDevices, and a
+-- directory moved elsewhere while the walk is inside it is ChangedDuringRemoval
+-- (D22). The first failure stops the walk, and what it removed stays removed.
+-- A bind mount of the same file system has the same device, so it is entered.
+FS_REMOVE_DIRECTORY_TREE_RUNTIME: String =
+    raw
+        |#include <dirent.h>
+        |enum {BLORP_FS_TREE_INITIAL_CAPACITY=8};
+        |/* One directory being emptied: its names, read in full before any is removed,
+        | * because macOS readdir can skip entries during deletion, and the identity the
+        | * walk checks when it climbs back to it. */
+        |struct blorp_fs_tree_level{char **names;size_t count;size_t next;dev_t device;ino_t inode;};
+        |/* The levels from the root down to the directory being emptied. They live on the
+        | * heap, so the C stack is the same at any depth. */
+        |struct blorp_fs_tree{struct blorp_fs_tree_level *levels;size_t depth;size_t capacity;};
+        |static void blorp_fs_release_tree_level(struct blorp_fs_tree_level *level){
+        |for(size_t index=0;index<level->count;index++){blorp_memory_release(level->names[index]);}
+        |blorp_memory_release(level->names);
+        |}
+        |static void blorp_fs_push_tree_level(struct blorp_fs_tree *tree,const struct stat *status){
+        |if(tree->depth==tree->capacity){
+        |const size_t capacity=tree->capacity==0?BLORP_FS_TREE_INITIAL_CAPACITY:tree->capacity*2;
+        |struct blorp_fs_tree_level *grown=blorp_memory_resize(tree->levels,capacity*sizeof *grown);
+        |if(grown==NULL){abort();}
+        |tree->levels=grown;
+        |tree->capacity=capacity;
+        |}
+        |tree->levels[tree->depth++]=(struct blorp_fs_tree_level){.names=NULL,.count=0,.next=0,.device=status->st_dev,.inode=status->st_ino};
+        |}
+        |/* Every name in the open directory but `.` and `..`, as bytes, so a name that is
+        | * not UTF-8 is still removed. The stream reads a copy of the descriptor, which is
+        | * never inherited and which closedir alone closes. readdir's NULL is a failure
+        | * only when errno is set, so errno is cleared before each call. */
+        |static int64_t blorp_fs_read_tree_level(int descriptor,struct blorp_fs_tree_level *level){
+        |int copy;
+        |BLORP_FS_RETRY(copy,fcntl(descriptor,F_DUPFD_CLOEXEC,0));
+        |if(copy<0){return blorp_fs_errno_code(errno);}
+        |DIR *stream=fdopendir(copy);
+        |if(stream==NULL){
+        |const int saved=errno;
+        |(void)close(copy);
+        |return blorp_fs_errno_code(saved);
+        |}
+        |int64_t failure=0;
+        |size_t capacity=0;
+        |for(;;){
+        |struct dirent *entry;
+        |do{errno=0;entry=readdir(stream);}while(entry==NULL&&errno==EINTR);
+        |if(entry==NULL){
+        |if(errno!=0){failure=blorp_fs_errno_code(errno);}
+        |break;
+        |}
+        |const char *name=entry->d_name;
+        |if(strcmp(name,".")==0||strcmp(name,"..")==0){continue;}
+        |if(level->count==capacity){
+        |capacity=capacity==0?BLORP_FS_TREE_INITIAL_CAPACITY:capacity*2;
+        |char **grown=blorp_memory_resize(level->names,capacity*sizeof *grown);
+        |if(grown==NULL){abort();}
+        |level->names=grown;
+        |}
+        |level->names[level->count++]=blorp_fs_copy_path(name,strlen(name));
+        |}
+        |(void)closedir(stream);
+        |return failure;
+        |}
+        |/* Removes a directory the walk has emptied, by its name in the open parent. One
+        | * already gone is no failure, and POSIX lets one that is not empty give EEXIST. */
+        |static int64_t blorp_fs_remove_emptied(int parent,const char *name){
+        |int removed;
+        |BLORP_FS_RETRY(removed,unlinkat(parent,name,AT_REMOVEDIR));
+        |if(removed==0||errno==ENOENT){return 0;}
+        |return errno==EEXIST?BLORP_FS_DIRECTORY_NOT_EMPTY:blorp_fs_errno_code(errno);
+        |}
+        |/* The current directory's entry `name`, which unlinkat refused with `refused`, as it
+        | * refuses a directory. O_NOFOLLOW with O_DIRECTORY refuses a link, so the walk
+        | * never enters one; ENOTDIR means the entry is no directory, and the unlink's own
+        | * failure stands. A child on another device is a mount point. A child that can be
+        | * read but not searched (mode 0400) is read like any other, and with no names it
+        | * is removed without entering it. One that cannot be opened at all (mode 000) is
+        | * removed only if it is empty: AT_REMOVEDIR removes nothing but an empty real
+        | * directory, as a link gives ENOTDIR and a mount point EBUSY, so nothing outside
+        | * the tree is reached. One that is not empty stays PermissionDenied, since the walk
+        | * cannot see inside it. A child with names becomes the current directory, its level
+        | * pushed; every other return leaves the levels as they were. */
+        |static int64_t blorp_fs_enter_tree_child(struct blorp_fs_tree *tree,int *current,const char *name,int refused){
+        |int child;
+        |BLORP_FS_RETRY(child,openat(*current,name,O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC));
+        |int64_t failure=0;
+        |if(child<0){
+        |const int failed=errno;
+        |if(failed!=ENOENT&&failed!=EACCES){return blorp_fs_errno_code(failed==ENOTDIR?refused:failed);}
+        |if(failed==EACCES){
+        |failure=blorp_fs_remove_emptied(*current,name);
+        |if(failure==BLORP_FS_DIRECTORY_NOT_EMPTY){failure=BLORP_FS_PERMISSION_DENIED;}
+        |}
+        |}else{
+        |struct stat status;
+        |int examined;
+        |BLORP_FS_RETRY(examined,fstat(child,&status));
+        |failure=examined<0?blorp_fs_errno_code(errno):0;
+        |if(failure==0&&status.st_dev!=tree->levels[tree->depth-1].device){failure=BLORP_FS_CROSSES_DEVICES;}
+        |if(failure==0){
+        |blorp_fs_push_tree_level(tree,&status);
+        |failure=blorp_fs_read_tree_level(child,&tree->levels[tree->depth-1]);
+        |if(failure==0&&tree->levels[tree->depth-1].count>0){
+        |(void)close(*current);
+        |*current=child;
+        |return 0;
+        |}
+        |blorp_fs_release_tree_level(&tree->levels[--tree->depth]);
+        |}
+        |(void)close(child);
+        |if(failure==0){failure=blorp_fs_remove_emptied(*current,name);}
+        |}
+        |if(failure==0){tree->levels[tree->depth-1].next++;}
+        |return failure;
+        |}
+        |/* Climbs from the emptied current directory through `..`, which is followed only
+        | * while it is the directory the walk came down from: another process may have
+        | * moved the current directory, and `..` would then leave the tree. The emptied
+        | * directory is then removed by its name in its parent. */
+        |static int64_t blorp_fs_leave_tree_level(struct blorp_fs_tree *tree,int *current){
+        |int parent;
+        |BLORP_FS_RETRY(parent,openat(*current,"..",O_RDONLY|O_DIRECTORY|O_CLOEXEC));
+        |if(parent<0){return blorp_fs_errno_code(errno);}
+        |struct blorp_fs_tree_level *above=&tree->levels[tree->depth-2];
+        |struct stat status;
+        |int examined;
+        |BLORP_FS_RETRY(examined,fstat(parent,&status));
+        |int64_t failure=examined<0?blorp_fs_errno_code(errno):0;
+        |if(failure==0&&(status.st_dev!=above->device||status.st_ino!=above->inode)){failure=BLORP_FS_CHANGED_DURING_REMOVAL;}
+        |if(failure!=0){(void)close(parent);return failure;}
+        |(void)close(*current);
+        |*current=parent;
+        |blorp_fs_release_tree_level(&tree->levels[--tree->depth]);
+        |failure=blorp_fs_remove_emptied(parent,above->names[above->next]);
+        |if(failure==0){above->next++;}
+        |return failure;
+        |}
+        |/* Empties the root, whose names are read and whose descriptor is `*current`. Only
+        | * the current directory stays open between steps. unlinkat comes first for every
+        | * name, so nothing is classified and then acted on as something else: it removes
+        | * a file or a link itself, and only the refusals a directory gives (EISDIR on
+        | * Linux, EPERM on macOS or in a sticky directory, EBUSY at a macOS mount point)
+        | * lead to opening the entry. */
+        |static int64_t blorp_fs_empty_tree(struct blorp_fs_tree *tree,int *current){
+        |for(;;){
+        |struct blorp_fs_tree_level *level=&tree->levels[tree->depth-1];
+        |int64_t failure=0;
+        |if(level->next==level->count){
+        |if(tree->depth==1){return 0;}
+        |failure=blorp_fs_leave_tree_level(tree,current);
+        |}else{
+        |const char *name=level->names[level->next];
+        |int removed;
+        |BLORP_FS_RETRY(removed,unlinkat(*current,name,0));
+        |if(removed==0||errno==ENOENT){level->next++;continue;}
+        |const int refused=errno;
+        |if(refused!=EISDIR&&refused!=EPERM&&refused!=EBUSY){return blorp_fs_errno_code(refused);}
+        |failure=blorp_fs_enter_tree_child(tree,current,name,refused);
+        |}
+        |if(failure!=0){return failure;}
+        |}
+        |}
+        |/* The root's `..` must be another directory on the root's device. Otherwise the
+        | * root is a mount point, whose whole file system the walk would empty before its
+        | * rmdir failed with EBUSY, or it is `/`, whose `..` is itself. Opening `..` needs
+        | * search permission on the root, so a root that cannot be searched (mode 0400) is
+        | * PermissionDenied even when it is empty, a known gap. */
+        |static int64_t blorp_fs_enter_tree_root(int root,struct blorp_fs_tree *tree){
+        |struct stat status,parent_status;
+        |int examined;
+        |BLORP_FS_RETRY(examined,fstat(root,&status));
+        |if(examined<0){return blorp_fs_errno_code(errno);}
+        |int parent;
+        |BLORP_FS_RETRY(parent,openat(root,"..",O_RDONLY|O_DIRECTORY|O_CLOEXEC));
+        |if(parent<0){return blorp_fs_errno_code(errno);}
+        |BLORP_FS_RETRY(examined,fstat(parent,&parent_status));
+        |const int64_t failure=examined<0?blorp_fs_errno_code(errno):0;
+        |(void)close(parent);
+        |if(failure!=0){return failure;}
+        |if(parent_status.st_dev!=status.st_dev||parent_status.st_ino==status.st_ino){return BLORP_FS_CROSSES_DEVICES;}
+        |blorp_fs_push_tree_level(tree,&status);
+        |return blorp_fs_read_tree_level(root,&tree->levels[0]);
+        |}
+        |/* `root`, already stripped of trailing slashes, ends in the name `.` or `..`. */
+        |static int blorp_fs_names_dot_entry(const char *root,size_t length){
+        |size_t start=length;
+        |while(start>0&&root[start-1]!='/'){start--;}
+        |return strcmp(root+start,".")==0||strcmp(root+start,"..")==0;
+        |}
+        |/* The root is opened without following a link: with O_DIRECTORY, both platforms
+        | * refuse a link to anything with ENOTDIR. */
+        |static int64_t blorp_fs_remove_tree_root(const char *root,size_t length){
+        |if(blorp_fs_names_dot_entry(root,length)){return blorp_fs_other_os_code(EINVAL);}
+        |int current;
+        |BLORP_FS_RETRY(current,open(root,O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC));
+        |if(current<0){return blorp_fs_errno_code(errno);}
+        |struct blorp_fs_tree tree={.levels=NULL,.depth=0,.capacity=0};
+        |int64_t failure=blorp_fs_enter_tree_root(current,&tree);
+        |if(failure==0){failure=blorp_fs_empty_tree(&tree,&current);}
+        |(void)close(current);
+        |/* The levels left are the directories the walk was inside when it stopped. */
+        |for(size_t index=0;index<tree.depth;index++){blorp_fs_release_tree_level(&tree.levels[index]);}
+        |blorp_memory_release(tree.levels);
+        |if(failure!=0){return failure;}
+        |int removed;
+        |BLORP_FS_RETRY(removed,rmdir(root));
+        |if(removed==0){return 0;}
+        |return errno==EEXIST?BLORP_FS_DIRECTORY_NOT_EMPTY:blorp_fs_errno_code(errno);
+        |}
+        |/* Trailing slashes are stripped, keeping one that is the whole path, because POSIX
+        | * resolves `link/` to the link's target, which the walk would then empty. */
+        |uint8_t blorp_fs_remove_directory_tree(const struct blorp_string *path,int64_t *error){
+        |if(blorp_fs_has_nul(path)){*error=BLORP_FS_PATH_CONTAINS_NUL;return BLORP_FS_FAILED;}
+        |size_t length=(size_t)path->length;
+        |if(length==0){*error=BLORP_FS_NOT_FOUND;return BLORP_FS_FAILED;}
+        |while(length>1&&path->bytes[length-1]=='/'){length--;}
+        |char *root=blorp_fs_copy_path(path->bytes,length);
+        |const int64_t failure=blorp_fs_remove_tree_root(root,length);
+        |blorp_memory_release(root);
+        |if(failure!=0){*error=failure;return BLORP_FS_FAILED;}
+        |return BLORP_FS_SUCCEEDED;
+        |}
+        |
+
+
+-- mkdtemp makes a fresh directory directly in `parent`, exclusively, with mode
+-- 0700 and a name no other process can predict, which matters in a shared
+-- parent such as /tmp. A '/' in the prefix is refused before any system call
+-- (D21). The six replaced bytes are ASCII letters and digits, so the path is
+-- valid UTF-8. macOS replaces every trailing X, so a prefix that ends in X
+-- loses those letters there.
+FS_CREATE_TEMPORARY_DIRECTORY_RUNTIME: String =
+    raw
+        |#include <stdlib.h>
+        |/* The bytes mkdtemp replaces, then the NUL. */
+        |static const char blorp_fs_temporary_suffix[]="XXXXXX";
+        |/* mkdtemp gives up on any errno but EEXIST, so EINTR is retried here, from a fresh
+        | * template. EEXIST is OtherOs: AlreadyExists would describe the parent. */
+        |uint8_t blorp_fs_create_temporary_directory(const struct blorp_string *parent,const struct blorp_string *prefix,struct blorp_string **directory,int64_t *error){
+        |if(blorp_fs_has_nul(parent)||blorp_fs_has_nul(prefix)){*error=BLORP_FS_PATH_CONTAINS_NUL;return BLORP_FS_FAILED;}
+        |if(memchr(prefix->bytes,'/',(size_t)prefix->length)!=NULL){*error=blorp_fs_other_os_code(EINVAL);return BLORP_FS_FAILED;}
+        |if(parent->length==0){*error=BLORP_FS_NOT_FOUND;return BLORP_FS_FAILED;}
+        |char *joined=blorp_fs_join_path(parent->bytes,prefix->bytes);
+        |const size_t length=strlen(joined);
+        |char *template=blorp_memory_resize(joined,length+sizeof blorp_fs_temporary_suffix);
+        |if(template==NULL){abort();}
+        |for(;;){
+        |memcpy(template+length,blorp_fs_temporary_suffix,sizeof blorp_fs_temporary_suffix);
+        |if(mkdtemp(template)!=NULL){break;}
+        |if(errno==EINTR){continue;}
+        |*error=errno==EEXIST?blorp_fs_other_os_code(EEXIST):blorp_fs_errno_code(errno);
+        |blorp_memory_release(template);
+        |return BLORP_FS_FAILED;
+        |}
+        |*directory=blorp_string_from_bytes(template,(int64_t)(length+sizeof blorp_fs_temporary_suffix-1));
+        |blorp_memory_release(template);
+        |return BLORP_FS_SUCCEEDED;
+        |}
+        |
+
+
+-- Opens a file for reading as read_text does, and gives the caller its
+-- descriptor, which only fs.close closes. A directory opens on POSIX but no
+-- read can take it, so it is refused and closed here. Nothing here is about
+-- lines, so a later reader of bytes can open with it too.
+FS_OPEN_READ_RUNTIME: String =
+    raw
+        |uint8_t blorp_fs_open_read(const struct blorp_string *path,int64_t *descriptor,int64_t *error){
+        |if(blorp_fs_has_nul(path)){*error=BLORP_FS_PATH_CONTAINS_NUL;return BLORP_FS_FAILED;}
+        |int opened;
+        |BLORP_FS_RETRY(opened,open(path->bytes,O_RDONLY|O_CLOEXEC));
+        |if(opened<0){*error=blorp_fs_errno_code(errno);return BLORP_FS_FAILED;}
+        |const int64_t refused=blorp_fs_refuse_directory(opened);
+        |if(refused!=0){(void)close(opened);*error=refused;return BLORP_FS_FAILED;}
+        |*descriptor=opened;
+        |return BLORP_FS_SUCCEEDED;
+        |}
+        |
+
+
+-- The natives keep no state between calls (D37): the kernel holds the file
+-- offset, and the caller holds the unfinished line and passes it back. Each
+-- call reads into one buffer that starts with that line, then checks every
+-- element before it allocates any, so a failure has nothing to release but
+-- the buffer.
+private FS_NEXT_LINES_SUPPORT: String =
+    raw
+        |/* A call reads this many bytes past what it was given, and more only while one line
+        | * is longer. 64 KiB is the default pipe capacity on Linux and macOS, so one read
+        | * empties a full pipe, and a batch of short lines stays far below a file's size. */
+        |enum {BLORP_FS_LINE_BLOCK=1<<16};
+        |/* What one call holds: the line it was given, then the bytes it read. `ended` is set
+        | * once a read has returned end of file. */
+        |struct blorp_fs_line_buffer{char *bytes;size_t used;size_t capacity;uint8_t ended;};
+        |/* Doubles the buffer until `needed` more bytes fit, so a long line costs linear
+        | * time. Returns 0, or FileTooLarge once the buffer holds the largest String. */
+        |static int64_t blorp_fs_line_room(struct blorp_fs_line_buffer *buffer,size_t needed){
+        |while(buffer->capacity-buffer->used<needed){
+        |const size_t grown=blorp_fs_grown_capacity(buffer->capacity,blorp_string_maximum_capacity());
+        |if(grown==0){return BLORP_FS_FILE_TOO_LARGE;}
+        |char *resized=blorp_memory_resize(buffer->bytes,grown);
+        |if(resized==NULL){abort();}
+        |buffer->bytes=resized;
+        |buffer->capacity=grown;
+        |}
+        |return 0;
+        |}
+        |/* Reads until a read brings an LF or the file ends. Only the new bytes are searched,
+        | * so a long line is scanned once. */
+        |static int64_t blorp_fs_read_line_blocks(int descriptor,struct blorp_fs_line_buffer *buffer){
+        |for(;;){
+        |const int64_t room=blorp_fs_line_room(buffer,1);
+        |if(room!=0){return room;}
+        |size_t request=buffer->capacity-buffer->used;
+        |if(request>BLORP_FS_REQUEST_MAXIMUM){request=BLORP_FS_REQUEST_MAXIMUM;}
+        |ssize_t received;
+        |BLORP_FS_RETRY(received,read(descriptor,buffer->bytes+buffer->used,request));
+        |if(received<0){return blorp_fs_errno_code(errno);}
+        |if(received==0){buffer->ended=1;return 0;}
+        |const int newline=memchr(buffer->bytes+buffer->used,'\n',(size_t)received)!=NULL;
+        |buffer->used+=(size_t)received;
+        |if(newline){return 0;}
+        |}
+        |}
+        |/* The bytes still missing from a UTF-8 sequence that `bytes` ends partway
+        | * through. It returns 0 when the last sequence is complete, or when its lead
+        | * byte can start no sequence; validation then reports the line. */
+        |static size_t blorp_fs_utf8_missing(const char *bytes,size_t length){
+        |for(size_t back=1;back<=3&&back<=length;back++){
+        |const unsigned char byte=(unsigned char)bytes[length-back];
+        |if((byte&0xC0)==0x80){continue;}
+        |const size_t needed=byte>=0xC2&&byte<=0xDF?2:byte>=0xE0&&byte<=0xEF?3:byte>=0xF0&&byte<=0xF4?4:1;
+        |return needed>back?needed-back:0;
+        |}
+        |return 0;
+        |}
+        |/* Reads exactly the bytes still missing from the unfinished line's last character,
+        | * at most three, so that line is a whole String. A FIFO may hold them back, which
+        | * delays the batch's complete lines until the character finishes. An LF is no
+        | * continuation byte, so the search never passes the last LF. End of file first, or
+        | * a byte that cannot continue the character, is InvalidUtf8. */
+        |static int64_t blorp_fs_complete_character(int descriptor,struct blorp_fs_line_buffer *buffer){
+        |size_t missing=blorp_fs_utf8_missing(buffer->bytes,buffer->used);
+        |const int64_t room=blorp_fs_line_room(buffer,missing);
+        |if(room!=0){return room;}
+        |while(missing>0){
+        |ssize_t received;
+        |BLORP_FS_RETRY(received,read(descriptor,buffer->bytes+buffer->used,missing));
+        |if(received<0){return blorp_fs_errno_code(errno);}
+        |if(received==0){return BLORP_FS_INVALID_UTF8;}
+        |for(size_t index=0;index<(size_t)received;index++){
+        |if(((unsigned char)buffer->bytes[buffer->used+index]&0xC0)!=0x80){return BLORP_FS_INVALID_UTF8;}
+        |}
+        |buffer->used+=(size_t)received;
+        |missing-=(size_t)received;
+        |}
+        |return 0;
+        |}
+        |/* Where the line that starts at `start` ends: at its LF, or at `used` for the line
+        | * that no LF has ended. */
+        |static size_t blorp_fs_line_end(const char *bytes,size_t start,size_t used){
+        |const char *newline=memchr(bytes+start,'\n',used-start);
+        |return newline==NULL?used:(size_t)(newline-bytes);
+        |}
+        |/* The line's length without its LF, or one CR just before that LF. A line that no LF
+        | * has ended keeps a last CR, which an LF in the next read may still follow. */
+        |static size_t blorp_fs_line_length(const char *bytes,size_t start,size_t end,size_t used){
+        |return end<used&&end>start&&bytes[end-1]=='\r'?end-start-1:end-start;
+        |}
+        |/* Checks each element as UTF-8 and counts them: every line an LF ended, then the
+        | * unfinished line, even when empty, or at end of file the final line, only when it
+        | * is not empty. */
+        |static int64_t blorp_fs_check_lines(const struct blorp_fs_line_buffer *buffer,size_t *count){
+        |size_t start=0;
+        |for(;;){
+        |const size_t end=blorp_fs_line_end(buffer->bytes,start,buffer->used);
+        |const size_t length=blorp_fs_line_length(buffer->bytes,start,end,buffer->used);
+        |if(end==buffer->used&&buffer->ended&&length==0){return 0;}
+        |if(!blorp_utf8_is_valid(buffer->bytes+start,length)){return BLORP_FS_INVALID_UTF8;}
+        |(*count)++;
+        |if(end==buffer->used){return 0;}
+        |start=end+1;
+        |}
+        |}
+        |/* Fills a fresh buffer, from `carried` on, and counts its elements. On success the
+        | * caller releases `buffer->bytes`; on a failure it is released here and the code
+        | * returned. */
+        |static int64_t blorp_fs_read_lines(int descriptor,const struct blorp_string *carried,struct blorp_fs_line_buffer *buffer,size_t *count){
+        |const size_t carried_length=(size_t)carried->length;
+        |const size_t maximum=blorp_string_maximum_capacity();
+        |buffer->capacity=carried_length>maximum-BLORP_FS_LINE_BLOCK?maximum:carried_length+BLORP_FS_LINE_BLOCK;
+        |buffer->bytes=blorp_memory_allocate(buffer->capacity);
+        |if(buffer->bytes==NULL){abort();}
+        |memcpy(buffer->bytes,carried->bytes,carried_length);
+        |buffer->used=carried_length;
+        |buffer->ended=0;
+        |int64_t failure=blorp_fs_read_line_blocks(descriptor,buffer);
+        |if(failure==0&&!buffer->ended){failure=blorp_fs_complete_character(descriptor,buffer);}
+        |if(failure==0){failure=blorp_fs_check_lines(buffer,count);}
+        |if(failure!=0){blorp_memory_release(buffer->bytes);}
+        |return failure;
+        |}
+        |/* Reads past `carried`, the unfinished line the previous call returned (empty
+        | * on the first call). The result is one of three:
+        | *   []                      end of file, with nothing left;
+        | *   [final]                 end of file; `final` is the last line, which had no LF;
+        | *   [line, ..., unfinished] at least one complete line, then the new unfinished
+        | *                           line, which may be empty.
+        | * A call reads until an LF arrives or the file ends, so a fold stops at a batch
+        | * of fewer than two elements and never reads past the end twice. A line ends at
+        | * LF, and one CR just before the LF is removed, even when the CR came in
+        | * `carried`. Every element is checked as UTF-8 (InvalidUtf8). Reads are
+        | * BLORP_FS_LINE_BLOCK bytes, growing only while a line is longer than that, so
+        | * memory follows the block and the longest line, never the file. */
+        |
+
+
+-- The line reader's entry point, for the emitter's List[String] C type. Its
+-- contract is the C comment that ends FS_NEXT_LINES_SUPPORT, which the
+-- emitted C places directly above this function. It never closes the
+-- descriptor: fs.close alone does.
+pure func fs_next_lines_runtime(string_list_type: String) -> String:
+    FS_NEXT_LINES_SUPPORT
+        .concat(
+            "uint8_t blorp_fs_next_lines(int64_t descriptor,const struct blorp_string *carried,${string_list_type} *lines,int64_t *error){\n",
+        )
+        .concat(
+            "if(!blorp_fs_is_descriptor(descriptor)){*error=blorp_fs_errno_code(EBADF);return BLORP_FS_FAILED;}\n",
+        )
+        .concat("struct blorp_fs_line_buffer buffer;\nsize_t count=0;\n")
+        .concat(
+            "const int64_t failure=blorp_fs_read_lines((int)descriptor,carried,&buffer,&count);\n",
+        )
+        .concat("if(failure!=0){*error=failure;return BLORP_FS_FAILED;}\n")
+        .concat(list_root_allocation(string_list_type, "result", "count"))
+        .concat(
+            "\n/* This walk repeats blorp_fs_check_lines', including its skip of an empty final\n * line at end of file; only `count` keeps it within the buffer. */\n",
+        )
+        .concat("size_t start=0;\nfor(size_t index=0;index<count;index++){\n")
+        .concat("const size_t end=blorp_fs_line_end(buffer.bytes,start,buffer.used);\n")
+        .concat("const size_t length=blorp_fs_line_length(buffer.bytes,start,end,buffer.used);\n")
+        .concat(
+            "${list_slot_store("result", "index", "blorp_string_from_bytes(buffer.bytes+start,(int64_t)length)")}\nstart=end+1;\n}\n",
+        )
+        .concat(
+            "blorp_memory_release(buffer.bytes);\n*lines=result;\nreturn BLORP_FS_SUCCEEDED;\n}\n",
+        )
+
+
+-- close, called once and never retried, as BLORP_FS_RETRY's comment says.
+FS_CLOSE_RUNTIME: String =
+    raw
+        |uint8_t blorp_fs_close(int64_t descriptor,int64_t *error){
+        |if(!blorp_fs_is_descriptor(descriptor)){*error=blorp_fs_errno_code(EBADF);return BLORP_FS_FAILED;}
+        |if(close((int)descriptor)<0){*error=blorp_fs_errno_code(errno);return BLORP_FS_FAILED;}
+        |return BLORP_FS_SUCCEEDED;
+        |}
+        |

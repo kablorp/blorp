@@ -1,0 +1,120 @@
+import:
+    bool: Bool methods
+    option: Option methods
+    result: Result methods
+    test: TestSuite
+    ../../../../src/compile/lower/lower as Lower
+    ../../../../src/compile/own/own as Own
+    ../../../../src/compile/specialize/specialize as Concrete
+    ../../../../src/syntax/syntax: entry_function
+    ../../fs_write_inputs: fs_write_seed
+    ../../module_input: test_base
+
+
+-- Both String parameters are borrowed, and the Void/Int Result has no managed
+-- payload, so nothing owns it.
+pure func test_two_parameters_remain_borrowed_and_result_is_unmanaged() -> Bool:
+    match fs_write_seed(test_base()):
+        Err(_): False
+        Ok(seed):
+            match Own.insert_function(seed.query, Lower.lowered_functions(seed.lowered).unions, []):
+                Err(_): False
+                Ok(function):
+                    match (function.operations, function.result):
+                        ([Own.DefineValue(path), Own.DefineValue(contents), Own.DefineValue(result)], Own.UnmanagedReturn(value)):
+                            match (result.operation, result.result):
+                                (Own.CallDefinition(_, [Own.BorrowedArgument(first), Own.BorrowedArgument(second)]), Own.UnmanagedResult):
+                                    (Lower.value_number(first.value) == Lower.value_number(path.id))
+                                        .and(
+                                            (
+                                                Lower.value_number(second.value)
+                                                == Lower.value_number(contents.id)
+                                            ),
+                                        )
+                                        .and(
+                                            (
+                                                Lower.value_number(value)
+                                                == Lower.value_number(result.id)
+                                            ),
+                                        )
+                                _: False
+                        _: False
+
+
+private pure func escaped_function() -> Option[Own.OwnedFunction]:
+    match fs_write_seed(test_base()):
+        Err(_): None
+        Ok(seed):
+            match Own.own(seed.lowered):
+                Err(_): None
+                Ok(program): program.functions.get(Concrete.function_number(seed.escape))
+
+
+pure func test_same_string_is_borrowed_twice_without_acquisition() -> Bool:
+    match escaped_function():
+        Some(function):
+            match function.operations:
+                [Own.DefineValue(path), Own.DefineValue(result), ...remaining]:
+                    match result.operation:
+                        Own.CallDefinition(_, [Own.BorrowedArgument(first), Own.BorrowedArgument(second)]):
+                            match (first.source, second.source):
+                                (Own.ParameterBorrow(first_source), Own.ParameterBorrow(second_source)):
+                                    (Lower.value_number(first.value) == Lower.value_number(path.id))
+                                        .and(
+                                            (
+                                                Lower.value_number(second.value)
+                                                == Lower.value_number(path.id)
+                                            ),
+                                        )
+                                        .and(
+                                            (
+                                                Lower.value_number(first_source)
+                                                == Lower.value_number(path.id)
+                                            ),
+                                        )
+                                        .and(
+                                            (
+                                                Lower.value_number(second_source)
+                                                == Lower.value_number(path.id)
+                                            ),
+                                        )
+                                _: False
+                        _: False
+                _: False
+        None: False
+
+
+-- The ignored call in main still borrows both literals, but its Result has no
+-- owner to drop.
+pure func test_ignored_result_has_no_owner() -> Bool:
+    match fs_write_seed(test_base()).and_then(pure func(seed): Own.own(seed.lowered)):
+        Err(_): False
+        Ok(program):
+            match program.functions.get(
+                Concrete.function_number(entry_function(program.entrypoint)),
+            ):
+                Some(main):
+                    -- Operations 0 and 1 define the literal operands; 2 is the ignored call.
+                    match main.operations.get(2):
+                        Some(Own.DefineValue(result)):
+                            match result.result:
+                                Own.UnmanagedResult: True
+                                _: False
+                        _: False
+                None: False
+
+
+tests: TestSuite = {
+    description = "Blorp fs.write_text ownership",
+    tests = [
+        (
+            "two borrowed Strings return one unmanaged Result",
+            test_two_parameters_remain_borrowed_and_result_is_unmanaged,
+        ),
+        (
+            "same String supplies two live borrows",
+            test_same_string_is_borrowed_twice_without_acquisition,
+        ),
+        ("ignored Void/Int Result has no owner", test_ignored_result_has_no_owner),
+    ],
+}

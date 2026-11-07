@@ -1,0 +1,111 @@
+import:
+	../../../../src/compile/check/model: match_arm_number
+	../../../../src/compile/check/check: check
+	../../../../src/compile/lower/lower as Lower
+	../../../../src/compile/own/own as Own
+	../../../../src/compile/specialize/specialize as Concrete
+	../../../../src/syntax/syntax: entry_function
+	../../../../src/utils/text: concat
+	../../input: setup_diagnostic
+	../../module_input: parse_modules
+	int as IntOps
+	test: TestSuite
+
+
+private pure func encoded_child_escapes(function: Own.OwnedFunction) -> Bool:
+	match (function.operations, function.result):
+		([Own.DefineValue(_), Own.DefineValue(parent), Own.ExecuteJoin(matched), Own.DropOwner(dropped, _)], Own.OwnedReturn(_, _)):
+			match parent.result:
+				Own.OwnedResult(parent_owner):
+					matched.arms.any(pure func(arm):
+						match (arm.inputs, arm.operations, arm.exit):
+							([Own.ManagedJoinParameter(input, canonical)], [], Own.Yield(outputs)):
+								matched.selection.nodes.any(pure func(node):
+									match node:
+										Own.EnterArm(edge):
+											match (edge.operations, edge.transfers, outputs.transfer):
+												([Own.DefineValue(payload), Own.AcquireOwner(child_owner, borrow, _)], [Own.OwnedReturn(selected, moved)], Own.OwnedReturn(returned, transferred)):
+													match (payload.operation, borrow.source):
+														(Own.PayloadDefinition(_, source), Own.PayloadBorrow(borrowed_parent)):
+															(
+																match_arm_number(edge.arm) == match_arm_number(arm.id)
+																and payload.value_type == Concrete.StringType
+																and IntOps.equals(Lower.value_number(source), Lower.value_number(parent.id))
+																and IntOps.equals(Lower.value_number(borrowed_parent), Lower.value_number(parent.id))
+																and IntOps.equals(Lower.value_number(borrow.value), Lower.value_number(payload.id))
+																and IntOps.equals(Lower.value_number(selected), Lower.value_number(payload.id))
+																and IntOps.equals(Own.owner_number(moved), Own.owner_number(child_owner))
+																and Own.owner_number(child_owner) != Own.owner_number(canonical)
+																and Lower.value_number(input.id) != Lower.value_number(payload.id)
+																and IntOps.equals(Lower.value_number(returned), Lower.value_number(input.id))
+																and IntOps.equals(Own.owner_number(dropped), Own.owner_number(parent_owner))
+																and IntOps.equals(Own.owner_number(transferred), Own.owner_number(canonical)) and outputs.carried.is_empty()
+															)
+														_: False
+												_: False
+										_: False
+								)
+							_: False
+					)
+				_:
+					False
+		_:
+			False
+
+
+func test_from_codepoint_owns_its_option_and_escaping_string() -> Bool:
+	source: String =
+		|pure func encode(value: Int) -> Option[String]:
+		|    builtin("string.from_codepoint")
+		|pure func text() -> String:
+		|    match encode(233):
+		|        Some(value): value
+		|        None: "failure"
+		|func main() -> Int:
+		|    unused = encode(128512)
+		|    unused_text = text()
+		|    0
+		|
+
+	match (
+		parse_modules([{ source = source, targets = [] }])
+			.and_then(pure func(parsed): check(parsed).map_err(setup_diagnostic))
+			.and_then(pure func(program): Concrete.specialize(program))
+			.and_then(pure func(program): Lower.lower(program))
+			.and_then(pure func(program): Own.own(program))
+	):
+		Err(error):
+			print_error(error.message)
+			print_error(error.help)
+			print_error(IntOps.to_string(error.span.start).concat("..").concat(IntOps.to_string(error.span.end)))
+			False
+		Ok(program):
+			match program.functions.get(Concrete.function_number(entry_function(program.entrypoint))):
+				Some(main):
+					match main.operations:
+						[Own.DefineValue(_), Own.DefineValue(encoded), Own.DropOwner(dropped, _), Own.DefineValue(_), Own.DropOwner(_, _), Own.DefineValue(_)]:
+							match (encoded.value_type, encoded.result):
+								(Concrete.UnionType(owner), Own.OwnedResult(obligation)):
+									match program.unions.get(Concrete.union_number(owner)):
+										Some(layout):
+											match (Concrete.union_variants(layout), layout):
+												([[Concrete.StringType], []], Concrete.OwningCases(_)):
+													IntOps.equals(Own.owner_number(dropped), Own.owner_number(obligation)) and program.functions.any(encoded_child_escapes)
+												_:
+													False
+										None:
+											False
+								_:
+									False
+						_:
+							False
+				None:
+					False
+
+
+tests: TestSuite = {
+	description = "Blorp String scalar encoding ownership",
+	tests = [
+		("from_codepoint owns Option[String] and its escaping child", test_from_codepoint_owns_its_option_and_escaping_string),
+	]
+}

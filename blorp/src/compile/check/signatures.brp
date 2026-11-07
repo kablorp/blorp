@@ -1,0 +1,779 @@
+---
+Publishes one checked signature per function in declaration order and
+identifies the entrypoint. A builtin body is accepted once its closed runtime
+contract validates against the resolved signature, publishing the typed
+runtime operation. Bool and Option results are the foundation's designated
+unions, which the operation carries by constructor identity.
+---
+import:
+    bool: Bool methods
+    int: Int methods
+    option: Option methods
+    ../../syntax/names: NameId, NameTable
+    ../../syntax/source: FunctionLabel, ModuleId, declared_label, root_module_id
+    ../../syntax/syntax:
+        TypeSyntax(CallableTypeSyntax, AtomicType, QualifiedType),
+        EntryResult(IntegerExitStatus, SuccessfulExit),
+        Entrypoint(NoArguments, WithArguments),
+        ParsedBody(ParsedBuiltinBody, ParsedMatchBody, ParsedValueBody),
+        ParsedFunction,
+        ParsedReceiverHead,
+        ParsedTypeParameter,
+        WrittenName,
+        ParsedMatch,
+        ParsedParameter,
+        Span,
+        ValueExpression,
+        ParsedRuntimeOperation(
+            FloatEqualsBuiltin,
+            FloatLessThanBuiltin,
+            StringParseIntBuiltin,
+            StringParseFloatBuiltin,
+            ListRepeatBuiltin,
+            ListLengthBuiltin,
+            ListGetBuiltin,
+            StringByteAtBuiltin,
+            StringFromCodepointBuiltin,
+            StringSliceBuiltin,
+            SystemBuiltin,
+            ListAppendBuiltin,
+            ListSetBuiltin,
+            ListConcatBuiltin,
+            StringEqualsBuiltin,
+            IntegerEqualsBuiltin,
+            IntegerLessThanBuiltin,
+        ),
+    ../assemble: ParsedContents
+    ../ids:
+        DeclarationInventory,
+        FunctionId,
+        FunctionRow,
+        ImplId,
+        ImplRow,
+        FunctionRole(ImplementationBody, FreeFunctionBody, TraitDefaultBody),
+        VariantId,
+    ../namespace/builtins as Builtins:
+        DesignatedUnions,
+        RuntimeOperation,
+        RuntimeType(
+            PrimitiveRuntimeType,
+            ElementRuntimeType,
+            ListRuntimeType,
+            StringListRuntimeType,
+        ),
+        RuntimeResult(ValueResult, OptionalResult, ResultResult, BooleanResult),
+        ParsedRuntimeOperation methods,
+    ../namespace/namespace: Namespace, FunctionSource(DeclaredHere), NamedValue(NamedFunction)
+    ./declarations:
+        TypeScope,
+        LocalTypeParameter,
+        Substitution,
+        TypeRef methods,
+        TypeAccess(PrivateTypeUse),
+        type_access,
+        local_type_parameters,
+        parameter_requirements,
+        resolve_bounds,
+    ./errors:
+        CheckError,
+        CheckerInvariant(InvalidFunctionContract, InvalidResolvedFunction, RuntimeContractMismatch),
+        SignatureError(
+            GenericMain,
+            MainHasParameters,
+            MainParameterType,
+            MainReturnType,
+            MissingMain,
+        ),
+        checker_invariant,
+        or_checker_invariant,
+        type_declaration_error,
+        TypeDeclarationError(TypeParameterTypeNameConflict),
+        trait_error,
+        TraitError(
+            DuplicateReceiverParameter,
+            ReceiverParameterCount,
+            IndependentImplementationParameters,
+        ),
+        signature_error,
+        BuiltinError(BuiltinContractMismatch, BuiltinTailAnnotation),
+        builtin_error,
+    ./model:
+        AcceptedTrait,
+        AcceptedTraitMethod,
+        FunctionSignature,
+        ImplementationHeader,
+        TraitRequirement,
+        TypeParameterId,
+        receiver_type,
+        TypeParameterOwner(FunctionDeclaration, TraitDeclaration),
+        TypeRef(ParameterType, CallableType, IntType, ListType, StringType, VoidType, NominalType),
+        AggregateId(UnionAggregate),
+        NominalId(AggregateNominal),
+        TypeUse,
+        type_parameter_id,
+        primitive_ref,
+
+
+-- A function body after signature checking. A builtin body has been validated
+-- against its runtime contract; source bodies are checked with the others.
+union AcceptedBody:
+    BuiltinBody(RuntimeOperation[VariantId, TypeRef], Span)
+    ValueBody(ValueExpression)
+    MatchBody(ParsedMatch)
+
+
+-- One function after signature checking: its declaration, its one published
+-- signature and its accepted body. Rows follow declaration order, so a
+-- FunctionId indexes them.
+-- Body checking borrows the same accepted type scope with private access;
+-- CheckedFunction publication discards that scope.
+record AcceptedFunction {
+    id: FunctionId,
+    label: FunctionLabel,
+    declaration: ParsedFunction,
+    signature: FunctionSignature,
+    body_types: TypeScope,
+    body: AcceptedBody,
+}
+
+
+private pure func function_label(
+    row: FunctionRow,
+    parsed: ParsedContents,
+) -> Result[FunctionLabel, CheckError]:
+    name = row.declaration.function_name
+    module ?= parsed.modules
+        .get(row.declaration.module.module_number())
+        .or_checker_invariant(name.span, InvalidResolvedFunction(row.id))
+    spelling ?= parsed.names
+        .name_spelling(name.id)
+        .or_checker_invariant(name.span, InvalidResolvedFunction(row.id))
+    Ok(declared_label(module.stem, spelling))
+
+
+record CheckedSignatures {
+    implementation_headers: List[ImplementationHeader],
+    functions: List[AcceptedFunction],
+    entrypoint: Entrypoint[FunctionId],
+}
+
+
+pure func validate_signatures(
+    parsed: ParsedContents,
+    namespace: Namespace,
+    designated: DesignatedUnions,
+    contracts: List[AcceptedTrait],
+) -> Result[CheckedSignatures, CheckError]:
+    -- Assembly selects the entry name: application main or the compiler-owned
+    -- test wrapper. Only a function declared by the root has the process ABI.
+    entrypoint: Option[FunctionId] = match namespace.named_value(
+        root_module_id(),
+        parsed.entrypoint,
+    ):
+        Some(NamedFunction(id, DeclaredHere)): Some(id)
+        _: None
+    headers ?= parsed.implementation_headers(namespace)
+    functions ?= parsed.accept_functions(namespace, designated, entrypoint, headers, contracts, [])
+    id: FunctionId ?= match entrypoint:
+        Some(present): Ok(present)
+        None: Err(signature_error(parsed.end, MissingMain))
+    main ?= functions
+        .get(id.function_number())
+        .or_checker_invariant(parsed.end, InvalidResolvedFunction(id))
+
+    result: EntryResult = if main.signature.return_type.value_type == VoidType:
+        SuccessfulExit
+    else:
+        IntegerExitStatus
+
+    accepted: Entrypoint[FunctionId] = match main.signature.parameters:
+        []: NoArguments(id, result)
+        _: WithArguments(id, result)
+
+    Ok({ functions = functions, implementation_headers = headers, entrypoint = accepted })
+
+
+private pure func accept_functions(
+    parsed: ParsedContents,
+    namespace: Namespace,
+    designated: DesignatedUnions,
+    entrypoint: Option[FunctionId],
+    headers: List[ImplementationHeader],
+    contracts: List[AcceptedTrait],
+    accepted: List[AcceptedFunction],
+) -> Result[List[AcceptedFunction], CheckError]:
+    match parsed.declarations.inventory_functions().get(accepted.length()):
+        None: Ok(accepted)
+        Some(row):
+            function = row.declaration
+
+            id = row.id
+
+            is_entry: Bool = match entrypoint:
+                Some(entry): id == entry
+                None: False
+
+            scope: TypeScope = {
+                self_binding = None,
+                records = parsed.declarations.inventory_records(),
+                unions = parsed.declarations.inventory_unions(),
+                opaques = parsed.declarations.inventory_opaques(),
+                namespace = namespace,
+                module = function.module,
+                access = type_access(function.visibility, function.function_name.id),
+                parameters = [],
+            }
+            match row.resolve_function(parsed, headers, contracts, is_entry, scope, designated):
+                Ok(signature):
+                    parsed.accept_functions(
+                        namespace,
+                        designated,
+                        entrypoint,
+                        headers,
+                        contracts,
+                        accepted.append(signature),
+                    )
+                Err(error): Err(error)
+
+
+private pure func resolve_signature(
+    function: ParsedFunction,
+    id: FunctionId,
+    label: FunctionLabel,
+    is_entry: Bool,
+    scope: TypeScope,
+    parameters: List[TypeParameterId],
+    requirements: List[TraitRequirement],
+    designated: DesignatedUnions,
+) -> Result[AcceptedFunction, CheckError]:
+
+    return_type ?= match function.return_type:
+        Some(written): scope.resolve_type(written)
+        None: Ok(VoidType)
+
+    return_span = match function.return_type:
+        Some(written): written.type_span()
+        None: function.function_name.span
+
+    _: Void ?= if is_entry.and((return_type != IntType).and(return_type != VoidType)):
+        Err(signature_error(return_span, MainReturnType(return_type)))
+    else:
+        Ok(void)
+
+    _: Void ?= match function.parameters:
+        [_, second, ..._]:
+            if is_entry:
+                Err(
+                    signature_error(
+                        second.name.span,
+                        MainHasParameters(function.parameters.length()),
+                    ),
+                )
+            else:
+                Ok(void)
+        _: Ok(void)
+
+    formal_parameters ?= function.parameters.resolve_parameters(is_entry, scope, [])
+    signature: FunctionSignature = {
+        type_parameters = parameters,
+        requirements = requirements,
+        purity = function.purity,
+        parameters = formal_parameters,
+        return_type = { value_type = return_type, span = return_span },
+    }
+    body ?= function.accept_body(signature, designated)
+
+    Ok({
+        id = id,
+        label = label,
+        declaration = function,
+        signature = signature,
+        body_types = { scope | access = PrivateTypeUse },
+        body = body,
+    })
+
+
+-- Resolves parameter types; the body scope validates every parameter name.
+private pure func resolve_parameters(
+    parameters: List[ParsedParameter],
+    is_entry: Bool,
+    scope: TypeScope,
+    resolved: List[TypeUse],
+) -> Result[List[TypeUse], CheckError]:
+    position = resolved.length()
+
+    match parameters.get(position):
+        None: Ok(resolved)
+        Some(parameter):
+            match scope.resolve_type(parameter.type_name):
+                Ok(value_type):
+                    span = parameter.type_name.type_span()
+
+                    entry_type_result: Result[Void, CheckError] = if is_entry.and(
+                        value_type != ListType(StringType),
+                    ):
+                        Err(signature_error(span, MainParameterType))
+                    else:
+                        Ok(void)
+
+                    match entry_type_result:
+                        Ok(_):
+                            parameters.resolve_parameters(
+                                is_entry,
+                                scope,
+                                resolved.append({ value_type = value_type, span = span }),
+                            )
+                        Err(error): Err(error)
+                Err(error): Err(error)
+
+
+-- A builtin body is accepted once its runtime contract is validated; source
+-- bodies are checked with every other body.
+private pure func accept_body(
+    function: ParsedFunction,
+    signature: FunctionSignature,
+    designated: DesignatedUnions,
+) -> Result[AcceptedBody, CheckError]:
+    match function.body:
+        ParsedBuiltinBody(operation, span):
+            match operation.validate_builtin_body({
+                function = function,
+                signature = signature,
+                designated = designated,
+                span = span,
+            }):
+                Ok(runtime): Ok(BuiltinBody(runtime, span))
+                Err(error): Err(error)
+        ParsedValueBody(value): Ok(ValueBody(value))
+        ParsedMatchBody(matched): Ok(MatchBody(matched))
+
+
+private pure func runtime_type_ref(value_type: Builtins.RuntimeType[TypeRef]) -> TypeRef:
+    match value_type:
+        PrimitiveRuntimeType(primitive): primitive.primitive_ref()
+        ElementRuntimeType(element): element
+        ListRuntimeType(element): ListType(element)
+        StringListRuntimeType: ListType(StringType)
+
+
+-- A List operation's real E is the element of the header's first parameter.
+private pure func first_list_element(site: BuiltinSite) -> Option[TypeRef]:
+    match site.signature.parameters.get(0):
+        Some(parameter):
+            match parameter.value_type:
+                ListType(element): Some(element)
+                _: None
+        None: None
+
+
+-- Parsed List tags acquire their real element from the resolved header, and
+-- designated results their constructors from the foundation designation. Other
+-- operations have no Element payload, so their phantom type needs no placeholder.
+private pure func accepted_operation(
+    parsed: ParsedRuntimeOperation,
+    site: BuiltinSite,
+) -> Result[RuntimeOperation[VariantId, TypeRef], CheckError]:
+    option = site.designated.option
+    boolean = site.designated.boolean
+    match parsed:
+        ListRepeatBuiltin:
+            match site.signature.parameters.get(0):
+                Some(parameter): Ok(Builtins.ListRepeat(parameter.value_type))
+                None: Err(builtin_error(site.span, BuiltinContractMismatch(parsed)))
+        ListLengthBuiltin:
+            match site.first_list_element():
+                Some(element): Ok(Builtins.ListLength(element))
+                None: Err(builtin_error(site.span, BuiltinContractMismatch(parsed)))
+        ListGetBuiltin:
+            match site.first_list_element():
+                Some(element): Ok(Builtins.ListGet(element, option))
+                None: Err(builtin_error(site.span, BuiltinContractMismatch(parsed)))
+        ListAppendBuiltin:
+            match site.first_list_element():
+                Some(element): Ok(Builtins.ListAppend(element))
+                None: Err(builtin_error(site.span, BuiltinContractMismatch(parsed)))
+        ListSetBuiltin:
+            match site.first_list_element():
+                Some(element): Ok(Builtins.ListSet(element))
+                None: Err(builtin_error(site.span, BuiltinContractMismatch(parsed)))
+        ListConcatBuiltin:
+            match site.first_list_element():
+                Some(element): Ok(Builtins.ListConcat(element))
+                None: Err(builtin_error(site.span, BuiltinContractMismatch(parsed)))
+        StringParseIntBuiltin: Ok(Builtins.StringParseInt(option))
+        StringParseFloatBuiltin: Ok(Builtins.StringParseFloat(option))
+        StringByteAtBuiltin: Ok(Builtins.StringByteAt(option))
+        StringFromCodepointBuiltin: Ok(Builtins.StringFromCodepoint(option))
+        StringSliceBuiltin: Ok(Builtins.StringSlice(option))
+        SystemBuiltin(system): Ok(Builtins.SystemCall(system, site.designated.result))
+        StringEqualsBuiltin: Ok(Builtins.StringEquals(boolean))
+        IntegerEqualsBuiltin: Ok(Builtins.IntEquals(boolean))
+        IntegerLessThanBuiltin: Ok(Builtins.IntLessThan(boolean))
+        FloatEqualsBuiltin: Ok(Builtins.FloatEquals(boolean))
+        FloatLessThanBuiltin: Ok(Builtins.FloatLessThan(boolean))
+        _:
+            primitive: Option[RuntimeOperation[VariantId, TypeRef]] = parsed.primitive_operation()
+            match primitive:
+                Some(operation): Ok(operation)
+                None: Err(checker_invariant(site.span, RuntimeContractMismatch))
+
+
+-- What validating one builtin body needs: its declaration and signature, and
+-- the foundation designation its Bool and Option results refer to.
+record BuiltinSite {
+    function: ParsedFunction,
+    signature: FunctionSignature,
+    designated: DesignatedUnions,
+    span: Span,
+}
+
+
+-- The checked type a runtime result denotes. Designated Option and Bool are
+-- their constructors' owner; the foundation check accepted Option as generic
+-- in its one payload and Bool as nongeneric.
+private pure func runtime_result_type(result: RuntimeResult[VariantId, TypeRef]) -> TypeRef:
+    match result:
+        ValueResult(value_type): value_type.runtime_type_ref()
+        OptionalResult(payload, option):
+            NominalType(AggregateNominal(UnionAggregate(option.some.variant_owner())), [
+                payload.runtime_type_ref(),
+            ])
+        ResultResult(success, error, constructors):
+            NominalType(AggregateNominal(UnionAggregate(constructors.ok.variant_owner())), [
+                success.runtime_type_ref(),
+                error.runtime_type_ref(),
+            ])
+        BooleanResult(boolean):
+            NominalType(AggregateNominal(UnionAggregate(boolean.true_variant.variant_owner())), [])
+
+
+pure func validate_builtin_body(
+    parsed: ParsedRuntimeOperation,
+    site: BuiltinSite,
+) -> Result[RuntimeOperation[VariantId, TypeRef], CheckError]:
+    _: Void ?= match site.function.tail_annotation:
+        Some(annotation): Err(builtin_error(annotation, BuiltinTailAnnotation))
+        None: Ok(void)
+
+    operation ?= parsed.accepted_operation(site)
+    contract = operation.runtime_contract()
+    signature = site.signature
+
+    generic_header: Bool = match parsed:
+        ListRepeatBuiltin | ListLengthBuiltin | ListGetBuiltin | ListAppendBuiltin | ListSetBuiltin | ListConcatBuiltin:
+            True
+        _: signature.type_parameters.is_empty()
+
+    matches_contract = match generic_header:
+        True:
+            match signature.purity == contract.purity:
+                True:
+                    declared = signature.parameters.map(
+                        pure func(parameter: TypeUse) -> TypeRef: parameter.value_type,
+                    )
+                    required = contract.parameters.map(
+                        pure func(parameter: Builtins.RuntimeType[TypeRef]) -> TypeRef: parameter.runtime_type_ref(),
+                    )
+                    match declared == required:
+                        True:
+                            (
+                                signature.return_type.value_type
+                                == contract.return_type.runtime_result_type()
+                            )
+                        False: False
+                False: False
+        False: False
+
+    if matches_contract:
+        Ok(operation)
+    else:
+        Err(builtin_error(site.span, BuiltinContractMismatch(parsed)))
+
+
+-- Families have no parameter identity domain. Validate their source names here;
+-- each actual body receives its own identities only during normalization.
+private pure func receiver_parameters(
+    parameters: List[ParsedTypeParameter],
+    scope: TypeScope,
+    self_name: NameId,
+) -> Result[Void, CheckError]:
+    var seen: List[WrittenName] = []
+    var failure: Option[CheckError] = None
+    for parameter in parameters:
+        for previous in seen:
+            if previous.id == parameter.name.id:
+                failure = Some(
+                    trait_error(parameter.name.span, DuplicateReceiverParameter(previous)),
+                )
+        if failure.is_none():
+            if parameter.name.id == self_name:
+                failure = Some(
+                    type_declaration_error(
+                        parameter.name.span,
+                        TypeParameterTypeNameConflict(parameter.name.id),
+                    ),
+                )
+            else:
+                match scope.namespace.named_type(scope.module, parameter.name.id):
+                    Some(_):
+                        failure = Some(
+                            type_declaration_error(
+                                parameter.name.span,
+                                TypeParameterTypeNameConflict(parameter.name.id),
+                            ),
+                        )
+                    None: seen = seen.append(parameter.name)
+        if failure.is_some():
+            break
+    match failure:
+        Some(error): Err(error)
+        None: Ok(void)
+
+
+private pure func implementation_header(
+    row: ImplRow,
+    scope: TypeScope,
+    parsed: ParsedContents,
+) -> Result[ImplementationHeader, CheckError]:
+    head ?= scope.resolve_receiver_head(row.header.receiver)
+    arity ?= scope.receiver_arity(head, row.header.receiver.receiver_head_span())
+    _: Void ?= if arity == row.header.type_parameters.length():
+        Ok(void)
+    else:
+        Err(
+            trait_error(
+                row.header.receiver.receiver_head_span(),
+                ReceiverParameterCount(arity, row.header.type_parameters.length()),
+            ),
+        )
+    fresh ?= row.header.type_parameters.receiver_parameters(
+        scope,
+        parsed.names.contextual_words().self_word,
+    )
+    bounds ?= row.header.type_parameters.resolve_bounds(scope)
+    Ok({ receiver_head = head, parameter_bounds = bounds })
+
+
+private pure func implementation_headers(
+    parsed: ParsedContents,
+    namespace: Namespace,
+) -> Result[List[ImplementationHeader], CheckError]:
+    var headers: List[ImplementationHeader] = []
+    var failure: Option[CheckError] = None
+    for row in parsed.declarations.inventory_implementations():
+        scope: TypeScope = {
+            records = parsed.declarations.inventory_records(),
+            unions = parsed.declarations.inventory_unions(),
+            opaques = parsed.declarations.inventory_opaques(),
+            namespace = namespace,
+            module = row.header.module,
+            access = PrivateTypeUse,
+            parameters = [],
+            self_binding = None,
+        }
+        match row.implementation_header(scope, parsed):
+            Ok(header): headers = headers.append(header)
+            Err(error):
+                failure = Some(error)
+                break
+    match failure:
+        Some(error): Err(error)
+        None: Ok(headers)
+
+
+private pure func resolve_implementation_function(
+    row: FunctionRow,
+    label: FunctionLabel,
+    implementation: ImplRow,
+    header: ImplementationHeader,
+    parsed: ParsedContents,
+    is_entry: Bool,
+    scope: TypeScope,
+    designated: DesignatedUnions,
+) -> Result[AcceptedFunction, CheckError]:
+    _: Void ?= match row.declaration.type_parameters:
+        [first, ..._]: Err(trait_error(first.name.span, IndependentImplementationParameters))
+        []: Ok(void)
+    var parameters: List[LocalTypeParameter] = []
+    for parameter in implementation.header.type_parameters:
+        parameters = parameters.append({
+            name = parameter.name,
+            id = type_parameter_id(FunctionDeclaration(row.id), parameters.length()),
+        })
+    body_scope = { scope | parameters = parameters }
+    identities = body_scope.declared_parameters()
+    receiver ?= receiver_type(
+        header.receiver_head,
+        identities.map(pure func(id): ParameterType(id)),
+    ).or_checker_invariant(implementation.header.span, InvalidFunctionContract)
+    normalized = { body_scope |
+        self_binding = Some({
+            name = parsed.names.contextual_words().self_word,
+            value_type = receiver,
+        }),
+    }
+    row.declaration.resolve_signature(
+        row.id,
+        label,
+        is_entry,
+        normalized,
+        identities,
+        header.parameter_bounds.parameter_requirements(FunctionDeclaration(row.id)),
+        designated,
+    )
+
+
+-- The default's written contract is accepted once in its trait domain.
+-- Normalization changes only that domain to this genuine body's Self; source
+-- annotations are neither reconstructed nor resolved a second time.
+private pure func resolve_default_function(
+    row: FunctionRow,
+    label: FunctionLabel,
+    owner: AcceptedTrait,
+    method: AcceptedTraitMethod,
+    parsed: ParsedContents,
+    scope: TypeScope,
+    designated: DesignatedUnions,
+) -> Result[AcceptedFunction, CheckError]:
+    self = type_parameter_id(FunctionDeclaration(row.id), 0)
+    substitution: Substitution = {
+        owner = TraitDeclaration(owner.id),
+        values = [ParameterType(self)],
+    }
+    var parameters: List[TypeUse] = []
+    var failure: Option[CheckError] = None
+    for parameter in method.signature.parameters:
+        match parameter.value_type.substitute_type(substitution, parameter.span):
+            Ok(value_type): parameters = parameters.append({ parameter | value_type = value_type })
+            Err(error):
+                failure = Some(error)
+                break
+    _: Void ?= match failure:
+        Some(error): Err(error)
+        None: Ok(void)
+    result ?= method.signature.return_type.value_type.substitute_type(
+        substitution,
+        method.signature.return_type.span,
+    )
+    requirement: TraitRequirement = {
+        parameter = self,
+        required_trait = owner.id,
+        span = row.declaration.function_name.span,
+    }
+    signature: FunctionSignature = {
+        type_parameters = [self],
+        requirements = [requirement],
+        purity = method.signature.purity,
+        parameters = parameters,
+        return_type = { method.signature.return_type | value_type = result },
+    }
+    body ?= row.declaration.accept_body(signature, designated)
+    Ok({
+        id = row.id,
+        label = label,
+        declaration = row.declaration,
+        signature = signature,
+        body_types = { scope |
+            access = PrivateTypeUse,
+            self_binding = Some({
+                name = parsed.names.contextual_words().self_word,
+                value_type = ParameterType(self),
+            }),
+        },
+        body = body,
+    })
+
+
+private pure func resolve_function(
+    row: FunctionRow,
+    parsed: ParsedContents,
+    headers: List[ImplementationHeader],
+    contracts: List[AcceptedTrait],
+    is_entry: Bool,
+    scope: TypeScope,
+    designated: DesignatedUnions,
+) -> Result[AcceptedFunction, CheckError]:
+    label ?= row.function_label(parsed)
+    match row.role:
+        FreeFunctionBody: row.resolve_free_function(label, is_entry, scope, designated)
+        ImplementationBody:
+            var accepted: Result[AcceptedFunction, CheckError] = Err(
+                checker_invariant(
+                    row.declaration.function_name.span,
+                    InvalidResolvedFunction(row.id),
+                ),
+            )
+            for implementation in parsed.declarations.inventory_implementations():
+                for member in implementation.methods:
+                    if member == row.id:
+                        match headers.get(implementation.id.impl_number()):
+                            Some(header):
+                                accepted = row.resolve_implementation_function(
+                                    label,
+                                    implementation,
+                                    header,
+                                    parsed,
+                                    is_entry,
+                                    scope,
+                                    designated,
+                                )
+                            None: void
+            accepted
+        TraitDefaultBody:
+            var accepted: Result[AcceptedFunction, CheckError] = Err(
+                checker_invariant(
+                    row.declaration.function_name.span,
+                    InvalidResolvedFunction(row.id),
+                ),
+            )
+            for owner in contracts:
+                for method in owner.methods:
+                    match method.default_body:
+                        Some(function):
+                            if function == row.id:
+                                accepted = row.resolve_default_function(
+                                    label,
+                                    owner,
+                                    method,
+                                    parsed,
+                                    scope,
+                                    designated,
+                                )
+                        None: void
+            accepted
+
+
+private pure func resolve_free_function(
+    row: FunctionRow,
+    label: FunctionLabel,
+    is_entry: Bool,
+    scope: TypeScope,
+    designated: DesignatedUnions,
+) -> Result[AcceptedFunction, CheckError]:
+    _: Void ?= match row.declaration.type_parameters.get(0):
+        Some(name):
+            if is_entry:
+                Err(
+                    signature_error(
+                        name.name.span,
+                        GenericMain(type_parameter_id(FunctionDeclaration(row.id), 0)),
+                    ),
+                )
+            else:
+                Ok(void)
+        None: Ok(void)
+
+    parameters ?= row.declaration.type_parameters.local_type_parameters(
+        FunctionDeclaration(row.id),
+        scope,
+    )
+    bounds ?= row.declaration.type_parameters.resolve_bounds(parameters)
+    row.declaration.resolve_signature(
+        row.id,
+        label,
+        is_entry,
+        parameters,
+        parameters.declared_parameters(),
+        bounds.parameter_requirements(FunctionDeclaration(row.id)),
+        designated,
+    )

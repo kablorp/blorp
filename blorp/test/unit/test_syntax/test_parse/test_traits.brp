@@ -1,0 +1,231 @@
+import:
+	../../../../src/syntax/lex: lex
+	../../../../src/syntax/parse: ParsedModule, module_contents, parse_module
+	../../../../src/syntax/names: name_spelling, program_names
+	../../../../src/syntax/source: module_source, root_module_id
+	../../../../src/syntax/syntax: Diagnostic, ParsedTraitMethod(AbstractTraitMethod, DefaultTraitMethod), ParsedReceiverHead(ReceiverName), ParsedFunctionGroup(FreeFunction, ImplementationGroup), ParsedBody(ParsedValueBody), ExpressionBase(IntegerExpression, NameExpression), TypeSyntax(AtomicType, QualifiedType), Purity(Pure)
+	test: TestSuite
+
+
+private REQUIREMENT: String =
+	|trait Equatable:
+	|    pure func equals(left: Self, right: Self) -> Bool
+	|
+
+
+private pure func parsed(source: String) -> Result[ParsedModule, Diagnostic]:
+	tokens ?= lex(module_source(root_module_id()), source, program_names().names)
+	parse_module(tokens, root_module_id())
+
+
+pure func test_signature_only_trait_requirement_has_located_fields() -> Bool:
+	match parsed(REQUIREMENT):
+		Err(_): False
+		Ok(module):
+			contents = module_contents(module)
+			match contents.traits:
+				[declaration]:
+					match declaration.methods:
+						[AbstractTraitMethod(header, span)]:
+							match (header.parameters, header.return_type):
+								([left, right], Some(AtomicType(result))):
+									match (left.type_name, right.type_name):
+										(AtomicType(first), AtomicType(second)):
+											(contents.functions.is_empty() and declaration.module == root_module_id()
+												and name_spelling(contents.names, declaration.type_name.id) == Some("Equatable")
+												and declaration.type_name.span.start == 6 and declaration.type_name.span.end == 15
+												and name_spelling(contents.names, header.function_name.id) == Some("equals")
+												and header.function_name.span.start == 31 and header.function_name.span.end == 37
+												and span.source == module_source(root_module_id()) and span.start == 21 and span.end == REQUIREMENT.length() - 1
+												and header.purity == Pure and header.type_parameters.is_empty()
+												and name_spelling(contents.names, first.id) == Some("Self") and name_spelling(contents.names, second.id) == Some("Self")
+												and name_spelling(contents.names, result.id) == Some("Bool"))
+										_: False
+								_: False
+						_: False
+				_: False
+
+
+pure func test_trait_method_omitted_return_is_signature_void() -> Bool:
+	match parsed("trait Observable:\n    pure func observe(value: Self)\n"):
+		Err(_): False
+		Ok(module):
+			match module_contents(module).traits:
+				[declaration]:
+					match declaration.methods:
+						[AbstractTraitMethod(header, span)]: header.return_type.is_none()
+						_: False
+				_: False
+
+
+pure func test_implementation_owns_real_bodies_between_free_functions() -> Bool:
+	match parsed("pure func before() -> Int:\n    1\nimplements Ops.Equatable for Shape:\n    pure func equals(left: Shape, right: Shape) -> Int:\n        7\npure func after() -> Int:\n    2\n"):
+		Err(_): False
+		Ok(module):
+			contents = module_contents(module)
+			match contents.functions:
+				[FreeFunction(before), ImplementationGroup(header, [method]), FreeFunction(after)]:
+					match (header.trait_name, header.receiver, method.body):
+						(QualifiedType(requirement, [], _), ReceiverName(receiver), ParsedValueBody(value)):
+							match value.base:
+								IntegerExpression(7):
+									(header.module == root_module_id() and method.module == root_module_id()
+										and name_spelling(contents.names, requirement.module.id) == Some("Ops") and name_spelling(contents.names, requirement.name.id) == Some("Equatable")
+										and name_spelling(contents.names, receiver.id) == Some("Shape")
+										and name_spelling(contents.names, before.function_name.id) == Some("before") and name_spelling(contents.names, after.function_name.id) == Some("after")
+										and before.function_name.span.start < header.span.start and method.function_name.span.start < after.function_name.span.start)
+								_: False
+						_: False
+				_: False
+
+
+private pure func rejected_at(prefix: String, marked: String, suffix: String, message: String, help: String) -> Bool:
+	match parsed(prefix + marked + suffix):
+		Ok(_): False
+		Err(error):
+			(error.span.source == module_source(root_module_id())
+				and error.span.start == prefix.length() and error.span.end == prefix.length() + marked.length()
+				and error.message == message and error.help == help and error.note.is_none())
+
+
+pure func test_trait_default_owns_its_actual_parsed_body() -> Bool:
+	source: String =
+		|trait Equatable:
+		|    pure func equals(left: Self, right: Self) -> Bool:
+		|        True
+		|
+	match parsed(source):
+		Err(_): False
+		Ok(module):
+			contents = module_contents(module)
+			match contents.traits:
+				[declaration]:
+					match declaration.methods:
+						[DefaultTraitMethod(function, span)]:
+							match function.body:
+								ParsedValueBody(value):
+									match value.base:
+										NameExpression(name):
+											(
+												contents.functions.is_empty()
+												and function.module == declaration.module
+												and name_spelling(contents.names, name.id) == Some("True")
+												and name_spelling(contents.names, function.function_name.id) == Some("equals")
+												and function.purity == Pure
+												and function.type_parameters.is_empty()
+												and span.start < function.function_name.span.start
+												and function.function_name.span.end < value.span.start
+											)
+										_: False
+								_: False
+						_: False
+				_: False
+
+
+pure func test_trait_parameters_are_rejected_at_their_opening() -> Bool:
+	rejected_at("trait Equatable", "[", "T]:\n    pure func equals(left: Self, right: Self) -> Bool\n", "traits do not take type parameters", "use Self for the implementing type")
+
+
+pure func test_generic_implementation_prefix_is_rejected_at_its_opening() -> Bool:
+	rejected_at("implements", "[", "T] Equatable for Box[T]:\n    pure func equals(left: Box[T], right: Box[T]) -> Bool:\n        True\n", "implementation parameters belong after the receiver head", "write implements Equatable for Box[T: Equatable]")
+
+
+private pure func default_only_at_end(ending: String) -> Bool:
+	match parsed("implements Observe for Int" + ending):
+		Err(_): False
+		Ok(module):
+			contents = module_contents(module)
+			match contents.functions:
+				[ImplementationGroup(header, [])]:
+					match header.receiver:
+						ReceiverName(name):
+							(
+								header.type_parameters.is_empty()
+								and name_spelling(contents.names, name.id) == Some("Int")
+								and header.module == root_module_id()
+							)
+						_: False
+				_: False
+
+
+pure func test_default_only_implementation_ends_at_lf_or_eof() -> Bool:
+	default_only_at_end("\n") and default_only_at_end("")
+
+
+pure func test_bounded_function_parameters_keep_names_and_bound_order() -> Bool:
+	source: String =
+		|pure func same[Element: Eq + Observe, Other](left: Element, right: Other) -> Element:
+		|    left
+		|
+	match parsed(source):
+		Err(_): False
+		Ok(module):
+			contents = module_contents(module)
+			match contents.functions:
+				[FreeFunction(function)]:
+					match function.type_parameters:
+						[first, second]:
+							match first.bounds:
+								[AtomicType(equality), AtomicType(observe)]:
+									(
+										name_spelling(contents.names, first.name.id) == Some("Element")
+										and name_spelling(contents.names, second.name.id) == Some("Other")
+										and name_spelling(contents.names, equality.id) == Some("Eq")
+										and name_spelling(contents.names, observe.id) == Some("Observe")
+										and first.name.span.end < equality.span.start
+										and equality.span.end < observe.span.start
+										and observe.span.end < second.name.span.start
+										and second.bounds.is_empty()
+									)
+								_: False
+						_: False
+				_: False
+
+
+pure func test_receiver_binders_own_their_bounds_without_type_patterns() -> Bool:
+	source: String =
+		|implements Eq for Box[Element: Eq]
+		|
+	match parsed(source):
+		Err(_): False
+		Ok(module):
+			contents = module_contents(module)
+			match contents.functions:
+				[ImplementationGroup(header, [])]:
+					match (header.receiver, header.type_parameters):
+						(ReceiverName(receiver), [parameter]):
+							match parameter.bounds:
+								[AtomicType(bound)]:
+									(
+										name_spelling(contents.names, receiver.id) == Some("Box")
+										and name_spelling(contents.names, parameter.name.id) == Some("Element")
+										and name_spelling(contents.names, bound.id) == Some("Eq")
+										and receiver.span.end < parameter.name.span.start
+										and parameter.name.span.end < bound.span.start
+									)
+								_: False
+						_: False
+				_: False
+
+
+
+-- `+` separates bounds in a type parameter list and adds in an expression.
+pure func test_bound_separator_and_addition_share_the_plus_token() -> Bool:
+	parsed("pure func sum[Value: Addable + Subtractable](left: Value, right: Value) -> Value:\n    left + right\n").is_ok()
+
+
+tests: TestSuite = {
+	description = "Blorp located trait and implementation syntax",
+	tests = [
+		("signature-only requirement retains located fields without a function body", test_signature_only_trait_requirement_has_located_fields),
+		("omitted requirement return uses the implicit Void signature", test_trait_method_omitted_return_is_signature_void),
+		("implementation owns real bodies in written function order", test_implementation_owns_real_bodies_between_free_functions),
+		("trait default owns its actual parsed body", test_trait_default_owns_its_actual_parsed_body),
+		("trait type parameters reject at their opening bracket", test_trait_parameters_are_rejected_at_their_opening),
+		("generic implementation prefix rejects at its opening bracket", test_generic_implementation_prefix_is_rejected_at_its_opening),
+		("default-only implementation ends at LF or EOF", test_default_only_implementation_ends_at_lf_or_eof),
+		("bounded function parameters keep names and bound order", test_bounded_function_parameters_keep_names_and_bound_order),
+		("receiver binders own bounds without type patterns", test_receiver_binders_own_their_bounds_without_type_patterns),
+		("bound separator and addition share the plus token", test_bound_separator_and_addition_share_the_plus_token),
+	]
+}

@@ -1,0 +1,142 @@
+import:
+    bool: not
+    int: Int methods
+    io: print_error
+    list: List methods
+    option: Option methods
+    path: dirname
+    result: Result methods
+    string: String methods
+    test: TestSuite
+    ../../../src/syntax/names: name_spelling
+    ../../../src/syntax/parse: ImportOrigin(RelativeImport, LibraryImport), ParsedModuleContents
+    ./repository_sources: SourceFile, parsed_source, repository_sources
+
+
+-- A layer's directory and the only directories its modules may import from, as
+-- allow-lists so that an import of `main` or of a new sibling is rejected too.
+-- `syntax/` imports `syntax/` and `utils/`; `format/` imports `format/`,
+-- `syntax/` and `utils/`, never `compile/`. Library imports name no file.
+private record Layer { directory: String, allowed: List[String] }
+
+
+private SYNTAX_LAYER: Layer = {
+    directory = "blorp/src/syntax",
+    allowed = ["blorp/src/syntax", "blorp/src/utils"],
+}
+
+
+private FORMAT_LAYER: Layer = {
+    directory = "blorp/src/format",
+    allowed = ["blorp/src/format", "blorp/src/syntax", "blorp/src/utils"],
+}
+
+
+private pure func is_inside(path: String, directory: String) -> Bool:
+    path.starts_with(directory + "/")
+
+
+-- Each relative import of `contents`, resolved against `file_path`'s directory
+-- into the repository-relative path it names. A part with no spelling resolves
+-- to a path inside no layer, so it is reported like any other bad import.
+private pure func relative_import_targets(
+    file_path: String,
+    contents: ParsedModuleContents,
+) -> List[String]:
+    var targets: List[String] = []
+    for row in contents.imports:
+        match row.path.origin:
+            LibraryImport: void
+            RelativeImport(parents):
+                var target = dirname(file_path)
+                for _ in 0..parents:
+                    target = dirname(target)
+                for part in row.path.parts:
+                    spelling = name_spelling(contents.names, part).get_or("<unspelled>")
+                    target = target + "/" + spelling
+                targets = targets.append(target)
+    targets
+
+
+-- One line per import of `file` outside what `layer` allows, naming the file
+-- and the resolved path; a file that does not parse is one line too.
+private pure func layer_violations(layer: Layer, file: SourceFile) -> List[String]:
+    match parsed_source(file.text):
+        Err(_): ["${file.path}: does not parse"]
+        Ok(parsed):
+            relative_import_targets(file.path, parsed.contents)
+                .filter(
+                    pure func(target: String): layer.allowed
+                        .any(pure func(directory: String): target.is_inside(directory))
+                        .not(),
+                )
+                .map(
+                    pure func(target: String): "${file.path} imports ${target}, outside what ${layer.directory} may import",
+                )
+
+
+private pure func files_in(layer: Layer, files: List[SourceFile]) -> List[SourceFile]:
+    files.filter(pure func(file: SourceFile): file.path.is_inside(layer.directory))
+
+
+pure func all_violations(files: List[SourceFile]) -> List[String]:
+    var violations: List[String] = []
+    for layer in [SYNTAX_LAYER, FORMAT_LAYER]:
+        for file in files_in(layer, files):
+            violations = violations.concat(layer_violations(layer, file))
+    violations
+
+
+func test_syntax_and_format_modules_import_only_their_layers() -> Bool:
+    match repository_sources():
+        Err(error):
+            print_error(error)
+            False
+        Ok(files):
+            violations = all_violations(files)
+            for violation in violations:
+                print_error(violation)
+            violations.is_empty()
+
+
+-- The rule is checked on text, so it is proved by imports it must reject.
+pure func test_a_format_module_importing_the_compiler_is_reported() -> Bool:
+    file: SourceFile = {
+        path = "blorp/src/format/example.brp",
+        text = "import:\n    ../compile/check/check: check\n    ../syntax/lex: lex\n\n\nvalue: Int = 1\n",
+    }
+    expected = [
+        "blorp/src/format/example.brp imports blorp/src/compile/check/check, outside what blorp/src/format may import",
+    ]
+    layer_violations(FORMAT_LAYER, file) == expected
+
+
+pure func test_a_syntax_module_importing_the_formatter_or_main_is_reported() -> Bool:
+    file: SourceFile = {
+        path = "blorp/src/syntax/example.brp",
+        text = "import:\n    ./lex: lex\n    ../format/format: format_source\n    ../main: main\n    ../utils/text: concat\n\n\nvalue: Int = 1\n",
+    }
+    expected = [
+        "blorp/src/syntax/example.brp imports blorp/src/format/format, outside what blorp/src/syntax may import",
+        "blorp/src/syntax/example.brp imports blorp/src/main, outside what blorp/src/syntax may import",
+    ]
+    layer_violations(SYNTAX_LAYER, file) == expected
+
+
+tests: TestSuite = {
+    description = "Source layer dependencies",
+    tests = [
+        (
+            "syntax and format modules import only their layers",
+            test_syntax_and_format_modules_import_only_their_layers,
+        ),
+        (
+            "a format module importing the compiler is reported",
+            test_a_format_module_importing_the_compiler_is_reported,
+        ),
+        (
+            "a syntax module importing the formatter or main is reported, every one",
+            test_a_syntax_module_importing_the_formatter_or_main_is_reported,
+        ),
+    ],
+}

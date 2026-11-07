@@ -1,0 +1,802 @@
+import:
+	../../../../src/compile/check/model as Model
+	../../../../src/compile/check/check: check, check_errors, checked_functions
+	../../../../src/compile/check/errors as Errors
+	../../../../src/compile/check/render: render_failure
+	../../../../src/compile/assemble: parsed_contents
+	../../../../src/compile/ids: function_number, inventory_functions, union_number
+	../../../../src/syntax/source: module_id, module_source, root_module_id
+	../../../../src/syntax/syntax: DiagnosticNote(CompetingDeclarations, NoteLines), Purity(Pure), Span
+	../../module_input: ModuleInput, parse_modules
+	../../input: setup_diagnostic
+	../../string_concat_inputs: APPEND_INT_CALLER, APPEND_INT_METHOD
+	test: TestSuite
+	../../../../src/utils/text: concat
+
+
+private pure func accepts(inputs: List[ModuleInput]) -> Bool:
+	match parse_modules(inputs):
+		Err(_): False
+		Ok(parsed): check(parsed).is_ok()
+
+
+private pure func rejects(inputs: List[ModuleInput], expected: pure (Errors.CheckError) -> Bool) -> Bool:
+	match parse_modules(inputs):
+		Err(_): False
+		Ok(parsed):
+			match check(parsed):
+				Ok(_): False
+				Err(failure): expected(check_errors(failure).first)
+
+
+private pure func method_diagnostic_is(
+	inputs: List[ModuleInput],
+	message: String,
+	help: String,
+	start: Int,
+	end: Int,
+) -> Bool:
+	match parse_modules(inputs):
+		Err(_): False
+		Ok(parsed):
+			match check(parsed):
+				Ok(_): False
+				Err(failure):
+					diagnostic = render_failure(failure).first
+					match diagnostic.note:
+						Some(CompetingDeclarations([_, _, _, _])):
+							(
+								diagnostic.message == message
+								and diagnostic.help == help
+								and diagnostic.span == {source = module_source(root_module_id()), start = start, end = end}
+							)
+						_: False
+
+
+private pure func two_methods(body: String, left: String, right: String) -> List[ModuleInput]:
+	root = "import:\n    ./left: Int methods, Float methods, String methods\n    ./right: Int methods, Float methods, String methods\nfunc main() -> Int:\n    ".concat(body).concat("\n")
+	[{source = root, targets = [1, 2]}, {source = left, targets = []}, {source = right, targets = []}]
+
+
+private pure func root_span(prefix: String, name: String) -> Span:
+	{ source = module_source(root_module_id()), start = prefix.length(), end = prefix.length() + name.length() }
+
+
+-- These controlled three-module inputs declare main, left measure, right measure.
+private pure func overlapping_int_receivers(error: Errors.CheckError) -> Bool:
+	match error.kind:
+		Errors.MethodRejection(Errors.OverlappingReceivers(_, overlap)):
+			(function_number(overlap.introduced.function) == 2 and function_number(overlap.other.function) == 1
+				and overlap.introduced_receiver == Model.IntType
+				and overlap.other_receiver == Model.IntType)
+		_: False
+
+
+private INT_METHOD: String =
+	|pure func measure(value: Int) -> Int:
+	|    value
+	|
+
+
+private FLOAT_METHOD: String =
+	|pure func measure(value: Float) -> Int:
+	|    42
+	|
+
+
+pure func test_receiver_type_selects_same_named_methods() -> Bool:
+	(
+		accepts(two_methods("42.measure()", INT_METHOD, FLOAT_METHOD))
+		and accepts(two_methods("1.0.measure()", INT_METHOD, FLOAT_METHOD))
+	)
+
+
+pure func test_receiver_selection_ignores_import_order() -> Bool:
+	accepts(two_methods("42.measure()", FLOAT_METHOD, INT_METHOD))
+
+
+pure func test_same_receiver_declarations_overlap() -> Bool:
+	rejects(two_methods("42.measure()", INT_METHOD, INT_METHOD), overlapping_int_receivers)
+
+
+pure func test_local_and_imported_receiver_clash_keeps_both_origins() -> Bool:
+	root: String =
+		|import:
+		|    ./ops: Int methods
+		|pure func measure(value: Int) -> Int:
+		|    value
+		|func main() -> Int:
+		|    42.measure()
+		|
+	match parse_modules([{source = root, targets = [1]}, {source = INT_METHOD, targets = []}]):
+		Err(_): False
+		Ok(parsed):
+			match check(parsed):
+				Ok(_): False
+				Err(failure):
+					error = check_errors(failure).first
+					diagnostic = render_failure(failure).first
+					match error.kind:
+						Errors.MethodRejection(Errors.OverlappingReceivers(_, overlap)):
+							match (overlap.other.import_site, overlap.introduced.import_site, diagnostic.note):
+								(None, Some(import_site), Some(NoteLines([imported, local]))):
+									primary = root_span("import:\n    ./ops: ", "Int")
+									(function_number(overlap.introduced.function) == 2 and function_number(overlap.other.function) == 0
+										and overlap.introduced_receiver == Model.IntType
+										and overlap.other_receiver == Model.IntType
+										and imported.span == overlap.introduced.declaration
+										and local.span == overlap.other.declaration
+										and imported.text == "receiver Int is declared here" and local.text == imported.text
+										and local.span.source == module_source(root_module_id())
+										and imported.span.source == module_source(module_id(1).get_or(root_module_id()))
+										and import_site == primary and error.span == primary and diagnostic.span == primary
+										and diagnostic.message == "two functions named measure can accept the same receiver"
+										and diagnostic.help == "rename one of them, or change a first parameter so that no value fits both receivers, Int and Int")
+								_: False
+						_: False
+
+
+pure func test_receiver_clash_renders_primary_and_all_other_sites() -> Bool:
+	match parse_modules(two_methods("42.measure()", INT_METHOD, INT_METHOD)):
+		Err(_): False
+		Ok(parsed):
+			match check(parsed):
+				Ok(_): False
+				Err(failure):
+					error = check_errors(failure).first
+					diagnostic = render_failure(failure).first
+					match diagnostic.note:
+						Some(NoteLines([right, left, left_import])):
+							primary_prefix = "import:\n    ./left: Int methods, Float methods, String methods\n    ./right: "
+							primary = root_span(primary_prefix, "Int")
+							declaration = "pure func ".length()
+							(
+								overlapping_int_receivers(error) and error.span == primary and diagnostic.span == primary
+								and diagnostic.message == "two functions named measure can accept the same receiver"
+								and diagnostic.help == "rename one of them, or change a first parameter so that no value fits both receivers, Int and Int"
+								and left.span == { source = module_source(module_id(1).get_or(root_module_id())), start = declaration, end = declaration + "measure".length() }
+								and right.span == { source = module_source(module_id(2).get_or(root_module_id())), start = declaration, end = declaration + "measure".length() }
+								and left_import.span == root_span("import:\n    ./left: ", "Int")
+								and left.text == "receiver Int is declared here" and right.text == left.text
+								and left_import.text == "receiver Int is imported here"
+							)
+						_: False
+
+
+pure func test_multiple_incompatible_receivers_have_typed_error() -> Bool:
+	rejects(two_methods("\"text\".measure()", INT_METHOD, FLOAT_METHOD), pure func(error):
+		match error.kind:
+			Errors.MethodRejection(Errors.NoApplicableMethod(_, Model.StringType, [_, _])): True
+			_: False
+	)
+
+
+pure func test_unique_incompatible_receiver_preserves_argument_error() -> Bool:
+	root: String =
+		|import:
+		|    ./ops: Int methods
+		|func main() -> Int:
+		|    "text".measure()
+		|
+	rejects([{source = root, targets = [1]}, {source = INT_METHOD, targets = []}], pure func(error):
+		match error.kind:
+			Errors.CallRejection(Errors.ArgumentTypeMismatch(mismatch)):
+				(
+					mismatch.expected == Model.IntType
+					and mismatch.actual.value_type == Model.StringType
+				)
+			_: False
+	)
+
+
+pure func test_unique_receiver_preserves_wrong_arity_beside_other_type() -> Bool:
+	left: String =
+		|pure func measure(value: Int, other: Int) -> Int:
+		|    value
+		|
+	rejects(two_methods("42.measure()", left, FLOAT_METHOD), pure func(error):
+		match error.kind:
+			Errors.CallRejection(Errors.ArgumentCountMismatch(mismatch)): mismatch.expected == 2 and mismatch.actual == 1
+			_: False
+	)
+
+
+pure func test_different_arities_do_not_separate_receivers() -> Bool:
+	right: String =
+		|pure func measure(value: Int, other: Int) -> Int:
+		|    value
+		|
+	rejects(two_methods("42.measure(1)", INT_METHOD, right), overlapping_int_receivers)
+
+
+pure func test_overlapping_declarations_precede_call_arity() -> Bool:
+	left: String =
+		|pure func measure(value: Int, other: Int) -> Int:
+		|    value
+		|
+	right: String =
+		|pure func measure(value: Int, other: Int, third: Int) -> Int:
+		|    value
+		|
+	rejects(two_methods("42.measure()", left, right), overlapping_int_receivers)
+
+
+pure func test_later_arguments_do_not_rank_candidates() -> Bool:
+	left: String =
+		|pure func measure(value: Int, other: Int) -> Int:
+		|    value
+		|
+	right: String =
+		|pure func measure(value: Int, other: String) -> Int:
+		|    value
+		|
+	rejects(two_methods("42.measure(1)", left, right), overlapping_int_receivers)
+
+
+pure func test_purity_does_not_rank_candidates() -> Bool:
+	root: String =
+		|import:
+		|    ./left: Int methods
+		|    ./right: Int methods
+		|pure func main() -> Int:
+		|    42.measure()
+		|
+	impure: String =
+		|func measure(value: Int) -> Int:
+		|    value
+		|
+	rejects([{source = root, targets = [1, 2]}, {source = INT_METHOD, targets = []}, {source = impure, targets = []}], overlapping_int_receivers)
+
+
+pure func test_expected_return_type_does_not_rank_candidates() -> Bool:
+	right: String =
+		|pure func measure(value: Int) -> Float:
+		|    1.0
+		|
+	rejects(two_methods("42.measure()", INT_METHOD, right), overlapping_int_receivers)
+
+
+pure func test_unique_selected_impure_method_rejects_pure_caller() -> Bool:
+	root: String =
+		|import:
+		|    ./ops: Int methods
+		|pure func main() -> Int:
+		|    42.measure()
+		|
+	ops: String =
+		|func measure(value: Int) -> Int:
+		|    value
+		|
+	rejects([{source = root, targets = [1]}, {source = ops, targets = []}], pure func(error):
+		match error.kind:
+			Errors.CallRejection(Errors.ImpureCall(_, _)): True
+			_: False
+	)
+
+
+private FOO: String =
+	|record Foo { value: Int }
+	|
+
+
+pure func test_record_methods_compose_across_modules_and_chain() -> Bool:
+	root: String =
+		|import:
+		|    ./foo: Foo
+		|    ./left: Foo methods
+		|    ./right: Foo methods
+		|pure func make() -> Foo:
+		|    { value = 42 }
+		|func main() -> Int:
+		|    make().identity().number()
+		|
+	left: String =
+		|import:
+		|    ./foo: Foo
+		|pure func identity(value: Foo) -> Foo:
+		|    value
+		|
+	right: String =
+		|import:
+		|    ./foo: Foo
+		|pure func number(value: Foo) -> Int:
+		|    value.value
+		|
+	accepts([{source = root, targets = [1, 2, 3]}, {source = FOO, targets = []}, {source = left, targets = [1]}, {source = right, targets = [1]}])
+
+
+pure func test_field_access_then_method_uses_field_type() -> Bool:
+	root: String =
+		|import:
+		|    ./left: Int methods
+		|    ./right: Float methods
+		|record Foo { value: Int }
+		|pure func make() -> Foo:
+		|    { value = 42 }
+		|func main() -> Int:
+		|    make().value.measure()
+		|
+	accepts([{source = root, targets = [1, 2]}, {source = INT_METHOD, targets = []}, {source = FLOAT_METHOD, targets = []}])
+
+
+pure func test_unique_constructor_receiver_context_is_preserved() -> Bool:
+	root: String =
+		|union Choice:
+		|    Chosen(Int)
+		|pure func measure(value: Choice) -> Int:
+		|    match value:
+		|        Chosen(number): number
+		|func main() -> Int:
+		|    Chosen(42).measure()
+		|
+	accepts([{source = root, targets = []}])
+
+
+pure func test_competing_constructor_receiver_context_teaches_annotation() -> Bool:
+	root: String =
+		|import:
+		|    ./left: Choice(Chosen)
+		|    ./right: Other
+		|func main() -> Int:
+		|    Chosen(42).measure()
+		|
+	left: String =
+		|union Choice:
+		|    Chosen(Int)
+		|pure func measure(value: Choice) -> Int:
+		|    42
+		|
+	right: String =
+		|union Other:
+		|    Empty
+		|pure func measure(value: Other) -> Int:
+		|    42
+		|
+	rejects([{source = root, targets = [1, 2]}, {source = left, targets = []}, {source = right, targets = []}], pure func(error):
+		match error.kind:
+			Errors.MethodRejection(Errors.MethodReceiverNeedsType(_, [_, _])): True
+			_: False
+	)
+
+
+pure func test_applied_generic_receiver_matches_full_arguments() -> Bool:
+	root: String =
+		|import:
+		|    ./left: Option methods
+		|    ./right: Option methods
+		|pure func make() -> Option[Int]:
+		|    Some(42)
+		|func main() -> Int:
+		|    make().measure()
+		|
+	left: String =
+		|pure func measure(value: Option[Int]) -> Int:
+		|    42
+		|
+	right: String =
+		|pure func measure(value: Option[String]) -> Int:
+		|    1
+		|
+	accepts([{source = root, targets = [1, 2]}, {source = left, targets = []}, {source = right, targets = []}])
+
+
+pure func test_generic_and_concrete_receiver_declarations_overlap() -> Bool:
+	root: String =
+		|import:
+		|    ./left: Option methods
+		|    ./right: Option methods
+		|pure func make() -> Option[Int]:
+		|    Some(42)
+		|func main() -> Int:
+		|    make().measure()
+		|
+	left: String =
+		|pure func measure[T](value: Option[T]) -> Int:
+		|    42
+		|
+	right: String =
+		|pure func measure(value: Option[Int]) -> Int:
+		|    1
+		|
+	match parse_modules([{source = root, targets = [1, 2]}, {source = left, targets = []}, {source = right, targets = []}]):
+		Err(_): False
+		Ok(parsed):
+			-- Root make/main precede the two provider declarations in the inventory.
+			match (check(parsed), inventory_functions(parsed_contents(parsed).declarations)):
+				(Err(failure), [_, _, generic, concrete]):
+					match check_errors(failure).first.kind:
+						Errors.MethodRejection(Errors.OverlappingReceivers(_, overlap)):
+							match (overlap.introduced_receiver, overlap.other_receiver):
+								(Model.NominalType(Model.AggregateNominal(Model.UnionAggregate(concrete_owner)), [Model.IntType]), Model.NominalType(Model.AggregateNominal(Model.UnionAggregate(generic_owner)), [Model.ParameterType(parameter)])):
+									match Model.parameter_owner(parameter):
+										Model.FunctionDeclaration(owner):
+											(function_number(overlap.introduced.function) == function_number(concrete.id)
+												and function_number(overlap.other.function) == function_number(generic.id)
+												and union_number(concrete_owner) == union_number(generic_owner)
+												and function_number(owner) == function_number(generic.id) and Model.parameter_position(parameter) == 0)
+										_: False
+								_: False
+						_: False
+				_: False
+
+
+pure func test_unique_generic_callee_provides_concrete_constructor_context() -> Bool:
+	root: String =
+		|import:
+		|    ./ops: Option methods
+		|func main() -> Int:
+		|    Some(42).measure(1)
+		|
+	ops: String =
+		|pure func measure[T](value: Option[Int], other: T) -> Int:
+		|    42
+		|
+	accepts([{source = root, targets = [1]}, {source = ops, targets = []}])
+
+
+pure func test_concrete_list_receiver_selects_list_method() -> Bool:
+	root: String =
+		|import:
+		|    ./left: List methods
+		|    ./right: String methods
+		|func main(arguments: List[String]) -> Int:
+		|    arguments.measure()
+		|
+	left: String =
+		|pure func measure(value: List[String]) -> Int:
+		|    42
+		|
+	right: String =
+		|pure func measure(value: String) -> Int:
+		|    1
+		|
+	accepts([{source = root, targets = [1, 2]}, {source = left, targets = []}, {source = right, targets = []}])
+
+
+pure func test_overlapping_constructor_receivers_reject_before_body_context() -> Bool:
+	root: String =
+		|import:
+		|    ./left: Option methods
+		|    ./right: Option methods
+		|func main() -> Int:
+		|    Some(42).measure(1)
+		|
+	left: String =
+		|pure func measure(value: Option[Int]) -> Int:
+		|    1
+		|
+	right: String =
+		|pure func measure(value: Option[Int], other: Int) -> Int:
+		|    42
+		|
+	rejects([{source = root, targets = [1, 2]}, {source = left, targets = []}, {source = right, targets = []}], pure func(error):
+		match error.kind:
+			Errors.MethodRejection(Errors.OverlappingReceivers(_, overlap)):
+				match overlap.introduced_receiver:
+					Model.NominalType(Model.AggregateNominal(Model.UnionAggregate(_)), [Model.IntType]):
+						(function_number(overlap.introduced.function) == 2 and function_number(overlap.other.function) == 1
+							and overlap.introduced_receiver == overlap.other_receiver)
+					_: False
+			_: False
+	)
+
+
+pure func test_unique_generic_union_receiver_instantiates_from_receiver() -> Bool:
+	root: String =
+		|import:
+		|    ./ops: Option methods
+		|pure func make() -> Option[String]:
+		|    None
+		|func main() -> Int:
+		|    make().measure()
+		|
+	ops: String =
+		|pure func measure[T](value: Option[T]) -> Int:
+		|    42
+		|
+	accepts([{source = root, targets = [1]}, {source = ops, targets = []}])
+
+
+pure func test_repeated_generic_receiver_arguments_must_unify() -> Bool:
+	root: String =
+		|import:
+		|    ./left: Result methods
+		|    ./right: Result methods
+		|pure func make() -> Result[Int, String]:
+		|    Ok(42)
+		|func main() -> Int:
+		|    make().measure()
+		|
+	left: String =
+		|pure func measure[T](value: Result[T, T]) -> Int:
+		|    1
+		|
+	right: String =
+		|pure func measure(value: Result[Int, String]) -> Int:
+		|    42
+		|
+	accepts([{source = root, targets = [1, 2]}, {source = left, targets = []}, {source = right, targets = []}])
+
+
+pure func test_inapplicable_method_diagnostic_has_exact_help_and_call_span() -> Bool:
+	method_diagnostic_is(
+		two_methods("\"text\".measure()", INT_METHOD, FLOAT_METHOD),
+		"no method accepts this receiver type",
+		"use a value of a declared receiver type, or import a function accepting this type",
+		180,
+		187,
+	)
+
+
+pure func test_unique_method_arity_diagnostic_has_exact_help_and_call_span() -> Bool:
+	left: String =
+		|pure func measure(value: Int, other: Int) -> Int:
+		|    value
+		|
+	match parse_modules(two_methods("42.measure()", left, FLOAT_METHOD)):
+		Err(_): False
+		Ok(parsed):
+			match check(parsed):
+				Ok(_): False
+				Err(failure):
+					error = check_errors(failure).first
+					diagnostic = render_failure(failure).first
+					prefix = "import:\n    ./left: Int methods, Float methods, String methods\n    ./right: Int methods, Float methods, String methods\nfunc main() -> Int:\n    42."
+					match error.kind:
+						Errors.CallRejection(Errors.ArgumentCountMismatch(mismatch)):
+							(mismatch.expected == 2 and mismatch.actual == 1
+								and error.span == root_span(prefix, "measure") and error.span == diagnostic.span
+								and diagnostic.note.is_none()
+								and diagnostic.message == "argument count does not match the function parameters"
+								and diagnostic.help == "pass one expression for each declared parameter; UFCS supplies the receiver first")
+						_: False
+
+
+pure func test_constructor_context_diagnostic_has_exact_help_and_call_span() -> Bool:
+	root: String =
+		|import:
+		|    ./left: Choice(Chosen)
+		|    ./right: Other
+		|func main() -> Int:
+		|    Chosen(42).measure()
+		|
+	left: String =
+		|union Choice:
+		|    Chosen(Int)
+		|pure func measure(value: Choice) -> Int:
+		|    42
+		|
+	right: String =
+		|union Other:
+		|    Empty
+		|pure func measure(value: Other) -> Int:
+		|    42
+		|
+	method_diagnostic_is(
+		[{source = root, targets = [1, 2]}, {source = left, targets = []}, {source = right, targets = []}],
+		"method receiver needs an explicit type",
+		"bind the receiver through a typed helper, or call a uniquely imported function directly",
+		89,
+		96,
+	)
+
+
+pure func test_competing_outer_methods_require_a_known_generic_receiver() -> Bool:
+	root: String =
+		|import:
+		|    ./left: Int methods
+		|    ./right: Float methods
+		|pure func identity[T](value: T) -> T:
+		|    value
+		|func main() -> Int:
+		|    identity(None).measure()
+		|
+	match parse_modules([{source = root, targets = [1, 2]}, {source = INT_METHOD, targets = []}, {source = FLOAT_METHOD, targets = []}]):
+		Err(_): False
+		Ok(parsed):
+			match check(parsed):
+				Ok(_): False
+				Err(failure):
+					error = check_errors(failure).first
+					diagnostic = render_failure(failure).first
+					owner_matches = match error.kind:
+						Errors.CallRejection(Errors.UninferableTypeParameter(parameter)):
+							match Model.parameter_owner(parameter):
+								Model.FunctionDeclaration(owner): function_number(owner) == 0 and Model.parameter_position(parameter) == 0
+								_: False
+						_: False
+					(owner_matches and error.span == {source = module_source(root_module_id()), start = 141, end = 149}
+						and diagnostic.message == "cannot infer the type parameter from the argument"
+						and diagnostic.help == "pass a value whose type determines the declared type parameter; use a concrete helper when no argument can determine it"
+						and diagnostic.note.is_none())
+
+
+pure func test_bare_constructor_with_competing_contexts_teaches_annotation() -> Bool:
+	root: String =
+		|import:
+		|    ./left: Option methods
+		|    ./right: Option methods
+		|func main() -> Int:
+		|    None.measure()
+		|
+	left: String =
+		|pure func measure(value: Option[Int]) -> Int:
+		|    1
+		|
+	right: String =
+		|pure func measure(value: Option[String]) -> Int:
+		|    42
+		|
+	rejects([{source = root, targets = [1, 2]}, {source = left, targets = []}, {source = right, targets = []}], pure func(error):
+		match error.kind:
+			Errors.MethodRejection(Errors.MethodReceiverNeedsType(_, [_, _])): True
+			_: False
+	)
+
+
+pure func test_record_with_competing_contexts_teaches_annotation() -> Bool:
+	root: String =
+		|import:
+		|    ./left: Foo
+		|    ./right: Other
+		|func main() -> Int:
+		|    { value = 42 }.measure()
+		|
+	left: String =
+		|record Foo { value: Int }
+		|pure func measure(value: Foo) -> Int:
+		|    1
+		|
+	right: String =
+		|record Other { value: Int }
+		|pure func measure(value: Other) -> Int:
+		|    42
+		|
+	rejects([{source = root, targets = [1, 2]}, {source = left, targets = []}, {source = right, targets = []}], pure func(error):
+		match error.kind:
+			Errors.MethodRejection(Errors.MethodReceiverNeedsType(_, [_, _])): True
+			_: False
+	)
+
+
+pure func test_rigid_actual_parameter_keeps_no_applicable_method() -> Bool:
+	prefix: String =
+		|import:
+		|    ./left: Int methods
+		|    ./right: Float methods
+		|pure func use[T](receiver: T) -> Int:
+		|    receiver.
+	source = prefix + "measure()\nfunc main() -> Int:\n    0\n"
+	match parse_modules([{ source = source, targets = [1, 2] }, { source = INT_METHOD, targets = [] }, { source = FLOAT_METHOD, targets = [] }]):
+		Err(_): False
+		Ok(parsed):
+			match (check(parsed), inventory_functions(parsed_contents(parsed).declarations).get(0)):
+				(Err(failure), Some(declaration)):
+					error = check_errors(failure).first
+					diagnostic = render_failure(failure).first
+					match (error.kind, diagnostic.note):
+						(Errors.MethodRejection(Errors.NoApplicableMethod(_, Model.ParameterType(parameter), [left, right])), Some(CompetingDeclarations([_, _, _, _]))):
+							match Model.parameter_owner(parameter):
+								Model.FunctionDeclaration(owner):
+									(function_number(owner) == function_number(declaration.id) and Model.parameter_position(parameter) == 0
+										and function_number(left.function) == 2 and function_number(right.function) == 3
+										and error.span == root_span(prefix, "measure") and diagnostic.span == error.span
+										and diagnostic.message == "no method accepts this receiver type"
+										and diagnostic.help == "use a value of a declared receiver type, or import a function accepting this type")
+								_: False
+						_: False
+				_: False
+
+
+pure func test_function_and_type_import_routes_keep_one_candidate_identity() -> Bool:
+	root: String =
+		|import:
+		|    ./ops: describe, Foo
+		|    ./other as OtherProvider
+		|func main() -> Int:
+		|    { value = 23 }.describe()
+		|
+	ops: String =
+		|record Foo { value: Int }
+		|pure func describe(value: Foo) -> Int:
+		|    value.value
+		|
+	unrelated: String =
+		|record Other { value: Int }
+		|pure func describe(value: Other) -> Int:
+		|    value.value
+		|
+	match parse_modules([{ source = root, targets = [1, 2] }, { source = ops, targets = [] }, { source = unrelated, targets = [] }]):
+		Err(_): False
+		Ok(parsed):
+			match (check(parsed), inventory_functions(parsed_contents(parsed).declarations).get(1)):
+				(Ok(program), Some(declaration)):
+					match checked_functions(program).functions.get(0):
+						None: False
+						Some(main):
+							match main.body:
+								Model.CheckedValueBody(Model.ReturnExpression(result)):
+									match result.form:
+										Model.InvokeFunction(call):
+											match call.operands:
+												[Model.ValueOperand(receiver)]:
+													match (call.target, receiver.value_type):
+														(Model.UserFunction(target, []), Model.NominalType(Model.AggregateNominal(Model.RecordAggregate(_)), [])):
+															function_number(target) == function_number(declaration.id)
+														_: False
+												_: False
+										_: False
+								_: False
+				_: False
+
+
+pure func test_append_int_resolves_the_public_string_method() -> Bool:
+	inputs = [
+		{ source = APPEND_INT_CALLER, targets = [1] },
+		{ source = APPEND_INT_METHOD, targets = [] },
+	]
+	match parse_modules(inputs).and_then(pure func(parsed): check(parsed).map_err(setup_diagnostic)):
+		Err(_): False
+		Ok(program):
+			match checked_functions(program).functions:
+				[main, _, _, method]:
+					match (main.statements, method.signature.purity, method.signature.parameters):
+						([Model.InitializeBinding(_, value)], Pure, [left, right]):
+							match value.form:
+								Model.InvokeFunction(call):
+									match call.operands:
+										[Model.ValueOperand(receiver), Model.ValueOperand(argument)]:
+											match call.target:
+												Model.UserFunction(target, []):
+													(function_number(target) == function_number(method.id)
+														and receiver.value_type == Model.StringType
+														and argument.value_type == Model.IntType
+														and value.value_type == Model.StringType
+														and left.value_type == Model.StringType
+														and right.value_type == Model.IntType)
+												_: False
+										_: False
+								_: False
+						_: False
+				_: False
+
+
+tests: TestSuite = {
+	description = "method resolution",
+	tests = [
+		("append_int resolves public String method", test_append_int_resolves_the_public_string_method),
+		("expected return type does not rank candidates", test_expected_return_type_does_not_rank_candidates),
+		("local and imported receiver clash retains both origins", test_local_and_imported_receiver_clash_keeps_both_origins),
+		("bare constructor competing contexts teach annotation", test_bare_constructor_with_competing_contexts_teaches_annotation),
+		("record competing contexts teach annotation", test_record_with_competing_contexts_teaches_annotation),
+		("competing methods require a known generic receiver", test_competing_outer_methods_require_a_known_generic_receiver),
+		("inapplicable diagnostic exact help and span", test_inapplicable_method_diagnostic_has_exact_help_and_call_span),
+		("unique method arity has exact help and span", test_unique_method_arity_diagnostic_has_exact_help_and_call_span),
+		("constructor context diagnostic exact help and span", test_constructor_context_diagnostic_has_exact_help_and_call_span),
+		("unique generic receiver instantiates from receiver", test_unique_generic_union_receiver_instantiates_from_receiver),
+		("repeated generic receiver arguments must unify", test_repeated_generic_receiver_arguments_must_unify),
+		("concrete List receiver selects List method", test_concrete_list_receiver_selects_list_method),
+		("overlapping constructor receivers reject before body context", test_overlapping_constructor_receivers_reject_before_body_context),
+		("receiver type selects same named methods", test_receiver_type_selects_same_named_methods),
+		("receiver selection ignores import order", test_receiver_selection_ignores_import_order),
+		("same receiver declarations overlap", test_same_receiver_declarations_overlap),
+		("receiver clash renders primary and every other site", test_receiver_clash_renders_primary_and_all_other_sites),
+		("multiple incompatible receivers have typed error", test_multiple_incompatible_receivers_have_typed_error),
+		("unique incompatible receiver preserves argument error", test_unique_incompatible_receiver_preserves_argument_error),
+		("wrong arity survives different receiver matching arity", test_unique_receiver_preserves_wrong_arity_beside_other_type),
+		("different arities do not separate receivers", test_different_arities_do_not_separate_receivers),
+		("overlapping declarations precede call arity", test_overlapping_declarations_precede_call_arity),
+		("later arguments do not rank candidates", test_later_arguments_do_not_rank_candidates),
+		("purity does not rank candidates", test_purity_does_not_rank_candidates),
+		("unique impure method rejects pure caller", test_unique_selected_impure_method_rejects_pure_caller),
+		("record methods compose across modules and chain", test_record_methods_compose_across_modules_and_chain),
+		("field then method uses field type", test_field_access_then_method_uses_field_type),
+		("unique constructor receiver context is preserved", test_unique_constructor_receiver_context_is_preserved),
+		("competing constructor context teaches annotation", test_competing_constructor_receiver_context_teaches_annotation),
+		("applied receiver matches full arguments", test_applied_generic_receiver_matches_full_arguments),
+		("generic and concrete receiver declarations overlap", test_generic_and_concrete_receiver_declarations_overlap),
+		("unique generic callee provides constructor context", test_unique_generic_callee_provides_concrete_constructor_context),
+		("rigid caller parameter keeps no applicable method", test_rigid_actual_parameter_keeps_no_applicable_method),
+		("function and type import routes keep one candidate identity", test_function_and_type_import_routes_keep_one_candidate_identity),
+	]
+}

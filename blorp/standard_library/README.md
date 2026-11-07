@@ -307,7 +307,7 @@ the fixed unions `IOErrorKind` and `EntryKind`, the records `IOError` and
 `Entry`, the pure `describe` and `default_if_not_found`, and the impure
 operations below, each returning a `Result` whose error is an `IOError`. Its
 natives return Int codes (or a list or String) that private decoders turn
-into kinds and entries; the codes are named in `src/runtime/fs.brp`. The
+into kinds and entries; the codes are named in `src/compile/runtime/fs.brp`. The
 language README's [I/O overview](../README.md#effects-and-io) shows where it
 fits beside `print` and the other effects, and
 [FILESYSTEM_DECISIONS.md](../FILESYSTEM_DECISIONS.md) records why the library

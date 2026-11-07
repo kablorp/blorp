@@ -1,0 +1,1300 @@
+import:
+	../../../../src/syntax/names: program_names
+	../../../../src/compile/check/check: check, checked_functions
+	../../../../src/compile/check/model as Checked
+	../../../../src/compile/ids as Declaration
+	../../../../src/syntax/lex: lex
+	../../../../src/syntax/source: compiler_source, module_source, root_module_id
+	../../../../src/compile/specialize/specialize as Concrete:
+		CallTarget(UserFunction, RuntimeFunction),
+		ConcreteBody(ConcreteValueBody),
+		ConcreteExit(ReturnExpression),
+		ConcreteFunction,
+		ConcreteStatement(InitializeBinding, ReassignBinding),
+		ConcreteExpr,
+		ConcreteForm(ConstructRecord, ConstructVariant, InvokeFunction, LiteralInteger),
+		ConcreteRecord(InlineFields, CountedFields),
+		SpecializedContents,
+		TypeRef(VoidType, IntType, FloatType, StringType, ListType, RecordType, UnionType),
+		ConcreteUnion(PlainCases, OwningCases, BoxedCases),
+		function_number,
+		record_fields,
+		record_number,
+		specialize,
+		specialized_contents,
+		union_number,
+		value_needs_ownership,
+		admit_scalar_loop,
+	../../../../src/syntax/syntax: Diagnostic, Entrypoint(NoArguments), FunctionExecution(SelfTailLoop), Span, diagnostic, entry_function
+	option: to_result
+	int as IntOps
+	../../input: parse, setup_diagnostic
+	../../managed_union_inputs: concrete_tail_join
+	../../ownership_inputs: input_ids, span
+	../../../../src/compile/namespace/builtins as Builtins
+	test: TestSuite
+
+
+private IDENTITY: String =
+	|pure func identity[T](value: T) -> T:
+	|	value
+	|
+
+
+private pure func program(source: String) -> Result[SpecializedContents, Diagnostic]:
+	lexed ?= lex(module_source(root_module_id()), source, program_names().names)
+	parsed ?= parse(lexed)
+	checked ?= check(parsed)
+		.map_err(setup_diagnostic)
+	concrete ?= specialize(checked)
+	Ok(specialized_contents(concrete))
+
+
+private pure func fixture(source: String) -> Result[List[ConcreteFunction], Diagnostic]:
+	program(source).map(pure func(contents): contents.functions)
+
+
+private pure func target(value: ConcreteExpr) -> Option[Int]:
+	match value.form:
+		InvokeFunction(call, _):
+			match call.target:
+				UserFunction(id):
+					Some(function_number(id))
+				RuntimeFunction(_):
+					None
+		_:
+			None
+
+
+-- User function numbers along the receiver chain, innermost call first.
+private pure func receiver_targets(value: ConcreteExpr) -> List[Int]:
+	match value.form:
+		InvokeFunction(call, arguments):
+			inner: List[Int] = match arguments.get(0):
+				Some(receiver):
+					receiver_targets(receiver)
+				None:
+					[]
+
+			match call.target:
+				UserFunction(id):
+					inner.append(function_number(id))
+				RuntimeFunction(_):
+					inner
+		_:
+			[]
+
+
+private pure func body_target(function: ConcreteFunction) -> Option[Int]:
+	match function.body:
+		ConcreteValueBody(ReturnExpression(value)):
+			target(value)
+		_:
+			None
+
+
+private pure func equal_targets(actual: Option[Int], expected: Int) -> Bool:
+	match actual:
+		Some(number):
+			IntOps.equals(number, expected)
+		None:
+			False
+
+
+private pure func repeated_target(value: ConcreteExpr, expected: Int) -> Bool:
+	match value.form:
+		InvokeFunction(_, arguments):
+			match arguments.get(0):
+				Some(receiver):
+					equal_targets(target(value), expected) and equal_targets(target(receiver), expected)
+				None:
+					False
+		_:
+			False
+
+
+pure func test_direct_and_ufcs_reuse_one_instance() -> Bool:
+	main_source: String =
+		|func main() -> Int:
+		|	first = identity(7)
+		|	second = 8.identity()
+		|	identity(9)
+		|
+
+	match fixture(IDENTITY + main_source):
+		Ok([main, identity]):
+			match main.statements:
+				[InitializeBinding(_, first), InitializeBinding(_, second)]:
+					(
+						target(first) == Some(1)
+						and target(second) == Some(1)
+						and body_target(main) == Some(1)
+						and identity.signature.return_type == IntType
+					)
+				_:
+					False
+		_:
+			False
+
+
+pure func test_argument_types_create_distinct_complete_instances() -> Bool:
+	main_source: String =
+		|func main() -> Int:
+		|	integer = identity(7)
+		|	text = "7".identity()
+		|	ignored = identity(text)
+		|	0
+		|
+
+	match fixture(IDENTITY + main_source):
+		Ok([_, integer, text]):
+			match integer.signature.parameters:
+				[integer_type]:
+					match text.signature.parameters:
+						[text_type]:
+							(
+								integer_type == IntType
+								and integer.signature.return_type == IntType
+								and text_type == StringType
+								and text.signature.return_type == StringType
+							)
+						_:
+							False
+				_:
+					False
+		_:
+			False
+
+
+pure func test_forwarded_symbolic_call_is_remapped_to_concrete_callee() -> Bool:
+	source: String =
+		|pure func forward[Element](value: Element) -> Element:
+		|	identity(value)
+		|func main() -> Int:
+		|	forward(42)
+		|
+
+	match fixture(IDENTITY + source):
+		Ok([main, forward, identity]):
+			(
+				body_target(main) == Some(1)
+				and body_target(forward) == Some(2)
+				and forward.signature.return_type == IntType
+				and identity.signature.return_type == IntType
+			)
+		_:
+			False
+
+
+pure func test_declarations_with_same_parameter_spelling_stay_distinct() -> Bool:
+	source: String =
+		|pure func other[T](value: T) -> T:
+		|	value
+		|func main() -> Int:
+		|	first = identity(7)
+		|	other(9)
+		|
+
+	match fixture(IDENTITY + source):
+		Ok([main, _, _]):
+			match main.statements:
+				[InitializeBinding(_, first)]:
+					target(first) == Some(1) and body_target(main) == Some(2)
+				_:
+					False
+		_:
+			False
+
+
+private pure func binding_types(function: ConcreteFunction, expected: TypeRef) -> Bool:
+	var valid = function.bindings.length() == 3
+
+	for binding in function.bindings:
+		valid = valid and binding.value_type == expected
+
+	match function.statements:
+		[InitializeBinding(_, first), InitializeBinding(_, second), ReassignBinding(_, replacement)]:
+			(
+				valid
+				and first.value_type == expected
+				and second.value_type == expected
+				and replacement.value_type == expected
+			)
+		_:
+			False
+
+
+pure func test_bindings_and_reassignments_are_substituted_per_instance() -> Bool:
+	source: String =
+		|pure func preserve[T](value: T) -> T:
+		|	var current = value
+		|	original = current
+		|	current = value
+		|	original
+		|func main() -> Int:
+		|	integer = preserve(7)
+		|	text = preserve("7")
+		|	0
+		|
+
+	match fixture(source):
+		Ok([_, integer, text]):
+			binding_types(integer, IntType) and binding_types(text, StringType)
+		_:
+			False
+
+
+pure func test_nominal_union_arguments_do_not_merge() -> Bool:
+	first_source: String =
+		|union First:
+		|	Only
+		|union Second:
+		|	Single
+		|pure func first() -> First:
+		|	Only
+		|pure func second() -> Second:
+		|	Single
+		|
+	main_source: String =
+		|func main() -> Int:
+		|	a = identity(first())
+		|	b = identity(second())
+		|	0
+		|
+
+	match fixture(first_source + IDENTITY + main_source):
+		Ok([_, _, first, _, second]):
+			match first.signature.return_type:
+				UnionType(_):
+					match second.signature.return_type:
+						UnionType(_):
+							not (first.signature.return_type == second.signature.return_type)
+						_:
+							False
+				_:
+					False
+		_:
+			False
+
+
+pure func test_unused_functions_create_no_concrete_instance() -> Bool:
+	source: String =
+		|pure func unused() -> String:
+		|    "unused"
+		|func main() -> Int:
+		|    0
+		|
+	match fixture(IDENTITY + source):
+		Ok([main]):
+			main.signature.return_type == IntType
+		_:
+			False
+
+
+pure func test_entrypoint_translates_original_declaration_to_first_instance() -> Bool:
+	source: String =
+		|pure func unused() -> Int:
+		|    7
+		|func main() -> Int:
+		|    0
+		|
+	match lex(module_source(root_module_id()), IDENTITY + source, program_names().names).and_then(parse):
+		Err(_): False
+		Ok(parsed):
+			match check(parsed):
+				Err(_): False
+				Ok(checked):
+					match specialize(checked):
+						Err(_): False
+						Ok(concrete):
+							(
+								Declaration.function_number(entry_function(checked_functions(checked).entrypoint)) == 2
+								and function_number(entry_function(specialized_contents(concrete).entrypoint)) == 0
+								and specialized_contents(concrete).functions.length() == 1
+							)
+
+
+pure func test_rigid_return_types_translate_in_every_match_arm() -> Bool:
+	source: String =
+		|union Flag:
+		|	Off
+		|	On
+		|pure func flag() -> Flag:
+		|	On
+		|pure func choose[T](value: T) -> T:
+		|	match flag():
+		|		Off: value
+		|		On: value
+		|func main() -> Int:
+		|	choose(7)
+		|
+
+	match fixture(source):
+		Ok([_, choose, _]):
+			match concrete_tail_join(choose.body):
+				Some(matched):
+					match matched.arms:
+						[first, second]:
+							(
+								first.value.value_type == IntType
+								and second.value.value_type == IntType
+								and choose.signature.return_type == IntType
+							)
+						_:
+							False
+				_:
+					False
+		_:
+			False
+
+
+pure func test_match_scrutinee_assignments_and_results_discover_generic_instances() -> Bool:
+	flag_source: String =
+		|union Flag:
+		|	Off
+		|	On
+		|pure func flag() -> Flag:
+		|	On
+		|
+	source: String =
+		|pure func save[T](value: T) -> T:
+		|	value
+		|pure func choose[T](value: T) -> T:
+		|	match identity(flag()):
+		|		Off:
+		|			saved = save(value)
+		|			saved
+		|		On: value.identity().identity()
+		|func main() -> Int:
+		|	choose(7)
+		|
+
+	match fixture(flag_source + IDENTITY + source):
+		Ok([main, choose, flag, flag_identity, save, int_identity]):
+			match concrete_tail_join(choose.body):
+				Some(matched):
+					match matched.arms:
+						[first, second]:
+							match first.statements:
+								[InitializeBinding(_, saved)]:
+									match choose.bindings:
+										[parameter, saved_binding]:
+											(
+												body_target(main) == Some(1)
+												and target(matched.scrutinee) == Some(3)
+												and target(saved) == Some(4)
+												and repeated_target(second.value, 5)
+												and flag_identity.signature.return_type == flag.signature.return_type
+												and matched.scrutinee.value_type == flag.signature.return_type
+												and int_identity.signature.return_type == IntType
+												and parameter.value_type == IntType
+												and save.signature.return_type == IntType
+												and saved_binding.value_type == IntType
+												and saved.value_type == IntType
+												and first.value.value_type == IntType
+											)
+										_:
+											False
+								_:
+									False
+						_:
+							False
+				_:
+					False
+		_:
+			False
+
+
+private pure func ownership_rejection(
+	result: Result[Bool, Diagnostic],
+	message: String,
+) -> Bool:
+	match result:
+		Err(error):
+			(
+				error.message == "internal compiler error: " + message
+				and error.help == "report this compiler error with the input program"
+				and error.span.source == compiler_source()
+				and error.span.start == 0
+				and error.span.end == 0
+				and error.note.is_none()
+			)
+		Ok(_):
+			False
+
+
+pure func test_numeric_and_void_types_have_no_ownership() -> Bool:
+	var valid = True
+
+	for value_type in [IntType, FloatType, VoidType]:
+		match value_needs_ownership(value_type, [], []):
+			Ok(False):
+				void
+			_:
+				valid = False
+
+	valid
+
+
+pure func test_string_ownership_is_a_managed_leaf() -> Bool:
+	match value_needs_ownership(StringType, [], []):
+		Ok(True):
+			True
+		_:
+			False
+
+
+pure func test_string_list_ownership_is_a_managed_root() -> Bool:
+	match value_needs_ownership(ListType(StringType), [], []):
+		Ok(True):
+			True
+		_:
+			False
+
+
+pure func test_all_supported_list_elements_have_one_managed_root() -> Bool:
+	values = [IntType, FloatType, VoidType, StringType, ListType(StringType)]
+	values.all(pure func(element):
+		match value_needs_ownership(ListType(element), [], []):
+			Ok(True): True
+			_: False
+	)
+
+
+private pure func return_needs_ownership(contents: SpecializedContents) -> Result[Bool, Diagnostic]:
+	match contents.functions:
+		[_, helper]:
+			value_needs_ownership(helper.signature.return_type, contents.unions, contents.records)
+		_:
+			Err({
+				span = {
+					source = compiler_source(),
+					start = 0,
+					end = 0
+				},
+				note = None,
+				message = "invalid ownership producer test",
+				help = "fix the two-function producer input",
+			})
+
+
+pure func test_nested_numeric_records_remain_inline() -> Bool:
+	source: String =
+		|record Inner { number: Int }
+		|record Outer { child: Inner, fraction: Float }
+		|pure func make() -> Outer:
+		|    { child = { number = 7 }, fraction = 1.5 }
+		|func main() -> Int:
+		|    unused = make()
+		|    0
+		|
+
+	match program(source):
+		Ok(contents):
+			match contents.records:
+				[inner, outer]:
+					inline_child = match inner:
+						InlineFields(_):
+							True
+						CountedFields(_):
+							False
+					inline_parent = match outer:
+						InlineFields(_):
+							True
+						CountedFields(_):
+							False
+					child_fields = match record_fields(inner):
+						[IntType]:
+							True
+						_:
+							False
+					parent_fields = match record_fields(outer):
+						[RecordType(child), FloatType]:
+							record_number(child) == 0
+						_:
+							False
+					unmanaged_parent = match return_needs_ownership(contents):
+						Ok(False):
+							True
+						_:
+							False
+					inline_child and inline_parent and child_fields and parent_fields and unmanaged_parent
+				_:
+					False
+		Err(_):
+			False
+
+pure func test_string_record_has_one_root_and_complete_repeated_fields() -> Bool:
+	source: String =
+		|record Pair { left: String, count: Int, right: String }
+		|pure func make() -> Pair:
+		|    { left = "same", count = 7, right = "same" }
+		|func main() -> Int:
+		|    unused = make()
+		|    0
+		|
+
+	match program(source):
+		Ok(contents):
+			match contents.records:
+				[layout]:
+					complete_fields = match record_fields(layout):
+						[StringType, IntType, StringType]:
+							True
+						_:
+							False
+					managed_root = match return_needs_ownership(contents):
+						Ok(True):
+							match contents.functions:
+								[_, helper]:
+									match helper.signature.return_type:
+										RecordType(id):
+											record_number(id) == 0
+										_: False
+								_: False
+						_:
+							False
+					complete_fields and managed_root
+				_:
+					False
+		Err(_):
+			False
+
+pure func test_void_record_has_a_root_without_owned_children() -> Bool:
+	source: String =
+		|record Unit { empty: Void }
+		|pure func make() -> Unit:
+		|    { empty = void }
+		|func main() -> Int:
+		|    unused = make()
+		|    0
+		|
+
+	match program(source):
+		Ok(contents):
+			match return_needs_ownership(contents):
+				Ok(True):
+					match contents.functions:
+						[_, helper]:
+							match helper.signature.return_type:
+								RecordType(id):
+									record_number(id) == 0
+								_: False
+						_: False
+				_:
+					False
+		Err(_):
+			False
+
+
+pure func test_unmanaged_union_field_still_requires_a_record_root() -> Bool:
+	source: String =
+		|union Maybe[T]:
+		|    Missing
+		|    Present(T)
+		|record Wrapped { value: Maybe[Int] }
+		|pure func make() -> Wrapped:
+		|    { value = Present(7) }
+		|func main() -> Int:
+		|    unused = make()
+		|    0
+		|
+
+	match program(source):
+		Ok(contents):
+			match contents.records:
+				[layout]:
+					unmanaged_child = match record_fields(layout):
+						[UnionType(child)]:
+							match value_needs_ownership(UnionType(child), contents.unions, contents.records):
+								Ok(False):
+									True
+								_:
+									False
+						_:
+							False
+					managed_parent = match return_needs_ownership(contents):
+						Ok(True):
+							match contents.functions:
+								[_, helper]:
+									match helper.signature.return_type:
+										RecordType(id):
+											record_number(id) == 0
+										_: False
+								_: False
+						_:
+							False
+					unmanaged_child and managed_parent
+				_:
+					False
+		Err(_):
+			False
+
+pure func test_phantom_string_argument_creates_no_child_obligation() -> Bool:
+	source: String =
+		|record Phantom[T] { number: Int }
+		|pure func make() -> Phantom[String]:
+		|    { number = 7 }
+		|func main() -> Int:
+		|    unused = make()
+		|    0
+		|
+
+	match program(source):
+		Ok(contents):
+			match return_needs_ownership(contents):
+				Ok(False):
+					True
+				_:
+					False
+		Err(_):
+			False
+
+
+pure func test_inline_union_keeps_each_repeated_owned_field() -> Bool:
+	source: String =
+		|union Payload:
+		|    Empty
+		|    Pair(String, Int, String)
+		|pure func make() -> Payload:
+		|    Pair("same", 7, "same")
+		|func main() -> Int:
+		|    unused = make()
+		|    0
+		|
+
+	match program(source):
+		Ok(contents):
+			match contents.unions:
+				[layout]:
+					complete_fields = match Concrete.union_variants(layout):
+						[[], [StringType, IntType, StringType]]:
+							True
+						_:
+							False
+					owning_representation = match layout:
+						OwningCases(_):
+							True
+						PlainCases(_) | BoxedCases(_):
+							False
+					owning_fields = match return_needs_ownership(contents):
+						Ok(True):
+							match contents.functions:
+								[_, helper]:
+									match helper.signature.return_type:
+										UnionType(id):
+											union_number(id) == 0
+										_: False
+								_: False
+						_:
+							False
+					complete_fields and owning_representation and owning_fields
+				_:
+					False
+		Err(_):
+			False
+
+pure func test_record_ownership_query_rejects_missing_layout() -> Bool:
+	source: String =
+		|record Number { number: Int }
+		|pure func make() -> Number:
+		|    { number = 7 }
+		|func main() -> Int:
+		|    unused = make()
+		|    0
+		|
+
+	match fixture(source):
+		Ok([_, helper]):
+			ownership_rejection(
+				value_needs_ownership(helper.signature.return_type, [], []),
+				"invalid record identity in ownership representation",
+			)
+		_:
+			False
+
+
+pure func test_union_ownership_query_rejects_missing_layout() -> Bool:
+	source: String =
+		|union Flag:
+		|    Off
+		|    On
+		|pure func make() -> Flag:
+		|    Off
+		|func main() -> Int:
+		|    unused = make()
+		|    0
+		|
+
+	match fixture(source):
+		Ok([_, helper]):
+			ownership_rejection(
+				value_needs_ownership(helper.signature.return_type, [], []),
+				"invalid union identity in ownership representation",
+			)
+		_:
+			False
+
+
+private pure func is_integer(value: ConcreteExpr, expected: Int) -> Bool:
+	match value.form:
+		LiteralInteger(actual):
+			IntOps.equals(actual, expected)
+		_:
+			False
+
+
+pure func test_ufcs_chain_nests_each_receiver_as_first_argument() -> Bool:
+	source: String =
+		|pure func one(value: Int) -> Int:
+		|	1
+		|pure func zero(value: Int) -> Int:
+		|	0
+		|func main() -> Int:
+		|	7.one().zero()
+		|
+
+	match fixture(source):
+		Ok([main, _, _]):
+			match main.body:
+				ConcreteValueBody(ReturnExpression(outer)):
+					match outer.form:
+						InvokeFunction(_, [inner]):
+							match inner.form:
+								InvokeFunction(_, [seven]):
+									-- Calls are numbered in request order: `one` is 1, `zero` is 2.
+									match receiver_targets(outer):
+										[1, 2]:
+											is_integer(seven, 7)
+										_:
+											False
+								_:
+									False
+						_:
+							False
+				_:
+					False
+		_:
+			False
+
+
+pure func test_chain_node_span_is_the_occurrence_and_the_anchor_stays_on_the_call() -> Bool:
+	source: String =
+		|pure func one(value: Int) -> Int:
+		|	1
+		|pure func zero(value: Int) -> Int:
+		|	0
+		|func main() -> Int:
+		|	7.one().zero()
+		|
+
+	match fixture(source):
+		Ok([main, _, _]):
+			match main.body:
+				ConcreteValueBody(ReturnExpression(outer)):
+					match outer.form:
+						InvokeFunction(outer_call, [inner]):
+							match inner.form:
+								InvokeFunction(inner_call, [seven]):
+									-- The occurrence extent starts at the written receiver; the callee anchor does not.
+									(
+										IntOps.equals(outer.span.start, seven.span.start)
+										and IntOps.equals(inner.span.start, seven.span.start)
+										and outer.span.end > inner.span.end
+										and outer_call.span.start > inner_call.span.start
+										and outer.span.start < outer_call.span.start
+										and outer.span != outer_call.span
+									)
+								_:
+									False
+						_:
+							False
+				_:
+					False
+		_:
+			False
+
+
+private pure func argument_integers(value: ConcreteExpr) -> List[Int]:
+	match value.form:
+		InvokeFunction(_, arguments):
+			var integers: List[Int] = []
+
+			for argument in arguments:
+				match argument.form:
+					LiteralInteger(integer):
+						integers = integers.append(integer)
+					_:
+						void
+
+			integers
+		_:
+			[]
+
+
+pure func test_direct_and_ufcs_calls_share_one_argument_order() -> Bool:
+	source: String =
+		|pure func pair(left: Int, right: Int) -> Int:
+		|	left
+		|func main() -> Int:
+		|	ufcs = 7.pair(9)
+		|	pair(7, 9)
+		|
+
+	match fixture(source):
+		Ok([main, _]):
+			match main.statements:
+				[InitializeBinding(_, ufcs)]:
+					match main.body:
+						ConcreteValueBody(ReturnExpression(direct)):
+							match argument_integers(ufcs):
+								[7, 9]:
+									match argument_integers(direct):
+										[7, 9]:
+											True
+										_:
+											False
+								_:
+									False
+						_:
+							False
+				_:
+					False
+		_:
+			False
+
+
+pure func test_payload_free_variant_is_a_construct_with_no_arguments() -> Bool:
+	source: String =
+		|union Step:
+		|	Stop
+		|	Once
+		|pure func pick(step: Step) -> Int:
+		|	match step:
+		|		Stop: 0
+		|		Once: 1
+		|func main() -> Int:
+		|	pick(Stop)
+		|
+
+	match fixture(source):
+		Ok([main, _]):
+			match main.body:
+				ConcreteValueBody(ReturnExpression(value)):
+					match value.form:
+						InvokeFunction(_, [stop]):
+							match stop.form:
+								ConstructVariant(_, []):
+									True
+								_:
+									False
+						_:
+							False
+				_:
+					False
+		_:
+			False
+
+
+private OPAQUE_RECORD_CALLS: String =
+	|opaque type Id = Int
+	|record First { value: Int }
+	|record Later { value: Float }
+	|pure func pick(value: First) -> Int:
+	|    value.value
+	|pure func later() -> Later:
+	|    { value = 1.25 }
+	|pure func make(value: Int) -> Id:
+	|    into_opaque Id(value)
+	|
+
+
+private pure func record_call_targets(contents: SpecializedContents, first: ConcreteExpr, later: ConcreteExpr) -> Bool:
+	match (contents.records, target(first), target(later), first.form):
+		([first_record, later_record], Some(first_target), Some(later_target), InvokeFunction(_, [argument])):
+			match (first_record, later_record, argument.form):
+				(InlineFields([IntType]), InlineFields([FloatType]), ConstructRecord(actual, [field])):
+					match (contents.functions.get(first_target), contents.functions.get(later_target), field.value.form):
+						(Some(pick), Some(produce_later), LiteralInteger(7)):
+							match (pick.signature.parameters, pick.signature.return_type, produce_later.signature.return_type):
+								([RecordType(first_owner)], IntType, RecordType(later_owner)):
+									(
+										record_number(actual) == 0 and record_number(first_owner) == 0 and record_number(later_owner) == 1
+									)
+								_: False
+						_: False
+				_: False
+		_: False
+
+
+pure func test_construction_visits_child_types_before_later_layout() -> Bool:
+	body: String =
+		|func main() -> Int:
+		|    first = into_opaque Id(pick({ value = 7 }))
+		|    second = later()
+		|    from_opaque Id(first)
+		|
+	source = OPAQUE_RECORD_CALLS + body
+	match program(source):
+		Err(_): False
+		Ok(contents):
+			match contents.functions.get(function_number(entry_function(contents.entrypoint))):
+				None: False
+				Some(main):
+					match (main.statements, source.index_of("into_opaque Id(pick({ value = 7 }))"), source.index_of("pick({")):
+						([InitializeBinding(_, first), InitializeBinding(_, later)], Some(start), Some(callee)):
+							match first.form:
+								InvokeFunction(call, [_]):
+									(
+										record_call_targets(contents, first, later)
+										and first.span.start == start and first.span.end == start + "into_opaque Id(pick({ value = 7 }))".length()
+										and first.span.source == module_source(root_module_id())
+										and call.span.source == first.span.source and call.span.start == callee and call.span.end == callee + "pick".length()
+									)
+								_: False
+						_: False
+
+
+pure func test_projection_visits_child_types_before_later_layout() -> Bool:
+	body: String =
+		|func main() -> Int:
+		|    first = from_opaque Id(make(pick({ value = 7 })))
+		|    second = later()
+		|    first
+		|
+	source = OPAQUE_RECORD_CALLS + body
+	match program(source):
+		Err(_): False
+		Ok(contents):
+			match contents.functions.get(function_number(entry_function(contents.entrypoint))):
+				None: False
+				Some(main):
+					match (main.statements, source.index_of("from_opaque Id(make(pick({ value = 7 })))"), source.index_of("make(pick({"), source.index_of("pick({")):
+						([InitializeBinding(_, first), InitializeBinding(_, later)], Some(start), Some(callee), Some(inner_callee)):
+							match (first.form, target(first)):
+								(InvokeFunction(call, [inner]), Some(make_target)):
+									match (contents.functions.get(make_target), inner.form):
+										(Some(make), InvokeFunction(inner_call, [_])):
+											match (make.signature.parameters, make.signature.return_type):
+												([IntType], IntType):
+													(
+														record_call_targets(contents, inner, later) and first.value_type == IntType
+														and first.span.start == start and first.span.end == start + "from_opaque Id(make(pick({ value = 7 })))".length()
+														and first.span.source == module_source(root_module_id())
+														and call.span.source == first.span.source and call.span.start == callee and call.span.end == callee + "make".length()
+														and inner_call.span.source == first.span.source and inner_call.span.start == inner_callee and inner_call.span.end == inner_callee + "pick".length()
+													)
+												_: False
+										_: False
+								_: False
+						_: False
+
+
+pure func test_managed_tail_signature_rejects_at_specialization() -> Bool:
+	source: String =
+		|@tail_recursive pure func loop(value: String) -> Int:
+		|	loop(value)
+		|func main() -> Int:
+		|	loop("seed")
+		|
+	match program(source):
+		Ok(_): False
+		Err(error):
+			(
+				error.span.source == module_source(root_module_id())
+				and error.span.start == 0
+				and error.span.end == "@tail_recursive".length()
+				and error.message == "managed values in @tail_recursive functions are not supported yet"
+				and error.help == "use an unmanaged helper, or remove @tail_recursive"
+				and error.note.is_none()
+			)
+
+
+pure func test_tail_admission_checks_managed_child_before_parent() -> Bool:
+	source: String =
+		|pure func wrap(value: String) -> String:
+		|	value
+		|@tail_recursive pure func loop(value: Int) -> Int:
+		|	ignored = wrap("child")
+		|	loop(value)
+		|func main() -> Int:
+		|	loop(0)
+		|
+	match program(source):
+		Ok(_): False
+		Err(error):
+			(
+				error.span.source == module_source(root_module_id())
+				-- The quoted child literal in the source above spans [115, 122).
+				and error.span.start == 115
+				and error.span.end == 122
+				and error.message == "managed values in @tail_recursive functions are not supported yet"
+				and error.help == "use an unmanaged helper, or remove @tail_recursive"
+				and error.note.is_none()
+			)
+
+
+private pure func capture_before_statement() -> Result[Bool, Diagnostic]:
+	source =
+		|union Box:
+		|	Box(String)
+		|pure func inspect(value: Box) -> Int:
+		|	match value:
+		|		Box(payload): 0
+		|func main() -> Int:
+		|	inspect(Box("seed"))
+		|
+	at: Span = { source = module_source(root_module_id()), start = 31, end = 32 }
+	invalid = diagnostic(at, "invalid capture admission fixture", "fix the test input")
+	contents ?= program(source)
+	function ?= contents.functions.get(1).to_result(invalid)
+	value_result = match function.body:
+		ConcreteValueBody(ReturnExpression(value)): Ok(value)
+		_: Err(invalid)
+	value ?= value_result
+	join ?= concrete_tail_join(function.body).to_result(invalid)
+	arm ?= join.arms.get(0).to_result(invalid)
+	capture ?= arm.inputs.get(0).to_result(invalid)
+	position = Checked.binding_number(capture)
+	binding ?= function.bindings.get(position).to_result(invalid)
+	statement = Concrete.DiscardExpression({
+		form = Concrete.LiteralString("later"), value_type = StringType,
+		span = { at | start = 40, end = 41 },
+	})
+	-- A forged scalar signature isolates this pure admission rule; it does not
+	-- claim that checking could construct the raw function below.
+	raw = { function |
+		execution = SelfTailLoop({ at | start = 10, end = 25 }),
+		signature = { parameters = [IntType], return_type = IntType },
+		bindings = function.bindings.set(position, { binding | span = at }),
+		body = ConcreteValueBody(ReturnExpression({ value |
+			form = Concrete.Match({ join | arms = [{ arm | statements = [statement] }] }),
+		})),
+	}
+	result = match admit_scalar_loop(raw, contents.unions, contents.records):
+		Ok(_): False
+		Err(error):
+			(arm.inputs.length() == 1 and join.arms.length() == 1
+			and binding.value_type == StringType
+			and error.span == at
+			and error.message == "managed values in @tail_recursive functions are not supported yet"
+			and error.help == "use an unmanaged helper, or remove @tail_recursive"
+			and error.note.is_none())
+	Ok(result)
+
+
+pure func test_tail_admission_checks_capture_before_arm_statement() -> Bool:
+	capture_before_statement().get_or(False)
+
+-- Raw concrete admission probes preserve the retired runtime-origin checks.
+private pure func scalar_admission_seed() -> ConcreteFunction:
+	{
+		execution = SelfTailLoop(span(90)),
+		signature = { parameters = [IntType, IntType], return_type = IntType },
+		bindings = [], statements = [],
+		body = ConcreteValueBody(Concrete.RecurWith([], span(80)))
+	}
+
+
+private pure func scalar_managed_initializer() -> ConcreteExpr:
+	{
+		form = InvokeFunction({ target = RuntimeFunction(Builtins.IntToString), span = span(30) }, [
+			{ form = LiteralInteger(7), value_type = IntType, span = span(29) },
+		]),
+		value_type = StringType, span = span(30)
+	}
+
+
+private pure func rejects_scalar_admission(function: ConcreteFunction, unions: List[Concrete.ConcreteUnion], at: Int) -> Bool:
+	match admit_scalar_loop(function, unions, []):
+		Ok(_): False
+		Err(error):
+			(
+				error.span == span(at)
+				and error.message == "managed values in @tail_recursive functions are not supported yet"
+				and error.help == "use an unmanaged helper, or remove @tail_recursive"
+				and error.note.is_none()
+			)
+
+
+pure func test_managed_parameter_signature() -> Bool:
+	match input_ids():
+		Err(_): False
+		Ok(ids):
+			original = scalar_admission_seed()
+			rejects_scalar_admission({ original | signature = { original.signature | parameters = [StringType, IntType] } }, ids.unions, 90)
+
+
+pure func test_managed_return_signature() -> Bool:
+	match input_ids():
+		Err(_): False
+		Ok(ids):
+			original = scalar_admission_seed()
+			rejects_scalar_admission({ original | signature = { original.signature | return_type = StringType } }, ids.unions, 90)
+
+
+pure func test_managed_intermediate_even_after_drop() -> Bool:
+	match input_ids():
+		Err(_): False
+		Ok(ids):
+			rejects_scalar_admission({ scalar_admission_seed() | statements = [Concrete.DiscardExpression(scalar_managed_initializer())] }, ids.unions, 30)
+
+
+pure func test_managed_terminal_operand() -> Bool:
+	match input_ids():
+		Err(_): False
+		Ok(ids):
+			rejects_scalar_admission({ scalar_admission_seed() | body = ConcreteValueBody(Concrete.RecurWith([scalar_managed_initializer()], span(80))) }, ids.unions, 30)
+
+
+pure func test_managed_arm_value_already_dropped() -> Bool:
+	match input_ids():
+		Err(_): False
+		Ok(ids):
+			rejects_scalar_admission({ scalar_admission_seed() | body = Concrete.ConcreteMatchBody({
+				scrutinee = { form = ConstructVariant(ids.second_variant, []), value_type = UnionType(ids.union_id), span = span(20) },
+				selection = { nodes = [Concrete.EnterArm(Checked.match_arm_id(0), [])], entry = Checked.decision_node_id(0) },
+				arms = [{ id = Checked.match_arm_id(0), inputs = [], statements = [Concrete.DiscardExpression(scalar_managed_initializer())], body = Concrete.RecurWith([], span(80)) }],
+			}) }, ids.unions, 30)
+
+
+private pure func scalar_carrier_seed() -> Result[SpecializedContents, Diagnostic]:
+	source: String =
+		|union Flag:
+		|    Off
+		|    On
+		|pure func choose(flag: Flag) -> Int:
+		|    var current = 0
+		|    match flag:
+		|        Off: current = 7
+		|        On: void
+		|    current
+		|func main() -> Int:
+		|    choose(Off)
+		|
+	program(source)
+
+
+pure func test_raw_managed_join_carrier_rejects_before_its_arm_operations() -> Bool:
+	match scalar_carrier_seed().map(pure func(contents): (contents.unions, contents.functions)):
+		Ok((unions, [_, function])):
+			match (function.bindings, function.statements):
+				([parameter, carrier], [initialized, Concrete.DiscardExpression(value)]):
+					match value.form:
+						Concrete.Match(join):
+							match join.arms:
+								[first, second]:
+									changed = { first | statements = [Concrete.DiscardExpression({ form = Concrete.LiteralString("arm"), value_type = StringType, span = span(40) })] }
+									rejects_scalar_admission({ function |
+										execution = SelfTailLoop(span(90)),
+										bindings = [parameter, { carrier | value_type = StringType, span = span(31) }],
+										statements = [initialized, Concrete.DiscardExpression({ value | form = Concrete.Match({ join | arms = [changed, second] }) })],
+									}, unions, 31)
+								_: False
+						_: False
+				_: False
+		_: False
+
+
+tests: TestSuite = {
+	description = "Blorp specialization",
+	tests = [
+		("construction visits child types before later layout", test_construction_visits_child_types_before_later_layout),
+		("projection visits child types before later layout", test_projection_visits_child_types_before_later_layout),
+		("raw managed join carrier rejects before its arm operations", test_raw_managed_join_carrier_rejects_before_its_arm_operations),
+		("managed arm value already dropped", test_managed_arm_value_already_dropped),
+		("managed terminal operand", test_managed_terminal_operand),
+		("managed intermediate even after drop", test_managed_intermediate_even_after_drop),
+		("managed return signature", test_managed_return_signature),
+		("managed parameter signature", test_managed_parameter_signature),
+		("tail admission checks captures before arm statements", test_tail_admission_checks_capture_before_arm_statement),
+		("managed tail signature rejects at Specialize", test_managed_tail_signature_rejects_at_specialization),
+		("tail admission checks child before parent", test_tail_admission_checks_managed_child_before_parent),
+		("numeric and Void ownership", test_numeric_and_void_types_have_no_ownership),
+		("String ownership authority", test_string_ownership_is_a_managed_leaf),
+		("String List ownership authority", test_string_list_ownership_is_a_managed_root),
+		(
+			"supported List elements share one root obligation",
+			test_all_supported_list_elements_have_one_managed_root,
+		),
+		("nested numeric records stay inline", test_nested_numeric_records_remain_inline),
+		(
+			"record root retains complete repeated fields",
+			test_string_record_has_one_root_and_complete_repeated_fields,
+		),
+		(
+			"Void record root without owned children",
+			test_void_record_has_a_root_without_owned_children,
+		),
+		(
+			"unmanaged union field needs record root",
+			test_unmanaged_union_field_still_requires_a_record_root,
+		),
+		(
+			"phantom String argument owns no child",
+			test_phantom_string_argument_creates_no_child_obligation,
+		),
+		(
+			"inline union keeps repeated owned fields",
+			test_inline_union_keeps_each_repeated_owned_field,
+		),
+		(
+			"record ownership rejects missing layout",
+			test_record_ownership_query_rejects_missing_layout,
+		),
+		(
+			"union ownership rejects missing layout",
+			test_union_ownership_query_rejects_missing_layout,
+		),
+		("direct and UFCS reuse one instance", test_direct_and_ufcs_reuse_one_instance),
+		(
+			"UFCS chain nests each receiver as the first argument",
+			test_ufcs_chain_nests_each_receiver_as_first_argument,
+		),
+		(
+			"chain node span is the occurrence and the anchor stays on the call",
+			test_chain_node_span_is_the_occurrence_and_the_anchor_stays_on_the_call,
+		),
+		(
+			"direct and UFCS calls share one argument order",
+			test_direct_and_ufcs_calls_share_one_argument_order,
+		),
+		(
+			"payload-free variant is a construct with no arguments",
+			test_payload_free_variant_is_a_construct_with_no_arguments,
+		),
+		(
+			"argument types create complete distinct instances",
+			test_argument_types_create_distinct_complete_instances,
+		),
+		(
+			"forwarded symbolic call maps to concrete callee",
+			test_forwarded_symbolic_call_is_remapped_to_concrete_callee,
+		),
+		(
+			"declarations with same parameter spelling stay distinct",
+			test_declarations_with_same_parameter_spelling_stay_distinct,
+		),
+		(
+			"binding and reassignment types substitute per instance",
+			test_bindings_and_reassignments_are_substituted_per_instance,
+		),
+		("nominal union arguments do not merge", test_nominal_union_arguments_do_not_merge),
+		(
+			"unused functions create no concrete instance",
+			test_unused_functions_create_no_concrete_instance,
+		),
+		(
+			"entrypoint translates original declaration to first instance",
+			test_entrypoint_translates_original_declaration_to_first_instance,
+		),
+		(
+			"rigid return types translate in every match arm",
+			test_rigid_return_types_translate_in_every_match_arm,
+		),
+		(
+			"match scrutinee, statements and results discover generic instances",
+			test_match_scrutinee_assignments_and_results_discover_generic_instances,
+		),
+	]
+}

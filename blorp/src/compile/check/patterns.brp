@@ -1,0 +1,1574 @@
+---
+Typed structural patterns and one ordered pattern matrix. Resolution owns names,
+arity and capture types; matrix specialization owns usefulness and selection.
+Only selectors and canonical body inputs survive checking.
+---
+import:
+    int: Int methods
+    list: repeat, List methods
+    option: Option methods
+    string: String methods
+    ../../syntax/syntax:
+        ParsedPattern(
+            PatternName,
+            PatternWildcard,
+            PatternConstructor,
+            PatternOr,
+            PatternList,
+            PatternLiteral,
+            PatternChar,
+            PatternTuple,
+        ),
+        LiteralPattern(ExactBytes, ExactInt),
+        PatternHead(BareHead, QualifiedHead),
+        SpreadTarget(SpreadName, SpreadWildcard),
+        Span,
+        WrittenName,
+        compiler_span,
+    ../ids: VariantId, UnionId
+    ./callables: ResolutionContext
+    ./constructors: VariantContract, ConstructionContext, ResolutionContext methods
+    ./declarations: occurrence_fields
+    ./errors:
+        CheckError,
+        match_error,
+        checker_invariant,
+        or_checker_invariant,
+        unsupported_form,
+        MatchError(
+            BarePatternName,
+            UnknownConstructorPattern,
+            PatternFieldCountMismatch,
+            UnreachableArm,
+            OrPatternBindingsDiffer,
+            OrPatternBindingTypeMismatch,
+            PatternTypeMismatch,
+            NonExhaustiveMatch,
+            NonExhaustiveStructuralMatch,
+            TuplePatternRequiresTuple,
+            TuplePatternArityMismatch,
+        ),
+        CheckerInvariant(InvalidCheckedUnion, JoinWithoutArms, UnsupportedPatternReachedResolution),
+        UnsupportedForm(CharPattern),
+        PatternWitness(
+            AnyWitness,
+            VariantWitness,
+            EmptyListWitness,
+            ConsListWitness,
+            OtherValueWitness,
+            TupleWitness,
+        ),
+    ./model:
+        BindingDefinition,
+        BindingId,
+        BindingOrigin(MatchCapture),
+        TypeRef(ListType, StringType, TupleType, IntType),
+        TypeUse,
+        UnionOccurrence,
+        CheckedPatternPlace,
+        CheckedPatternRoute(MatchRoot, UnionField, ListElement, RecordField),
+        CheckedPatternArgument(BorrowPlace, CopyListSuffix),
+        CheckedDecisionNode(TestVariant, TestListLength, TestLiteral, EnterArm),
+        ListLengthTest(ExactLength, MinimumLength),
+        CheckedSelection,
+        MatchArmId,
+        DecisionNodeId,
+        match_arm_id,
+        decision_node_id,
+        binding_id,
+    ./scope: ScopedValue, bind_local
+
+
+union Pattern:
+    Anything
+    VariantPattern(VariantId, List[Pattern])
+    TuplePattern(List[Pattern])
+    EmptyListPattern
+    ConsListPattern(PatternChildren)
+    ExactPattern(LiteralPattern)
+
+
+-- Two children cross a managed record edge; direct recursive union payloads
+-- remain unary for the existing boxed-union layout and release chain.
+record PatternChildren { head: Pattern, tail: Pattern }
+
+
+private record Capture { name: WrittenName, value_type: TypeRef, argument: CheckedPatternArgument }
+
+
+-- One normalized pattern row can belong to several nested source alternatives.
+-- Usefulness is existential across those rows, never a claim about one product
+-- combination alone (for example (A | B, C | D) after an earlier (A, C)).
+private record PatternCase { pattern: Pattern, captures: List[Capture], alternatives: List[Int] }
+
+
+private record AlternativeCheck { id: Int, span: Span, rejection: Option[CheckError] }
+
+
+private record ResolvedPattern {
+    cases: List[PatternCase],
+    scope: List[ScopedValue],
+    bindings: List[BindingDefinition],
+    checks: List[AlternativeCheck],
+    next_alternative: Int,
+    pending_failure: Option[CheckError],
+}
+
+
+private union PatternPosition:
+    WholeArm
+    Payload
+
+
+private pure func plain(pattern: Pattern, scope: List[ScopedValue], next: Int) -> ResolvedPattern:
+    {
+        cases = [{ pattern = pattern, captures = [], alternatives = [] }],
+        scope = scope,
+        bindings = [],
+        checks = [],
+        next_alternative = next,
+        pending_failure = None,
+    }
+
+
+private pure func capture(
+    name: WrittenName,
+    value_type: TypeRef,
+    argument: CheckedPatternArgument,
+    scope: List[ScopedValue],
+    ordinal: Int,
+    next: Int,
+    context: ResolutionContext,
+) -> Result[ResolvedPattern, CheckError]:
+    definition: BindingDefinition = {
+        origin = MatchCapture,
+        mutable = False,
+        value_type = value_type,
+        span = name.span,
+    }
+    binding ?= bind_local(
+        scope,
+        context.namespace,
+        context.module,
+        context.caller.body,
+        name,
+        binding_id(ordinal),
+        definition,
+    )
+    Ok({
+        cases = [
+            {
+                pattern = Anything,
+                captures = [{ name = name, value_type = value_type, argument = argument }],
+                alternatives = [],
+            },
+        ],
+        scope = scope.append(binding),
+        bindings = [definition],
+        checks = [],
+        next_alternative = next,
+        pending_failure = None,
+    })
+
+
+private pure func first_captures(cases: List[PatternCase]) -> List[Capture]:
+    match cases.get(0):
+        Some(first): first.captures
+        None: []
+
+
+private pure func capture_agreement(
+    expected: List[Capture],
+    actual: List[Capture],
+    span: Span,
+) -> Option[CheckError]:
+    if expected.length() == actual.length():
+        var failure: Option[CheckError] = None
+        for required in expected:
+            var found: Option[Capture] = None
+            for candidate in actual:
+                if required.name.id == candidate.name.id:
+                    found = Some(candidate)
+                    break
+            match found:
+                None: failure = Some(match_error(span, OrPatternBindingsDiffer))
+                Some(candidate):
+                    match required.value_type == candidate.value_type:
+                        True: void
+                        False:
+                            failure = Some(
+                                match_error(
+                                    candidate.name.span,
+                                    OrPatternBindingTypeMismatch(
+                                        candidate.name.id,
+                                        required.value_type,
+                                        candidate.value_type,
+                                    ),
+                                ),
+                            )
+            if failure.is_some():
+                break
+        failure
+    else:
+        Some(match_error(span, OrPatternBindingsDiffer))
+
+
+private record PatternParts {
+    patterns: List[Pattern],
+    captures: List[Capture],
+    alternatives: List[Int],
+}
+
+
+private record ResolvedFields {
+    parts: List[PatternParts],
+    scope: List[ScopedValue],
+    bindings: List[BindingDefinition],
+    checks: List[AlternativeCheck],
+    next_alternative: Int,
+    pending_failure: Option[CheckError],
+}
+
+
+private pure func resolve_fields(
+    fields: List[ParsedPattern],
+    places: List[CheckedPatternPlace],
+    scope: List[ScopedValue],
+    ordinal: Int,
+    next: Int,
+    context: ResolutionContext,
+) -> Result[ResolvedFields, CheckError]:
+    var parts: List[PatternParts] = [{ patterns = [], captures = [], alternatives = [] }]
+    var field_scope = scope
+    var bindings: List[BindingDefinition] = []
+    var checks: List[AlternativeCheck] = []
+    var cursor = next
+    var position = 0
+    var failure: Option[CheckError] = None
+    for field in fields:
+        match places.get(position):
+            None:
+                failure = Some(
+                    checker_invariant(field.pattern_span(), UnsupportedPatternReachedResolution),
+                )
+            Some(place):
+                match field.resolve_pattern(
+                    place,
+                    Payload,
+                    field_scope,
+                    ordinal + bindings.length(),
+                    cursor,
+                    context,
+                ):
+                    Err(error): failure = Some(error)
+                    Ok(resolved):
+                        var combined: List[PatternParts] = []
+                        for prefix in parts:
+                            for child in resolved.cases:
+                                combined = combined.append({
+                                    patterns = prefix.patterns.append(child.pattern),
+                                    captures = prefix.captures.concat(child.captures),
+                                    alternatives = prefix.alternatives.concat(child.alternatives),
+                                })
+                        parts = combined
+                        field_scope = resolved.scope
+                        bindings = bindings.concat(resolved.bindings)
+                        checks = checks.concat(resolved.checks)
+                        cursor = resolved.next_alternative
+                        failure = resolved.pending_failure
+                        position = position + 1
+        if failure.is_some():
+            break
+    ready ?= checks.earlier_alternatives(failure)
+    -- An unresolved suffix is only a diagnostic context for earlier alternatives.
+    -- The pending failure is returned before any row can enter the selector.
+    var completed: List[PatternParts] = []
+    for part in parts:
+        completed = completed.append(
+            { part |
+                patterns = part.patterns.concat(repeat(Anything, fields.length() - position)),
+            },
+        )
+    Ok({
+        parts = completed,
+        scope = field_scope,
+        bindings = bindings,
+        checks = checks,
+        next_alternative = cursor,
+        pending_failure = failure,
+    })
+
+
+private pure func resolve_variant(
+    contract: VariantContract,
+    fields: List[ParsedPattern],
+    place: CheckedPatternPlace,
+    span: Span,
+    scope: List[ScopedValue],
+    ordinal: Int,
+    next: Int,
+    context: ResolutionContext,
+) -> Result[ResolvedPattern, CheckError]:
+    if contract.fields.length() == fields.length():
+        contract.resolve_variant_fields(fields, place, scope, ordinal, next, context)
+    else:
+        Err(
+            match_error(
+                span,
+                PatternFieldCountMismatch(
+                    contract.variant,
+                    contract.fields.length(),
+                    fields.length(),
+                ),
+            ),
+        )
+
+
+private pure func resolve_variant_fields(
+    contract: VariantContract,
+    fields: List[ParsedPattern],
+    place: CheckedPatternPlace,
+    scope: List[ScopedValue],
+    ordinal: Int,
+    next: Int,
+    context: ResolutionContext,
+) -> Result[ResolvedPattern, CheckError]:
+    var places: List[CheckedPatternPlace] = []
+    var ordinal_field = 0
+    for field in contract.fields:
+        places = places.append({
+            value_type = field.value_type,
+            route = UnionField(place, contract.variant, ordinal_field),
+        })
+        ordinal_field = ordinal_field + 1
+    resolved ?= fields.resolve_fields(places, scope, ordinal, next, context)
+    cases: List[PatternCase] = resolved.parts.map(
+        pure func(part: PatternParts) -> PatternCase: {
+            pattern = VariantPattern(contract.variant, part.patterns),
+            captures = part.captures,
+            alternatives = part.alternatives,
+        },
+    )
+    Ok({
+        cases = cases,
+        scope = resolved.scope,
+        bindings = resolved.bindings,
+        checks = resolved.checks,
+        next_alternative = resolved.next_alternative,
+        pending_failure = resolved.pending_failure,
+    })
+
+
+private pure func resolve_tuple(
+    fields: List[ParsedPattern],
+    span: Span,
+    place: CheckedPatternPlace,
+    scope: List[ScopedValue],
+    ordinal: Int,
+    next: Int,
+    context: ResolutionContext,
+) -> Result[ResolvedPattern, CheckError]:
+    selected: Result[List[TypeRef], CheckError] = match place.value_type:
+        TupleType(elements): Ok(elements)
+        _: Err(match_error(span, TuplePatternRequiresTuple(place.value_type)))
+    types ?= selected
+    _: Void ?= if types.length() == fields.length():
+        Ok(void)
+    else:
+        Err(match_error(span, TuplePatternArityMismatch(types.length(), fields.length())))
+    var places: List[CheckedPatternPlace] = []
+    var position = 0
+    for value_type in types:
+        places = places.append({ value_type = value_type, route = RecordField(place, position) })
+        position = position + 1
+    resolved ?= fields.resolve_fields(places, scope, ordinal, next, context)
+    cases: List[PatternCase] = resolved.parts.map(
+        pure func(part: PatternParts) -> PatternCase: {
+            pattern = TuplePattern(part.patterns),
+            captures = part.captures,
+            alternatives = part.alternatives,
+        },
+    )
+    Ok({
+        cases = cases,
+        scope = resolved.scope,
+        bindings = resolved.bindings,
+        checks = resolved.checks,
+        next_alternative = resolved.next_alternative,
+        pending_failure = resolved.pending_failure,
+    })
+
+
+private pure func resolve_name(
+    name: WrittenName,
+    place: CheckedPatternPlace,
+    position: PatternPosition,
+    scope: List[ScopedValue],
+    ordinal: Int,
+    next: Int,
+    context: ResolutionContext,
+) -> Result[ResolvedPattern, CheckError]:
+    match place.value_type.union_occurrence():
+        Some(occurrence):
+            match context.construction_context().find_variant(occurrence, name):
+                Err(error): Err(error)
+                Ok(Some(contract)):
+                    contract.resolve_variant([], place, name.span, scope, ordinal, next, context)
+                Ok(None): name.resolve_capture_name(place, position, scope, ordinal, next, context)
+        None: name.resolve_capture_name(place, position, scope, ordinal, next, context)
+
+
+private pure func resolve_capture_name(
+    name: WrittenName,
+    place: CheckedPatternPlace,
+    position: PatternPosition,
+    scope: List[ScopedValue],
+    ordinal: Int,
+    next: Int,
+    context: ResolutionContext,
+) -> Result[ResolvedPattern, CheckError]:
+    match position:
+        WholeArm: Err(match_error(name.span, BarePatternName(name.id, place.value_type)))
+        Payload: capture(name, place.value_type, BorrowPlace(place), scope, ordinal, next, context)
+
+
+private pure func resolve_constructor(
+    head: PatternHead,
+    fields: List[ParsedPattern],
+    span: Span,
+    place: CheckedPatternPlace,
+    scope: List[ScopedValue],
+    ordinal: Int,
+    next: Int,
+    context: ResolutionContext,
+) -> Result[ResolvedPattern, CheckError]:
+    occurrence: UnionOccurrence ?= match place.value_type.union_occurrence():
+        Some(present): Ok(present)
+        None: Err(match_error(span, PatternTypeMismatch(place.value_type)))
+    found: Result[Option[VariantContract], CheckError] = match head:
+        BareHead(name): context.construction_context().find_variant(occurrence, name)
+        QualifiedHead(name): context.construction_context().find_qualified_variant(occurrence, name)
+    contract ?= found
+    match contract:
+        Some(resolved): resolved.resolve_variant(fields, place, span, scope, ordinal, next, context)
+        None:
+            name = match head:
+                BareHead(written): written.id
+                QualifiedHead(written): written.name.id
+            Err(match_error(span, UnknownConstructorPattern(name, place.value_type)))
+
+
+private pure func resolve_alternatives(
+    alternatives: List[ParsedPattern],
+    place: CheckedPatternPlace,
+    position: PatternPosition,
+    scope: List[ScopedValue],
+    ordinal: Int,
+    next: Int,
+    context: ResolutionContext,
+) -> Result[ResolvedPattern, CheckError]:
+    var first: Option[ResolvedPattern] = None
+    var cases: List[PatternCase] = []
+    var checks: List[AlternativeCheck] = []
+    var cursor = next
+    var failure: Option[CheckError] = None
+    for alternative in alternatives:
+        id = cursor
+        match alternative.resolve_pattern(place, position, scope, ordinal, cursor + 1, context):
+            Err(error): failure = Some(error)
+            Ok(resolved):
+                match resolved.pending_failure:
+                    None:
+                        rejection: Option[CheckError] = match first:
+                            None: None
+                            Some(canonical):
+                                canonical.cases
+                                    .first_captures()
+                                    .capture_agreement(
+                                        resolved.cases.first_captures(),
+                                        alternative.pattern_span(),
+                                    )
+                        checks = checks.append({
+                            id = id,
+                            span = alternative.pattern_span(),
+                            rejection = rejection,
+                        })
+                    Some(_): void
+                checks = checks.concat(resolved.checks)
+                for branch in resolved.cases:
+                    cases = cases.append(
+                        { branch | alternatives = [id].concat(branch.alternatives) },
+                    )
+                cursor = resolved.next_alternative
+                failure = resolved.pending_failure
+                if first.is_none():
+                    first = Some(resolved)
+        if failure.is_some():
+            break
+    ready ?= checks.earlier_alternatives(failure)
+    canonical ?= first.or_checker_invariant(pattern_span_fallback(alternatives), JoinWithoutArms)
+    Ok({
+        cases = cases,
+        scope = canonical.scope,
+        bindings = canonical.bindings,
+        checks = checks,
+        next_alternative = cursor,
+        pending_failure = failure,
+    })
+
+
+-- Keep source-ordered alternative diagnostics ahead of a later resolution
+-- failure. Without earlier alternatives, resolution errors still return directly.
+private pure func earlier_alternatives(
+    checks: List[AlternativeCheck],
+    failure: Option[CheckError],
+) -> Result[Void, CheckError]:
+    match failure:
+        Some(error):
+            if checks.is_empty():
+                Err(error)
+            else:
+                Ok(void)
+        None: Ok(void)
+
+
+private pure func pattern_span_fallback(patterns: List[ParsedPattern]) -> Span:
+    match patterns.get(0):
+        Some(pattern): pattern.pattern_span()
+        None: compiler_span()
+
+
+private pure func list_shape(patterns: List[Pattern], tail: Pattern) -> Pattern:
+    var shape = tail
+    for head in patterns.reverse():
+        shape = ConsListPattern({ head = head, tail = shape })
+    shape
+
+
+private pure func resolve_list(
+    fields: List[ParsedPattern],
+    rest: Option[SpreadTarget],
+    span: Span,
+    place: CheckedPatternPlace,
+    scope: List[ScopedValue],
+    ordinal: Int,
+    next: Int,
+    context: ResolutionContext,
+) -> Result[ResolvedPattern, CheckError]:
+    match place.value_type:
+        ListType(element):
+            fields.resolve_list_elements(rest, place, element, scope, ordinal, next, context)
+        _: Err(match_error(span, PatternTypeMismatch(place.value_type)))
+
+
+private pure func resolve_list_elements(
+    fields: List[ParsedPattern],
+    rest: Option[SpreadTarget],
+    place: CheckedPatternPlace,
+    element: TypeRef,
+    scope: List[ScopedValue],
+    ordinal: Int,
+    next: Int,
+    context: ResolutionContext,
+) -> Result[ResolvedPattern, CheckError]:
+    var places: List[CheckedPatternPlace] = []
+    var index = 0
+    for field in fields:
+        places = places.append({ value_type = element, route = ListElement(place, index) })
+        index = index + 1
+    resolved ?= fields.resolve_fields(places, scope, ordinal, next, context)
+    tail ?= rest.resolve_list_tail(place, fields.length(), resolved, ordinal, context)
+    var cases: List[PatternCase] = []
+    for part in resolved.parts:
+        for ending in tail.cases:
+            cases = cases.append({
+                pattern = list_shape(part.patterns, ending.pattern),
+                captures = part.captures.concat(ending.captures),
+                alternatives = part.alternatives.concat(ending.alternatives),
+            })
+    Ok({
+        cases = cases,
+        scope = tail.scope,
+        bindings = resolved.bindings.concat(tail.bindings),
+        checks = resolved.checks.concat(tail.checks),
+        next_alternative = tail.next_alternative,
+        pending_failure = tail.pending_failure,
+    })
+
+
+private pure func resolve_list_tail(
+    rest: Option[SpreadTarget],
+    place: CheckedPatternPlace,
+    skip: Int,
+    resolved: ResolvedFields,
+    ordinal: Int,
+    context: ResolutionContext,
+) -> Result[ResolvedPattern, CheckError]:
+    shape: Pattern = match rest:
+        None: EmptyListPattern
+        Some(_): Anything
+    fallback = plain(shape, resolved.scope, resolved.next_alternative)
+    match resolved.pending_failure:
+        Some(error): Ok({ fallback | pending_failure = Some(error) })
+        None:
+            match rest:
+                Some(SpreadName(name)):
+                    name.resolve_list_capture(place, skip, resolved, ordinal, context)
+                _: Ok(fallback)
+
+
+private pure func resolve_list_capture(
+    name: WrittenName,
+    place: CheckedPatternPlace,
+    skip: Int,
+    resolved: ResolvedFields,
+    ordinal: Int,
+    context: ResolutionContext,
+) -> Result[ResolvedPattern, CheckError]:
+    match capture(
+        name,
+        place.value_type,
+        CopyListSuffix(place, skip),
+        resolved.scope,
+        ordinal + resolved.bindings.length(),
+        resolved.next_alternative,
+        context,
+    ):
+        Ok(tail): Ok(tail)
+        Err(error): error.defer_list_capture(resolved)
+
+
+private pure func defer_list_capture(
+    error: CheckError,
+    resolved: ResolvedFields,
+) -> Result[ResolvedPattern, CheckError]:
+    ready ?= resolved.checks.earlier_alternatives(Some(error))
+    fallback = plain(Anything, resolved.scope, resolved.next_alternative)
+    Ok({ fallback | pending_failure = Some(error) })
+
+
+private pure func resolve_pattern(
+    pattern: ParsedPattern,
+    place: CheckedPatternPlace,
+    position: PatternPosition,
+    scope: List[ScopedValue],
+    ordinal: Int,
+    next: Int,
+    context: ResolutionContext,
+) -> Result[ResolvedPattern, CheckError]:
+    match pattern:
+        PatternTuple(fields, span): fields.resolve_tuple(span, place, scope, ordinal, next, context)
+        PatternWildcard(_): Ok(plain(Anything, scope, next))
+        PatternName(name): name.resolve_name(place, position, scope, ordinal, next, context)
+        PatternConstructor(head, fields, span):
+            head.resolve_constructor(fields, span, place, scope, ordinal, next, context)
+        PatternOr(alternatives, _):
+            alternatives.resolve_alternatives(place, position, scope, ordinal, next, context)
+        PatternList(fields, rest, span):
+            fields.resolve_list(rest, span, place, scope, ordinal, next, context)
+        PatternLiteral(literal, span):
+            if literal.fits(place.value_type):
+                Ok(plain(ExactPattern(literal), scope, next))
+            else:
+                Err(match_error(span, PatternTypeMismatch(place.value_type)))
+        PatternChar(span): Err(unsupported_form(span, CharPattern))
+
+
+-- The value type each literal kind compares with. Verify keeps its own copy,
+-- because its concrete TypeRef is a different union.
+private pure func fits(literal: LiteralPattern, value_type: TypeRef) -> Bool:
+    match literal:
+        ExactBytes(_): value_type == StringType
+        ExactInt(_): value_type == IntType
+
+
+pure func unsupported_pattern_form(pattern: ParsedPattern) -> Option[CheckError]:
+    match pattern:
+        PatternChar(span): Some(unsupported_form(span, CharPattern))
+        PatternConstructor(_, fields, _): fields.unsupported_children()
+        PatternOr(fields, _): fields.unsupported_children()
+        PatternTuple(fields, _): fields.unsupported_children()
+        PatternList(fields, _, _): fields.unsupported_children()
+        _: None
+
+
+private pure func unsupported_children(patterns: List[ParsedPattern]) -> Option[CheckError]:
+    var failure: Option[CheckError] = None
+    for child in patterns:
+        if failure.is_none():
+            failure = child.unsupported_pattern_form()
+    failure
+
+
+pure func supports_root(value_type: TypeRef) -> Bool:
+    match value_type.union_occurrence():
+        Some(_): True
+        None:
+            match value_type:
+                ListType(_) | StringType | TupleType(_) | IntType: True
+                _: False
+
+
+private union PatternCursor:
+    ValueCursor(CheckedPatternPlace)
+    ListCursor(CheckedPatternPlace, Int)
+
+
+private union Head:
+    UnionHead(VariantId, List[TypeRef])
+    TupleHead(List[TypeRef])
+    NilHead
+    ConsHead(TypeRef)
+    LiteralHead(LiteralPattern)
+
+
+-- An open domain has more values than any list of literals names, so only a
+-- catch-all covers it; a scalar domain is matched by binders and `_` alone.
+private union ColumnDomain:
+    ClosedDomain(List[Head])
+    OpenDomain
+    ScalarDomain
+
+
+private record Column { cursor: PatternCursor, domain: ColumnDomain }
+
+
+-- The scrutinee's root domain is fixed before checking any source arm.
+-- Keep that one fact through usefulness, coverage and selector construction.
+opaque type PatternSubject = Column
+
+
+pure func prepare_subject(
+    value_type: TypeRef,
+    context: ResolutionContext,
+    span: Span,
+) -> Result[PatternSubject, CheckError]:
+    place: CheckedPatternPlace = { value_type = value_type, route = MatchRoot }
+    root ?= place.column(ValueCursor(place), context, span)
+    Ok(into_opaque PatternSubject(root))
+
+
+record PatternRow {
+    arm: MatchArmId,
+    patterns: List[Pattern],
+    arguments: List[CheckedPatternArgument],
+}
+
+
+private pure func column(
+    place: CheckedPatternPlace,
+    cursor: PatternCursor,
+    context: ResolutionContext,
+    span: Span,
+) -> Result[Column, CheckError]:
+    match place.value_type.union_occurrence():
+        Some(occurrence): place.union_column(cursor, occurrence, context, span)
+        None:
+            domain: ColumnDomain = match place.value_type:
+                TupleType(elements): ClosedDomain([TupleHead(elements)])
+                ListType(element): ClosedDomain([NilHead, ConsHead(element)])
+                StringType | IntType: OpenDomain
+                _: ScalarDomain
+            Ok({ cursor = cursor, domain = domain })
+
+
+private pure func union_column(
+    place: CheckedPatternPlace,
+    cursor: PatternCursor,
+    occurrence: UnionOccurrence,
+    context: ResolutionContext,
+    span: Span,
+) -> Result[Column, CheckError]:
+    declaration ?= context.unions
+        .get(occurrence.owner.union_number())
+        .or_checker_invariant(span, InvalidCheckedUnion(occurrence.owner))
+    var heads: List[Head] = []
+    var failure: Option[CheckError] = None
+    for variant in declaration.variants:
+        match variant.fields.occurrence_fields(occurrence):
+            Ok(fields):
+                heads = heads.append(
+                    UnionHead(variant.id, fields.map(pure func(field): field.value_type)),
+                )
+            Err(error):
+                failure = Some(error)
+                break
+    _: Void ?= match failure:
+        Some(error): Err(error)
+        None: Ok(void)
+    Ok({ cursor = cursor, domain = ClosedDomain(heads) })
+
+
+private pure func same_head(left: Head, right: Head) -> Bool:
+    match left:
+        UnionHead(id, _):
+            match right:
+                UnionHead(other, _): id == other
+                _: False
+        TupleHead(_):
+            match right:
+                TupleHead(_): True
+                _: False
+        NilHead:
+            match right:
+                NilHead: True
+                _: False
+        ConsHead(_):
+            match right:
+                ConsHead(_): True
+                _: False
+        LiteralHead(literal):
+            match right:
+                LiteralHead(other): literal == other
+                _: False
+
+
+private pure func arity(head: Head) -> Int:
+    match head:
+        UnionHead(_, fields): fields.length()
+        TupleHead(fields): fields.length()
+        ConsHead(_): 2
+        NilHead | LiteralHead(_): 0
+
+
+private pure func pattern_head(pattern: Pattern, domain: ColumnDomain) -> Option[Head]:
+    match pattern:
+        Anything: None
+        EmptyListPattern: Some(NilHead)
+        ExactPattern(literal): Some(LiteralHead(literal))
+        TuplePattern(_):
+            match domain:
+                ClosedDomain([head]): Some(head)
+                _: None
+        ConsListPattern(_):
+            match domain:
+                ClosedDomain(heads): heads.find(pure func(head): head.is_cons())
+                _: None
+        VariantPattern(id, _):
+            match domain:
+                ClosedDomain(heads): heads.find(pure func(head): head.has_variant(id))
+                _: None
+
+
+private pure func is_cons(head: Head) -> Bool:
+    match head:
+        ConsHead(_): True
+        _: False
+
+
+private pure func has_variant(head: Head, id: VariantId) -> Bool:
+    match head:
+        UnionHead(variant, _): variant == id
+        _: False
+
+
+private pure func children(pattern: Pattern, head: Head) -> List[Pattern]:
+    match pattern:
+        Anything: repeat(Anything, head.arity())
+        VariantPattern(_, fields): fields
+        TuplePattern(fields): fields
+        ConsListPattern(parts): [parts.head, parts.tail]
+        EmptyListPattern | ExactPattern(_): []
+
+
+private pure func matches_head(pattern: Pattern, head: Head) -> Bool:
+    match pattern:
+        Anything: True
+        TuplePattern(_):
+            match head:
+                TupleHead(_): True
+                _: False
+        VariantPattern(id, _): head.has_variant(id)
+        ConsListPattern(_): head.is_cons()
+        EmptyListPattern:
+            match head:
+                NilHead: True
+                _: False
+        ExactPattern(literal):
+            match head:
+                LiteralHead(other): literal == other
+                _: False
+
+
+private pure func specialize_rows(rows: List[PatternRow], head: Head) -> List[PatternRow]:
+    var specialized: List[PatternRow] = []
+    for row in rows:
+        match row.patterns:
+            [first, ...rest]:
+                if first.matches_head(head):
+                    specialized = specialized.append(
+                        { row | patterns = first.children(head).concat(rest) },
+                    )
+            []: void
+    specialized
+
+
+private pure func default_rows(rows: List[PatternRow]) -> List[PatternRow]:
+    var defaults: List[PatternRow] = []
+    for row in rows:
+        match row.patterns:
+            [Anything, ...rest]: defaults = defaults.append({ row | patterns = rest })
+            _: void
+    defaults
+
+
+private pure func excluding_rows(rows: List[PatternRow], head: Head) -> List[PatternRow]:
+    var defaults: List[PatternRow] = []
+    for row in rows:
+        match row.patterns:
+            [Anything, ...rest]: defaults = defaults.append(row)
+            [first, ...rest]:
+                match first.matches_head(head):
+                    True: void
+                    False: defaults = defaults.append(row)
+            []: void
+    defaults
+
+
+private pure func root_place(cursor: PatternCursor) -> CheckedPatternPlace:
+    match cursor:
+        ValueCursor(place): place
+        ListCursor(place, _): place
+
+
+private pure func list_skip(cursor: PatternCursor) -> Int:
+    match cursor:
+        ValueCursor(_): 0
+        ListCursor(_, skipped): skipped
+
+
+private pure func child_columns(
+    parent: Column,
+    head: Head,
+    context: ResolutionContext,
+    span: Span,
+) -> Result[List[Column], CheckError]:
+    place = parent.cursor.root_place()
+    match head:
+        UnionHead(id, fields):
+            fields.field_columns(
+                pure func(ordinal: Int) -> CheckedPatternRoute: UnionField(place, id, ordinal),
+                context,
+                span,
+            )
+        TupleHead(fields):
+            fields.field_columns(
+                pure func(ordinal: Int) -> CheckedPatternRoute: RecordField(place, ordinal),
+                context,
+                span,
+            )
+        ConsHead(element):
+            place.list_child_columns(parent.cursor.list_skip(), element, context, span)
+        NilHead | LiteralHead(_): Ok([])
+
+
+-- One column per field; `route` names where the field at an ordinal sits.
+private pure func field_columns(
+    fields: List[TypeRef],
+    route: pure (Int) -> CheckedPatternRoute,
+    context: ResolutionContext,
+    span: Span,
+) -> Result[List[Column], CheckError]:
+    var columns: List[Column] = []
+    var ordinal = 0
+    var failure: Option[CheckError] = None
+    for value_type in fields:
+        place: CheckedPatternPlace = { value_type = value_type, route = route(ordinal) }
+        match place.column(ValueCursor(place), context, span):
+            Ok(child): columns = columns.append(child)
+            Err(error):
+                failure = Some(error)
+                break
+        ordinal = ordinal + 1
+    _: Void ?= match failure:
+        Some(error): Err(error)
+        None: Ok(void)
+    Ok(columns)
+
+
+private pure func list_child_columns(
+    parent: CheckedPatternPlace,
+    skipped: Int,
+    element: TypeRef,
+    context: ResolutionContext,
+    span: Span,
+) -> Result[List[Column], CheckError]:
+    place: CheckedPatternPlace = { value_type = element, route = ListElement(parent, skipped) }
+    first ?= place.column(ValueCursor(place), context, span)
+    rest: Column = {
+        cursor = ListCursor(parent, skipped + 1),
+        domain = ClosedDomain([NilHead, ConsHead(element)]),
+    }
+    Ok([first, rest])
+
+
+private pure func wrap_witness(head: Head, witnesses: List[PatternWitness]) -> List[PatternWitness]:
+    fields = witnesses.take(head.arity())
+    rest = witnesses.drop(head.arity())
+    witness: PatternWitness = match head:
+        UnionHead(id, _): VariantWitness(id, fields)
+        TupleHead(_): TupleWitness(fields)
+        NilHead: EmptyListWitness
+        ConsHead(_):
+            match fields:
+                [first, tail]: ConsListWitness({ head = first, tail = tail })
+                _: AnyWitness
+        LiteralHead(_): OtherValueWitness
+    [witness].concat(rest)
+
+
+-- Maranget's usefulness recurrence and selector construction below share the
+-- same typed columns and row-specialization operations. Open literal columns
+-- use their wildcard default; finite union and Nil/Cons domains enumerate.
+private pure func pattern_witness(pattern: Pattern) -> PatternWitness:
+    match pattern:
+        Anything: AnyWitness
+        VariantPattern(id, fields): VariantWitness(id, fields.map(pattern_witness))
+        TuplePattern(fields): TupleWitness(fields.map(pattern_witness))
+        EmptyListPattern: EmptyListWitness
+        ConsListPattern(parts):
+            ConsListWitness({
+                head = parts.head.pattern_witness(),
+                tail = parts.tail.pattern_witness(),
+            })
+        ExactPattern(_): OtherValueWitness
+
+
+private pure func row_is_irrefutable(row: PatternRow) -> Bool:
+    row.patterns.all(is_any)
+
+
+private pure func row_starts_any(row: PatternRow) -> Bool:
+    match row.patterns:
+        [Anything, ...rest]: True
+        _: False
+
+
+private pure func useful(
+    rows: List[PatternRow],
+    candidate: List[Pattern],
+    columns: List[Column],
+    context: ResolutionContext,
+    span: Span,
+) -> Result[Option[List[PatternWitness]], CheckError]:
+    if rows.any(row_is_irrefutable):
+        Ok(None)
+    else if rows.is_empty():
+        Ok(Some(candidate.map(pattern_witness)))
+    else if rows.all(row_starts_any):
+        rows.useful_unconstrained(candidate, columns, context, span)
+    else:
+        rows.useful_nonempty(candidate, columns, context, span)
+
+
+private pure func useful_unconstrained(
+    rows: List[PatternRow],
+    candidate: List[Pattern],
+    columns: List[Column],
+    context: ResolutionContext,
+    span: Span,
+) -> Result[Option[List[PatternWitness]], CheckError]:
+    first ?= candidate.get(0).or_checker_invariant(span, UnsupportedPatternReachedResolution)
+    result ?= rows.default_rows().useful(candidate.drop(1), columns.drop(1), context, span)
+    match result:
+        Some(witness): Ok(Some([first.pattern_witness()].concat(witness)))
+        None: Ok(None)
+
+
+private pure func useful_nonempty(
+    rows: List[PatternRow],
+    candidate: List[Pattern],
+    columns: List[Column],
+    context: ResolutionContext,
+    span: Span,
+) -> Result[Option[List[PatternWitness]], CheckError]:
+    match candidate:
+        []:
+            match columns:
+                []:
+                    if rows.is_empty():
+                        Ok(Some([]))
+                    else:
+                        Ok(None)
+                _: Err(checker_invariant(span, UnsupportedPatternReachedResolution))
+        [first, ...rest]:
+            match columns:
+                []: Err(checker_invariant(span, UnsupportedPatternReachedResolution))
+                [current, ...following]:
+                    match first:
+                        Anything: rows.useful_wildcard(rest, current, following, context, span)
+                        _:
+                            match first.pattern_head(current.domain):
+                                None: Ok(None)
+                                Some(head):
+                                    rows.useful_head(
+                                        first.children(head).concat(rest),
+                                        current,
+                                        following,
+                                        head,
+                                        context,
+                                        span,
+                                    )
+
+
+private pure func useful_head(
+    rows: List[PatternRow],
+    candidate: List[Pattern],
+    current: Column,
+    following: List[Column],
+    head: Head,
+    context: ResolutionContext,
+    span: Span,
+) -> Result[Option[List[PatternWitness]], CheckError]:
+    fields ?= current.child_columns(head, context, span)
+    result ?= rows.specialize_rows(head).useful(candidate, fields.concat(following), context, span)
+    match result:
+        Some(witness): Ok(Some(wrap_witness(head, witness)))
+        None: Ok(None)
+
+
+private pure func useful_wildcard(
+    rows: List[PatternRow],
+    candidate: List[Pattern],
+    current: Column,
+    following: List[Column],
+    context: ResolutionContext,
+    span: Span,
+) -> Result[Option[List[PatternWitness]], CheckError]:
+    match current.domain:
+        ClosedDomain(heads): rows.useful_closed(candidate, current, following, heads, context, span)
+        OpenDomain: rows.useful_default(candidate, following, OtherValueWitness, context, span)
+        ScalarDomain: rows.useful_default(candidate, following, AnyWitness, context, span)
+
+
+private pure func useful_default(
+    rows: List[PatternRow],
+    candidate: List[Pattern],
+    columns: List[Column],
+    first: PatternWitness,
+    context: ResolutionContext,
+    span: Span,
+) -> Result[Option[List[PatternWitness]], CheckError]:
+    result ?= rows.default_rows().useful(candidate, columns, context, span)
+    match result:
+        Some(witness): Ok(Some([first].concat(witness)))
+        None: Ok(None)
+
+
+private pure func useful_closed(
+    rows: List[PatternRow],
+    candidate: List[Pattern],
+    current: Column,
+    following: List[Column],
+    heads: List[Head],
+    context: ResolutionContext,
+    span: Span,
+) -> Result[Option[List[PatternWitness]], CheckError]:
+    match heads:
+        []: Ok(None)
+        [head, ...rest]:
+            rows.useful_closed_first(candidate, current, following, head, rest, context, span)
+
+
+private pure func useful_closed_first(
+    rows: List[PatternRow],
+    candidate: List[Pattern],
+    current: Column,
+    following: List[Column],
+    head: Head,
+    rest: List[Head],
+    context: ResolutionContext,
+    span: Span,
+) -> Result[Option[List[PatternWitness]], CheckError]:
+    result ?= rows.useful_head(
+        repeat(Anything, head.arity()).concat(candidate),
+        current,
+        following,
+        head,
+        context,
+        span,
+    )
+    match result:
+        Some(witness): Ok(Some(witness))
+        None: rows.useful_closed(candidate, current, following, rest, context, span)
+
+
+private pure func ordered_arguments(
+    required: List[Capture],
+    actual: List[Capture],
+    span: Span,
+) -> Result[List[CheckedPatternArgument], CheckError]:
+    var arguments: List[CheckedPatternArgument] = []
+    var failure: Option[CheckError] = None
+    for required_capture in required:
+        var found: Option[CheckedPatternArgument] = None
+        for candidate in actual:
+            if required_capture.name.id == candidate.name.id:
+                found = Some(candidate.argument)
+                break
+        match found:
+            Some(argument): arguments = arguments.append(argument)
+            None: failure = Some(match_error(span, OrPatternBindingsDiffer))
+        if failure.is_some():
+            break
+    _: Void ?= match failure:
+        Some(error): Err(error)
+        None: Ok(void)
+    Ok(arguments)
+
+
+record ResolvedArmPattern {
+    rows: List[PatternRow],
+    scope: List[ScopedValue],
+    bindings: List[BindingDefinition],
+    inputs: List[BindingId],
+}
+
+
+pure func resolve_arm(
+    pattern: ParsedPattern,
+    subject: PatternSubject,
+    scope: List[ScopedValue],
+    ordinal: Int,
+    arm: MatchArmId,
+    previous: List[PatternRow],
+    context: ResolutionContext,
+) -> Result[ResolvedArmPattern, CheckError]:
+    root = from_opaque PatternSubject(subject)
+    resolved ?= pattern.resolve_pattern(
+        root.cursor.root_place(),
+        WholeArm,
+        scope,
+        ordinal,
+        0,
+        context,
+    )
+    accepted ?= resolved.useful_cases(previous, root, arm, context, pattern.pattern_span())
+    var inputs: List[BindingId] = []
+    var position = ordinal
+    for definition in resolved.bindings:
+        inputs = inputs.append(binding_id(position))
+        position = position + 1
+    Ok({ rows = accepted, scope = resolved.scope, bindings = resolved.bindings, inputs = inputs })
+
+
+private pure func useful_cases(
+    resolved: ResolvedPattern,
+    previous: List[PatternRow],
+    root: Column,
+    arm: MatchArmId,
+    context: ResolutionContext,
+    span: Span,
+) -> Result[List[PatternRow], CheckError]:
+    var rows = previous
+    var accepted: List[PatternRow] = []
+    var reached: List[Int] = []
+    var any_useful: Bool = False
+    var failure: Option[CheckError] = None
+    for candidate in resolved.cases:
+        match rows.useful([candidate.pattern], [root], context, span):
+            Err(error): failure = Some(error)
+            Ok(witness):
+                if witness.is_some():
+                    any_useful = True
+                    reached = reached.concat(candidate.alternatives)
+                -- Arguments are ordered only after compatibility diagnostics below.
+                row: PatternRow = { arm = arm, patterns = [candidate.pattern], arguments = [] }
+                rows = rows.append(row)
+        if failure.is_some():
+            break
+    _: Void ?= match failure:
+        Some(error): Err(error)
+        None: Ok(void)
+    checked ?= resolved.checks.check_alternatives(reached)
+    _: Void ?= match resolved.pending_failure:
+        Some(error): Err(error)
+        None: Ok(void)
+    _: Void ?= if any_useful:
+        Ok(void)
+    else:
+        Err(match_error(span, UnreachableArm))
+    var arguments_failure: Option[CheckError] = None
+    for candidate in resolved.cases:
+        match resolved.cases.first_captures().ordered_arguments(candidate.captures, span):
+            Ok(arguments):
+                accepted = accepted.append({
+                    arm = arm,
+                    patterns = [candidate.pattern],
+                    arguments = arguments,
+                })
+            Err(error):
+                arguments_failure = Some(error)
+                break
+    _: Void ?= match arguments_failure:
+        Some(error): Err(error)
+        None: Ok(void)
+    Ok(accepted)
+
+
+private pure func check_alternatives(
+    checks: List[AlternativeCheck],
+    reached: List[Int],
+) -> Result[Void, CheckError]:
+    var failure: Option[CheckError] = None
+    for check in checks:
+        var alternative_useful: Bool = False
+        for known in reached:
+            if known == check.id:
+                alternative_useful = True
+        if alternative_useful:
+            failure = check.rejection
+        else:
+            failure = Some(match_error(check.span, UnreachableArm))
+        if failure.is_some():
+            break
+    match failure:
+        Some(error): Err(error)
+        None: Ok(void)
+
+
+private pure func is_any(pattern: Pattern) -> Bool:
+    match pattern:
+        Anything: True
+        _: False
+
+
+private pure func structural_column(patterns: List[Pattern]) -> Int:
+    var ordinal = 0
+    for pattern in patterns:
+        match pattern:
+            Anything: ordinal = ordinal + 1
+            _: break
+    ordinal
+
+
+private pure func move_first[T](values: List[T], position: Int) -> List[T]:
+    if position == 0:
+        values
+    else:
+        match values.get(position):
+            None: values
+            Some(selected):
+                var reordered = [selected]
+                var ordinal = 0
+                for value in values:
+                    if ordinal != position:
+                        reordered = reordered.append(value)
+                    ordinal = ordinal + 1
+                reordered
+
+
+private pure func move_rows(rows: List[PatternRow], position: Int) -> List[PatternRow]:
+    if position == 0:
+        rows
+    else:
+        rows.map(
+            pure func(row: PatternRow) -> PatternRow: { row |
+                patterns = row.patterns.move_first(position),
+            },
+        )
+
+
+private pure func different_head(left: Head, right: Head) -> Bool:
+    match left.same_head(right):
+        True: False
+        False: True
+
+
+private pure func exclude_head(current: Column, head: Head) -> Column:
+    match current.domain:
+        ClosedDomain(heads):
+            remaining = heads.filter(pure func(known): known.different_head(head))
+            { current | domain = ClosedDomain(remaining) }
+        OpenDomain | ScalarDomain: current
+
+
+private pure func compile_rows(
+    rows: List[PatternRow],
+    columns: List[Column],
+    nodes: List[CheckedDecisionNode],
+    context: ResolutionContext,
+    span: Span,
+) -> Result[CheckedSelection, CheckError]:
+    first ?= rows.get(0).or_checker_invariant(span, JoinWithoutArms)
+    if first.patterns.all(is_any):
+        Ok({
+            nodes = nodes.append(EnterArm(first.arm, first.arguments)),
+            entry = decision_node_id(nodes.length()),
+        })
+    else:
+        rows.compile_structural(columns, nodes, first.patterns, context, span)
+
+
+private pure func compile_structural(
+    rows: List[PatternRow],
+    columns: List[Column],
+    nodes: List[CheckedDecisionNode],
+    patterns: List[Pattern],
+    context: ResolutionContext,
+    span: Span,
+) -> Result[CheckedSelection, CheckError]:
+    position = patterns.structural_column()
+    ordered = rows.move_rows(position)
+    columns_ordered = columns.move_first(position)
+    current ?= columns_ordered
+        .get(0)
+        .or_checker_invariant(span, UnsupportedPatternReachedResolution)
+    pattern ?= patterns
+        .get(position)
+        .or_checker_invariant(span, UnsupportedPatternReachedResolution)
+    head ?= pattern
+        .pattern_head(current.domain)
+        .or_checker_invariant(span, UnsupportedPatternReachedResolution)
+    following = columns_ordered.drop(1)
+    fields ?= current.child_columns(head, context, span)
+    match current.domain:
+        ClosedDomain([_]):
+            ordered
+                .specialize_rows(head)
+                .compile_rows(fields.concat(following), nodes, context, span)
+        _: ordered.compile_split(current, following, fields, head, nodes, context, span)
+
+
+private pure func compile_split(
+    rows: List[PatternRow],
+    current: Column,
+    following: List[Column],
+    fields: List[Column],
+    head: Head,
+    nodes: List[CheckedDecisionNode],
+    context: ResolutionContext,
+    span: Span,
+) -> Result[CheckedSelection, CheckError]:
+    -- False successors are issued first, preserving the established flat selector
+    -- numbering. Both submatrices describe inhabited, exhaustive domains.
+    no ?= rows
+        .excluding_rows(head)
+        .compile_rows([current.exclude_head(head)].concat(following), nodes, context, span)
+    yes ?= rows
+        .specialize_rows(head)
+        .compile_rows(fields.concat(following), no.nodes, context, span)
+    place = current.cursor.root_place()
+    test: CheckedDecisionNode ?= match head:
+        TupleHead(_): Err(checker_invariant(span, UnsupportedPatternReachedResolution))
+        UnionHead(variant, _): Ok(TestVariant(place, variant, yes.entry, no.entry))
+        NilHead:
+            Ok(TestListLength(place, ExactLength(current.cursor.list_skip()), yes.entry, no.entry))
+        ConsHead(_):
+            Ok(
+                TestListLength(
+                    place,
+                    MinimumLength(current.cursor.list_skip() + 1),
+                    yes.entry,
+                    no.entry,
+                ),
+            )
+        LiteralHead(literal): Ok(TestLiteral(place, literal, yes.entry, no.entry))
+    Ok({ nodes = yes.nodes.append(test), entry = decision_node_id(yes.nodes.length()) })
+
+
+private pure func missing_error(
+    rows: List[PatternRow],
+    root: Column,
+    witness: PatternWitness,
+    context: ResolutionContext,
+    span: Span,
+) -> Result[CheckError, CheckError]:
+    match root.domain:
+        ClosedDomain(heads): rows.missing_finite_error(root, heads, witness, context, span)
+        OpenDomain | ScalarDomain: Ok(match_error(span, NonExhaustiveStructuralMatch(witness)))
+
+
+private pure func missing_finite_error(
+    rows: List[PatternRow],
+    root: Column,
+    heads: List[Head],
+    witness: PatternWitness,
+    context: ResolutionContext,
+    span: Span,
+) -> Result[CheckError, CheckError]:
+    var missing: List[VariantId] = []
+    var flat: Bool = True
+    var failure: Option[CheckError] = None
+    for head in heads:
+        match head:
+            UnionHead(id, _):
+                match rows.useful_head(
+                    repeat(Anything, head.arity()),
+                    root,
+                    [],
+                    head,
+                    context,
+                    span,
+                ):
+                    Err(error): failure = Some(error)
+                    Ok(Some(_)):
+                        if rows.specialize_rows(head).is_empty():
+                            missing = missing.append(id)
+                        else:
+                            flat = False
+                    Ok(None): void
+            _: flat = False
+        if failure.is_some():
+            break
+    _: Void ?= match failure:
+        Some(error): Err(error)
+        None: Ok(void)
+    if flat:
+        Ok(match_error(span, NonExhaustiveMatch(missing)))
+    else:
+        Ok(match_error(span, NonExhaustiveStructuralMatch(witness)))
+
+
+pure func finish_selection(
+    rows: List[PatternRow],
+    subject: PatternSubject,
+    span: Span,
+    context: ResolutionContext,
+) -> Result[CheckedSelection, CheckError]:
+    root = from_opaque PatternSubject(subject)
+    missing ?= rows.useful([Anything], [root], context, span)
+    match missing:
+        Some(witnesses): rows.reject_missing(root, witnesses, context, span)
+        None: rows.compile_rows([root], [], context, span)
+
+
+private pure func reject_missing(
+    rows: List[PatternRow],
+    root: Column,
+    witnesses: List[PatternWitness],
+    context: ResolutionContext,
+    span: Span,
+) -> Result[CheckedSelection, CheckError]:
+    witness ?= witnesses.get(0).or_checker_invariant(span, UnsupportedPatternReachedResolution)
+    error ?= rows.missing_error(root, witness, context, span)
+    Err(error)
+
+
+-- Synthetic Bool/Result joins already own their designation and payload types.
+-- They enter the same matrix, without repeating source name resolution.
+record UnionSelectionCase {
+    arm: MatchArmId,
+    variant: VariantId,
+    fields: List[TypeRef],
+    arguments: List[CheckedPatternArgument],
+}
+
+
+pure func union_selection(
+    cases: List[UnionSelectionCase],
+    value_type: TypeRef,
+    span: Span,
+    context: ResolutionContext,
+) -> Result[CheckedSelection, CheckError]:
+    subject ?= value_type.prepare_subject(context, span)
+    rows: List[PatternRow] = cases.map(
+        pure func(selected: UnionSelectionCase) -> PatternRow: {
+            arm = selected.arm,
+            patterns = [
+                VariantPattern(selected.variant, repeat(Anything, selected.fields.length())),
+            ],
+            arguments = selected.arguments,
+        },
+    )
+    rows.finish_selection(subject, span, context)

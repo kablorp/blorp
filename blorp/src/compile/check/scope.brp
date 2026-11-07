@@ -1,0 +1,191 @@
+import:
+    ../../syntax/names: NameId
+    ../../syntax/source: ModuleId
+    ../../syntax/syntax: Span, WrittenName
+    ../namespace/namespace: Namespace
+    ./errors:
+        BindingSite,
+        CheckError,
+        BindingError(ModuleBindingConflict, LocalBindingConflict, CallableBindingConflict),
+        binding_error,
+        CheckerInvariant(InvalidFunctionContract),
+        checker_invariant,
+    ./model:
+        BindingDefinition,
+        BindingId,
+        BodyOwner,
+        ScopedBindingId,
+        CallableParameterId,
+        FunctionSignature,
+        TypeRef(CallableType),
+        TypeUse,
+        BindingOrigin(CallableParameterBinding),
+
+
+-- Only bind_local publishes a binding; later readers receive accepted facts.
+opaque type LocalBinding = ScopedBinding
+
+
+private record ScopedBinding { name: NameId, id: ScopedBindingId, definition: BindingDefinition }
+
+
+union ScopedValue:
+    DataLocal(LocalBinding)
+    CallableLocal(CallableBinding)
+
+
+pure func lookup_binding(scope: List[ScopedValue], name: NameId) -> Option[ScopedValue]:
+    var found: Option[ScopedValue] = None
+
+    for binding in scope:
+        binding_name = match binding:
+            DataLocal(data): from_opaque LocalBinding(data).name
+            CallableLocal(callable): callable.callable_local().binding_site().name
+        if binding_name == name:
+            found = Some(binding)
+            break
+
+    found
+
+
+pure func local_binding_id(binding: LocalBinding) -> BindingId:
+    from_opaque LocalBinding(binding).id.binding
+
+
+pure func binding_definition(binding: LocalBinding) -> BindingDefinition:
+    from_opaque LocalBinding(binding).definition
+
+
+pure func binding_site(binding: LocalBinding) -> BindingSite:
+    accepted = from_opaque LocalBinding(binding)
+    { binding = accepted.id, name = accepted.name, span = accepted.definition.span }
+
+
+private pure func bind_data(
+    scope: List[ScopedValue],
+    namespace: Namespace,
+    module: ModuleId,
+    owner: BodyOwner,
+    name: WrittenName,
+    id: BindingId,
+    definition: BindingDefinition,
+) -> Result[LocalBinding, CheckError]:
+    match namespace.value_binding(module, name.id):
+        Some(previous): Err(binding_error(name.span, ModuleBindingConflict(previous)))
+        None:
+            match scope.lookup_binding(name.id):
+                Some(DataLocal(previous)):
+                    Err(
+                        binding_error(
+                            name.span,
+                            LocalBindingConflict(
+                                previous.binding_site(),
+                                previous.binding_definition().origin,
+                            ),
+                        ),
+                    )
+                Some(CallableLocal(previous)): Err(callable_conflict(name.span, previous))
+                None:
+                    Ok(
+                        into_opaque LocalBinding({
+                            name = name.id,
+                            id = { owner = owner, binding = id },
+                            definition = definition,
+                        }),
+                    )
+
+
+pure func bind_local(
+    scope: List[ScopedValue],
+    namespace: Namespace,
+    module: ModuleId,
+    owner: BodyOwner,
+    name: WrittenName,
+    id: BindingId,
+    definition: BindingDefinition,
+) -> Result[ScopedValue, CheckError]:
+    local ?= scope.bind_data(namespace, module, owner, name, id, definition)
+    Ok(DataLocal(local))
+
+
+pure func bind_callable(
+    scope: List[ScopedValue],
+    namespace: Namespace,
+    module: ModuleId,
+    name: WrittenName,
+    id: CallableParameterId,
+    value_type: TypeUse,
+    owner: BodyOwner,
+    binding: BindingId,
+) -> Result[ScopedValue, CheckError]:
+    definition: BindingDefinition = {
+        origin = CallableParameterBinding(id),
+        mutable = False,
+        value_type = value_type.value_type,
+        span = name.span,
+    }
+    local ?= scope.bind_data(namespace, module, owner, name, binding, definition)
+    match value_type.value_type:
+        CallableType(_, _, _):
+            Ok(
+                CallableLocal(
+                    into_opaque CallableBinding({ local = local, annotation = value_type.span }),
+                ),
+            )
+        _: Err(checker_invariant(value_type.span, InvalidFunctionContract))
+
+
+private record ScopedCallable { local: LocalBinding, annotation: Span }
+
+
+opaque type CallableBinding = ScopedCallable
+
+
+record CallableParameterContract { parameter: CallableParameterId, signature: FunctionSignature }
+
+
+-- A transient projection of the canonical local definition, not a second
+-- stored signature or identity. Annotation spans remain declaration-owned.
+pure func callable_parameter_contract(
+    binding: CallableBinding,
+) -> Result[CallableParameterContract, CheckError]:
+    accepted = from_opaque CallableBinding(binding)
+    definition = accepted.local.binding_definition()
+    match definition.origin:
+        CallableParameterBinding(parameter):
+            match definition.value_type:
+                CallableType(purity, parameters, result):
+                    Ok({
+                        parameter = parameter,
+                        signature = {
+                            type_parameters = [],
+                            requirements = [],
+                            purity = purity,
+                            parameters = parameters.map(
+                                pure func(value) -> TypeUse: {
+                                    value_type = value,
+                                    span = accepted.annotation,
+                                },
+                            ),
+                            return_type = { value_type = result, span = accepted.annotation },
+                        },
+                    })
+                _: Err(checker_invariant(definition.span, InvalidFunctionContract))
+        _: Err(checker_invariant(definition.span, InvalidFunctionContract))
+
+
+pure func callable_local(binding: CallableBinding) -> LocalBinding:
+    from_opaque CallableBinding(binding).local
+
+
+private pure func callable_conflict(span: Span, previous: CallableBinding) -> CheckError:
+    match previous.callable_parameter_contract():
+        Err(error): error
+        Ok(accepted):
+            binding_error(
+                span,
+                CallableBindingConflict(
+                    accepted.parameter,
+                    previous.callable_local().binding_site().span,
+                ),
+            )

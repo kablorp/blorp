@@ -1,0 +1,105 @@
+import:
+    bool: and
+    int: Int methods
+    list: List methods
+    option: Option methods
+    string: String methods
+    test: TestSuite
+    ../../../../src/syntax/lex: lex
+    ../../../../src/syntax/names: program_names
+    ../../../../src/syntax/parse: ParsedModule, module_contents, parse_module
+    ../../../../src/syntax/source: module_source, root_module_id
+    ../../../../src/syntax/syntax:
+        Diagnostic,
+        ValueExpression,
+        ExpressionBase(DirectApplication),
+        ParsedBody(ParsedValueBody),
+        PostfixOperation(ReceiverInvocation),
+    ../../parse_function_inputs: free_functions
+
+
+-- `and`, `or` and `not` are ordinary identifiers naming the `bool` functions;
+-- Blorp has no Boolean operators.
+
+private HEADER: String = "func main() -> Int:\n"
+
+
+private pure func parse_source(source: String) -> Result[ParsedModule, Diagnostic]:
+    tokens ?= lex(module_source(root_module_id()), source, program_names().names)
+    parse_module(tokens, root_module_id())
+
+
+-- The body of `main` after HEADER, which is 20 bytes, so a body written as
+-- "\t..." starts its expression at byte 21.
+private pure func value(source: String) -> Option[ValueExpression]:
+    match parse_source(HEADER + source):
+        Err(_): None
+        Ok(parsed):
+            match free_functions(module_contents(parsed).functions).get(0).map(
+                pure func(function): function.body,
+            ):
+                Some(ParsedValueBody(body)): Some(body)
+                _: None
+
+
+private pure func rejects(
+    source: String,
+    start: Int,
+    end: Int,
+    message: String,
+    help: String,
+) -> Bool:
+    match parse_source(HEADER + source):
+        Ok(_): False
+        Err(error):
+            error.span.start
+                .equals(start)
+                .and(error.span.end.equals(end))
+                .and(error.message == message)
+                .and(error.help == help)
+
+
+pure func test_direct_calls_take_their_arguments() -> Bool:
+    ["\tand(a, b)\n", "\tor(a, b)\n"].all(pure func(source):
+        match value(source):
+            Some(body):
+                match body.base:
+                    DirectApplication(_, [_, _]): body.applications.is_empty()
+                    _: False
+            None: False
+    )
+
+
+pure func test_receiver_calls_chain_after_a_direct_call() -> Bool:
+    match value("\tnot(a).and(b).or(c).not()\n"):
+        Some(body):
+            match (body.base, body.applications):
+                (DirectApplication(_, [_]), [ReceiverInvocation(first), ReceiverInvocation(second), ReceiverInvocation(third)]):
+                    first.arguments
+                        .length()
+                        .equals(1)
+                        .and(second.arguments.length().equals(1))
+                        .and(third.arguments.is_empty())
+                _: False
+        None: False
+
+
+-- A written operator is a name where the statement should end.
+pure func test_infix_word_ends_the_binding() -> Bool:
+    rejects(
+        "\tvalue = a and b\n\tvalue\n",
+        31,
+        34,
+        "expected a newline after the binding",
+        "put each statement on its own line",
+    )
+
+
+tests: TestSuite = {
+    description = "Boolean function names",
+    tests = [
+        ("direct calls take their arguments", test_direct_calls_take_their_arguments),
+        ("receiver calls chain after a direct call", test_receiver_calls_chain_after_a_direct_call),
+        ("an infix word ends the binding", test_infix_word_ends_the_binding),
+    ],
+}

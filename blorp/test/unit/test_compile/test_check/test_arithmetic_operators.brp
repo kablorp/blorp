@@ -1,0 +1,713 @@
+import:
+    bool: and
+    int: Int methods
+    list: List methods
+    option: Option methods
+    result: Result methods
+    string: String methods
+    test: TestSuite
+    ../../../../src/compile/assemble:
+        ParsedAssembly,
+        ParsedProgram,
+        append_module,
+        assembly_names,
+        begin_program,
+        parsed_contents,
+    ../../../../src/compile/check/check: check, checked_functions
+    ../../../../src/compile/check/model as Model
+    ../../../../src/compile/check/render: render_failure
+    ../../../../src/compile/ids:
+        TraitMethodId,
+        inventory_traits,
+        trait_method_header,
+        trait_method_number,
+        trait_method_owner,
+        trait_number,
+    ../../../../src/syntax/lex: lex
+    ../../../../src/syntax/names: name_spelling
+    ../../../../src/syntax/parse: parse_module
+    ../../../../src/syntax/source:
+        ModuleId,
+        ModuleKind(UserModule, LibraryModule, FoundationTypesModule, FoundationPreludeModule),
+        SourceId,
+        module_id,
+        module_source,
+        root_module_id,
+    ../../../../src/syntax/syntax: Diagnostic, diagnostic
+    ../../module_input: FOUNDATION_TYPES, sealed
+
+
+-- Each fixture has four modules: the root at 0, a library at 1 implementing the
+-- traits for Int and String, the base at 2 declaring the canonical traits, and
+-- the prelude at 3 selecting from the base.
+private BASE_POSITION: Int = 2
+
+
+private BASE_SELECTIONS: String = "Int, Float, String, Void, List, Bool(True, False), Option(Some, None), Result(Ok, Err)"
+
+
+private ARITHMETIC_SELECTIONS: String = ", Addable, Subtractable, Multipliable, Divisible, Modulable, Negatable"
+
+
+private ARITHMETIC_TRAITS: String =
+    |trait Addable:
+    |    pure func add(left: Self, right: Self) -> Self
+    |trait Subtractable:
+    |    pure func subtract(left: Self, right: Self) -> Self
+    |trait Multipliable:
+    |    pure func multiply(left: Self, right: Self) -> Self
+    |trait Divisible:
+    |    pure func divide(left: Self, right: Self) -> Self
+    |trait Modulable:
+    |    pure func remainder(left: Self, right: Self) -> Self
+    |trait Negatable:
+    |    pure func negate(value: Self) -> Self
+    |
+
+
+private ARITHMETIC_IMPLEMENTATIONS: String =
+    |implements Addable for Int:
+    |    pure func add(left: Self, right: Self) -> Self:
+    |        builtin("int.add")
+    |implements Subtractable for Int:
+    |    pure func subtract(left: Self, right: Self) -> Self:
+    |        builtin("int.subtract")
+    |implements Multipliable for Int:
+    |    pure func multiply(left: Self, right: Self) -> Self:
+    |        builtin("int.multiply")
+    |implements Divisible for Int:
+    |    pure func divide(left: Self, right: Self) -> Self:
+    |        builtin("int.divide")
+    |implements Modulable for Int:
+    |    pure func remainder(left: Self, right: Self) -> Self:
+    |        builtin("int.remainder")
+    |implements Negatable for Int:
+    |    pure func negate(value: Self) -> Self:
+    |        subtract(0, value)
+    |implements Addable for String:
+    |    pure func add(left: Self, right: Self) -> Self:
+    |        builtin("string.add")
+    |
+
+
+private ENTRY: String = "func main() -> Int:\n    0\n"
+private MISSING_BOUND: String = "type does not satisfy the required trait bound"
+
+
+private MISSING_BOUND_HELP: String = "add the required trait to this function's type parameter bounds, or provide an implementation for the concrete receiver"
+
+
+private MISSING_IMPLEMENTATION_HELP: String = "declare a matching implementation; generic functions must declare their required trait bounds"
+
+
+private MISMATCH: String = "argument type does not match the parameter type"
+
+
+private ORDERABLE_TEXT: String = "canonical Orderable requires pure less_than(Self, Self) -> Bool as its sole abstract method"
+
+
+private ORDERABLE_HELP: String = "keep less_than abstract; other pure methods require default bodies"
+
+
+-- Which canonical traits the base declares and the library implements.
+private record Foundation { traits: String, implementations: String, imported: String }
+
+
+private pure func arithmetic() -> Foundation:
+    {
+        traits = ARITHMETIC_TRAITS,
+        implementations = ARITHMETIC_IMPLEMENTATIONS,
+        imported = ARITHMETIC_SELECTIONS,
+    }
+
+
+-- A contract the library does not implement, so only admission runs.
+private pure func contract_only(traits: String) -> Foundation:
+    { traits = traits, implementations = "", imported = "" }
+
+
+private pure func append_source(
+    assembly: ParsedAssembly,
+    position: Int,
+    source: String,
+    targets: List[ModuleId],
+    role: ModuleKind,
+) -> Result[ParsedAssembly, Diagnostic]:
+    invalid = diagnostic(
+        { source = module_source(root_module_id()), start = 0, end = 0 },
+        "invalid arithmetic fixture module",
+        "use the four fixture module positions",
+    )
+    module ?= module_id(position).to_result(invalid)
+    tokens ?= lex(module_source(module), source, assembly_names(assembly))
+    parsed ?= parse_module(tokens, module)
+    append_module(assembly, parsed, targets, role, "module_".append_int(position))
+
+
+-- `selections` follow the base selections in the prelude's one import.
+private pure func program(
+    source: String,
+    foundation: Foundation,
+    selections: String,
+) -> Result[ParsedProgram, Diagnostic]:
+    invalid = diagnostic(
+        { source = module_source(root_module_id()), start = 0, end = 0 },
+        "invalid arithmetic fixture module",
+        "use the four fixture module positions",
+    )
+    base ?= module_id(BASE_POSITION).to_result(invalid)
+    library = (
+        "import:\n    _base: Int, String, Bool"
+        + foundation.imported
+        + "\n"
+        + foundation.implementations
+    )
+    root ?= append_source(begin_program(), 0, source, [], UserModule)
+    integer ?= append_source(root, 1, library, [base], LibraryModule)
+    types ?= append_source(
+        integer,
+        BASE_POSITION,
+        FOUNDATION_TYPES + foundation.traits,
+        [],
+        FoundationTypesModule,
+    )
+    prelude ?= append_source(
+        types,
+        3,
+        "import:\n    _base: " + BASE_SELECTIONS + selections + "\n",
+        [base],
+        FoundationPreludeModule,
+    )
+    sealed(prelude)
+
+
+-- The single diagnostic, compared exactly.
+private pure func rejects_in(
+    source: String,
+    foundation: Foundation,
+    selections: String,
+    origin: SourceId,
+    start: Int,
+    end: Int,
+    message: String,
+    help: String,
+) -> Bool:
+    match program(source, foundation, selections):
+        Err(_): False
+        Ok(parsed):
+            match check(parsed):
+                Ok(_): False
+                Err(failure):
+                    diagnostics = render_failure(failure)
+                    first = diagnostics.first
+                    (first.span.source == origin)
+                        .and(first.span.start.equals(start))
+                        .and(first.span.end.equals(end))
+                        .and(first.message == message)
+                        .and(first.help == help)
+                        .and(first.note.is_none())
+                        .and(diagnostics.remaining.is_empty())
+
+
+private pure func rejects(
+    source: String,
+    start: Int,
+    end: Int,
+    message: String,
+    help: String,
+) -> Bool:
+    rejects_in(
+        source,
+        arithmetic(),
+        ARITHMETIC_SELECTIONS,
+        module_source(root_module_id()),
+        start,
+        end,
+        message,
+        help,
+    )
+
+
+-- A malformed contract in the base, at offsets within `traits`.
+private pure func rejects_in_base(
+    traits: String,
+    selections: String,
+    start: Int,
+    end: Int,
+    message: String,
+    help: String,
+) -> Bool:
+    match module_id(BASE_POSITION):
+        None: False
+        Some(base):
+            rejects_in(
+                ENTRY,
+                contract_only(traits),
+                selections,
+                module_source(base),
+                FOUNDATION_TYPES.length() + start,
+                FOUNDATION_TYPES.length() + end,
+                message,
+                help,
+            )
+
+
+private pure func accepts(source: String, foundation: Foundation, selections: String) -> Bool:
+    match program(source, foundation, selections):
+        Ok(parsed): check(parsed).is_ok()
+        Err(_): False
+
+
+private pure func member_spelling(parsed: ParsedProgram, method: TraitMethodId) -> String:
+    contents = parsed_contents(parsed)
+    match inventory_traits(contents.declarations).get(trait_number(trait_method_owner(method))):
+        None: ""
+        Some(row):
+            match row.methods.get(trait_method_number(method)):
+                None: ""
+                Some(written):
+                    match trait_method_header(written, contents.declarations):
+                        None: ""
+                        Some(header):
+                            name_spelling(contents.names, header.function_name.id).get_or("")
+
+
+-- The call invokes this canonical member with an Int receiver, and the member
+-- has the expected spelling, so a swap at admission or dispatch shows here.
+private pure func calls_member(
+    parsed: ParsedProgram,
+    call: Model.CheckedCall,
+    contract: Option[Model.CanonicalOperation],
+    spelling: String,
+) -> Bool:
+    match (call.target, contract):
+        (Model.TraitMethod(method), Some(operation)):
+            member = Model.canonical_operation_member(operation)
+            (Model.method_identity(method) == member)
+                .and(Model.method_receiver(method) == Model.IntType)
+                .and(member_spelling(parsed, member) == spelling)
+        _: False
+
+
+-- Each operator selects its own field, and admission fills each field from its
+-- own trait: a swap at either step names the wrong member here.
+pure func test_each_operator_calls_its_own_canonical_member() -> Bool:
+    source: String =
+        |pure func compute(left: Int, right: Int) -> List[Int]:
+        |    [left + right, left - right, left * right, left / right, left % right, -left]
+        |
+    match program(source + ENTRY, arithmetic(), ARITHMETIC_SELECTIONS):
+        Err(_): False
+        Ok(parsed):
+            match check(parsed):
+                Err(_): False
+                Ok(checked):
+                    functions = checked_functions(checked)
+                    canonical = functions.traits.canonical
+                    match functions.functions.get(0):
+                        Some(compute):
+                            match Model.function_calls(compute):
+                                [add, subtract, multiply, divide, remainder, negate]:
+                                    calls_member(parsed, add, canonical.addition, "add")
+                                        .and(
+                                            calls_member(
+                                                parsed,
+                                                subtract,
+                                                canonical.subtraction,
+                                                "subtract",
+                                            ),
+                                        )
+                                        .and(
+                                            calls_member(
+                                                parsed,
+                                                multiply,
+                                                canonical.multiplication,
+                                                "multiply",
+                                            ),
+                                        )
+                                        .and(
+                                            calls_member(
+                                                parsed,
+                                                divide,
+                                                canonical.division,
+                                                "divide",
+                                            ),
+                                        )
+                                        .and(
+                                            calls_member(
+                                                parsed,
+                                                remainder,
+                                                canonical.remainder,
+                                                "remainder",
+                                            ),
+                                        )
+                                        .and(
+                                            calls_member(
+                                                parsed,
+                                                negate,
+                                                canonical.negation,
+                                                "negate",
+                                            ),
+                                        )
+                                _: False
+                        None: False
+
+
+-- With the canonical traits selected, a same-spelled free function or an
+-- unrelated trait's member in the user module cannot redirect `+`. `ordinal`
+-- is main's position among the module's functions.
+private pure func calls_canonical_add(declarations: String, ordinal: Int) -> Bool:
+    match program(
+        declarations + ("func main() -> Int:\n    1 + 2\n"),
+        arithmetic(),
+        ARITHMETIC_SELECTIONS,
+    ):
+        Err(_): False
+        Ok(parsed):
+            match check(parsed):
+                Err(_): False
+                Ok(checked):
+                    functions = checked_functions(checked)
+                    match functions.functions.get(ordinal):
+                        Some(main):
+                            match Model.function_calls(main):
+                                [call]:
+                                    calls_member(
+                                        parsed,
+                                        call,
+                                        functions.traits.canonical.addition,
+                                        "add",
+                                    )
+                                _: False
+                        None: False
+
+
+pure func test_decoys_do_not_redirect_operators() -> Bool:
+    calls_canonical_add("trait Other:\n    pure func add(left: Self, right: Self) -> Int\n", 0).and(
+        calls_canonical_add("pure func add(left: Int, right: Int) -> Int:\n    0\n", 1),
+    )
+
+
+-- The prelude's binding selects each trait, not its spelling: a user trait
+-- named Addable with an Int implementation cannot stand in for it.
+pure func test_operators_need_the_prelude_selected_traits() -> Bool:
+    user_trait: String =
+        |trait Addable:
+        |    pure func add(left: Self, right: Self) -> Self
+        |implements Addable for Int:
+        |    pure func add(left: Self, right: Self) -> Self:
+        |        left
+        |
+    prefix = user_trait + ("pure func compute(left: Int, right: Int) -> Int:\n    left ")
+    binary = [
+        ("+", "Addable"),
+        ("-", "Subtractable"),
+        ("*", "Multipliable"),
+        ("/", "Divisible"),
+        ("%", "Modulable"),
+    ].all(pure func(case):
+        rejects_in(
+            prefix + case[0] + " right\n" + ENTRY,
+            arithmetic(),
+            "",
+            module_source(root_module_id()),
+            prefix.length(),
+            prefix.length() + 1,
+            "arithmetic operator '${case[0]}' requires the canonical ${case[1]} trait",
+            "select ${case[1]} in the configured prelude",
+        )
+    )
+    negation_prefix = "pure func compute(value: Int) -> Int:\n    "
+    binary.and(
+        rejects_in(
+            negation_prefix + ("-value\n") + ENTRY,
+            arithmetic(),
+            "",
+            module_source(root_module_id()),
+            negation_prefix.length(),
+            negation_prefix.length() + 1,
+            "arithmetic operator '-' requires the canonical Negatable trait",
+            "select Negatable in the configured prelude",
+        ),
+    )
+
+
+-- The base declares only the trait under test and the prelude selects it. A
+-- malformed contract is reported at the trait's name, six bytes into the
+-- `trait` line, with the signature its operator needs.
+private pure func malformed(
+    traits: String,
+    name: String,
+    member: String,
+    parameters: String,
+) -> Bool:
+    rejects_in_base(
+        traits,
+        ", " + name,
+        6,
+        name.length() + 6,
+        "canonical ${name} requires pure ${member}(${parameters}) -> Self as its sole abstract method",
+        "keep ${member} abstract; other pure methods require default bodies",
+    )
+
+
+pure func test_malformed_arithmetic_traits_are_rejected_at_the_trait() -> Bool:
+    malformed(
+        "trait Addable:\n    pure func add(left: Self, right: Self) -> Bool\n",
+        "Addable",
+        "add",
+        "Self, Self",
+    )
+        .and(
+            malformed(
+                "trait Subtractable:\n    pure func minus(left: Self, right: Self) -> Self\n",
+                "Subtractable",
+                "subtract",
+                "Self, Self",
+            ),
+        )
+        .and(
+            malformed(
+                "trait Multipliable:\n    pure func multiply(left: Self, right: Self) -> Self\n    pure func square(value: Self) -> Self\n",
+                "Multipliable",
+                "multiply",
+                "Self, Self",
+            ),
+        )
+        .and(
+            malformed(
+                "trait Divisible:\n    pure func divide(left: Self, right: Int) -> Self\n",
+                "Divisible",
+                "divide",
+                "Self, Self",
+            ),
+        )
+        .and(
+            malformed(
+                "trait Modulable:\n    pure func remainder(left: Self, right: Self) -> Self:\n        left\n",
+                "Modulable",
+                "remainder",
+                "Self, Self",
+            ),
+        )
+        .and(
+            malformed(
+                "trait Negatable:\n    pure func negate(value: Self) -> Int\n",
+                "Negatable",
+                "negate",
+                "Self",
+            ),
+        )
+
+
+-- Arity distinguishes the unary shape from the binary one, so a member with
+-- the other operator family's parameters is malformed, as it is for the
+-- comparison traits.
+pure func test_abstract_members_with_wrong_parameters_are_malformed() -> Bool:
+    orderable_defaults = "    pure func greater_than(left: Self, right: Self) -> Bool:\n        True\n    pure func less_than_or_equal(left: Self, right: Self) -> Bool:\n        True\n    pure func greater_than_or_equal(left: Self, right: Self) -> Bool:\n        True\n"
+    malformed(
+        "trait Addable:\n    pure func add(value: Self) -> Self\n",
+        "Addable",
+        "add",
+        "Self, Self",
+    )
+        .and(
+            malformed(
+                "trait Modulable:\n    pure func remainder(left: Self, right: Self, extra: Self) -> Self\n",
+                "Modulable",
+                "remainder",
+                "Self, Self",
+            ),
+        )
+        .and(
+            malformed(
+                "trait Negatable:\n    pure func negate(left: Self, right: Self) -> Self\n",
+                "Negatable",
+                "negate",
+                "Self",
+            ),
+        )
+        .and(
+            rejects_in_base(
+                (
+                    "trait Orderable:\n    pure func less_than(value: Self) -> Bool\n"
+                    + orderable_defaults
+                ),
+                ", Orderable",
+                6,
+                15,
+                ORDERABLE_TEXT,
+                ORDERABLE_HELP,
+            ),
+        )
+        .and(
+            rejects_in_base(
+                "trait Equatable:\n    pure func equals(left: Self, right: Self, extra: Self) -> Bool\n",
+                ", Equatable",
+                6,
+                15,
+                "canonical Equatable requires pure equals(Self, Self) -> Bool as its sole abstract method",
+                "keep equals abstract; additional pure methods require default bodies",
+            ),
+        )
+
+
+-- Defaults beside the abstract member are admitted, as for the comparison traits.
+pure func test_defaults_beside_the_member_are_admitted() -> Bool:
+    accepts(
+        "pure func twice(value: Int) -> Int:\n    value + value\n" + ENTRY,
+        {
+            traits = "trait Addable:\n    pure func add(left: Self, right: Self) -> Self\n    pure func double(value: Self) -> Self:\n        add(value, value)\n",
+            implementations = "implements Addable for Int:\n    pure func add(left: Self, right: Self) -> Self:\n        builtin(\"int.add\")\n",
+            imported = ", Addable",
+        },
+        ", Addable",
+    )
+
+
+-- Arithmetic is never derived: a record needs written implementations.
+pure func test_aggregates_without_an_implementation_name_the_trait() -> Bool:
+    prefix = "record Box { value: Int }\npure func compute(left: Box, right: Box) -> Box:\n    left "
+    negation_prefix = "record Box { value: Int }\npure func compute(value: Box) -> Box:\n    "
+    rejects(
+        prefix + ("* right\n") + ENTRY,
+        prefix.length(),
+        prefix.length() + 1,
+        "receiver does not implement Multipliable",
+        MISSING_IMPLEMENTATION_HELP,
+    ).and(
+        rejects(
+            negation_prefix + ("-value\n") + ENTRY,
+            negation_prefix.length(),
+            negation_prefix.length() + 1,
+            "receiver does not implement Negatable",
+            MISSING_IMPLEMENTATION_HELP,
+        ),
+    )
+
+
+pure func test_generic_operands_need_the_trait_bound() -> Bool:
+    prefix = "pure func total[Value](left: Value, right: Value) -> Value:\n    left "
+    accepts(
+        (
+            "pure func total[Value: Addable](left: Value, right: Value) -> Value:\n    left + right\n"
+            + ENTRY
+        ),
+        arithmetic(),
+        ARITHMETIC_SELECTIONS,
+    ).and(
+        rejects(
+            prefix + ("+ right\n") + ENTRY,
+            prefix.length(),
+            prefix.length() + 1,
+            MISSING_BOUND,
+            MISSING_BOUND_HELP,
+        ),
+    )
+
+
+-- Both operands share Self, so mixed numbers are an ordinary mismatch at the
+-- right operand, and text joined to another type teaches interpolation with
+-- `to_string`, the conversion an interpolation hole needs.
+pure func test_operand_mismatches_are_reported_at_the_right_operand() -> Bool:
+    prefix = "pure func compute() -> Int:\n    "
+    text_prefix = "pure func compute() -> String:\n    "
+    interpolation = "use interpolation with to_string, such as \"n=$\{value.to_string()}\", to join a value to text"
+    rejects(
+        prefix + ("1 + 2.0\n") + ENTRY,
+        prefix.length() + 4,
+        prefix.length() + 7,
+        MISMATCH,
+        "use an expression of type Int here",
+    )
+        .and(
+            rejects(
+                text_prefix + ("\"n=\" + 5\n") + ENTRY,
+                text_prefix.length() + 7,
+                text_prefix.length() + 8,
+                MISMATCH,
+                interpolation,
+            ),
+        )
+        .and(
+            rejects(
+                prefix + ("5 + \"n\"\n") + ENTRY,
+                prefix.length() + 4,
+                prefix.length() + 7,
+                MISMATCH,
+                interpolation,
+            ),
+        )
+        .and(
+            rejects(
+                prefix + ("5 - 2.0\n") + ENTRY,
+                prefix.length() + 4,
+                prefix.length() + 7,
+                MISMATCH,
+                "use an expression of type Int here",
+            ),
+        )
+
+
+-- A constant initializer is a literal: operators are rejected, and a folded
+-- negative literal is still a literal.
+pure func test_constant_initializers_reject_operators() -> Bool:
+    prefix = "LIMIT: Int = "
+    accepts(
+        "LOW: Int = -5\nMINIMUM: Int = -9223372036854775808\nHALF: Float = -0.5\n" + ENTRY,
+        arithmetic(),
+        ARITHMETIC_SELECTIONS,
+    )
+        .and(
+            rejects(
+                prefix + ("1 + 2\n") + ENTRY,
+                prefix.length(),
+                prefix.length() + 5,
+                "constant initializer is not a closed value",
+                "use literals, constructor data, or named function references; calls, operators, constant references and lambdas are not allowed",
+            ),
+        )
+        .and(
+            rejects(
+                prefix + ("-(5)\n") + ENTRY,
+                prefix.length(),
+                prefix.length() + 4,
+                "constant initializer is not a closed value",
+                "use literals, constructor data, or named function references; calls, operators, constant references and lambdas are not allowed",
+            ),
+        )
+
+
+tests: TestSuite = {
+    description = "arithmetic operator checking",
+    tests = [
+        (
+            "each operator calls its own canonical member",
+            test_each_operator_calls_its_own_canonical_member,
+        ),
+        ("decoys do not redirect operators", test_decoys_do_not_redirect_operators),
+        (
+            "operators need the prelude-selected traits",
+            test_operators_need_the_prelude_selected_traits,
+        ),
+        (
+            "malformed arithmetic traits are rejected at the trait",
+            test_malformed_arithmetic_traits_are_rejected_at_the_trait,
+        ),
+        (
+            "abstract members with wrong parameters are malformed",
+            test_abstract_members_with_wrong_parameters_are_malformed,
+        ),
+        ("defaults beside the member are admitted", test_defaults_beside_the_member_are_admitted),
+        (
+            "aggregates without an implementation name the trait",
+            test_aggregates_without_an_implementation_name_the_trait,
+        ),
+        ("generic operands need the trait bound", test_generic_operands_need_the_trait_bound),
+        (
+            "operand mismatches are reported at the right operand",
+            test_operand_mismatches_are_reported_at_the_right_operand,
+        ),
+        ("constant initializers reject operators", test_constant_initializers_reject_operators),
+    ],
+}

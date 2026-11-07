@@ -1,0 +1,4352 @@
+import:
+    bool: Bool methods
+    float: Float methods
+    int: Int methods
+    list: List methods
+    option: Option methods
+    result: Result methods
+    ../../syntax/syntax:
+        Diagnostic,
+        EntryResult(IntegerExitStatus, SuccessfulExit),
+        Entrypoint(NoArguments, WithArguments),
+        LiteralPattern(ExactBytes, ExactInt),
+        Span,
+        compiler_span,
+    ../../utils/results: first_error
+    ../../utils/stack: push_at
+    ../../utils/text: concat
+    ../check/model: MatchArmId, decision_node_number, ListLengthTest(ExactLength, MinimumLength)
+    ../lower/lower: LoopTarget, ValueParameter, ValueId
+    ../namespace/builtins as Builtins:
+        RuntimeOperation,
+        RuntimeResult(ValueResult, OptionalResult, ResultResult, BooleanResult),
+    ../own/own:
+        BorrowSource(ParameterBorrow, OwnerBorrow, PayloadBorrow),
+        BorrowedValue,
+        OwnedArgument(UnmanagedArgument, BorrowedArgument, ConsumedArgument),
+        OwnedDefinition,
+        OwnedLoop,
+        OwnedLoopExit(Break, Recur),
+        OwnedLoopTail(ExitLoop, MatchLoop),
+        OwnedFunction,
+        OwnedParameter(UnmanagedParameter, ManagedParameter),
+        parameter_owned,
+        parameter_type,
+        OwnedJoin,
+        OwnedJoinArm,
+        OwnedJoinOutputs,
+        OwnedJoinExit(Yield, TransferLoop),
+        OwnedSelection,
+        OwnedDecisionNode(TestVariant, TestListLength, TestLiteral, EnterArm),
+        OwnedSelectionEdge,
+        OwnedJoinParameter(UnmanagedJoinParameter, ManagedJoinParameter),
+        OwnedLoopMatch,
+        OwnedLoopBlock,
+        OwnedValueOperation(
+            ParameterDefinition,
+            VoidDefinition,
+            IntegerDefinition,
+            FloatDefinition,
+            StringDefinition,
+            CallDefinition,
+            InvokeCallableDefinition,
+            FreeCallableDefinition,
+            CapturedCallableDefinition,
+            ConstructDefinition,
+            ConstructListDefinition,
+            PayloadDefinition,
+            ListElementDefinition,
+            ListSuffixDefinition,
+            ConstructRecordDefinition,
+            ReadRecordFieldDefinition,
+        ),
+        OwnerId,
+        OwnershipOperation(DefineValue, ExecuteJoin, ExecuteLoop, AcquireOwner, DropOwner),
+        OwnershipProgram,
+        ResultOwnership(UnmanagedResult, BorrowedResult, OwnedResult),
+        ReturnTransfer(UnmanagedReturn, OwnedReturn),
+        StoredPayload(UnmanagedPayload, OwnedPayload),
+    ../specialize/specialize:
+        CallTarget(UserFunction, RuntimeFunction),
+        ConcretePatternPlace,
+        ConcretePatternRoute(MatchRoot, UnionField, RecordField, ListElement),
+        ConcreteRecord(InlineFields, ValueFields, CountedFields),
+        ConcreteUnion(PlainCases, OwningCases, BoxedCases),
+        FieldInstanceId,
+        FunctionInstanceId,
+        FunctionSignature,
+        RecordInstanceId,
+        TypeRef(
+            VoidType,
+            IntType,
+            FloatType,
+            StringType,
+            ListType,
+            CallableType,
+            UnionType,
+            RecordType,
+        ),
+        UnionInstanceId,
+        VariantFieldInstanceId,
+        VariantInstanceId,
+        runtime_signature,
+        runtime_type_ref,
+
+
+-- Concrete representation is an upstream fact, shared with insertion.
+-- Verification independently validates the actual raw operations and layouts;
+-- it does not consume insertion's decisions about owners or borrow lifetimes.
+-- This seal belongs to the exact operations and contracts checked below.
+opaque type VerifiedProgram = OwnershipProgram
+
+
+pure func verified_contents(program: VerifiedProgram) -> OwnershipProgram:
+    from_opaque VerifiedProgram(program)
+
+
+private pure func verification_error(span: Span, message: String) -> Diagnostic:
+    {
+        span = span,
+        note = None,
+        message = "ownership verification failed: ${message}",
+        help = "report this compiler error with the input program",
+    }
+
+
+-- A fact earlier phases guarantee. The error is built here, only when the fact
+-- is missing, so the success path of a lookup allocates nothing.
+private pure func or_verification_error[T](
+    value: Option[T],
+    span: Span,
+    message: String,
+) -> Result[T, Diagnostic]:
+    match value:
+        Some(present): Ok(present)
+        None: Err(verification_error(span, message))
+
+
+-- List storage ownership is a root fact. Raw IR must also name a member of
+-- each supplied concrete catalogue; do not expand nominal fields per query.
+private pure func verify_type_membership(
+    value_type: TypeRef,
+    unions: List[ConcreteUnion],
+    records: List[ConcreteRecord],
+    span: Span,
+) -> Result[Void, Diagnostic]:
+    match value_type:
+        ListType(element): element.verify_type_membership(unions, records, span)
+        CallableType(parameters, result):
+            parameters
+                .append(result)
+                .first_error(pure func(parameter: TypeRef) -> Result[Void, Diagnostic]:
+                    parameter.verify_type_membership(unions, records, span)
+                )
+        _:
+            match value_type.value_needs_ownership(unions, records):
+                Ok(_): Ok(void)
+                Err(error): Err({ error | span = span })
+
+
+private record KnownValue {
+    value_type: TypeRef,
+    span: Span,
+    result: ResultOwnership,
+    projection_parent: Option[BorrowedValue],
+    projection_place: Option[ConcretePatternPlace],
+}
+
+
+private union OwnerState:
+    ActiveOwner(ValueId)
+    DischargedOwner
+
+
+-- One block enclosing the block being verified, as of the join or tail
+-- match that entered it: the function's prefix or an enclosing arm, with its
+-- consecutive values and owners. It is a shared view: a nested block flags
+-- the enclosing owners it discharges instead of changing it.
+private record EnclosingScope {
+    first_value: Int,
+    values: List[KnownValue],
+    first_owner: Int,
+    owners: List[OwnerState],
+}
+
+
+private record VerificationFacts {
+    enclosing: List[EnclosingScope],
+    first_value: Int,
+    values: List[KnownValue],
+    first_owner: Int,
+    parameters: List[ValueId],
+}
+
+
+-- `discharged` flags the enclosing owners discharged so far, those the block
+-- was entered with included, by owner number. A nested block shares its
+-- parent's flags until its first discharge copies them.
+private record VerificationState {
+    facts: VerificationFacts,
+    discharged: List[Bool],
+    owners: List[OwnerState],
+}
+
+
+-- The nearest lexical loop owns abrupt join exits. A nested loop replaces this
+-- context; an outer or sibling target never becomes a permitted destination.
+private record ActiveLoop { loop: OwnedLoop, pre: VerificationState, first_owner: Int }
+
+
+private union ProjectionContext:
+    NoProjection
+    SelectionProjection(OwnedArgument, List[PlaceFact])
+
+
+private pure func known_value(
+    state: VerificationFacts,
+    id: ValueId,
+    span: Span,
+) -> Result[KnownValue, Diagnostic]:
+    ordinal = id.value_number()
+    var entry: Option[KnownValue] = None
+
+    if ordinal >= state.first_value:
+        entry = state.values.get(ordinal - state.first_value)
+    else:
+        for scope in state.enclosing:
+            if (ordinal >= scope.first_value).and(
+                ordinal < scope.first_value + scope.values.length(),
+            ):
+                entry = scope.values.get(ordinal - scope.first_value)
+                break
+
+    match entry:
+        Some(known): Ok(known)
+        None:
+            Err(verification_error(span, "value ${ordinal.to_string()} is not defined before use"))
+
+
+-- An owner's slot: an enclosing owner by ordinal, or a local one by index.
+private union OwnerSlot:
+    EnclosingSlot(Int)
+    LocalSlot(Int)
+
+
+-- An enclosing owner's state when its block was entered.
+private pure func enclosing_owner(state: VerificationFacts, ordinal: Int) -> Option[OwnerState]:
+    var found: Option[OwnerState] = None
+    for scope in state.enclosing:
+        if (ordinal >= scope.first_owner).and(ordinal < scope.first_owner + scope.owners.length()):
+            found = scope.owners.get(ordinal - scope.first_owner)
+            break
+    found
+
+
+private pure func owner_slot(
+    state: VerificationFacts,
+    owner_count: Int,
+    id: OwnerId,
+    span: Span,
+) -> Result[OwnerSlot, Diagnostic]:
+    ordinal = id.owner_number()
+    first_owner = state.first_owner
+
+    match state.enclosing_owner(ordinal):
+        Some(_): Ok(EnclosingSlot(ordinal))
+        None:
+            if (ordinal >= 0).and(ordinal < first_owner):
+                Err(
+                    verification_error(
+                        span,
+                        "owner ${ordinal.to_string()} is not available in this match arm",
+                    ),
+                )
+            else if (ordinal >= first_owner).and(ordinal < (first_owner + owner_count)):
+                Ok(LocalSlot(ordinal - first_owner))
+            else:
+                Err(verification_error(span, "owner ${ordinal.to_string()} is not defined"))
+
+
+private pure func discharged_already(discharged: List[Bool], ordinal: Int) -> Bool:
+    match discharged.get(ordinal):
+        Some(flag): flag
+        None: False
+
+
+-- Flags enclosing owner `ordinal` discharged. Which enclosing owners a block
+-- may discharge is checked where it leaves: a yield against its join's
+-- entering owners, a loop edge against the state before the loop. Selection
+-- edges admit only local drops and transfers, so they never reach this.
+private pure func discharge(discharged: List[Bool], ordinal: Int) -> List[Bool]:
+    var flags = discharged
+    while flags.length() < ordinal + 1:
+        flags = flags.append(False)
+    flags.set(ordinal, True)
+
+
+private pure func known_owner(
+    state: VerificationFacts,
+    discharged: List[Bool],
+    owners: List[OwnerState],
+    id: OwnerId,
+    span: Span,
+) -> Result[OwnerState, Diagnostic]:
+    slot ?= state.owner_slot(owners.length(), id, span)
+
+    entry: Option[OwnerState] = match slot:
+        EnclosingSlot(ordinal):
+            if discharged.discharged_already(ordinal):
+                Some(DischargedOwner)
+            else:
+                state.enclosing_owner(ordinal)
+        LocalSlot(index): owners.get(index)
+
+    -- Built only on failure: this lookup runs at every owner use.
+    match entry:
+        Some(found): Ok(found)
+        None: Err(verification_error(span, "owner ${id.owner_number().to_string()} is not defined"))
+
+
+private pure func validate_next_owner(
+    first_owner: Int,
+    owners: List[OwnerState],
+    id: OwnerId,
+    span: Span,
+) -> Result[Void, Diagnostic]:
+    ordinal = id.owner_number()
+    next_owner = first_owner + owners.length()
+
+    if ordinal < 0:
+        Err(verification_error(span, "negative owner identity"))
+    else if ordinal < next_owner:
+        Err(verification_error(span, "owner ${ordinal.to_string()} is defined more than once"))
+    else if ordinal != next_owner:
+        Err(verification_error(span, "owner identity is not the next function ordinal"))
+    else:
+        Ok(void)
+
+
+private pure func argument_value(argument: OwnedArgument) -> ValueId:
+    match argument:
+        UnmanagedArgument(id): id
+        ConsumedArgument(id, _): id
+        BorrowedArgument(borrow): borrow.value
+
+
+private pure func payload_value(payload: StoredPayload) -> ValueId:
+    match payload:
+        UnmanagedPayload(value): value
+        OwnedPayload(value, _): value
+
+
+private pure func transfer_value(transfer: ReturnTransfer) -> ValueId:
+    match transfer:
+        UnmanagedReturn(value): value
+        OwnedReturn(value, _): value
+
+
+private pure func verify_borrow(
+    borrow: BorrowedValue,
+    state: VerificationFacts,
+    span: Span,
+    discharged: List[Bool],
+    owners: List[OwnerState],
+) -> Result[Void, Diagnostic]:
+    borrowed ?= state.known_value(borrow.value, span)
+
+    managed: Void ?= match borrowed.result:
+        UnmanagedResult: Err(verification_error(span, "borrow requires a managed value"))
+        _: Ok(void)
+
+    match borrow.source:
+        -- An owned parameter is an owner, never a parameter borrow.
+        ParameterBorrow(source):
+            borrows_parameter = match borrowed.result:
+                BorrowedResult(ParameterBorrow(_)): source == borrow.value
+                _: False
+            parameter_defined = if borrows_parameter:
+                state.parameters.any(pure func(parameter: ValueId) -> Bool: parameter == source)
+            else:
+                False
+
+            if parameter_defined:
+                Ok(void)
+            else:
+                Err(
+                    verification_error(
+                        span,
+                        "parameter borrow does not refer to the borrowed parameter",
+                    ),
+                )
+        OwnerBorrow(id):
+            match state.known_owner(discharged, owners, id, span):
+                Ok(entry):
+
+                    match entry:
+                        DischargedOwner:
+                            Err(
+                                verification_error(
+                                    span,
+                                    "borrow refers to discharged owner ".append_int(
+                                        id.owner_number(),
+                                    ),
+                                ),
+                            )
+                        ActiveOwner(owned):
+                            if owned == borrow.value:
+                                Ok(void)
+                            else:
+                                Err(
+                                    verification_error(
+                                        span,
+                                        "owner ${id.owner_number().to_string()} does not own value ${borrow.value.value_number().to_string()}",
+                                    ),
+                                )
+                Err(error): Err(error)
+        PayloadBorrow(parent):
+            match borrowed.result:
+                BorrowedResult(PayloadBorrow(expected)):
+                    if parent == expected:
+                        match borrowed.projection_parent.or_verification_error(
+                            span,
+                            "projection has no parent lifetime",
+                        ):
+                            Ok(ancestor):
+
+                                if ancestor.value == parent:
+                                    ancestor.verify_borrow(state, span, discharged, owners)
+                                else:
+                                    Err(
+                                        verification_error(
+                                            span,
+                                            "payload borrow has the wrong parent value",
+                                        ),
+                                    )
+                            Err(error): Err(error)
+                    else:
+                        Err(verification_error(span, "payload borrow has the wrong parent value"))
+                _: Err(verification_error(span, "payload borrow requires a borrowed projection"))
+
+
+-- The signature a call's target declares, after its types are shown to exist.
+private pure func call_signature(
+    target: CallTarget,
+    span: Span,
+    functions: List[OwnedFunction],
+    unions: List[ConcreteUnion],
+    records: List[ConcreteRecord],
+) -> Result[FunctionSignature, Diagnostic]:
+    match target:
+        RuntimeFunction(operation): operation.verify_runtime_signature(span, unions, records)
+        UserFunction(id):
+            match functions.get(id.function_number()):
+                Some(function):
+                    Ok({
+                        parameters = function.parameters.map(parameter_type),
+                        return_type = function.return_type,
+                    })
+                None: Err(verification_error(span, "unknown called function"))
+
+
+private pure func verify_runtime_signature(
+    operation: RuntimeOperation[VariantInstanceId, TypeRef],
+    span: Span,
+    unions: List[ConcreteUnion],
+    records: List[ConcreteRecord],
+) -> Result[FunctionSignature, Diagnostic]:
+    contract = operation.runtime_signature()
+    _ ?= contract.parameters.first_error(pure func(parameter: TypeRef) -> Result[Void, Diagnostic]:
+        parameter.verify_type_membership(unions, records, span)
+    )
+    validation: Result[Void, Diagnostic] = match operation.runtime_contract().return_type:
+        ValueResult(_): Ok(void)
+        OptionalResult(payload, option):
+            option.some.verify_two_variant_union(
+                [payload.runtime_type_ref()],
+                option.none,
+                [],
+                unions,
+                span,
+                "runtime Option constructors do not cover one result union",
+            )
+        ResultResult(success, error, constructors):
+            constructors.ok.verify_two_variant_union(
+                [success.runtime_type_ref()],
+                constructors.err,
+                [error.runtime_type_ref()],
+                unions,
+                span,
+                "runtime Result constructors do not cover one result union",
+            )
+        BooleanResult(boolean):
+            boolean.true_variant.verify_two_variant_union(
+                [],
+                boolean.false_variant,
+                [],
+                unions,
+                span,
+                "runtime Bool constructors do not cover one result union",
+            )
+
+    valid ?= validation
+    result ?= contract.return_type.verify_type_membership(unions, records, span)
+    Ok(contract)
+
+
+-- A runtime union result: its two constructors must be distinct
+-- variants of one two-variant union. This sees specialized instances, not
+-- declarations, so it checks only the owner, both payloads and the two variants.
+-- That the union is the designated foundation union is enforced where the
+-- checker's `runtime_result_type` builds each result from the designated
+-- unions. Specialization maps those variants into the result instance and
+-- treats a mismatch as a compiler invariant.
+private pure func verify_two_variant_union(
+    first: VariantInstanceId,
+    first_payload: List[TypeRef],
+    second: VariantInstanceId,
+    second_payload: List[TypeRef],
+    unions: List[ConcreteUnion],
+    span: Span,
+    message: String,
+) -> Result[Void, Diagnostic]:
+    first_type ?= first.variant_type(first_payload, unions, span)
+    second_type ?= second.variant_type(second_payload, unions, span)
+    layout ?= unions
+        .get(first.variant_owner().union_number())
+        .or_verification_error(span, "unknown runtime result union")
+
+    if (first_type == second_type).and(layout.union_variants().length() == 2).and(
+        first.variant_number() != second.variant_number(),
+    ):
+        Ok(void)
+    else:
+        Err(verification_error(span, message))
+
+
+private pure func verify_argument(
+    argument: OwnedArgument,
+    expected: TypeRef,
+    state: VerificationFacts,
+    unions: List[ConcreteUnion],
+    span: Span,
+    records: List[ConcreteRecord],
+    discharged: List[Bool],
+    owners: List[OwnerState],
+) -> Result[Void, Diagnostic]:
+    id = match argument:
+        UnmanagedArgument(id): id
+        ConsumedArgument(id, _): id
+        BorrowedArgument(borrow): borrow.value
+
+    known ?= state.known_value(id, span)
+
+    if known.value_type != expected:
+        Err(verification_error(span, "call argument type does not match its contract"))
+    else:
+        match argument:
+            ConsumedArgument(_, _):
+                Err(
+                    verification_error(
+                        span,
+                        "consumed argument requires an owned parameter or an in-place operand",
+                    ),
+                )
+            UnmanagedArgument(_):
+                match expected.value_needs_ownership(unions, records):
+                    Ok(needs_owner):
+
+                        match needs_owner:
+                            False: Ok(void)
+                            True:
+                                Err(
+                                    verification_error(
+                                        span,
+                                        "managed call argument requires an owner-dependent borrow",
+                                    ),
+                                )
+                    Err(error): Err(error)
+            BorrowedArgument(borrow): borrow.verify_borrow(state, span, discharged, owners)
+
+
+-- Borrow validation uses the complete pre-call state, in which each
+-- transferred operand is still a borrow of its owner. A reusing runtime
+-- operand 0 may receive a transfer and otherwise borrows; an owned row of the
+-- callee must receive one. verify_argument rejects a transfer anywhere else.
+private pure func transferred_borrows(
+    target: CallTarget,
+    arguments: List[OwnedArgument],
+    functions: List[OwnedFunction],
+    span: Span,
+) -> Result[List[OwnedArgument], Diagnostic]:
+    match target:
+        RuntimeFunction(operation):
+            match arguments.get(0):
+                Some(ConsumedArgument(value, owner)):
+                    if operation.reuses_first_operand():
+                        Ok(
+                            arguments.set(
+                                0,
+                                BorrowedArgument({ value = value, source = OwnerBorrow(owner) }),
+                            ),
+                        )
+                    else:
+                        Ok(arguments)
+                _: Ok(arguments)
+        UserFunction(id):
+            match functions.get(id.function_number()):
+                None: Err(verification_error(span, "unknown called function"))
+                Some(callee):
+                    var borrows = arguments
+                    var failure: Option[Diagnostic] = None
+                    var index = 0
+                    for row in callee.parameters:
+                        if row.parameter_owned():
+                            match arguments.get(index):
+                                Some(ConsumedArgument(value, owner)):
+                                    borrows = borrows.set(
+                                        index,
+                                        BorrowedArgument({
+                                            value = value,
+                                            source = OwnerBorrow(owner),
+                                        }),
+                                    )
+                                Some(_):
+                                    failure = Some(
+                                        verification_error(
+                                            span,
+                                            "owned parameter requires a transferred argument",
+                                        ),
+                                    )
+                                None: void
+                        index = index + 1
+                    match failure:
+                        Some(error): Err(error)
+                        None: Ok(borrows)
+
+
+private pure func verify_arguments(
+    arguments: List[OwnedArgument],
+    parameters: List[TypeRef],
+    state: VerificationFacts,
+    unions: List[ConcreteUnion],
+    span: Span,
+    records: List[ConcreteRecord],
+    discharged: List[Bool],
+    owners: List[OwnerState],
+) -> Result[Void, Diagnostic]:
+    if arguments.length() < parameters.length():
+        Err(verification_error(span, "call is missing its argument"))
+    else if arguments.length() > parameters.length():
+        Err(verification_error(span, "call has an unexpected argument"))
+    else:
+        var index: Int = 0
+        var invalid: Option[Diagnostic] = None
+
+        for argument in arguments:
+            match parameters.get(index):
+                None:
+                    invalid = Some(verification_error(span, "missing call parameter contract"))
+                    break
+                Some(expected):
+                    match argument.verify_argument(
+                        expected,
+                        state,
+                        unions,
+                        span,
+                        records,
+                        discharged,
+                        owners,
+                    ):
+                        Err(error):
+                            invalid = Some(error)
+                            break
+                        Ok(_): void
+
+            index = index + 1
+
+        match invalid:
+            Some(error): Err(error)
+            None: Ok(void)
+
+
+private pure func variant_shape(
+    id: VariantInstanceId,
+    unions: List[ConcreteUnion],
+    span: Span,
+) -> Result[List[TypeRef], Diagnostic]:
+    declaration ?= unions
+        .get(id.variant_owner().union_number())
+        .or_verification_error(span, "unknown variant owner")
+    declaration
+        .union_variants()
+        .get(id.variant_number())
+        .or_verification_error(span, "unknown variant identity")
+
+
+private pure func variant_type(
+    id: VariantInstanceId,
+    expected: List[TypeRef],
+    unions: List[ConcreteUnion],
+    span: Span,
+) -> Result[TypeRef, Diagnostic]:
+    shape ?= id.variant_shape(unions, span)
+    if shape.length() != expected.length():
+        Err(verification_error(span, "variant field count does not match its operation"))
+    else:
+        var position = 0
+        var valid: Bool = True
+        for actual in expected:
+            match shape.get(position):
+                Some(field):
+                    valid = match valid:
+                        True: field == actual
+                        False: False
+                None: valid = False
+            position = position + 1
+        if valid:
+            Ok(UnionType(id.variant_owner()))
+        else:
+            Err(verification_error(span, "variant payload does not match its operation"))
+
+
+private pure func valid_union_layout(
+    layout: ConcreteUnion,
+    position: Int,
+    records: List[ConcreteRecord],
+    unions: List[ConcreteUnion],
+) -> Result[Void, Diagnostic]:
+    span: Span = compiler_span()
+
+    variants = layout.union_variants()
+
+    if variants.length() == 0:
+        Err(verification_error(span, "union layout must contain one or more variants"))
+    else:
+        var invalid: Option[Diagnostic] = None
+        var owning: Bool = False
+        var self_referencing: Bool = False
+
+        for fields in variants:
+            var self_payloads = 0
+
+            for value_type in fields:
+                valid: Bool = match value_type:
+                    VoidType | IntType | FloatType: True
+                    RecordType(id):
+                        match records.get(id.record_number()):
+                            Some(child):
+                                match child:
+                                    ValueFields(_) | CountedFields(_): owning = True
+                                    InlineFields(_): void
+
+                                True
+                            None: False
+                    UnionType(id):
+                        if id.union_number() == position:
+                            -- The unary recursive shape: a boxed node's pointer to
+                            -- at most one child of its own layout.
+                            self_referencing = True
+                            self_payloads = self_payloads + 1
+
+                            match layout:
+                                BoxedCases(_):
+                                    if self_payloads > 1:
+                                        invalid = Some(
+                                            verification_error(
+                                                span,
+                                                "boxed union variant may store at most one self-reference",
+                                            ),
+                                        )
+                                PlainCases(_) | OwningCases(_):
+                                    invalid = Some(
+                                        verification_error(
+                                            span,
+                                            "recursive union payload requires the boxed representation",
+                                        ),
+                                    )
+
+                            True
+                        else:
+                            -- Any other layout in range: a boxed child is a pointer
+                            -- edge, an inline child is stored by value, and the
+                            -- layout graph walk below proves the by-value edges
+                            -- acyclic. Definition order is the emitter's concern.
+                            match unions.get(id.union_number()):
+                                Some(child):
+                                    match child:
+                                        OwningCases(_) | BoxedCases(_): owning = True
+                                        PlainCases(_): void
+
+                                    True
+                                None: False
+                    StringType:
+                        owning = True
+                        True
+                    ListType(_) | CallableType(_, _):
+                        owning = True
+                        True
+
+                if invalid.is_some():
+                    break
+
+                if valid.not():
+                    invalid = Some(
+                        verification_error(span, "union payload must reference a supported layout"),
+                    )
+                    break
+            if invalid.is_some():
+                break
+
+        match invalid:
+            Some(error): Err(error)
+            None:
+                match layout:
+                    BoxedCases(_):
+                        if self_referencing:
+                            Ok(void)
+                        else:
+                            Err(
+                                verification_error(
+                                    span,
+                                    "boxed union representation requires a self-referencing payload",
+                                ),
+                            )
+                    PlainCases(_):
+                        if owning:
+                            Err(
+                                verification_error(
+                                    span,
+                                    "union ownership summary does not match its payloads",
+                                ),
+                            )
+                        else:
+                            Ok(void)
+                    OwningCases(_):
+                        if owning:
+                            Ok(void)
+                        else:
+                            Err(
+                                verification_error(
+                                    span,
+                                    "union ownership summary does not match its payloads",
+                                ),
+                            )
+
+
+private pure func valid_record_layout(
+    layout: ConcreteRecord,
+    span: Span,
+) -> Result[ConcreteRecord, Diagnostic]:
+    if layout.record_fields().length() > 0:
+        Ok(layout)
+    else:
+        Err(verification_error(span, "record layout must contain one or more fields"))
+
+
+private union LayoutVisit:
+    UnvisitedLayout
+    VisitingLayout
+    CompleteLayout
+
+
+private union LayoutVisitStep:
+    VisitRecordLayout(Int)
+    VisitUnionLayout(Int)
+    VisitStoredType(TypeRef)
+    FinishRecordLayout(Int)
+    FinishUnionLayout(Int)
+
+
+private pure func list_terminal_presence(
+    element: TypeRef,
+    records: List[ConcreteRecord],
+    unions: List[ConcreteUnion],
+) -> Result[Void, Diagnostic]:
+    span: Span = compiler_span()
+    var terminal = element
+    while True:
+        match terminal:
+            ListType(inner): terminal = inner
+            _: break
+    match terminal:
+        CallableType(_, _): terminal.verify_type_membership(unions, records, span)
+        RecordType(id):
+            match records.get(id.record_number()):
+                Some(_): Ok(void)
+                None: Err(verification_error(span, "unknown record layout"))
+        UnionType(id):
+            match unions.get(id.union_number()):
+                Some(_): Ok(void)
+                None: Err(verification_error(span, "unknown union layout"))
+        _: Ok(void)
+
+
+-- The by-value storage graph of the layouts must be acyclic: every cycle
+-- passes through a managed record, a boxed union or a List, which the walk
+-- does not follow. Each layout is also walked as a root, and a record's
+-- storage summary is checked once its fields are known.
+private pure func verify_layout_graph(
+    records: List[ConcreteRecord],
+    unions: List[ConcreteUnion],
+) -> Result[Void, Diagnostic]:
+    span: Span = compiler_span()
+    -- A local traversal owns each state vector throughout every update.
+    var record_visits = records.map(pure func(_) -> LayoutVisit: UnvisitedLayout)
+    var union_visits = unions.map(pure func(_) -> LayoutVisit: UnvisitedLayout)
+    var pending: List[LayoutVisitStep] = []
+    var pending_count = 0
+    var position = unions.length()
+
+    while position > 0:
+        position = position - 1
+        pending = pending.push_at(pending_count, VisitUnionLayout(position))
+        pending_count = pending_count + 1
+
+    position = records.length()
+
+    while position > 0:
+        position = position - 1
+        pending = pending.push_at(pending_count, VisitRecordLayout(position))
+        pending_count = pending_count + 1
+
+    var invalid: Option[Diagnostic] = None
+
+    while (pending_count > 0).and(invalid.is_some().not()):
+        pending_count = pending_count - 1
+
+        match pending.get(pending_count):
+            None:
+                invalid = Some(verification_error(span, "invalid aggregate layout traversal state"))
+            Some(step):
+                match step:
+                    VisitStoredType(value_type):
+                        -- Only storage by value continues the walk: an inline record
+                        -- or inline union lies inside its parent. A managed record,
+                        -- a boxed union, a List and a String are pointer edges, and
+                        -- their layouts are walked as roots of their own.
+                        match value_type:
+                            RecordType(id):
+                                match records.get(id.record_number()):
+                                    None:
+                                        invalid = Some(
+                                            verification_error(span, "unknown record layout"),
+                                        )
+                                    Some(child):
+                                        match child:
+                                            InlineFields(_) | ValueFields(_):
+                                                pending = pending.push_at(
+                                                    pending_count,
+                                                    VisitRecordLayout(id.record_number()),
+                                                )
+                                                pending_count = pending_count + 1
+                                            CountedFields(_): void
+                            UnionType(id):
+                                match unions.get(id.union_number()):
+                                    None:
+                                        invalid = Some(
+                                            verification_error(span, "unknown union layout"),
+                                        )
+                                    Some(child):
+                                        match child:
+                                            PlainCases(_) | OwningCases(_):
+                                                pending = pending.push_at(
+                                                    pending_count,
+                                                    VisitUnionLayout(id.union_number()),
+                                                )
+                                                pending_count = pending_count + 1
+                                            BoxedCases(_): void
+                            ListType(element):
+                                -- A pointer edge whose target must exist; its layout is
+                                -- walked as a root of its own, not from here.
+                                match element.list_terminal_presence(records, unions):
+                                    Ok(_): void
+                                    Err(error): invalid = Some(error)
+                            CallableType(_, _):
+                                -- A callable stores an ops/environment pair, not its signature children.
+                                match value_type.verify_type_membership(unions, records, span):
+                                    Ok(_): void
+                                    Err(error): invalid = Some(error)
+                            VoidType | IntType | FloatType | StringType: void
+                    VisitRecordLayout(index):
+                        match record_visits.get(index):
+                            None: invalid = Some(verification_error(span, "unknown record layout"))
+                            Some(CompleteLayout): void
+                            Some(VisitingLayout):
+                                invalid = Some(
+                                    verification_error(
+                                        span,
+                                        "aggregate layouts form a by-value cycle",
+                                    ),
+                                )
+                            Some(UnvisitedLayout):
+                                match records.get(index):
+                                    None:
+                                        invalid = Some(
+                                            verification_error(span, "unknown record layout"),
+                                        )
+                                    Some(layout):
+                                        record_visits = record_visits.set(index, VisitingLayout)
+                                        pending = pending.push_at(
+                                            pending_count,
+                                            FinishRecordLayout(index),
+                                        )
+                                        pending_count = pending_count + 1
+                                        fields = layout.record_fields()
+                                        var child = fields.length()
+
+                                        while child > 0:
+                                            child = child - 1
+
+                                            match fields.get(child):
+                                                Some(field):
+                                                    pending = pending.push_at(
+                                                        pending_count,
+                                                        VisitStoredType(field),
+                                                    )
+                                                    pending_count = pending_count + 1
+                                                None:
+                                                    invalid = Some(
+                                                        verification_error(
+                                                            span,
+                                                            "invalid aggregate layout traversal state",
+                                                        ),
+                                                    )
+                                                    break
+                    VisitUnionLayout(index):
+                        match union_visits.get(index):
+                            None: invalid = Some(verification_error(span, "unknown union layout"))
+                            Some(CompleteLayout): void
+                            Some(VisitingLayout):
+                                invalid = Some(
+                                    verification_error(
+                                        span,
+                                        "aggregate layouts form a by-value cycle",
+                                    ),
+                                )
+                            Some(UnvisitedLayout):
+                                match unions.get(index):
+                                    None:
+                                        invalid = Some(
+                                            verification_error(span, "unknown union layout"),
+                                        )
+                                    Some(layout):
+                                        union_visits = union_visits.set(index, VisitingLayout)
+                                        pending = pending.push_at(
+                                            pending_count,
+                                            FinishUnionLayout(index),
+                                        )
+                                        pending_count = pending_count + 1
+                                        variants = layout.union_variants()
+                                        var child = variants.length()
+
+                                        while child > 0:
+                                            child = child - 1
+
+                                            match variants.get(child):
+                                                Some(fields):
+                                                    var field_position = fields.length()
+                                                    while field_position > 0:
+                                                        field_position = field_position - 1
+                                                        match fields.get(field_position):
+                                                            Some(field):
+                                                                pending = pending.push_at(
+                                                                    pending_count,
+                                                                    VisitStoredType(field),
+                                                                )
+                                                                pending_count = pending_count + 1
+                                                            None:
+                                                                invalid = Some(
+                                                                    verification_error(
+                                                                        span,
+                                                                        "invalid aggregate layout traversal state",
+                                                                    ),
+                                                                )
+                                                                break
+                                                None:
+                                                    invalid = Some(
+                                                        verification_error(
+                                                            span,
+                                                            "invalid aggregate layout traversal state",
+                                                        ),
+                                                    )
+                                                    break
+                    FinishUnionLayout(index): union_visits = union_visits.set(index, CompleteLayout)
+                    FinishRecordLayout(index):
+                        match records.get(index):
+                            None: invalid = Some(verification_error(span, "unknown record layout"))
+                            Some(layout):
+                                var inline: Bool = True
+
+                                for field in layout.record_fields():
+                                    match field:
+                                        IntType | FloatType: void
+                                        -- Verification checks only that the union has no counted
+                                        -- child: a PlainCases union is stored by value and needs no
+                                        -- cleanup. It does not see the declared fixed fact, so it
+                                        -- accepts any PlainCases union, a superset of what
+                                        -- specialization produces: specialization keeps a record
+                                        -- inline only for a union declared fixed, which is always
+                                        -- PlainCases.
+                                        UnionType(child):
+                                            match unions.get(child.union_number()):
+                                                Some(PlainCases(_)): void
+                                                Some(OwningCases(_) | BoxedCases(_)): inline = False
+                                                None:
+                                                    invalid = Some(
+                                                        verification_error(
+                                                            span,
+                                                            "unknown union layout",
+                                                        ),
+                                                    )
+                                                    break
+                                        RecordType(child):
+                                            match records.get(child.record_number()):
+                                                Some(child_layout):
+                                                    match child_layout:
+                                                        InlineFields(_): void
+                                                        ValueFields(_) | CountedFields(_):
+                                                            inline = False
+                                                None:
+                                                    invalid = Some(
+                                                        verification_error(
+                                                            span,
+                                                            "unknown record layout",
+                                                        ),
+                                                    )
+                                                    break
+                                        _: inline = False
+
+                                matches = match layout:
+                                    InlineFields(_): inline
+                                    -- By-value and counted storage permit any field; Spec owns
+                                    -- the storage choice, and the layout walk above keeps
+                                    -- by-value nesting finite. Only inline storage constrains fields.
+                                    ValueFields(_) | CountedFields(_): True
+
+                                if invalid.is_some().not():
+                                    if matches:
+                                        record_visits = record_visits.set(index, CompleteLayout)
+                                    else:
+                                        invalid = Some(
+                                            verification_error(
+                                                span,
+                                                "record storage summary does not match its fields",
+                                            ),
+                                        )
+
+    match invalid:
+        Some(error): Err(error)
+        None: Ok(void)
+
+
+private pure func record_layout(
+    owner: RecordInstanceId,
+    records: List[ConcreteRecord],
+    span: Span,
+) -> Result[ConcreteRecord, Diagnostic]:
+    layout ?= records
+        .get(owner.record_number())
+        .or_verification_error(span, "unknown record layout")
+    layout.valid_record_layout(span)
+
+
+private pure func record_field_type(
+    field: FieldInstanceId,
+    owner: RecordInstanceId,
+    layout: ConcreteRecord,
+    span: Span,
+) -> Result[TypeRef, Diagnostic]:
+    if field.field_owner() != owner:
+        Err(verification_error(span, "field belongs to a different record layout"))
+    else:
+        layout
+            .record_fields()
+            .get(field.field_number())
+            .or_verification_error(span, "unknown record field")
+
+
+private pure func definition_value(
+    definition: OwnedDefinition,
+    expected: TypeRef,
+    projection_parent: Option[BorrowedValue],
+    projection_place: Option[ConcretePatternPlace],
+) -> Result[KnownValue, Diagnostic]:
+    if expected == definition.value_type:
+        Ok({
+            value_type = definition.value_type,
+            span = definition.span,
+            result = definition.result,
+            projection_parent = projection_parent,
+            projection_place = projection_place,
+        })
+    else:
+        Err(verification_error(definition.span, "definition type does not match its operation"))
+
+
+private pure func operation_value(
+    definition: OwnedDefinition,
+    state: VerificationFacts,
+    rows: List[OwnedParameter],
+    functions: List[OwnedFunction],
+    unions: List[ConcreteUnion],
+    projection: ProjectionContext,
+    records: List[ConcreteRecord],
+    discharged: List[Bool],
+    owners: List[OwnerState],
+) -> Result[KnownValue, Diagnostic]:
+    match definition.operation:
+        ConstructRecordDefinition(owner, fields):
+            match owner.record_layout(records, definition.span):
+                Ok(layout):
+
+                    if fields.length() == layout.record_fields().length():
+                        var seen: List[Int] = []
+                        var invalid: Option[Diagnostic] = None
+
+                        for field in fields:
+                            if seen.contains(field.field.field_number()):
+                                invalid = Some(
+                                    verification_error(
+                                        definition.span,
+                                        "record construction repeats a field",
+                                    ),
+                                )
+                                break
+
+                            result = field.field
+                                .record_field_type(owner, layout, definition.span)
+                                .and_then(pure func(expected: TypeRef) -> Result[Void, Diagnostic]:
+                                    stored = field.value.payload_value()
+
+                                    match state.known_value(stored, definition.span):
+                                        Err(error): Err(error)
+                                        Ok(known):
+                                            if known.value_type == expected:
+                                                Ok(void)
+                                            else:
+                                                Err(
+                                                    verification_error(
+                                                        definition.span,
+                                                        "record field value type does not match its layout",
+                                                    ),
+                                                )
+                                )
+
+                            match result:
+                                Err(error):
+                                    invalid = Some(error)
+                                    break
+                                Ok(_): seen = seen.append(field.field.field_number())
+
+                        match invalid:
+                            Some(error): Err(error)
+                            None: definition.definition_value(RecordType(owner), None, None)
+                    else:
+                        Err(
+                            verification_error(
+                                definition.span,
+                                "record construction must provide every field exactly once",
+                            ),
+                        )
+                Err(error): Err(error)
+        ReadRecordFieldDefinition(field, argument):
+            field.record_projection_value(
+                argument,
+                definition,
+                state,
+                unions,
+                records,
+                projection,
+                discharged,
+                owners,
+            )
+        ParameterDefinition(index):
+            if index < state.parameters.length():
+                Err(
+                    verification_error(
+                        definition.span,
+                        "function parameter is defined more than once",
+                    ),
+                )
+            else if index != state.parameters.length():
+                Err(
+                    verification_error(
+                        definition.span,
+                        "function parameter position is not the next signature position",
+                    ),
+                )
+            else:
+                match rows.get(index).map(parameter_type).or_verification_error(
+                    definition.span,
+                    "parameter value in a zero-argument function",
+                ):
+                    Err(error): Err(error)
+                    Ok(expected): definition.definition_value(expected, None, None)
+        VoidDefinition: definition.definition_value(VoidType, None, None)
+        StringDefinition(_): definition.definition_value(StringType, None, None)
+        IntegerDefinition(_): definition.definition_value(IntType, None, None)
+        FloatDefinition(value):
+            if value.is_finite():
+                definition.definition_value(FloatType, None, None)
+            else:
+                Err(verification_error(definition.span, "Float literal must be finite"))
+        FreeCallableDefinition(id):
+            match id.pinned_callable(functions, definition.span):
+                Err(error): Err(error)
+                Ok(function):
+                    definition.definition_value(
+                        CallableType(function.parameters.map(parameter_type), function.return_type),
+                        None,
+                        None,
+                    )
+        CapturedCallableDefinition(id, payload):
+            stored = payload.payload_value()
+            match state.known_value(stored, definition.span):
+                Err(error): Err(error)
+                Ok(environment):
+                    match id.pinned_callable(functions, definition.span):
+                        Err(error): Err(error)
+                        Ok(function):
+                            match environment.value_type:
+                                RecordType(owner):
+                                    match function.parameters.map(parameter_type):
+                                        []:
+                                            Err(
+                                                verification_error(
+                                                    definition.span,
+                                                    "captured callable requires an environment parameter",
+                                                ),
+                                            )
+                                        [parameter, ...parameters]:
+                                            match owner.record_layout(records, definition.span):
+                                                Err(error): Err(error)
+                                                Ok(layout):
+                                                    match layout:
+                                                        InlineFields(_) | ValueFields(_):
+                                                            Err(
+                                                                verification_error(
+                                                                    definition.span,
+                                                                    "callable environment must be a counted record",
+                                                                ),
+                                                            )
+                                                        CountedFields(_):
+                                                            if parameter == environment.value_type:
+                                                                definition.definition_value(
+                                                                    CallableType(
+                                                                        parameters,
+                                                                        function.return_type,
+                                                                    ),
+                                                                    None,
+                                                                    None,
+                                                                )
+                                                            else:
+                                                                Err(
+                                                                    verification_error(
+                                                                        definition.span,
+                                                                        "callable body environment type does not match its stored environment",
+                                                                    ),
+                                                                )
+                                _:
+                                    Err(
+                                        verification_error(
+                                            definition.span,
+                                            "captured callable requires an environment parameter",
+                                        ),
+                                    )
+        InvokeCallableDefinition(callee, arguments):
+            match state.known_value(callee.argument_value(), definition.span):
+                Err(error): Err(error)
+                Ok(known):
+                    match callee.verify_argument(
+                        known.value_type,
+                        state,
+                        unions,
+                        definition.span,
+                        records,
+                        discharged,
+                        owners,
+                    ):
+                        Err(error): Err(error)
+                        Ok(live):
+                            match known.value_type:
+                                CallableType(parameters, result):
+                                    match arguments.verify_arguments(
+                                        parameters,
+                                        state,
+                                        unions,
+                                        definition.span,
+                                        records,
+                                        discharged,
+                                        owners,
+                                    ):
+                                        Err(error): Err(error)
+                                        Ok(valid): definition.definition_value(result, None, None)
+                                _:
+                                    Err(
+                                        verification_error(
+                                            definition.span,
+                                            "indirect call requires a callable value",
+                                        ),
+                                    )
+        CallDefinition(target, arguments):
+            match target.call_signature(definition.span, functions, unions, records):
+                Ok(contract):
+                    match target.transferred_borrows(arguments, functions, definition.span):
+                        Err(error): Err(error)
+                        Ok(borrows):
+                            match borrows.verify_arguments(
+                                contract.parameters,
+                                state,
+                                unions,
+                                definition.span,
+                                records,
+                                discharged,
+                                owners,
+                            ):
+                                Ok(valid):
+                                    if contract.return_type == definition.value_type:
+                                        definition.definition_value(
+                                            contract.return_type,
+                                            None,
+                                            None,
+                                        )
+                                    else:
+                                        Err(
+                                            verification_error(
+                                                definition.span,
+                                                "call result type does not match its contract",
+                                            ),
+                                        )
+                                Err(error): Err(error)
+                Err(error): Err(error)
+        ConstructDefinition(id, payloads):
+            var types: List[TypeRef] = []
+            var found_error: Option[Diagnostic] = None
+            for payload in payloads:
+                argument = payload.payload_value()
+                match state.known_value(argument, definition.span):
+                    Ok(known): types = types.append(known.value_type)
+                    Err(failure):
+                        found_error = Some(failure)
+                        break
+            match found_error:
+                Some(error): Err(error)
+                None:
+                    match id.variant_type(types, unions, definition.span):
+                        Err(error): Err(error)
+                        Ok(expected): definition.definition_value(expected, None, None)
+        ConstructListDefinition(payloads):
+            -- The definition's List type is the one authority for E; every
+            -- stored element must carry exactly that type.
+            match definition.value_type:
+                ListType(element):
+                    var found_error: Option[Diagnostic] = None
+                    for payload in payloads:
+                        argument = payload.payload_value()
+                        match state.known_value(argument, definition.span):
+                            Err(failure):
+                                found_error = Some(failure)
+                                break
+                            Ok(known):
+                                if known.value_type != element:
+                                    found_error = Some(
+                                        verification_error(
+                                            definition.span,
+                                            "list element type does not match its List",
+                                        ),
+                                    )
+                                    break
+                    match found_error:
+                        Some(error): Err(error)
+                        None: definition.definition_value(definition.value_type, None, None)
+                _:
+                    Err(
+                        verification_error(
+                            definition.span,
+                            "list construction result must be a List",
+                        ),
+                    )
+
+        PayloadDefinition(field, source):
+            field.payload_projection_value(
+                source,
+                state,
+                projection,
+                unions,
+                records,
+                definition,
+                discharged,
+                owners,
+            )
+        ListElementDefinition(index, source):
+            index.element_projection_value(
+                source,
+                state,
+                projection,
+                unions,
+                records,
+                definition,
+                discharged,
+                owners,
+            )
+        ListSuffixDefinition(argument, skip):
+            match argument.suffix_projection_type(
+                skip,
+                state,
+                projection,
+                unions,
+                records,
+                definition.span,
+                discharged,
+                owners,
+            ):
+                Err(error): Err(error)
+                Ok(expected): definition.definition_value(expected, None, None)
+
+
+-- Owner slots after every stored payload of one construction discharged its
+-- obligation into storage; variants, list literals and records share it.
+private record DischargedOwners { discharged: List[Bool], owners: List[OwnerState] }
+
+
+-- The payloads an operation stores, each of which discharges an owner into
+-- its storage; variants, list literals, captures and records share this.
+private pure func stored_payloads(operation: OwnedValueOperation) -> List[StoredPayload]:
+    match operation:
+        ConstructListDefinition(payloads): payloads
+        ConstructDefinition(_, payloads): payloads
+        CapturedCallableDefinition(_, payload): [payload]
+        ConstructRecordDefinition(_, fields):
+            var payloads: List[StoredPayload] = []
+            for field in fields:
+                payloads = payloads.append(field.value)
+            payloads
+        _: []
+
+
+private pure func discharge_payloads(
+    payloads: List[StoredPayload],
+    state: VerificationFacts,
+    discharged: List[Bool],
+    owners: List[OwnerState],
+    unions: List[ConcreteUnion],
+    records: List[ConcreteRecord],
+    span: Span,
+) -> Result[DischargedOwners, Diagnostic]:
+    var enclosing = discharged
+    var local = owners
+    var failure_slot: Option[Diagnostic] = None
+    for payload in payloads:
+        match payload.stored_payload_transfer(state, enclosing, local, unions, records, span):
+            Err(error):
+                failure_slot = Some(error)
+                break
+            Ok(Some(EnclosingSlot(ordinal))): enclosing = enclosing.discharge(ordinal)
+            Ok(Some(LocalSlot(index))): local = local.set(index, DischargedOwner)
+            Ok(None): void
+    match failure_slot:
+        Some(error): Err(error)
+        None: Ok({ discharged = enclosing, owners = local })
+
+
+-- Consumed owners discharge in argument order, so one owner consumed at two
+-- positions fails at the second. Every remaining borrow is then revalidated
+-- against the post-discharge state, so projection ancestry and direct
+-- same-owner borrows cannot survive a consuming call. Distinct counted owners
+-- remain valid even when they reference the same runtime allocation.
+private pure func discharge_call_arguments(
+    arguments: List[OwnedArgument],
+    state: VerificationFacts,
+    discharged: List[Bool],
+    owners: List[OwnerState],
+    span: Span,
+) -> Result[DischargedOwners, Diagnostic]:
+    var enclosing = discharged
+    var local = owners
+    var failure: Option[Diagnostic] = None
+    var transferred: Bool = False
+    for argument in arguments:
+        match argument:
+            ConsumedArgument(_, owner):
+                transferred = True
+                match state.known_owner(enclosing, local, owner, span):
+                    Err(error): failure = Some(error)
+                    Ok(DischargedOwner):
+                        failure = Some(
+                            verification_error(
+                                span,
+                                "owner ${owner.owner_number().to_string()} has already been discharged",
+                            ),
+                        )
+                    Ok(ActiveOwner(_)):
+                        match state.owner_slot(local.length(), owner, span):
+                            Ok(EnclosingSlot(ordinal)): enclosing = enclosing.discharge(ordinal)
+                            Ok(LocalSlot(index)): local = local.set(index, DischargedOwner)
+                            Err(error): failure = Some(error)
+            _: void
+        if failure.is_some():
+            break
+    -- A call that transfers nothing leaves its pre-call borrows valid.
+    for argument in arguments:
+        if failure.is_some().or(transferred.not()):
+            break
+        match argument:
+            BorrowedArgument(borrow):
+                match borrow.verify_borrow(state, span, enclosing, local):
+                    Err(error): failure = Some(error)
+                    Ok(_): void
+            _: void
+    match failure:
+        Some(error): Err(error)
+        None: Ok({ discharged = enclosing, owners = local })
+
+
+private pure func stored_payload_transfer(
+    payload: StoredPayload,
+    state: VerificationFacts,
+    discharged: List[Bool],
+    owners: List[OwnerState],
+    unions: List[ConcreteUnion],
+    records: List[ConcreteRecord],
+    span: Span,
+) -> Result[Option[OwnerSlot], Diagnostic]:
+    id = payload.payload_value()
+
+    known ?= state.known_value(id, span)
+    needs_owner ?= known.value_type.value_needs_ownership(unions, records)
+
+    match payload:
+        UnmanagedPayload(_):
+            match needs_owner:
+                False: Ok(None)
+                True: Err(verification_error(span, "managed payload requires an owner transfer"))
+        OwnedPayload(value, transferred):
+            match needs_owner:
+                False: Err(verification_error(span, "unmanaged payload cannot transfer an owner"))
+                True:
+                    match state.known_owner(discharged, owners, transferred, span):
+                        Ok(entry):
+
+                            match entry:
+                                DischargedOwner:
+                                    Err(
+                                        verification_error(
+                                            span,
+                                            "payload owner has already been discharged",
+                                        ),
+                                    )
+                                ActiveOwner(owned):
+                                    if value == owned:
+                                        state
+                                            .owner_slot(owners.length(), transferred, span)
+                                            .map(pure func(slot): Some(slot))
+                                    else:
+                                        Err(
+                                            verification_error(
+                                                span,
+                                                "payload owner does not own the stored value",
+                                            ),
+                                        )
+                        Err(error): Err(error)
+
+
+-- A managed projection borrows from its parent value and introduces no owner.
+private pure func verify_projection_borrow(
+    definition: OwnedDefinition,
+    parent: ValueId,
+) -> Result[Option[OwnerId], Diagnostic]:
+    match definition.result:
+        BorrowedResult(PayloadBorrow(source)):
+            if parent == source:
+                Ok(None)
+            else:
+                Err(
+                    verification_error(
+                        definition.span,
+                        "payload borrow has the wrong parent value",
+                    ),
+                )
+        _: Err(verification_error(definition.span, "managed projection requires its parent borrow"))
+
+
+private pure func verify_definition_result(
+    definition: OwnedDefinition,
+    rows: List[OwnedParameter],
+    unions: List[ConcreteUnion],
+    records: List[ConcreteRecord],
+) -> Result[Option[OwnerId], Diagnostic]:
+    needs_owner ?= definition.value_type.value_needs_ownership(unions, records)
+
+    ownership_result: Result[Option[OwnerId], Diagnostic] = match needs_owner:
+        False:
+            match definition.result:
+                UnmanagedResult: Ok(None)
+                _:
+                    Err(
+                        verification_error(
+                            definition.span,
+                            "unmanaged value carries an ownership obligation",
+                        ),
+                    )
+        True:
+            match definition.operation:
+                -- An owned parameter is an obligation the function must discharge.
+                ParameterDefinition(index):
+                    match (rows.get(index), definition.result):
+                        (Some(ManagedParameter(passing)), OwnedResult(owner)):
+                            if passing.owned:
+                                Ok(Some(owner))
+                            else:
+                                Err(
+                                    verification_error(
+                                        definition.span,
+                                        "borrowed parameter cannot introduce an owner",
+                                    ),
+                                )
+                        (Some(ManagedParameter(passing)), BorrowedResult(ParameterBorrow(source))):
+                            if passing.owned:
+                                Err(
+                                    verification_error(
+                                        definition.span,
+                                        "owned parameter must introduce its owner",
+                                    ),
+                                )
+                            else if source == definition.id:
+                                Ok(None)
+                            else:
+                                Err(
+                                    verification_error(
+                                        definition.span,
+                                        "managed parameter has the wrong borrow source",
+                                    ),
+                                )
+                        _:
+                            Err(
+                                verification_error(
+                                    definition.span,
+                                    "managed parameter must follow its row",
+                                ),
+                            )
+                PayloadDefinition(_, parent): definition.verify_projection_borrow(parent)
+                ListElementDefinition(_, parent): definition.verify_projection_borrow(parent)
+                ReadRecordFieldDefinition(_, argument):
+                    definition.verify_projection_borrow(argument.argument_value())
+                StringDefinition(_) | CallDefinition(_, _) | InvokeCallableDefinition(_, _) | FreeCallableDefinition(_) | CapturedCallableDefinition(_, _) | ConstructDefinition(_, _) | ConstructListDefinition(_) | ConstructRecordDefinition(_, _) | ListSuffixDefinition(_, _):
+                    match definition.result:
+                        OwnedResult(owner): Ok(Some(owner))
+                        _:
+                            Err(
+                                verification_error(
+                                    definition.span,
+                                    "managed result requires an owner",
+                                ),
+                            )
+                _: Err(verification_error(definition.span, "unsupported managed value operation"))
+
+    ownership_result
+
+
+private pure func verify_match_argument(
+    argument: OwnedArgument,
+    state: VerificationFacts,
+    unions: List[ConcreteUnion],
+    records: List[ConcreteRecord],
+    span: Span,
+    discharged: List[Bool],
+    owners: List[OwnerState],
+) -> Result[Void, Diagnostic]:
+    match argument:
+        ConsumedArgument(_, _):
+            Err(verification_error(span, "match or projection cannot consume a call argument"))
+        BorrowedArgument(borrow): borrow.verify_borrow(state, span, discharged, owners)
+        UnmanagedArgument(id):
+            match state.known_value(id, span):
+                Ok(known):
+                    match known.value_type.value_needs_ownership(unions, records):
+                        Ok(needs_owner):
+
+                            match needs_owner:
+                                False: Ok(void)
+                                True:
+                                    Err(
+                                        verification_error(
+                                            span,
+                                            "managed match scrutinee requires an owner-dependent borrow",
+                                        ),
+                                    )
+                        Err(error): Err(error)
+                Err(error): Err(error)
+
+
+private pure func projection_includes(possible: List[Bool], ordinal: Int) -> Bool:
+    match possible.get(ordinal):
+        Some(included): included
+        None: False
+
+
+private pure func value_argument(value: ValueId, known: KnownValue) -> OwnedArgument:
+    match known.result:
+        UnmanagedResult: UnmanagedArgument(value)
+        BorrowedResult(source): BorrowedArgument({ value = value, source = source })
+        OwnedResult(owner): BorrowedArgument({ value = value, source = OwnerBorrow(owner) })
+
+
+private pure func value_place(
+    value: ValueId,
+    state: VerificationFacts,
+    projection: ProjectionContext,
+    span: Span,
+) -> Result[ConcretePatternPlace, Diagnostic]:
+    known ?= state.known_value(value, span)
+    match projection:
+        NoProjection:
+            Err(verification_error(span, "payload projection outside its selected match arm"))
+        SelectionProjection(root, _):
+            if value == root.argument_value():
+                Ok({ value_type = known.value_type, route = MatchRoot })
+            else:
+                known.projection_place.or_verification_error(
+                    span,
+                    "selection projection parent is not one of its verified places",
+                )
+
+
+-- The selected root's explicit borrow may differ from its definition result.
+-- Descendants instead depend on their already verified immediate parent.
+private record ProjectionParent { place: ConcretePatternPlace, borrow: Option[BorrowedValue] }
+
+
+private pure func verified_projection_parent(
+    value: ValueId,
+    state: VerificationFacts,
+    projection: ProjectionContext,
+    unions: List[ConcreteUnion],
+    records: List[ConcreteRecord],
+    span: Span,
+    discharged: List[Bool],
+    owners: List[OwnerState],
+) -> Result[ProjectionParent, Diagnostic]:
+    place ?= value.value_place(state, projection, span)
+    known ?= state.known_value(value, span)
+    parent_argument: OwnedArgument ?= match projection:
+        NoProjection:
+            Err(verification_error(span, "payload projection outside its selected match arm"))
+        SelectionProjection(root, _):
+            argument = if value == root.argument_value():
+                root
+            else:
+                value.value_argument(known)
+            match argument.verify_match_argument(state, unions, records, span, discharged, owners):
+                Err(error): Err(error)
+                Ok(_): Ok(argument)
+    match projection:
+        NoProjection:
+            Err(verification_error(span, "payload projection outside its selected match arm"))
+        SelectionProjection(root, facts):
+            match state.known_value(root.argument_value(), span):
+                Err(error): Err(error)
+                Ok(root_value):
+                    match root.verify_match_argument(
+                        state,
+                        unions,
+                        records,
+                        span,
+                        discharged,
+                        owners,
+                    ):
+                        Err(error): Err(error)
+                        Ok(_):
+                            match place.verify_pattern_place(
+                                root_value.value_type,
+                                facts,
+                                unions,
+                                span,
+                                records,
+                            ):
+                                Err(error): Err(error)
+                                Ok(_):
+                                    borrow: Option[BorrowedValue] = match parent_argument:
+                                        BorrowedArgument(parent): Some(parent)
+                                        UnmanagedArgument(_) | ConsumedArgument(_, _): None
+                                    Ok({ place = place, borrow = borrow })
+
+
+-- Ordinary record reads and selected product fields use the same layout and
+-- borrow checks. Selection reads additionally publish their verified path.
+private pure func record_projection_value(
+    field: FieldInstanceId,
+    argument: OwnedArgument,
+    definition: OwnedDefinition,
+    state: VerificationFacts,
+    unions: List[ConcreteUnion],
+    records: List[ConcreteRecord],
+    projection: ProjectionContext,
+    discharged: List[Bool],
+    owners: List[OwnerState],
+) -> Result[KnownValue, Diagnostic]:
+    source = argument.argument_value()
+    known ?= state.known_value(source, definition.span)
+    owner_result: Result[RecordInstanceId, Diagnostic] = match known.value_type:
+        RecordType(id): Ok(id)
+        _: Err(verification_error(definition.span, "field projection requires a record value"))
+    owner ?= owner_result
+    layout ?= owner.record_layout(records, definition.span)
+    live ?= [argument].verify_arguments(
+        [known.value_type],
+        state,
+        unions,
+        definition.span,
+        records,
+        discharged,
+        owners,
+    )
+    expected ?= field.record_field_type(owner, layout, definition.span)
+    match projection:
+        NoProjection:
+            parent: Option[BorrowedValue] = match argument:
+                BorrowedArgument(borrow): Some(borrow)
+                UnmanagedArgument(_) | ConsumedArgument(_, _): None
+            definition.definition_value(expected, parent, None)
+        SelectionProjection(_, _):
+            match source.verified_projection_parent(
+                state,
+                projection,
+                unions,
+                records,
+                definition.span,
+                discharged,
+                owners,
+            ):
+                Err(error): Err(error)
+                Ok(parent):
+                    definition.definition_value(
+                        expected,
+                        parent.borrow,
+                        Some({ value_type = expected, route = RecordField(parent.place, field) }),
+                    )
+
+
+private pure func payload_projection_value(
+    field: VariantFieldInstanceId,
+    source: ValueId,
+    state: VerificationFacts,
+    projection: ProjectionContext,
+    unions: List[ConcreteUnion],
+    records: List[ConcreteRecord],
+    definition: OwnedDefinition,
+    discharged: List[Bool],
+    owners: List[OwnerState],
+) -> Result[KnownValue, Diagnostic]:
+    span = definition.span
+    parent ?= source.verified_projection_parent(
+        state,
+        projection,
+        unions,
+        records,
+        span,
+        discharged,
+        owners,
+    )
+    selected = field.variant_field_variant()
+    fields ?= selected.variant_shape(unions, span)
+    payload_type ?= fields
+        .get(field.variant_field_number())
+        .or_verification_error(span, "unknown variant field identity")
+    nominal: Void ?= if parent.place.value_type == UnionType(selected.variant_owner()):
+        Ok(void)
+    else:
+        Err(verification_error(span, "payload projection does not belong to this match arm"))
+    match projection:
+        NoProjection:
+            Err(verification_error(span, "payload projection outside its selected match arm"))
+        SelectionProjection(_, facts):
+            match parent.place.variant_possibilities(facts, unions, span):
+                Err(error): Err(error)
+                Ok(possible):
+                    if possible.projection_includes(selected.variant_number()):
+                        if possible.singleton_variant(selected.variant_number()):
+                            definition.definition_value(
+                                payload_type,
+                                parent.borrow,
+                                Some({
+                                    value_type = definition.value_type,
+                                    route = UnionField(parent.place, field),
+                                }),
+                            )
+                        else:
+                            Err(
+                                verification_error(
+                                    span,
+                                    "payload projection outside its selected match arm",
+                                ),
+                            )
+                    else:
+                        Err(
+                            verification_error(
+                                span,
+                                "payload projection does not belong to this match arm",
+                            ),
+                        )
+
+
+private pure func element_projection_value(
+    index: Int,
+    source: ValueId,
+    state: VerificationFacts,
+    projection: ProjectionContext,
+    unions: List[ConcreteUnion],
+    records: List[ConcreteRecord],
+    definition: OwnedDefinition,
+    discharged: List[Bool],
+    owners: List[OwnerState],
+) -> Result[KnownValue, Diagnostic]:
+    span = definition.span
+    parent ?= source.verified_projection_parent(
+        state,
+        projection,
+        unions,
+        records,
+        span,
+        discharged,
+        owners,
+    )
+    element ?= parent.place.value_type.list_element_type(span)
+    match projection:
+        NoProjection: Err(verification_error(span, "list element outside its selected match arm"))
+        SelectionProjection(_, facts):
+            match parent.place.verify_element_bound(index, facts, span):
+                Err(error): Err(error)
+                Ok(_):
+                    definition.definition_value(
+                        element,
+                        parent.borrow,
+                        Some({
+                            value_type = definition.value_type,
+                            route = ListElement(parent.place, index),
+                        }),
+                    )
+
+
+private pure func suffix_projection_type(
+    argument: OwnedArgument,
+    skip: Int,
+    state: VerificationFacts,
+    projection: ProjectionContext,
+    unions: List[ConcreteUnion],
+    records: List[ConcreteRecord],
+    span: Span,
+    discharged: List[Bool],
+    owners: List[OwnerState],
+) -> Result[TypeRef, Diagnostic]:
+    live ?= argument.verify_match_argument(state, unions, records, span, discharged, owners)
+    parent ?= argument
+        .argument_value()
+        .verified_projection_parent(state, projection, unions, records, span, discharged, owners)
+    element ?= parent.place.value_type.list_element_type(span)
+    nonnegative: Void ?= if skip < 0:
+        Err(verification_error(span, "list suffix skip must be nonnegative"))
+    else:
+        Ok(void)
+    match projection:
+        NoProjection: Err(verification_error(span, "list suffix outside its selected match arm"))
+        SelectionProjection(_, facts):
+            if parent.place.length_bounds(facts).minimum >= skip:
+                Ok(ListType(element))
+            else:
+                Err(verification_error(span, "list suffix lacks its required length guard"))
+
+
+private pure func verify_definition_type(
+    definition: OwnedDefinition,
+    state: VerificationFacts,
+    rows: List[OwnedParameter],
+    functions: List[OwnedFunction],
+    unions: List[ConcreteUnion],
+    projection: ProjectionContext,
+    records: List[ConcreteRecord],
+    discharged: List[Bool],
+    owners: List[OwnerState],
+) -> Result[KnownValue, Diagnostic]:
+    ordinal: Void ?= if definition.id.value_number() != state.first_value + state.values.length():
+        Err(verification_error(definition.span, "value identity is not the next function ordinal"))
+    else:
+        Ok(void)
+    membership: Void ?= match definition.value_type:
+        ListType(_) | CallableType(_, _):
+            definition.value_type.verify_type_membership(unions, records, definition.span)
+        VoidType | IntType | FloatType | StringType | RecordType(_) | UnionType(_): Ok(void)
+    definition.operation_value(
+        state,
+        rows,
+        functions,
+        unions,
+        projection,
+        records,
+        discharged,
+        owners,
+    )
+
+
+private pure func verified_drop(
+    id: OwnerId,
+    span: Span,
+    state: VerificationFacts,
+    discharged: List[Bool],
+    owners: List[OwnerState],
+) -> Result[OwnerSlot, Diagnostic]:
+    entry ?= state.known_owner(discharged, owners, id, span)
+
+    match entry:
+        DischargedOwner:
+            Err(
+                verification_error(
+                    span,
+                    "owner ${id.owner_number().to_string()} has already been discharged",
+                ),
+            )
+        ActiveOwner(_): state.owner_slot(owners.length(), id, span)
+
+
+-- A header initial whose owner is not one of the loop's entry acquisitions
+-- takes that existing obligation. Membership, not origin, decides: a
+-- projection's owner is itself an acquisition made before the loop.
+private pure func takes_existing_owner(loop: OwnedLoop, owner: OwnerId) -> Bool:
+    loop.entry_acquisitions.all(pure func(acquisition): acquisition.owner != owner)
+
+
+-- Each taken header owner must own its initial, as an owner borrow would, and
+-- is then discharged by a drop at the loop step, checked as any other drop.
+-- The loop and its continuation both start from that one post-transfer state,
+-- so a later drop or a body read of a taken owner uses a discharged owner.
+private pure func transfer_loop_entry(
+    loop: OwnedLoop,
+    state: VerificationState,
+    rows: List[OwnedParameter],
+    functions: List[OwnedFunction],
+    unions: List[ConcreteUnion],
+    projection: ProjectionContext,
+    records: List[ConcreteRecord],
+) -> Result[VerificationState, Diagnostic]:
+    var drops: List[OwnershipOperation] = []
+    var failure: Option[Diagnostic] = None
+    for header in loop.headers:
+        match header.initial:
+            UnmanagedReturn(_): void
+            OwnedReturn(value, owner):
+                if loop.takes_existing_owner(owner):
+                    span = header.parameter.join_parameter().span
+                    match verify_borrow(
+                        { value = value, source = OwnerBorrow(owner) },
+                        state.facts,
+                        span,
+                        state.discharged,
+                        state.owners,
+                    ):
+                        Err(error): failure = Some(error)
+                        Ok(_): drops = drops.append(DropOwner(owner, span))
+        if failure.is_some():
+            break
+    match failure:
+        Some(error): Err(error)
+        None:
+            drops
+                .verify_operations(state, rows, functions, unions, projection, records)
+                .map(pure func(transferred): transferred.state)
+
+
+-- Each entering owner is discharged at the join step, checked as a drop
+-- there. The arms start from the state before it and the continuation from
+-- the state after, so a later drop or read of an entering owner is rejected.
+private pure func transfer_join_entry(
+    join: OwnedJoin,
+    state: VerificationState,
+    rows: List[OwnedParameter],
+    functions: List[OwnedFunction],
+    unions: List[ConcreteUnion],
+    projection: ProjectionContext,
+    records: List[ConcreteRecord],
+) -> Result[VerificationState, Diagnostic]:
+    span = join.result.join_parameter().span
+    drops = join.entering.map(
+        pure func(owner: OwnerId) -> OwnershipOperation: DropOwner(owner, span),
+    )
+    drops
+        .verify_operations(state, rows, functions, unions, projection, records)
+        .map(pure func(entered): entered.state)
+
+
+-- A join whose arms are verified after its block, as they are numbered:
+-- each arm starts from `start`, the block's state just before the join.
+private record PendingJoin { join: OwnedJoin, start: VerificationState }
+
+
+private union PendingControl:
+    VerifyJoin(PendingJoin)
+    VerifyLoop(OwnedLoop, VerificationState)
+
+
+private record VerifiedBlock { state: VerificationState, pending: List[PendingControl] }
+
+
+private pure func verify_join_header(
+    join: OwnedJoin,
+    state: VerificationFacts,
+    unions: List[ConcreteUnion],
+    records: List[ConcreteRecord],
+    discharged: List[Bool],
+    owners: List[OwnerState],
+) -> Result[Void, Diagnostic]:
+    parameter = join.result.join_parameter()
+    var yielding: Bool = False
+    for arm in join.arms:
+        match arm.exit:
+            Yield(_): yielding = True
+            TransferLoop(_, _): void
+    continuation: Void ?= if yielding:
+        Ok(void)
+    else:
+        Err(verification_error(parameter.span, "join has no yielding arm"))
+    ordinal: Void ?= if parameter.id.value_number() == state.first_value + state.values.length():
+        Ok(void)
+    else:
+        Err(verification_error(parameter.span, "value identity is not the next function ordinal"))
+    membership: Void ?= match parameter.value_type:
+        ListType(_) | CallableType(_, _):
+            parameter.value_type.verify_type_membership(unions, records, parameter.span)
+        _: Ok(void)
+    join.selection.scrutinee.verify_match_argument(
+        state,
+        unions,
+        records,
+        parameter.span,
+        discharged,
+        owners,
+    )
+
+
+private pure func introduce_join_parameter(
+    output: OwnedJoinParameter,
+    initial: VerificationState,
+    unions: List[ConcreteUnion],
+    records: List[ConcreteRecord],
+) -> Result[VerificationState, Diagnostic]:
+    parameter = output.join_parameter()
+    state = initial.facts
+
+    needs_owner ?= parameter.value_type.value_needs_ownership(unions, records)
+    var owners = initial.owners
+    classification: Result[Void, Diagnostic] = match needs_owner:
+        False:
+            match output:
+                UnmanagedJoinParameter(_): Ok(void)
+                _:
+                    Err(
+                        verification_error(
+                            parameter.span,
+                            "unmanaged value carries an ownership obligation",
+                        ),
+                    )
+        True:
+            match output:
+                UnmanagedJoinParameter(_):
+                    Err(verification_error(parameter.span, "managed result requires an owner"))
+                ManagedJoinParameter(_, owner):
+                    match state.first_owner.validate_next_owner(owners, owner, parameter.span):
+                        Ok(_):
+                            owners = owners.append(ActiveOwner(parameter.id))
+                            Ok(void)
+                        Err(error): Err(error)
+    classified ?= classification
+    Ok(
+        { initial |
+            facts = { state |
+                values = state.values.append({
+                    value_type = parameter.value_type,
+                    span = parameter.span,
+                    result = output.join_ownership(),
+                    projection_parent = None,
+                    projection_place = None,
+                }),
+            },
+            owners = owners,
+        },
+    )
+
+
+private pure func introduce_carried_parameter(
+    output: OwnedJoinParameter,
+    start: VerificationState,
+    unions: List[ConcreteUnion],
+    records: List[ConcreteRecord],
+) -> Result[VerificationState, Diagnostic]:
+    parameter = output.join_parameter()
+    ordinal: Void ?= if (
+        parameter.id.value_number()
+        == start.facts.first_value + start.facts.values.length()
+    ):
+        Ok(void)
+    else:
+        Err(verification_error(parameter.span, "value identity is not the next function ordinal"))
+    membership ?= parameter.value_type.verify_type_membership(unions, records, parameter.span)
+    output.introduce_join_parameter(start, unions, records)
+
+
+private pure func introduce_outputs(
+    outputs: List[OwnedJoinParameter],
+    start: VerificationState,
+    unions: List[ConcreteUnion],
+    records: List[ConcreteRecord],
+) -> Result[VerificationState, Diagnostic]:
+    var state = start
+    var invalid: Option[Diagnostic] = None
+    for output in outputs:
+        match output.introduce_carried_parameter(state, unions, records):
+            Ok(introduced): state = introduced
+            Err(error):
+                invalid = Some(error)
+                break
+    match invalid:
+        Some(error): Err(error)
+        None: Ok(state)
+
+
+-- Owner vectors belong to this traversal, not the per-definition facts carrier.
+-- Enclosing owners are shared views: a block records the ones it discharges,
+-- and its local owner vector stays uniquely held.
+private pure func verify_operations(
+    operations: List[OwnershipOperation],
+    initial: VerificationState,
+    rows: List[OwnedParameter],
+    functions: List[OwnedFunction],
+    unions: List[ConcreteUnion],
+    projection: ProjectionContext,
+    records: List[ConcreteRecord],
+) -> Result[VerifiedBlock, Diagnostic]:
+    var discharged = initial.discharged
+    var owners = initial.owners
+    var state = initial.facts
+    var pending: List[PendingControl] = []
+    var invalid: Option[Diagnostic] = None
+
+    for operation in operations:
+        checked: Result[Void, Diagnostic] = match operation:
+            DefineValue(definition):
+
+                match definition.verify_definition_type(
+                    state,
+                    rows,
+                    functions,
+                    unions,
+                    projection,
+                    records,
+                    discharged,
+                    owners,
+                ):
+                    Err(error): Err(error)
+                    Ok(candidate):
+                        stored: Result[Void, Diagnostic] = match definition.operation:
+                            CallDefinition(_, arguments):
+                                match arguments.discharge_call_arguments(
+                                    state,
+                                    discharged,
+                                    owners,
+                                    definition.span,
+                                ):
+                                    Err(error): Err(error)
+                                    Ok(moved):
+                                        discharged = moved.discharged
+                                        owners = moved.owners
+                                        Ok(void)
+                            _:
+                                payloads = definition.operation.stored_payloads()
+                                if payloads.is_empty():
+                                    Ok(void)
+                                else:
+                                    match payloads.discharge_payloads(
+                                        state,
+                                        discharged,
+                                        owners,
+                                        unions,
+                                        records,
+                                        definition.span,
+                                    ):
+                                        Err(error): Err(error)
+                                        Ok(moved):
+                                            discharged = moved.discharged
+                                            owners = moved.owners
+                                            Ok(void)
+
+                        match stored:
+                            Err(error): Err(error)
+                            Ok(_):
+                                match definition.verify_definition_result(rows, unions, records):
+                                    Err(error): Err(error)
+                                    Ok(introduced):
+                                        valid_owner: Result[Void, Diagnostic] = match introduced:
+                                            None: Ok(void)
+                                            Some(id):
+                                                match state.first_owner.validate_next_owner(
+                                                    owners,
+                                                    id,
+                                                    definition.span,
+                                                ):
+                                                    Err(error): Err(error)
+                                                    Ok(_):
+                                                        owners = owners.append(
+                                                            ActiveOwner(definition.id),
+                                                        )
+                                                        Ok(void)
+
+                                        match valid_owner:
+                                            Err(error): Err(error)
+                                            Ok(_):
+                                                parameters = match definition.operation:
+                                                    ParameterDefinition(_):
+                                                        state.parameters.append(definition.id)
+                                                    _: state.parameters
+
+                                                state = { state |
+                                                    values = state.values.append(candidate),
+                                                    parameters = parameters,
+                                                }
+                                                Ok(void)
+            ExecuteJoin(join):
+                start: VerificationState = {
+                    facts = state,
+                    discharged = discharged,
+                    owners = owners,
+                }
+                match join.verify_join_header(state, unions, records, discharged, owners):
+                    Err(error): Err(error)
+                    Ok(_):
+                        match join.transfer_join_entry(
+                            start,
+                            rows,
+                            functions,
+                            unions,
+                            projection,
+                            records,
+                        ):
+                            Err(error): Err(error)
+                            Ok(entered):
+                                match [join.result].concat(join.carried).introduce_outputs(
+                                    entered,
+                                    unions,
+                                    records,
+                                ):
+                                    Err(error): Err(error)
+                                    Ok(introduced):
+                                        pending = pending.append(
+                                            VerifyJoin({ join = join, start = start }),
+                                        )
+                                        state = introduced.facts
+                                        discharged = introduced.discharged
+                                        owners = introduced.owners
+                                        Ok(void)
+
+            ExecuteLoop(loop):
+                match loop.transfer_loop_entry(
+                    { facts = state, discharged = discharged, owners = owners },
+                    rows,
+                    functions,
+                    unions,
+                    projection,
+                    records,
+                ):
+                    Err(error): Err(error)
+                    Ok(start):
+                        match [loop.result].concat(loop.carried).introduce_outputs(
+                            start,
+                            unions,
+                            records,
+                        ):
+                            Err(error): Err(error)
+                            Ok(introduced):
+                                pending = pending.append(VerifyLoop(loop, start))
+                                state = introduced.facts
+                                discharged = introduced.discharged
+                                owners = introduced.owners
+                                Ok(void)
+
+            AcquireOwner(id, borrow, span):
+                match borrow.verify_borrow(state, span, discharged, owners):
+                    Err(error): Err(error)
+                    Ok(_):
+                        match state.first_owner.validate_next_owner(owners, id, span):
+                            Err(error): Err(error)
+                            Ok(_):
+                                owners = owners.append(ActiveOwner(borrow.value))
+                                Ok(void)
+            DropOwner(id, span):
+                match id.verified_drop(span, state, discharged, owners):
+                    Err(error): Err(error)
+                    Ok(EnclosingSlot(ordinal)):
+                        discharged = discharged.discharge(ordinal)
+                        Ok(void)
+                    Ok(LocalSlot(index)):
+                        owners = owners.set(index, DischargedOwner)
+                        Ok(void)
+
+        match checked:
+            Ok(_): void
+            Err(error):
+                invalid = Some(error)
+                break
+
+    match invalid:
+        Some(error): Err(error)
+        None:
+            Ok({
+                state = { facts = state, discharged = discharged, owners = owners },
+                pending = pending,
+            })
+
+
+-- The edge a block leaves by, which names an owner it leaves live.
+private union ExitEdge:
+    ReturnEdge
+    YieldEdge
+
+
+private pure func complete_owners(
+    owners: List[OwnerState],
+    first_owner: Int,
+    excluded: Option[OwnerId],
+    edge: ExitEdge,
+    span: Span,
+) -> Result[Void, Diagnostic]:
+    var position = first_owner
+    var failure_owner: Option[Int] = None
+
+    for owner in owners:
+        match owner:
+            ActiveOwner(_):
+                transferred = match excluded:
+                    Some(id): id.owner_number() == position
+                    None: False
+
+                if transferred.not():
+                    failure_owner = Some(position)
+                    break
+            DischargedOwner: void
+
+        position = position + 1
+
+    match failure_owner:
+        Some(id):
+            owner_prefix: String = "owner ".append_int(id)
+            edge_description: String = match edge:
+                ReturnEdge: " remains live at return"
+                YieldEdge: " remains live at yield"
+            Err(verification_error(span, owner_prefix.concat(edge_description)))
+        None: Ok(void)
+
+
+-- Every enclosing owner, function prefix and enclosing arms alike, is
+-- discharged when the function returns from a nested block.
+private pure func complete_enclosing(
+    state: VerificationState,
+    excluded: Option[OwnerId],
+    span: Span,
+) -> Result[Void, Diagnostic]:
+    var failure_owner: Option[Int] = None
+    for scope in state.facts.enclosing:
+        var ordinal = scope.first_owner
+        for entry in scope.owners:
+            match entry:
+                ActiveOwner(_):
+                    transferred = match excluded:
+                        Some(id): id.owner_number() == ordinal
+                        None: False
+                    if failure_owner.is_none().and(transferred.not()).and(
+                        state.discharged.discharged_already(ordinal).not(),
+                    ):
+                        failure_owner = Some(ordinal)
+                DischargedOwner: void
+            ordinal = ordinal + 1
+    match failure_owner:
+        Some(id): Err(verification_error(span, "owner ${id.to_string()} remains live at return"))
+        None: Ok(void)
+
+
+private pure func verify_return(
+    returned: ValueId,
+    returned_owner: Option[OwnerId],
+    state: VerificationState,
+    return_type: TypeRef,
+    unions: List[ConcreteUnion],
+    records: List[ConcreteRecord],
+) -> Result[Void, Diagnostic]:
+    result ?= state.facts.known_value(returned, compiler_span())
+
+    if result.value_type != return_type:
+        Err(verification_error(result.span, "return type does not match its contract"))
+    else:
+        match return_type.value_needs_ownership(unions, records):
+            Ok(needs_owner):
+
+                ownership_result: Result[Void, Diagnostic] = match needs_owner:
+                    False:
+                        match returned_owner:
+                            None: Ok(void)
+                            Some(_):
+                                Err(
+                                    verification_error(
+                                        result.span,
+                                        "unmanaged return cannot transfer an owner",
+                                    ),
+                                )
+                    True:
+                        match returned_owner:
+                            None:
+                                Err(
+                                    verification_error(
+                                        result.span,
+                                        "managed return requires an owner transfer",
+                                    ),
+                                )
+                            Some(id):
+                                match state.facts.known_owner(
+                                    state.discharged,
+                                    state.owners,
+                                    id,
+                                    result.span,
+                                ):
+                                    Ok(entry):
+
+                                        match entry:
+                                            DischargedOwner:
+                                                Err(
+                                                    verification_error(
+                                                        result.span,
+                                                        "return refers to discharged owner ".append_int(
+                                                            id.owner_number(),
+                                                        ),
+                                                    ),
+                                                )
+                                            ActiveOwner(owned):
+                                                if owned == returned:
+                                                    Ok(void)
+                                                else:
+                                                    Err(
+                                                        verification_error(
+                                                            result.span,
+                                                            "returned owner does not own the returned value",
+                                                        ),
+                                                    )
+                                    Err(error): Err(error)
+
+                match ownership_result:
+                    Ok(transferred):
+                        match state.complete_enclosing(returned_owner, result.span):
+                            Ok(prefix):
+                                state.owners.complete_owners(
+                                    state.facts.first_owner,
+                                    returned_owner,
+                                    ReturnEdge,
+                                    result.span,
+                                )
+                            Err(error): Err(error)
+                    Err(error): Err(error)
+            Err(error): Err(error)
+
+
+private pure func verify_transfer(
+    result: ReturnTransfer,
+    state: VerificationState,
+    return_type: TypeRef,
+    unions: List[ConcreteUnion],
+    records: List[ConcreteRecord],
+) -> Result[Void, Diagnostic]:
+    match result:
+        UnmanagedReturn(value): value.verify_return(None, state, return_type, unions, records)
+        OwnedReturn(value, owner):
+            value.verify_return(Some(owner), state, return_type, unions, records)
+
+
+-- A nested block's starting state: the enclosing block's state `start`
+-- becomes one more enclosing scope, shared rather than copied, and its own
+-- values and owners begin at the given ordinals. Sibling ordinal gaps never
+-- become visible.
+private pure func enter(
+    start: VerificationState,
+    first_value: Int,
+    first_owner: Int,
+) -> VerificationState:
+    facts = start.facts
+    {
+        facts = { facts |
+            enclosing = facts.enclosing.append({
+                first_value = facts.first_value,
+                values = facts.values,
+                first_owner = facts.first_owner,
+                owners = start.owners,
+            }),
+            first_value = first_value,
+            values = [],
+            first_owner = first_owner,
+        },
+        discharged = start.discharged,
+        owners = [],
+    }
+
+
+-- The ordinals after a block and the joins nested in it.
+private fixed record BlockEnd { next_value: Int, next_owner: Int }
+
+
+private pure func block_end(state: VerificationState) -> BlockEnd:
+    {
+        next_value = state.facts.first_value + state.facts.values.length(),
+        next_owner = state.facts.first_owner + state.owners.length(),
+    }
+
+
+-- A yield moves the joined value into the join's own definition, and a loop
+-- entry or exit moves each value into its header or output. Each may move
+-- only an owner made in its own block, once, and a join arm must have
+-- discharged its other owners. A loop exit may also move a loop-local owner
+-- of an enclosing block, which the edge would otherwise retire: `loop_floor`
+-- is the loop's first owner ordinal on a loop exit and None elsewhere. A
+-- join's enclosing discharges are checked against its entering owners, so
+-- all edges into the join agree.
+private pure func consume_yield(
+    transfer: ReturnTransfer,
+    state: VerificationState,
+    join_type: TypeRef,
+    loop_floor: Option[Int],
+    unions: List[ConcreteUnion],
+    records: List[ConcreteRecord],
+    span: Span,
+) -> Result[VerificationState, Diagnostic]:
+    yielded = transfer.transfer_value()
+    moved: Option[OwnerId] = match transfer:
+        UnmanagedReturn(_): None
+        OwnedReturn(_, owner): Some(owner)
+    known ?= state.facts.known_value(yielded, span)
+    matching: Void ?= if known.value_type == join_type:
+        Ok(void)
+    else:
+        Err(verification_error(span, "yield type does not match its join"))
+    needs_owner ?= join_type.value_needs_ownership(unions, records)
+    transferred: Result[Option[OwnerSlot], Diagnostic] = match (needs_owner, moved):
+        (False, None): Ok(None)
+        (False, Some(_)): Err(verification_error(span, "unmanaged yield cannot transfer an owner"))
+        (True, None): Err(verification_error(span, "managed yield requires an owner transfer"))
+        (True, Some(id)):
+            match state.facts.owner_slot(state.owners.length(), id, span):
+                Err(error): Err(error)
+                Ok(slot):
+                    movable: Bool = match slot:
+                        LocalSlot(_): True
+                        EnclosingSlot(ordinal):
+                            match loop_floor:
+                                Some(first): ordinal >= first
+                                None: False
+                    if movable:
+                        match state.facts.known_owner(state.discharged, state.owners, id, span):
+                            Ok(ActiveOwner(owned)):
+                                if owned == yielded:
+                                    Ok(Some(slot))
+                                else:
+                                    Err(
+                                        verification_error(
+                                            span,
+                                            "yielded owner does not own the yielded value",
+                                        ),
+                                    )
+                            Ok(DischargedOwner):
+                                Err(
+                                    verification_error(
+                                        span,
+                                        "yield refers to discharged owner ".append_int(
+                                            id.owner_number(),
+                                        ),
+                                    ),
+                                )
+                            Err(error): Err(error)
+                    else:
+                        Err(
+                            verification_error(
+                                span,
+                                "yield must transfer an owner made in its arm, not owner ".append_int(
+                                    id.owner_number(),
+                                ),
+                            ),
+                        )
+    consumed ?= transferred
+    match consumed:
+        None: Ok(state)
+        Some(LocalSlot(position)):
+            Ok({ state | owners = state.owners.set(position, DischargedOwner) })
+        Some(EnclosingSlot(ordinal)):
+            Ok({ state | discharged = state.discharged.discharge(ordinal) })
+
+
+private pure func verify_yield(
+    transfer: ReturnTransfer,
+    state: VerificationState,
+    join_type: TypeRef,
+    unions: List[ConcreteUnion],
+    records: List[ConcreteRecord],
+    span: Span,
+) -> Result[Void, Diagnostic]:
+    consumed ?= transfer.consume_yield(state, join_type, None, unions, records, span)
+    consumed.owners.complete_owners(state.facts.first_owner, None, YieldEdge, span)
+
+
+-- A yielding arm discharges exactly its join's entering owners, so every edge
+-- into the continuation agrees on which enclosing owners remain live. `entry`
+-- holds the flags the arm was entered with.
+private pure func verify_entering_discharges(
+    entering: List[OwnerId],
+    entry: List[Bool],
+    state: VerificationState,
+    span: Span,
+) -> Result[Void, Diagnostic]:
+    var failure: Option[Diagnostic] = None
+    for scope in state.facts.enclosing:
+        var ordinal = scope.first_owner
+        for owner in scope.owners:
+            current = ordinal
+            newly = state.discharged
+                .discharged_already(current)
+                .and(entry.discharged_already(current).not())
+            enters = entering.any(pure func(id): id.owner_number() == current)
+            match owner:
+                ActiveOwner(_):
+                    if failure.is_none():
+                        if enters.and(newly.not()):
+                            failure = Some(
+                                verification_error(
+                                    span,
+                                    "join arm leaves entering owner ${current.to_string()} live",
+                                ),
+                            )
+                        else if newly.and(enters.not()):
+                            failure = Some(
+                                verification_error(
+                                    span,
+                                    "join arm discharges owner ${current.to_string()}, which does not enter its join",
+                                ),
+                            )
+                DischargedOwner: void
+            ordinal = ordinal + 1
+    match failure:
+        Some(error): Err(error)
+        None: Ok(void)
+
+
+private pure func verify_join_transfers(
+    outputs: OwnedJoinOutputs,
+    join: OwnedJoin,
+    entry: List[Bool],
+    state: VerificationState,
+    unions: List[ConcreteUnion],
+    records: List[ConcreteRecord],
+) -> Result[Void, Diagnostic]:
+    result = join.result.join_parameter()
+    arity: Void ?= if outputs.carried.length() == join.carried.length():
+        Ok(void)
+    else:
+        Err(verification_error(result.span, "join arm carries the wrong number of values"))
+    yielded: Void ?= if join.carried.is_empty():
+        outputs.transfer.verify_yield(state, result.value_type, unions, records, result.span)
+    else:
+        match outputs.transfer.consume_yield(
+            state,
+            result.value_type,
+            None,
+            unions,
+            records,
+            result.span,
+        ):
+            Err(error): Err(error)
+            Ok(first):
+                var current = first
+                var position = 0
+                var invalid: Option[Diagnostic] = None
+                for output in join.carried:
+                    parameter = output.join_parameter()
+                    match outputs.carried.get(position):
+                        None:
+                            invalid = Some(
+                                verification_error(
+                                    result.span,
+                                    "join arm carries the wrong number of values",
+                                ),
+                            )
+                        Some(transfer):
+                            match transfer.consume_yield(
+                                current,
+                                parameter.value_type,
+                                None,
+                                unions,
+                                records,
+                                parameter.span,
+                            ):
+                                Ok(consumed): current = consumed
+                                Err(error): invalid = Some(error)
+                    if invalid.is_some():
+                        break
+                    position = position + 1
+                match invalid:
+                    Some(error): Err(error)
+                    None:
+                        current.owners.complete_owners(
+                            state.facts.first_owner,
+                            None,
+                            YieldEdge,
+                            result.span,
+                        )
+    join.entering.verify_entering_discharges(entry, state, result.span)
+
+
+-- Canonical arm identity is independent of the variant route used to enter it.
+private record SelectionTarget { id: MatchArmId, inputs: List[OwnedJoinParameter] }
+
+
+private pure func selection_target(
+    id: MatchArmId,
+    targets: List[SelectionTarget],
+    span: Span,
+) -> Result[SelectionTarget, Diagnostic]:
+    var found: Option[SelectionTarget] = None
+    for target in targets:
+        if id == target.id:
+            found = Some(target)
+            break
+    found.or_verification_error(span, "selection enters an unknown arm")
+
+
+private pure func merge_possible(existing: List[Bool], incoming: List[Bool]) -> List[Bool]:
+    if existing.is_empty():
+        incoming
+    else:
+        var merged = existing
+        var position = 0
+        for possible in incoming:
+            if possible:
+                merged = merged.set(position, True)
+            position = position + 1
+        merged
+
+
+private pure func has_possible(possible: List[Bool]) -> Bool:
+    var found: Bool = False
+    for included in possible:
+        if included:
+            found = True
+            break
+    found
+
+
+private record LengthBounds { minimum: Int, maximum: Option[Int], excluded: List[Int] }
+
+
+private union PlaceConstraint:
+    VariantPossibilities(List[Bool])
+    ListLengths(LengthBounds)
+
+
+private record PlaceFact { place: ConcretePatternPlace, constraint: PlaceConstraint }
+
+
+private pure func place_constraint(
+    place: ConcretePatternPlace,
+    facts: List[PlaceFact],
+) -> Option[PlaceConstraint]:
+    var found: Option[PlaceConstraint] = None
+    for fact in facts:
+        if place == fact.place:
+            found = Some(fact.constraint)
+            break
+    found
+
+
+private pure func put_constraint(
+    place: ConcretePatternPlace,
+    constraint: PlaceConstraint,
+    facts: List[PlaceFact],
+) -> List[PlaceFact]:
+    var found: Option[Int] = None
+    var position = 0
+    for fact in facts:
+        if place == fact.place:
+            found = Some(position)
+            break
+        position = position + 1
+    match found:
+        Some(index): facts.set(index, { place = place, constraint = constraint })
+        None: facts.append({ place = place, constraint = constraint })
+
+
+private pure func variant_possibilities(
+    place: ConcretePatternPlace,
+    facts: List[PlaceFact],
+    unions: List[ConcreteUnion],
+    span: Span,
+) -> Result[List[Bool], Diagnostic]:
+    match place.place_constraint(facts):
+        Some(VariantPossibilities(possible)): Ok(possible)
+        _:
+            match place.value_type:
+                UnionType(owner):
+                    match unions.get(owner.union_number()):
+                        None: Err(verification_error(span, "unknown match union"))
+                        Some(layout):
+                            var possible: List[Bool] = []
+                            for _ in layout.union_variants():
+                                possible = possible.append(True)
+                            Ok(possible)
+                _: Err(verification_error(span, "variant test requires a union place"))
+
+
+private pure func length_bounds(
+    place: ConcretePatternPlace,
+    facts: List[PlaceFact],
+) -> LengthBounds:
+    match place.place_constraint(facts):
+        Some(ListLengths(bounds)): bounds
+        _: { minimum = 0, maximum = None, excluded = [] }
+
+
+private pure func singleton_variant(possible: List[Bool], ordinal: Int) -> Bool:
+    var count = 0
+    for included in possible:
+        if included:
+            count = count + 1
+    if count == 1:
+        possible.projection_includes(ordinal)
+    else:
+        False
+
+
+-- Every ancestor is checked before the next borrowed field or element can be
+-- evaluated. Equal ordinals in another nominal union prove nothing.
+private pure func verify_pattern_place(
+    place: ConcretePatternPlace,
+    root_type: TypeRef,
+    facts: List[PlaceFact],
+    unions: List[ConcreteUnion],
+    span: Span,
+    records: List[ConcreteRecord],
+) -> Result[Void, Diagnostic]:
+    match place.route:
+        MatchRoot:
+            if place.value_type == root_type:
+                Ok(void)
+            else:
+                Err(verification_error(span, "pattern root type does not match its scrutinee"))
+        UnionField(parent, field):
+            place.verify_field_place(parent, field, root_type, facts, unions, span, records)
+        RecordField(parent, field):
+            place.verify_record_place(parent, field, root_type, facts, unions, span, records)
+        ListElement(parent, index):
+            place.verify_element_place(parent, index, root_type, facts, unions, span, records)
+
+
+private pure func verify_record_place(
+    place: ConcretePatternPlace,
+    parent: ConcretePatternPlace,
+    field: FieldInstanceId,
+    root_type: TypeRef,
+    facts: List[PlaceFact],
+    unions: List[ConcreteUnion],
+    span: Span,
+    records: List[ConcreteRecord],
+) -> Result[Void, Diagnostic]:
+    ancestor ?= parent.verify_pattern_place(root_type, facts, unions, span, records)
+    owner_result: Result[RecordInstanceId, Diagnostic] = match parent.value_type:
+        RecordType(id): Ok(id)
+        _: Err(verification_error(span, "pattern record projection requires a record parent"))
+    owner ?= owner_result
+    layout ?= owner.record_layout(records, span)
+    expected ?= field.record_field_type(owner, layout, span)
+    if expected == place.value_type:
+        Ok(void)
+    else:
+        Err(verification_error(span, "pattern record field type does not match its layout"))
+
+
+private pure func verify_field_place(
+    place: ConcretePatternPlace,
+    parent: ConcretePatternPlace,
+    field: VariantFieldInstanceId,
+    root_type: TypeRef,
+    facts: List[PlaceFact],
+    unions: List[ConcreteUnion],
+    span: Span,
+    records: List[ConcreteRecord],
+) -> Result[Void, Diagnostic]:
+    ancestor ?= parent.verify_pattern_place(root_type, facts, unions, span, records)
+    selected = field.variant_field_variant()
+    nominal: Void ?= if parent.value_type == UnionType(selected.variant_owner()):
+        Ok(void)
+    else:
+        Err(verification_error(span, "pattern field belongs to another union"))
+    fields ?= selected.variant_shape(unions, span)
+    expected ?= fields
+        .get(field.variant_field_number())
+        .or_verification_error(span, "unknown variant field identity")
+    typed: Void ?= if expected == place.value_type:
+        Ok(void)
+    else:
+        Err(verification_error(span, "pattern field type does not match its layout"))
+    possible ?= parent.variant_possibilities(facts, unions, span)
+    if possible.singleton_variant(selected.variant_number()):
+        Ok(void)
+    else:
+        Err(verification_error(span, "pattern field lacks its selected variant guard"))
+
+
+private pure func verify_element_place(
+    place: ConcretePatternPlace,
+    parent: ConcretePatternPlace,
+    index: Int,
+    root_type: TypeRef,
+    facts: List[PlaceFact],
+    unions: List[ConcreteUnion],
+    span: Span,
+    records: List[ConcreteRecord],
+) -> Result[Void, Diagnostic]:
+    ancestor ?= parent.verify_pattern_place(root_type, facts, unions, span, records)
+    element ?= parent.value_type.list_element_type(span)
+    typed: Void ?= if element == place.value_type:
+        Ok(void)
+    else:
+        Err(verification_error(span, "pattern element type does not match its List"))
+    parent.verify_element_bound(index, facts, span)
+
+
+private pure func list_element_type(value_type: TypeRef, span: Span) -> Result[TypeRef, Diagnostic]:
+    match value_type:
+        ListType(element): Ok(element)
+        _: Err(verification_error(span, "list pattern operation requires a List place"))
+
+
+private pure func verify_element_bound(
+    parent: ConcretePatternPlace,
+    index: Int,
+    facts: List[PlaceFact],
+    span: Span,
+) -> Result[Void, Diagnostic]:
+    if index < 0:
+        Err(verification_error(span, "list element index must be nonnegative"))
+    else if parent.length_bounds(facts).minimum > index:
+        Ok(void)
+    else:
+        Err(verification_error(span, "list element lacks its required length guard"))
+
+
+private pure func merge_bounds(left: LengthBounds, right: LengthBounds) -> LengthBounds:
+    minimum = if left.minimum < right.minimum:
+        left.minimum
+    else:
+        right.minimum
+    maximum: Option[Int] = match left.maximum:
+        None: None
+        Some(first):
+            match right.maximum:
+                None: None
+                Some(second):
+                    if first > second:
+                        Some(first)
+                    else:
+                        Some(second)
+    var excluded: List[Int] = []
+    for length in left.excluded:
+        if right.excluded.contains(length):
+            excluded = excluded.append(length)
+    { minimum = minimum, maximum = maximum, excluded = excluded }
+
+
+private pure func merge_guards(left: List[PlaceFact], right: List[PlaceFact]) -> List[PlaceFact]:
+    var merged: List[PlaceFact] = []
+    for fact in left:
+        match fact.place.place_constraint(right):
+            Some(VariantPossibilities(other)):
+                match fact.constraint:
+                    VariantPossibilities(possible):
+                        merged = merged.append(
+                            { fact |
+                                constraint = VariantPossibilities(possible.merge_possible(other)),
+                            },
+                        )
+                    _: void
+            Some(ListLengths(other)):
+                match fact.constraint:
+                    ListLengths(bounds):
+                        merged = merged.append(
+                            { fact | constraint = ListLengths(bounds.merge_bounds(other)) },
+                        )
+                    _: void
+            None: void
+    merged
+
+
+private pure func normalize_bounds(bounds: LengthBounds) -> Option[LengthBounds]:
+    var minimum = bounds.minimum
+    var maximum = bounds.maximum
+    var invalid: Bool = False
+    while bounds.excluded.contains(minimum):
+        next = minimum + 1
+        if next < minimum:
+            invalid = True
+            break
+        minimum = next
+    match maximum:
+        Some(limit):
+            var last = limit
+            while bounds.excluded.contains(last):
+                if last == 0:
+                    invalid = True
+                    break
+                last = last - 1
+            if last < minimum:
+                invalid = True
+            maximum = Some(last)
+        None: void
+    if invalid:
+        None
+    else:
+        Some({ bounds | minimum = minimum, maximum = maximum })
+
+
+private pure func refine_lengths(
+    place: ConcretePatternPlace,
+    test: ListLengthTest,
+    succeeds: Bool,
+    facts: List[PlaceFact],
+) -> Option[List[PlaceFact]]:
+    bounds = place.length_bounds(facts)
+    var minimum = bounds.minimum
+    var maximum = bounds.maximum
+    var excluded = bounds.excluded
+    var viable: Bool = True
+    match test:
+        ExactLength(length):
+            if succeeds:
+                if length > minimum:
+                    minimum = length
+                match maximum:
+                    None: maximum = Some(length)
+                    Some(limit):
+                        if length < limit:
+                            maximum = Some(length)
+            else:
+                excluded = excluded.append(length)
+        MinimumLength(length):
+            if succeeds:
+                if length > minimum:
+                    minimum = length
+            else:
+                if length == 0:
+                    viable = False
+                else:
+                    limit = length - 1
+                    match maximum:
+                        None: maximum = Some(limit)
+                        Some(previous):
+                            if limit < previous:
+                                maximum = Some(limit)
+    if viable:
+        match normalize_bounds({ minimum = minimum, maximum = maximum, excluded = excluded }):
+            None: None
+            Some(refined): Some(place.put_constraint(ListLengths(refined), facts))
+    else:
+        None
+
+
+private pure func refine_variants(
+    place: ConcretePatternPlace,
+    variant: VariantInstanceId,
+    succeeds: Bool,
+    facts: List[PlaceFact],
+    unions: List[ConcreteUnion],
+    span: Span,
+) -> Result[Option[List[PlaceFact]], Diagnostic]:
+    nominal: Void ?= if place.value_type == UnionType(variant.variant_owner()):
+        Ok(void)
+    else:
+        Err(verification_error(span, "selection variant belongs to another union"))
+    possible ?= place.variant_possibilities(facts, unions, span)
+    declared ?= possible
+        .get(variant.variant_number())
+        .or_verification_error(span, "unknown variant identity")
+    var refined: List[Bool] = []
+    var position = 0
+    for included in possible:
+        matching = position == variant.variant_number()
+        if matching:
+            if succeeds:
+                refined = refined.append(included)
+            else:
+                refined = refined.append(False)
+        else:
+            if succeeds:
+                refined = refined.append(False)
+            else:
+                refined = refined.append(included)
+        position = position + 1
+    if refined.has_possible():
+        Ok(Some(place.put_constraint(VariantPossibilities(refined), facts)))
+    else:
+        Ok(None)
+
+
+private record DecisionBranches { yes: Option[List[PlaceFact]], no: Option[List[PlaceFact]] }
+
+
+private pure func decision_branches(
+    node: OwnedDecisionNode,
+    root_type: TypeRef,
+    facts: List[PlaceFact],
+    unions: List[ConcreteUnion],
+    span: Span,
+    records: List[ConcreteRecord],
+) -> Result[DecisionBranches, Diagnostic]:
+    match node:
+        TestVariant(place, variant, _, _):
+            place.variant_branches(variant, root_type, facts, unions, span, records)
+        TestListLength(place, test, _, _):
+            place.length_branches(test, root_type, facts, unions, span, records)
+        TestLiteral(place, literal, _, _):
+            place.literal_branches(literal, root_type, facts, unions, span, records)
+        EnterArm(_): Ok({ yes = Some(facts), no = Some(facts) })
+
+
+private pure func variant_branches(
+    place: ConcretePatternPlace,
+    variant: VariantInstanceId,
+    root_type: TypeRef,
+    facts: List[PlaceFact],
+    unions: List[ConcreteUnion],
+    span: Span,
+    records: List[ConcreteRecord],
+) -> Result[DecisionBranches, Diagnostic]:
+    valid ?= place.verify_pattern_place(root_type, facts, unions, span, records)
+    yes ?= place.refine_variants(variant, True, facts, unions, span)
+    no ?= place.refine_variants(variant, False, facts, unions, span)
+    Ok({ yes = yes, no = no })
+
+
+private pure func length_branches(
+    place: ConcretePatternPlace,
+    test: ListLengthTest,
+    root_type: TypeRef,
+    facts: List[PlaceFact],
+    unions: List[ConcreteUnion],
+    span: Span,
+    records: List[ConcreteRecord],
+) -> Result[DecisionBranches, Diagnostic]:
+    valid ?= place.verify_pattern_place(root_type, facts, unions, span, records)
+    element ?= place.value_type.list_element_type(span)
+    count = match test:
+        ExactLength(length): length
+        MinimumLength(length): length
+    nonnegative: Void ?= if count < 0:
+        Err(verification_error(span, "list length test count must be nonnegative"))
+    else:
+        Ok(void)
+    Ok({
+        yes = place.refine_lengths(test, True, facts),
+        no = place.refine_lengths(test, False, facts),
+    })
+
+
+private pure func literal_branches(
+    place: ConcretePatternPlace,
+    literal: LiteralPattern,
+    root_type: TypeRef,
+    facts: List[PlaceFact],
+    unions: List[ConcreteUnion],
+    span: Span,
+    records: List[ConcreteRecord],
+) -> Result[DecisionBranches, Diagnostic]:
+    valid ?= place.verify_pattern_place(root_type, facts, unions, span, records)
+    if literal.fits(place.value_type):
+        Ok({ yes = Some(facts), no = Some(facts) })
+    else:
+        match literal:
+            ExactBytes(_): Err(verification_error(span, "string byte test requires a String place"))
+            ExactInt(_): Err(verification_error(span, "integer literal test requires an Int place"))
+
+
+-- The concrete type each literal kind compares with; check keeps the same
+-- rule over its own TypeRef.
+private pure func fits(literal: LiteralPattern, value_type: TypeRef) -> Bool:
+    match literal:
+        ExactBytes(_): value_type == StringType
+        ExactInt(_): value_type == IntType
+
+
+-- All incoming paths arrive before a node is examined. Missing place facts
+-- disappear at merges; possibilities are widened, never granted by one path.
+private pure func selection_possibilities(
+    selection: OwnedSelection,
+    scrutinee: KnownValue,
+    unions: List[ConcreteUnion],
+    records: List[ConcreteRecord],
+) -> Result[List[Option[List[PlaceFact]]], Diagnostic]:
+    span = scrutinee.span
+    var incoming: List[Option[List[PlaceFact]]] = []
+    for _ in selection.nodes:
+        incoming = incoming.append(None)
+    entry = selection.entry.decision_node_number()
+    valid_entry: Void ?= if entry < 0:
+        Err(verification_error(span, "selection entry is not a node"))
+    else if entry >= selection.nodes.length():
+        Err(verification_error(span, "selection entry is not a node"))
+    else:
+        Ok(void)
+    incoming = incoming.set(entry, Some([]))
+    var position = selection.nodes.length() - 1
+    var failure: Option[Diagnostic] = None
+    while position >= 0:
+        match selection.nodes.get(position):
+            Some(node):
+                match incoming.get(position):
+                    Some(Some(facts)):
+                        match node.decision_branches(
+                            scrutinee.value_type,
+                            facts,
+                            unions,
+                            span,
+                            records,
+                        ):
+                            Err(error): failure = Some(error)
+                            Ok(branches):
+                                match node:
+                                    EnterArm(_): void
+                                    TestVariant(_, _, yes, no) | TestListLength(_, _, yes, no) | TestLiteral(_, _, yes, no):
+                                        match incoming.propagate_selection(
+                                            position,
+                                            yes.decision_node_number(),
+                                            branches.yes,
+                                            span,
+                                        ):
+                                            Err(error): failure = Some(error)
+                                            Ok(first):
+                                                match first.propagate_selection(
+                                                    position,
+                                                    no.decision_node_number(),
+                                                    branches.no,
+                                                    span,
+                                                ):
+                                                    Err(error): failure = Some(error)
+                                                    Ok(next): incoming = next
+                    _:
+                        failure = Some(
+                            verification_error(span, "selection contains an unreachable node"),
+                        )
+            None: failure = Some(verification_error(span, "selection node is missing"))
+        if failure.is_some():
+            break
+        position = position - 1
+    match failure:
+        Some(error): Err(error)
+        None: Ok(incoming)
+
+
+private pure func propagate_selection(
+    incoming: List[Option[List[PlaceFact]]],
+    position: Int,
+    target: Int,
+    facts: Option[List[PlaceFact]],
+    span: Span,
+) -> Result[List[Option[List[PlaceFact]]], Diagnostic]:
+    if target < 0:
+        Err(verification_error(span, "selection successor is not an earlier node"))
+    else if target >= position:
+        Err(verification_error(span, "selection successor is not an earlier node"))
+    else:
+        match incoming.get(target):
+            None: Err(verification_error(span, "selection successor is not a node"))
+            Some(previous):
+                match facts:
+                    None: Ok(incoming)
+                    Some(arriving):
+                        match previous:
+                            None: Ok(incoming.set(target, Some(arriving)))
+                            Some(existing):
+                                Ok(incoming.set(target, Some(existing.merge_guards(arriving))))
+
+
+private pure func edge_value_allowed(id: ValueId, root: ValueId, first_value: Int) -> Bool:
+    if id == root:
+        True
+    else:
+        id.value_number() >= first_value
+
+
+-- The restricted edge cannot create calls/control or consume its enclosing
+-- owners. Normal operation and transfer verification still checks every borrow,
+-- actual projection identity, owner occurrence and local ordinal independently.
+private pure func verify_selection_edge(
+    edge: OwnedSelectionEdge,
+    target: SelectionTarget,
+    selection: OwnedSelection,
+    initial: VerificationState,
+    projection: ProjectionContext,
+    rows: List[OwnedParameter],
+    functions: List[OwnedFunction],
+    unions: List[ConcreteUnion],
+    records: List[ConcreteRecord],
+    span: Span,
+) -> Result[BlockEnd, Diagnostic]:
+    var failure: Option[Diagnostic] = None
+    root = selection.scrutinee.argument_value()
+    for operation in edge.operations:
+        allowed = match operation:
+            DefineValue(definition):
+                match definition.operation:
+                    ReadRecordFieldDefinition(_, argument):
+                        argument
+                            .argument_value()
+                            .edge_value_allowed(root, initial.facts.first_value)
+                    PayloadDefinition(_, source):
+                        source.edge_value_allowed(root, initial.facts.first_value)
+                    ListElementDefinition(_, source):
+                        source.edge_value_allowed(root, initial.facts.first_value)
+                    ListSuffixDefinition(source, _):
+                        source.argument_value().edge_value_allowed(root, initial.facts.first_value)
+                    _: False
+            AcquireOwner(_, borrow, _):
+                borrow.value.edge_value_allowed(root, initial.facts.first_value)
+            DropOwner(owner, _): owner.owner_number() >= initial.facts.first_owner
+            ExecuteJoin(_) | ExecuteLoop(_): False
+        match allowed:
+            True: void
+            False:
+                failure = Some(
+                    verification_error(
+                        span,
+                        "selection edge contains an operation outside its local projections",
+                    ),
+                )
+                break
+    restricted: Void ?= match failure:
+        Some(error): Err(error)
+        None: Ok(void)
+    verified ?= edge.operations.verify_operations(
+        initial,
+        rows,
+        functions,
+        unions,
+        projection,
+        records,
+    )
+    arity: Void ?= if edge.transfers.length() == target.inputs.length():
+        Ok(void)
+    else:
+        Err(verification_error(span, "selection edge argument count does not match its arm inputs"))
+    var current = verified.state
+    var position = 0
+    for transfer in edge.transfers:
+        value = transfer.transfer_value()
+        if value.edge_value_allowed(root, initial.facts.first_value):
+            match target.inputs.get(position):
+                None:
+                    failure = Some(
+                        verification_error(span, "selection edge has no corresponding arm input"),
+                    )
+                Some(input):
+                    match transfer.consume_yield(
+                        current,
+                        input.join_parameter().value_type,
+                        None,
+                        unions,
+                        records,
+                        span,
+                    ):
+                        Err(error): failure = Some(error)
+                        Ok(consumed): current = consumed
+        else:
+            failure = Some(
+                verification_error(
+                    span,
+                    "selection edge argument is outside its local projections",
+                ),
+            )
+        if failure.is_some():
+            break
+        position = position + 1
+    transferred: Void ?= match failure:
+        Some(error): Err(error)
+        None: Ok(void)
+    completed ?= current.owners.complete_owners(current.facts.first_owner, None, YieldEdge, span)
+    Ok(current.block_end())
+
+
+private pure func verify_selection(
+    selection: OwnedSelection,
+    targets: List[SelectionTarget],
+    state: VerificationState,
+    end: BlockEnd,
+    rows: List[OwnedParameter],
+    functions: List[OwnedFunction],
+    unions: List[ConcreteUnion],
+    records: List[ConcreteRecord],
+) -> Result[BlockEnd, Diagnostic]:
+    span: Span = compiler_span()
+    scrutinee ?= state.facts.known_value(selection.scrutinee.argument_value(), span)
+    live ?= selection.scrutinee.verify_match_argument(
+        state.facts,
+        unions,
+        records,
+        scrutinee.span,
+        state.discharged,
+        state.owners,
+    )
+    incoming ?= selection.selection_possibilities(scrutinee, unions, records)
+    var seen: List[Int] = []
+    var failure: Option[Diagnostic] = None
+    var target_ordinal = 0
+    for target in targets:
+        identity = target.id.match_arm_number()
+        if seen.contains(identity):
+            failure = Some(
+                verification_error(scrutinee.span, "selection arm identity appears more than once"),
+            )
+            break
+        if identity != target_ordinal:
+            failure = Some(
+                verification_error(
+                    scrutinee.span,
+                    "selection arm identity is not its source ordinal",
+                ),
+            )
+            break
+        seen = seen.append(identity)
+        target_ordinal = target_ordinal + 1
+    var cursor = end
+    var position = 0
+    var entered: List[Int] = []
+    for node in selection.nodes:
+        if failure.is_some():
+            break
+        match node:
+            TestVariant(_, _, _, _) | TestListLength(_, _, _, _) | TestLiteral(_, _, _, _): void
+            EnterArm(edge):
+                match edge.arm.selection_target(targets, scrutinee.span):
+                    Err(error): failure = Some(error)
+                    Ok(target):
+                        match incoming.get(position):
+                            None:
+                                failure = Some(
+                                    verification_error(scrutinee.span, "selection node is missing"),
+                                )
+                            Some(None):
+                                failure = Some(
+                                    verification_error(
+                                        scrutinee.span,
+                                        "selection contains an unreachable node",
+                                    ),
+                                )
+                            Some(Some(facts)):
+                                initial = state.enter(cursor.next_value, cursor.next_owner)
+                                projection: ProjectionContext = SelectionProjection(
+                                    selection.scrutinee,
+                                    facts,
+                                )
+                                match edge.verify_selection_edge(
+                                    target,
+                                    selection,
+                                    initial,
+                                    projection,
+                                    rows,
+                                    functions,
+                                    unions,
+                                    records,
+                                    scrutinee.span,
+                                ):
+                                    Err(error): failure = Some(error)
+                                    Ok(after):
+                                        cursor = after
+                                        entered = entered.append(edge.arm.match_arm_number())
+        position = position + 1
+    match failure:
+        Some(_): void
+        None:
+            for target in targets:
+                match entered.contains(target.id.match_arm_number()):
+                    True: void
+                    False:
+                        failure = Some(
+                            verification_error(
+                                scrutinee.span,
+                                "selection arm has no incoming edge",
+                            ),
+                        )
+                        break
+    match failure:
+        Some(error): Err(error)
+        None: Ok(cursor)
+
+
+-- Verifies every pending join's arms after their block, in the order their
+-- values and owners are numbered, and returns the ordinals after them.
+private pure func verify_joins(
+    pending: List[PendingControl],
+    active: Option[ActiveLoop],
+    end: BlockEnd,
+    rows: List[OwnedParameter],
+    functions: List[OwnedFunction],
+    unions: List[ConcreteUnion],
+    records: List[ConcreteRecord],
+) -> Result[BlockEnd, Diagnostic]:
+    var cursor = end
+    var invalid: Option[Diagnostic] = None
+    for control in pending:
+        checked: Result[BlockEnd, Diagnostic] = match control:
+            VerifyLoop(loop, start):
+                loop.verify_loop(start, cursor, rows, functions, unions, records)
+            VerifyJoin(join):
+                var targets: List[SelectionTarget] = []
+                for arm in join.join.arms:
+                    targets = targets.append({ id = arm.id, inputs = arm.inputs })
+                selected = join.join.selection.verify_selection(
+                    targets,
+                    join.start,
+                    cursor,
+                    rows,
+                    functions,
+                    unions,
+                    records,
+                )
+                var after = cursor
+                match selected:
+                    Err(error): invalid = Some(error)
+                    Ok(completed): after = completed
+                for arm in join.join.arms:
+                    if invalid.is_some():
+                        break
+                    match arm.verify_join_arm(
+                        join,
+                        after,
+                        active,
+                        rows,
+                        functions,
+                        unions,
+                        records,
+                    ):
+                        Err(error):
+                            invalid = Some(error)
+                            break
+                        Ok(next): after = next
+                match invalid:
+                    Some(error): Err(error)
+                    None: Ok(after)
+        match checked:
+            Ok(after): cursor = after
+            Err(error):
+                invalid = Some(error)
+                break
+    match invalid:
+        Some(error): Err(error)
+        None: Ok(cursor)
+
+
+private pure func verify_join_arm(
+    arm: OwnedJoinArm,
+    join: PendingJoin,
+    cursor: BlockEnd,
+    active: Option[ActiveLoop],
+    rows: List[OwnedParameter],
+    functions: List[OwnedFunction],
+    unions: List[ConcreteUnion],
+    records: List[ConcreteRecord],
+) -> Result[BlockEnd, Diagnostic]:
+    initial = join.start.enter(cursor.next_value, cursor.next_owner)
+    start ?= arm.inputs.introduce_outputs(initial, unions, records)
+    match arm.exit:
+        Yield(outputs):
+            match arm.operations.verify_operations(
+                start,
+                rows,
+                functions,
+                unions,
+                NoProjection,
+                records,
+            ):
+                Err(error): Err(error)
+                Ok(verified):
+                    match outputs.verify_join_transfers(
+                        join.join,
+                        join.start.discharged,
+                        verified.state,
+                        unions,
+                        records,
+                    ):
+                        Err(error): Err(error)
+                        Ok(_):
+                            verified.pending.verify_joins(
+                                active,
+                                verified.state.block_end(),
+                                rows,
+                                functions,
+                                unions,
+                                records,
+                            )
+        TransferLoop(target, tail):
+            target.verify_abrupt_exit(
+                { operations = arm.operations, tail = tail },
+                active,
+                start,
+                rows,
+                functions,
+                unions,
+                records,
+            )
+
+
+private pure func verify_abrupt_exit(
+    target: LoopTarget,
+    body: OwnedLoopBlock,
+    active: Option[ActiveLoop],
+    state: VerificationState,
+    rows: List[OwnedParameter],
+    functions: List[OwnedFunction],
+    unions: List[ConcreteUnion],
+    records: List[ConcreteRecord],
+) -> Result[BlockEnd, Diagnostic]:
+    span = body.tail.loop_tail_span()
+    scope ?= active.or_verification_error(span, "loop transfer has no active loop")
+    nearest: Void ?= if target.loop_target_value() == scope.loop.result.join_parameter().id:
+        Ok(void)
+    else:
+        Err(verification_error(span, "loop transfer does not target the nearest active loop"))
+    body.verify_loop_block(
+        scope.loop,
+        scope.pre,
+        scope.first_owner,
+        state,
+        rows,
+        functions,
+        unions,
+        records,
+    )
+
+
+private pure func loop_exit_span(exit: OwnedLoopExit) -> Span:
+    match exit:
+        Recur(_, span): span
+        Break(outputs): outputs.span
+
+
+private pure func loop_tail_span(tail: OwnedLoopTail) -> Span:
+    match tail:
+        ExitLoop(exit): exit.loop_exit_span()
+        MatchLoop(matched):
+            match matched.arms.get(0):
+                Some(arm): arm.body.tail.loop_tail_span()
+                None: compiler_span()
+
+
+-- `pre` is the actual state captured before the loop publishes any output.
+private pure func complete_loop_owners(
+    pre: VerificationState,
+    state: VerificationState,
+    first_owner: Int,
+    span: Span,
+) -> Result[Void, Diagnostic]:
+    captured: List[EnclosingScope] = pre.facts.enclosing.append({
+        first_value = pre.facts.first_value,
+        values = pre.facts.values,
+        first_owner = pre.facts.first_owner,
+        owners = pre.owners,
+    })
+    var failure: Option[Diagnostic] = None
+    for scope in captured:
+        var ordinal = scope.first_owner
+        for owner in scope.owners:
+            match owner:
+                ActiveOwner(_):
+                    newly_discharged: Bool = match pre.discharged.discharged_already(ordinal):
+                        True: False
+                        False: state.discharged.discharged_already(ordinal)
+                    if newly_discharged:
+                        failure = Some(
+                            verification_error(span, "loop edge discharges a captured owner"),
+                        )
+                        break
+                DischargedOwner: void
+            ordinal = ordinal + 1
+        if failure.is_some():
+            break
+    preserved: Void ?= match failure:
+        Some(error): Err(error)
+        None: Ok(void)
+    for scope in state.facts.enclosing:
+        var ordinal = scope.first_owner
+        for owner in scope.owners:
+            match owner:
+                ActiveOwner(_):
+                    missing_discharge = match ordinal >= first_owner:
+                        True: state.discharged.discharged_already(ordinal).not()
+                        False: False
+                    if missing_discharge:
+                        failure = Some(
+                            verification_error(span, "loop-local owner remains live at an edge"),
+                        )
+                        break
+                DischargedOwner: void
+            ordinal = ordinal + 1
+        if failure.is_some():
+            break
+    retired: Void ?= match failure:
+        Some(error): Err(error)
+        None: Ok(void)
+    state.owners.complete_owners(state.facts.first_owner, None, YieldEdge, span)
+
+
+private pure func verify_loop_exit(
+    exit: OwnedLoopExit,
+    loop: OwnedLoop,
+    pre: VerificationState,
+    first_owner: Int,
+    state: VerificationState,
+    unions: List[ConcreteUnion],
+    records: List[ConcreteRecord],
+) -> Result[Void, Diagnostic]:
+    var parameters: List[ValueParameter] = []
+    match exit:
+        Recur(_, _):
+            for header in loop.headers:
+                parameters = parameters.append(header.parameter.join_parameter())
+        Break(_):
+            for output in [loop.result].concat(loop.carried):
+                parameters = parameters.append(output.join_parameter())
+    transfers = match exit:
+        Recur(arguments, _): arguments
+        Break(outputs): [outputs.value].concat(outputs.carried)
+    span = exit.loop_exit_span()
+    arity: Void ?= if parameters.length() == transfers.length():
+        Ok(void)
+    else:
+        Err(verification_error(span, "loop edge has the wrong number of values"))
+    var current = state
+    var position = 0
+    var failure: Option[Diagnostic] = None
+    for parameter in parameters:
+        match transfers.get(position):
+            None:
+                failure = Some(verification_error(span, "missing loop edge transfer"))
+                break
+            Some(transfer):
+                match transfer.consume_yield(
+                    current,
+                    parameter.value_type,
+                    Some(first_owner),
+                    unions,
+                    records,
+                    span,
+                ):
+                    Err(error):
+                        failure = Some(error)
+                        break
+                    Ok(consumed): current = consumed
+        position = position + 1
+    transferred: Void ?= match failure:
+        Some(error): Err(error)
+        None: Ok(void)
+    pre.complete_loop_owners(current, first_owner, span)
+
+
+-- `pre` follows the loop step's header transfers and precedes the entry
+-- acquisitions and the header parameters. Acquisitions live only in this
+-- private interval; every other managed initial consumes one before the header
+-- parameters are published.
+private pure func initialize_loop(
+    loop: OwnedLoop,
+    pre: VerificationState,
+    cursor: BlockEnd,
+    rows: List[OwnedParameter],
+    functions: List[OwnedFunction],
+    unions: List[ConcreteUnion],
+    records: List[ConcreteRecord],
+) -> Result[VerificationState, Diagnostic]:
+    span = loop.result.join_parameter().span
+    start = pre.enter(cursor.next_value, cursor.next_owner)
+    var operations: List[OwnershipOperation] = []
+    for acquisition in loop.entry_acquisitions:
+        operations = operations.append(AcquireOwner(acquisition.owner, acquisition.borrow, span))
+    acquired ?= operations.verify_operations(start, rows, functions, unions, NoProjection, records)
+    var current = acquired.state
+    var failure: Option[Diagnostic] = None
+    for header in loop.headers:
+        parameter = header.parameter.join_parameter()
+        value = header.initial.transfer_value()
+        taken: Bool = match header.initial:
+            UnmanagedReturn(_): False
+            OwnedReturn(_, owner): loop.takes_existing_owner(owner)
+        match pre.facts.known_value(value, parameter.span):
+            Err(error): failure = Some(error)
+            Ok(source):
+                if source.value_type == parameter.value_type:
+                    -- ExecuteLoop already discharged a taken owner, before `pre`.
+                    if taken:
+                        void
+                    else:
+                        match header.initial.consume_yield(
+                            current,
+                            parameter.value_type,
+                            None,
+                            unions,
+                            records,
+                            parameter.span,
+                        ):
+                            Err(error): failure = Some(error)
+                            Ok(consumed): current = consumed
+                else:
+                    failure = Some(
+                        verification_error(
+                            parameter.span,
+                            "loop initial type does not match its header",
+                        ),
+                    )
+        if failure.is_some():
+            break
+    transferred: Void ?= match failure:
+        Some(error): Err(error)
+        None: Ok(void)
+    complete ?= current.owners.complete_owners(current.facts.first_owner, None, YieldEdge, span)
+    for header in loop.headers:
+        parameter = header.parameter.join_parameter()
+        next_value = current.facts.first_value + current.facts.values.length()
+        if parameter.id.value_number() != next_value:
+            failure = Some(
+                verification_error(
+                    parameter.span,
+                    "loop header identity is not the next function ordinal",
+                ),
+            )
+            break
+        match header.parameter.introduce_carried_parameter(current, unions, records):
+            Err(error):
+                failure = Some(error)
+                break
+            Ok(introduced): current = introduced
+    match failure:
+        Some(error): Err(error)
+        None: Ok(current)
+
+
+private pure func verify_loop(
+    loop: OwnedLoop,
+    pre: VerificationState,
+    cursor: BlockEnd,
+    rows: List[OwnedParameter],
+    functions: List[OwnedFunction],
+    unions: List[ConcreteUnion],
+    records: List[ConcreteRecord],
+) -> Result[BlockEnd, Diagnostic]:
+    initial ?= loop.initialize_loop(pre, cursor, rows, functions, unions, records)
+    loop.body.verify_loop_block(
+        loop,
+        pre,
+        cursor.next_owner,
+        initial,
+        rows,
+        functions,
+        unions,
+        records,
+    )
+
+
+private pure func verify_loop_match(
+    matched: OwnedLoopMatch,
+    loop: OwnedLoop,
+    pre: VerificationState,
+    first_owner: Int,
+    state: VerificationState,
+    end: BlockEnd,
+    rows: List[OwnedParameter],
+    functions: List[OwnedFunction],
+    unions: List[ConcreteUnion],
+    records: List[ConcreteRecord],
+) -> Result[BlockEnd, Diagnostic]:
+    var targets: List[SelectionTarget] = []
+    for arm in matched.arms:
+        targets = targets.append({ id = arm.id, inputs = arm.inputs })
+    selected ?= matched.selection.verify_selection(
+        targets,
+        state,
+        end,
+        rows,
+        functions,
+        unions,
+        records,
+    )
+    var cursor = selected
+    var invalid: Option[Diagnostic] = None
+    for arm in matched.arms:
+        initial = state.enter(cursor.next_value, cursor.next_owner)
+        match arm.inputs.introduce_outputs(initial, unions, records):
+            Err(error): invalid = Some(error)
+            Ok(branch_start):
+                match arm.body.verify_loop_block(
+                    loop,
+                    pre,
+                    first_owner,
+                    branch_start,
+                    rows,
+                    functions,
+                    unions,
+                    records,
+                ):
+                    Err(error): invalid = Some(error)
+                    Ok(after): cursor = after
+        if invalid.is_some():
+            break
+    match invalid:
+        Some(error): Err(error)
+        None: Ok(cursor)
+
+
+private pure func verify_loop_block(
+    body: OwnedLoopBlock,
+    loop: OwnedLoop,
+    pre: VerificationState,
+    first_owner: Int,
+    initial: VerificationState,
+    rows: List[OwnedParameter],
+    functions: List[OwnedFunction],
+    unions: List[ConcreteUnion],
+    records: List[ConcreteRecord],
+) -> Result[BlockEnd, Diagnostic]:
+    active: Option[ActiveLoop] = Some({ loop = loop, pre = pre, first_owner = first_owner })
+    verified ?= body.operations.verify_operations(
+        initial,
+        rows,
+        functions,
+        unions,
+        NoProjection,
+        records,
+    )
+    match body.tail:
+        ExitLoop(exit):
+            match exit.verify_loop_exit(loop, pre, first_owner, verified.state, unions, records):
+                Err(error): Err(error)
+                Ok(_):
+                    verified.pending.verify_joins(
+                        active,
+                        verified.state.block_end(),
+                        rows,
+                        functions,
+                        unions,
+                        records,
+                    )
+        MatchLoop(matched):
+            match verified.pending.verify_joins(
+                active,
+                verified.state.block_end(),
+                rows,
+                functions,
+                unions,
+                records,
+            ):
+                Err(error): Err(error)
+                Ok(completed):
+                    matched.verify_loop_match(
+                        loop,
+                        pre,
+                        first_owner,
+                        verified.state,
+                        completed,
+                        rows,
+                        functions,
+                        unions,
+                        records,
+                    )
+
+
+private pure func verify_function(
+    function: OwnedFunction,
+    functions: List[OwnedFunction],
+    unions: List[ConcreteUnion],
+    records: List[ConcreteRecord],
+) -> Result[Void, Diagnostic]:
+    initial: VerificationState = {
+        facts = { enclosing = [], first_value = 0, values = [], first_owner = 0, parameters = [] },
+        discharged = [],
+        owners = [],
+    }
+    verified ?= function.operations.verify_operations(
+        initial,
+        function.parameters,
+        functions,
+        unions,
+        NoProjection,
+        records,
+    )
+    state = verified.state
+
+    valid_parameter: Void ?= if state.facts.parameters.length() == function.parameters.length():
+        Ok(void)
+    else:
+        Err(verification_error(compiler_span(), "function parameter has no value definition"))
+
+    returned ?= function.result.verify_transfer(state, function.return_type, unions, records)
+    completed ?= verified.pending.verify_joins(
+        None,
+        state.block_end(),
+        function.parameters,
+        functions,
+        unions,
+        records,
+    )
+    Ok(void)
+
+
+-- A callable invocation and the entry wrapper pass every argument borrowed,
+-- so an instance taken as a callable, and the entry, are pinned: none of
+-- their parameters may own.
+private pure func borrowed_contract(
+    function: OwnedFunction,
+    span: Span,
+) -> Result[Void, Diagnostic]:
+    if function.parameters.any(parameter_owned):
+        Err(verification_error(span, "pinned instance has an owned parameter"))
+    else:
+        Ok(void)
+
+
+private pure func pinned_callable(
+    id: FunctionInstanceId,
+    functions: List[OwnedFunction],
+    span: Span,
+) -> Result[OwnedFunction, Diagnostic]:
+    function ?= functions
+        .get(id.function_number())
+        .or_verification_error(span, "unknown callable body")
+    pinned ?= function.borrowed_contract(span)
+    Ok(function)
+
+
+-- Independently check the accepted wrapper convention against its target signature.
+private pure func verify_entry(
+    entry: OwnedFunction,
+    convention: Entrypoint[FunctionInstanceId],
+) -> Result[Void, Diagnostic]:
+    parameters_match = match convention:
+        NoArguments(_, _): entry.parameters.is_empty()
+        WithArguments(_, _):
+            match entry.parameters:
+                [value]: value.parameter_type() == ListType(StringType)
+                _: False
+
+    result = match convention:
+        NoArguments(_, result): result
+        WithArguments(_, result): result
+
+    result_matches = match result:
+        IntegerExitStatus: entry.return_type == IntType
+        SuccessfulExit: entry.return_type == VoidType
+
+    valid = parameters_match.and(result_matches)
+    span: Span = match entry.operations.get(0):
+        Some(operation):
+            match operation:
+                DefineValue(definition): definition.span
+                ExecuteJoin(join): join.result.join_parameter().span
+                ExecuteLoop(loop): loop.result.join_parameter().span
+                AcquireOwner(_, _, occurrence): occurrence
+                DropOwner(_, occurrence): occurrence
+        None: compiler_span()
+
+    -- The entry wrapper passes its arguments borrowed, so the entry is pinned.
+    if valid:
+        entry.borrowed_contract(span)
+    else:
+        Err(
+            verification_error(
+                span,
+                "entrypoint signature does not match its accepted argument and result conventions",
+            ),
+        )
+
+
+pure func verify(program: OwnershipProgram) -> Result[VerifiedProgram, Diagnostic]:
+    entry ?= program.functions
+        .get(program.entrypoint.entry_function().function_number())
+        .or_verification_error(compiler_span(), "entrypoint function is not defined")
+    var invalid: Option[Diagnostic] = None
+
+    for layout in program.records:
+        match (layout.valid_record_layout(compiler_span())):
+            Ok(_): void
+            Err(error):
+                invalid = Some(error)
+                break
+
+    var union_position = 0
+
+    for layout in program.unions:
+        if invalid.is_some():
+            break
+
+        match layout.valid_union_layout(union_position, program.records, program.unions):
+            Err(error):
+                invalid = Some(error)
+                break
+            Ok(_): union_position = union_position + 1
+
+    complete_layouts: Void ?= match invalid:
+        Some(error): Err(error)
+        None: program.records.verify_layout_graph(program.unions)
+
+    for function in program.functions:
+        match function.return_type.verify_type_membership(
+            program.unions,
+            program.records,
+            compiler_span(),
+        ):
+            Ok(_): void
+            Err(error): invalid = Some(error)
+        -- Each row's type exists, and the row is managed exactly when its type
+        -- needs ownership. The first failure is the one reported.
+        for row in function.parameters:
+            if invalid.is_some():
+                break
+            match row.parameter_type().verify_type_membership(
+                program.unions,
+                program.records,
+                compiler_span(),
+            ):
+                Err(error):
+                    invalid = Some(error)
+                    break
+                Ok(_): void
+            match row.parameter_type().value_needs_ownership(program.unions, program.records):
+                Err(error):
+                    invalid = Some(error)
+                    break
+                Ok(managed):
+                    agrees: Bool = match row:
+                        ManagedParameter(_): managed
+                        UnmanagedParameter(_): managed.not()
+                    if agrees.not():
+                        invalid = Some(
+                            verification_error(
+                                compiler_span(),
+                                "parameter row disagrees with its type's ownership",
+                            ),
+                        )
+
+        if invalid.is_some():
+            break
+
+        match function.verify_function(program.functions, program.unions, program.records):
+            Ok(_): void
+            Err(error):
+                invalid = Some(error)
+                break
+
+    match invalid:
+        Some(error): Err(error)
+        None:
+            match entry.verify_entry(program.entrypoint):
+                Ok(valid_entry): Ok(into_opaque VerifiedProgram(program))
+                Err(error): Err(error)

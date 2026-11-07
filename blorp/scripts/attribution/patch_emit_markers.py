@@ -219,7 +219,7 @@ EDITS = [
 
 
 def main():
-    path = ROOT.rstrip("/") + "/emit/emit.brp"
+    path = ROOT.rstrip("/") + "/compile/emit/emit.brp"
     with open(path) as handle:
         text = handle.read()
     for old, new in EDITS:

@@ -1,0 +1,202 @@
+import:
+    bool: Bool methods
+    int: Int methods
+    io: print_error
+    list: List methods
+    result: Result methods
+    string: String methods
+    test: TestSuite
+    ../../../../src/compile/check/check: check
+    ../../../../src/compile/load/load: load_program
+    ../../../../src/compile/lower/lower: lower
+    ../../../../src/compile/namespace/builtins as Builtins
+    ../../../../src/compile/own/own as Own
+    ../../../../src/compile/specialize/specialize as Concrete
+    ../../../../src/syntax/source: label_text
+    ../../consumed_calls: all_consumed, first_argument_consumed
+    ../../list_update_inputs: owned_source
+
+
+private LIBRARY_ROOT: String = "blorp/standard_library"
+
+-- Calls every rewritten List function: each appends in a different loop shape.
+private LOOPS_FIXTURE: String = "blorp/test/e2e/fixtures/list/library_loops.brp"
+
+
+private pure func is_list_append(definition: Own.OwnedDefinition) -> Bool:
+    match definition.operation:
+        Own.CallDefinition(Concrete.RuntimeFunction(Builtins.ListAppend(_)), _): True
+        _: False
+
+
+private pure func is_list_set(definition: Own.OwnedDefinition) -> Bool:
+    match definition.operation:
+        Own.CallDefinition(Concrete.RuntimeFunction(Builtins.ListSet(_)), _): True
+        _: False
+
+
+-- `joined + separator` and `+ value` call String `add`; no other call in
+-- `join` produces a String.
+private pure func is_string_call(definition: Own.OwnedDefinition) -> Bool:
+    match (definition.operation, definition.value_type):
+        (Own.CallDefinition(_, _), Concrete.StringType): True
+        _: False
+
+
+private func library_program() -> Result[Own.OwnershipProgram, String]:
+    loaded ?= load_program(LOOPS_FIXTURE, LIBRARY_ROOT).map_err(
+        pure func(failure): failure.diagnostic.message,
+    )
+    checked ?= check(loaded.program).map_err(pure func(_): LOOPS_FIXTURE + " does not check")
+    lowered ?= Concrete.specialize(checked).and_then(lower).map_err(pure func(error): error.message)
+    Own.own(lowered).map_err(pure func(error): error.message)
+
+
+-- Library functions have one owned instance per element type, labelled by
+-- module and name; the fixture instantiates each at least once.
+private func library_function_updates(
+    name: String,
+    is_update: pure (Own.OwnedDefinition) -> Bool,
+    expected: Int,
+) -> Bool:
+    match library_program():
+        Err(message):
+            print_error(message)
+            False
+        Ok(program):
+            var seen = 0
+            var consumed: Bool = True
+            for function in program.functions:
+                if label_text(function.label) == "list." + name:
+                    seen = seen + 1
+                    consumed = consumed.and(
+                        all_consumed(
+                            first_argument_consumed(function.operations, is_update),
+                            expected,
+                        ),
+                    )
+            found = (seen > 0).and(consumed)
+            if found.not():
+                print_error(
+                    (
+                        "list."
+                        + name
+                        + ": "
+                        + seen.to_string()
+                        + " instances, an update borrows its accumulator or too few updates"
+                    ),
+                )
+            found
+
+
+func test_map_loop_append_consumes_its_accumulator() -> Bool:
+    library_function_updates("map", is_list_append, 1)
+
+
+func test_filter_branch_append_consumes_its_accumulator() -> Bool:
+    library_function_updates("filter", is_list_append, 1)
+
+
+func test_copy_range_match_arm_append_consumes_its_accumulator() -> Bool:
+    library_function_updates("copy_range", is_list_append, 1)
+
+
+func test_reverse_match_arm_append_consumes_its_accumulator() -> Bool:
+    library_function_updates("reverse", is_list_append, 1)
+
+
+-- merge_runs writes the dying target buffer, so its one set is the buffer's
+-- last owner and updates it in place once the buffer is unique.
+func test_merge_runs_set_consumes_its_buffer() -> Bool:
+    library_function_updates("merge_runs", is_list_set, 1)
+
+
+-- The separator and value concatenations: the accumulator, then its fresh result.
+func test_join_concatenations_consume_their_accumulator() -> Bool:
+    match library_program():
+        Err(message):
+            print_error(message)
+            False
+        Ok(program):
+            var seen = 0
+            var consumed: Bool = True
+            for function in program.functions:
+                if label_text(function.label) == "list.join":
+                    seen = seen + 1
+                    consumed = consumed.and(
+                        all_consumed(
+                            first_argument_consumed(function.operations, is_string_call),
+                            2,
+                        ),
+                    )
+            found = (seen > 0).and(consumed)
+            if found.not():
+                print_error(
+                    (
+                        "list.join: "
+                        + seen.to_string()
+                        + " instances, a concatenation borrows its accumulator or too few concatenations"
+                    ),
+                )
+            found
+
+
+-- The oracle must see a failure: reading the old List after the append keeps
+-- the append's input borrowed, as a saved snapshot of an accumulator would.
+pure func test_snapshot_read_after_append_is_not_consumed() -> Bool:
+    body: String =
+        |pure func collect() -> Int:
+        |    var values: List[Int] = []
+        |    var seen = 0
+        |    while less_than(length(values), 12):
+        |        before = values
+        |        values = append(values, 7)
+        |        seen = length(before)
+        |    seen
+        |func main() -> Int:
+        |    collect()
+        |
+    match owned_source(body):
+        Err(_): False
+        Ok(program):
+            var appends: List[Bool] = []
+            for function in program.functions:
+                appends = appends.concat(
+                    first_argument_consumed(function.operations, is_list_append),
+                )
+            (appends.length() == 1).and(appends.any(pure func(taken: Bool): taken).not())
+
+
+tests: TestSuite = {
+    description = "List library loops update a consumed accumulator",
+    tests = [
+        (
+            "map appends in a for loop and consumes the accumulator",
+            test_map_loop_append_consumes_its_accumulator,
+        ),
+        (
+            "filter appends in an if branch and consumes the accumulator",
+            test_filter_branch_append_consumes_its_accumulator,
+        ),
+        (
+            "copy_range appends in a match arm and consumes the accumulator",
+            test_copy_range_match_arm_append_consumes_its_accumulator,
+        ),
+        (
+            "reverse appends in a match arm and consumes the accumulator",
+            test_reverse_match_arm_append_consumes_its_accumulator,
+        ),
+        (
+            "merge_runs sets in a match arm and consumes the target buffer",
+            test_merge_runs_set_consumes_its_buffer,
+        ),
+        (
+            "join concatenates onto a consumed String accumulator",
+            test_join_concatenations_consume_their_accumulator,
+        ),
+        (
+            "a snapshot read after an append keeps the accumulator borrowed",
+            test_snapshot_read_after_append_is_not_consumed,
+        ),
+    ],
+}

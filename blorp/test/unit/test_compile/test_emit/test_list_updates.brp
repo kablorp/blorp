@@ -1,0 +1,205 @@
+import:
+    bool: Bool methods
+    int: Int methods
+    list: List methods
+    result: Result methods
+    string: String methods
+    test: TestSuite
+    ../../../../src/compile/emit/emit: emit
+    ../../../../src/compile/own/own as Own
+    ../../../../src/compile/verify/verify: verify
+    ../../list_update_inputs:
+        input_ids,
+        span,
+        raw_integer_append,
+        raw_append,
+        append_arguments,
+        raw_list_update,
+        update_arguments,
+    ../../text_search: has_text, occurrences
+
+
+pure func test_consumed_integer_append_selects_transfer_helper() -> Bool:
+    match input_ids():
+        Err(_): False
+        Ok(ids):
+            match verify(raw_integer_append(ids, True)).and_then(emit):
+                Err(_): False
+                Ok(code):
+                    has_text(code, "=blorp_list_append_take_left_0_i(blorp_vl_0,blorp_vl_1);").and(
+                        has_text(code, "blorp_list_drop_0_i(blorp_owner_0);").not(),
+                    )
+
+
+pure func test_borrowed_integer_append_selects_copy_helper() -> Bool:
+    match input_ids():
+        Err(_): False
+        Ok(ids):
+            match verify(raw_integer_append(ids, False)).and_then(emit):
+                Err(_): False
+                Ok(code):
+                    has_text(code, "=blorp_list_append_0_i(blorp_vl_0,blorp_vl_1);").and(
+                        has_text(code, "blorp_list_drop_0_i(blorp_owner_0);"),
+                    )
+
+
+pure func test_consumed_managed_append_keeps_element_cleanup() -> Bool:
+    match input_ids():
+        Err(_): False
+        Ok(ids):
+            program = raw_append(ids, append_arguments(ids), [
+                Own.DropOwner(Own.owner_id(1), span(40)),
+            ])
+            match verify(program).and_then(emit):
+                Err(_): False
+                Ok(code):
+                    has_text(code, "=blorp_list_append_take_left_0_s(blorp_vl_0,blorp_vl_1);")
+                        .and(has_text(code, "blorp_list_drop_0_s(blorp_owner_0);").not())
+                        .and(occurrences(code, "blorp_string_release(blorp_owner_1);").equals(1))
+
+
+pure func test_empty_literal_names_immortal_root() -> Bool:
+    match input_ids():
+        Err(_): False
+        Ok(ids):
+            match verify(raw_integer_append(ids, True)).and_then(emit):
+                Err(_): False
+                Ok(code):
+                    has_text(
+                        code,
+                        "struct blorp_l_0_i* const blorp_vl_0=(struct blorp_l_0_i*)blorp_list_empty_acquire(&blorp_list_empty_0_i);",
+                    ).and(has_text(code, "blorp_vl_0_capacity").not())
+
+
+-- Strict leak checking can catch an ownership bug on `[]` only if every exit
+-- of a program with Lists checks the root owner count.
+pure func test_list_program_finish_checks_empty_root_owners() -> Bool:
+    match input_ids():
+        Err(_): False
+        Ok(ids):
+            match verify(raw_integer_append(ids, True)).and_then(emit):
+                Err(_): False
+                Ok(code):
+                    has_text(
+                        code,
+                        "static int blorp_program_finish(int status){return blorp_memory_finish(blorp_list_empty_finish(status));}",
+                    )
+
+
+pure func test_string_list_program_finish_checks_literals_then_roots() -> Bool:
+    match input_ids():
+        Err(_): False
+        Ok(ids):
+            program = raw_append(ids, append_arguments(ids), [
+                Own.DropOwner(Own.owner_id(1), span(40)),
+            ])
+            match verify(program).and_then(emit):
+                Err(_): False
+                Ok(code):
+                    has_text(
+                        code,
+                        "static int blorp_program_finish(int status){return blorp_memory_finish(blorp_list_empty_finish(blorp_string_literals_finish(status)));}",
+                    )
+
+
+private pure func update_emits(is_set: Bool, consumed: Bool) -> Bool:
+    match input_ids():
+        Err(_): False
+        Ok(ids):
+            cleanup = if consumed:
+                [Own.DropOwner(Own.owner_id(1), span(40))]
+            else:
+                [Own.DropOwner(Own.owner_id(0), span(40)), Own.DropOwner(Own.owner_id(1), span(41))]
+            match verify(
+                raw_list_update(ids, is_set, update_arguments(ids, is_set, consumed), cleanup),
+            ).and_then(emit):
+                Err(_): False
+                Ok(code):
+                    helper = if is_set:
+                        if consumed:
+                            "=blorp_list_set_take_left_0_s(blorp_vl_0,blorp_vl_2,blorp_vl_1);"
+                        else:
+                            "=blorp_list_set_0_s(blorp_vl_0,blorp_vl_2,blorp_vl_1);"
+                    else:
+                        if consumed:
+                            "=blorp_list_concat_take_left_0_s(blorp_vl_0,blorp_vl_1);"
+                        else:
+                            "=blorp_list_concat_0_s(blorp_vl_0,blorp_vl_1);"
+                    right_drop = if is_set:
+                        "blorp_string_release(blorp_owner_1);"
+                    else:
+                        "blorp_list_drop_0_s(blorp_owner_1);"
+                    old_drop = if consumed:
+                        0
+                    else:
+                        1
+                    has_text(code, helper)
+                        .and(
+                            occurrences(code, "blorp_list_drop_0_s(blorp_owner_0);").equals(
+                                old_drop,
+                            ),
+                        )
+                        .and(occurrences(code, right_drop).equals(1))
+
+
+pure func test_consumed_set_emits_ordered_transfer() -> Bool:
+    update_emits(True, True)
+
+
+pure func test_borrowed_set_emits_copy_and_drop() -> Bool:
+    update_emits(True, False)
+
+
+pure func test_consumed_concat_emits_ordered_transfer() -> Bool:
+    update_emits(False, True)
+
+
+pure func test_borrowed_concat_emits_copy_and_drop() -> Bool:
+    update_emits(False, False)
+
+
+tests: TestSuite = {
+    description = "List update ownership-directed emission",
+    tests = [
+        (
+            "set consumed first argument emits ordered three-operand transfer",
+            test_consumed_set_emits_ordered_transfer,
+        ),
+        (
+            "set borrowed first argument emits copy and old drop",
+            test_borrowed_set_emits_copy_and_drop,
+        ),
+        (
+            "concat consumed first argument emits transfer and RHS cleanup",
+            test_consumed_concat_emits_ordered_transfer,
+        ),
+        (
+            "concat borrowed first argument emits copy and old drop",
+            test_borrowed_concat_emits_copy_and_drop,
+        ),
+        (
+            "empty List literal names its layout's immortal root without allocating",
+            test_empty_literal_names_immortal_root,
+        ),
+        (
+            "a List program's exit checks the empty root owner count",
+            test_list_program_finish_checks_empty_root_owners,
+        ),
+        (
+            "a String and List program's exit checks literals, then empty root owners",
+            test_string_list_program_finish_checks_literals_then_roots,
+        ),
+        (
+            "consumed integer List emits transfer helper with ordered operands",
+            test_consumed_integer_append_selects_transfer_helper,
+        ),
+        (
+            "borrowed integer List emits copy helper and old-root cleanup",
+            test_borrowed_integer_append_selects_copy_helper,
+        ),
+        (
+            "managed append transfers List while retaining element cleanup",
+            test_consumed_managed_append_keeps_element_cleanup,
+        ),
+    ],
+}

@@ -30,17 +30,17 @@ How Int and Float are built in today:
   `type Int = builtin` and `type Float = builtin`. Their behaviour is library
   code in `int.brp` and `float.brp`, over `builtin("int.add")`-style labels.
 - **Compiler tables.**
-  - `namespace/builtins.brp` has the type roles at `:332-338` and the
+  - `compile/namespace/builtins.brp` has the type roles at `:332-338` and the
     `PrimitiveType` and `RuntimeType` tables at `:101-112`.
   - The parser has a name-to-role table (`parse.brp:3806-3851`).
   - `_base` must declare every role, or compilation stops with
     `MissingBuiltinType` (`builtins.brp:450-457`).
-  - `TypeRef` is declared twice, once for check (`check/model.brp:101`) and
-    once for specialize and later phases (`specialize/specialize.brp:170`).
+  - `TypeRef` is declared twice, once for check (`compile/check/model.brp:101`) and
+    once for specialize and later phases (`compile/specialize/specialize.brp:170`).
     67 lines in `blorp/src` name `IntType` or `FloatType`, about 25 of them in
     exhaustive matches.
 - **Operators.** `+`, `==`, `<` and the rest are trait calls
-  (`check/expressions.brp:702-713`). `int.brp` implements those traits with
+  (`compile/check/expressions.brp:702-713`). `int.brp` implements those traits with
   nine `RuntimeOperation`s:
   - `IntAdd`, `IntSubtract`, `IntMultiply`, `IntDivide`, `IntRemainder`;
   - `IntToString`;
@@ -50,7 +50,7 @@ How Int and Float are built in today:
   emit, with C helpers at `emit.brp:2386-2396`. Int wraps on overflow, and
   division and remainder by zero give 0.
 - **Literals.** An integer literal always gets the type `Int`
-  (`check/expressions.brp:587`), and the parser checks its range against Int64
+  (`compile/check/expressions.brp:587`), and the parser checks its range against Int64
   (`parse.brp:821-851`).
   - A closed expected type does reach List literal elements
     (`constructors.brp:673-690`).
@@ -60,7 +60,7 @@ How Int and Float are built in today:
 - **Opaque types and traits.** Opaque types implement traits by hand, with
   precedent in `lower.brp:51` and `own.brp:51`. Neither equality nor `Hashable`
   is derived for them (README "Automatic equality").
-- **List storage** is per element C type (`runtime/list.brp:271`, with keys at
+- **List storage** is per element C type (`compile/runtime/list.brp:271`, with keys at
   `:42-51`), so a `List[UInt8]` packs `uint8_t` once `UInt8` has a key.
 - **Natives** take `Int`, `String` or `List[String]` parameters, and return
   `Int`, `String`, `List[String]` or `Void` (`builtins.brp:192-203`).

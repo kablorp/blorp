@@ -1,0 +1,867 @@
+---
+The namespace's behaviour, through `check` and its rendered diagnostics: one
+test per scope invariant, then one per diagnostic a scope problem renders.
+Module 0 is the root; its imports name modules by their position in the list.
+---
+import:
+	../../../../src/compile/check/check: check
+	../../../../src/compile/check/render: render_failure
+	../../../../src/compile/namespace/namespace: Origin(Declared, Imported, Implicit), TypeHead(RecordHead, PrimitiveHead), build_namespace, named_type
+	../../../../src/syntax/source: module_id, module_source, root_module_id
+	../../../../src/syntax/syntax: Diagnostic, DiagnosticNote(PreviousDeclaration, Declaration, CompetingDeclarations), Span, Visibility(Private, Public)
+	../../../../src/compile/assemble: ParsedProgram, parsed_contents
+	../../input: existing_name
+	../../module_input: ModuleInput, test_base, parse_modules, parse_modules_with_libraries, parse_modules_with_prelude, prelude_source
+	test: TestSuite
+
+
+-- The `occurrence`th copy of `text`, counting from 1, in module `module`'s
+-- source.
+record Place {
+	module: Int,
+	text: String,
+	occurrence: Int
+}
+
+
+-- The prelude's selection of `text`; the prelude follows the inputs and the base.
+private pure func in_prelude(inputs: List[ModuleInput], text: String) -> Place:
+	{ module = inputs.length() + 1, text = text, occurrence = 1 }
+
+
+private pure func source_of(inputs: List[ModuleInput], module: Int) -> String:
+	match inputs.get(module):
+		Some(input): input.source
+		None: prelude_source(test_base())
+
+
+private pure func offset(source: String, text: String, occurrence: Int) -> Int:
+	var start = 0
+	var found = -1
+	for _ in 0..occurrence:
+		match source.substring(start, source.length() - start).index_of(text):
+			Some(at):
+				found = start + at
+				start = found + 1
+			None:
+				found = -1
+				break
+	found
+
+
+private pure func covers(inputs: List[ModuleInput], span: Span, place: Place) -> Bool:
+	match module_id(place.module):
+		Some(module):
+			start = offset(source_of(inputs, place.module), place.text, place.occurrence)
+			span.source == module_source(module) and span.start == start and span.end == start + place.text.length()
+		None:
+			False
+
+
+-- The first parsing or checking diagnostic; None if the program is accepted.
+private pure func diagnosed(parsed: Result[ParsedProgram, Diagnostic]) -> Option[Diagnostic]:
+	match parsed:
+		Err(error): Some(error)
+		Ok(program):
+			match check(program):
+				Ok(_): None
+				Err(failure): Some(render_failure(failure).first)
+
+
+private pure func accepted(inputs: List[ModuleInput]) -> Bool:
+	match parse_modules(inputs):
+		Err(_): False
+		Ok(program): check(program).is_ok()
+
+
+pure func test_parse_failures_survive_the_diagnostic_helper() -> Bool:
+	inputs = [root("func main( -> Int:\n    0\n", [])]
+	diagnosed(parse_modules(inputs)).is_some()
+
+
+-- `found` says `message` and `help` at `place`, with a note at `earlier` when
+-- one is expected: the previous holder of the name, or the declaration a
+-- selection should import from.
+private pure func says(inputs: List[ModuleInput], found: Option[Diagnostic], place: Place, message: String, help: String, earlier: Option[Place]) -> Bool:
+	match found:
+		Some(diagnostic):
+			noted = match earlier:
+				None: diagnostic.note.is_none()
+				Some(expected):
+					match diagnostic.note:
+						Some(PreviousDeclaration(span)): covers(inputs, span, expected)
+						Some(Declaration(span)): covers(inputs, span, expected)
+						_: False
+			noted and covers(inputs, diagnostic.span, place) and diagnostic.message == message and diagnostic.help == help
+		None:
+			False
+
+
+private pure func rejects(inputs: List[ModuleInput], place: Place, message: String, help: String) -> Bool:
+	says(inputs, diagnosed(parse_modules(inputs)), place, message, help, None)
+
+
+private pure func rejects_noted(inputs: List[ModuleInput], place: Place, message: String, help: String, earlier: Place) -> Bool:
+	says(inputs, diagnosed(parse_modules(inputs)), place, message, help, Some(earlier))
+
+
+private pure func root(source: String, targets: List[Int]) -> ModuleInput:
+	{ source = source, targets = targets }
+
+
+private pure func leaf(source: String) -> ModuleInput:
+	{ source = source, targets = [] }
+
+
+MAIN: String = "func main() -> Int:\n    0\n"
+
+
+private pure func type_origin(spelling: String, matches: pure (Origin) -> Bool) -> Bool:
+	inputs = [
+		root("import:\n    ./types: Selected\nprivate record Hidden { value: Int }\nrecord Visible { value: Int }\n" + MAIN, [1]),
+		leaf("record Selected { value: Int }\n"),
+	]
+	match parse_modules(inputs):
+		Err(_): False
+		Ok(program):
+			match (build_namespace(program), existing_name(parsed_contents(program).names, spelling)):
+				(Ok(namespace), Some(name)):
+					match named_type(namespace, root_module_id(), name):
+						Some(found):
+							match found.head:
+								RecordHead(_) | PrimitiveHead(_): matches(found.origin)
+								_: False
+						None: False
+				_: False
+
+
+pure func test_named_type_preserves_private_declaration_origin() -> Bool:
+	type_origin("Hidden", pure func(origin: Origin) -> Bool:
+		match origin:
+			Declared(Private(_)): True
+			_: False
+	)
+
+
+pure func test_named_type_preserves_public_declaration_origin() -> Bool:
+	type_origin("Visible", pure func(origin: Origin) -> Bool:
+		match origin:
+			Declared(Public): True
+			_: False
+	)
+
+
+pure func test_named_type_preserves_imported_origin() -> Bool:
+	type_origin("Selected", pure func(origin: Origin) -> Bool:
+		match origin:
+			Imported: True
+			_: False
+	)
+
+
+pure func test_named_type_preserves_implicit_origin() -> Bool:
+	type_origin("Int", pure func(origin: Origin) -> Bool:
+		match origin:
+			Implicit: True
+			_: False
+	)
+
+
+-- A library module for module 1, which declares without the prelude, and a
+-- prelude of the test's own that selects from it and declares `hidden`.
+ANSWERS: String =
+	|union Answer:
+	|    Yes
+	|pure func answer() -> Answer:
+	|    Yes
+	|
+
+
+private pure func answers_prelude(inputs: List[ModuleInput]) -> ModuleInput:
+	-- The base follows the inputs.
+	source: String =
+		|import:
+		|    _base: Int
+		|    ./answers: Answer, answer
+		|pure func hidden() -> Int:
+		|    1
+		|
+
+	{ source = source, targets = [inputs.length(), 1] }
+
+
+private pure func with_answers(inputs: List[ModuleInput]) -> Option[Diagnostic]:
+	diagnosed(parse_modules_with_prelude(inputs, 1, answers_prelude(inputs)))
+
+
+-- A module sees what it declares and its import rows bring; a user module
+-- also receives the prelude's selections, and a library module does not.
+pure func test_a_module_sees_only_what_it_declares_imports_or_receives() -> Bool:
+	numbers_source: String =
+		|pure func one() -> Int:
+		|    1
+		|pure func two() -> Int:
+		|    2
+		|
+
+	numbers = leaf(numbers_source)
+	calls_one_source: String =
+		|import:
+		|    ./numbers: one
+		|func main() -> Int:
+		|    one()
+		|
+
+	calls_one = root(calls_one_source, [1])
+	calls_two_source: String =
+		|import:
+		|    ./numbers: one
+		|func main() -> Int:
+		|    two()
+		|
+
+	calls_two = root(calls_two_source, [1])
+	uses_prelude = root("pure func pick(flag: Bool) -> Option[Int]:\n    None\n" + MAIN, [])
+	library = [root("import:\n    ./flags: flag\n" + MAIN, [1]), leaf("pure func flag() -> Bool:\n    True\n")]
+	shapes = leaf("union Shape:\n    Circle(Int)\n")
+	type_source: String =
+		|import:
+		|    ./shapes: Shape
+		|pure func make() -> Shape:
+		|    Circle(1)
+		|
+
+	type_only = root(type_source + MAIN, [1])
+	-- The prelude offers its selections; its own declaration stays its own.
+	selected_by_prelude = [root("pure func pick() -> Answer:\n    answer()\n" + MAIN, []), leaf(ANSWERS)]
+	declared_by_prelude = [root("func main() -> Int:\n    hidden()\n", []), leaf(ANSWERS)]
+	unknown = "unknown function"
+	unknown_help = "declare the function locally or import it by name; type selections enable receiver calls only"
+	(
+		accepted([calls_one, numbers])
+		and accepted([uses_prelude])
+		and rejects([calls_two, numbers], { module = 0, text = "two", occurrence = 1 }, unknown, unknown_help)
+		and says(library, diagnosed(parse_modules_with_libraries(library, 1)), { module = 1, text = "Bool", occurrence = 1 }, "unknown type", "declare or import this type; builtin types and declared type parameters are also available", None)
+		and rejects([type_only, shapes], { module = 0, text = "Circle", occurrence = 1 }, "unknown function", unknown_help)
+		and with_answers(selected_by_prelude).is_none()
+		and says(declared_by_prelude, with_answers(declared_by_prelude), { module = 0, text = "hidden", occurrence = 1 }, unknown, unknown_help, None)
+	)
+
+
+-- Values and types are separate spaces, and an alias claims both.
+pure func test_a_spelling_denotes_one_entity_per_space() -> Bool:
+	point_source: String =
+		|record point { x: Int }
+		|pure func point() -> Int:
+		|    1
+		|
+
+	both_spaces = root(point_source + MAIN, [])
+	alias_type_source: String =
+		|import:
+		|    ./numbers as point
+		|record point { x: Int }
+		|
+
+	alias_and_type = root(alias_type_source + MAIN, [1])
+	alias_function_source: String =
+		|import:
+		|    ./numbers as point
+		|pure func point() -> Int:
+		|    1
+		|
+
+	alias_and_function = root(alias_function_source + MAIN, [1])
+	type_alias_source: String =
+		|import:
+		|    ./shapes: point
+		|    ./numbers as point
+		|
+
+	type_then_alias = root(type_alias_source + MAIN, [2, 1])
+	shapes = leaf("record point { x: Int }\n")
+	numbers = leaf("pure func one() -> Int:\n    1\n")
+	claimed = "point is already a module alias"
+	alias_at = { module = 0, text = "point", occurrence = 1 }
+	-- The prelude's `answer` and an explicit selection of it are one entity.
+	answer_source: String =
+		|import:
+		|    ./answers: answer
+		|pure func pick() -> Answer:
+		|    answer()
+		|
+
+	twice_over = [root(answer_source + MAIN, [1]), leaf(ANSWERS)]
+	(
+		accepted([both_spaces])
+		and with_answers(twice_over).is_none()
+		and rejects_noted([alias_and_type, numbers], { module = 0, text = "point", occurrence = 2 }, claimed, "rename this type, or choose another alias", alias_at)
+		and rejects_noted([alias_and_function, numbers], { module = 0, text = "point", occurrence = 2 }, claimed, "rename this function, or choose another alias", alias_at)
+		and rejects_noted([type_then_alias, numbers, shapes], { module = 0, text = "point", occurrence = 2 }, "point is already imported", "choose another alias for this module", alias_at)
+	)
+
+
+-- A module offers only its own public declarations, to a selection, a
+-- qualified name and a method import alike. Module 2 declares `area` on
+-- Shape; module 3 imports it, so offers it to none of the three.
+pure func test_a_module_offers_only_its_own_public_declarations() -> Bool:
+	shapes = leaf("record Shape { size: Int }\n")
+	area_source: String =
+		|import:
+		|    ./shapes: Shape
+		|pure func area(shape: Shape) -> Int:
+		|    shape.size
+		|
+
+	area_of = { source = area_source, targets = [1] }
+	facade_source: String =
+		|import:
+		|    ./area_of: area
+		|    ./shapes: Shape
+		|
+
+	facade = { source = facade_source, targets = [2, 1] }
+	declared_source: String =
+		|import:
+		|    ./shapes: Shape
+		|    ./area_of: Shape methods
+		|func main() -> Int:
+		|    { size = 2 }.area()
+		|
+
+	declared = root(declared_source, [1, 2])
+	methods_source: String =
+		|import:
+		|    ./shapes: Shape
+		|    ./facade: Shape methods
+		|func main() -> Int:
+		|    { size = 2 }.area()
+		|
+
+	methods = root(methods_source, [1, 3])
+	qualified_source: String =
+		|import:
+		|    ./facade as F
+		|func main() -> Int:
+		|    F.area({ size = 1 })
+		|
+
+	qualified = root(qualified_source, [3])
+	selected = root("import:\n    ./facade: area\n" + MAIN, [3])
+	-- A private function does not hide the public type it shares a spelling with.
+	beside_source: String =
+		|record shape { v: Int }
+		|private pure func shape() -> Int:
+		|    1
+		|
+
+	beside = leaf(beside_source)
+	type_source: String =
+		|import:
+		|    ./beside: shape
+		|pure func read(s: shape) -> Int:
+		|    s.v
+		|
+
+	type_beside = root(type_source + MAIN, [1])
+	unknown = "unknown function"
+	unknown_help = "declare the function locally or import it by name; type selections enable receiver calls only"
+	(
+		accepted([declared, shapes, area_of, facade])
+		and accepted([type_beside, beside])
+		and rejects([methods, shapes, area_of, facade], { module = 0, text = "area", occurrence = 1 }, unknown, unknown_help)
+		and rejects([qualified, shapes, area_of, facade], { module = 0, text = "area", occurrence = 1 }, "module ./facade declares no public area", "F names module ./facade; qualify a public function, constructor or type it declares; imports are not reexported")
+		and rejects_noted([selected, shapes, area_of, facade], { module = 0, text = "area", occurrence = 1 }, "area is imported by ./facade, not declared there", "import area from the module that declares it", { module = 2, text = "area", occurrence = 1 })
+	)
+
+
+-- Checking reports one problem, the first in source order of the first
+-- failing module in dependency order; modules that depend on it are silent, and
+-- names are checked before signatures.
+pure func test_one_problem_is_reported_where_names_first_fail() -> Bool:
+	duplicate_union_source: String =
+		|union A:
+		|    X
+		|    X
+		|union A:
+		|    Z
+		|
+
+	twice = root(duplicate_union_source + MAIN, [])
+	failing_source: String =
+		|pure func one() -> Int:
+		|    1
+		|pure func one() -> Int:
+		|    2
+		|
+
+	failing = leaf(failing_source)
+	also_failing_source: String =
+		|pure func two() -> Int:
+		|    2
+		|pure func two() -> Int:
+		|    3
+		|
+
+	also_failing = leaf(also_failing_source)
+	-- The root also selects a name module 2 lacks; module 1 fails first and the root is silent.
+	ordered_source: String =
+		|import:
+		|    ./failing: one
+		|    ./also_failing: missing
+		|
+
+	ordered = root(ordered_source + MAIN, [1, 2])
+	signature_source: String =
+		|pure func first(value: Unknown) -> Int:
+		|    1
+		|pure func first() -> Int:
+		|    2
+		|
+
+	before_signatures = root(signature_source + MAIN, [])
+	-- `methods` selections are resolved after every row, but the earlier
+	-- line is reported: the receiver type on line 2 before the repeat on line 4.
+	shapes = leaf("record Shape { size: Int }\n")
+	numbers = leaf("pure func one() -> Int:\n    1\n")
+	methods_source: String =
+		|import:
+		|    ./shapes: Shape methods
+		|    ./left: one
+		|    ./right: one
+		|
+
+	methods_first = root(methods_source + MAIN, [1, 2, 3])
+	duplicate = "duplicate function name"
+	distinct = "give each function in a module a distinct name"
+	(
+		rejects_noted([twice], { module = 0, text = "X", occurrence = 2 }, "duplicate constructor name", "give each constructor in a module a distinct name", { module = 0, text = "X", occurrence = 1 })
+		and rejects_noted([ordered, failing, also_failing], { module = 1, text = "one", occurrence = 2 }, duplicate, distinct, { module = 1, text = "one", occurrence = 1 })
+		and rejects_noted([before_signatures], { module = 0, text = "first", occurrence = 2 }, duplicate, distinct, { module = 0, text = "first", occurrence = 1 })
+		and rejects([methods_first, shapes, numbers, numbers], { module = 0, text = "Shape", occurrence = 1 }, "method receiver type is not independently visible", "import the exact type with an ordinary type selection before using methods")
+	)
+
+
+-- A duplicate union or record is a namespace problem, so it is reported before
+-- checking reads either declaration's annotations.
+pure func test_a_duplicate_type_is_reported_before_its_annotations() -> Bool:
+	union_source: String =
+		|union A:
+		|    X(Unknown)
+		|union A:
+		|    Y
+		|
+
+	unions = root(union_source + MAIN, [])
+	records = root("record R { f: Unknown }\nrecord R { g: Int }\n" + MAIN, [])
+	-- A record and a union share the type space; the later one is reported.
+	mixed_source: String =
+		|record Item { x: Int }
+		|union Item:
+		|    Thing
+		|
+
+	mixed = root(mixed_source + MAIN, [])
+	duplicate = "duplicate type name"
+	distinct = "give each type in a module a distinct name"
+	(
+		rejects_noted([unions], { module = 0, text = "A", occurrence = 2 }, duplicate, distinct, { module = 0, text = "A", occurrence = 1 })
+		and rejects_noted([records], { module = 0, text = "R", occurrence = 2 }, duplicate, distinct, { module = 0, text = "R", occurrence = 1 })
+		and rejects_noted([mixed], { module = 0, text = "Item", occurrence = 2 }, duplicate, distinct, { module = 0, text = "Item", occurrence = 1 })
+	)
+
+
+-- A function the root selects by name and also reaches through `Shape
+-- methods` is one candidate, located at its named selection.
+pure func test_a_selected_method_keeps_its_selection_site() -> Bool:
+	shapes = leaf("record Shape { size: Int }\n")
+	ops_source: String =
+		|import:
+		|    ./shapes: Shape
+		|pure func pick(shape: Shape) -> Int:
+		|    shape.size
+		|
+
+	ops = { source = ops_source, targets = [1] }
+	circles_source: String =
+		|record Circle { radius: Int }
+		|pure func pick(circle: Circle) -> Int:
+		|    circle.radius
+		|
+
+	circles = leaf(circles_source)
+	caller_source: String =
+		|import:
+		|    ./shapes: Shape
+		|    ./ops: pick, Shape methods
+		|    ./circles: Circle
+		|func main() -> Int:
+		|    5.pick()
+		|
+
+	caller = root(caller_source, [1, 2, 3])
+	inputs = [caller, shapes, ops, circles]
+	match diagnosed(parse_modules(inputs)):
+		Some(diagnostic):
+			match diagnostic.note:
+				Some(CompetingDeclarations(sites)):
+					var selection = False
+					var methods = False
+					for site in sites:
+						selection = selection or covers(inputs, site, { module = 0, text = "pick", occurrence = 1 })
+						methods = methods or covers(inputs, site, { module = 0, text = "Shape", occurrence = 2 })
+					diagnostic.message == "no method accepts this receiver type" and sites.length() == 4 and selection and not methods
+				_: False
+		None: False
+
+
+-- `T methods` needs the importer to see the type the target holds,
+-- whichever of its rows brings the type.
+pure func test_methods_needs_the_importer_to_see_the_type() -> Bool:
+	shapes = leaf("record Shape { size: Int }\n")
+	ops_source: String =
+		|import:
+		|    ./shapes: Shape
+		|pure func area(shape: Shape) -> Int:
+		|    shape.size
+		|
+
+	ops = { source = ops_source, targets = [1] }
+	later_source: String =
+		|import:
+		|    ./ops: Shape methods
+		|    ./shapes: Shape
+		|func main() -> Int:
+		|    { size = 2 }.area()
+		|
+
+	later_row = root(later_source, [2, 1])
+	unseen = root("import:\n    ./ops: Shape methods\n" + MAIN, [2])
+	-- The root sees a Shape, but not the one module 2 holds.
+	another_source: String =
+		|import:
+		|    ./ops: Shape methods
+		|    ./other: Shape
+		|
+
+	another = root(another_source + MAIN, [2, 3])
+	not_visible = "method receiver type is not independently visible"
+	not_visible_help = "import the exact type with an ordinary type selection before using methods"
+	(
+		accepted([later_row, shapes, ops])
+		and rejects([unseen, shapes, ops], { module = 0, text = "Shape", occurrence = 1 }, not_visible, not_visible_help)
+		and rejects([another, shapes, ops, shapes], { module = 0, text = "Shape", occurrence = 1 }, not_visible, not_visible_help)
+	)
+
+
+-- Conflicts: the message names what holds the spelling, the help how to rename.
+pure func test_a_second_function_of_one_name_is_a_duplicate() -> Bool:
+	source: String =
+		|pure func one() -> Int:
+		|    1
+		|pure func one() -> Int:
+		|    2
+		|
+
+	inputs = [root(source + MAIN, [])]
+	rejects_noted(inputs, { module = 0, text = "one", occurrence = 2 }, "duplicate function name", "give each function in a module a distinct name", { module = 0, text = "one", occurrence = 1 })
+
+
+-- Declarations enter in source order, so the later of the two is reported.
+pure func test_a_constructor_and_a_function_share_the_value_space() -> Bool:
+	function_source: String =
+		|pure func Item() -> Int:
+		|    1
+		|union Choice:
+		|    Item
+		|
+
+	function_first = [root(function_source + MAIN, [])]
+	union_source: String =
+		|union Choice:
+		|    Item
+		|pure func Item() -> Int:
+		|    1
+		|
+
+	union_first = [root(union_source + MAIN, [])]
+	help = "functions and constructors share one name space; give them distinct names"
+	first = { module = 0, text = "Item", occurrence = 1 }
+	second = { module = 0, text = "Item", occurrence = 2 }
+	(
+		rejects_noted(function_first, second, "constructor name conflicts with a function", help, first)
+		and rejects_noted(union_first, second, "function name conflicts with a constructor", help, first)
+	)
+
+
+pure func test_a_declaration_cannot_reuse_a_prelude_name() -> Bool:
+	inputs = [root("union Option:\n    Nothing\n" + MAIN, [])]
+	rejects_noted(inputs, { module = 0, text = "Option", occurrence = 1 }, "Option is provided by the prelude", "give this type another name; the prelude's type Option is always in scope", in_prelude(inputs, "Option"))
+
+
+pure func test_a_declaration_cannot_reuse_an_imported_name() -> Bool:
+	source: String =
+		|import:
+		|    ./numbers: one
+		|pure func one() -> Int:
+		|    1
+		|
+
+	inputs = [root(source + MAIN, [1]), leaf("pure func one() -> Int:\n    1\n")]
+	rejects_noted(inputs, { module = 0, text = "one", occurrence = 2 }, "one is already imported", "rename this function, or remove one from the import", { module = 0, text = "one", occurrence = 1 })
+
+
+pure func test_two_selections_of_one_name_conflict() -> Bool:
+	numbers = leaf("pure func one() -> Int:\n    1\n")
+	source: String =
+		|import:
+		|    ./left: one
+		|    ./right: one
+		|
+
+	inputs = [root(source + MAIN, [1, 2]), numbers, numbers]
+	rejects_noted(inputs, { module = 0, text = "one", occurrence = 2 }, "one is already imported", "select one from one module only, and reach the other through a module alias", { module = 0, text = "one", occurrence = 1 })
+
+
+-- A library module, which does not receive the prelude, may declare its names.
+pure func test_a_selection_cannot_reuse_a_prelude_name() -> Bool:
+	maybe_source: String =
+		|union Maybe:
+		|    Some
+		|    Nothing
+		|
+
+	inputs = [root("import:\n    ./maybe: Maybe(Some)\n" + MAIN, [1]), leaf(maybe_source)]
+	says(inputs, diagnosed(parse_modules_with_libraries(inputs, 1)), { module = 0, text = "Some", occurrence = 1 }, "Some is provided by the prelude", "omit Some from this selection, or reach it through a module alias", Some(in_prelude(inputs, "Some")))
+
+
+-- A library module's selection of a name the prelude also supplies is not offered.
+pure func test_selecting_a_name_the_prelude_supplies_is_rejected() -> Bool:
+	inputs = [root("import:\n    ./facade: answer\n" + MAIN, [2]), leaf(ANSWERS), { source = "import:\n    ./answers: answer\n", targets = [1] }]
+	says(inputs, with_answers(inputs), { module = 0, text = "answer", occurrence = 1 }, "answer is already in scope through the prelude", "remove answer from this selection", None)
+
+
+pure func test_an_alias_cannot_reuse_a_selected_name() -> Bool:
+	numbers = leaf("pure func one() -> Int:\n    1\n")
+	source: String =
+		|import:
+		|    ./left: one
+		|    ./right as one
+		|
+
+	inputs = [root(source + MAIN, [1, 2]), numbers, numbers]
+	rejects_noted(inputs, { module = 0, text = "one", occurrence = 2 }, "one is already imported", "choose another alias for this module", { module = 0, text = "one", occurrence = 1 })
+
+
+pure func test_a_selection_cannot_reuse_an_alias() -> Bool:
+	numbers = leaf("pure func one() -> Int:\n    1\n")
+	source: String =
+		|import:
+		|    ./left as one
+		|    ./right: one
+		|
+
+	inputs = [root(source + MAIN, [1, 2]), numbers, numbers]
+	rejects_noted(inputs, { module = 0, text = "one", occurrence = 2 }, "one is already a module alias", "choose another alias for that module, or omit one from this selection", { module = 0, text = "one", occurrence = 1 })
+
+
+pure func test_two_aliases_of_one_name_conflict() -> Bool:
+	numbers = leaf("pure func one() -> Int:\n    1\n")
+	source: String =
+		|import:
+		|    ./left as N
+		|    ./right as N
+		|
+
+	inputs = [root(source + MAIN, [1, 2]), numbers, numbers]
+	rejects_noted(inputs, { module = 0, text = "N", occurrence = 2 }, "N is already a module alias", "choose another alias for this module", { module = 0, text = "N", occurrence = 1 })
+
+
+-- Selections: what the target does not offer, and why.
+pure func test_selecting_an_undeclared_name_is_rejected() -> Bool:
+	inputs = [root("import:\n    ./numbers: three\n" + MAIN, [1]), leaf("pure func one() -> Int:\n    1\n")]
+	rejects(inputs, { module = 0, text = "three", occurrence = 1 }, "module ./numbers declares no public function or type three", "select a public function or type that ./numbers declares")
+
+
+pure func test_selecting_an_undeclared_union_is_rejected() -> Bool:
+	inputs = [root("import:\n    ./numbers: Shape(Circle)\n" + MAIN, [1]), leaf("record Shape { size: Int }\n")]
+	rejects(inputs, { module = 0, text = "Shape", occurrence = 1 }, "module ./numbers declares no public union Shape", "select a union that ./numbers declares")
+
+
+pure func test_methods_of_an_unknown_type_is_rejected() -> Bool:
+	inputs = [root("import:\n    ./numbers: Shape methods\n" + MAIN, [1]), leaf("pure func one() -> Int:\n    1\n")]
+	rejects(inputs, { module = 0, text = "Shape", occurrence = 1 }, "module ./numbers has no type Shape", "methods names a type that ./numbers declares or imports")
+
+
+-- A union selected with its constructors is offered by the same rule.
+pure func test_selecting_a_private_name_is_rejected() -> Bool:
+	function = [root("import:\n    ./hidden: secret\n" + MAIN, [1]), leaf("private pure func secret() -> Int:\n    1\n")]
+	-- A public function of the union's spelling does not make the union public.
+	union_source: String =
+		|private union Shape:
+		|    Circle(Int)
+		|pure func Shape() -> Int:
+		|    7
+		|
+
+	private_union = [root("import:\n    ./hidden: Shape(Circle)\n" + MAIN, [1]), leaf(union_source)]
+	help = "remove private or import a public declaration"
+	(
+		rejects(function, { module = 0, text = "secret", occurrence = 1 }, "secret is private to ./hidden", help)
+		and rejects(private_union, { module = 0, text = "Shape", occurrence = 1 }, "Shape is private to ./hidden", help)
+	)
+
+
+pure func test_selecting_an_imported_function_names_its_declaration() -> Bool:
+	numbers = leaf("pure func one() -> Int:\n    1\n")
+	inputs = [root("import:\n    ./facade: one\n" + MAIN, [1]), { source = "import:\n    ./numbers: one\n", targets = [2] }, numbers]
+	rejects_noted(inputs, { module = 0, text = "one", occurrence = 1 }, "one is imported by ./facade, not declared there", "import one from the module that declares it", { module = 2, text = "one", occurrence = 1 })
+
+
+pure func test_selecting_an_imported_constructor_names_its_union_and_declaration() -> Bool:
+	shape_source: String =
+		|union Shape:
+		|    Circle(Int)
+		|
+	facade_source: String =
+		|import:
+		|    ./shapes: Shape(Circle)
+		|
+	selected_source: String =
+		|import:
+		|    ./facade: Circle
+		|
+	inputs = [root(selected_source + MAIN, [1]), { source = facade_source, targets = [2] }, leaf(shape_source)]
+	match diagnosed(parse_modules(inputs)):
+		Some(error):
+			declaration_note = match error.note:
+				Some(Declaration(_)): True
+				_: False
+			declaration_note and says(inputs, Some(error), { module = 0, text = "Circle", occurrence = 1 }, "Circle is imported by ./facade, not declared there", "import the union from the module that declares it, selecting Shape(Circle)", Some({ module = 2, text = "Circle", occurrence = 1 }))
+		None:
+			False
+
+
+pure func test_selecting_an_imported_type_suggests_methods() -> Bool:
+	shapes = leaf("record Shape { size: Int }\n")
+	inputs = [root("import:\n    ./facade: Shape\n" + MAIN, [1]), { source = "import:\n    ./shapes: Shape\n", targets = [2] }, shapes]
+	rejects_noted(inputs, { module = 0, text = "Shape", occurrence = 1 }, "Shape is imported by ./facade, not declared there", "import Shape from the module that declares it, or write ./facade: Shape methods to use the functions ./facade declares on Shape", { module = 2, text = "Shape", occurrence = 1 })
+
+
+pure func test_a_declared_function_is_selected_beside_an_imported_type() -> Bool:
+	types = leaf("record Foo { value: Int }\n")
+	target_source: String =
+		|import:
+		|    ./types: Foo
+		|pure func Foo() -> Int:
+		|    42
+		|pure func read(value: Foo) -> Int:
+		|    value.value
+		|
+	ops: ModuleInput = { source = target_source, targets = [2] }
+	selected_source: String =
+		|import:
+		|    ./ops: Foo
+		|func main() -> Int:
+		|    Foo()
+		|
+	selected = root(selected_source, [1])
+	-- The selected function does not also reexport the type the target imports.
+	forwarded_source: String =
+		|import:
+		|    ./ops: Foo
+		|pure func read(value: Foo) -> Int:
+		|    value.value
+		|
+	forwarded = root(forwarded_source + MAIN, [1])
+	(
+		accepted([selected, ops, types])
+		and rejects([forwarded, ops, types], { module = 0, text = "Foo", occurrence = 2 }, "unknown type", "declare or import this type; builtin types and declared type parameters are also available")
+	)
+
+
+pure func test_selecting_a_name_already_imported_is_rejected() -> Bool:
+	shapes = leaf("record Shape { size: Int }\n")
+	source: String =
+		|import:
+		|    ./shapes: Shape
+		|    ./facade: Shape
+		|
+
+	inputs = [root(source + MAIN, [2, 1]), { source = "import:\n    ./shapes: Shape\n", targets = [2] }, shapes]
+	rejects(inputs, { module = 0, text = "Shape", occurrence = 2 }, "Shape is already imported, and ./facade does not declare it", "remove Shape from this selection, or write ./facade: Shape methods to use the functions ./facade declares on Shape")
+
+
+pure func test_selecting_a_prelude_name_from_a_user_module_is_rejected() -> Bool:
+	inputs = [root("import:\n    ./ops: Int\n" + MAIN, [1]), leaf("pure func one() -> Int:\n    1\n")]
+	rejects(inputs, { module = 0, text = "Int", occurrence = 1 }, "./ops receives Int from the prelude and does not declare it", "Int is already in scope through the prelude; remove it from this selection, or write ./ops: Int methods to use the functions ./ops declares on Int")
+
+
+pure func test_a_bare_selection_of_a_type_and_a_function_is_ambiguous() -> Bool:
+	point_source: String =
+		|record point { x: Int }
+		|pure func point() -> Int:
+		|    1
+		|
+
+	inputs = [root("import:\n    ./both: point\n" + MAIN, [1]), leaf(point_source)]
+	rejects(inputs, { module = 0, text = "point", occurrence = 1 }, "import selection names both a type and a function", "rename the type or the function in ./both; a bare selection names one declaration")
+
+
+pure func test_a_bare_constructor_selection_names_its_union() -> Bool:
+	inputs = [root("import:\n    ./shapes: Circle\n" + MAIN, [1]), leaf("union Shape:\n    Circle(Int)\n")]
+	rejects(inputs, { module = 0, text = "Circle", occurrence = 1 }, "Circle is a constructor of the union Shape", "write Shape(Circle) to select the union with this constructor")
+
+
+pure func test_a_listed_constructor_must_belong_to_the_union() -> Bool:
+	union_source: String =
+		|union Shape:
+		|    Circle(Int)
+		|union Other:
+		|    Square
+		|
+
+	inputs = [root("import:\n    ./shapes: Shape(Square)\n" + MAIN, [1]), leaf(union_source)]
+	rejects(inputs, { module = 0, text = "Square", occurrence = 1 }, "constructor does not belong to the selected union", "select a constructor declared inside that union")
+
+
+tests: TestSuite = {
+	description = "Blorp module scopes",
+	tests = [
+		("named type preserves private declaration origin", test_named_type_preserves_private_declaration_origin),
+		("named type preserves public declaration origin", test_named_type_preserves_public_declaration_origin),
+		("named type preserves imported origin", test_named_type_preserves_imported_origin),
+		("named type preserves implicit origin", test_named_type_preserves_implicit_origin),
+		("parse failures survive the diagnostic helper", test_parse_failures_survive_the_diagnostic_helper),
+		("a module sees only what it declares, imports or receives", test_a_module_sees_only_what_it_declares_imports_or_receives),
+		("a spelling denotes one entity per space", test_a_spelling_denotes_one_entity_per_space),
+		("a module offers only its own public declarations", test_a_module_offers_only_its_own_public_declarations),
+		("one problem is reported, where names first fail", test_one_problem_is_reported_where_names_first_fail),
+		("methods needs the importer to see the type", test_methods_needs_the_importer_to_see_the_type),
+		("a duplicate type is reported before its annotations", test_a_duplicate_type_is_reported_before_its_annotations),
+		("a selected method keeps its selection site", test_a_selected_method_keeps_its_selection_site),
+		("a second function of one name is a duplicate", test_a_second_function_of_one_name_is_a_duplicate),
+		("a constructor and a function share the value space", test_a_constructor_and_a_function_share_the_value_space),
+		("a declaration cannot reuse a prelude name", test_a_declaration_cannot_reuse_a_prelude_name),
+		("a declaration cannot reuse an imported name", test_a_declaration_cannot_reuse_an_imported_name),
+		("two selections of one name conflict", test_two_selections_of_one_name_conflict),
+		("a selection cannot reuse a prelude name", test_a_selection_cannot_reuse_a_prelude_name),
+		("selecting a name the prelude supplies is rejected", test_selecting_a_name_the_prelude_supplies_is_rejected),
+		("an alias cannot reuse a selected name", test_an_alias_cannot_reuse_a_selected_name),
+		("a selection cannot reuse an alias", test_a_selection_cannot_reuse_an_alias),
+		("two aliases of one name conflict", test_two_aliases_of_one_name_conflict),
+		("selecting an undeclared name is rejected", test_selecting_an_undeclared_name_is_rejected),
+		("selecting an undeclared union is rejected", test_selecting_an_undeclared_union_is_rejected),
+		("methods of an unknown type is rejected", test_methods_of_an_unknown_type_is_rejected),
+		("selecting a private name is rejected", test_selecting_a_private_name_is_rejected),
+		("selecting an imported function names its declaration", test_selecting_an_imported_function_names_its_declaration),
+		("selecting an imported constructor names its union and declaration", test_selecting_an_imported_constructor_names_its_union_and_declaration),
+		("selecting an imported type suggests methods", test_selecting_an_imported_type_suggests_methods),
+		("a declared function is selected beside an imported type", test_a_declared_function_is_selected_beside_an_imported_type),
+		("selecting a name already imported is rejected", test_selecting_a_name_already_imported_is_rejected),
+		("selecting a prelude name from a user module is rejected", test_selecting_a_prelude_name_from_a_user_module_is_rejected),
+		("a bare selection of a type and a function is ambiguous", test_a_bare_selection_of_a_type_and_a_function_is_ambiguous),
+		("a bare constructor selection names its union", test_a_bare_constructor_selection_names_its_union),
+		("a listed constructor must belong to the union", test_a_listed_constructor_must_belong_to_the_union),
+	]
+}

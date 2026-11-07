@@ -1,0 +1,827 @@
+import:
+	../../../../src/syntax/names: program_names
+	../../../../src/compile/ids as Declaration
+	../../../../src/syntax/source: module_source, root_module_id
+	../../../../src/compile/check/check: CheckedProgram, check_errors, checked_functions
+	../../../../src/compile/check/errors as Errors
+	../../../../src/compile/check/model as Check
+	../../../../src/compile/check/render: render_failure
+	../../../../src/compile/namespace/namespace: ValueBinding(FunctionName)
+	../../../../src/compile/assemble: parsed_contents
+	../../../../src/syntax/lex: lex
+	../../../../src/syntax/syntax: Diagnostic, DiagnosticNote(PreviousDeclaration), FunctionExecution(SelfTailLoop, OrdinaryCalls)
+	../../input: check, parse, setup_diagnostic, existing_name
+	../../module_input: primitive_base, INTEGER_OPERATIONS, parse_modules_with_base
+	test: TestSuite
+
+
+private STEP: String =
+	|union Step:
+	|	Stop
+	|	Once
+	|
+
+private MAIN: String =
+	|func main() -> Int:
+	|	0
+	|
+
+
+private pure func checked(source: String) -> Result[CheckedProgram, Diagnostic]:
+	tokens ?= lex(module_source(root_module_id()), source, program_names().names)
+	parsed ?= parse(tokens)
+	check(parsed).map_err(setup_diagnostic)
+
+
+private pure func accepts(source: String) -> Bool:
+	match checked(source):
+		Ok(_):
+			True
+		Err(_):
+			False
+
+
+private pure func rejects_non_tail(source: String, start: Int, end: Int) -> Bool:
+	match lex(module_source(root_module_id()), source, program_names().names).and_then(pure func(tokens): parse(tokens)):
+		Err(_):
+			False
+		Ok(parsed):
+			match check(parsed):
+				Ok(_):
+					False
+				Err(failure):
+					error = check_errors(failure).first
+					diagnostic = render_failure(failure).first
+
+					match error.kind:
+						Errors.RecursionRejection(Errors.NonTailSelfCall(id)):
+							(
+								Declaration.function_number(id) == 0
+								and error.span.start == start
+								and error.span.end == end
+								and diagnostic.span == error.span
+								and diagnostic.message == "recursive call is not in tail position"
+								and diagnostic.help == "return this call directly, or remove @tail_recursive"
+								and diagnostic.note.is_none()
+							)
+						_:
+							False
+
+
+private pure func rejects_annotation(source: String, generic: Bool) -> Bool:
+	match lex(module_source(root_module_id()), source, program_names().names).and_then(pure func(tokens): parse(tokens)):
+		Err(_):
+			False
+		Ok(parsed):
+			match check(parsed):
+				Ok(_):
+					False
+				Err(failure):
+					error = check_errors(failure).first
+					diagnostic = render_failure(failure).first
+
+					kind_valid = match error.kind:
+						Errors.RecursionRejection(Errors.GenericTailRecursionUnsupported):
+							(
+								generic
+								and diagnostic.message == "generic @tail_recursive functions are not supported yet"
+								and diagnostic.help == "use a nongeneric helper, or remove @tail_recursive"
+							)
+						Errors.RecursionRejection(Errors.NoSelfRecursion):
+							(
+								not generic
+								and diagnostic.message == "@tail_recursive function has no direct self call"
+								and diagnostic.help == "remove @tail_recursive; mutual recursion is not covered by this annotation"
+							)
+						_:
+							False
+
+					(
+						kind_valid
+						and error.span.start == 0
+						and error.span.end == 15
+						and diagnostic.span == error.span
+						and diagnostic.note.is_none()
+					)
+
+
+pure func test_direct_terminal_is_explicit() -> Bool:
+	source: String =
+		|@tail_recursive pure func loop(value: Int) -> Int:
+		|	loop(value)
+		|func main() -> Int:
+		|	0
+		|
+
+	match checked(source):
+		Err(_):
+			False
+		Ok(program):
+			match checked_functions(program).functions:
+				[function, _]:
+					match function.execution:
+						SelfTailLoop(annotation):
+							match function.body:
+								Check.CheckedValueBody(Check.RecurWith([argument], span)):
+									match argument.form:
+										Check.ReadBinding(id):
+											(
+												annotation.start == 0
+												and annotation.end == 15
+												and Check.binding_number(id) == 0
+												and span.start == 52
+												and span.end == 63
+												and Check
+													.function_calls(function)
+													.length() == 0
+											)
+										_:
+											False
+								_:
+									False
+						_:
+							False
+				_:
+					False
+
+
+pure func test_ufcs_terminal_preserves_receiver() -> Bool:
+	source: String =
+		|@tail_recursive pure func loop(value: Int) -> Int:
+		|	value.loop()
+		|func main() -> Int:
+		|	0
+		|
+
+	match checked(source):
+		Err(_):
+			False
+		Ok(program):
+			match checked_functions(program).functions:
+				[function, _]:
+					match function.body:
+						Check.CheckedValueBody(Check.RecurWith([receiver], span)):
+							match receiver.form:
+								Check.ReadBinding(id):
+									(
+										Check.binding_number(id) == 0
+										and span.start == 52
+										and span.end == 64
+									)
+								_:
+									False
+						_:
+							False
+				_:
+					False
+
+
+pure func test_zero_argument_main_is_checked() -> Bool:
+	source: String =
+		|@tail_recursive func main() -> Int:
+		|	main()
+		|
+	accepts(source)
+
+
+pure func test_unused_zero_argument_helper_is_checked() -> Bool:
+	source: String =
+		|@tail_recursive pure func loop() -> Int:
+		|	loop()
+		|
+	accepts(source + MAIN)
+
+
+pure func test_impure_self_tail_is_checked() -> Bool:
+	source: String =
+		|@tail_recursive func loop(value: Int) -> Int:
+		|	loop(value)
+		|
+	accepts(source + MAIN)
+
+
+pure func test_ufcs_tail_call_preserves_a_local_receiver_identity() -> Bool:
+	source: String =
+		|@tail_recursive func loop(value: Int) -> Int:
+		|	receiver = value
+		|	receiver.loop()
+		|
+	match checked(source + MAIN):
+		Err(_): False
+		Ok(program):
+			match checked_functions(program).functions:
+				[function, _]:
+					match (function.execution, function.statements, function.body):
+						(SelfTailLoop(_), [Check.InitializeBinding(local, initializer)], Check.CheckedValueBody(Check.RecurWith([receiver], _))):
+							match (initializer.form, receiver.form):
+								(Check.ReadBinding(parameter), Check.ReadBinding(argument)):
+									Check.binding_number(parameter) == 0 and Check.binding_number(local) == 1 and Check.binding_number(argument) == Check.binding_number(local)
+								_: False
+						_: False
+				_: False
+
+
+pure func test_unannotated_recursion_stays_ordinary() -> Bool:
+	source: String =
+		|func main() -> Int:
+		|	main()
+		|
+
+	match checked(source):
+		Err(_):
+			False
+		Ok(program):
+			match checked_functions(program).functions:
+				[function]:
+					match function.execution:
+						OrdinaryCalls:
+							match function.body:
+								Check.CheckedValueBody(Check.ReturnExpression(value)):
+									match value.form:
+										Check.InvokeFunction(operand_call_1):
+											match operand_call_1.operands:
+												[]:
+													True
+												_: False
+										_:
+											False
+								_:
+									False
+						_:
+							False
+				_:
+					False
+
+
+pure func test_unused_nongeneric_no_self_rejects() -> Bool:
+	source: String =
+		|@tail_recursive func idle() -> Int:
+		|	7
+		|
+	rejects_annotation(source + MAIN, False)
+
+
+pure func test_unused_generic_rejects() -> Bool:
+	source: String =
+		|@tail_recursive func loop[T](value: T) -> T:
+		|	loop(value)
+		|
+	rejects_annotation(source + MAIN, True)
+
+
+pure func test_generic_restriction_precedes_no_self() -> Bool:
+	source: String =
+		|@tail_recursive func idle[T](value: T) -> Int:
+		|	7
+		|
+	rejects_annotation(source + MAIN, True)
+
+
+pure func test_generic_restriction_precedes_non_tail() -> Bool:
+	source: String =
+		|@tail_recursive func loop[T](value: T) -> Int:
+		|	unused = loop(value)
+		|	7
+		|
+	rejects_annotation(source + MAIN, True)
+
+
+pure func test_mutual_only_annotation_rejects() -> Bool:
+	source: String =
+		|@tail_recursive func first(value: Int) -> Int:
+		|	second(value)
+		|func second(value: Int) -> Int:
+		|	first(value)
+		|
+	rejects_annotation(source + MAIN, False)
+
+
+pure func test_ordinary_name_error_precedes_annotation() -> Bool:
+	source: String =
+		|@tail_recursive func loop[T](value: T) -> Int:
+		|	missing
+		|func main() -> Int:
+		|	0
+		|
+
+	match lex(module_source(root_module_id()), source, program_names().names).and_then(pure func(tokens): parse(tokens)):
+		Err(_):
+			False
+		Ok(parsed):
+			match check(parsed):
+				Ok(_):
+					False
+				Err(failure):
+					match check_errors(failure).first.kind:
+						Errors.ValueRejection(Errors.UnknownValue(_)):
+							True
+						_:
+							False
+
+
+pure func test_binding_initializer_is_non_tail() -> Bool:
+	source: String =
+		|@tail_recursive pure func loop(value: Int) -> Int:
+		|	unused = loop(value)
+		|	unused
+		|func main() -> Int:
+		|	0
+		|
+	rejects_non_tail(source, 61, 72)
+
+
+pure func test_explicit_argument_is_non_tail() -> Bool:
+	source: String =
+		|@tail_recursive pure func loop(value: Int) -> Int:
+		|	identity(loop(value))
+		|pure func identity(value: Int) -> Int:
+		|	value
+		|func main() -> Int:
+		|	0
+		|
+	rejects_non_tail(source, 61, 72)
+
+
+pure func test_earlier_direct_postfix_is_non_tail() -> Bool:
+	source: String =
+		|@tail_recursive pure func loop(value: Int) -> Int:
+		|	loop(value).identity()
+		|pure func identity(value: Int) -> Int:
+		|	value
+		|func main() -> Int:
+		|	0
+		|
+	rejects_non_tail(source, 52, 63)
+
+
+pure func test_earlier_ufcs_postfix_is_non_tail() -> Bool:
+	source: String =
+		|@tail_recursive pure func loop(value: Int) -> Int:
+		|	value.loop().identity()
+		|pure func identity(value: Int) -> Int:
+		|	value
+		|func main() -> Int:
+		|	0
+		|
+	rejects_non_tail(source, 52, 64)
+
+
+pure func test_self_receiver_is_non_tail() -> Bool:
+	source: String =
+		|@tail_recursive pure func loop(value: Int) -> Int:
+		|	loop(value).loop()
+		|func main() -> Int:
+		|	0
+		|
+	rejects_non_tail(source, 52, 63)
+
+
+pure func test_self_explicit_argument_in_recur_is_non_tail() -> Bool:
+	source: String =
+		|@tail_recursive pure func loop(value: Int) -> Int:
+		|	loop(loop(value))
+		|func main() -> Int:
+		|	0
+		|
+	rejects_non_tail(source, 57, 68)
+
+
+-- Several non-tail self calls in one value are reported in evaluation order: a
+-- call's arguments, receiver first, before the call. A direct call therefore
+-- reports its nested argument call, and a receiver chain its base call.
+pure func test_nested_direct_self_call_in_initializer_reports_the_inner_call() -> Bool:
+	source: String =
+		|@tail_recursive pure func loop(value: Int) -> Int:
+		|	unused = loop(loop(value))
+		|	loop(value)
+		|func main() -> Int:
+		|	0
+		|
+	rejects_non_tail(source, 66, 77)
+
+
+pure func test_self_call_in_a_ufcs_argument_reports_the_argument_call() -> Bool:
+	source: String =
+		|@tail_recursive pure func loop(left: Int, right: Int) -> Int:
+		|	unused = left.loop(loop(left, right))
+		|	loop(left, right)
+		|func main() -> Int:
+		|	0
+		|
+	rejects_non_tail(source, 82, 99)
+
+
+pure func test_self_receiver_chain_in_initializer_reports_the_base_call() -> Bool:
+	source: String =
+		|@tail_recursive pure func loop(value: Int) -> Int:
+		|	unused = loop(value).loop()
+		|	loop(value)
+		|func main() -> Int:
+		|	0
+		|
+	rejects_non_tail(source, 61, 72)
+
+
+pure func test_constructor_payload_is_non_tail() -> Bool:
+	source: String =
+		|union Box:
+		|	Number(Int)
+		|@tail_recursive pure func loop(value: Int) -> Int:
+		|	unwrap(Number(loop(value)))
+		|pure func unwrap(value: Box) -> Int:
+		|	match value:
+		|		Number(number): number
+		|func main() -> Int:
+		|	0
+		|
+	rejects_non_tail(source, 96, 107)
+
+
+pure func test_record_child_is_non_tail() -> Bool:
+	source: String =
+		|record Pair { first: Int, second: Int }
+		|@tail_recursive pure func loop(value: Int) -> Int:
+		|	first({ first = loop(value), second = 9 })
+		|pure func first(pair: Pair) -> Int:
+		|	pair.first
+		|func main() -> Int:
+		|	0
+		|
+	rejects_non_tail(source, 108, 119)
+
+
+pure func test_scrutinee_is_non_tail() -> Bool:
+	source: String =
+		|union Step:
+		|	Stop
+		|	Once
+		|@tail_recursive pure func loop(value: Step) -> Step:
+		|	match loop(value):
+		|		Stop: Stop
+		|		Once: Once
+		|func main() -> Int:
+		|	0
+		|
+	rejects_non_tail(source, 90, 101)
+
+
+pure func test_arm_initializer_is_non_tail() -> Bool:
+	source: String =
+		|union Step:
+		|	Stop
+		|	Once
+		|@tail_recursive pure func loop(value: Step) -> Int:
+		|	match value:
+		|		Stop: 7
+		|		Once:
+		|			unused = loop(Stop)
+		|			unused
+		|func main() -> Int:
+		|	0
+		|
+	rejects_non_tail(source, 126, 136)
+
+
+pure func test_mixed_good_bad_arms_reject() -> Bool:
+	source: String =
+		|union Step:
+		|	Stop
+		|	Once
+		|@tail_recursive pure func loop(value: Step) -> Int:
+		|	match value:
+		|		Stop: loop(Once)
+		|		Once: identity(loop(Stop))
+		|pure func identity(value: Int) -> Int:
+		|	value
+		|func main() -> Int:
+		|	0
+		|
+	rejects_non_tail(source, 132, 142)
+
+
+pure func test_nonself_ufcs_argument_is_non_tail() -> Bool:
+	source: String =
+		|@tail_recursive pure func loop(value: Int) -> Int:
+		|	unused = value.identity(loop(value))
+		|	loop(value)
+		|pure func identity(left: Int, right: Int) -> Int:
+		|	right
+		|func main() -> Int:
+		|	0
+		|
+	rejects_non_tail(source, 76, 87)
+
+
+pure func test_following_field_access_is_non_tail() -> Bool:
+	source: String =
+		|record Pair { first: Int }
+		|@tail_recursive pure func loop(pair: Pair) -> Pair:
+		|	{ first = loop(pair).first }
+		|func main() -> Int:
+		|	0
+		|
+	rejects_non_tail(source, 90, 100)
+
+
+pure func test_ordinary_arity_error_precedes_annotation() -> Bool:
+	source: String =
+		|@tail_recursive pure func loop(value: Int) -> Int:
+		|	loop()
+		|func main() -> Int:
+		|	0
+		|
+
+	match lex(module_source(root_module_id()), source, program_names().names).and_then(pure func(tokens): parse(tokens)):
+		Err(_):
+			False
+		Ok(parsed):
+			match check(parsed):
+				Ok(_):
+					False
+				Err(failure):
+					match check_errors(failure).first.kind:
+						Errors.CallRejection(Errors.ArgumentCountMismatch(_)):
+							True
+						_:
+							False
+
+
+pure func test_ordinary_type_error_precedes_annotation() -> Bool:
+	source: String =
+		|import:
+		|    int: to_string
+		|@tail_recursive pure func loop(value: Int) -> Int:
+		|	loop(value.to_string())
+		|func main() -> Int:
+		|	0
+		|
+
+	match parse_modules_with_base([
+		{ source = source, targets = [1] },
+		{ source = INTEGER_OPERATIONS, targets = [] },
+	], primitive_base()):
+		Err(_):
+			False
+		Ok(parsed):
+			match check(parsed):
+				Ok(_):
+					False
+				Err(failure):
+					match check_errors(failure).first.kind:
+						Errors.CallRejection(Errors.ArgumentTypeMismatch(_)):
+							True
+						_:
+							False
+
+
+pure func test_ordinary_purity_error_precedes_annotation() -> Bool:
+	source: String =
+		|@tail_recursive pure func loop(value: Int) -> Int:
+		|	unused = effect()
+		|	loop(value)
+		|func effect() -> Int:
+		|	0
+		|func main() -> Int:
+		|	0
+		|
+
+	match lex(module_source(root_module_id()), source, program_names().names).and_then(pure func(tokens): parse(tokens)):
+		Err(_):
+			False
+		Ok(parsed):
+			match check(parsed):
+				Ok(_):
+					False
+				Err(failure):
+					match check_errors(failure).first.kind:
+						Errors.CallRejection(Errors.ImpureCall(_, _)):
+							True
+						_:
+							False
+
+
+pure func test_parameter_collision_precedes_tail_annotation() -> Bool:
+	source: String =
+		|@tail_recursive pure func loop(loop: Int) -> Int:
+		|	loop(loop)
+		|func main() -> Int:
+		|	0
+		|
+
+	match lex(module_source(root_module_id()), source, program_names().names).and_then(pure func(tokens): parse(tokens)):
+		Err(_):
+			False
+		Ok(parsed):
+			match check(parsed):
+				Ok(_):
+					False
+				Err(failure):
+					errors = check_errors(failure)
+					diagnostics = render_failure(failure)
+					match (errors.first.kind, existing_name(parsed_contents(parsed).names, "loop")):
+						(Errors.BindingRejection(Errors.ModuleBindingConflict(FunctionName(previous))), Some(expected)):
+							primary_start = "@tail_recursive pure func loop(".length()
+							primary = { source = module_source(root_module_id()), start = primary_start, end = primary_start + 4 }
+							declaration_start = "@tail_recursive pure func ".length()
+							declaration = { source = module_source(root_module_id()), start = declaration_start, end = declaration_start + 4 }
+							note_matches = match diagnostics.first.note:
+								Some(PreviousDeclaration(original)): original == declaration
+								_: False
+							(
+								errors.remaining.is_empty() and diagnostics.remaining.is_empty()
+								and previous.id == expected and previous.span == declaration
+								and errors.first.span == primary and diagnostics.first.span == primary
+								and diagnostics.first.message == "`loop` is already a function in this module"
+								and diagnostics.first.help == "choose a different name for this binding" and note_matches
+							)
+						_: False
+
+
+pure func test_no_self_error_precedes_managed_admission() -> Bool:
+	source: String =
+		|@tail_recursive pure func identity(value: String) -> String:
+		|	value
+		|func main() -> Int:
+		|	0
+		|
+	rejects_annotation(source, False)
+
+
+private pure func rejects_callable_tail(
+	prefix: String,
+	marked: String,
+	suffix: String,
+	message: String,
+	help: String,
+	matches: pure (Errors.CheckErrorKind) -> Bool,
+) -> Bool:
+	match lex(module_source(root_module_id()), prefix + marked + suffix, program_names().names).and_then(pure func(tokens): parse(tokens)):
+		Err(_): False
+		Ok(parsed):
+			match check(parsed):
+				Ok(_): False
+				Err(failure):
+					errors = check_errors(failure)
+					diagnostic = render_failure(failure).first
+					(
+						errors.remaining.is_empty() and matches(errors.first.kind)
+						and errors.first.span.start == prefix.length() and errors.first.span.end == prefix.length() + marked.length()
+						and diagnostic.span == errors.first.span and diagnostic.note.is_none()
+						and diagnostic.message == message and diagnostic.help == help
+					)
+
+
+private CALLABLE_TAIL: String =
+	| pure func invoke(f: pure (Int) -> Int, value: Int) -> Int:
+	|    missing()
+	|
+private BUILTIN_CALLABLE_TAIL: String =
+	| pure func invoke(f: pure (Int) -> Int) -> Int:
+	|    builtin("int.add")
+	|
+private ANNOTATED_REFERENCE: String =
+	|pure func ignore(f: pure (Int) -> Int) -> Int:
+	|    0
+	|@tail_recursive pure func loop(value: Int) -> Int:
+	|
+
+
+pure func test_callable_tail_annotation_rejects_before_body_lookup() -> Bool:
+	rejects_callable_tail("", "@tail_recursive", CALLABLE_TAIL + MAIN, "tail recursion with callable parameters is not supported yet", "remove @tail_recursive; callable parameters on recursive backedges are not supported yet", pure func(kind):
+		match kind:
+			Errors.RecursionRejection(Errors.CallableTailRecursionUnsupported): True
+			_: False
+	)
+
+
+pure func test_annotated_function_rejects_its_own_callback_reference() -> Bool:
+	prefix = ANNOTATED_REFERENCE + "    ignore("
+	rejects_callable_tail(prefix, "loop", ")\n" + MAIN, "tail-recursive function cannot reference itself as a callback", "pass a different callback or remove @tail_recursive", pure func(kind):
+		match kind:
+			Errors.RecursionRejection(Errors.AnnotatedSelfCallback): True
+			_: False
+	)
+
+
+pure func test_generic_tail_precedence_survives_callable_parameters() -> Bool:
+	source: String =
+		|@tail_recursive pure func invoke[T](f: pure (T) -> T, value: T) -> T:
+		|    missing()
+		|
+	rejects_annotation(source + MAIN, True)
+
+
+pure func test_builtin_tail_precedence_survives_callable_parameters() -> Bool:
+	rejects_callable_tail("", "@tail_recursive", BUILTIN_CALLABLE_TAIL + MAIN, "builtin bodies cannot have a tail-recursion annotation", "remove @tail_recursive from the builtin declaration", pure func(kind):
+		match kind:
+			Errors.BuiltinRejection(Errors.BuiltinTailAnnotation): True
+			_: False
+	)
+
+
+pure func test_another_function_can_reference_an_annotated_declaration() -> Bool:
+	source: String =
+		|@tail_recursive pure func loop(value: Int) -> Int:
+		|    loop(value)
+		|pure func ignore(f: pure (Int) -> Int) -> Int:
+		|    0
+		|func main() -> Int:
+		|    ignore(loop)
+		|
+	accepts(source)
+
+
+pure func test_ordinary_self_call_in_prefix() -> Bool:
+	source: String =
+		|@tail_recursive pure func loop(value: Int) -> Int:
+		|	unused = loop(value)
+		|	unused
+		|func main() -> Int:
+		|	0
+		|
+	rejects_non_tail(source, 61, 72)
+
+
+pure func test_ordinary_self_call_in_arm() -> Bool:
+	source: String =
+		|union Step:
+		|	Stop
+		|	Once
+		|@tail_recursive pure func loop(value: Step) -> Int:
+		|	match value:
+		|		Stop: 7
+		|		Once:
+		|			unused = loop(Stop)
+		|			unused
+		|func main() -> Int:
+		|	0
+		|
+	rejects_non_tail(source, 126, 136)
+
+
+pure func test_loop_without_backedge() -> Bool:
+	rejects_annotation("@tail_recursive pure func loop(value: Int) -> Int:\n\tvalue\n" + MAIN, False)
+
+
+tests: TestSuite = {
+	description = "Checked self-tail contexts",
+	tests = [
+		("callable tail contract precedes unknown body", test_callable_tail_annotation_rejects_before_body_lookup),
+		("annotated declaration cannot select itself as callback", test_annotated_function_rejects_its_own_callback_reference),
+		("generic tail restriction retains priority", test_generic_tail_precedence_survives_callable_parameters),
+		("builtin tail restriction retains priority", test_builtin_tail_precedence_survives_callable_parameters),
+		("other function may select annotated declaration", test_another_function_can_reference_an_annotated_declaration),
+		("raw-origin prefix rule belongs to Check", test_ordinary_self_call_in_prefix),
+		("raw-origin arm rule belongs to Check", test_ordinary_self_call_in_arm),
+		("raw-origin no-backedge rule belongs to Check", test_loop_without_backedge),
+		(
+			"nested direct self call in an initializer reports the inner call",
+			test_nested_direct_self_call_in_initializer_reports_the_inner_call,
+		),
+		(
+			"self call in a UFCS argument reports the argument call",
+			test_self_call_in_a_ufcs_argument_reports_the_argument_call,
+		),
+		(
+			"self receiver chain in an initializer reports the base call",
+			test_self_receiver_chain_in_initializer_reports_the_base_call,
+		),
+		("nonself ufcs argument is non tail", test_nonself_ufcs_argument_is_non_tail),
+		("following field access is non tail", test_following_field_access_is_non_tail),
+		("ordinary arity error precedes annotation", test_ordinary_arity_error_precedes_annotation),
+		("ordinary type error precedes annotation", test_ordinary_type_error_precedes_annotation),
+		(
+			"ordinary purity error precedes annotation",
+			test_ordinary_purity_error_precedes_annotation,
+		),
+		("parameter collision precedes tail annotation", test_parameter_collision_precedes_tail_annotation),
+		("no self error precedes managed admission", test_no_self_error_precedes_managed_admission),
+		("direct terminal is explicit", test_direct_terminal_is_explicit),
+		("ufcs terminal preserves receiver", test_ufcs_terminal_preserves_receiver),
+		("zero argument main is checked", test_zero_argument_main_is_checked),
+		("unused zero argument helper is checked", test_unused_zero_argument_helper_is_checked),
+		("impure self tail is checked", test_impure_self_tail_is_checked),
+		("ufcs tail call preserves local receiver identity", test_ufcs_tail_call_preserves_a_local_receiver_identity),
+		("unannotated recursion stays ordinary", test_unannotated_recursion_stays_ordinary),
+		("unused nongeneric no self rejects", test_unused_nongeneric_no_self_rejects),
+		("unused generic rejects", test_unused_generic_rejects),
+		("generic restriction precedes no self", test_generic_restriction_precedes_no_self),
+		("generic restriction precedes non tail", test_generic_restriction_precedes_non_tail),
+		("mutual only annotation rejects", test_mutual_only_annotation_rejects),
+		("ordinary name error precedes annotation", test_ordinary_name_error_precedes_annotation),
+		("binding initializer is non tail", test_binding_initializer_is_non_tail),
+		("explicit argument is non tail", test_explicit_argument_is_non_tail),
+		("earlier direct postfix is non tail", test_earlier_direct_postfix_is_non_tail),
+		("earlier ufcs postfix is non tail", test_earlier_ufcs_postfix_is_non_tail),
+		("self receiver is non tail", test_self_receiver_is_non_tail),
+		(
+			"self explicit argument in recur is non tail",
+			test_self_explicit_argument_in_recur_is_non_tail,
+		),
+		("constructor payload is non tail", test_constructor_payload_is_non_tail),
+		("record child is non tail", test_record_child_is_non_tail),
+		("scrutinee is non tail", test_scrutinee_is_non_tail),
+		("arm initializer is non tail", test_arm_initializer_is_non_tail),
+		("mixed good bad arms reject", test_mixed_good_bad_arms_reject),
+	]
+}
