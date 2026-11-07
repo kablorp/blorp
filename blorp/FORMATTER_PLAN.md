@@ -98,6 +98,17 @@ What the formatter reuses (surveyed 2026-11-06):
     breaks, so a chain in one stays on its line. Chains nested in another
     chain's arguments break too (Keith, 2026-11-07: "Yes, break them all").
 
+13. (Keith, 2026-11-07: "Adopt, per match", proposing "if one branch of a
+    match or if breaks and indents, then all should".) If any arm of a
+    `match` is laid out as a block, every arm of that match is a block. Each
+    `match` decides for itself, so a nested one neither forces nor follows
+    its outer match. An arm is a block when its body has more than one
+    statement, its single value does not fit on the pattern's line (this
+    includes a value that must break, such as a chain of two or more calls),
+    or it holds an own-line comment; an or-pattern is one arm. `if`,
+    `else if` and `else` are always blocks by grammar, so nothing changes
+    there.
+
 Settled without a choice: one space around binary operators, `=` and
 annotation `:`, and after commas; a space inside record braces and none inside
 `[]` or `()`; no column alignment; `if` is always a block, and an `else:`
@@ -190,7 +201,8 @@ print it flat; if that passes column 100, holds a comment or holds a method
 chain of two or more calls (decision 12), break it by its
 one rule (one item per line, one chain link per line, or parenthesized
 operands with the operator first), then lay out each child the same way.
-Only the outermost operator chain of a value breaks; its operands stay flat
+A `match` lays out all its arms as blocks when any one needs a block
+(decision 13). Only the outermost operator chain of a value breaks; its operands stay flat
 unless they are themselves parenthesized or bracketed. There is no cost
 function and no search across siblings, so an edit changes the layout of the
 constructs containing it and of nothing beside them.
