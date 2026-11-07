@@ -85,6 +85,18 @@ What the formatter reuses (surveyed 2026-11-06):
 10. `--check` changes nothing, prints `path:line: would reformat` per file
     that would change, and exits 1 if any would.
 11. The architecture: the shared parser plus source positions.
+12. (Keith, 2026-11-07: "any time there are multiple chained method calls,
+    they should be put on new lines and indented" and, for block headers,
+    "Parenthesize headers".) A chain of two or more method calls
+    (`.name(...)`) always breaks, one call per line, one level deeper than its
+    head, at any width. Field reads and a leading direct call belong to the
+    head and do not count; `and`, `or` and `not` are ordinary calls. A chain
+    of one call breaks only by the width rule. In a block header (`if`,
+    `else if`, `while`, `for ... in`, `match`) the grammar forbids an indented
+    chain outside brackets, so the formatter encloses the header's value in
+    parentheses and breaks the chain inside them. An interpolation hole never
+    breaks, so a chain in one stays on its line. Chains nested in another
+    chain's arguments break too (Keith, 2026-11-07: "Yes, break them all").
 
 Settled without a choice: one space around binary operators, `=` and
 annotation `:`, and after commas; a space inside record braces and none inside
@@ -174,7 +186,8 @@ emits the trivia between the cursor and that position:
 ### Layout engine
 
 Each construct is laid out from its own contents and indentation only:
-print it flat; if that passes column 100 or holds a comment, break it by its
+print it flat; if that passes column 100, holds a comment or holds a method
+chain of two or more calls (decision 12), break it by its
 one rule (one item per line, one chain link per line, or parenthesized
 operands with the operator first), then lay out each child the same way.
 Only the outermost operator chain of a value breaks; its operands stay flat

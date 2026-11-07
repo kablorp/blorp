@@ -98,6 +98,13 @@ union NoFlatForm:
     HoldsComment
     -- A pipe or raw String, which must start a line.
     HoldsPipeString
+    -- A method chain of two or more calls, which always has a line per call
+    -- (Keith, 2026-11-07).
+    HoldsMethodChain
+
+
+-- The fewest method calls in a chain that always breaks, one per line.
+MIN_BROKEN_CHAIN_CALLS: Int = 2
 
 
 -- Where the code that parentheses around `value` can wrap ends: its last
@@ -544,6 +551,32 @@ pure func closing_count(pairs: List[Span], open: Int, next_end: Int) -> Int:
     open - still_open
 
 
+-- The end of what a value's written parentheses cover: the furthest pair, or
+-- the base when it has none.
+pure func covered_end(value: ValueExpression, pairs: List[Span]) -> Int:
+    var furthest = value.base_span.end
+    for pair in pairs:
+        furthest = furthest.max(pair.end)
+    furthest
+
+
+-- How many method calls a value's chain has after its head. The head is the
+-- base, the field reads before the first call, and whatever written
+-- parentheses wrap short of the whole value, as `(x.f()).g()` has one call.
+pure func method_call_count(value: ValueExpression, pairs: List[Span]) -> Int:
+    covered = value.covered_end(
+        pairs.filter(pure func(pair: Span) -> Bool: pair.wraps_whole(value).not()),
+    )
+    var count = 0
+    for application in value.applications:
+        match application:
+            ReceiverInvocation(call):
+                if call.span.end > covered:
+                    count = count + 1
+            FieldAccess(_) | TupleIndex(_, _): void
+    count
+
+
 -- `value` on one line where it stands, or why it has none. Comments are the
 -- caller's to check: a construct holding one is broken however short.
 pure func value_text(
@@ -552,6 +585,18 @@ pure func value_text(
     placement: Placement,
 ) -> Result[String, NoFlatForm]:
     pairs = value.kept_parentheses(placement)
+    if value.method_call_count(pairs) >= MIN_BROKEN_CHAIN_CALLS:
+        Err(HoldsMethodChain)
+    else:
+        source.parts_text(value, pairs)
+
+
+-- `value` on one line, with no regard for a chain of calls that must break.
+pure func parts_text(
+    source: SourceView,
+    value: ValueExpression,
+    pairs: List[Span],
+) -> Result[String, NoFlatForm]:
     var parts: List[Result[String, NoFlatForm]] = [
         Ok("(".repeated(pairs.length())),
         source.base_text(value.base, value.base_span),

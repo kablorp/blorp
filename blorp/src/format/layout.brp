@@ -66,7 +66,8 @@ import:
         ValueExpression,
         type_span,
     ./flat:
-        NoFlatForm(HoldsBlock, HoldsComment, HoldsPipeString),
+        MIN_BROKEN_CHAIN_CALLS,
+        NoFlatForm(HoldsBlock, HoldsComment, HoldsPipeString, HoldsMethodChain),
         Placement(WholeValue, PartValue),
         application_end,
         application_text,
@@ -75,6 +76,7 @@ import:
         base_text,
         binder_text,
         closing_count,
+        covered_end,
         comparison_text,
         is_pipe_string,
         joined,
@@ -82,6 +84,8 @@ import:
         wraps_whole,
         lambda_header_text,
         lambda_parameter_text,
+        method_call_count,
+        parts_text,
         name_text,
         negation_prefix,
         pattern_text,
@@ -532,6 +536,11 @@ private pure func emit_broken(
                     .text("(".repeated(count - 1))
                     .emit_parenthesized_chain(inner, indent, Some(innermost.end - 1))
                     .text(")".repeated(count - 1))
+            else if inner.breaks_outside_brackets(PartValue):
+                printer
+                    .text("(".repeated(count - 1))
+                    .emit_enclosed_value(inner, indent, Some(innermost.end - 1))
+                    .text(")".repeated(count - 1))
             else:
                 opened = printer
                     .text("(".repeated(count))
@@ -638,6 +647,54 @@ private pure func emit_parenthesized_chain(
     closed = match closer:
         Some(offset): written_operands.flush(offset)
         None: written_operands
+    closed.close_block().newline_without_blank(indent).text(")")
+
+
+-- Whether a value has a method chain of two or more calls, or an operand
+-- with one, that is not inside brackets of its own. It must break there
+-- (Keith, 2026-11-07), which a block header's line cannot do, so a header
+-- encloses such a value in parentheses. A written pair that wraps the whole
+-- value is such brackets already.
+private pure func breaks_outside_brackets(value: ValueExpression, placement: Placement) -> Bool:
+    pairs = value.kept_parentheses(placement)
+    if pairs.filter(pure func(pair: Span) -> Bool: pair.wraps_whole(value)).is_empty().not():
+        False
+    else if value.is_operator_chain():
+        value
+            .chain_operands()
+            .any(
+                pure func(operand: ChainOperand) -> Bool: operand.value.breaks_outside_brackets(
+                    PartValue,
+                ),
+            )
+    else if value.applications.is_empty():
+        match value.base:
+            NegationExpression(_, operand): operand.breaks_outside_brackets(PartValue)
+            RangeExpression(low, high):
+                or(low.breaks_outside_brackets(PartValue), high.breaks_outside_brackets(PartValue))
+            _: False
+    else:
+        value.method_call_count(pairs) >= MIN_BROKEN_CHAIN_CALLS
+
+
+-- A value inside parentheses with the value on a line of its own, one level
+-- deeper, and the closing parenthesis on another. `closer` is the written
+-- closing parenthesis, whose comments come before it; added ones have none.
+private pure func emit_enclosed_value(
+    printer: Printer,
+    inner: ValueExpression,
+    indent: Int,
+    closer: Option[Int],
+) -> Printer:
+    opened = printer
+        .text("(")
+        .open_block(0, indent + 1, BODY_BLANK_LINES)
+        .flush(inner.span.start)
+        .newline_without_blank(indent + 1)
+    inside = opened.emit_value(inner, PartValue, InBrackets, indent + 1, 0)
+    closed = match closer:
+        Some(offset): inside.flush(offset)
+        None: inside
     closed.close_block().newline_without_blank(indent).text(")")
 
 
@@ -764,11 +821,11 @@ private pure func emit_postfix_chain(
     reserve: Int,
 ) -> Printer:
     source = printer.source
-    covered_end = pairs.map(pure func(pair: Span) -> Int: pair.end).fold_max(value.base_span.end)
+    covered = value.covered_end(pairs)
     var head: List[PostfixOperation] = []
     var links: List[ChainLink] = []
     for application in value.applications:
-        in_head = and(links.is_empty(), application.application_end() <= covered_end)
+        in_head = and(links.is_empty(), application.application_end() <= covered)
         match application:
             ReceiverInvocation(call):
                 if in_head:
@@ -783,7 +840,7 @@ private pure func emit_postfix_chain(
                             .append({ link | rest = link.rest.append(application) })
                     None: head = head.append(application)
     head_value: ValueExpression = { value | applications = head, parentheses = pairs }
-    head_text = source.value_text(head_value, PartValue)
+    head_text = source.parts_text(head_value, pairs)
     match links.last():
         None: printer.emit_pieces(value, pairs, context, indent, reserve)
         Some(last):
@@ -811,7 +868,11 @@ private pure func emit_postfix_chain(
                 source.hug_line(shape, arguments),
             ):
                 (Ok(before), Some(hugged)):
-                    if source.has_comment(value.span.start, last.call.span.start):
+                    -- A chain of two or more calls has a line per call, so it never hugs.
+                    if or(
+                        links.length() >= MIN_BROKEN_CHAIN_CALLS,
+                        source.has_comment(value.span.start, last.call.span.start),
+                    ):
                         None
                     else if printer.fits(
                         "${before}.${source.name_text(last.call.callee)}${hugged.before}${hugged.opening}",
@@ -832,7 +893,7 @@ private pure func emit_postfix_chain(
                         value,
                         pairs,
                         head_value,
-                        covered_end,
+                        covered,
                         links,
                         context,
                         indent,
@@ -847,7 +908,7 @@ private pure func emit_unhugged_chain(
     value: ValueExpression,
     pairs: List[Span],
     head_value: ValueExpression,
-    covered_end: Int,
+    covered: Int,
     links: List[ChainLink],
     context: LineContext,
     indent: Int,
@@ -866,7 +927,7 @@ private pure func emit_unhugged_chain(
         -- comment between two of them sits at their indentation.
         var written_links = printer
             .emit_pieces(
-                { head_value | span = { value.span | end = covered_end } },
+                { head_value | span = { value.span | end = covered } },
                 pairs,
                 context,
                 indent,
@@ -892,13 +953,6 @@ private pure func emit_unhugged_chain(
         written_links.close_block()
     else:
         printer.emit_pieces(value, pairs, context, indent, reserve)
-
-
-private pure func fold_max(values: List[Int], floor: Int) -> Int:
-    var largest = floor
-    for value in values:
-        largest = largest.max(value)
-    largest
 
 
 private pure func fold_applications(
@@ -1197,11 +1251,20 @@ private pure func emit_header_value(
     placement: Placement,
     indent: Int,
 ) -> Printer:
-    written_value = printer.emit_value(value, placement, HeaderLine, indent, 1)
-    if printer.source.ends_line(value, placement):
-        written_value.newline_without_blank(indent).text(":")
+    if value.breaks_outside_brackets(placement):
+        -- The header's line cannot hold a broken chain, so parentheses
+        -- carry it; written ones that wrapped the whole value were dropped.
+        enclosed: ValueExpression = { value | parentheses = value.kept_parentheses(placement) }
+        if and(enclosed.is_operator_chain(), enclosed.parentheses.is_empty()):
+            printer.emit_parenthesized_chain(enclosed, indent, None).text(":")
+        else:
+            printer.emit_enclosed_value(enclosed, indent, None).text(":")
     else:
-        written_value.text(":")
+        written_value = printer.emit_value(value, placement, HeaderLine, indent, 1)
+        if printer.source.ends_line(value, placement):
+            written_value.newline_without_blank(indent).text(":")
+        else:
+            written_value.text(":")
 
 
 -- An `if` and its branches. Each `else:` block prints as written: the
