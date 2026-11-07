@@ -66,7 +66,7 @@ import:
         ValueExpression,
         type_span,
     ./flat:
-        MIN_BROKEN_CHAIN_CALLS,
+        ChainLink,
         NoFlatForm(HoldsBlock, HoldsComment, HoldsPipeString, HoldsMethodChain),
         Placement(WholeValue, PartValue),
         application_end,
@@ -76,7 +76,13 @@ import:
         base_text,
         binder_text,
         closing_count,
-        covered_end,
+        chain_split,
+        content_start,
+        has_broken_links,
+        has_whole_pair,
+        holds_broken_chain,
+        outer_pair_contents,
+        partial_pairs,
         comparison_text,
         is_pipe_string,
         joined,
@@ -84,8 +90,6 @@ import:
         wraps_whole,
         lambda_header_text,
         lambda_parameter_text,
-        method_call_count,
-        parts_text,
         name_text,
         negation_prefix,
         pattern_text,
@@ -567,13 +571,7 @@ private pure func emit_broken(
 ) -> Printer:
     pairs = value.kept_parentheses(placement)
     whole = pairs.filter(pure func(pair: Span) -> Bool: pair.wraps_whole(value))
-    inner: ValueExpression = { value |
-        parentheses = pairs.filter(
-            pure func(pair: Span) -> Bool: pair
-                .wraps_whole(value)
-                .not(),
-        ),
-    }
+    inner: ValueExpression = { value | parentheses = value.partial_pairs(pairs) }
     match whole.last():
         Some(innermost):
             -- Written parentheses around the whole value, kept where it stands:
@@ -714,12 +712,7 @@ private pure func emit_parenthesized_chain(
 -- value is such brackets already.
 private pure func breaks_outside_brackets(value: ValueExpression, placement: Placement) -> Bool:
     pairs = value.kept_parentheses(placement)
-    if (
-        pairs
-            .filter(pure func(pair: Span) -> Bool: pair.wraps_whole(value))
-            .is_empty()
-            .not()
-    ):
+    if value.has_whole_pair(pairs):
         False
     else if value.is_operator_chain():
         value
@@ -736,7 +729,7 @@ private pure func breaks_outside_brackets(value: ValueExpression, placement: Pla
                 or(low.breaks_outside_brackets(PartValue), high.breaks_outside_brackets(PartValue))
             _: False
     else:
-        value.method_call_count(pairs) >= MIN_BROKEN_CHAIN_CALLS
+        value.has_broken_links(pairs)
 
 
 -- A value inside parentheses with the value on a line of its own, one level
@@ -751,7 +744,7 @@ private pure func emit_enclosed_value(
     opened = printer
         .text("(")
         .open_block(0, indent + 1, BODY_BLANK_LINES)
-        .flush(inner.span.start)
+        .flush(inner.content_start())
         .newline_without_blank(indent + 1)
     inside = opened.emit_value(inner, PartValue, InBrackets, indent + 1, 0)
     closed = match closer:
@@ -841,6 +834,48 @@ private pure func emit_pieces(
     indent: Int,
     reserve: Int,
 ) -> Printer:
+    match value.outer_pair_contents(pairs):
+        Some((outer, contents)):
+            if contents.holds_broken_chain(contents.parentheses):
+                printer.emit_enclosed_head(value, outer, contents, indent, reserve)
+            else:
+                printer.emit_flat_pieces(value, pairs, context, indent, reserve)
+        None: printer.emit_flat_pieces(value, pairs, context, indent, reserve)
+
+
+-- A parenthesized head that holds a chain which breaks, on lines of its own
+-- inside its parentheses, then the operations after the pair.
+private pure func emit_enclosed_head(
+    printer: Printer,
+    value: ValueExpression,
+    outer: Span,
+    contents: ValueExpression,
+    indent: Int,
+    reserve: Int,
+) -> Printer:
+    var written_parts = printer.emit_enclosed_value(contents, indent, Some(outer.end - 1))
+    after = value.applications.filter(
+        pure func(application: PostfixOperation) -> Bool: application.application_end() > outer.end,
+    )
+    var position = 0
+    for application in after:
+        last_reserve = if position + 1 == after.length():
+            reserve
+        else:
+            0
+        written_parts = written_parts.emit_application(application, indent, last_reserve)
+        position = position + 1
+    written_parts
+
+
+private pure func emit_flat_pieces(
+    printer: Printer,
+    value: ValueExpression,
+    pairs: List[Span],
+    context: LineContext,
+    indent: Int,
+    reserve: Int,
+) -> Printer:
     var open = pairs.length()
     var written_parts = printer
         .text("(".repeated(open))
@@ -866,10 +901,6 @@ private pure func emit_pieces(
     written_parts.text(")".repeated(open))
 
 
--- One link of a method chain: a call, and the field reads and indexes after it.
-private record ChainLink { call: ReceiverApplication, rest: List[PostfixOperation] }
-
-
 -- A method chain (FORMATTER_PLAN.md, "Layout engine"): hugging the last
 -- call's final literal or block lambda when the line before it fits;
 -- otherwise one link per line, one level deeper, when it has two or more
@@ -886,26 +917,10 @@ private pure func emit_postfix_chain(
     reserve: Int,
 ) -> Printer:
     source = printer.source
-    covered = value.covered_end(pairs)
-    var head: List[PostfixOperation] = []
-    var links: List[ChainLink] = []
-    for application in value.applications:
-        in_head = and(links.is_empty(), application.application_end() <= covered)
-        match application:
-            ReceiverInvocation(call):
-                if in_head:
-                    head = head.append(application)
-                else:
-                    links = links.append({ call = call, rest = [] })
-            FieldAccess(_) | TupleIndex(_, _):
-                match links.last():
-                    Some(link):
-                        links = links
-                            .take(links.length() - 1)
-                            .append({ link | rest = link.rest.append(application) })
-                    None: head = head.append(application)
-    head_value: ValueExpression = { value | applications = head, parentheses = pairs }
-    head_text = source.parts_text(head_value, pairs)
+    split = value.chain_split(pairs)
+    links = split.links
+    head_value: ValueExpression = { value | applications = split.head, parentheses = pairs }
+    head_text = source.value_text(head_value, PartValue)
     match links.last():
         None: printer.emit_pieces(value, pairs, context, indent, reserve)
         Some(last):
@@ -935,7 +950,7 @@ private pure func emit_postfix_chain(
                 (Ok(before), Some(hugged)):
                     -- A chain of two or more calls has a line per call, so it never hugs.
                     if or(
-                        links.length() >= MIN_BROKEN_CHAIN_CALLS,
+                        value.has_broken_links(pairs),
                         source.has_comment(value.span.start, last.call.span.start),
                     ):
                         None
@@ -958,7 +973,7 @@ private pure func emit_postfix_chain(
                         value,
                         pairs,
                         head_value,
-                        covered,
+                        split.head_end,
                         links,
                         context,
                         indent,
@@ -973,7 +988,7 @@ private pure func emit_unhugged_chain(
     value: ValueExpression,
     pairs: List[Span],
     head_value: ValueExpression,
-    covered: Int,
+    head_end: Int,
     links: List[ChainLink],
     context: LineContext,
     indent: Int,
@@ -987,12 +1002,12 @@ private pure func emit_unhugged_chain(
     may_break: Bool = match context:
         HeaderLine: False
         StatementLine | InBrackets: True
-    if and(may_break, or(links.length() >= 2, comment_between)):
+    if and(may_break, or(value.has_broken_links(pairs), comment_between)):
         -- The links are an open level, like a broken list's items, so a
         -- comment between two of them sits at their indentation.
         var written_links = printer
             .emit_pieces(
-                { head_value | span = { value.span | end = covered } },
+                { head_value | span = { value.span | end = head_end } },
                 pairs,
                 context,
                 indent,
@@ -1337,13 +1352,21 @@ private pure func emit_header_value(
         -- The header's line cannot hold a broken chain, so parentheses
         -- carry it; written ones that wrapped the whole value were dropped.
         enclosed: ValueExpression = { value | parentheses = value.kept_parentheses(placement) }
+        -- Comments before a written pair's closing parenthesis stay inside it.
+        closer: Option[Int] = value.parentheses
+            .filter(pure func(pair: Span) -> Bool: pair.wraps_whole(value))
+            .last()
+            .map(pure func(pair: Span) -> Int: pair.end - 1)
+        -- An operator chain without written parentheses is the one value
+        -- that adds its own pair, one operand per line, so it needs no
+        -- second one from here.
         if and(enclosed.is_operator_chain(), enclosed.parentheses.is_empty()):
             printer
-                .emit_parenthesized_chain(enclosed, indent, None)
+                .emit_parenthesized_chain(enclosed, indent, closer)
                 .text(":")
         else:
             printer
-                .emit_enclosed_value(enclosed, indent, None)
+                .emit_enclosed_value(enclosed, indent, closer)
                 .text(":")
     else:
         written_value = printer.emit_value(value, placement, HeaderLine, indent, 1)

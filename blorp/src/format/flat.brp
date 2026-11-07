@@ -66,6 +66,7 @@ import:
         ParsedTypeParameter,
         PatternHead(BareHead, QualifiedHead),
         PostfixOperation(ReceiverInvocation, FieldAccess, TupleIndex),
+        ReceiverApplication,
         Purity(Pure, Impure),
         Span,
         SpreadTarget(SpreadName, SpreadWildcard),
@@ -575,34 +576,112 @@ pure func closing_count(pairs: List[Span], open: Int, next_end: Int) -> Int:
     open - still_open
 
 
--- The end of what a value's written parentheses cover: the furthest pair, or
--- the base when it has none.
-pure func covered_end(value: ValueExpression, pairs: List[Span]) -> Int:
-    var furthest = value.base_span.end
-    for pair in pairs:
-        furthest = furthest.max(pair.end)
-    furthest
+-- Whether any of `pairs` wraps the whole of `value`.
+pure func has_whole_pair(value: ValueExpression, pairs: List[Span]) -> Bool:
+    pairs.any(pure func(pair: Span) -> Bool: pair.wraps_whole(value))
 
 
--- How many method calls a value's chain has after its head. The head is the
--- base, the field reads before the first call, and whatever written
--- parentheses wrap short of the whole value, as `(x.f()).g()` has one call.
-pure func method_call_count(value: ValueExpression, pairs: List[Span]) -> Int:
-    covered = value.covered_end(
-        pairs.filter(
-            pure func(pair: Span) -> Bool: pair
-                .wraps_whole(value)
-                .not(),
-        ),
+-- The pairs that wrap `value` short of its whole, outermost first.
+pure func partial_pairs(value: ValueExpression, pairs: List[Span]) -> List[Span]:
+    pairs.filter(
+        pure func(pair: Span) -> Bool: pair
+            .wraps_whole(value)
+            .not(),
     )
-    var count = 0
+
+
+-- Where the first token of `value` is, inside any written parentheses that
+-- wrap part of it.
+pure func content_start(value: ValueExpression) -> Int:
+    var start = value.base_span.start
+    for pair in value.parentheses:
+        start = start.min(pair.start)
+    start
+
+
+-- One link of a method chain: a call, and the field reads and indexes after it.
+record ChainLink { call: ReceiverApplication, rest: List[PostfixOperation] }
+
+
+-- A value's postfix operations split into its head and its links. The head
+-- is what precedes the first call outside the written parentheses: the base,
+-- the field reads before that call, and everything a pair wraps short of the
+-- whole value, as `(x.f()).g()` has the head `(x.f())` and one link. A link
+-- is a call with the field reads after it.
+record ChainSplit { head: List[PostfixOperation], head_end: Int, links: List[ChainLink] }
+
+
+-- The one place that counts a chain's calls: both the flat form and the
+-- layout read the links from here.
+pure func chain_split(value: ValueExpression, pairs: List[Span]) -> ChainSplit:
+    var head_end = value.base_span.end
+    for pair in value.partial_pairs(pairs):
+        head_end = head_end.max(pair.end)
+    var head: List[PostfixOperation] = []
+    var links: List[ChainLink] = []
     for application in value.applications:
         match application:
             ReceiverInvocation(call):
-                if call.span.end > covered:
-                    count = count + 1
-            FieldAccess(_) | TupleIndex(_, _): void
-    count
+                if and(links.is_empty(), application.application_end() <= head_end):
+                    head = head.append(application)
+                else:
+                    links = links.append({ call = call, rest = [] })
+            FieldAccess(_) | TupleIndex(_, _):
+                match links.last():
+                    Some(link):
+                        links = links
+                            .take(links.length() - 1)
+                            .append({ link | rest = link.rest.append(application) })
+                    None: head = head.append(application)
+    { head = head, head_end = head_end, links = links }
+
+
+-- Whether the links of `value` are a chain that always breaks.
+pure func has_broken_links(value: ValueExpression, pairs: List[Span]) -> Bool:
+    (
+        value
+            .chain_split(pairs).links
+            .length()
+        >= MIN_BROKEN_CHAIN_CALLS
+    )
+
+
+-- What the outermost of `pairs` wraps: the base and the operations up to the
+-- pair's end, with the pairs inside it. None when there are no pairs.
+pure func outer_pair_contents(
+    value: ValueExpression,
+    pairs: List[Span],
+) -> Option[(Span, ValueExpression)]:
+    match pairs.get(0):
+        Some(outer):
+            Some(
+                (
+                    outer,
+                    { value |
+                        applications = value.applications.filter(
+                            pure func(application: PostfixOperation) -> Bool: (
+                                application.application_end()
+                                <= outer.end
+                            ),
+                        ),
+                        parentheses = pairs.drop(1),
+                        span = { value.span | end = outer.end },
+                    },
+                ),
+            )
+        None: None
+
+
+-- Whether `value` holds a chain that always breaks anywhere in it that is
+-- not inside another value: in its links, or within the written parentheses
+-- around its head, however deep (Keith, 2026-11-07: "Yes, break them all").
+pure func holds_broken_chain(value: ValueExpression, pairs: List[Span]) -> Bool:
+    if value.has_broken_links(pairs):
+        True
+    else:
+        match value.outer_pair_contents(value.partial_pairs(pairs)):
+            Some((_, contents)): contents.holds_broken_chain(contents.parentheses)
+            None: False
 
 
 -- `value` on one line where it stands, or why it has none. Comments are the
@@ -613,14 +692,14 @@ pure func value_text(
     placement: Placement,
 ) -> Result[String, NoFlatForm]:
     pairs = value.kept_parentheses(placement)
-    if value.method_call_count(pairs) >= MIN_BROKEN_CHAIN_CALLS:
+    if value.holds_broken_chain(pairs):
         Err(HoldsMethodChain)
     else:
-        source.parts_text(value, pairs)
+        source.flat_text(value, pairs)
 
 
--- `value` on one line, with no regard for a chain of calls that must break.
-pure func parts_text(
+-- `value` on one line, once `value_text` has found no chain that must break.
+private pure func flat_text(
     source: SourceView,
     value: ValueExpression,
     pairs: List[Span],
