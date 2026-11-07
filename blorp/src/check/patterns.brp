@@ -12,19 +12,20 @@ import:
 		MatchError(BarePatternName, UnknownConstructorPattern, PatternFieldCountMismatch, UnreachableArm, OrPatternBindingsDiffer, OrPatternBindingTypeMismatch, PatternTypeMismatch, NonExhaustiveMatch, NonExhaustiveStructuralMatch, TuplePatternRequiresTuple, TuplePatternArityMismatch),
 		CheckerInvariant(InvalidCheckedUnion, JoinWithoutArms, UnsupportedPatternReachedResolution),
 		UnsupportedForm(CharPattern),
-		PatternWitness(AnyWitness, VariantWitness, EmptyListWitness, ConsListWitness, OtherStringWitness, TupleWitness)
+		PatternWitness(AnyWitness, VariantWitness, EmptyListWitness, ConsListWitness, OtherValueWitness, TupleWitness)
 	./model:
 		BindingDefinition, BindingId, BindingOrigin(MatchCapture),
 		TypeRef(ListType, StringType, TupleType), TypeUse, UnionOccurrence,
 		CheckedPatternPlace, CheckedPatternRoute(MatchRoot, UnionField, ListElement, RecordField),
 		CheckedPatternArgument(BorrowPlace, CopyListSuffix),
-		CheckedDecisionNode(TestVariant, TestListLength, TestStringBytes, EnterArm),
+		CheckedDecisionNode(TestVariant, TestListLength, TestLiteral, EnterArm),
 		ListLengthTest(ExactLength, MinimumLength), CheckedSelection,
 		MatchArmId, DecisionNodeId, match_arm_id, decision_node_id, binding_id
 	./scope: ScopedValue, bind_local
 	../utils/ids: VariantId, UnionId
 	../utils/syntax:
-		ParsedPattern(PatternName, PatternWildcard, PatternConstructor, PatternOr, PatternList, PatternString, PatternChar, PatternTuple),
+		ParsedPattern(PatternName, PatternWildcard, PatternConstructor, PatternOr, PatternList, PatternLiteral, PatternChar, PatternTuple),
+		LiteralPattern,
 		PatternHead(BareHead, QualifiedHead), SpreadTarget(SpreadName, SpreadWildcard),
 		Span, WrittenName, compiler_span
 	int: Int methods
@@ -39,7 +40,7 @@ union Pattern:
 	TuplePattern(List[Pattern])
 	EmptyListPattern
 	ConsListPattern(PatternChildren)
-	BytesPattern(String)
+	ExactPattern(LiteralPattern)
 
 
 -- Two children cross a managed record edge; direct recursive union payloads
@@ -405,9 +406,9 @@ private pure func resolve_pattern(pattern: ParsedPattern, place: CheckedPatternP
 		PatternConstructor(head, fields, span): head.resolve_constructor(fields, span, place, scope, ordinal, next, context)
 		PatternOr(alternatives, _): alternatives.resolve_alternatives(place, position, scope, ordinal, next, context)
 		PatternList(fields, rest, span): fields.resolve_list(rest, span, place, scope, ordinal, next, context)
-		PatternString(bytes, span):
+		PatternLiteral(literal, span):
 			if place.value_type == StringType:
-				Ok(plain(BytesPattern(bytes), scope, next))
+				Ok(plain(ExactPattern(literal), scope, next))
 			else:
 				Err(match_error(span, PatternTypeMismatch(place.value_type)))
 		PatternChar(span): Err(unsupported_form(span, CharPattern))
@@ -450,12 +451,14 @@ private union Head:
 	TupleHead(List[TypeRef])
 	NilHead
 	ConsHead(TypeRef)
-	StringHead(String)
+	LiteralHead(LiteralPattern)
 
 
+-- An open domain has more values than any list of literals names, so only a
+-- catch-all covers it; a scalar domain is matched by binders and `_` alone.
 private union ColumnDomain:
 	ClosedDomain(List[Head])
-	StringDomain
+	OpenDomain
 	ScalarDomain
 
 
@@ -490,7 +493,7 @@ private pure func column(place: CheckedPatternPlace, cursor: PatternCursor, cont
 			domain: ColumnDomain = match place.value_type:
 				TupleType(elements): ClosedDomain([TupleHead(elements)])
 				ListType(element): ClosedDomain([NilHead, ConsHead(element)])
-				StringType: StringDomain
+				StringType: OpenDomain
 				_: ScalarDomain
 			Ok({ cursor = cursor, domain = domain })
 
@@ -529,9 +532,9 @@ private pure func same_head(left: Head, right: Head) -> Bool:
 			match right:
 				ConsHead(_): True
 				_: False
-		StringHead(bytes):
+		LiteralHead(literal):
 			match right:
-				StringHead(other): bytes == other
+				LiteralHead(other): literal == other
 				_: False
 
 
@@ -540,14 +543,14 @@ private pure func arity(head: Head) -> Int:
 		UnionHead(_, fields): fields.length()
 		TupleHead(fields): fields.length()
 		ConsHead(_): 2
-		NilHead | StringHead(_): 0
+		NilHead | LiteralHead(_): 0
 
 
 private pure func pattern_head(pattern: Pattern, domain: ColumnDomain) -> Option[Head]:
 	match pattern:
 		Anything: None
 		EmptyListPattern: Some(NilHead)
-		BytesPattern(bytes): Some(StringHead(bytes))
+		ExactPattern(literal): Some(LiteralHead(literal))
 		TuplePattern(_):
 			match domain:
 				ClosedDomain([head]): Some(head)
@@ -581,7 +584,7 @@ private pure func children(pattern: Pattern, head: Head) -> List[Pattern]:
 		VariantPattern(_, fields): fields
 		TuplePattern(fields): fields
 		ConsListPattern(parts): [parts.head, parts.tail]
-		EmptyListPattern | BytesPattern(_): []
+		EmptyListPattern | ExactPattern(_): []
 
 
 private pure func matches_head(pattern: Pattern, head: Head) -> Bool:
@@ -597,9 +600,9 @@ private pure func matches_head(pattern: Pattern, head: Head) -> Bool:
 			match head:
 				NilHead: True
 				_: False
-		BytesPattern(bytes):
+		ExactPattern(literal):
 			match head:
-				StringHead(other): bytes == other
+				LiteralHead(other): literal == other
 				_: False
 
 
@@ -654,7 +657,7 @@ private pure func child_columns(parent: Column, head: Head, context: ResolutionC
 		UnionHead(id, fields): fields.field_columns(pure func(ordinal: Int) -> CheckedPatternRoute: UnionField(place, id, ordinal), context, span)
 		TupleHead(fields): fields.field_columns(pure func(ordinal: Int) -> CheckedPatternRoute: RecordField(place, ordinal), context, span)
 		ConsHead(element): place.list_child_columns(parent.cursor.list_skip(), element, context, span)
-		NilHead | StringHead(_): Ok([])
+		NilHead | LiteralHead(_): Ok([])
 
 
 -- One column per field; `route` names where the field at an ordinal sits.
@@ -694,12 +697,12 @@ private pure func wrap_witness(head: Head, witnesses: List[PatternWitness]) -> L
 			match fields:
 				[first, tail]: ConsListWitness({ head = first, tail = tail })
 				_: AnyWitness
-		StringHead(_): OtherStringWitness
+		LiteralHead(_): OtherValueWitness
 	[witness].concat(rest)
 
 
 -- Maranget's usefulness recurrence and selector construction below share the
--- same typed columns and row-specialization operations. Open String columns
+-- same typed columns and row-specialization operations. Open literal columns
 -- use their wildcard default; finite union and Nil/Cons domains enumerate.
 private pure func pattern_witness(pattern: Pattern) -> PatternWitness:
 	match pattern:
@@ -712,7 +715,7 @@ private pure func pattern_witness(pattern: Pattern) -> PatternWitness:
 				head = parts.head.pattern_witness(),
 				tail = parts.tail.pattern_witness()
 			})
-		BytesPattern(_): OtherStringWitness
+		ExactPattern(_): OtherValueWitness
 
 
 private pure func row_is_irrefutable(row: PatternRow) -> Bool:
@@ -777,7 +780,7 @@ private pure func useful_head(rows: List[PatternRow], candidate: List[Pattern], 
 private pure func useful_wildcard(rows: List[PatternRow], candidate: List[Pattern], current: Column, following: List[Column], context: ResolutionContext, span: Span) -> Result[Option[List[PatternWitness]], CheckError]:
 	match current.domain:
 		ClosedDomain(heads): rows.useful_closed(candidate, current, following, heads, context, span)
-		StringDomain: rows.useful_default(candidate, following, OtherStringWitness, context, span)
+		OpenDomain: rows.useful_default(candidate, following, OtherValueWitness, context, span)
 		ScalarDomain: rows.useful_default(candidate, following, AnyWitness, context, span)
 
 
@@ -950,7 +953,7 @@ private pure func exclude_head(current: Column, head: Head) -> Column:
 		ClosedDomain(heads):
 			remaining = heads.filter(pure func(known): known.different_head(head))
 			{ current | domain = ClosedDomain(remaining) }
-		StringDomain | ScalarDomain: current
+		OpenDomain | ScalarDomain: current
 
 
 private pure func compile_rows(rows: List[PatternRow], columns: List[Column], nodes: List[CheckedDecisionNode], context: ResolutionContext, span: Span) -> Result[CheckedSelection, CheckError]:
@@ -986,14 +989,14 @@ private pure func compile_split(rows: List[PatternRow], current: Column, followi
 		UnionHead(variant, _): Ok(TestVariant(place, variant, yes.entry, no.entry))
 		NilHead: Ok(TestListLength(place, ExactLength(current.cursor.list_skip()), yes.entry, no.entry))
 		ConsHead(_): Ok(TestListLength(place, MinimumLength(current.cursor.list_skip() + 1), yes.entry, no.entry))
-		StringHead(bytes): Ok(TestStringBytes(place, bytes, yes.entry, no.entry))
+		LiteralHead(literal): Ok(TestLiteral(place, literal, yes.entry, no.entry))
 	Ok({ nodes = yes.nodes.append(test), entry = decision_node_id(yes.nodes.length()) })
 
 
 private pure func missing_error(rows: List[PatternRow], root: Column, witness: PatternWitness, context: ResolutionContext, span: Span) -> Result[CheckError, CheckError]:
 	match root.domain:
 		ClosedDomain(heads): rows.missing_finite_error(root, heads, witness, context, span)
-		StringDomain | ScalarDomain: Ok(match_error(span, NonExhaustiveStructuralMatch(witness)))
+		OpenDomain | ScalarDomain: Ok(match_error(span, NonExhaustiveStructuralMatch(witness)))
 
 
 private pure func missing_finite_error(rows: List[PatternRow], root: Column, heads: List[Head], witness: PatternWitness, context: ResolutionContext, span: Span) -> Result[CheckError, CheckError]:
