@@ -4,6 +4,7 @@ import:
 	int: INT_MIN, INT_MAX, Int methods
 	../utils/names: ContextualWords, NameId, NameTable
 	option: Option methods
+	result: Result methods
 	../utils/source: ModuleId
 	string: from_codepoint, String methods
 	../utils/syntax:
@@ -47,7 +48,7 @@ import:
 		ParsedOpaque,
 		ParsedParameter,
 		ParsedPattern(PatternName, PatternWildcard, PatternConstructor, PatternOr, PatternList, PatternTuple, PatternLiteral, PatternChar),
-		LiteralPattern(ExactBytes),
+		LiteralPattern(ExactBytes, ExactInt),
 		PatternHead(BareHead, QualifiedHead),
 		ParsedRecord,
 		ParsedRecordField,
@@ -2364,9 +2365,9 @@ private pure func consume_tuple_pattern_field(count: Int, state: ParserState) ->
 		Ok({ item = field.pattern, next = field.next })
 
 
--- A String or Char literal token at `state` as a pattern, or None when
--- the token is not a literal. A String pattern's escapes decode as in a
--- String expression.
+-- A String, Int or Char literal token at `state` as a pattern, or None when
+-- the token is not a literal. A String pattern's escapes decode, and an Int
+-- pattern's digits are range-checked, as in an expression.
 private pure func literal_pattern(state: ParserState) -> Option[Result[PatternResult, Diagnostic]]:
 	match state.current_token():
 		Some(token):
@@ -2378,6 +2379,12 @@ private pure func literal_pattern(state: ParserState) -> Option[Result[PatternRe
 						Err(error):
 							Err(error)
 					Some(decoded)
+				IntegerLiteral(spelling):
+					Some(spelling.integer_value(False, token.span).map(pure func(value): { pattern = PatternLiteral(ExactInt(value), token.span), span = token.span, next = state.shifted(1) }))
+				SymbolToken(Minus):
+					state.negative_literal_pattern(token.span)
+				FloatLiteral(_):
+					Some(Err(float_pattern(token.span)))
 				CharLiteral:
 					Some(Ok({ pattern = PatternChar(token.span), span = token.span, next = state.shifted(1) }))
 				StringStart(_):
@@ -2386,6 +2393,25 @@ private pure func literal_pattern(state: ParserState) -> Option[Result[PatternRe
 					None
 		None:
 			None
+
+
+-- `-` directly before an Int literal folds into one negative literal, as in an
+-- expression, so `-9223372036854775808` is in range. Any other `-` is not a
+-- pattern.
+private pure func negative_literal_pattern(state: ParserState, minus: Span) -> Option[Result[PatternResult, Diagnostic]]:
+	match state.shifted(1).current_token():
+		Some(token):
+			span = { minus | end = token.span.end }
+			match token.kind:
+				IntegerLiteral(spelling):
+					Some(spelling.integer_value(True, span).map(pure func(value): { pattern = PatternLiteral(ExactInt(value), span), span = span, next = state.shifted(2) }))
+				FloatLiteral(_): Some(Err(float_pattern(span)))
+				_: None
+		None: None
+
+
+private pure func float_pattern(span: Span) -> Diagnostic:
+	diagnostic(span, "Float literals are not patterns", "bind the value and compare it in the arm; NaN never equals itself")
 
 
 -- One alternative of a pattern: no '|' is read here.

@@ -473,8 +473,8 @@ func main() -> Int:
     pick(Right(1, 2)) + describe(["a", "b", "c"])
 ```
 
-This exits 14. A scrutinee is a union, a List, a String or a tuple; Int
-scrutinees are not supported. Patterns nest:
+This exits 14. A scrutinee is a union, a List, a String, an Int or a tuple.
+Patterns nest:
 
 - `Number(value)` selects a constructor and binds its fields; `_` discards a
   field or, as a whole pattern, matches anything.
@@ -485,15 +485,22 @@ scrutinees are not supported. Patterns nest:
   same types.
 - `[a, b]` matches an exact length; `[first, ...rest]` matches a prefix and
   binds a new List of the rest, and `..._` discards it.
-- A String literal matches the complete byte sequence.
+- A String literal matches the complete byte sequence, and an Int literal
+  such as `0` or `-1` matches that value, at the top of a match or inside
+  `Exited(0)`, `(0, _)` or `[0, ...rest]`. A `-` before the digits is part of
+  the literal, as in an expression, so `-9223372036854775808` is a pattern. A
+  Float literal is not a pattern, because NaN never equals itself: bind the
+  value and compare it in the arm.
 - `Alias.Variant` names a constructor through a module alias.
 
-Arms must be exhaustive and each must be reachable; a String scrutinee needs a
-catch-all. The scrutinee runs once and only the first matching arm runs, and
-captures are immutable and local to their arm. An arm is `Pattern: value`,
-one statement on the same line (`None: failure = Some(error)`), or an indented
-block ending in a value; an arm that must produce a value and ends in a
-statement reports "match arm has no final value".
+Arms must be exhaustive and each must be reachable. Literals never cover every
+String or Int, so a String or Int that literals test needs a catch-all, and a
+repeated literal makes its arm unreachable. The scrutinee runs once and only
+the first matching arm runs, and captures are immutable and local to their
+arm. An arm is `Pattern: value`, one statement on the same line
+(`None: failure = Some(error)`), or an indented block ending in a value; an
+arm that must produce a value and ends in a statement reports "match arm has
+no final value".
 
 A function's last `match` is its result, and every arm is checked against the
 return type. A `match` elsewhere, bound to a name or written as a statement,

@@ -15,7 +15,8 @@ import:
 		ParsedFunction,
 		ParsedMatch,
 		ParsedMatchArm,
-		ParsedPattern(PatternName, PatternWildcard, PatternConstructor),
+		LiteralPattern(ExactInt),
+		ParsedPattern(PatternName, PatternWildcard, PatternConstructor, PatternLiteral, PatternOr, PatternList, PatternTuple),
 		PatternHead(BareHead),
 		ParsedRuntimeOperation(IntegerAddBuiltin, IntegerToStringBuiltin, StringLengthBuiltin, ListRepeatBuiltin, ListLengthBuiltin, ListGetBuiltin, SystemBuiltin),
 		SystemOperation(FsReadText, FsWriteText),
@@ -1677,13 +1678,15 @@ pure func test_match_requires_nonempty_indented_arms() -> Bool:
 
 
 pure func test_match_patterns_require_supported_field_shape() -> Bool:
-	rejects_identifier(MATCH_HEADER + "\t\t0: 1", 41, 42, "expected a match pattern")
+	rejects_identifier(MATCH_HEADER + "\t\t+: 1", 41, 42, "expected a match pattern")
 		.and(rejects_identifier(
-			MATCH_HEADER + "\t\tNumber(0): 1",
+			MATCH_HEADER + "\t\tNumber(+): 1",
 			48,
 			49,
 			"expected a match pattern",
 		))
+		-- A '-' that does not begin a numeric literal is not a pattern.
+		.and(rejects_identifier(MATCH_HEADER + "\t\t-x: 1", 41, 42, "expected a match pattern"))
 		-- Fields are patterns, so a constructor nests; checking rejects it.
 		.and(parse_source(MATCH_HEADER + "\t\tNumber(Inner(x)): 1").is_ok())
 		.and(rejects(
@@ -1709,6 +1712,73 @@ pure func test_match_patterns_require_supported_field_shape() -> Bool:
 		))
 		-- A dotted pattern is a qualified constructor; checking rejects it.
 		.and(parse_source(MATCH_HEADER + "\t\tValue.Empty: 1").is_ok())
+
+
+-- The first arm's pattern of a one-function program whose body is a match.
+private pure func first_pattern(source: String) -> Option[ParsedPattern]:
+	match parse_source(source):
+		Err(_): None
+		Ok(parsed):
+			match root_functions(parsed_contents(parsed)):
+				[function]:
+					match function.body:
+						ParsedMatchBody(body): body.arms.get(0).map(pure func(arm): arm.pattern)
+						_: None
+				_: None
+
+
+private pure func int_pattern_is(pattern: ParsedPattern, expected: Int, start: Int, end: Int) -> Bool:
+	match pattern:
+		PatternLiteral(ExactInt(value), span): (value == expected).and(span.start == start).and(span.end == end)
+		_: False
+
+
+private pure func root_int_pattern_is(source: String, expected: Int, start: Int, end: Int) -> Bool:
+	match first_pattern(MATCH_HEADER + source):
+		Some(pattern): pattern.int_pattern_is(expected, start, end)
+		None: False
+
+
+-- An Int literal is decoded as in an expression: the range check sees a
+-- folded '-', whatever the spacing, so both Int64 extremes are patterns.
+pure func test_int_literal_patterns_fold_their_sign() -> Bool:
+	root_int_pattern_is("\t\t0: 1", 0, 41, 42)
+		.and(root_int_pattern_is("\t\t-1: 1", -1, 41, 43))
+		.and(root_int_pattern_is("\t\t- 1: 1", -1, 41, 44))
+		.and(root_int_pattern_is("\t\t9223372036854775807: 1", 9223372036854775807, 41, 60))
+		.and(root_int_pattern_is("\t\t-9223372036854775808: 1", -9223372036854775808, 41, 61))
+
+
+-- Constructor fields, tuple and List elements and alternatives are patterns,
+-- so an Int literal stands in each.
+pure func test_int_literal_patterns_nest_and_alternate() -> Bool:
+	field = match first_pattern(MATCH_HEADER + "\t\tExited(-1): 1"):
+		Some(PatternConstructor(_, [status], _)): status.int_pattern_is(-1, 48, 50)
+		_: False
+	element = match first_pattern(MATCH_HEADER + "\t\t(_, 0): 1"):
+		Some(PatternTuple([PatternWildcard(_), second], _)): second.int_pattern_is(0, 45, 46)
+		_: False
+	head = match first_pattern(MATCH_HEADER + "\t\t[0, ...rest]: 1"):
+		Some(PatternList([first], Some(_), _)): first.int_pattern_is(0, 42, 43)
+		_: False
+	alternatives = match first_pattern(MATCH_HEADER + "\t\t0 | 1: 1"):
+		Some(PatternOr([zero, one], span)): zero.int_pattern_is(0, 41, 42).and(one.int_pattern_is(1, 45, 46)).and(span.start == 41).and(span.end == 46)
+		_: False
+	field.and(element).and(head).and(alternatives)
+
+
+pure func test_int_literal_patterns_reject_as_expressions_do() -> Bool:
+	range_help = "use a value from -9223372036854775808 to 9223372036854775807"
+	rejects(MATCH_HEADER + "\t\t9223372036854775808: 1", 41, 60, "integer literal is outside the Int64 range", range_help)
+		.and(rejects(MATCH_HEADER + "\t\t-9223372036854775809: 1", 41, 61, "integer literal is outside the Int64 range", range_help))
+		.and(rejects(MATCH_HEADER + "\t\t00: 1", 41, 43, "integer literals cannot have leading zeros", "write 0 or -0, or remove the leading zeros"))
+
+
+pure func test_float_literals_are_not_patterns() -> Bool:
+	help = "bind the value and compare it in the arm; NaN never equals itself"
+	rejects(MATCH_HEADER + "\t\t0.0: 1", 41, 44, "Float literals are not patterns", help)
+		.and(rejects(MATCH_HEADER + "\t\t-1.5: 1", 41, 45, "Float literals are not patterns", help))
+		.and(rejects(MATCH_HEADER + "\t\tValue(0.0): 1", 47, 50, "Float literals are not patterns", help))
 
 
 pure func test_match_arms_require_colon_and_result() -> Bool:
@@ -2637,6 +2707,13 @@ tests: TestSuite = {
 		(
 			"match patterns require supported field shape",
 			test_match_patterns_require_supported_field_shape,
+		),
+		("Int literal patterns fold their sign", test_int_literal_patterns_fold_their_sign),
+		("Int literal patterns nest and alternate", test_int_literal_patterns_nest_and_alternate),
+		("Int literal patterns reject as expressions do", test_int_literal_patterns_reject_as_expressions_do),
+		(
+			"Float literals are not patterns",
+			test_float_literals_are_not_patterns,
 		),
 		("match arms require colon and result", test_match_arms_require_colon_and_result),
 		(
