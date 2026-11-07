@@ -602,3 +602,145 @@ compiler reports it and where the five sibling cases point. The legacy file neve
 | `union_receiver` | 140,000 | 90,863 | 104,493 | 500,000,000 | 513,365,105 | 590,369,871 |
 | `union_second` | 140,000 | 90,493 | 104,067 | 500,000,000 | 513,372,122 | 590,377,941 |
 | `union_values` | 135,000 | 92,166 | 105,991 | 445,000,000 | 517,355,767 | 594,959,133 |
+
+
+## T3 batch 4: control flow, patterns, process input and entry points, 2026-11-06
+
+The 83 programs ported in batch 4 (`blorp/test/e2e/self_hosted_control.brp`, from 12
+legacy files) carry ceilings set by the same rule: measured cost plus 15%,
+rounded up to a whole count. "Old" is the ceiling in the deleted `test_*.brp`
+file, or `none` for the four `test_entry` programs, which the legacy file only
+compiled and ran. The legacy ceilings were "initial absolute feature gates",
+"prospective feature ceilings" and "measured normal fixture compilations ... modest
+headroom" from before the library grew; none of them names a regression it
+guards, so every program takes the plain +15%. The suite has 90 tests: these 83
+programs and 7 rejection checks, which compile nothing that is run and so have
+no ceiling. The 256-arm match's one-body-and-one-incoming-edge check is now a unit test
+on the lowered join (`test_lower/test_match_arms.brp`), not a count of C text.
+No test now checks the emitted C's brace depth: that is emit's property, the
+legacy check never ran, and emit exposes no structure to assert it on without
+counting characters of the C.
+
+- **Compiler:** the tree of `35e2e0a86` (the last commit touching `blorp/src` and
+  `blorp/standard_library`; this branch changes neither), `make -C blorp
+  test-compiler`: `-O0 -DBLORP_MEMORY_DIAGNOSTICS=1`. Host: Apple M4, macOS 26.7.1,
+  Apple clang 21.0.0, strictly serial; 1-minute load average 2.5 to 2.6 at the
+  start of the three sweeps, other sessions shared the machine.
+- **Samples:** three `make -C blorp test-e2e INSTRUCTION_CHECK=on` runs with the
+  driver temporarily restricted to this suite and printing each compile
+  measurement and each strict native report instead of failing on it
+  (`batch4_measure.patch`). Compile allocations and the allocations of all 163
+  native runs agree exactly across the samples; instructions differ by at most
+  0.5%, and the table takes the largest. No spawn flake occurred.
+- **Ranking:** the highest allocation and instruction counts are `match_many_arms`
+  (355,304 and 1,212,641,145, a 517-line source), then `pattern_moderate_nested`
+  (227,502) and `calculator_float_stress` (118,779). Every other program is
+  between 89,511 and 113,870 allocations, the library's base cost plus its own
+  source. No program is far from its siblings.
+- **Legacy ceilings:** 13 of the 79 programs with an old ceiling exceed their old
+  allocation ceiling and 48 their old instruction ceiling (the `Dict` base cost
+  described above). The reset also lowers the loose ones: for example
+  `source_loops_nesting` from 1,500,000 allocations and 5,000,000,000 instructions
+  to its measured cost plus 15%.
+- **Native counts:** the legacy `ZeroTargetAllocations` of
+  `previous_or_pattern` and the "positive and balanced" checks of the other eight
+  structural-pattern programs were not exact counts, and every `run_source_example`,
+  `run_output_example` and `argv_case` program checked no native allocations at all;
+  all 163 runs now check an exact strict count.
+- **Samples are kept out of the repository** in the ignored directory
+  `/Users/keithphilpott/CLionProjects/blorp/build/blorp2-e2e-ceilings-2026-11-05/`:
+
+| File | sha256 |
+| --- | --- |
+| `batch4_measure1.log` | `c155310c4c3497825bde0d261ee78363e0494c7faefc43d0795ba2116ea9f271` |
+| `batch4_measure2.log` | `da95d6e1ae14a51975ef7cc7669f6063cbc232b361feb1461d21ee5c560f421d` |
+| `batch4_measure3.log` | `78e86257394ba6e31141654d1072fdff85ccd469af61ba841a6e2cd41ffd59b9` |
+| `batch4_measure.patch` (the temporary driver change) | `41aa74f0ea3f5b3c895842ab4fd3872eee8d5253adaf8c486dbdfd65c0ae24e9` |
+| `batch4_samples.json` (every sample per program) | `eab87e5872a2f049cac151984db2617acbc15f8b2dab4161c6272eb86ef73d56` |
+| `batch4_ceilings.json` (the ceiling literals, then each run's strict allocations) | `b6017f16cf81de798d5df645f7134e8e53b663389d6d4a4f8a9e33386a35ee96` |
+
+| Program | Old allocs | Measured allocs | New allocs | Old instr | Measured instr | New instr |
+| --- | --- | --- | --- | --- | --- | --- |
+| `argument_input` | 195,000 | 96,530 | 111,010 | 620,000,000 | 473,642,928 | 544,689,368 |
+| `argument_input_access_stress` | 270,000 | 113,870 | 130,951 | 850,000,000 | 525,204,485 | 603,985,158 |
+| `argument_input_escaped_string` | 210,000 | 95,676 | 110,028 | 650,000,000 | 475,719,128 | 547,076,998 |
+| `calculator_addition` | 240,000 | 99,649 | 114,597 | 710,000,000 | 481,562,553 | 553,796,936 |
+| `calculator_float` | 270,000 | 113,218 | 130,201 | 800,000,000 | 515,771,339 | 593,137,040 |
+| `calculator_float_literals` | 190,000 | 95,844 | 110,221 | 590,000,000 | 529,433,557 | 608,848,591 |
+| `calculator_float_stress` | 230,000 | 118,779 | 136,596 | 720,000,000 | 597,475,280 | 687,096,572 |
+| `calculator_integer` | 255,000 | 113,217 | 130,200 | 800,000,000 | 514,564,710 | 591,749,417 |
+| `effects_alias` | 145,000 | 90,895 | 104,530 | 500,000,000 | 514,378,599 | 591,535,389 |
+| `effects_bytes` | 145,000 | 90,565 | 104,150 | 500,000,000 | 513,325,488 | 590,324,312 |
+| `effects_hello` | 145,000 | 90,404 | 103,965 | 500,000,000 | 513,979,167 | 591,076,043 |
+| `effects_nested` | 145,000 | 91,151 | 104,824 | 500,000,000 | 514,824,609 | 592,048,301 |
+| `effects_order` | 145,000 | 90,960 | 104,604 | 500,000,000 | 516,192,676 | 593,621,578 |
+| `effects_selected_arm` | 145,000 | 91,951 | 105,744 | 500,000,000 | 516,675,101 | 594,176,367 |
+| `effects_sequence` | 230,000 | 100,105 | 115,121 | 800,000,000 | 543,428,480 | 624,942,752 |
+| `effects_unit` | 145,000 | 92,270 | 106,111 | 500,000,000 | 523,628,986 | 602,173,334 |
+| `main_implicit_void_arguments` | 195,000 | 92,659 | 106,558 | 620,000,000 | 464,229,589 | 533,864,028 |
+| `main_implicit_void_nullary` | 195,000 | 90,907 | 104,544 | 620,000,000 | 513,875,444 | 590,956,761 |
+| `main_int_arguments` | 195,000 | 90,144 | 103,666 | 620,000,000 | 456,334,856 | 524,785,085 |
+| `main_int_nullary` | 195,000 | 89,511 | 102,938 | 620,000,000 | 510,293,794 | 586,837,864 |
+| `main_pure_implicit_void_arguments` | 195,000 | 89,800 | 103,270 | 620,000,000 | 509,862,336 | 586,341,687 |
+| `main_pure_int_arguments` | 195,000 | 90,145 | 103,667 | 620,000,000 | 456,757,371 | 525,270,977 |
+| `main_pure_int_nullary` | 195,000 | 89,512 | 102,939 | 620,000,000 | 510,485,725 | 587,058,584 |
+| `main_pure_void_nullary` | 195,000 | 90,884 | 104,517 | 620,000,000 | 435,899,616 | 501,284,559 |
+| `main_void_arguments` | 195,000 | 91,683 | 105,436 | 620,000,000 | 462,041,177 | 531,347,354 |
+| `main_void_nullary` | 195,000 | 90,669 | 104,270 | 620,000,000 | 513,937,029 | 591,027,584 |
+| `match_binding_current` | 140,000 | 91,667 | 105,418 | 500,000,000 | 515,963,538 | 593,358,069 |
+| `match_binding_empty` | 140,000 | 91,541 | 105,273 | 500,000,000 | 516,145,333 | 593,567,133 |
+| `match_binding_original` | 140,000 | 91,428 | 105,143 | 500,000,000 | 515,150,194 | 592,422,724 |
+| `match_binding_outer` | 140,000 | 91,247 | 104,935 | 500,000,000 | 515,682,953 | 593,035,396 |
+| `match_constructor_argument` | 140,000 | 90,980 | 104,627 | 500,000,000 | 514,895,292 | 592,129,586 |
+| `match_constructor_spine` | 230,000 | 95,305 | 109,601 | 900,000,000 | 527,602,254 | 606,742,593 |
+| `match_empty` | 140,000 | 90,690 | 104,294 | 500,000,000 | 513,104,716 | 590,070,424 |
+| `match_many_arms` | 230,000 | 355,304 | 408,600 | 900,000,000 | 1,212,641,145 | 1,394,537,317 |
+| `match_qualified_flat` | 140,000 | 97,107 | 111,674 | 500,000,000 | 532,582,632 | 612,470,027 |
+| `match_scalar_capture` | 140,000 | 91,053 | 104,711 | 500,000,000 | 513,558,075 | 590,591,787 |
+| `match_selected_arm` | 140,000 | 91,333 | 105,033 | 500,000,000 | 514,889,523 | 592,122,952 |
+| `match_shadow` | 140,000 | 91,095 | 104,760 | 500,000,000 | 513,670,320 | 590,720,868 |
+| `match_sibling_empty` | 140,000 | 91,038 | 104,694 | 500,000,000 | 514,898,200 | 592,132,930 |
+| `match_sibling_payload` | 140,000 | 90,856 | 104,485 | 500,000,000 | 513,262,938 | 590,252,379 |
+| `match_value` | 135,000 | 90,859 | 104,488 | 500,000,000 | 513,461,727 | 590,480,987 |
+| `match_values` | 140,000 | 91,460 | 105,179 | 500,000,000 | 515,018,941 | 592,271,783 |
+| `match_whole_empty` | 140,000 | 91,288 | 104,982 | 500,000,000 | 514,274,708 | 591,415,915 |
+| `match_wildcard` | 140,000 | 90,505 | 104,081 | 500,000,000 | 512,495,064 | 589,369,324 |
+| `option_byte_at` | 205,000 | 90,713 | 104,320 | 600,000,000 | 513,534,199 | 590,564,329 |
+| `option_byte_at_zero` | 205,000 | 90,715 | 104,323 | 600,000,000 | 512,207,804 | 589,038,975 |
+| `option_from_codepoint_nul` | 250,000 | 91,546 | 105,278 | 800,000,000 | 515,334,460 | 592,634,629 |
+| `option_from_codepoint_ownership` | 250,000 | 91,420 | 105,133 | 800,000,000 | 515,458,095 | 592,776,810 |
+| `option_imported` | 205,000 | 90,989 | 104,638 | 600,000,000 | 513,006,052 | 589,956,960 |
+| `option_parse_int` | 145,000 | 91,099 | 104,764 | 500,000,000 | 513,483,100 | 590,505,565 |
+| `option_repeated` | 170,000 | 106,488 | 122,462 | 550,000,000 | 555,191,874 | 638,470,656 |
+| `pattern_alternative_inputs` | 140,000 | 93,844 | 107,921 | 500,000,000 | 521,789,767 | 600,058,233 |
+| `pattern_list_rest` | 140,000 | 96,821 | 111,345 | 500,000,000 | 528,095,902 | 607,310,288 |
+| `pattern_moderate_nested` | 140,000 | 227,502 | 261,628 | 500,000,000 | 987,915,286 | 1,136,102,579 |
+| `pattern_nested_fallthrough` | 140,000 | 93,988 | 108,087 | 500,000,000 | 521,211,636 | 599,393,382 |
+| `pattern_ordered_inputs` | 140,000 | 98,156 | 112,880 | 500,000,000 | 532,670,180 | 612,570,707 |
+| `pattern_previous_list` | 140,000 | 90,915 | 104,553 | 500,000,000 | 457,937,475 | 526,628,097 |
+| `pattern_previous_or` | 140,000 | 90,645 | 104,242 | 500,000,000 | 512,346,319 | 589,198,267 |
+| `pattern_previous_string` | 140,000 | 90,289 | 103,833 | 500,000,000 | 511,308,323 | 588,004,572 |
+| `pattern_string_bytes` | 140,000 | 93,622 | 107,666 | 500,000,000 | 521,000,785 | 599,150,903 |
+| `result_chain_1` | 60,000 | 93,622 | 107,666 | 200,000,000 | 519,832,523 | 597,807,402 |
+| `result_chain_16` | 60,000 | 105,262 | 121,052 | 200,000,000 | 548,408,356 | 630,669,610 |
+| `result_chain_2` | 60,000 | 94,394 | 108,554 | 200,000,000 | 522,695,129 | 601,099,399 |
+| `result_chain_5` | 60,000 | 96,726 | 111,235 | 200,000,000 | 527,127,066 | 606,196,126 |
+| `result_chain_9` | 60,000 | 99,830 | 114,805 | 200,000,000 | 534,102,806 | 614,218,227 |
+| `result_propagation_managed` | 51,000 | 97,321 | 111,920 | 200,000,000 | 529,859,905 | 609,338,891 |
+| `result_rhs_carriers` | 60,000 | 94,997 | 109,247 | 200,000,000 | 523,958,782 | 602,552,600 |
+| `source_loops_control` | 600,000 | 104,889 | 120,623 | 2,000,000,000 | 550,370,372 | 632,925,928 |
+| `source_loops_list_sum` | 300,000 | 91,216 | 104,899 | 1,000,000,000 | 514,134,353 | 591,254,506 |
+| `source_loops_managed_headers` | 1,000,000 | 108,003 | 124,204 | 3,000,000,000 | 506,298,424 | 582,243,188 |
+| `source_loops_nesting` | 1,500,000 | 109,380 | 125,787 | 5,000,000,000 | 575,910,583 | 662,297,171 |
+| `source_while_evaluation_order` | 150,000 | 95,437 | 109,753 | 500,000,000 | 525,529,550 | 604,358,983 |
+| `source_while_header_swap` | 150,000 | 93,205 | 107,186 | 500,000,000 | 520,708,344 | 598,814,596 |
+| `source_while_location` | 150,000 | 99,018 | 113,871 | 500,000,000 | 535,478,876 | 615,800,708 |
+| `source_while_nested` | 300,000 | 100,751 | 115,864 | 1,000,000,000 | 540,076,464 | 621,087,934 |
+| `test_entry_counts` | none | 102,388 | 117,747 | none | 545,647,554 | 627,494,688 |
+| `test_entry_empty` | none | 102,140 | 117,461 | none | 545,568,306 | 627,403,552 |
+| `test_entry_failing` | none | 104,108 | 119,725 | none | 549,358,205 | 631,761,936 |
+| `test_entry_passing` | none | 103,320 | 118,818 | none | 546,966,730 | 629,011,740 |
+| `value_if_answer` | 45,000 | 90,654 | 104,253 | 200,000,000 | 512,894,437 | 589,828,603 |
+| `value_if_effects` | 45,000 | 98,552 | 113,335 | 200,000,000 | 535,663,388 | 616,012,897 |
+| `value_if_list_aliases` | 45,000 | 96,405 | 110,866 | 200,000,000 | 473,237,885 | 544,223,568 |
+| `value_if_return` | 45,000 | 90,050 | 103,558 | 200,000,000 | 511,410,998 | 588,122,648 |
