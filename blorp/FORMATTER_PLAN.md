@@ -1,7 +1,10 @@
 # Formatter
 
 Status: approved by Keith on 2026-11-06 (revision 3, after two reviews), with
-D1 decided as (a). F1 starts with its spike.
+D1 decided as (a). F1 to F3 have landed: the parse tree keeps parentheses and
+declaration starts (`3887c855e`), the formatter is in `864c9b950`, and the
+repository was formatted in `1ca080abd`, which `.git-blame-ignore-revs` lists;
+`make -C blorp test` checks that every parsable source stays formatted.
 
 ## Problem
 

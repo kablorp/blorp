@@ -107,6 +107,9 @@ bash blorp/test/tooling/test_bootstrap.sh   # bootstrap resolver and Makefile re
 bash benchmarks/bench.sh <name>           # cross-language speed table (see benchmarks/README.md)
 ```
 
+Run `blorp/build/compiler --format <files>` on the `.brp` files you changed
+before committing them; `make -C blorp test` fails on any unformatted file.
+
 **Tests.** Compiler tests are Blorp `TestSuite`s, not a test `main` or Python.
 The one sanctioned shell test is
 [test/tooling/test_bootstrap.sh](test/tooling/test_bootstrap.sh): it tests the

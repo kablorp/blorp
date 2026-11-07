@@ -63,7 +63,10 @@ parser's diagnostic and is left as it was, and the command exits 1; the other
 files are still processed. Formatting reads a file on its own, so it need not
 type-check. Patterns, types and declaration header lines never break, so
 a comment inside one stops the formatter, which says where and leaves that
-file unchanged; move the comment above the line.
+file unchanged; move the comment above the line. `make -C blorp test` checks
+that every source in the repository is formatted, and `git config
+blame.ignoreRevsFile .git-blame-ignore-revs` hides the commit that applied the
+formatter from `git blame`.
 [FORMATTER_PLAN.md](FORMATTER_PLAN.md) records the layout rules.
 
 ## The language
