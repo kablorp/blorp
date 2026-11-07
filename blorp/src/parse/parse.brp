@@ -38,6 +38,7 @@ import:
 		ParsedBinding,
 		ParsedBlock,
 		ParsedBody(ParsedBuiltinBody, ParsedValueBody, ParsedMatchBody),
+		ParsedBuiltinTypeDeclaration,
 		ParsedBuiltinType(IntegerBuiltin, FloatBuiltin, StringBuiltin, VoidBuiltin, ListBuiltin),
 		ParsedConstant,
 		ParsedFunction, ParsedTrait, ParsedTraitMethod(AbstractTraitMethod, DefaultTraitMethod), ParsedImplementationHeader,
@@ -171,7 +172,7 @@ record ParsedModuleContents {
 	names: NameTable,
 	module: ModuleId,
 	imports: List[ParsedImport],
-	builtin_types: List[ParsedBuiltinType],
+	builtin_types: List[ParsedBuiltinTypeDeclaration],
 	functions: List[ParsedFunctionGroup],
 	traits: List[ParsedTrait],
 	unions: List[ParsedUnion],
@@ -1226,7 +1227,7 @@ private pure func append_string_text(parts: List[ValueExpression], pieces: List[
 				bytes = bytes.append(piece.bytes)
 				last = piece.span
 			span = { first.span | end = last.end }
-			parts.append({ base = StringExpression(bytes.join("")), base_span = span, applications = [], span = span })
+			parts.append({ base = StringExpression(bytes.join("")), base_span = span, applications = [], parentheses = [], span = span })
 
 
 -- Parts are flat and already located: no reparsing, fake declaration or
@@ -1516,7 +1517,7 @@ private pure func consume_comparison_right(left: ParsedValue, operator: Comparis
 		Err(expected_syntax(right.next, "comparisons cannot be chained", "compare each pair separately, or parenthesize an intended nested comparison"))
 	else:
 		span = { left.body.span | end = right.body.span.end }
-		Ok({ body = { base = ComparisonExpression(operator, token, left.body, right.body), base_span = span, applications = [], span = span }, next = right.next, ending = right.ending, owed = left.owed + right.owed })
+		Ok({ body = { base = ComparisonExpression(operator, token, left.body, right.body), base_span = span, applications = [], parentheses = [], span = span }, next = right.next, ending = right.ending, owed = left.owed + right.owed })
 
 -- One operand, or `low..high`: two operands around '..'. A range has no
 -- postfix operations of its own; group it to apply any.
@@ -1538,7 +1539,7 @@ private pure func consume_range_rest(low: ParsedValue) -> Result[ParsedValue, Di
 		match high_result:
 			Ok(high):
 				span = { low.body.span | end = high.body.span.end }
-				Ok({ body = { base = RangeExpression(low.body, high.body), base_span = span, applications = [], span = span }, next = high.next, ending = high.ending, owed = low.owed + high.owed })
+				Ok({ body = { base = RangeExpression(low.body, high.body), base_span = span, applications = [], parentheses = [], span = span }, next = high.next, ending = high.ending, owed = low.owed + high.owed })
 			Err(error): Err(error)
 
 
@@ -1594,7 +1595,7 @@ private pure func consume_arithmetic_rest(
 					Ok(right):
 						span = { current.body.span | end = right.body.span.end }
 						base: ExpressionBase = ArithmeticExpression(operator, current.next.parser_span(), current.body, right.body)
-						current = { body = { base = base, base_span = span, applications = [], span = span }, next = right.next, ending = right.ending, owed = current.owed + right.owed }
+						current = { body = { base = base, base_span = span, applications = [], parentheses = [], span = span }, next = right.next, ending = right.ending, owed = current.owed + right.owed }
 	match failure:
 		Some(error): Err(error)
 		None: Ok(current)
@@ -1638,7 +1639,7 @@ private pure func fold_negative_literal(start: ParserState, literal: Span, digit
 	postfixes ?= start.shifted(2).consume_postfixes([], literal.end)
 	if postfixes.applications.is_empty():
 		span = { minus | end = literal.end }
-		Ok({ body = { base = base, base_span = span, applications = [], span = span }, next = postfixes.next, ending = postfixes.ending, owed = postfixes.owed })
+		Ok({ body = { base = base, base_span = span, applications = [], parentheses = [], span = span }, next = postfixes.next, ending = postfixes.ending, owed = postfixes.owed })
 	else:
 		match postfixes.applications.first_postfix_spelling(start.input.names):
 			Some(applied): Err(diagnostic(minus, "write (-${digits})${applied} or -(${digits}${applied}) to say which is meant", "prefix '-' applies after method calls"))
@@ -1665,7 +1666,7 @@ private pure func consume_arithmetic_negation(start: ParserState) -> Result[Pars
 	minus = start.parser_span()
 	operand ?= start.shifted(1).consume_prefix()
 	span = { minus | end = operand.body.span.end }
-	Ok({ body = { base = NegationExpression(minus, operand.body), base_span = span, applications = [], span = span }, next = operand.next, ending = operand.ending, owed = operand.owed })
+	Ok({ body = { base = NegationExpression(minus, operand.body), base_span = span, applications = [], parentheses = [], span = span }, next = operand.next, ending = operand.ending, owed = operand.owed })
 
 
 -- A base and its postfix operations, or a control form, which takes none.
@@ -1699,6 +1700,7 @@ private pure func consume_operand(start: ParserState) -> Result[ParsedValue, Dia
 											base = base.base,
 											base_span = base.span,
 											applications = postfixes.applications,
+											parentheses = [],
 											span = { token.span | end = postfixes.end }
 										},
 										next = postfixes.next,
@@ -1769,7 +1771,7 @@ private pure func consume_lambda(start: ParserState) -> Result[ParsedValue, Diag
 	}
 	span = lambda.span
 	Ok({
-		body = { base = LambdaExpression(lambda), base_span = span, applications = [], span = span },
+		body = { base = LambdaExpression(lambda), base_span = span, applications = [], parentheses = [], span = span },
 		next = body.next.with_context(start.context),
 		ending = body.ending,
 		owed = body.owed,
@@ -1843,7 +1845,7 @@ private pure func consume_lambda_body(after_colon: ParserState) -> Result[Lambda
 private pure func consume_if(start: ParserState) -> Result[ParsedValue, Diagnostic]:
 	parsed ?= start.consume_if_form()
 	span = parsed.form.span
-	Ok({ body = { base = IfExpression(parsed.form), base_span = span, applications = [], span = span }, next = parsed.next, ending = BlockEnding, owed = 0 })
+	Ok({ body = { base = IfExpression(parsed.form), base_span = span, applications = [], parentheses = [], span = span }, next = parsed.next, ending = BlockEnding, owed = 0 })
 
 
 private record IfResult {
@@ -1952,7 +1954,7 @@ private union EnclosedMember:
 private pure func enclosed_value(member: EnclosedMember) -> Result[ValueExpression, Diagnostic]:
 	match member:
 		BareMember(NamedBinder(name)):
-			Ok({ base = NameExpression(name), base_span = name.span, applications = [], span = name.span })
+			Ok({ base = NameExpression(name), base_span = name.span, applications = [], parentheses = [], span = name.span })
 		BareMember(DiscardBinder(span)): Err(diagnostic(span, DISCARD_VALUE_MESSAGE, DISCARD_VALUE_HELP))
 		ValueMember(value): Ok(value)
 
@@ -2026,7 +2028,8 @@ private pure func consume_tuple_element(count: Int, state: ParserState) -> Resul
 
 private pure func finish_enclosed_value(enclosed: ParsedEnclosed) -> Result[ParsedValue, Diagnostic]:
 	inner: ValueExpression ?= match enclosed.contents:
-		GroupedContents(value): Ok(value)
+		-- Only a group is a pair of parentheses the author wrote; a tuple is not.
+		GroupedContents(value): Ok({ value | parentheses = [enclosed.span].concat(value.parentheses) })
 		TupleContents(members):
 			var values: List[ValueExpression] = []
 			var failure: Option[Diagnostic] = None
@@ -2038,10 +2041,10 @@ private pure func finish_enclosed_value(enclosed: ParsedEnclosed) -> Result[Pars
 						break
 			match failure:
 				Some(error): Err(error)
-				None: Ok({ base = TupleExpression(values), base_span = enclosed.span, applications = [], span = enclosed.span })
+				None: Ok({ base = TupleExpression(values), base_span = enclosed.span, applications = [], parentheses = [], span = enclosed.span })
 	postfixes ?= enclosed.next.consume_postfixes(inner.applications, enclosed.span.end)
 	Ok({
-		body = { base = inner.base, base_span = inner.base_span, applications = postfixes.applications, span = { enclosed.span | end = postfixes.end } },
+		body = { base = inner.base, base_span = inner.base_span, applications = postfixes.applications, parentheses = inner.parentheses, span = { enclosed.span | end = postfixes.end } },
 		next = postfixes.next, ending = postfixes.ending, owed = postfixes.owed,
 	})
 
@@ -2927,7 +2930,7 @@ private pure func consume_match_value(start: ParserState) -> Result[ParsedValue,
 
 -- The match as one value with no postfix operations.
 private pure func match_expression(form: ParsedMatch) -> ValueExpression:
-	{ base = MatchExpression(form), base_span = form.span, applications = [], span = form.span }
+	{ base = MatchExpression(form), base_span = form.span, applications = [], parentheses = [], span = form.span }
 
 
 private record MatchResult {
@@ -3359,12 +3362,13 @@ private record FunctionResult {
 }
 
 
-private pure func consume_function(start: ParserState, module: ModuleId, visibility: Visibility) -> Result[FunctionResult, Diagnostic]:
+private pure func consume_function(start: ParserState, declaration_start: Span, module: ModuleId, visibility: Visibility) -> Result[FunctionResult, Diagnostic]:
 	annotation ?= start.consume_annotation()
 	header ?= annotation.next.consume_header()
 	body ?= header.next.consume_function_lines()
 	Ok({
 		function = {
+			start = declaration_start,
 			module = module,
 			visibility = visibility,
 			tail_annotation = annotation.span,
@@ -3398,7 +3402,7 @@ private pure func consume_default_trait_method(state: ParserState, signature: He
 	opened ?= newline.expect(newline.at_indent(), INDENTED_BLOCK_MESSAGE, INDENTED_BLOCK_HELP)
 	body ?= opened.consume_function_lines()
 	function: ParsedFunction = {
-		module = module, visibility = visibility, tail_annotation = None,
+		start = state.parser_span(), module = module, visibility = visibility, tail_annotation = None,
 		purity = signature.header.purity, function_name = signature.header.function_name,
 		type_parameters = signature.header.type_parameters, parameters = signature.header.parameters,
 		return_type = signature.header.return_type, statements = body.statements, body = body.body
@@ -3455,7 +3459,7 @@ private pure func consume_bundle_end(state: ParserState) -> Result[ParsedTraitMe
 
 -- `trait Name:` opens a method block. Supertraits after the colon are read as
 -- bounds are, then a second colon opens the methods or the line ends a bundle.
-private pure func consume_trait(start: ParserState, module: ModuleId, visibility: Visibility) -> Result[TraitResult, Diagnostic]:
+private pure func consume_trait(start: ParserState, declaration_start: Span, module: ModuleId, visibility: Visibility) -> Result[TraitResult, Diagnostic]:
 	name ?= start.shifted(1).consume_name("expected a trait name")
 	_: Void ?= if name.next.at_left_bracket():
 		Err(expected_syntax(name.next, "traits do not take type parameters", "use Self for the implementing type"))
@@ -3476,7 +3480,7 @@ private pure func consume_trait(start: ParserState, module: ModuleId, visibility
 		after_supertraits.consume_bundle_end()
 	Ok({
 		declaration = {
-			module = module, visibility = visibility, type_name = name.name, supertraits = supertraits.types,
+			start = declaration_start, module = module, visibility = visibility, type_name = name.name, supertraits = supertraits.types,
 			methods = methods.methods, span = { start.parser_span() | end = name.next.parser_span().end }
 		},
 		next = methods.next
@@ -3490,7 +3494,9 @@ private record ImplementationMethods {
 
 
 private pure func consume_implementation_methods(state: ParserState, module: ModuleId, visibility: Visibility, methods: List[ParsedFunction]) -> Result[ImplementationMethods, Diagnostic]:
-	method ?= state.consume_function(module, visibility)
+	-- A free function can start at `private`, so the caller names the start; a
+	-- method starts at its own first token.
+	method ?= state.consume_function(state.parser_span(), module, visibility)
 	gathered = methods.append(method.function)
 	if method.next.at_dedent():
 		Ok({ methods = gathered, next = method.next.shifted(1) })
@@ -3539,7 +3545,7 @@ private pure func consume_implementation_body(state: ParserState, module: Module
 			Err(error): Err(error)
 
 
-private pure func consume_implementation(start: ParserState, module: ModuleId, visibility: Visibility) -> Result[ImplementationResult, Diagnostic]:
+private pure func consume_implementation(start: ParserState, declaration_start: Span, module: ModuleId, visibility: Visibility) -> Result[ImplementationResult, Diagnostic]:
 	after_keyword = start.shifted(1)
 	requirement: ParsedType ?= if after_keyword.at_left_bracket():
 		Err(expected_syntax(after_keyword, "implementation parameters belong after the receiver head", "write implements Equatable for Box[T: Equatable]"))
@@ -3555,7 +3561,7 @@ private pure func consume_implementation(start: ParserState, module: ModuleId, v
 		parameters.next.parser_span().start
 	Ok({
 		header = {
-			module = module, visibility = visibility, trait_name = requirement.written,
+			start = declaration_start, module = module, visibility = visibility, trait_name = requirement.written,
 			receiver = receiver.head, type_parameters = parameters.parameters,
 			span = { start.parser_span() | end = header_end }
 		},
@@ -3646,7 +3652,7 @@ private pure func reject_fixed_type_parameters(opening: ParserState, parameters:
 
 
 -- `start` is at the `union` keyword.
-private pure func consume_union(start: ParserState, module: ModuleId, visibility: Visibility, fixed: Bool) -> Result[UnionResult, Diagnostic]:
+private pure func consume_union(start: ParserState, declaration_start: Span, module: ModuleId, visibility: Visibility, fixed: Bool) -> Result[UnionResult, Diagnostic]:
 	name ?= start.shifted(1).consume_name("expected a union type name")
 	type_parameters ?= name.next.consume_type_parameters()
 	_: Void ?= name.next.reject_fixed_type_parameters(type_parameters, fixed, "union")
@@ -3656,6 +3662,7 @@ private pure func consume_union(start: ParserState, module: ModuleId, visibility
 	variants ?= opened.consume_variants([])
 	Ok({
 		declaration = {
+			start = declaration_start,
 			module = module,
 			visibility = visibility,
 			type_name = name.name,
@@ -3775,7 +3782,7 @@ private record ParsedRecordResult {
 
 
 -- `start` is at the `record` keyword.
-private pure func consume_record(start: ParserState, module: ModuleId, visibility: Visibility, fixed: Bool) -> Result[ParsedRecordResult, Diagnostic]:
+private pure func consume_record(start: ParserState, declaration_start: Span, module: ModuleId, visibility: Visibility, fixed: Bool) -> Result[ParsedRecordResult, Diagnostic]:
 	name ?= start.shifted(1).consume_name("expected a record type name")
 	type_parameters ?= name.next.consume_type_parameters()
 	_: Void ?= name.next.reject_fixed_type_parameters(type_parameters, fixed, "record")
@@ -3787,7 +3794,7 @@ private pure func consume_record(start: ParserState, module: ModuleId, visibilit
 	fields ?= opened.consume_parameter_list("expected a record field name", [])
 	closed ?= fields.next.expect(fields.next.at_right_brace(), "expected '}' after the record declaration", "separate record fields with commas, then close the declaration with '}'")
 	next ?= closed.end_value_line()
-	Ok({ declaration = { module = module, visibility = visibility, type_name = name.name, type_parameters = type_parameters.parameters, fields = fields.parameters, fixed = fixed }, next = next })
+	Ok({ declaration = { start = declaration_start, module = module, visibility = visibility, type_name = name.name, type_parameters = type_parameters.parameters, fields = fields.parameters, fixed = fixed }, next = next })
 
 
 private record BuiltinTypeResult {
@@ -4164,7 +4171,7 @@ private pure func consume_import_block(start: ParserState) -> Result[ImportBlock
 -- One top-level item of a module.
 private union Declaration:
 	ImportBlock(List[ParsedImport])
-	BuiltinTypeDeclaration(ParsedBuiltinType)
+	BuiltinTypeDeclaration(ParsedBuiltinTypeDeclaration)
 	FunctionDeclaration(ParsedFunctionGroup)
 	TraitDeclaration(ParsedTrait)
 	UnionDeclaration(ParsedUnion)
@@ -4180,14 +4187,14 @@ private record ParsedConstantResult {
 
 
 -- `NAME: Type = value`; the value may stand alone on the next line.
-private pure func consume_constant(start: ParserState, module: ModuleId, visibility: Visibility) -> Result[ParsedConstantResult, Diagnostic]:
+private pure func consume_constant(start: ParserState, declaration_start: Span, module: ModuleId, visibility: Visibility) -> Result[ParsedConstantResult, Diagnostic]:
 	name ?= start.consume_name("expected a constant name")
 	colon ?= name.next.expect(name.next.at_colon(), "expected ':' after the constant name", "write NAME: Type = value")
 	type_name ?= colon.consume_type("expected the constant's type after ':'")
 	equals ?= type_name.next.expect(type_name.next.at_equals(), "expected '=' after the constant type", "write NAME: Type = value")
 	value ?= equals.consume_initializer(Assign, "expected a newline after the constant value", "put each declaration on a new line")
 	Ok({
-		declaration = { module = module, visibility = visibility, name = name.name, type_name = type_name.written, value = value.body },
+		declaration = { start = declaration_start, module = module, visibility = visibility, name = name.name, type_name = type_name.written, value = value.body },
 		next = value.next,
 	})
 
@@ -4199,7 +4206,7 @@ private record ParsedOpaqueResult {
 
 
 -- `opaque type Name[T] = Underlying` on one line.
-private pure func consume_opaque(start: ParserState, module: ModuleId, visibility: Visibility) -> Result[ParsedOpaqueResult, Diagnostic]:
+private pure func consume_opaque(start: ParserState, declaration_start: Span, module: ModuleId, visibility: Visibility) -> Result[ParsedOpaqueResult, Diagnostic]:
 	after_opaque = start.shifted(1)
 	type_word: ParserState ?= if after_opaque.at_type_keyword():
 		Ok(after_opaque.shifted(1))
@@ -4211,7 +4218,7 @@ private pure func consume_opaque(start: ParserState, module: ModuleId, visibilit
 	underlying ?= equals.consume_type("expected the underlying type after '='")
 	next ?= underlying.next.end_value_line()
 	Ok({
-		declaration = { module = module, visibility = visibility, type_name = name.name, type_parameters = type_parameters.parameters, underlying = underlying.written },
+		declaration = { start = declaration_start, module = module, visibility = visibility, type_name = name.name, type_parameters = type_parameters.parameters, underlying = underlying.written },
 		next = next,
 	})
 
@@ -4237,7 +4244,7 @@ private pure func consume_declaration(state: ParserState, module: ModuleId, decl
 		match state.consume_builtin_type():
 			Ok(parsed):
 				match parsed.next.end_value_line():
-					Ok(next): Ok({ declaration = BuiltinTypeDeclaration(parsed.declaration), next = next })
+					Ok(next): Ok({ declaration = BuiltinTypeDeclaration({ start = state.parser_span(), kind = parsed.declaration }), next = next })
 					Err(error): Err(error)
 			Err(error): Err(error)
 	else if state.at_private().and(state.shifted(1).at_type_keyword()):
@@ -4256,48 +4263,51 @@ private pure func consume_declaration(state: ParserState, module: ModuleId, decl
 
 -- The declarations that may carry `private`.
 private pure func consume_visible_declaration(state: ParserState, module: ModuleId, visibility: Visibility) -> Result[DeclarationResult, Diagnostic]:
+	declaration_start = match visibility:
+		Private(keyword): keyword
+		Public: state.parser_span()
 	if state.at_keyword(TraitKeyword):
-		match state.consume_trait(module, visibility):
+		match state.consume_trait(declaration_start, module, visibility):
 			Ok(parsed): Ok({ declaration = TraitDeclaration(parsed.declaration), next = parsed.next })
 			Err(error): Err(error)
 	else if state.at_keyword(ImplementsKeyword):
-		match state.consume_implementation(module, visibility):
+		match state.consume_implementation(declaration_start, module, visibility):
 			Ok(parsed): Ok({ declaration = FunctionDeclaration(ImplementationGroup(parsed.header, parsed.methods)), next = parsed.next })
 			Err(error): Err(error)
 	else if state.at_keyword(RecordKeyword):
-		match state.consume_record(module, visibility, False):
+		match state.consume_record(declaration_start, module, visibility, False):
 			Ok(parsed): Ok({ declaration = RecordDeclaration(parsed.declaration), next = parsed.next })
 			Err(error): Err(error)
 	-- `fixed record` promises inline storage with no counted child. The parser
 	-- rejects its type parameters; checking rejects managed fields and
 	-- recursion.
 	else if state.at_word(state.recognized_words().fixed_word).and(state.shifted(1).at_keyword(RecordKeyword)):
-		match state.shifted(1).consume_record(module, visibility, True):
+		match state.shifted(1).consume_record(declaration_start, module, visibility, True):
 			Ok(parsed): Ok({ declaration = RecordDeclaration(parsed.declaration), next = parsed.next })
 			Err(error): Err(error)
 	else if state.at_keyword(OpaqueKeyword):
-		match state.consume_opaque(module, visibility):
+		match state.consume_opaque(declaration_start, module, visibility):
 			Ok(parsed): Ok({ declaration = OpaqueDeclaration(parsed.declaration), next = parsed.next })
 			Err(error): Err(error)
 	else if state.at_identifier().and(state.shifted(1).at_colon()):
-		match state.consume_constant(module, visibility):
+		match state.consume_constant(declaration_start, module, visibility):
 			Ok(parsed): Ok({ declaration = ConstantDeclaration(parsed.declaration), next = parsed.next })
 			Err(error): Err(error)
 	else if state.at_keyword(UnionKeyword):
-		match state.consume_union(module, visibility, False):
+		match state.consume_union(declaration_start, module, visibility, False):
 			Ok(parsed): Ok({ declaration = UnionDeclaration(parsed.declaration), next = parsed.next })
 			Err(error): Err(error)
 	-- `fixed union` promises inline storage with no counted child. The parser
 	-- rejects its type parameters; checking rejects managed payloads and
 	-- recursion.
 	else if state.at_word(state.recognized_words().fixed_word).and(state.shifted(1).at_keyword(UnionKeyword)):
-		match state.shifted(1).consume_union(module, visibility, True):
+		match state.shifted(1).consume_union(declaration_start, module, visibility, True):
 			Ok(parsed): Ok({ declaration = UnionDeclaration(parsed.declaration), next = parsed.next })
 			Err(error): Err(error)
 	else if state.at_word(state.recognized_words().fixed_word):
 		Err(expected_syntax(state.shifted(1), "expected 'record' or 'union' after 'fixed'", "write fixed record Name { field: Int } or fixed union Choice:"))
 	else:
-		match state.consume_function(module, visibility):
+		match state.consume_function(declaration_start, module, visibility):
 			Ok(parsed): Ok({ declaration = FunctionDeclaration(FreeFunction(parsed.function)), next = parsed.next })
 			Err(error): Err(error)
 
@@ -4313,7 +4323,7 @@ pure func parse_module(input: LexedProgram, module: ModuleId) -> Result[ParsedMo
 	else:
 		Err(source_bundle_error("parsed module's source does not match its module identity"))
 	var imports: List[ParsedImport] = []
-	var builtin_types: List[ParsedBuiltinType] = []
+	var builtin_types: List[ParsedBuiltinTypeDeclaration] = []
 	var functions: List[ParsedFunctionGroup] = []
 	var traits: List[ParsedTrait] = []
 	var unions: List[ParsedUnion] = []
