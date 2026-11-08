@@ -78,15 +78,14 @@ rewrites only the files whose layout changes. `--check` prints
 changed line, and exits 1 if any would. A file that does not parse gets the
 parser's diagnostic and is left as it was, and the command exits 1; the other
 files are still processed. A bare `blorp format` from the repository root would
-also rewrite the layout fixtures' inputs, which are unformatted on purpose: format
-the files you changed, or the roots `blorp/src`, `blorp/standard_library` and
-`blorp/test` with `--exclude blorp/test/unit/test_format/fixtures`. Over
-`blorp/test` the command still exits 1, because some old test sources do not
-parse; that stays until they are deleted or ported. Formatting reads a file on
+also rewrite sources that are unformatted on purpose (the layout fixtures'
+inputs and a few must-fail fixtures): format the files you changed, or run
+`make -C blorp format-check`, which checks the roots with the exclusions
+listed in `blorp/Makefile`. Formatting reads a file on
 its own, so it need not type-check. Patterns, types and declaration header lines never break, so
 a comment inside one stops the formatter, which says where and leaves that
-file unchanged; move the comment above the line. `make -C blorp test` checks
-that every source in the repository is formatted, and `git config
+file unchanged; move the comment above the line. `make -C blorp test` runs that
+check first, and `git config
 blame.ignoreRevsFile .git-blame-ignore-revs` hides the commit that applied the
 formatter from `git blame`.
 [FORMATTER_PLAN.md](FORMATTER_PLAN.md) records the layout rules.

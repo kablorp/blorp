@@ -164,11 +164,13 @@ blorp format --check --exclude blorp/test/unit/test_format/fixtures \
 
 and `test_repository_formatted.brp` is deleted in favour of it. The roots are
 named explicitly so the gate never walks build output, and the layout
-fixtures' inputs are unformatted on purpose. Until the cleanup of the
-unparsable files lands, the test stays. Until a per-file opt-out exists, a
-bare `blorp format` run in place from the repository root would also rewrite
-those fixture inputs; the README's contributor note says to format the files
-you changed or to run the gate's command.
+fixtures' inputs are unformatted on purpose. This landed on 2026-11-07 as
+`make -C blorp format-check`, after the unparsable old-syntax suites were
+deleted; it also excludes the four must-fail fixtures that do not parse.
+Until a per-file opt-out exists, a bare `blorp format` run in place from the
+repository root would also rewrite those fixture inputs; the README's
+contributor note says to format the files you changed or to run the gate's
+command.
 
 ### Parsing
 

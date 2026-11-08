@@ -25,7 +25,7 @@ INSTRUCTION_CHECK :=
 TEST_DRIVER_DIRECTORY := blorp/build/self-hosted-tests/driver
 TEST_DRIVER := $(TEST_DRIVER_DIRECTORY)/driver
 
-.PHONY: compiler generate-compiler link-compiler example test test-components test-target-components test-compiler link-test-compiler test-e2e build-test-driver
+.PHONY: compiler generate-compiler link-compiler example test format-check test-components test-target-components test-compiler link-test-compiler test-e2e build-test-driver
 
 compiler: generate-compiler
 	@$(MAKE) --no-print-directory link-compiler
@@ -67,7 +67,26 @@ endef
 # it as a prerequisite, so they share one build when given together.
 test:
 	@$(MAKE) --no-print-directory test-compiler
-	@$(MAKE) --no-print-directory test-components test-e2e
+	@$(MAKE) --no-print-directory format-check test-components test-e2e
+
+# The formatting gate. The roots are named so the walk never reaches build
+# output. FORMAT_EXCLUDED holds the sources that are unformatted on purpose:
+# the formatter's own layout inputs, and must-fail fixtures that the parser
+# rejects (so the formatter cannot read them), whose rejections the e2e driver
+# checks. It uses the compiler already built; `make test` builds it first, and
+# run alone it needs `make -C blorp test-compiler` (or `compiler`) beforehand.
+FORMAT_ROOTS := blorp/src blorp/standard_library blorp/test
+FORMAT_EXCLUDED := \
+	blorp/test/unit/test_format/fixtures \
+	blorp/test/e2e/fixtures/opaque/generic/explicit_arguments.brp \
+	blorp/test/e2e/fixtures/unsupported/propagation_if.brp \
+	blorp/test/e2e/fixtures/unsupported/propagation_match.brp \
+	blorp/test/e2e/trait_inputs/operators/reject_chain.brp
+
+format-check:
+	@$(RESOLVE_TEST_TOOLS); \
+	"$$compiler_path" format --check \
+		$(addprefix --exclude ,$(FORMAT_EXCLUDED)) $(FORMAT_ROOTS)
 
 # Other suites remain in source for incremental self-hosted migration; the
 # driver prints how many it leaves out, per top directory. That report is its own
