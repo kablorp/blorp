@@ -13,6 +13,8 @@ file holds the language principles and development rules that apply to every
 change. [`docs/CODE_STYLE.md`](docs/CODE_STYLE.md) owns code style and
 [`docs/HANDOFF_SPEC.md`](docs/HANDOFF_SPEC.md) owns the shape of a brief.
 `scripts/README.md` describes the remaining repository scripts.
+[`blorp/NEXT.md`](blorp/NEXT.md) indexes the open workstreams, each with its
+status, next step and owning plan.
 
 ## Language Principles
 

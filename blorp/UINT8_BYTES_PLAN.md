@@ -1,11 +1,27 @@
 # UInt8 and Bytes
 
-Plan revision 2, 2026-11-06, against origin/main `dd9ef71cf`. Revision 1's review
-(2 blockers, 8 should-fix) is folded in. Keith set the direction: a `UInt8`
-numeric type, which Blorp "would add eventually anyway", and
-`opaque type Bytes = List[UInt8]`, with no separate `Byte` type. Keith approved
-U2 to U9 and B1 to B3 as recommended on 2026-11-06, and started S0, which
-decides U1 by measurement.
+Plan revision 3, 2026-11-08. Revision 2 was written against origin/main
+`dd9ef71cf`, and revision 1's review (2 blockers, 8 should-fix) is folded in.
+
+Keith set the direction: a `UInt8` numeric type, which Blorp "would add
+eventually anyway", and `opaque type Bytes = List[UInt8]`, with no separate
+`Byte` type. He then decided:
+- **2026-11-06:** U2 to U9 and B1 to B3, approved as recommended;
+- **2026-11-07:** U1 as (a), after the S0 spike, and the spike's ceilings.
+
+**Status:** S0 is done (see "S0 results"). L0 is next. One ceiling is open:
+see Ceilings. L0's first brief was written and reviewed outside the
+repository, and its content is folded into the L0 entry under Landings; a new
+brief re-derives the citations from current main.
+
+**Stale citations.** The `src/` layout split (`065e5e9ce`) and the
+repository-wide formatting (`1ca080abd`) landed after revision 2:
+- check, specialize, lower, own, verify, emit, namespace and runtime moved
+  under `blorp/src/compile/`;
+- the parser moved under `blorp/src/syntax/`.
+
+So the `file:line` citations below are stale. Re-derive them from current
+main before writing a brief.
 
 ## Problem
 
@@ -75,9 +91,9 @@ How Int and Float are built in today:
 
 ## Decisions for Keith
 
-- **U1, the integer model.** The width family should be one concept, because
-  Keith expects more widths. Two shapes are possible. *Recommended:* let the
-  spike (S0) choose between them by measurement.
+- **U1, the integer model. Decided as (a)** on 2026-11-07, after S0. The width
+  family should be one concept, because Keith expects more widths. The two
+  shapes considered:
   - **(a) A payload.** `fixed union IntegerFormat: Int64Format, UInt8Format`,
     and `TypeRef`'s `IntType` becomes `IntegerType(IntegerFormat)`. A new
     width adds one variant. The risk is that equality, hashing and the many
@@ -207,18 +223,100 @@ Two limits remain and are stated rather than fixed:
   signature is a function returning `from_list([137, 80, 78, 71, ...])`.
 - `for byte in data` needs `data.to_list()`.
 
+## S0 results
+
+The spike ran on 2026-11-07. Its report and branches stayed on the machine
+that ran it, outside the repository, and none of them landed; this section
+keeps what a later landing needs. What it found:
+
+- **U1 (a) costs nothing.** Both `TypeRef`s are boxed unions already, so even
+  a bare `IntType` is one counted node. Under (a), the format is a C enum
+  stored inside that node, and the node does not grow.
+  - Fixed-input allocations: +0.
+  - Fixed-input instructions: +0.003%. Option (b) measured +0.05 to +0.06%.
+  - Fixed-input self C: byte-identical.
+  - All 685 e2e fixtures gave identical output.
+  - Production lines: +114 −103 for (a), against +59 −14 for (b).
+  - (a) won on design: a new width adds one `IntegerFormat` variant.
+- **U2 works.** It is built like Rust's `{integer}`. An unconstrained literal
+  becomes `Int` when the call, variant, record or list it fills finishes, when
+  lambda resolution stops making progress, or when its type is published.
+  - These check:
+    - `x: UInt8 = 200`, `byte + 1`, `0 - byte` and `byte == 0`;
+    - `Some(200)` against an `Option[UInt8]`, and `[137, 80]` against a
+      `List[UInt8]`;
+    - `byte.max(3)`, and a generic `larger(byte, 3)` in either argument
+      order.
+  - `x: UInt8 = 300` gives "300 does not fit in UInt8", with help "UInt8
+    holds 0 to 255".
+  - All 685 fixtures are identical, and existing messages are byte-identical.
+  - The tuned version costs +0.10% fixed-input instructions and +420
+    allocations, with about 225 lines of literal machinery. A first version built error values
+    eagerly on two hot paths; allocation-site tracing found it.
+  - One limit: in `g(h(5), byte)` the 5 defaults to `Int`, as it does today.
+- **L1's estimated size, about 600 lines:**
+
+  | Part | Lines |
+  | --- | --- |
+  | Role, word, parse, head and spelling | 25 |
+  | Format arms | 10 |
+  | Limits authority | 15 |
+  | Deferred literal and range message | 225 |
+  | Pattern `fits` rule and verify range check | 30 |
+  | C type and List key | 20 |
+  | Nine operations, labels, contracts, emit names, wrapping C helpers | 60 |
+  | `UInt8ListRuntimeType`, parameter and payload kinds | 50 |
+  | Four natives with their C runtime | 120 |
+  | U3 and U4 messages | 45 |
+- **Two spike shortcuts L1 must fix.**
+  - Literal slots borrowed the expected variable's `TypeParameterId`. Give
+    `InferenceSlot` an origin variant instead.
+  - The spike wrote `IntegerType(_)` where the format matters. L0 routes every
+    such site through an exhaustive format function.
+
 ## Landings
 
-1. **S0, a spike** that never lands. On a branch, measure:
+1. **S0, a spike** that never lands (done; see "S0 results"). On a branch, measure:
    - (a) and (b) of U1, as before-and-after self-compile allocations and
      instructions for the `IntType` rename alone;
    - a prototype of the deferred integer literal (U2), with its cost and
      whether every existing fixture keeps its types.
 
    It reports the line counts that set the ceilings below, and decides U1.
-2. **L0, the integer model.** The rename that U1 chose, with no behaviour
-   change. The generated self C is byte-identical, and self-compile cost is
-   measured against the base.
+2. **L0, the integer model.** A pure refactor, with no behaviour change.
+   - **The format type.** Declare `fixed union IntegerFormat: Int64Format`, with
+     only Int64, so that L1's `UInt8Format` makes the compiler list every site
+     that must handle it.
+   - **The type.** `IntType` becomes `IntegerType(Int64Format)` in both
+     `TypeRef` unions.
+   - **The operations.** They carry the format: `IntegerAdd(IntegerFormat)`,
+     and the rest.
+   - **One owner per fact.** Every fact that depends on the format comes from
+     one exhaustive, single-arm function in the phase that owns it. Find the
+     sites by searching for `IntType` under `blorp/src`: about 18 exhaustive
+     `TypeRef` matches and 6 operation matches, of which these depend on the
+     format:
+     - the C type, the List element key and suffix;
+     - the type hash, which keeps `INT_TYPE_HASH`, so names stay the same;
+     - the primitive, and the source name `Int`;
+     - whether a literal value fits, for Int literal patterns in check and
+       verify;
+     - in `render.brp`, the type's spelling, the "Int parameters cannot be
+       called" message, and the declaration-to-type match;
+     - the operation constructors in `signatures.brp`, and emit's helper names
+       (`blorp_int_add` and the rest), chosen by a nested exhaustive match.
+
+     These are the places L1 adds its `UInt8Format` arm.
+   - **Wildcards.** `IntegerType(_)` remains only where a fact holds for every
+     integer format.
+   - **Role names.** `BuiltinTypeRole`'s variants become `IntRole`,
+     `FloatRole`, `StringRole`, `VoidRole` and `ListRole`, so they no longer
+     share spellings with `TypeRef`'s.
+   - **The test rename.** It must also add the `IntegerFormat(Int64Format)`
+     import. It shrank from about 1,117 lines to 151 lines in 35 files when
+     `824f3d4ee` deleted 329 unparsable old-syntax tests.
+   - **Proof.** Fixed-input self C is byte-identical, and all e2e fixtures
+     give identical output.
 3. **L1, the compiler learns UInt8.** This landing adds:
    - the role, which stays optional until L3, so that today's `_base`, which
      cannot declare it before the rotation, still compiles;
@@ -232,8 +330,21 @@ Two limits remain and are stated rather than fixed:
 
    Tests use fixtures with their own `_base`, so nothing the seed parses uses
    `UInt8` yet.
-4. **L2, seed rotation** onto L1. It also switches the seed family name, both
-   in the pin and in `seed_release_family` (see the rename notes).
+4. **L2, seed rotation** onto L1. It is the first rotation since both the
+   rename to Blorp (`d49241001`) and the `blorp` command, so in the same change
+   as the pin it must also switch:
+   - the pin, in `blorp/bootstrap.env`, to a `blorp-seed-*` release, with its
+     three digests;
+   - `seed_release_family` in `scripts/blorp-compiler-bootstrap`, from
+     `blorp2` to `blorp`;
+   - the `family=` line in `blorp/test/tooling/test_bootstrap.sh`;
+   - the seed's old command line (`--library-root DIR INPUT OUTPUT`), which
+     moves to `compile INPUT --library-root DIR -o OUTPUT` in
+     `generate-compiler` and the generator target in `blorp/Makefile`, the seed
+     step of `blorp-seed.yml`, and the fake seed's two argument lists in
+     `test_bootstrap.sh`.
+
+   `scripts/README.md` lists these.
 5. **L3, the library.** This landing adds:
    - `type UInt8 = builtin` in `_base`, which makes the role mandatory, and
      the prelude exports;
@@ -249,16 +360,25 @@ Two limits remain and are stated rather than fixed:
 
 ## Ceilings
 
-These are proposed now and re-set from S0's measurements before L0 begins.
+Keith approved the S0 spike's ceilings on 2026-11-07:
 
-| Landing | Production lines | Self-compile allocations and instructions | Fixed-input instructions |
+| Landing | Production lines | Self-compile allocations and instructions | Fixed input |
 | --- | --- | --- | --- |
-| L0 | net 0 ±20 | measured, at most +0.1% | — |
-| L1 | at most +700 compiler lines | at most +0.6% | at most +0.2% |
+| L0 | see below | at most +0.3% | self C byte-identical; allocations +0; instructions at most +0.1% |
+| L1 | at most +700 compiler lines | at most +2.0% | instructions at most +0.2%; allocations at most +0.05% |
 | L3 | library lines reported | at most +0.3% | — |
 | L4 | compiler call sites only | at most +0.1% | — |
 
-L0's self C must be byte-identical.
+L1's self-compile ceiling is high because compiling the added source alone
+costs about 0.3% per 100 lines, so the fixed-input ceiling is what guards the
+new machinery's own cost.
+
+**Open, for Keith: L0's line ceiling.** The approved figure was net at most +40,
+with at most 150 lines changed. The spike itself measured 217 lines changed
+(+114 −103) before the format functions L0 adds, so it cannot hold. The
+proposed correction, from the L0 brief's review, is at most 260 lines added
+plus removed and net at most +60, by `git diff --numstat` over `blorp/src`.
+L0 should not start until Keith decides.
 
 ## Risks and unknowns
 
