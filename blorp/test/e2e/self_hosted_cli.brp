@@ -1,0 +1,832 @@
+-- The `blorp` command, run as a user runs it: exact stdout, stderr and status
+-- for compile, format, help and bad usage, on files in the work directory.
+import:
+    bool: and, not
+    fs: create_directories, describe, read_text, write_text
+    int: Int methods
+    list: List methods
+    result: Result methods
+    string: String methods
+    test: TestSuite
+    ../../src/cli: EXIT_PATH, EXIT_REJECTED, EXIT_USAGE
+    ./self_hosted_harness:
+        COMPILATION_TIMEOUT_MS,
+        LIBRARY_ROOT,
+        WITHOUT_DIAGNOSTICS,
+        command,
+        reported,
+
+
+private FORMATTED: String = "func main() -> Int:\n    x = 1\n    x + 1\n"
+-- Its third line is the first that differs from FORMATTED.
+private UNFORMATTED: String = "func main() -> Int:\n    x = 1\n    x+1\n"
+private UNPARSABLE: String = "func main( -> Int:\n    0\n"
+
+
+private UNPARSABLE_DIAGNOSTIC: String = ":1:12: error: expected a parameter name or ')'\nhelp: use an ASCII identifier starting with a letter or underscore; keywords and lone '_' are reserved\n"
+
+
+private SUITE_ONE: String = "import:\n    test: TestSuite\npure func test_first() -> Bool:\n    True\ntests: TestSuite = { description = \"first suite\", tests = [(\"passes\", test_first)] }\n"
+
+
+private SUITE_TWO: String = "import:\n    test: TestSuite\npure func test_second() -> Bool:\n    True\ntests: TestSuite = { description = \"second suite\", tests = [(\"passes\", test_second)] }\n"
+
+
+private OVERVIEW: String =
+    |blorp compiles Blorp programs to C and formats Blorp source.
+    |
+    |usage: blorp COMMAND [ARGUMENT ...]
+    |
+    |commands:
+    |  compile  write the C for a program
+    |  format   put source files in the canonical layout
+    |  help     show this overview, or the help of one command
+    |
+    |run blorp help COMMAND for the options of a command
+    |
+    |exit status: 0 success; 1 the code needs fixing; 2 bad usage;
+    |3 a path could not be read or written; 4 a fault in blorp (report it)
+
+
+private FORMAT_HELP: String =
+    |usage: blorp format [--check] [--exclude PATH]... [PATH ...]
+    |
+    |Puts .brp files in the canonical layout. Each PATH is a .brp file or a
+    |directory, which is searched recursively; with no PATH it formats the current
+    |directory. While searching, names that begin with a dot and symbolic links
+    |are skipped; a PATH written on the command line is always used. A file that
+    |does not parse is reported and left as it is, and the command exits with
+    |status 1.
+    |
+    |options:
+    |  --check         change nothing; list each file that would be reformatted
+    |  --exclude PATH  skip a file, or a directory and everything below it;
+    |                  repeat it for several paths
+    |  -h, --help      show this help
+
+
+private COMPILE_HELP: String =
+    |usage: blorp compile INPUT.brp [-o OUTPUT.c] --library-root DIRECTORY
+    |       blorp compile --test-suite SUITE.brp [SUITE.brp ...] -o OUTPUT.c --library-root DIRECTORY
+    |
+    |Writes the C for INPUT.brp and the modules it imports. Without -o the C goes
+    |to the input's name with .c, in the current directory: blorp compile
+    |src/main.brp writes ./main.c.
+    |
+    |options:
+    |  -o OUTPUT.c              where to write the C (required with --test-suite)
+    |  --library-root DIRECTORY the standard library directory (required for now)
+    |  --test-suite             compile the listed test suite files into one program
+    |  -h, --help               show this help
+
+
+private HELP_HELP: String =
+    |usage: blorp help [COMMAND]
+    |
+    |Shows the overview of blorp, or the options of one command.
+
+
+-- What one run printed.
+private record CliOutput { stdout: String, stderr: String }
+
+
+private pure func expect(
+    actual: String,
+    expected: String,
+    description: String,
+) -> Result[Void, String]:
+    if actual.equals(expected):
+        Ok(void)
+    else:
+        Err("${description}: expected [${expected}], got [${actual}]")
+
+
+-- Runs the command with `arguments`, requiring `status`, and returns what it
+-- printed. The child runs without the leak check, so its stderr is only what
+-- a user sees.
+private func run(
+    compiler: String,
+    arguments: List[String],
+    prefix: String,
+    status: Int,
+) -> Result[CliOutput, String]:
+    _ ?= command(
+        WITHOUT_DIAGNOSTICS
+            .concat([compiler])
+            .concat(arguments),
+        prefix,
+        status,
+        COMPILATION_TIMEOUT_MS,
+    )
+    stdout ?= read_text(prefix + ".stdout").map_err(describe)
+    stderr ?= read_text(prefix + ".stderr").map_err(describe)
+    Ok({ stdout = stdout, stderr = stderr })
+
+
+private pure func expect_output(
+    output: CliOutput,
+    stdout: String,
+    stderr: String,
+) -> Result[Void, String]:
+    _ ?= expect(output.stdout, stdout, "stdout")
+    expect(output.stderr, stderr, "stderr")
+
+
+private func written(path: String, contents: String) -> Result[Void, String]:
+    write_text(path, contents).map_err(describe)
+
+
+private func contents_are(path: String, contents: String) -> Result[Void, String]:
+    now ?= read_text(path).map_err(describe)
+    expect(now, contents, "${path} afterwards")
+
+
+private pure func has_text(haystack: String, needle: String) -> Bool:
+    var position = 0
+    var found: Bool = False
+    while position + needle.length() <= haystack.length():
+        if haystack.slice(position, position + needle.length()) == Some(needle):
+            found = True
+            break
+        position = position + 1
+    found
+
+
+-- A symbolic link, which no fs operation can make.
+private func linked(target: String, link: String, prefix: String) -> Result[Void, String]:
+    command(["ln", "-s", target, link], prefix, 0, COMPILATION_TIMEOUT_MS)
+
+
+-- Every file is unformatted, so a walk's visits are visible. In walk order:
+--   a.brp  dir.brp/e.brp  sub/b.brp  subway/x.brp
+-- and the rest are never visited: .hidden/c.brp is hidden, link.brp and linkdir
+-- are symbolic links, and sub/note.txt is not a source file.
+private func build_tree(root: String) -> Result[Void, String]:
+    _ ?= create_directories("${root}/dir.brp").map_err(describe)
+    _ ?= create_directories("${root}/sub").map_err(describe)
+    _ ?= create_directories("${root}/subway").map_err(describe)
+    _ ?= create_directories("${root}/.hidden").map_err(describe)
+    _ ?= written("${root}/a.brp", UNFORMATTED)
+    _ ?= written("${root}/dir.brp/e.brp", UNFORMATTED)
+    _ ?= written("${root}/sub/b.brp", UNFORMATTED)
+    _ ?= written("${root}/sub/note.txt", "not a source\n")
+    _ ?= written("${root}/subway/x.brp", UNFORMATTED)
+    _ ?= written("${root}/.hidden/c.brp", UNFORMATTED)
+    _ ?= linked("a.brp", "${root}/link.brp", root + ".link_file")
+    linked("sub", "${root}/linkdir", root + ".link_directory")
+
+
+-- compile
+
+private func compile_writes_the_c_named_by_o(
+    compiler: String,
+    work_directory: String,
+) -> Result[Void, String]:
+    prefix = "${work_directory}/cli_compile"
+    source = prefix + ".brp"
+    _ ?= written(source, FORMATTED)
+    output ?= run(
+        compiler,
+        ["compile", source, "--library-root", LIBRARY_ROOT, "-o", prefix + ".c"],
+        prefix,
+        0,
+    )
+    _ ?= expect_output(output, "", "")
+    generated ?= read_text(prefix + ".c").map_err(describe)
+    if generated.length() > 0:
+        Ok(void)
+    else:
+        Err("compile wrote an empty C file")
+
+
+private func compile_names_a_missing_input_as_a_path_problem(
+    compiler: String,
+    work_directory: String,
+) -> Result[Void, String]:
+    prefix = "${work_directory}/cli_compile_missing"
+    output ?= run(
+        compiler,
+        ["compile", prefix + ".brp", "--library-root", LIBRARY_ROOT, "-o", prefix + ".c"],
+        prefix,
+        EXIT_PATH,
+    )
+    expect_output(
+        output,
+        "",
+        "blorp: error: could not read module ${prefix}.brp: no such file\nhelp: check the path and provide a readable .brp file; the standard library is read from --library-root\n",
+    )
+
+
+private func compile_test_suite_takes_one_suite_and_then_two(
+    compiler: String,
+    work_directory: String,
+) -> Result[Void, String]:
+    first = "${work_directory}/cli_suite_first.brp"
+    second = "${work_directory}/cli_suite_second.brp"
+    _ ?= written(first, SUITE_ONE)
+    _ ?= written(second, SUITE_TWO)
+    one_c = "${work_directory}/cli_suite_one.c"
+    two_c = "${work_directory}/cli_suite_two.c"
+    prefix = "${work_directory}/cli_suite"
+    one ?= run(
+        compiler,
+        ["compile", "--test-suite", first, "--library-root", LIBRARY_ROOT, "-o", one_c],
+        prefix + "_one",
+        0,
+    )
+    _ ?= expect_output(one, "", "")
+    two ?= run(
+        compiler,
+        ["compile", "--test-suite", first, second, "--library-root", LIBRARY_ROOT, "-o", two_c],
+        prefix + "_two",
+        0,
+    )
+    _ ?= expect_output(two, "", "")
+    one_text ?= read_text(one_c).map_err(describe)
+    two_text ?= read_text(two_c).map_err(describe)
+    -- The generated C labels each function with its module and name.
+    if (
+        one_text
+            .has_text("cli_suite_first.test_first")
+            .and(two_text.has_text("cli_suite_first.test_first"))
+            .and(two_text.has_text("cli_suite_second.test_second"))
+            .and(
+                one_text
+                    .has_text("cli_suite_second.test_second")
+                    .not(),
+            )
+    ):
+        Ok(void)
+    else:
+        Err("the generated C does not hold exactly the listed suites")
+
+
+-- Load owns the rule that each suite is listed once, for foundation inputs too.
+private func compile_test_suite_names_a_suite_listed_twice(
+    compiler: String,
+    work_directory: String,
+) -> Result[Void, String]:
+    prefix = "${work_directory}/cli_suite_twice"
+    suite_file = prefix + ".brp"
+    _ ?= written(suite_file, SUITE_ONE)
+    output ?= run(
+        compiler,
+        [
+            "compile",
+            "--test-suite",
+            suite_file,
+            suite_file,
+            "--library-root",
+            LIBRARY_ROOT,
+            "-o",
+            prefix + ".c",
+        ],
+        prefix,
+        EXIT_REJECTED,
+    )
+    expect_output(
+        output,
+        "",
+        "blorp: error: test suite input ${suite_file} is already part of this compilation\nhelp: list each test suite file once; foundation inputs are supplied by --library-root\n",
+    )
+
+
+private func compile_without_a_library_root_is_a_usage_error_and_keeps_the_output(
+    compiler: String,
+    work_directory: String,
+) -> Result[Void, String]:
+    prefix = "${work_directory}/cli_compile_usage"
+    _ ?= written(prefix + ".brp", FORMATTED)
+    _ ?= written(prefix + ".c", "keep me")
+    output ?= run(compiler, ["compile", prefix + ".brp", "-o", prefix + ".c"], prefix, EXIT_USAGE)
+    _ ?= expect_output(
+        output,
+        "",
+        "blorp: error: blorp compile needs --library-root\nhelp: pass --library-root DIRECTORY, such as --library-root blorp/standard_library\n",
+    )
+    contents_are(prefix + ".c", "keep me")
+
+
+-- format on a file
+
+private func check_reports_the_first_changed_line(
+    compiler: String,
+    work_directory: String,
+) -> Result[Void, String]:
+    path = "${work_directory}/cli_check_unformatted.brp"
+    _ ?= written(path, UNFORMATTED)
+    output ?= run(compiler, ["format", "--check", path], path, EXIT_REJECTED)
+    _ ?= expect_output(output, "${path}:3: would reformat\n", "")
+    contents_are(path, UNFORMATTED)
+
+
+private func check_prints_the_parser_diagnostic(
+    compiler: String,
+    work_directory: String,
+) -> Result[Void, String]:
+    path = "${work_directory}/cli_check_unparsable.brp"
+    _ ?= written(path, UNPARSABLE)
+    output ?= run(compiler, ["format", "--check", path], path, EXIT_REJECTED)
+    _ ?= expect_output(output, "", path + UNPARSABLE_DIAGNOSTIC)
+    contents_are(path, UNPARSABLE)
+
+
+private func check_accepts_a_formatted_file(
+    compiler: String,
+    work_directory: String,
+) -> Result[Void, String]:
+    path = "${work_directory}/cli_check_formatted.brp"
+    _ ?= written(path, FORMATTED)
+    output ?= run(compiler, ["format", "--check", path], path, 0)
+    expect_output(output, "", "")
+
+
+private func format_keeps_a_formatted_file(
+    compiler: String,
+    work_directory: String,
+) -> Result[Void, String]:
+    path = "${work_directory}/cli_format_formatted.brp"
+    _ ?= written(path, FORMATTED)
+    output ?= run(compiler, ["format", path], path, 0)
+    _ ?= expect_output(output, "", "")
+    contents_are(path, FORMATTED)
+
+
+private func format_rewrites_an_unformatted_file(
+    compiler: String,
+    work_directory: String,
+) -> Result[Void, String]:
+    path = "${work_directory}/cli_format_unformatted.brp"
+    _ ?= written(path, UNFORMATTED)
+    output ?= run(compiler, ["format", path], path, 0)
+    _ ?= expect_output(output, "", "")
+    contents_are(path, FORMATTED)
+
+
+private func format_reports_the_same_file_given_twice_once(
+    compiler: String,
+    work_directory: String,
+) -> Result[Void, String]:
+    path = "${work_directory}/cli_twice/a.brp"
+    _ ?= create_directories("${work_directory}/cli_twice").map_err(describe)
+    _ ?= written(path, UNFORMATTED)
+    output ?= run(
+        compiler,
+        [
+            "format",
+            "--check",
+            path,
+            "${work_directory}/cli_twice/./a.brp",
+            "${work_directory}/cli_twice",
+        ],
+        path,
+        EXIT_REJECTED,
+    )
+    expect_output(output, "${path}:3: would reformat\n", "")
+
+
+private func format_names_a_missing_path(
+    compiler: String,
+    work_directory: String,
+) -> Result[Void, String]:
+    path = "${work_directory}/cli_missing.brp"
+    output ?= run(compiler, ["format", "--check", path], path, EXIT_PATH)
+    expect_output(
+        output,
+        "",
+        "blorp: error: could not read ${path}: no such file\nhelp: check that the path exists and can be read\n",
+    )
+
+
+private func format_rejects_a_file_that_is_not_a_source(
+    compiler: String,
+    work_directory: String,
+) -> Result[Void, String]:
+    path = "${work_directory}/cli_not_source.txt"
+    _ ?= written(path, "text\n")
+    output ?= run(compiler, ["format", path], path, EXIT_USAGE)
+    expect_output(
+        output,
+        "",
+        "blorp: error: `${path}` is not a .brp source file or a directory\nhelp: pass .brp files and directories to blorp format\n",
+    )
+
+
+-- format on a directory
+
+private func format_walks_a_directory_in_place(
+    compiler: String,
+    work_directory: String,
+) -> Result[Void, String]:
+    root = "${work_directory}/cli_walk"
+    _ ?= build_tree(root)
+    output ?= run(compiler, ["format", root], root, 0)
+    _ ?= expect_output(output, "", "")
+    _ ?= contents_are("${root}/a.brp", FORMATTED)
+    _ ?= contents_are("${root}/dir.brp/e.brp", FORMATTED)
+    _ ?= contents_are("${root}/sub/b.brp", FORMATTED)
+    _ ?= contents_are("${root}/subway/x.brp", FORMATTED)
+    _ ?= contents_are("${root}/sub/note.txt", "not a source\n")
+    contents_are("${root}/.hidden/c.brp", UNFORMATTED)
+
+
+private func check_lists_a_walk_in_byte_order_and_skips_hidden_and_links(
+    compiler: String,
+    work_directory: String,
+) -> Result[Void, String]:
+    root = "${work_directory}/cli_walk_check"
+    _ ?= build_tree(root)
+    output ?= run(compiler, ["format", "--check", root], root, EXIT_REJECTED)
+    expect_output(
+        output,
+        "${root}/a.brp:3: would reformat\n${root}/dir.brp/e.brp:3: would reformat\n${root}/sub/b.brp:3: would reformat\n${root}/subway/x.brp:3: would reformat\n",
+        "",
+    )
+
+
+private func check_accepts_a_formatted_tree(
+    compiler: String,
+    work_directory: String,
+) -> Result[Void, String]:
+    root = "${work_directory}/cli_walk_formatted"
+    _ ?= build_tree(root)
+    _ ?= run(compiler, ["format", root], root + ".format", 0)
+    output ?= run(compiler, ["format", "--check", root], root, 0)
+    expect_output(output, "", "")
+
+
+private func a_root_is_used_as_given_even_when_hidden_or_a_link(
+    compiler: String,
+    work_directory: String,
+) -> Result[Void, String]:
+    root = "${work_directory}/cli_walk_given"
+    _ ?= build_tree(root)
+    output ?= run(
+        compiler,
+        ["format", "--check", "${root}/.hidden", "${root}/link.brp"],
+        root,
+        EXIT_REJECTED,
+    )
+    expect_output(
+        output,
+        "${root}/.hidden/c.brp:3: would reformat\n${root}/link.brp:3: would reformat\n",
+        "",
+    )
+
+
+private func a_file_under_two_roots_is_visited_once_at_its_first_occurrence(
+    compiler: String,
+    work_directory: String,
+) -> Result[Void, String]:
+    root = "${work_directory}/cli_walk_twice"
+    _ ?= build_tree(root)
+    output ?= run(
+        compiler,
+        ["format", "--check", "${root}/sub/b.brp", root, "${root}/sub"],
+        root,
+        EXIT_REJECTED,
+    )
+    expect_output(
+        output,
+        "${root}/sub/b.brp:3: would reformat\n${root}/a.brp:3: would reformat\n${root}/dir.brp/e.brp:3: would reformat\n${root}/subway/x.brp:3: would reformat\n",
+        "",
+    )
+
+
+private func an_unparsable_file_in_a_walk_fails_and_the_others_are_still_formatted(
+    compiler: String,
+    work_directory: String,
+) -> Result[Void, String]:
+    root = "${work_directory}/cli_walk_unparsable"
+    _ ?= create_directories(root).map_err(describe)
+    _ ?= written("${root}/a.brp", UNPARSABLE)
+    _ ?= written("${root}/b.brp", UNFORMATTED)
+    output ?= run(compiler, ["format", root], root, EXIT_REJECTED)
+    _ ?= expect_output(output, "", "${root}/a.brp" + UNPARSABLE_DIAGNOSTIC)
+    _ ?= contents_are("${root}/a.brp", UNPARSABLE)
+    contents_are("${root}/b.brp", FORMATTED)
+
+
+-- --exclude
+
+private func exclude_removes_a_file(
+    compiler: String,
+    work_directory: String,
+) -> Result[Void, String]:
+    root = "${work_directory}/cli_exclude_file"
+    _ ?= build_tree(root)
+    output ?= run(compiler, ["format", "--exclude", "${root}/a.brp", root], root, 0)
+    _ ?= expect_output(output, "", "")
+    _ ?= contents_are("${root}/a.brp", UNFORMATTED)
+    contents_are("${root}/sub/b.brp", FORMATTED)
+
+
+-- sub is excluded with everything below it, and subway, which shares its
+-- prefix, is not.
+private func exclude_removes_a_directory_on_component_boundaries(
+    compiler: String,
+    work_directory: String,
+) -> Result[Void, String]:
+    root = "${work_directory}/cli_exclude_directory"
+    _ ?= build_tree(root)
+    output ?= run(compiler, ["format", "--exclude", "${root}/sub/", root], root, 0)
+    _ ?= expect_output(output, "", "")
+    _ ?= contents_are("${root}/sub/b.brp", UNFORMATTED)
+    _ ?= contents_are("${root}/subway/x.brp", FORMATTED)
+    contents_are("${root}/a.brp", FORMATTED)
+
+
+private func exclude_may_repeat(compiler: String, work_directory: String) -> Result[Void, String]:
+    root = "${work_directory}/cli_exclude_repeat"
+    _ ?= build_tree(root)
+    output ?= run(
+        compiler,
+        ["format", "--check", "--exclude", "${root}/a.brp", "--exclude", "${root}/sub", root],
+        root,
+        EXIT_REJECTED,
+    )
+    expect_output(
+        output,
+        "${root}/dir.brp/e.brp:3: would reformat\n${root}/subway/x.brp:3: would reformat\n",
+        "",
+    )
+
+
+private func exclude_names_a_path_that_does_not_exist(
+    compiler: String,
+    work_directory: String,
+) -> Result[Void, String]:
+    root = "${work_directory}/cli_exclude_missing"
+    _ ?= build_tree(root)
+    output ?= run(compiler, ["format", "--exclude", "${root}/nope.brp", root], root, EXIT_USAGE)
+    _ ?= expect_output(
+        output,
+        "",
+        "blorp: error: the excluded path `${root}/nope.brp` does not exist\nhelp: check the spelling of the path given to --exclude\n",
+    )
+    contents_are("${root}/a.brp", UNFORMATTED)
+
+
+private func exclude_names_a_path_outside_the_roots(
+    compiler: String,
+    work_directory: String,
+) -> Result[Void, String]:
+    root = "${work_directory}/cli_exclude_outside"
+    _ ?= build_tree(root)
+    outside = "${work_directory}/cli_exclude_outside_file.brp"
+    _ ?= written(outside, UNFORMATTED)
+    output ?= run(compiler, ["format", "--exclude", outside, root], root, EXIT_USAGE)
+    _ ?= expect_output(
+        output,
+        "",
+        "blorp: error: the excluded path `${outside}` is not inside any path being formatted\nhelp: exclude a file or directory below one of the paths to format, or add a path that contains it\n",
+    )
+    contents_are("${root}/a.brp", UNFORMATTED)
+
+
+-- With no PATH the root is the current directory, which `../x` is not inside.
+private func exclude_outside_the_default_root_is_a_usage_error(
+    compiler: String,
+    work_directory: String,
+) -> Result[Void, String]:
+    output ?= run(
+        compiler,
+        ["format", "--check", "--exclude", "../x"],
+        "${work_directory}/cli_exclude_default",
+        EXIT_USAGE,
+    )
+    expect_output(
+        output,
+        "",
+        "blorp: error: the excluded path `../x` is not inside any path being formatted\nhelp: exclude a file or directory below one of the paths to format, or add a path that contains it\n",
+    )
+
+
+-- help and usage
+
+private func help_prints_the_overview_to_stdout(
+    compiler: String,
+    work_directory: String,
+) -> Result[Void, String]:
+    prefix = "${work_directory}/cli_help"
+    output ?= run(compiler, ["help"], prefix, 0)
+    _ ?= expect_output(output, OVERVIEW + "\n", "")
+    flag ?= run(compiler, ["-h"], prefix + "_flag", 0)
+    expect_output(flag, OVERVIEW + "\n", "")
+
+
+private func help_format_and_the_flag_print_the_command_help(
+    compiler: String,
+    work_directory: String,
+) -> Result[Void, String]:
+    prefix = "${work_directory}/cli_help_format"
+    output ?= run(compiler, ["help", "format"], prefix, 0)
+    _ ?= expect_output(output, FORMAT_HELP + "\n", "")
+    compile_help ?= run(compiler, ["help", "compile"], prefix + "_compile", 0)
+    _ ?= expect_output(compile_help, COMPILE_HELP + "\n", "")
+    help_help ?= run(compiler, ["help", "help"], prefix + "_help", 0)
+    _ ?= expect_output(help_help, HELP_HELP + "\n", "")
+    flag ?= run(compiler, ["format", "--check", "--help"], prefix + "_flag", 0)
+    expect_output(flag, FORMAT_HELP + "\n", "")
+
+
+private func no_command_prints_the_overview_to_stderr(
+    compiler: String,
+    work_directory: String,
+) -> Result[Void, String]:
+    output ?= run(compiler, [], "${work_directory}/cli_no_command", EXIT_USAGE)
+    expect_output(output, "", OVERVIEW + "\n")
+
+
+private func an_unknown_command_is_named(
+    compiler: String,
+    work_directory: String,
+) -> Result[Void, String]:
+    output ?= run(compiler, ["frobnicate"], "${work_directory}/cli_unknown", EXIT_USAGE)
+    expect_output(
+        output,
+        "",
+        "blorp: error: unknown command `frobnicate`\nhelp: run blorp help to list the commands\n",
+    )
+
+
+private func an_unknown_option_is_named(
+    compiler: String,
+    work_directory: String,
+) -> Result[Void, String]:
+    output ?= run(compiler, ["format", "--bogus"], "${work_directory}/cli_option", EXIT_USAGE)
+    expect_output(
+        output,
+        "",
+        "blorp: error: unknown option `--bogus` for blorp format\nhelp: run blorp help format to list its options\n",
+    )
+
+
+func suite(compiler: String, work_directory: String) -> TestSuite:
+    {
+        description = "The blorp command",
+        tests = [
+            (
+                "compile writes the C named by -o",
+                func(): reported(compile_writes_the_c_named_by_o(compiler, work_directory)),
+            ),
+            (
+                "compile names a missing input as a path problem",
+                func(): reported(
+                    compile_names_a_missing_input_as_a_path_problem(compiler, work_directory),
+                ),
+            ),
+            (
+                "compile --test-suite takes one suite and then two",
+                func(): reported(
+                    compile_test_suite_takes_one_suite_and_then_two(compiler, work_directory),
+                ),
+            ),
+            (
+                "compile --test-suite names a suite listed twice",
+                func(): reported(
+                    compile_test_suite_names_a_suite_listed_twice(compiler, work_directory),
+                ),
+            ),
+            (
+                "compile without a library root is a usage error and keeps the output",
+                func(): reported(
+                    compile_without_a_library_root_is_a_usage_error_and_keeps_the_output(
+                        compiler,
+                        work_directory,
+                    ),
+                ),
+            ),
+            (
+                "format --check prints path:line: would reformat at the first changed line and exits 1",
+                func(): reported(check_reports_the_first_changed_line(compiler, work_directory)),
+            ),
+            (
+                "format --check prints the parser's diagnostic for an unparsable file and exits 1",
+                func(): reported(check_prints_the_parser_diagnostic(compiler, work_directory)),
+            ),
+            (
+                "format --check prints nothing for a formatted file and exits 0",
+                func(): reported(check_accepts_a_formatted_file(compiler, work_directory)),
+            ),
+            (
+                "format leaves a formatted file's bytes unchanged",
+                func(): reported(format_keeps_a_formatted_file(compiler, work_directory)),
+            ),
+            (
+                "format rewrites an unformatted file to the canonical layout",
+                func(): reported(format_rewrites_an_unformatted_file(compiler, work_directory)),
+            ),
+            (
+                "format names a file given twice once",
+                func(): reported(
+                    format_reports_the_same_file_given_twice_once(compiler, work_directory),
+                ),
+            ),
+            (
+                "format names a missing path as a path problem",
+                func(): reported(format_names_a_missing_path(compiler, work_directory)),
+            ),
+            (
+                "format rejects a file that is not a source",
+                func(): reported(
+                    format_rejects_a_file_that_is_not_a_source(compiler, work_directory),
+                ),
+            ),
+            (
+                "format rewrites a walked directory and skips hidden entries, links and other files",
+                func(): reported(format_walks_a_directory_in_place(compiler, work_directory)),
+            ),
+            (
+                "format --check lists a walk in byte order",
+                func(): reported(
+                    check_lists_a_walk_in_byte_order_and_skips_hidden_and_links(
+                        compiler,
+                        work_directory,
+                    ),
+                ),
+            ),
+            (
+                "format --check accepts a formatted tree",
+                func(): reported(check_accepts_a_formatted_tree(compiler, work_directory)),
+            ),
+            (
+                "format uses a root as given even when it is hidden or a link",
+                func(): reported(
+                    a_root_is_used_as_given_even_when_hidden_or_a_link(compiler, work_directory),
+                ),
+            ),
+            (
+                "format visits a file under two roots once, at its first occurrence",
+                func(): reported(
+                    a_file_under_two_roots_is_visited_once_at_its_first_occurrence(
+                        compiler,
+                        work_directory,
+                    ),
+                ),
+            ),
+            (
+                "format fails on an unparsable file in a walk and still formats the others",
+                func(): reported(
+                    an_unparsable_file_in_a_walk_fails_and_the_others_are_still_formatted(
+                        compiler,
+                        work_directory,
+                    ),
+                ),
+            ),
+            (
+                "format --exclude removes a file",
+                func(): reported(exclude_removes_a_file(compiler, work_directory)),
+            ),
+            (
+                "format --exclude removes a directory on component boundaries",
+                func(): reported(
+                    exclude_removes_a_directory_on_component_boundaries(compiler, work_directory),
+                ),
+            ),
+            (
+                "format --exclude may repeat",
+                func(): reported(exclude_may_repeat(compiler, work_directory)),
+            ),
+            (
+                "format --exclude names a path that does not exist",
+                func(): reported(
+                    exclude_names_a_path_that_does_not_exist(compiler, work_directory),
+                ),
+            ),
+            (
+                "format --exclude names a path outside the roots",
+                func(): reported(exclude_names_a_path_outside_the_roots(compiler, work_directory)),
+            ),
+            (
+                "format --exclude ../x with no PATH is outside the default root",
+                func(): reported(
+                    exclude_outside_the_default_root_is_a_usage_error(compiler, work_directory),
+                ),
+            ),
+            (
+                "help and -h print the overview to stdout",
+                func(): reported(help_prints_the_overview_to_stdout(compiler, work_directory)),
+            ),
+            (
+                "help format and --help print the command's help to stdout",
+                func(): reported(
+                    help_format_and_the_flag_print_the_command_help(compiler, work_directory),
+                ),
+            ),
+            (
+                "no command prints the overview to stderr and exits 2",
+                func(): reported(
+                    no_command_prints_the_overview_to_stderr(compiler, work_directory),
+                ),
+            ),
+            (
+                "an unknown command is named",
+                func(): reported(an_unknown_command_is_named(compiler, work_directory)),
+            ),
+            (
+                "an unknown option is named",
+                func(): reported(an_unknown_option_is_named(compiler, work_directory)),
+            ),
+        ],
+    }

@@ -1,0 +1,480 @@
+---
+Tests for the `blorp` command's argument parsing: every command's request, the
+defaults, and the exact text of each usage error.
+---
+import:
+    bool: and, not
+    int: Int methods
+    list: List methods
+    string: String methods
+    test: TestSuite
+    ../../../src/cli:
+        Command(Compile, Format, Help),
+        CompileInputs(ProgramInput, SuiteInputs),
+        has_source_suffix,
+        parse_command,
+
+
+-- What a rejection prints: the error line, then the help line.
+private pure func usage(message: String, help: String) -> String:
+    "blorp: error: ${message}\nhelp: ${help}"
+
+
+private pure func compile_request(
+    inputs: CompileInputs,
+    output: String,
+    library_root: String,
+) -> Result[Command, String]:
+    Ok(Compile({ inputs = inputs, output = output, library_root = library_root }))
+
+
+private pure func format_request(
+    roots: List[String],
+    excluded: List[String],
+    check_only: Bool,
+) -> Result[Command, String]:
+    Ok(Format({ roots = roots, excluded = excluded, check_only = check_only }))
+
+
+private pure func rejected(words: List[String], message: String, help: String) -> Bool:
+    parse_command(words) == Err(usage(message, help))
+
+
+-- Whether `words` print a help text that begins with `first_line`.
+private pure func prints_help(words: List[String], first_line: String) -> Bool:
+    match parse_command(words):
+        Ok(Help(text)): text.starts_with(first_line)
+        _: False
+
+
+private OVERVIEW_START: String = "blorp compiles Blorp programs to C and formats Blorp source."
+
+private COMPILE_HELP_START: String = "usage: blorp compile INPUT.brp"
+
+private FORMAT_HELP_START: String = "usage: blorp format"
+
+private HELP_HELP_START: String = "usage: blorp help"
+
+
+-- compile
+
+pure func test_compile_defaults_the_output_to_the_input_stem_in_the_current_directory() -> Bool:
+    (
+        parse_command(["compile", "src/main.brp", "--library-root", "lib"])
+        == compile_request(ProgramInput("src/main.brp"), "main.c", "lib")
+    )
+
+
+pure func test_compile_takes_the_output_from_dash_o() -> Bool:
+    (
+        parse_command(["compile", "main.brp", "-o", "out/main.c", "--library-root", "lib"])
+        == (compile_request(ProgramInput("main.brp"), "out/main.c", "lib"))
+    )
+
+
+pure func test_compile_options_may_come_before_the_input() -> Bool:
+    (
+        parse_command(["compile", "--library-root", "lib", "-o", "o.c", "a.brp"])
+        == compile_request(ProgramInput("a.brp"), "o.c", "lib")
+    )
+
+
+pure func test_compile_test_suite_takes_the_first_suite_then_the_rest_in_order() -> Bool:
+    (
+        parse_command([
+            "compile",
+            "--test-suite",
+            "a.brp",
+            "b/c.brp",
+            "d.brp",
+            "-o",
+            "suites.c",
+            "--library-root",
+            "lib",
+        ])
+        == compile_request(SuiteInputs("a.brp", ["b/c.brp", "d.brp"]), "suites.c", "lib")
+    )
+
+
+pure func test_compile_test_suite_flag_may_follow_the_suites() -> Bool:
+    (
+        parse_command([
+            "compile",
+            "a.brp",
+            "--test-suite",
+            "-o",
+            "suites.c",
+            "--library-root",
+            "lib",
+        ])
+        == compile_request(SuiteInputs("a.brp", []), "suites.c", "lib")
+    )
+
+
+pure func test_compile_names_a_missing_input() -> Bool:
+    rejected(
+        ["compile", "--library-root", "lib"],
+        "blorp compile needs an input file",
+        "run blorp compile INPUT.brp --library-root DIRECTORY, or blorp help compile",
+    )
+
+
+pure func test_compile_names_the_extra_input() -> Bool:
+    rejected(
+        ["compile", "a.brp", "b.brp", "--library-root", "lib"],
+        "blorp compile takes one input file, but `b.brp` follows it",
+        "pass one INPUT.brp, or use --test-suite to compile several suite files into one program",
+    )
+
+
+pure func test_compile_rejects_an_input_without_the_source_suffix() -> Bool:
+    rejected(
+        ["compile", "main.c", "--library-root", "lib"],
+        "`main.c` is not a .brp source file",
+        "name a file that ends in .brp and has a name before it, such as main.brp",
+    )
+
+
+pure func test_compile_rejects_an_input_with_an_empty_stem() -> Bool:
+    rejected(
+        ["compile", "src/.brp", "--library-root", "lib"],
+        "`src/.brp` is not a .brp source file",
+        "name a file that ends in .brp and has a name before it, such as main.brp",
+    )
+
+
+pure func test_compile_rejects_a_suite_without_the_source_suffix() -> Bool:
+    rejected(
+        ["compile", "--test-suite", "a.brp", "b.txt", "-o", "o.c", "--library-root", "lib"],
+        "`b.txt` is not a .brp source file",
+        "name a file that ends in .brp and has a name before it, such as main.brp",
+    )
+
+
+pure func test_compile_requires_the_library_root() -> Bool:
+    rejected(
+        ["compile", "main.brp"],
+        "blorp compile needs --library-root",
+        "pass --library-root DIRECTORY, such as --library-root blorp/standard_library",
+    )
+
+
+pure func test_compile_rejects_an_output_that_is_the_input() -> Bool:
+    rejected(
+        ["compile", "src/main.brp", "-o", "./src/../src/main.brp", "--library-root", "lib"],
+        "the output `./src/../src/main.brp` is also an input",
+        "write the C to a different file with -o",
+    )
+
+
+pure func test_compile_rejects_an_output_that_is_a_suite() -> Bool:
+    rejected(
+        ["compile", "--test-suite", "a.brp", "b.brp", "-o", "b.brp", "--library-root", "lib"],
+        "the output `b.brp` is also an input",
+        "write the C to a different file with -o",
+    )
+
+
+pure func test_compile_test_suite_requires_dash_o() -> Bool:
+    rejected(
+        ["compile", "--test-suite", "a.brp", "--library-root", "lib"],
+        "blorp compile --test-suite needs -o",
+        "pass -o OUTPUT.c, the C file for the suite program",
+    )
+
+
+pure func test_compile_test_suite_requires_a_suite() -> Bool:
+    rejected(
+        ["compile", "--test-suite", "-o", "o.c", "--library-root", "lib"],
+        "blorp compile --test-suite needs at least one suite file",
+        "list the suite files, such as --test-suite a.brp b.brp",
+    )
+
+
+pure func test_compile_names_an_option_without_its_value() -> Bool:
+    and(
+        rejected(["compile", "a.brp", "-o"], "`-o` needs a value", "write -o OUTPUT.c"),
+        rejected(
+            ["compile", "a.brp", "--library-root"],
+            "`--library-root` needs a value",
+            "write --library-root DIRECTORY",
+        ),
+    )
+
+
+pure func test_compile_does_not_read_an_option_as_a_value() -> Bool:
+    rejected(
+        ["compile", "a.brp", "-o", "--library-root", "lib"],
+        "`-o` needs a value",
+        "write -o OUTPUT.c",
+    )
+
+
+pure func test_compile_names_a_repeated_option() -> Bool:
+    and(
+        rejected(
+            ["compile", "a.brp", "-o", "x.c", "-o", "y.c"],
+            "`-o` was given twice",
+            "give `-o` once",
+        ),
+        and(
+            rejected(
+                ["compile", "a.brp", "--library-root", "x", "--library-root", "y"],
+                "`--library-root` was given twice",
+                "give `--library-root` once",
+            ),
+            rejected(
+                ["compile", "--test-suite", "a.brp", "--test-suite"],
+                "`--test-suite` was given twice",
+                "give `--test-suite` once",
+            ),
+        ),
+    )
+
+
+pure func test_compile_names_an_unknown_option() -> Bool:
+    rejected(
+        ["compile", "a.brp", "--check"],
+        "unknown option `--check` for blorp compile",
+        "run blorp help compile to list its options",
+    )
+
+
+-- format
+
+pure func test_format_without_paths_formats_the_current_directory() -> Bool:
+    parse_command(["format"]) == format_request(["."], [], False)
+
+
+pure func test_format_normalizes_paths_and_keeps_their_order() -> Bool:
+    (
+        parse_command(["format", "./src/", "b/../a.brp", "tests//x"])
+        == format_request(["src", "a.brp", "tests/x"], [], False)
+    )
+
+
+pure func test_format_check_and_repeated_excludes() -> Bool:
+    (
+        parse_command(["format", "--check", "--exclude", "a/./b", "src", "--exclude", "c"])
+        == (format_request(["src"], ["a/b", "c"], True))
+    )
+
+
+pure func test_format_exclude_with_an_explicit_root() -> Bool:
+    (
+        parse_command(["format", "--exclude", "tests/format", "."])
+        == format_request(["."], ["tests/format"], False)
+    )
+
+
+pure func test_format_exclude_without_paths_formats_the_current_directory() -> Bool:
+    parse_command(["format", "--exclude", "../x"]) == format_request(["."], ["../x"], False)
+
+
+pure func test_format_names_an_exclude_without_its_value() -> Bool:
+    rejected(["format", "--exclude"], "`--exclude` needs a value", "write --exclude PATH")
+
+
+pure func test_format_names_a_repeated_check() -> Bool:
+    rejected(["format", "--check", "--check"], "`--check` was given twice", "give `--check` once")
+
+
+pure func test_format_names_an_unknown_option() -> Bool:
+    rejected(
+        ["format", "--library-root", "lib"],
+        "unknown option `--library-root` for blorp format",
+        "run blorp help format to list its options",
+    )
+
+
+-- help and dispatch
+
+pure func test_help_prints_the_overview_and_each_commands_help() -> Bool:
+    and(
+        prints_help(["help"], OVERVIEW_START),
+        and(
+            prints_help(["help", "compile"], COMPILE_HELP_START),
+            and(
+                prints_help(["help", "format"], FORMAT_HELP_START),
+                prints_help(["help", "help"], HELP_HELP_START),
+            ),
+        ),
+    )
+
+
+pure func test_help_flags_anywhere_in_a_command_print_that_commands_help() -> Bool:
+    and(
+        prints_help(["-h"], OVERVIEW_START),
+        and(
+            prints_help(["--help"], OVERVIEW_START),
+            and(
+                prints_help(["compile", "-h"], COMPILE_HELP_START),
+                and(
+                    prints_help(["compile", "a.brp", "--help", "-o"], COMPILE_HELP_START),
+                    and(
+                        prints_help(["format", "--check", "-h"], FORMAT_HELP_START),
+                        prints_help(["help", "-h"], HELP_HELP_START),
+                    ),
+                ),
+            ),
+        ),
+    )
+
+
+pure func test_help_names_an_unknown_command() -> Bool:
+    rejected(
+        ["help", "frobnicate"],
+        "unknown command `frobnicate`",
+        "run blorp help to list the commands",
+    )
+
+
+pure func test_help_takes_at_most_one_command() -> Bool:
+    rejected(
+        ["help", "compile", "format"],
+        "blorp help takes at most one command, but `format` follows `compile`",
+        "run blorp help COMMAND",
+    )
+
+
+pure func test_an_unknown_command_is_named() -> Bool:
+    rejected(
+        ["frobnicate", "x"],
+        "unknown command `frobnicate`",
+        "run blorp help to list the commands",
+    )
+
+
+pure func test_an_unknown_first_option_is_named_and_there_is_no_version() -> Bool:
+    rejected(
+        ["--version"],
+        "unknown option `--version`",
+        "options follow a command; run blorp help to list the commands",
+    )
+
+
+pure func test_no_command_prints_the_overview_as_the_error() -> Bool:
+    match parse_command([]):
+        Err(text): text.starts_with(OVERVIEW_START)
+        Ok(_): False
+
+
+pure func test_source_suffix_needs_a_name_before_the_extension() -> Bool:
+    and(
+        has_source_suffix("main.brp"),
+        and(
+            has_source_suffix("a/b/main.brp"),
+            and(
+                has_source_suffix("a.b.brp"),
+                and(
+                    has_source_suffix(".brp").not(),
+                    and(
+                        has_source_suffix("src/.brp").not(),
+                        and(has_source_suffix("main.c").not(), has_source_suffix("brp").not()),
+                    ),
+                ),
+            ),
+        ),
+    )
+
+
+tests: TestSuite = {
+    description = "The blorp command's argument parsing",
+    tests = [
+        (
+            "compile defaults the output to the input stem in the current directory",
+            test_compile_defaults_the_output_to_the_input_stem_in_the_current_directory,
+        ),
+        ("compile takes the output from -o", test_compile_takes_the_output_from_dash_o),
+        (
+            "compile options may come before the input",
+            test_compile_options_may_come_before_the_input,
+        ),
+        (
+            "compile --test-suite takes the first suite, then the rest in order",
+            test_compile_test_suite_takes_the_first_suite_then_the_rest_in_order,
+        ),
+        (
+            "compile --test-suite may follow the suites",
+            test_compile_test_suite_flag_may_follow_the_suites,
+        ),
+        ("compile names a missing input", test_compile_names_a_missing_input),
+        ("compile names the extra input", test_compile_names_the_extra_input),
+        (
+            "compile rejects an input without the source suffix",
+            test_compile_rejects_an_input_without_the_source_suffix,
+        ),
+        (
+            "compile rejects an input with an empty stem",
+            test_compile_rejects_an_input_with_an_empty_stem,
+        ),
+        (
+            "compile rejects a suite without the source suffix",
+            test_compile_rejects_a_suite_without_the_source_suffix,
+        ),
+        ("compile requires the library root", test_compile_requires_the_library_root),
+        (
+            "compile rejects an output that is the input",
+            test_compile_rejects_an_output_that_is_the_input,
+        ),
+        (
+            "compile rejects an output that is a suite",
+            test_compile_rejects_an_output_that_is_a_suite,
+        ),
+        ("compile --test-suite requires -o", test_compile_test_suite_requires_dash_o),
+        ("compile --test-suite requires a suite", test_compile_test_suite_requires_a_suite),
+        (
+            "compile names an option without its value",
+            test_compile_names_an_option_without_its_value,
+        ),
+        (
+            "compile does not read an option as a value",
+            test_compile_does_not_read_an_option_as_a_value,
+        ),
+        ("compile names a repeated option", test_compile_names_a_repeated_option),
+        ("compile names an unknown option", test_compile_names_an_unknown_option),
+        (
+            "format without paths formats the current directory",
+            test_format_without_paths_formats_the_current_directory,
+        ),
+        (
+            "format normalizes paths and keeps their order",
+            test_format_normalizes_paths_and_keeps_their_order,
+        ),
+        ("format takes --check and repeated --exclude", test_format_check_and_repeated_excludes),
+        ("format takes --exclude with an explicit root", test_format_exclude_with_an_explicit_root),
+        (
+            "format --exclude without paths formats the current directory",
+            test_format_exclude_without_paths_formats_the_current_directory,
+        ),
+        (
+            "format names an exclude without its value",
+            test_format_names_an_exclude_without_its_value,
+        ),
+        ("format names a repeated --check", test_format_names_a_repeated_check),
+        ("format names an unknown option", test_format_names_an_unknown_option),
+        (
+            "help prints the overview and each command's help",
+            test_help_prints_the_overview_and_each_commands_help,
+        ),
+        (
+            "help flags anywhere in a command print that command's help",
+            test_help_flags_anywhere_in_a_command_print_that_commands_help,
+        ),
+        ("help names an unknown command", test_help_names_an_unknown_command),
+        ("help takes at most one command", test_help_takes_at_most_one_command),
+        ("an unknown command is named", test_an_unknown_command_is_named),
+        (
+            "an unknown first option is named and there is no version",
+            test_an_unknown_first_option_is_named_and_there_is_no_version,
+        ),
+        (
+            "no command prints the overview as the error",
+            test_no_command_prints_the_overview_as_the_error,
+        ),
+        (
+            "a source suffix needs a name before the extension",
+            test_source_suffix_needs_a_name_before_the_extension,
+        ),
+    ],
+}

@@ -18,19 +18,27 @@ working on the compiler are in [AGENTS.md](AGENTS.md).
 Every command runs from the repository root.
 
 ```sh
-make -C blorp                  # build blorp/build/compiler from the pinned seed
+make -C blorp                  # build blorp/build/blorp from the pinned seed
 make -C blorp example          # compile, build and run test/e2e/fixtures/return/zero.brp
 ```
 
-The compiler takes the library root, one input and one output path:
+The `blorp` command (`blorp/build/blorp`, also `bin/blorp`) has the commands
+`compile`, `format` and `help`. `compile` takes the input, the library root and
+where to write the C:
 
 ```sh
-blorp/build/compiler --library-root blorp/standard_library input.brp output.c
+bin/blorp compile input.brp --library-root blorp/standard_library -o output.c
 clang -std=c11 -Wall -Wextra -Werror -pedantic -O0 output.c -o program -lm
 ./program
 ```
 
-There is no default library root and no fallback library. Every error has a
+Without `-o` the C goes to the input's name with `.c` in the current directory.
+`blorp help` and `blorp help COMMAND` print each command's options. There is no
+default library root and no fallback library yet: `--library-root` is required.
+The exit status is 0 on success, 1 when the code needs fixing (a diagnostic, a
+file that does not parse, a file `--check` would reformat), 2 for bad usage, 3
+when a path could not be read or written, and 4 for a fault in blorp itself.
+Every error has a
 source location, an explanation and a help line. A rejected program writes no
 C and leaves an existing output file as it was. Programs that use Float need
 `-lm`. `BLORP_CC` selects the C compiler `make` uses (default `clang`).
@@ -48,20 +56,34 @@ the test layout and gates; [Tests](#tests) describes `TestSuite`.
 
 ### Formatting
 
-The compiler also formats source files to the one canonical layout:
+`blorp format` puts source files in the one canonical layout:
 
 ```sh
-blorp/build/compiler --format blorp/src/main.brp        # rewrite in place
-blorp/build/compiler --check blorp/src/main.brp         # report, change nothing
+bin/blorp format                                  # every .brp file under the current directory
+bin/blorp format blorp/src blorp/src/main.brp     # directories and files, rewritten in place
+bin/blorp format --check blorp/src                # report, change nothing
+bin/blorp format --exclude blorp/test/unit/test_format/fixtures blorp/test
 ```
 
-Each argument is one `.brp` file; directories are not searched. `--format`
+Each `PATH` is a `.brp` file or a directory, which is walked recursively in byte
+order of entry name; with no `PATH` the current directory is walked. Walked
+entries whose names start with `.` and walked symbolic links are skipped, but a
+`PATH` written on the command line is always used. Paths are normalized, so
+`blorp format --check .` prints `src/a.brp`, and a file reached from two paths is
+processed once. `--exclude PATH`, which may repeat, removes a file, or a
+directory and everything below it on component boundaries; an excluded path
+that does not exist or lies outside every `PATH` is a usage error. Formatting
 rewrites only the files whose layout changes. `--check` prints
 `path:line: would reformat` for each file that would change, at its first
 changed line, and exits 1 if any would. A file that does not parse gets the
 parser's diagnostic and is left as it was, and the command exits 1; the other
-files are still processed. Formatting reads a file on its own, so it need not
-type-check. Patterns, types and declaration header lines never break, so
+files are still processed. A bare `blorp format` from the repository root would
+also rewrite the layout fixtures' inputs, which are unformatted on purpose: format
+the files you changed, or the roots `blorp/src`, `blorp/standard_library` and
+`blorp/test` with `--exclude blorp/test/unit/test_format/fixtures`. Over
+`blorp/test` the command still exits 1, because some old test sources do not
+parse; that stays until they are deleted or ported. Formatting reads a file on
+its own, so it need not type-check. Patterns, types and declaration header lines never break, so
 a comment inside one stops the formatter, which says where and leaves that
 file unchanged; move the comment above the line. `make -C blorp test` checks
 that every source in the repository is formatted, and `git config
@@ -963,8 +985,8 @@ callbacks returning `Bool`; a `tests` function, an imported `tests` and inline
 lambdas are rejected. Compile one or more suite files into one program:
 
 ```sh
-blorp/build/compiler --library-root blorp/standard_library --test-suite \
-  blorp/test/unit/test_utils/test_text.brp [MORE_SUITES.brp ...] blorp/build/test_text.c
+bin/blorp compile --test-suite blorp/test/unit/test_utils/test_text.brp \
+  [MORE_SUITES.brp ...] --library-root blorp/standard_library -o blorp/build/test_text.c
 ```
 
 The generated entry runs each file's suite with `run_suite_result` in
@@ -1128,7 +1150,7 @@ allocation and release.
 ### Leak check
 
 ```sh
-blorp/build/compiler --library-root blorp/standard_library program.brp program.c
+bin/blorp compile program.brp --library-root blorp/standard_library -o program.c
 clang -std=c11 -O0 -DBLORP_MEMORY_DIAGNOSTICS=1 -fsanitize=address,undefined program.c -o program -lm -lpthread
 BLORP_LEAK_CHECK=strict ./program
 ```
@@ -1193,7 +1215,7 @@ tag, its source commit and a SHA-256 digest for each native target (macOS
 ARM64, Linux x64 and Linux ARM64).
 [`scripts/blorp-compiler-bootstrap`](../scripts/blorp-compiler-bootstrap)
 downloads the seed for this machine, verifies the digest, caches it and runs
-it on `blorp/src/main.brp` to produce `blorp/build/compiler.c`, which `make`
+it on `blorp/src/main.brp` to produce `blorp/build/blorp.c`, which `make`
 links. The compiler's own source can use only what the seed supports.
 
 `scripts/blorp-fixpoint --prove` checks that the compiler reproduces itself:

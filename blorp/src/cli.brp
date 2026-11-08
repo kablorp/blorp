@@ -1,0 +1,435 @@
+---
+The `blorp` command line: pure argument parsing into one request per command,
+and the help and usage texts. `main.brp` and `source_walk.brp` do the I/O.
+
+A parse returns a request or the usage message to print on a bad command line.
+---
+import:
+    bool: and
+    int: Int methods
+    list: List methods
+    option: Option methods
+    path: normalize
+    result: Result methods
+    string: String methods
+    ./utils/results: first_error
+
+
+record CompileRequest { inputs: CompileInputs, output: String, library_root: String }
+
+
+-- A suite list is never empty: the first suite owns the entry, and the rest
+-- follow it in command-line order.
+union CompileInputs:
+    ProgramInput(String)
+    SuiteInputs(String, List[String])
+
+
+-- `roots` and `excluded` are normalized; `roots` is never empty.
+record FormatRequest { roots: List[String], excluded: List[String], check_only: Bool }
+
+
+-- What the command line asks for. `Help` holds the text to print.
+union Command:
+    Compile(CompileRequest)
+    Format(FormatRequest)
+    Help(String)
+
+
+-- The exit statuses of the command, so a caller learns from the status alone
+-- what kind of failure it was. 0 is success.
+EXIT_REJECTED: Int = 1
+
+EXIT_USAGE: Int = 2
+
+EXIT_PATH: Int = 3
+
+EXIT_INTERNAL: Int = 4
+
+
+private SOURCE_SUFFIX: String = ".brp"
+
+private OBJECT_SUFFIX: String = ".c"
+
+private PATH_SEPARATOR_BYTE: Int = 47
+
+private HELP_FLAGS: List[String] = ["-h", "--help"]
+
+private CURRENT_DIRECTORY: String = "."
+
+
+private OVERVIEW: String =
+    |blorp compiles Blorp programs to C and formats Blorp source.
+    |
+    |usage: blorp COMMAND [ARGUMENT ...]
+    |
+    |commands:
+    |  compile  write the C for a program
+    |  format   put source files in the canonical layout
+    |  help     show this overview, or the help of one command
+    |
+    |run blorp help COMMAND for the options of a command
+    |
+    |exit status: 0 success; 1 the code needs fixing; 2 bad usage;
+    |3 a path could not be read or written; 4 a fault in blorp (report it)
+
+
+private COMPILE_HELP: String =
+    |usage: blorp compile INPUT.brp [-o OUTPUT.c] --library-root DIRECTORY
+    |       blorp compile --test-suite SUITE.brp [SUITE.brp ...] -o OUTPUT.c --library-root DIRECTORY
+    |
+    |Writes the C for INPUT.brp and the modules it imports. Without -o the C goes
+    |to the input's name with .c, in the current directory: blorp compile
+    |src/main.brp writes ./main.c.
+    |
+    |options:
+    |  -o OUTPUT.c              where to write the C (required with --test-suite)
+    |  --library-root DIRECTORY the standard library directory (required for now)
+    |  --test-suite             compile the listed test suite files into one program
+    |  -h, --help               show this help
+
+
+private FORMAT_HELP: String =
+    |usage: blorp format [--check] [--exclude PATH]... [PATH ...]
+    |
+    |Puts .brp files in the canonical layout. Each PATH is a .brp file or a
+    |directory, which is searched recursively; with no PATH it formats the current
+    |directory. While searching, names that begin with a dot and symbolic links
+    |are skipped; a PATH written on the command line is always used. A file that
+    |does not parse is reported and left as it is, and the command exits with
+    |status 1.
+    |
+    |options:
+    |  --check         change nothing; list each file that would be reformatted
+    |  --exclude PATH  skip a file, or a directory and everything below it;
+    |                  repeat it for several paths
+    |  -h, --help      show this help
+
+
+private HELP_HELP: String =
+    |usage: blorp help [COMMAND]
+    |
+    |Shows the overview of blorp, or the options of one command.
+
+
+-- The error line and the help line every usage error prints.
+pure func error_message(message: String, help: String) -> String:
+    "blorp: error: ${message}\nhelp: ${help}"
+
+
+private pure func unknown_command(command: String) -> String:
+    error_message("unknown command `${command}`", "run blorp help to list the commands")
+
+
+private pure func unknown_option(option: String, command: String) -> String:
+    error_message(
+        "unknown option `${option}` for blorp ${command}",
+        "run blorp help ${command} to list its options",
+    )
+
+
+private pure func given_twice(option: String) -> String:
+    error_message("`${option}` was given twice", "give `${option}` once")
+
+
+-- The value that follows `option`, which is not itself an option.
+private pure func option_value(
+    option: String,
+    placeholder: String,
+    following: List[String],
+) -> Result[String, String]:
+    missing = error_message("`${option}` needs a value", "write ${option} ${placeholder}")
+    match following.get(0):
+        Some(value):
+            if value.starts_with("-"):
+                Err(missing)
+            else:
+                Ok(value)
+        None:
+            Err(missing)
+
+
+-- The part of `path` after its last '/'.
+private pure func file_name(path: String) -> String:
+    var start = path.length()
+    while start > 0:
+        if path.byte_at(start - 1) == Some(PATH_SEPARATOR_BYTE):
+            break
+        start = start - 1
+    path
+        .slice(start, path.length())
+        .get_or(path)
+
+
+-- True for a path that names a source file: it ends in .brp and has a name
+-- before the extension.
+pure func has_source_suffix(path: String) -> Bool:
+    name = path.file_name()
+    and(
+        name.length() > SOURCE_SUFFIX.length(),
+        name.slice(name.length() - SOURCE_SUFFIX.length(), name.length()) == Some(SOURCE_SUFFIX),
+    )
+
+
+private pure func source_file(path: String) -> Result[Void, String]:
+    if path.has_source_suffix():
+        Ok(void)
+    else:
+        Err(
+            error_message(
+                "`${path}` is not a .brp source file",
+                "name a file that ends in .brp and has a name before it, such as main.brp",
+            ),
+        )
+
+
+-- What `blorp compile` read from its words, before the rules that join them.
+private record CompileOptions {
+    paths: List[String],
+    output: Option[String],
+    library_root: Option[String],
+    test_suite: Bool,
+}
+
+
+private pure func read_compile_options(
+    words: List[String],
+    options: CompileOptions,
+) -> Result[CompileOptions, String]:
+    match words:
+        []:
+            Ok(options)
+        ["-o", ...following]:
+            if options.output.is_some():
+                Err(given_twice("-o"))
+            else:
+                option_value("-o", "OUTPUT.c", following).and_then(
+                    pure func(path: String): following
+                        .drop(1)
+                        .read_compile_options({ options | output = Some(path) }),
+                )
+        ["--library-root", ...following]:
+            if options.library_root.is_some():
+                Err(given_twice("--library-root"))
+            else:
+                option_value("--library-root", "DIRECTORY", following).and_then(
+                    pure func(root: String): following
+                        .drop(1)
+                        .read_compile_options({ options | library_root = Some(root) }),
+                )
+        ["--test-suite", ...following]:
+            if options.test_suite:
+                Err(given_twice("--test-suite"))
+            else:
+                following.read_compile_options({ options | test_suite = True })
+        [word, ...following]:
+            if word.starts_with("-"):
+                Err(unknown_option(word, "compile"))
+            else:
+                following.read_compile_options({ options | paths = options.paths.append(word) })
+
+
+-- The C goes beside the working directory's other files unless -o says
+-- otherwise: `src/main.brp` becomes `main.c`.
+private pure func default_output(input: String) -> String:
+    name = input.file_name()
+    (
+        name
+            .slice(0, name.length() - SOURCE_SUFFIX.length())
+            .get_or(name)
+        + OBJECT_SUFFIX
+    )
+
+
+private pure func output_is_input(output: String, inputs: List[String]) -> Result[Void, String]:
+    if inputs.any(pure func(input: String): input.normalize() == output.normalize()):
+        Err(
+            error_message(
+                "the output `${output}` is also an input",
+                "write the C to a different file with -o",
+            ),
+        )
+    else:
+        Ok(void)
+
+
+private pure func suite_inputs(suites: List[String]) -> Result[CompileInputs, String]:
+    match suites:
+        []:
+            Err(
+                error_message(
+                    "blorp compile --test-suite needs at least one suite file",
+                    "list the suite files, such as --test-suite a.brp b.brp",
+                ),
+            )
+        [first, ...later]:
+            Ok(SuiteInputs(first, later))
+
+
+private pure func suite_request(
+    suites: List[String],
+    output: Option[String],
+    library_root: String,
+) -> Result[Command, String]:
+    written ?= output.to_result(
+        error_message(
+            "blorp compile --test-suite needs -o",
+            "pass -o OUTPUT.c, the C file for the suite program",
+        ),
+    )
+    _ ?= suites.first_error(source_file)
+    _ ?= written.output_is_input(suites)
+    inputs ?= suite_inputs(suites)
+    Ok(Compile({ inputs = inputs, output = written, library_root = library_root }))
+
+
+private pure func single_input(inputs: List[String]) -> Result[String, String]:
+    match inputs:
+        []:
+            Err(
+                error_message(
+                    "blorp compile needs an input file",
+                    "run blorp compile INPUT.brp --library-root DIRECTORY, or blorp help compile",
+                ),
+            )
+        [input]:
+            Ok(input)
+        [_, extra, ..._]:
+            Err(
+                error_message(
+                    "blorp compile takes one input file, but `${extra}` follows it",
+                    "pass one INPUT.brp, or use --test-suite to compile several suite files into one program",
+                ),
+            )
+
+
+private pure func program_request(
+    paths: List[String],
+    output: Option[String],
+    library_root: String,
+) -> Result[Command, String]:
+    input ?= single_input(paths)
+    _ ?= input.source_file()
+    written = output.get_or(input.default_output())
+    _ ?= written.output_is_input([input])
+    Ok(Compile({ inputs = ProgramInput(input), output = written, library_root = library_root }))
+
+
+private pure func parse_compile(words: List[String]) -> Result[Command, String]:
+    options ?= words.read_compile_options({
+        paths = [],
+        output = None,
+        library_root = None,
+        test_suite = False,
+    })
+    root ?= options.library_root.to_result(
+        error_message(
+            "blorp compile needs --library-root",
+            "pass --library-root DIRECTORY, such as --library-root blorp/standard_library",
+        ),
+    )
+    if options.test_suite:
+        suite_request(options.paths, options.output, root)
+    else:
+        program_request(options.paths, options.output, root)
+
+
+private record FormatOptions { paths: List[String], excluded: List[String], check_only: Bool }
+
+
+private pure func read_format_options(
+    words: List[String],
+    options: FormatOptions,
+) -> Result[FormatOptions, String]:
+    match words:
+        []:
+            Ok(options)
+        ["--check", ...following]:
+            if options.check_only:
+                Err(given_twice("--check"))
+            else:
+                following.read_format_options({ options | check_only = True })
+        ["--exclude", ...following]:
+            option_value("--exclude", "PATH", following).and_then(
+                pure func(path: String): following
+                    .drop(1)
+                    .read_format_options({ options | excluded = options.excluded.append(path) }),
+            )
+        [word, ...following]:
+            if word.starts_with("-"):
+                Err(unknown_option(word, "format"))
+            else:
+                following.read_format_options({ options | paths = options.paths.append(word) })
+
+
+private pure func parse_format(words: List[String]) -> Result[Command, String]:
+    options ?= words.read_format_options({ paths = [], excluded = [], check_only = False })
+    roots = if options.paths.is_empty():
+        [CURRENT_DIRECTORY]
+    else:
+        options.paths.map(normalize)
+    Ok(
+        Format({
+            roots = roots,
+            excluded = options.excluded.map(normalize),
+            check_only = options.check_only,
+        }),
+    )
+
+
+private pure func parse_help(words: List[String]) -> Result[Command, String]:
+    match words:
+        []:
+            Ok(Help(OVERVIEW))
+        ["compile"]:
+            Ok(Help(COMPILE_HELP))
+        ["format"]:
+            Ok(Help(FORMAT_HELP))
+        ["help"]:
+            Ok(Help(HELP_HELP))
+        [command]:
+            Err(unknown_command(command))
+        [command, extra, ..._]:
+            Err(
+                error_message(
+                    "blorp help takes at most one command, but `${extra}` follows `${command}`",
+                    "run blorp help COMMAND",
+                ),
+            )
+
+
+-- `words` are the command line after the program name.
+pure func parse_command(words: List[String]) -> Result[Command, String]:
+    match words:
+        []:
+            Err(OVERVIEW)
+        [command, ...arguments]:
+            wants_help = HELP_FLAGS.any(pure func(flag: String): arguments.contains(flag))
+            match command:
+                "compile":
+                    if wants_help:
+                        Ok(Help(COMPILE_HELP))
+                    else:
+                        arguments.parse_compile()
+                "format":
+                    if wants_help:
+                        Ok(Help(FORMAT_HELP))
+                    else:
+                        arguments.parse_format()
+                "help":
+                    if wants_help:
+                        Ok(Help(HELP_HELP))
+                    else:
+                        arguments.parse_help()
+                _:
+                    if HELP_FLAGS.contains(command):
+                        Ok(Help(OVERVIEW))
+                    else if command.starts_with("-"):
+                        Err(
+                            error_message(
+                                "unknown option `${command}`",
+                                "options follow a command; run blorp help to list the commands",
+                            ),
+                        )
+                    else:
+                        Err(unknown_command(command))

@@ -82,7 +82,7 @@ What the formatter reuses (surveyed 2026-11-06):
    entry value, or `?=` value (the last four by D1). Keep every other pair
    the author wrote.
 9. A declaration's header line holds its keyword, name and opening bracket.
-10. `--check` changes nothing, prints `path:line: would reformat` per file
+10. `blorp format --check` changes nothing, prints `path:line: would reformat` per file
     that would change, and exits 1 if any would.
 11. The architecture: the shared parser plus source positions.
 12. (Keith, 2026-11-07: "any time there are multiple chained method calls,
@@ -223,7 +223,7 @@ formatter is a new module, `src/format/`, that depends only on `syntax/`
 and `utils/`, so it formats files that do not type-check.
 
 1. **F1: keep parentheses and declaration starts in the parse tree.**
-2. **F2: the formatter**, its `--format` and `--check` modes and its tests.
+2. **F2: the formatter**, `blorp format` and its `--check` mode, and its tests.
 3. **F3: format the repository** in one commit, list it in
    `.git-blame-ignore-revs`, and add the check to `make -C blorp test`.
 
@@ -351,7 +351,7 @@ Suites live under `test/unit/test_format/` and are listed in
   comment's text, whether it is trailing or on its own line, and how many
   names, literals and keywords precede it. A file that does not parse
   (failure fixtures) is skipped and counted, and must be left byte-identical
-  by `--format`.
+  by `blorp format`.
 - **Locality:** lengthen one argument's name in chosen files, format, and
   check that only the containing statement's lines differ.
 - **Red check:** break one rule in the printer (for example drop the
@@ -367,10 +367,10 @@ iterating; `make -C blorp test` before review.
   passes with no Check suite edited; the ceiling above holds, reported with
   production and test line counts separately; self-compiled C byte-identical.
 - F2: every layout pair, idempotence, meaning-preserved and locality test
-  passes. `blorp/build/compiler --check` on an unformatted file prints
+  passes. `blorp format --check` on an unformatted file prints
   `path:line: would reformat` and exits 1, and on an unparsable file prints
   the parser diagnostic and exits 1.
-- F3: `--check` over the repository prints nothing and exits 0; `make -C
+- F3: `blorp format --check` over the repository prints nothing and exits 0; `make -C
   blorp test` passes; the self-compiled C is byte-identical before and after
   the formatting commit.
 

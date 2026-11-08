@@ -7,8 +7,8 @@ BLORP_CC ?= clang
 # test-compiler links BLORP_COMPILER from BLORP_COMPILER_C;
 # scripts/blorp-fixpoint sets both per stage and links at -O0. A command-line
 # VAR=value overrides these; the environment does not (hence := and not ?=).
-BLORP_COMPILER := blorp/build/compiler
-BLORP_COMPILER_C := blorp/build/compiler.c
+BLORP_COMPILER := blorp/build/blorp
+BLORP_COMPILER_C := blorp/build/blorp.c
 TEST_COMPILER_FLAGS := -O0
 TEST_COMPILER_LIBRARIES := -lm -lpthread
 # The component programs are listed in test/e2e/self_hosted.brp. Setting this
@@ -44,8 +44,8 @@ link-compiler:
 
 example: compiler
 	@mkdir -p build
-	@cd .. && "$(BLORP_COMPILER)" \
-		--library-root blorp/standard_library blorp/test/e2e/fixtures/return/zero.brp blorp/build/return_zero.c
+	@cd .. && "$(BLORP_COMPILER)" compile blorp/test/e2e/fixtures/return/zero.brp \
+		--library-root blorp/standard_library -o blorp/build/return_zero.c
 	@"$(BLORP_CC)" -std=c11 -Wall -Wextra -Werror -pedantic -O0 \
 		build/return_zero.c -o build/return_zero
 	@build/return_zero
@@ -89,8 +89,8 @@ test-components: test-target-components
 build-test-driver:
 	@set -eu; $(RESOLVE_TEST_TOOLS); \
 		mkdir -p "$(TEST_DRIVER_DIRECTORY)"; rm -f "$(TEST_DRIVER)"; \
-		BLORP_LEAK_CHECK=strict "$$compiler_path" --library-root blorp/standard_library \
-			blorp/test/e2e/self_hosted.brp "$(TEST_DRIVER).c"; \
+		BLORP_LEAK_CHECK=strict "$$compiler_path" compile blorp/test/e2e/self_hosted.brp \
+			--library-root blorp/standard_library -o "$(TEST_DRIVER).c"; \
 		"$$cc_path" -std=c11 -Wall -Wextra -Werror -pedantic -O0 \
 			-fsanitize=undefined -fno-sanitize-recover=all \
 			-DBLORP_MEMORY_DIAGNOSTICS=1 "$(TEST_DRIVER).c" -o "$(TEST_DRIVER)" $(TEST_COMPILER_LIBRARIES)

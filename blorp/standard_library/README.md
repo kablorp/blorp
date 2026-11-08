@@ -96,7 +96,7 @@ declarations are enabled only as their features enter the supported subset.
 The original modules are preserved in the legacy
 [standard_library/src](https://github.com/kablorp/blorp/blob/ee9e001c6de8911ee486fd992419bef5bc628e8b/standard_library/src/).
 
-Pass `blorp/standard_library` explicitly as the argument to `--library-root`. Bare `int: add` imports resolve here; relative
+Pass `blorp/standard_library` explicitly as the argument to `blorp compile --library-root`. Bare `int: add` imports resolve here; relative
 imports still resolve beside their importer. There is no host-library fallback.
 
 `io.brp` adapts the legacy
@@ -479,7 +479,7 @@ their results in one pass.
 `test: TestSuite` holds `description: String` and
 `tests: List[(String, () -> Bool)]`. Declare a `tests: TestSuite` constant with
 named callback entries in each suite file itself; a `tests()` function or an
-imported `tests` is rejected. `--test-suite` accepts one or more such files: its
+imported `tests` is rejected. `blorp compile --test-suite` accepts one or more such files: its
 entry passes each file's constant to `run_suite_result` in command-line order
 and returns `suites_exit_status` of the counts. Both pure and impure callbacks
 run in registration order, including entries after a False result. Empty suites

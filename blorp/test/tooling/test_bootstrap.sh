@@ -92,11 +92,14 @@ SEED
 #!/usr/bin/env bash
 set -euo pipefail
 printf 'built\n' >>"$TEST_CC_LOG"
-if [ "${1:-}" = --library-root ]; then
+if [ "${1:-}" = compile ]; then
 	printf 'compiler:%s\n' "${BLORP_LEAK_CHECK:-unset}" >>"$TEST_COMPILER_ARGS"
 	printf '%s\n' "$*" >>"$TEST_COMPILER_ARGS"
 	if [ "${TEST_DRIVER_COMPILE_STATUS:-0}" -ne 0 ]; then exit "$TEST_DRIVER_COMPILE_STATUS"; fi
-	printf '/* fake fixture C */\n' >"$4"
+	while [ $# -gt 0 ]; do
+		if [ "$1" = -o ]; then printf '/* fake fixture C */\n' >"$2"; fi
+		shift
+	done
 fi
 SEED
 		;;
@@ -271,10 +274,10 @@ make -s -C "$fixture/blorp" -j compiler test-compiler BLORP_CC="$tools/fake cc" 
 printf 'seed\nlink:0\nlink:1\n' >"$scratch/expected"
 cmp -s "$TEST_CC_LOG" "$scratch/expected" || fail 'generation/link ordering or diagnostic modes'
 printf 'cwd:%s\0arg:%s\0arg:%s\0arg:%s\0arg:%s\0' "$fixture" \
-	--library-root blorp/standard_library blorp/src/main.brp blorp/build/compiler.c >"$scratch/expected"
+	--library-root blorp/standard_library blorp/src/main.brp blorp/build/blorp.c >"$scratch/expected"
 cmp -s "$TEST_SEED_LOG" "$scratch/expected" || fail 'make seed CLI or generation count'
-printf '%s\0' -O0 -DBLORP_MEMORY_DIAGNOSTICS=0 blorp/build/compiler.c -o blorp/build/compiler -lm -lpthread \
-	-O0 -DBLORP_MEMORY_DIAGNOSTICS=1 blorp/build/compiler.c -o blorp/build/compiler -lm -lpthread >"$scratch/expected"
+printf '%s\0' -O0 -DBLORP_MEMORY_DIAGNOSTICS=0 blorp/build/blorp.c -o blorp/build/blorp -lm -lpthread \
+	-O0 -DBLORP_MEMORY_DIAGNOSTICS=1 blorp/build/blorp.c -o blorp/build/blorp -lm -lpthread >"$scratch/expected"
 cmp -s "$TEST_CC_ARGS" "$scratch/expected" || fail 'link flags or operand argv'
 pass 'parallel requested normal/diagnostic builds generate once and link serially'
 
@@ -340,7 +343,7 @@ grep -Fq 'INSTRUCTION_CHECK must be empty or on, not off' "$scratch/make.stderr"
 [ ! -s "$TEST_DRIVER_ARGS" ] || fail 'INSTRUCTION_CHECK=off still ran the driver'
 pass 'INSTRUCTION_CHECK passes the instruction flag only for on, and rejects other values'
 
-printf 'compiler:strict\n--library-root blorp/standard_library blorp/test/e2e/self_hosted.brp blorp/build/self-hosted-tests/driver/driver.c\n' >"$scratch/expected"
+printf 'compiler:strict\ncompile blorp/test/e2e/self_hosted.brp --library-root blorp/standard_library -o blorp/build/self-hosted-tests/driver/driver.c\n' >"$scratch/expected"
 cmp -s "$TEST_COMPILER_ARGS" "$scratch/expected" || fail 'the driver was not compiled strictly from the driver entry'
 printf '%s\0' -std=c11 -Wall -Wextra -Werror -pedantic -O0 -fsanitize=undefined -fno-sanitize-recover=all \
 	-DBLORP_MEMORY_DIAGNOSTICS=1 blorp/build/self-hosted-tests/driver/driver.c -o blorp/build/self-hosted-tests/driver/driver \

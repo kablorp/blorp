@@ -49,7 +49,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 # shellcheck source=legacy-compiler.env
 . "$SCRIPT_DIR/legacy-compiler.env"
-BLORP_COMPILER="${BLORP_COMPILER:-$PROJECT_DIR/blorp/build/compiler}"
+BLORP_COMPILER="${BLORP_COMPILER:-$PROJECT_DIR/blorp/build/blorp}"
 PYTHON="${PYTHON:-python3}"
 if [ "${PYTHON_CONCURRENCY+x}" ]; then
     PYTHON_CONCURRENCY_DEFAULTED=0
@@ -337,8 +337,8 @@ compile_blorp() {
 
     cp "$src" "$bench_src" || return 1
     if [ "$lang" = "blorp" ]; then
-        "$BLORP_COMPILER" --library-root "$PROJECT_DIR/blorp/standard_library" \
-            "$bench_src" "$bench_c" >/dev/null || return 1
+        "$BLORP_COMPILER" compile "$bench_src" \
+            --library-root "$PROJECT_DIR/blorp/standard_library" -o "$bench_c" >/dev/null || return 1
     else
         if [ -d "$helper_src" ]; then
             cp -R "$helper_src" "$TEMP_DIR/support" || return 1

@@ -101,5 +101,16 @@ Rotate the tag, source commit and all three digests together, and only after
 first rotation after the rename also switches `seed_release_family` in
 `scripts/blorp-compiler-bootstrap` from `blorp2` to `blorp`, in the same
 change as the pin.
+The seed still has the old command line (`--library-root DIR INPUT OUTPUT`), so
+`generate-compiler` in `blorp/Makefile`, the seed step of `blorp-seed.yml` and
+the fake seed in `blorp/test/tooling/test_bootstrap.sh` keep it. The first
+rotation to a seed that has the `blorp compile` command moves those three to
+`compile INPUT --library-root DIR -o OUTPUT` in the same change as the pin, and
+the resolver's `seed_release_family` with it. Also in that change:
+`blorp/bootstrap.env`, and the seed's expected arguments at
+`blorp/test/tooling/test_bootstrap.sh:277`.
+
+The seed workflow's fixture parity step deliberately accepts only exit 0 and 1
+for a fixture: an exit 4 (a fault in blorp) or 2 or 3 fails the step.
 Run `make -C blorp test`, the fixpoint and the bootstrap test against the new
 pin before landing it.

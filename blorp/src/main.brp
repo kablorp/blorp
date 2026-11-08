@@ -6,6 +6,17 @@ import:
     option: Option methods
     result: Result methods
     string: String methods
+    ./cli:
+        Command(Compile, Format, Help),
+        CompileInputs(ProgramInput, SuiteInputs),
+        CompileRequest,
+        EXIT_INTERNAL,
+        EXIT_PATH,
+        EXIT_REJECTED,
+        EXIT_USAGE,
+        FormatRequest,
+        error_message,
+        parse_command,
     ./compile/assemble: ParsedProgram
     ./compile/check/check: check
     ./compile/check/render: render_failure
@@ -22,6 +33,7 @@ import:
     ./compile/specialize/specialize: specialize
     ./compile/verify/verify: verify
     ./format/format: first_changed_line, format_source
+    ./source_walk: walk_sources
     ./syntax/source: SourceRole(CompilerRole, ModuleRole, InvalidRole), ModuleId, SourceId
     ./syntax/syntax:
         Diagnostic,
@@ -34,6 +46,7 @@ import:
             Declaration,
             NoteLines,
         ),
+        DiagnosticKind(ProgramProblem, PathProblem, CompilerFault),
         Diagnostics,
         NoteLine,
         Span,
@@ -169,66 +182,90 @@ private pure func render_lines(
                     Err(error)
 
 
-pure func render_diagnostics(inputs: SourceInputs, errors: Diagnostics) -> String:
+-- The rendered report, or why it could not be rendered: a defect in blorp.
+private pure func rendered_report(
+    inputs: SourceInputs,
+    errors: Diagnostics,
+) -> Result[String, String]:
     var lines: List[LocatedText] = []
     for error in [errors.first].concat(errors.remaining):
         lines = lines.concat(error.located_texts())
-    match inputs.render_lines(lines, []):
-        Ok(rendered):
-            rendered.join("\n")
-        Err(error):
-            "blorp: error: ${error}\nhelp: report this compiler error with the input program"
+    inputs
+        .render_lines(lines, [])
+        .map(pure func(rendered: List[String]): rendered.join("\n"))
+
+
+private pure func render_fault(fault: String) -> String:
+    error_message(fault, "report this compiler error with the input program")
+
+
+pure func render_diagnostics(inputs: SourceInputs, errors: Diagnostics) -> String:
+    match inputs.rendered_report(errors):
+        Ok(rendered): rendered
+        Err(fault): render_fault(fault)
 
 
 func main(args: List[String]) -> Int:
-    match args:
-        -- The last path is the output; any paths before it are later suite roots.
-        [_, "--library-root", library_root, "--test-suite", root_path, ...later_and_output]:
-            match later_and_output.last():
-                None:
-                    usage_error()
-                Some(output_path):
-                    root_path
-                        .load_test_program(
-                            later_and_output.take(later_and_output.length() - 1),
-                            library_root,
-                        )
-                        .compile_loaded(output_path)
-        [_, "--library-root", library_root, input_path, output_path]:
-            input_path
-                .load_program(library_root)
-                .compile_loaded(output_path)
-        [_, "--format", ...paths]:
-            paths.format_files(FormatInPlace)
-        [_, "--check", ...paths]:
-            paths.format_files(ReportUnformatted)
-        _:
-            usage_error()
+    match (
+        args
+            .drop(1)
+            .parse_command()
+    ):
+        Ok(Compile(request)):
+            request.compile_request()
+        Ok(Format(request)):
+            request.format_request()
+        Ok(Help(text)):
+            print(text)
+            0
+        Err(usage):
+            print_error(usage)
+            EXIT_USAGE
 
 
-private func usage_error() -> Int:
-    print_error(
-        "blorp: error: expected a library root, input and output paths, or a formatting mode and source files\nhelp: run blorp --library-root DIRECTORY INPUT.brp OUTPUT.c, or --library-root DIRECTORY --test-suite SUITE.brp [SUITE.brp ...] OUTPUT.c; run blorp --format FILE.brp [FILE.brp ...] to rewrite files in the canonical layout, or --check FILE.brp [FILE.brp ...] to list the files it would change",
-    )
-    1
+pure func kind_status(kind: DiagnosticKind) -> Int:
+    match kind:
+        ProgramProblem: EXIT_REJECTED
+        PathProblem: EXIT_PATH
+        CompilerFault: EXIT_INTERNAL
 
 
--- What the formatter does with a file whose layout is not canonical.
-private union FormatMode:
-    FormatInPlace
-    ReportUnformatted
+-- The most severe status any of the diagnostics asks for: a fault in blorp
+-- over a path problem over a problem in the program.
+pure func diagnostics_status(errors: Diagnostics) -> Int:
+    var status: Int = 0
+    for error in [errors.first].concat(errors.remaining):
+        kind = error.kind.kind_status()
+        if kind > status:
+            status = kind
+    status
+
+
+-- Prints the diagnostics and returns the status their kinds ask for.
+private func report_failure(inputs: SourceInputs, errors: Diagnostics) -> Int:
+    match inputs.rendered_report(errors):
+        Err(fault):
+            print_error(render_fault(fault))
+            EXIT_INTERNAL
+        Ok(report):
+            print_error(report)
+            errors.diagnostics_status()
 
 
 -- Formats one source file: 0 when it needed nothing or was rewritten, 1 when it
--- could not be read, parsed or written, or `--check` found it unformatted. An
--- unparsable file prints the parser's diagnostic and is left untouched.
-private func format_file(path: String, mode: FormatMode) -> Int:
+-- did not parse or `--check` found it unformatted, 3 when it could not be read or
+-- written. An unparsable file prints the parser's diagnostic and is left
+-- untouched.
+private func format_file(path: String, check_only: Bool) -> Int:
     match path.read_text():
         Err(error):
             print_error(
-                "blorp: error: could not read ${error.describe()}\nhelp: pass each .brp source file to format by its path; directories are not searched",
+                error_message(
+                    "could not read ${error.describe()}",
+                    "check that the file exists and can be read",
+                ),
             )
-            1
+            EXIT_PATH
         Ok(original):
             match original.format_source():
                 Err(diagnostic):
@@ -236,39 +273,52 @@ private func format_file(path: String, mode: FormatMode) -> Int:
                     sources
                         .render_diagnostics(diagnostic.singleton_diagnostic())
                         .print_error()
-                    1
+                    EXIT_REJECTED
                 Ok(formatted):
                     if formatted == original:
                         0
+                    else if check_only:
+                        print(
+                            "${path}:${first_changed_line(original, formatted).to_string()}: would reformat",
+                        )
+                        EXIT_REJECTED
                     else:
-                        match mode:
-                            -- write_text replaces the file atomically, as `publish` does.
-                            FormatInPlace:
-                                match path.write_text(formatted):
-                                    Err(error):
-                                        print_error(
-                                            "blorp: error: could not write ${error.describe()}\nhelp: make the source file writable, then format it again",
-                                        )
-                                        1
-                                    Ok(_):
-                                        0
-                            ReportUnformatted:
-                                print(
-                                    "${path}:${first_changed_line(original, formatted).to_string()}: would reformat",
+                        -- write_text replaces the file atomically, as `publish` does.
+                        match path.write_text(formatted):
+                            Err(error):
+                                print_error(
+                                    error_message(
+                                        "could not write ${error.describe()}",
+                                        "make the source file writable, then format it again",
+                                    ),
                                 )
-                                1
+                                EXIT_PATH
+                            Ok(_):
+                                0
 
 
--- Every file is processed, whatever happens to the others.
-private func format_files(paths: List[String], mode: FormatMode) -> Int:
-    if paths.is_empty():
-        usage_error()
-    else:
-        var status: Int = 0
-        for path in paths:
-            if path.format_file(mode) != 0:
-                status = 1
-        status
+-- Every file is processed, whatever happens to the others. The status is the
+-- most severe one any of them had.
+private func format_request(request: FormatRequest) -> Int:
+    match walk_sources(request.roots, request.excluded):
+        Err(usage):
+            print_error(usage)
+            EXIT_USAGE
+        Ok(walk):
+            var status: Int = 0
+            for error in walk.unreadable:
+                print_error(
+                    error_message(
+                        "could not read ${error.describe()}",
+                        "check that the path exists and can be read",
+                    ),
+                )
+                status = EXIT_PATH
+            for path in walk.files:
+                file_status = path.format_file(request.check_only)
+                if file_status > status:
+                    status = file_status
+            status
 
 
 -- write_text replaces the output atomically, so a failed or interrupted
@@ -277,26 +327,24 @@ private func publish(path: String, generated_c: String) -> Int:
     match path.write_text(generated_c):
         Err(error):
             print_error(
-                "blorp: error: could not write ${error.describe()}\nhelp: provide a writable output path",
+                error_message(
+                    "could not write ${error.describe()}",
+                    "provide a writable output path",
+                ),
             )
-            1
+            EXIT_PATH
         Ok(_):
             0
 
 
-private func compile_loaded(input: Result[LoadedProgram, LoadFailure], output_path: String) -> Int:
-    match input:
+private func compile_request(request: CompileRequest) -> Int:
+    loaded = match request.inputs:
+        ProgramInput(input): input.load_program(request.library_root)
+        SuiteInputs(first, later): first.load_test_program(later, request.library_root)
+    match loaded:
         Err(failure):
-            failure.sources
-                .render_diagnostics(failure.diagnostic.singleton_diagnostic())
-                .print_error()
-            1
-        Ok(loaded):
-            match loaded.program.compile():
-                Err(errors):
-                    loaded.sources
-                        .render_diagnostics(errors)
-                        .print_error()
-                    1
-                Ok(generated_c):
-                    output_path.publish(generated_c)
+            failure.sources.report_failure(failure.diagnostic.singleton_diagnostic())
+        Ok(program):
+            match program.program.compile():
+                Err(errors): program.sources.report_failure(errors)
+                Ok(generated_c): request.output.publish(generated_c)

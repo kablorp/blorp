@@ -8,6 +8,7 @@ import:
     result: Result methods
     string: String methods
     test: TestSuite
+    ../../src/cli: EXIT_PATH, EXIT_REJECTED
     ./self_hosted_reports: parse_instructions, positive_allocations, within_ceiling
 
 
@@ -363,7 +364,7 @@ func command(
 -- Returns the compile's allocations, from its strict report. With
 -- `check_instructions` the compiler runs under the process timer, which writes
 -- what it cost to `prefix.instructions`. `inputs` are the compiler arguments
--- between the library root and the output.
+-- between the command and the library root.
 private func compile_timed(
     check_instructions: Bool,
     compiler: String,
@@ -378,9 +379,9 @@ private func compile_timed(
     _ ?= command(
         ["-u", "BLORP_MEMORY_STATS", "BLORP_LEAK_CHECK=strict"]
             .concat(timer)
-            .concat([compiler, "--library-root", library_root])
+            .concat([compiler, "compile"])
             .concat(inputs)
-            .concat([prefix + ".c"]),
+            .concat(["--library-root", library_root, "-o", prefix + ".c"]),
         prefix + ".compile",
         0,
         COMPILATION_TIMEOUT_MS,
@@ -564,7 +565,7 @@ record Program {
 }
 
 
--- The compiler arguments between the library root and the output.
+-- The compiler arguments that name the inputs, between `compile` and the options.
 private pure func compiler_inputs(input: CompileInput) -> List[String]:
     match input:
         SingleSource(source): [source]
@@ -835,12 +836,13 @@ private func rejected_fixture(compiler: String, work_directory: String) -> Resul
     )
 
 
--- The compiler, given exactly `arguments`, exits 1 with nothing on stdout and
--- exactly this stderr.
-func expect_failure(
+-- The compiler, given exactly `arguments`, exits with `status`, nothing on
+-- stdout and exactly this stderr.
+func expect_status(
     compiler: String,
     arguments: List[String],
     prefix: String,
+    status: Int,
     expected_stderr: String,
 ) -> Result[Void, String]:
     _ ?= command(
@@ -848,7 +850,7 @@ func expect_failure(
             .concat([compiler])
             .concat(arguments),
         prefix + ".compile",
-        1,
+        status,
         COMPILATION_TIMEOUT_MS,
     )
     stdout: String ?= read_text(prefix + ".compile.stdout").map_err(describe)
@@ -857,13 +859,23 @@ func expect_failure(
     expect(stderr, expected_stderr, "failed compiler diagnostic")
 
 
+-- The same, for a rejection: status 1, the code needs fixing.
+func expect_failure(
+    compiler: String,
+    arguments: List[String],
+    prefix: String,
+    expected_stderr: String,
+) -> Result[Void, String]:
+    expect_status(compiler, arguments, prefix, EXIT_REJECTED, expected_stderr)
+
+
 -- The arguments of an ordinary compilation of `source` to `output`.
 private pure func compile_arguments(
     library_root: String,
     source: String,
     output: String,
 ) -> List[String]:
-    ["--library-root", library_root, source, output]
+    ["compile", source, "--library-root", library_root, "-o", output]
 
 
 -- fs words the failure, naming the output path the compiler was given.
@@ -873,10 +885,11 @@ private func directory_output_fixture(
 ) -> Result[Void, String]:
     source = work_directory + "/directory_output.brp"
     _ ?= write_text(source, "func main() -> Int:\n    0\n").map_err(describe)
-    expect_failure(
+    expect_status(
         compiler,
         compile_arguments(LIBRARY_ROOT, source, work_directory),
         work_directory + "/directory_output",
+        EXIT_PATH,
         (
             "blorp: error: could not write "
             + work_directory
