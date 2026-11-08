@@ -3,6 +3,8 @@ BLORP_CC ?= clang
 # Normal and diagnostic targets share output overrides. Serialize this small
 # Makefile so `make -j compiler test-compiler` cannot race competing links.
 .NOTPARALLEL:
+# A generator that fails halfway must not leave a module that looks up to date.
+.DELETE_ON_ERROR:
 # Paths are relative to the repository root, where every recipe runs.
 # test-compiler links BLORP_COMPILER from BLORP_COMPILER_C;
 # scripts/blorp-fixpoint sets both per stage and links at -O0. A command-line
@@ -25,12 +27,35 @@ INSTRUCTION_CHECK :=
 TEST_DRIVER_DIRECTORY := blorp/build/self-hosted-tests/driver
 TEST_DRIVER := $(TEST_DRIVER_DIRECTORY)/driver
 
+# The standard library embedded in the compiler: a generator the pinned seed
+# builds, and the module it writes, which src/compile/load/load.brp imports.
+# Both are file targets, so they are rebuilt only when the library or the
+# generator changes. These are targets, so relative to blorp/ where make runs;
+# the recipes run in the repository root and prefix them with blorp/.
+EMBED_LIBRARY := build/generated/embed_library
+EMBEDDED_LIBRARY := build/generated/embedded_library.brp
+
 .PHONY: compiler generate-compiler link-compiler example test format-check test-components test-target-components test-compiler link-test-compiler test-e2e build-test-driver
 
 compiler: generate-compiler
 	@$(MAKE) --no-print-directory link-compiler
 
-generate-compiler:
+# A pinned-seed change (bootstrap.env) rebuilds the generator too. -O1: the
+# generator loops over every library byte, which -O0 makes needlessly slow.
+$(EMBED_LIBRARY): scripts/embed_library.brp bootstrap.env
+	@echo 'Build blorp/$(EMBED_LIBRARY)'
+	@cd .. && mkdir -p "$$(dirname "blorp/$(EMBED_LIBRARY)")" \
+		&& scripts/blorp-compiler-bootstrap --library-root blorp/standard_library \
+			blorp/scripts/embed_library.brp "blorp/$(EMBED_LIBRARY).c" \
+		&& "$(BLORP_CC)" -O1 "blorp/$(EMBED_LIBRARY).c" -o "blorp/$(EMBED_LIBRARY)" $(TEST_COMPILER_LIBRARIES)
+
+# The directory is a prerequisite so that a deleted or renamed library file,
+# which no wildcard match can name, regenerates the module.
+$(EMBEDDED_LIBRARY): $(EMBED_LIBRARY) standard_library $(wildcard standard_library/*.brp)
+	@echo 'Generate blorp/$(EMBEDDED_LIBRARY)'
+	@cd .. && "blorp/$(EMBED_LIBRARY)" blorp/standard_library "blorp/$(EMBEDDED_LIBRARY)"
+
+generate-compiler: $(EMBEDDED_LIBRARY)
 	@echo 'Generate $(BLORP_COMPILER_C)'
 	@cd .. && mkdir -p "$$(dirname "$(BLORP_COMPILER_C)")" \
 		&& scripts/blorp-compiler-bootstrap --library-root blorp/standard_library \
@@ -75,7 +100,7 @@ test:
 # rejects (so the formatter cannot read them), whose rejections the e2e driver
 # checks. It uses the compiler already built; `make test` builds it first, and
 # run alone it needs `make -C blorp test-compiler` (or `compiler`) beforehand.
-FORMAT_ROOTS := blorp/src blorp/standard_library blorp/test
+FORMAT_ROOTS := blorp/scripts blorp/src blorp/standard_library blorp/test
 FORMAT_EXCLUDED := \
 	blorp/test/unit/test_format/fixtures \
 	blorp/test/e2e/fixtures/opaque/generic/explicit_arguments.brp \

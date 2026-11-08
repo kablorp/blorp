@@ -58,7 +58,10 @@ timing helpers use comes from that release's embedded library.
 ### The blorp column
 
 The `blorp` column uses `blorp/build/blorp` and the explicit
-`blorp/standard_library` root. Set `BLORP_COMPILER` to select another compiler
+`blorp/standard_library` root. A recipe that compiles `blorp/src/main.brp` with
+another compiler must first run `make -C blorp build/generated/embedded_library.brp`
+(`make -C blorp compiler` does), because the compiler's source imports that
+generated module. Set `BLORP_COMPILER` to select another compiler
 executable. The column never falls back to the legacy compiler. A missing compiler is
 an error when the selected workload has a Blorp port; unsupported rows show
 `-`. Listing the workloads needs neither compiler.

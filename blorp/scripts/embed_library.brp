@@ -1,0 +1,253 @@
+---
+Writes the module that holds the text of every standard library file, so the
+`blorp` binary can compile without a library directory.
+
+usage: embed_library LIBRARY_ROOT OUTPUT
+
+The pinned seed compiler builds this program during `make -C blorp compiler`,
+so it uses only what the seed supports. Make runs it again whenever a library
+file or this program changes; see EMBEDDED_LIBRARY_PLAN.md.
+---
+import:
+    bool: and, or
+    fs:
+        Entry,
+        EntryKind(File, Directory, Symlink, Other),
+        describe,
+        list_directory,
+        read_text,
+        write_text,
+    int: Int methods
+    io: print_error
+    list: List methods
+    option: Option methods
+    path: join
+    result: Result methods
+    string: String methods
+
+
+private LIBRARY_SUFFIX: String = ".brp"
+
+private ASCII_TAB: Int = 9
+
+private ASCII_LF: Int = 10
+
+private ASCII_CR: Int = 13
+
+private ASCII_NUL: Int = 0
+
+private ASCII_SPACE: Int = 32
+
+private ASCII_QUOTE: Int = 34
+
+private ASCII_DOLLAR: Int = 36
+
+private ASCII_BACKSLASH: Int = 92
+
+private ASCII_OPEN_BRACE: Int = 123
+
+private ASCII_DEL: Int = 127
+
+private HEX_DIGITS: String = "0123456789ABCDEF"
+
+private HEX_RADIX: Int = 16
+
+private EXIT_FAILED: Int = 1
+
+private EXIT_USAGE: Int = 2
+
+private INDENT: String = "    "
+
+
+-- The lexer's escape for a control byte or DEL: always two hex digits, since
+-- the largest such byte is 7F.
+private pure func unicode_escape(byte: Int) -> Result[String, String]:
+    high ?= HEX_DIGITS
+        .slice(byte / HEX_RADIX, byte / HEX_RADIX + 1)
+        .to_result("no hex digit for byte ${byte.to_string()}")
+    low ?= HEX_DIGITS
+        .slice(byte % HEX_RADIX, byte % HEX_RADIX + 1)
+        .to_result("no hex digit for byte ${byte.to_string()}")
+    Ok("\\u{${high}${low}}")
+
+
+-- How a String literal must spell `byte`, or None when it is written as is.
+-- `previous` is the byte before it: `${` starts a hole, so its brace is
+-- escaped. Every other control byte and DEL has no short escape, so it takes
+-- the lexer's Unicode escape.
+private pure func escaped_byte(byte: Int, previous: Option[Int]) -> Result[Option[String], String]:
+    if byte == ASCII_LF:
+        Ok(Some("\\n"))
+    else if byte == ASCII_TAB:
+        Ok(Some("\\t"))
+    else if byte == ASCII_CR:
+        Ok(Some("\\r"))
+    else if byte == ASCII_NUL:
+        Ok(Some("\\0"))
+    else if byte == ASCII_QUOTE:
+        Ok(Some("\\\""))
+    else if byte == ASCII_BACKSLASH:
+        Ok(Some("\\\\"))
+    else if and(byte == ASCII_OPEN_BRACE, previous == Some(ASCII_DOLLAR)):
+        Ok(Some("\\{"))
+    else if or(byte < ASCII_SPACE, byte == ASCII_DEL):
+        unicode_escape(byte).map(pure func(spelling: String): Some(spelling))
+    else:
+        Ok(None)
+
+
+-- The text between double quotes that the lexer decodes back to `contents`.
+-- Only ASCII bytes are escaped, so every run between them ends on a character
+-- boundary and the slices cannot fail; a failure is reported rather than
+-- dropping text, and the freshness test compares every embedded file anyway.
+private pure func quoted_contents(contents: String) -> Result[String, String]:
+    var pieces: List[String] = []
+    var run_start = 0
+    var previous: Option[Int] = None
+    var failure: Option[String] = None
+    for position in 0..contents.length():
+        match contents.byte_at(position):
+            None:
+                failure = Some("byte ${position.to_string()} is out of range")
+                break
+            Some(byte):
+                match escaped_byte(byte, previous):
+                    Err(message):
+                        failure = Some(message)
+                        break
+                    Ok(None):
+                        void
+                    Ok(Some(spelling)):
+                        match contents.slice(run_start, position):
+                            None:
+                                failure = Some("byte ${position.to_string()} splits a character")
+                                break
+                            Some(run):
+                                pieces = pieces
+                                    .append(run)
+                                    .append(spelling)
+                                run_start = position + 1
+                previous = Some(byte)
+    match (failure, contents.slice(run_start, contents.length())):
+        (Some(message), _): Err(message)
+        (None, Some(last)): Ok("\"${pieces.append(last).join("")}\"")
+        (None, None): Err("the last run of the text is out of range")
+
+
+private pure func file_arm(path: String, contents: String) -> String:
+    "${INDENT}${INDENT}${path}:\n${INDENT}${INDENT}${INDENT}Some(\n${INDENT}${INDENT}${INDENT}${INDENT}${contents},\n${INDENT}${INDENT}${INDENT})\n"
+
+
+-- The generated module for `files`, which are (path, text) rows in the order
+-- the paths are listed, or why a row cannot be written. Pure, so the escaping
+-- is tested without a file system.
+pure func render_embedded_library(files: List[(String, String)]) -> Result[String, String]:
+    var arms: List[String] = []
+    var paths: List[String] = []
+    var failure: Option[String] = None
+    for file in files:
+        (path, contents) = file
+        match (quoted_contents(path), quoted_contents(contents)):
+            (Ok(quoted_path), Ok(quoted_text)):
+                arms = arms.append(file_arm(quoted_path, quoted_text))
+                paths = paths.append("${INDENT}${quoted_path},\n")
+            (Err(message), _):
+                failure = Some("${path}: ${message}")
+                break
+            (_, Err(message)):
+                failure = Some("${path}: ${message}")
+                break
+    match failure:
+        Some(message):
+            Err(message)
+        None:
+            Ok(
+                [
+                    "-- Generated from blorp/standard_library by blorp/scripts/embed_library.brp\n",
+                    "-- during `make -C blorp compiler`. Do not edit; it is rewritten when the\n",
+                    "-- library changes.\n",
+                    "\n",
+                    "\n",
+                    "-- The text of the library file at `path`, relative to the library root.\n",
+                    "pure func embedded_library_file(path: String) -> Option[String]:\n",
+                    "${INDENT}match path:\n",
+                    arms.join(""),
+                    "${INDENT}${INDENT}_:\n",
+                    "${INDENT}${INDENT}${INDENT}None\n",
+                    "\n",
+                    "\n",
+                    "-- Every embedded file's path, in byte order.\n",
+                    "EMBEDDED_LIBRARY_PATHS: List[String] = [\n",
+                    paths.join(""),
+                    "]\n",
+                ].join(""),
+            )
+
+
+private pure func has_library_suffix(name: String) -> Bool:
+    start = name.length() - LIBRARY_SUFFIX.length()
+    and(start >= 0, name.slice(start, name.length()) == Some(LIBRARY_SUFFIX))
+
+
+-- The row of one directory entry: Some((name, text)) for a library file, None
+-- for a file that is not library code, such as the README. A subdirectory is
+-- an error until the library has one, so that no module is dropped without a
+-- word.
+private func library_row(root: String, entry: Entry) -> Result[Option[(String, String)], String]:
+    path = join(root, entry.name)
+    match entry.kind:
+        Directory:
+            Err(
+                "${path} is a directory; the embedded library holds only the files directly under its root",
+            )
+        File:
+            if has_library_suffix(entry.name):
+                read_text(path)
+                    .map_err(describe)
+                    .map(pure func(contents: String): Some((entry.name, contents)))
+            else:
+                Ok(None)
+        Symlink | Other:
+            if has_library_suffix(entry.name):
+                Err("${path} is not a regular file")
+            else:
+                Ok(None)
+
+
+-- The (name, text) rows of the library files directly under `root`, in the
+-- order list_directory returns them: sorted by name bytes. Recursion depth is
+-- the file count of the library.
+private func read_entries(
+    root: String,
+    entries: List[Entry],
+    files: List[(String, String)],
+) -> Result[List[(String, String)], String]:
+    match entries:
+        []:
+            Ok(files)
+        [entry, ...later]:
+            match library_row(root, entry):
+                Err(message): Err(message)
+                Ok(Some(file)): read_entries(root, later, files.append(file))
+                Ok(None): read_entries(root, later, files)
+
+
+private func write_module(root: String, output: String) -> Result[Void, String]:
+    entries ?= list_directory(root).map_err(describe)
+    files ?= read_entries(root, entries, [])
+    text ?= render_embedded_library(files)
+    write_text(output, text).map_err(describe)
+
+
+func main(args: List[String]) -> Int:
+    match args.drop(1):
+        [root, output]:
+            match write_module(root, output):
+                Ok(_):
+                    0
+                Err(message):
+                    print_error("embed_library: error: ${message}")
+                    EXIT_FAILED
+        _:
+            print_error("usage: embed_library LIBRARY_ROOT OUTPUT")
+            EXIT_USAGE

@@ -7,9 +7,13 @@ scratch=$(mktemp -d "${TMPDIR:-/tmp}/blorp bootstrap.XXXXXX")
 trap 'chmod -R u+w "$scratch"; rm -rf "$scratch"' EXIT
 fixture="$scratch/repo with spaces"
 tools="$scratch/fake tools"
-mkdir -p "$fixture/scripts" "$fixture/blorp/src" "$tools"
+mkdir -p "$fixture/scripts" "$fixture/blorp/src" "$fixture/blorp/scripts" "$fixture/blorp/standard_library" "$tools"
 fixture=$(cd "$fixture" && pwd -P)
 cp "$repo_root/blorp/Makefile" "$fixture/blorp/Makefile"
+# The embedded library's generator source and one library file: the fake seed
+# "compiles" the first and the file target's prerequisites name the second.
+printf '%s\n' '# stub generator' >"$fixture/blorp/scripts/embed_library.brp"
+printf '%s\n' '-- stub library file' >"$fixture/blorp/standard_library/stub.brp"
 if [ -f "$repo_root/scripts/blorp-compiler-bootstrap" ]; then
 	cp "$repo_root/scripts/blorp-compiler-bootstrap" "$fixture/scripts/"
 fi
@@ -92,6 +96,10 @@ SEED
 #!/usr/bin/env bash
 set -euo pipefail
 printf 'built\n' >>"$TEST_CC_LOG"
+if [ "$#" = 2 ] && [ -d "$1" ]; then
+	# The generator: embed_library LIBRARY_ROOT OUTPUT.
+	printf '%s\n' '-- fake embedded library' >"$2"
+fi
 if [ "${1:-}" = compile ]; then
 	printf 'compiler:%s\n' "${BLORP_LEAK_CHECK:-unset}" >>"$TEST_COMPILER_ARGS"
 	printf '%s\n' "$*" >>"$TEST_COMPILER_ARGS"
@@ -271,12 +279,20 @@ pass 'help works before publication and missing manifest has useful error'
 : >"$TEST_CC_ARGS"
 : >"$TEST_SEED_LOG"
 make -s -C "$fixture/blorp" -j compiler test-compiler BLORP_CC="$tools/fake cc" >"$scratch/make.stdout" 2>"$scratch/make.stderr" || { cat "$scratch/make.stderr" >&2; fail 'parallel requested build targets'; }
-printf 'seed\nlink:0\nlink:1\n' >"$scratch/expected"
+# The seed builds the embedded-library generator (and the fake cc links it with
+# no diagnostics flag, hence "link:example"), the generator runs once ("built"),
+# and only then does the seed generate the compiler.
+printf 'seed\nlink:example\nbuilt\nseed\nlink:0\nlink:1\n' >"$scratch/expected"
 cmp -s "$TEST_CC_LOG" "$scratch/expected" || fail 'generation/link ordering or diagnostic modes'
+[ -s "$fixture/blorp/build/generated/embedded_library.brp" ] || fail 'generator did not write the embedded library module'
 printf 'cwd:%s\0arg:%s\0arg:%s\0arg:%s\0arg:%s\0' "$fixture" \
-	--library-root blorp/standard_library blorp/src/main.brp blorp/build/blorp.c >"$scratch/expected"
+	--library-root blorp/standard_library blorp/scripts/embed_library.brp blorp/build/generated/embed_library.c \
+	>"$scratch/expected"
+printf 'cwd:%s\0arg:%s\0arg:%s\0arg:%s\0arg:%s\0' "$fixture" \
+	--library-root blorp/standard_library blorp/src/main.brp blorp/build/blorp.c >>"$scratch/expected"
 cmp -s "$TEST_SEED_LOG" "$scratch/expected" || fail 'make seed CLI or generation count'
-printf '%s\0' -O0 -DBLORP_MEMORY_DIAGNOSTICS=0 blorp/build/blorp.c -o blorp/build/blorp -lm -lpthread \
+printf '%s\0' -O1 blorp/build/generated/embed_library.c -o blorp/build/generated/embed_library -lm -lpthread \
+	-O0 -DBLORP_MEMORY_DIAGNOSTICS=0 blorp/build/blorp.c -o blorp/build/blorp -lm -lpthread \
 	-O0 -DBLORP_MEMORY_DIAGNOSTICS=1 blorp/build/blorp.c -o blorp/build/blorp -lm -lpthread >"$scratch/expected"
 cmp -s "$TEST_CC_ARGS" "$scratch/expected" || fail 'link flags or operand argv'
 pass 'parallel requested normal/diagnostic builds generate once and link serially'
@@ -289,6 +305,42 @@ printf 'seed\nlink:0\n' >"$scratch/expected"
 cmp -s "$TEST_CC_LOG" "$scratch/expected" || fail 'default target normal mode'
 [ -x "$fixture/blorp/build/output compiler" ] || fail 'explicit binary override'
 pass 'default target and explicit output paths with spaces work'
+
+# A changed library file regenerates the module without rebuilding the generator;
+# a changed generator source rebuilds and reruns it. The outputs are dated well
+# in the past first: make 3.81 compares whole seconds, so a source touched in the
+# same second as the previous build would not look newer.
+long_ago=200001010000
+generated="$fixture/blorp/build/generated"
+: >"$TEST_CC_LOG"
+touch -t "$long_ago" "$generated/embedded_library.brp"
+touch "$fixture/blorp/standard_library/stub.brp"
+make -s -C "$fixture/blorp" BLORP_CC="$tools/fake cc" >"$scratch/make.stdout" 2>"$scratch/make.stderr" || { cat "$scratch/make.stderr" >&2; fail 'build after a library change'; }
+printf 'built\nseed\nlink:0\n' >"$scratch/expected"
+cmp -s "$TEST_CC_LOG" "$scratch/expected" || { cat "$TEST_CC_LOG" >&2; fail 'a library change must rerun only the generator'; }
+: >"$TEST_CC_LOG"
+touch -t "$long_ago" "$generated/embed_library" "$generated/embedded_library.brp"
+touch "$fixture/blorp/scripts/embed_library.brp"
+make -s -C "$fixture/blorp" BLORP_CC="$tools/fake cc" >"$scratch/make.stdout" 2>"$scratch/make.stderr" || { cat "$scratch/make.stderr" >&2; fail 'build after a generator change'; }
+printf 'seed\nlink:example\nbuilt\nseed\nlink:0\n' >"$scratch/expected"
+cmp -s "$TEST_CC_LOG" "$scratch/expected" || { cat "$TEST_CC_LOG" >&2; fail 'a generator change must rebuild and rerun it'; }
+# A deleted library file leaves nothing for a wildcard to name; the directory's
+# own modification time regenerates the module.
+: >"$TEST_CC_LOG"
+printf '%s\n' '-- second stub' >"$fixture/blorp/standard_library/second.brp"
+touch -t "$long_ago" "$generated/embedded_library.brp"
+make -s -C "$fixture/blorp" BLORP_CC="$tools/fake cc" >"$scratch/make.stdout" 2>"$scratch/make.stderr" || { cat "$scratch/make.stderr" >&2; fail 'build after a library file was added'; }
+: >"$TEST_CC_LOG"
+# Every input is older than the generator, which is older than the module, so only
+# the directory's modification time, made by the removal, can rebuild it.
+touch -t "$long_ago" "$fixture/blorp/standard_library/stub.brp" "$fixture/blorp/scripts/embed_library.brp" "$fixture/blorp/bootstrap.env"
+touch -t 200006010000 "$generated/embed_library"
+touch -t 200101010000 "$generated/embedded_library.brp"
+rm "$fixture/blorp/standard_library/second.brp"
+make -s -C "$fixture/blorp" BLORP_CC="$tools/fake cc" >"$scratch/make.stdout" 2>"$scratch/make.stderr" || { cat "$scratch/make.stderr" >&2; fail 'build after a library file was deleted'; }
+printf 'built\nseed\nlink:0\n' >"$scratch/expected"
+cmp -s "$TEST_CC_LOG" "$scratch/expected" || { cat "$TEST_CC_LOG" >&2; fail 'a deleted library file must regenerate the module'; }
+pass 'the embedded library module is regenerated only when its inputs change'
 
 : >"$TEST_CC_LOG"
 make -s -C "$fixture/blorp" link-test-compiler BLORP_CC="$tools/fake cc" >"$scratch/make.stdout" 2>"$scratch/make.stderr" || { cat "$scratch/make.stderr" >&2; fail 'standalone diagnostic link'; }

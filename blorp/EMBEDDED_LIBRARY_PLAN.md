@@ -120,7 +120,7 @@ generate-compiler test-compiler: $(EMBEDDED_LIBRARY)
   `benchmarks/README.md` say so (`make -C blorp compiler` does it).
 - **`blorp format` and `blorp/build`.** The generated file is not formatted
   (its arms hold long literals). The repository's formatting gate names its
-  roots (`blorp/src blorp/standard_library blorp/test`), so it never walks
+  roots (`blorp/scripts blorp/src blorp/standard_library blorp/test`), so it never walks
   `blorp/build`; the README and AGENTS.md tell contributors to format the
   files they changed or to run the gate's command, not `blorp format blorp`.
 
@@ -151,6 +151,13 @@ union LibraryLayout:
 -- brackets cannot equal a path Load builds, which are absolute.
 private EMBEDDED_LIBRARY_ROOT: String = "<standard library>"
 ```
+
+As built, Load has two unions, because two unions in one module cannot share
+constructor names. `LibrarySource` (below) is the command line's choice and keeps
+the names `EmbeddedLibrary | LibraryDirectory(String)`. `LibraryLayout` is opaque
+over a private union named after what differs, `ReadFromDirectory(LibraryContents)
+| ReadFromEmbedded`; the embedded variant holds nothing, and its paths derive
+from `EMBEDDED_LIBRARY_ROOT`, so they cannot disagree with it.
 
 - `CompileRequest.library_root: String` (P1) becomes `library:
   LibrarySource` (`EmbeddedLibrary | LibraryDirectory(String)`); `--library-root

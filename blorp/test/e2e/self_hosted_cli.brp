@@ -66,8 +66,8 @@ private FORMAT_HELP: String =
 
 
 private COMPILE_HELP: String =
-    |usage: blorp compile INPUT.brp [-o OUTPUT.c] --library-root DIRECTORY
-    |       blorp compile --test-suite SUITE.brp [SUITE.brp ...] -o OUTPUT.c --library-root DIRECTORY
+    |usage: blorp compile INPUT.brp [-o OUTPUT.c] [--library-root DIRECTORY]
+    |       blorp compile --test-suite SUITE.brp [SUITE.brp ...] -o OUTPUT.c [--library-root DIRECTORY]
     |
     |Writes the C for INPUT.brp and the modules it imports. Without -o the C goes
     |to the input's name with .c, in the current directory: blorp compile
@@ -75,7 +75,8 @@ private COMPILE_HELP: String =
     |
     |options:
     |  -o OUTPUT.c              where to write the C (required with --test-suite)
-    |  --library-root DIRECTORY the standard library directory (required for now)
+    |  --library-root DIRECTORY use this standard library directory instead of the one
+    |                           built into blorp
     |  --test-suite             compile the listed test suite files into one program
     |  -h, --help               show this help
 
@@ -213,7 +214,7 @@ private func compile_names_a_missing_input_as_a_path_problem(
     expect_output(
         output,
         "",
-        "blorp: error: could not read module ${prefix}.brp: no such file\nhelp: check the path and provide a readable .brp file; the standard library is read from --library-root\n",
+        "blorp: error: could not read module ${prefix}.brp: no such file\nhelp: check the path and provide a readable .brp file\n",
     )
 
 
@@ -287,24 +288,70 @@ private func compile_test_suite_names_a_suite_listed_twice(
     expect_output(
         output,
         "",
-        "blorp: error: test suite input ${suite_file} is already part of this compilation\nhelp: list each test suite file once; foundation inputs are supplied by --library-root\n",
+        "blorp: error: test suite input ${suite_file} is already part of this compilation\nhelp: list each test suite file once; foundation inputs come from the standard library\n",
     )
 
 
-private func compile_without_a_library_root_is_a_usage_error_and_keeps_the_output(
+-- The embedded library is the one on disk: the C is the same bytes.
+private func compile_without_a_library_root_uses_the_embedded_library(
     compiler: String,
     work_directory: String,
 ) -> Result[Void, String]:
-    prefix = "${work_directory}/cli_compile_usage"
-    _ ?= written(prefix + ".brp", FORMATTED)
-    _ ?= written(prefix + ".c", "keep me")
-    output ?= run(compiler, ["compile", prefix + ".brp", "-o", prefix + ".c"], prefix, EXIT_USAGE)
-    _ ?= expect_output(
-        output,
-        "",
-        "blorp: error: blorp compile needs --library-root\nhelp: pass --library-root DIRECTORY, such as --library-root blorp/standard_library\n",
+    prefix = "${work_directory}/cli_embedded"
+    source = prefix + ".brp"
+    _ ?= written(source, FORMATTED)
+    embedded ?= run(
+        compiler,
+        ["compile", source, "-o", prefix + "_embedded.c"],
+        prefix + "_embedded",
+        0,
     )
-    contents_are(prefix + ".c", "keep me")
+    _ ?= expect_output(embedded, "", "")
+    on_disk ?= run(
+        compiler,
+        ["compile", source, "--library-root", LIBRARY_ROOT, "-o", prefix + "_disk.c"],
+        prefix + "_disk",
+        0,
+    )
+    _ ?= expect_output(on_disk, "", "")
+    embedded_c ?= read_text(prefix + "_embedded.c").map_err(describe)
+    disk_c ?= read_text(prefix + "_disk.c").map_err(describe)
+    if embedded_c.length() > 0:
+        expect(embedded_c, disk_c, "C without --library-root")
+    else:
+        Err("compile wrote an empty C file")
+
+
+-- A copy of the library with an unparsable list.brp: --library-root reads the
+-- copy and fails there, while the embedded library, untouched, compiles.
+private func a_library_root_wins_over_the_embedded_library(
+    compiler: String,
+    work_directory: String,
+) -> Result[Void, String]:
+    prefix = "${work_directory}/cli_override"
+    copy = prefix + "_library"
+    _ ?= command(["cp", "-R", LIBRARY_ROOT, copy], prefix + "_copy", 0, COMPILATION_TIMEOUT_MS)
+    original ?= read_text("${copy}/list.brp").map_err(describe)
+    _ ?= written("${copy}/list.brp", original + "\nfunc broken( -> Int:\n")
+    source = prefix + ".brp"
+    _ ?= written(source, FORMATTED)
+    overridden ?= run(
+        compiler,
+        ["compile", source, "--library-root", copy, "-o", prefix + "_copy.c"],
+        prefix + "_copy_run",
+        EXIT_REJECTED,
+    )
+    _: Void ?= if overridden.stderr.has_text("${copy}/list.brp:"):
+        Ok(void)
+    else:
+        Err("the changed copy was not read; stderr: ${overridden.stderr}")
+    embedded ?= run(
+        compiler,
+        ["compile", source, "-o", prefix + "_embedded.c"],
+        prefix + "_embedded",
+        0,
+    )
+    expect_output(embedded, "", "")
 
 
 -- format on a file
@@ -689,12 +736,18 @@ func suite(compiler: String, work_directory: String) -> TestSuite:
                 ),
             ),
             (
-                "compile without a library root is a usage error and keeps the output",
+                "compile without a library root uses the embedded library",
                 func(): reported(
-                    compile_without_a_library_root_is_a_usage_error_and_keeps_the_output(
+                    compile_without_a_library_root_uses_the_embedded_library(
                         compiler,
                         work_directory,
                     ),
+                ),
+            ),
+            (
+                "a library root wins over the embedded library",
+                func(): reported(
+                    a_library_root_wins_over_the_embedded_library(compiler, work_directory),
                 ),
             ),
             (

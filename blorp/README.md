@@ -23,18 +23,21 @@ make -C blorp example          # compile, build and run test/e2e/fixtures/return
 ```
 
 The `blorp` command (`blorp/build/blorp`, also `bin/blorp`) has the commands
-`compile`, `format` and `help`. `compile` takes the input, the library root and
-where to write the C:
+`compile`, `format` and `help`. `compile` takes the input and where to write the
+C; the standard library is built into the binary:
 
 ```sh
-bin/blorp compile input.brp --library-root blorp/standard_library -o output.c
+bin/blorp compile input.brp -o output.c
 clang -std=c11 -Wall -Wextra -Werror -pedantic -O0 output.c -o program -lm
 ./program
 ```
 
 Without `-o` the C goes to the input's name with `.c` in the current directory.
-`blorp help` and `blorp help COMMAND` print each command's options. There is no
-default library root and no fallback library yet: `--library-root` is required.
+`blorp help` and `blorp help COMMAND` print each command's options.
+`--library-root DIRECTORY` compiles against that directory's library instead of the
+embedded copy, as the tests and the compiler's own build do. The embedded copy
+is the text of `blorp/standard_library` at the last `make -C blorp compiler`;
+diagnostics name its files `<standard library>/list.brp`.
 The exit status is 0 on success, 1 when the code needs fixing (a diagnostic, a
 file that does not parse, a file `--check` would reformat), 2 for bad usage, 3
 when a path could not be read or written, and 4 for a fault in blorp itself.
@@ -1216,6 +1219,17 @@ ARM64, Linux x64 and Linux ARM64).
 downloads the seed for this machine, verifies the digest, caches it and runs
 it on `blorp/src/main.brp` to produce `blorp/build/blorp.c`, which `make`
 links. The compiler's own source can use only what the seed supports.
+
+The embedded standard library is a generated module,
+`blorp/build/generated/embedded_library.brp`, which `src/compile/load/load.brp`
+imports. The seed builds [`scripts/embed_library.brp`](scripts/embed_library.brp),
+and `make -C blorp compiler` runs it whenever a library file or the generator
+changes. Anything that compiles `src/main.brp` directly (a benchmark recipe, a
+seed workflow) must run `make -C blorp build/generated/embedded_library.brp`
+first. The generated file is not formatted, and the repository formatting
+gate does not walk `blorp/build`; format the files you changed rather than
+running `blorp format blorp`. The gate's roots are `blorp/scripts`, `blorp/src`,
+`blorp/standard_library` and `blorp/test`.
 
 `scripts/blorp-fixpoint --prove` checks that the compiler reproduces itself:
 the seed builds A, A builds B and B builds C. B and C must emit identical C, A

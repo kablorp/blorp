@@ -1,0 +1,242 @@
+---
+Tests for the library embedded in the compiler: the generated module still
+matches `blorp/standard_library`, and Load treats `EmbeddedLibrary` as a layout
+whose modules have paths under `<standard library>`.
+
+The generated module is built by `make -C blorp test-compiler`, so these tests
+run against the library as it was at the last build.
+---
+import:
+    bool: and, not
+    fs: EntryKind(File), describe, list_directory, read_text
+    int: Int methods
+    io: print_error
+    list: List methods
+    option: Option methods
+    path as Path
+    result: Result methods
+    string: String methods
+    test: TestSuite
+    ../../../../build/generated/embedded_library: EMBEDDED_LIBRARY_PATHS, embedded_library_file
+    ../../../../src/cli: has_source_suffix
+    ../../../../src/compile/load/load:
+        LibrarySource(EmbeddedLibrary, LibraryDirectory),
+        LibraryLayout,
+        import_path,
+        library_layout,
+        load_program,
+        load_test_program,
+        module_role,
+    ../../../../src/syntax/names: intern_names, program_names
+    ../../../../src/syntax/parse: ImportOrigin(LibraryImport), ParsedImport
+    ../../../../src/syntax/source:
+        ModuleKind(UserModule, LibraryModule, FoundationTypesModule, FoundationPreludeModule),
+        compiler_source,
+
+
+private LIBRARY_ROOT: String = "blorp/standard_library"
+
+private PROGRAM: String = "blorp/test/e2e/fixtures/return/zero.brp"
+
+
+-- The library files directly under the library directory, in byte order.
+private func library_file_names() -> Result[List[String], String]:
+    entries ?= list_directory(LIBRARY_ROOT).map_err(describe)
+    Ok(
+        entries
+            .filter(pure func(entry): and(entry.kind == File, entry.name.has_source_suffix()))
+            .map(pure func(entry): entry.name),
+    )
+
+
+-- The first file whose embedded text differs from the file on disk.
+private func stale_file(names: List[String]) -> Result[Option[String], String]:
+    match names:
+        []:
+            Ok(None)
+        [name, ...later]:
+            match read_text(Path.join(LIBRARY_ROOT, name)):
+                Err(error):
+                    Err(describe(error))
+                Ok(disk):
+                    if embedded_library_file(name) == Some(disk):
+                        stale_file(later)
+                    else:
+                        Ok(Some(name))
+
+
+private func freshness_problem() -> Result[Void, String]:
+    names ?= library_file_names()
+    stale ?= stale_file(names)
+    if EMBEDDED_LIBRARY_PATHS != names:
+        Err(
+            "embedded paths [${EMBEDDED_LIBRARY_PATHS.join(", ")}] differ from the directory's [${names.join(", ")}]; run make -C blorp compiler",
+        )
+    else:
+        match stale:
+            None:
+                Ok(void)
+            Some(name):
+                Err(
+                    "embedded ${name} differs from ${LIBRARY_ROOT}/${name}; run make -C blorp compiler",
+                )
+
+
+-- Embedded paths are the directory's `.brp` files, and each file's text is the
+-- embedded text byte for byte.
+func test_embedded_library_is_the_library_directory() -> Bool:
+    match freshness_problem():
+        Ok(_):
+            True
+        Err(message):
+            print_error(message)
+            False
+
+
+pure func test_a_file_that_is_not_embedded_is_absent() -> Bool:
+    and(
+        embedded_library_file("missing.brp").is_none(),
+        embedded_library_file("README.md").is_none(),
+    )
+
+
+private pure func embedded_layout() -> LibraryLayout:
+    library_layout(EmbeddedLibrary, "/project")
+
+
+pure func test_embedded_roles_use_the_embedded_root() -> Bool:
+    layout = embedded_layout()
+    and(
+        and(
+            module_role(layout, "<standard library>/_base.brp") == FoundationTypesModule,
+            module_role(layout, "<standard library>/prelude.brp") == FoundationPreludeModule,
+        ),
+        and(
+            and(
+                module_role(layout, "<standard library>/int.brp") == LibraryModule,
+                module_role(layout, "<standard library>_copy/int.brp") == UserModule,
+            ),
+            and(
+                module_role(layout, "/project/<standard library>/int.brp") == UserModule,
+                module_role(layout, "/project/main.brp") == UserModule,
+            ),
+        ),
+    )
+
+
+pure func test_a_directory_layout_joins_a_relative_root_to_the_working_directory() -> Bool:
+    layout = library_layout(LibraryDirectory("lib/../std"), "/project")
+    and(
+        and(
+            module_role(layout, "/project/std/int.brp") == LibraryModule,
+            module_role(layout, "/project/std/_base.brp") == FoundationTypesModule,
+        ),
+        module_role(layout, "/project/lib/int.brp") == UserModule,
+    )
+
+
+pure func test_an_embedded_library_import_has_the_embedded_path() -> Bool:
+    part = intern_names(program_names().names, ["int"])
+    request: ParsedImport = {
+        path = { origin = LibraryImport, parts = part.ids },
+        module_alias = None,
+        symbols = [],
+        span = { source = compiler_source(), start = 0, end = 0 },
+    }
+    match import_path("/project/main.brp", request, part.names, embedded_layout()):
+        Ok(actual): actual == "<standard library>/int.brp"
+        Err(_): False
+
+
+private EMBEDDED_PREFIX: String = "<standard library>/"
+
+private MISSING_IMPORT: String = "blorp/test/e2e/fixtures/test_entry/missing_library_import.brp"
+
+private TEST_ENTRY: String = "blorp/test/e2e/fixtures/test_entry/passing.brp"
+
+
+private pure func embedded_rows(paths: List[String]) -> Int:
+    paths
+        .filter(pure func(path): path.starts_with(EMBEDDED_PREFIX))
+        .length()
+
+
+-- A program compiled against the embedded library reads no library directory:
+-- every module but the root has an embedded path.
+func test_a_program_loads_against_the_embedded_library() -> Bool:
+    match load_program(PROGRAM, EmbeddedLibrary):
+        Err(_):
+            False
+        Ok(loaded):
+            paths = loaded.sources.modules.map(pure func(row): row.path)
+            and(
+                and(
+                    paths.contains("<standard library>/_base.brp"),
+                    paths.contains("<standard library>/prelude.brp"),
+                ),
+                embedded_rows(paths) == paths.length() - 1,
+            )
+
+
+-- A library import with no embedded file is the ordinary missing-import
+-- diagnostic, naming the embedded path.
+func test_a_missing_embedded_module_is_a_missing_import() -> Bool:
+    match load_program(MISSING_IMPORT, EmbeddedLibrary):
+        Ok(_):
+            False
+        Err(failure):
+            and(
+                (
+                    failure.diagnostic.message
+                    == "could not read module <standard library>/no_such_library_module.brp: no such file"
+                ),
+                (
+                    failure.diagnostic.help
+                    == "check the import path and provide a readable .brp file under its source root"
+                ),
+            )
+
+
+-- The test entry module is queued from the layout's root, so under the
+-- embedded layout it is the embedded test.brp.
+func test_the_test_entry_is_read_from_the_embedded_library() -> Bool:
+    no_later_roots: List[String] = []
+    match load_test_program(TEST_ENTRY, no_later_roots, EmbeddedLibrary):
+        Err(_):
+            False
+        Ok(loaded):
+            paths = loaded.sources.modules.map(pure func(row): row.path)
+            paths.contains("<standard library>/test.brp")
+
+
+tests: TestSuite = {
+    description = "Blorp embedded standard library",
+    tests = [
+        (
+            "embedded library is the library directory",
+            test_embedded_library_is_the_library_directory,
+        ),
+        ("a file that is not embedded is absent", test_a_file_that_is_not_embedded_is_absent),
+        ("embedded roles use the embedded root", test_embedded_roles_use_the_embedded_root),
+        (
+            "a directory layout joins a relative root to the working directory",
+            test_a_directory_layout_joins_a_relative_root_to_the_working_directory,
+        ),
+        (
+            "an embedded library import has the embedded path",
+            test_an_embedded_library_import_has_the_embedded_path,
+        ),
+        (
+            "a program loads against the embedded library",
+            test_a_program_loads_against_the_embedded_library,
+        ),
+        (
+            "a missing embedded module is a missing import",
+            test_a_missing_embedded_module_is_a_missing_import,
+        ),
+        (
+            "the test entry is read from the embedded library",
+            test_the_test_entry_is_read_from_the_embedded_library,
+        ),
+    ],
+}

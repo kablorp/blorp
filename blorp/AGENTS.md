@@ -109,6 +109,15 @@ bash benchmarks/bench.sh <name>           # cross-language speed table (see benc
 
 Run `blorp/build/blorp format <files>` on the `.brp` files you changed
 before committing them; `make -C blorp test` fails on any unformatted file.
+Do not run `blorp format blorp`: it would rewrite the generated, unformatted
+`blorp/build/generated/embedded_library.brp`.
+
+The compiler embeds the standard library through that generated module, which
+`make -C blorp compiler` and `test-compiler` build first. A compile of
+`blorp/src/main.brp` by anything else (a seed command, a benchmark recipe)
+needs `make -C blorp build/generated/embedded_library.brp` beforehand. Tests
+and the build pass `--library-root blorp/standard_library`, so they test the
+library on disk; the freshness test fails when the module is stale.
 
 **Tests.** Compiler tests are Blorp `TestSuite`s, not a test `main` or Python.
 The one sanctioned shell test is

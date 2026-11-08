@@ -95,6 +95,11 @@ Artifacts, hashes and explicit coverage status stay under
 
 ## Rotating the seed pin
 
+Before the compiler C, the same seed builds `blorp/scripts/embed_library.brp`,
+whose output `blorp/build/generated/embedded_library.brp` holds the standard
+library the compiler embeds. Both are Make file targets, so they are rebuilt only
+when the library or the generator changes; `blorp-seed.yml` runs the target
+before reference A. The generator uses the seed's old command line too.
 `blorp/bootstrap.env` names the seed release and its three SHA-256 values.
 Rotate the tag, source commit and all three digests together, and only after
 `blorp-seed.yml` has published and qualified the release for every target. The
@@ -102,13 +107,13 @@ first rotation after the rename also switches `seed_release_family` in
 `scripts/blorp-compiler-bootstrap` from `blorp2` to `blorp`, in the same
 change as the pin.
 The seed still has the old command line (`--library-root DIR INPUT OUTPUT`), so
-`generate-compiler` in `blorp/Makefile`, the seed step of `blorp-seed.yml` and
+`generate-compiler` and the generator target in `blorp/Makefile`, the seed step of `blorp-seed.yml` and
 the fake seed in `blorp/test/tooling/test_bootstrap.sh` keep it. The first
 rotation to a seed that has the `blorp compile` command moves those three to
 `compile INPUT --library-root DIR -o OUTPUT` in the same change as the pin, and
 the resolver's `seed_release_family` with it. Also in that change:
 `blorp/bootstrap.env`, and the seed's expected arguments at
-`blorp/test/tooling/test_bootstrap.sh:277`.
+`blorp/test/tooling/test_bootstrap.sh` (the two seed argument lists).
 
 The seed workflow's fixture parity step deliberately accepts only exit 0 and 1
 for a fixture: an exit 4 (a fault in blorp) or 2 or 3 fails the step.

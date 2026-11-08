@@ -116,8 +116,8 @@ blorp run INPUT.brp [ARGUMENT ...]            (P3)
 ```
 
 - **`compile`** loads the input and its imports, with the standard library
-  from the embedded copy unless `--library-root` is given (P2; required in
-  P1), and writes C atomically (today's `publish`). An input must end in
+  from the embedded copy unless `--library-root` is given (required in P1,
+  optional since P2), and writes C atomically (today's `publish`). An input must end in
   `.brp` and have a nonempty stem; the output must not be one of the inputs.
   Default output: `<input stem>.c` in the current directory, so
   `blorp compile src/main.brp` writes `./main.c`; the help text says so.
@@ -159,7 +159,7 @@ landed:
 
 ```sh
 blorp format --check --exclude blorp/test/unit/test_format/fixtures \
-    blorp/src blorp/standard_library blorp/test
+    blorp/scripts blorp/src blorp/standard_library blorp/test
 ```
 
 and `test_repository_formatted.brp` is deleted in favour of it. The roots are
@@ -235,7 +235,7 @@ within +10% (to be confirmed once measured).
    `classify()` in `scripts/blorp-fixpoint` and the seed workflow's status
    check are updated to D6's statuses; the seed callers stay.
 2. **P2: the embedded standard library**, after which `--library-root` is
-   optional.
+   optional. Landed; the design note is `EMBEDDED_LIBRARY_PLAN.md`.
 3. **P3: `blorp test` and `blorp run`**, in their own plan.
 
 Separately, Decision 4 means `blorp format --check` over `blorp/` fails until

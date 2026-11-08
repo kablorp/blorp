@@ -5,6 +5,10 @@ import:
     path as Path
     string: String methods
     system: get_current_directory
+    -- The one import that leaves src/: the module is generated into the build
+    -- directory (see EMBEDDED_LIBRARY_PLAN.md), so build it first with
+    -- `make -C blorp compiler`.
+    ../../../build/generated/embedded_library: embedded_library_file
     ../../syntax/lex: lex
     ../../syntax/names: NameId, NameTable
     ../../syntax/parse:
@@ -56,6 +60,19 @@ private pure func failure(modules: List[SourceFile], error: Diagnostic) -> LoadF
     { sources = { modules = modules }, diagnostic = error }
 
 
+-- Where the library comes from, as the command line wrote it.
+union LibrarySource:
+    -- The copy built into the compiler.
+    EmbeddedLibrary
+    -- A directory, absolute or relative to the working directory.
+    LibraryDirectory(String)
+
+
+-- The root of embedded library paths in diagnostics. A relative name in angle
+-- brackets cannot equal a path Load builds, which are absolute.
+private EMBEDDED_LIBRARY_ROOT: String = "<standard library>"
+
+
 private record LibraryContents {
     root: String,
     prefix: String,
@@ -64,28 +81,57 @@ private record LibraryContents {
 }
 
 
--- The configured library root is the only authority for module roles: the
+-- The variants differ in where the text is read from. The embedded one holds
+-- nothing: its paths always derive from EMBEDDED_LIBRARY_ROOT, so they cannot
+-- disagree with it.
+private union LibraryChoice:
+    -- Library and foundation modules under a directory.
+    ReadFromDirectory(LibraryContents)
+    -- The embedded copy; its modules get paths under EMBEDDED_LIBRARY_ROOT.
+    ReadFromEmbedded
+
+
+-- The configured library is the only authority for module roles: the
 -- foundation inputs are its two designated files, and every other file under it
 -- is library code. Only library_layout builds one, so these paths always agree.
-opaque type LibraryLayout = LibraryContents
+opaque type LibraryLayout = LibraryChoice
 
 
--- The root is normalized here, like every path passed to module_role.
-pure func library_layout(root: String) -> LibraryLayout:
-    normalized = Path.normalize(root)
-    into_opaque LibraryLayout({
-        root = normalized,
-        prefix = Path.join(normalized, ""),
-        types_path = Path.join(normalized, FOUNDATION_TYPES_PATH),
-        prelude_path = Path.join(normalized, FOUNDATION_PRELUDE_PATH),
-    })
+private pure func root_contents(root: String) -> LibraryContents:
+    {
+        root = root,
+        prefix = Path.join(root, ""),
+        types_path = Path.join(root, FOUNDATION_TYPES_PATH),
+        prelude_path = Path.join(root, FOUNDATION_PRELUDE_PATH),
+    }
+
+
+private pure func embedded_contents() -> LibraryContents:
+    root_contents(EMBEDDED_LIBRARY_ROOT)
+
+
+private pure func layout_contents(layout: LibraryLayout) -> LibraryContents:
+    match from_opaque LibraryLayout(layout):
+        ReadFromDirectory(contents): contents
+        ReadFromEmbedded: embedded_contents()
+
+
+-- A directory root is joined to the working directory and normalized here,
+-- like every path passed to module_role.
+pure func library_layout(source: LibrarySource, working_directory: String) -> LibraryLayout:
+    match source:
+        EmbeddedLibrary:
+            into_opaque LibraryLayout(ReadFromEmbedded)
+        LibraryDirectory(root):
+            directory = Path.normalize(Path.join(working_directory, root))
+            into_opaque LibraryLayout(ReadFromDirectory(root_contents(directory)))
 
 
 -- Decides the role of a normalized path, whether it was queued by an import or
 -- named on the command line. The application root is the caller's concern: it
 -- is a user module wherever it lives, and only foundation roles are rejected.
 pure func module_role(layout: LibraryLayout, path: String) -> ModuleKind:
-    contents = from_opaque LibraryLayout(layout)
+    contents = layout_contents(layout)
     if path == contents.types_path:
         FoundationTypesModule
     else if path == contents.prelude_path:
@@ -128,7 +174,7 @@ pure func import_path(
 ) -> Result[String, Diagnostic]:
     base = match request.path.origin:
         LibraryImport:
-            from_opaque LibraryLayout(layout).root
+            layout_contents(layout).root
         RelativeImport(parents):
             var directory = Path.dirname(importer)
             var remaining = parents
@@ -166,32 +212,83 @@ private pure func known_module(
     known
 
 
-private func read_module(path: String, site: Option[Span]) -> Result[String, Diagnostic]:
-    match path.read_text():
-        Ok(contents):
-            Ok(contents)
-        Err(error):
-            -- describe names the path: "missing.brp: no such file".
-            message = "could not read module ${error.describe()}"
-            -- Only the command line and the library root name a module with no
-            -- import site: that is a path problem, not a fault in the program.
-            match site:
-                Some(import_site):
-                    Err(
-                        diagnostic(
-                            import_site,
-                            message,
-                            "check the import path and provide a readable .brp file under its source root",
-                        ),
-                    )
-                None:
-                    Err(
-                        path_error(
-                            compiler_span(),
-                            message,
-                            "check the path and provide a readable .brp file; the standard library is read from --library-root",
-                        ),
-                    )
+-- Where a module's text comes from. Only library and foundation modules of
+-- an embedded layout are embedded; every other module is a file.
+private union ModuleStore:
+    DiskFile
+    -- The path relative to the library root.
+    EmbeddedFile(String)
+
+
+private pure func module_store(
+    layout: LibraryLayout,
+    role: ModuleKind,
+    path: String,
+) -> Result[ModuleStore, Diagnostic]:
+    match from_opaque LibraryLayout(layout):
+        ReadFromDirectory(_):
+            Ok(DiskFile)
+        ReadFromEmbedded:
+            match role:
+                UserModule:
+                    Ok(DiskFile)
+                FoundationTypesModule | FoundationPreludeModule | LibraryModule:
+                    prefix = embedded_contents().prefix
+                    relative = if path.starts_with(prefix):
+                        path.slice(prefix.length(), path.length())
+                    else:
+                        None
+                    match relative:
+                        Some(inside):
+                            Ok(EmbeddedFile(inside))
+                        None:
+                            Err(
+                                internal_error(
+                                    compiler_span(),
+                                    "a library module of the embedded layout has a path outside the embedded root",
+                                ),
+                            )
+
+
+-- The failure to read a module. `reason` is the file system's description of
+-- the path, or "path: no such file" for an embedded file. A module with no
+-- import site was named by the command line, or is a foundation input; the
+-- advice differs, since only the second depends on the library source.
+private pure func unreadable(reason: String, site: Option[Span], role: ModuleKind) -> Diagnostic:
+    message = "could not read module ${reason}"
+    match site:
+        Some(import_site):
+            diagnostic(
+                import_site,
+                message,
+                "check the import path and provide a readable .brp file under its source root",
+            )
+        None:
+            help = match role:
+                UserModule:
+                    "check the path and provide a readable .brp file"
+                FoundationTypesModule | FoundationPreludeModule | LibraryModule:
+                    "check that --library-root names a directory that holds the standard library"
+            path_error(compiler_span(), message, help)
+
+
+private func read_module(
+    layout: LibraryLayout,
+    current: RequestedModule,
+) -> Result[String, Diagnostic]:
+    store ?= module_store(layout, current.role, current.path)
+    match store:
+        DiskFile:
+            match current.path.read_text():
+                Ok(contents):
+                    Ok(contents)
+                Err(error):
+                    -- describe names the path: "missing.brp: no such file".
+                    Err(unreadable(error.describe(), current.site, current.role))
+        EmbeddedFile(relative):
+            match embedded_library_file(relative):
+                Some(contents): Ok(contents)
+                None: Err(unreadable("${current.path}: no such file", current.site, current.role))
 
 
 -- Everything loading threads through the queue. Each queued file yields exactly
@@ -325,7 +422,7 @@ private func load_module(
     state: LoadState,
     current: RequestedModule,
 ) -> Result[LoadState, LoadFailure]:
-    match current.path.read_module(current.site):
+    match state.layout.read_module(current):
         Err(error):
             Err(failure(state.modules, error))
         Ok(contents):
@@ -365,7 +462,7 @@ private func load_test_entry(
     state: LoadState,
     grouped: List[RequestedModule],
 ) -> Result[LoadState, LoadFailure]:
-    path = Path.join(from_opaque LibraryLayout(state.layout).root, "test.brp")
+    path = Path.join(layout_contents(state.layout).root, "test.brp")
     known = state.requests.known_module(path)
     id: ModuleId ?= match known:
         Some(request):
@@ -441,16 +538,16 @@ pure func working_directory_result(result: Result[String, String]) -> Result[Str
 
 
 -- Every queued path has one identity, role, read, and parse in this invocation.
-func load_program(root_path: String, library_root: String) -> Result[LoadedProgram, LoadFailure]:
-    root_path.load_input(library_root, ApplicationInput)
+func load_program(root_path: String, library: LibrarySource) -> Result[LoadedProgram, LoadFailure]:
+    root_path.load_input(library, ApplicationInput)
 
 
 func load_test_program(
     root_path: String,
     grouped_paths: List[String],
-    library_root: String,
+    library: LibrarySource,
 ) -> Result[LoadedProgram, LoadFailure]:
-    root_path.load_input(library_root, TestSuiteInput(grouped_paths))
+    root_path.load_input(library, TestSuiteInput(grouped_paths))
 
 
 -- The later test suite roots, queued after the foundation inputs in
@@ -476,7 +573,7 @@ private pure func queue_roots(
                             diagnostic(
                                 compiler_span(),
                                 "test suite input ${written} is already part of this compilation",
-                                "list each test suite file once; foundation inputs are supplied by --library-root",
+                                "list each test suite file once; foundation inputs come from the standard library",
                             ),
                         ),
                     )
@@ -497,12 +594,12 @@ private pure func queue_roots(
 
 private func load_input(
     root_path: String,
-    library_root: String,
+    library: LibrarySource,
     mode: LoadMode,
 ) -> Result[LoadedProgram, LoadFailure]:
     working_directory ?= get_current_directory().working_directory_result()
-    layout = Path.join(working_directory, library_root).library_layout()
-    foundation = from_opaque LibraryLayout(layout)
+    layout = library_layout(library, working_directory)
+    foundation = layout_contents(layout)
     root_file = Path.normalize(Path.join(working_directory, root_path))
     -- Only the foundation inputs are barred from being the application root.
     _: Void ?= match layout.module_role(root_file):
@@ -513,7 +610,7 @@ private func load_input(
                     diagnostic(
                         { source = root_module_id().module_source(), start = 0, end = 0 },
                         "foundation modules cannot be application roots",
-                        "choose an application module; foundation inputs are supplied by --library-root",
+                        "choose an application module; foundation inputs come from the standard library",
                     ),
                 ),
             )
