@@ -11,9 +11,10 @@ Earlier, Keith had approved the direction:
 - streaming later;
 - `Exit` as a `fixed union`.
 
-L0 is implemented; L1 and L2 are not implemented. The feasibility review
-prototyped the C core on macOS 26 and Linux arm64, and compiled every declaration and example below
-against a scratch library. Those spikes were not kept.
+L0 is implemented, and L1 implements the API beside `run_to_files`; L2 is not
+implemented. The feasibility review had prototyped the C core on macOS 26 and
+Linux arm64, and compiled every declaration and example below against a
+scratch library.
 
 ## Problem
 
@@ -142,7 +143,8 @@ private func isolated(binary: String, arguments: List[String]) -> Result[Capture
 
 - No shell and no implicit PATH search; arguments are literal.
 - A child never outlives the call. When it exits, or the deadline passes, its
-  process group is killed and only what is already buffered is read, so a
+  process group is killed and only what is already buffered is read (at most
+  16 MiB per stream, which only a process that left the group can reach), so a
   grandchild that keeps a pipe open cannot hang the call. Python, Rust, and Go
   before 1.20's `WaitDelay` hang there.
 - Writing `stdin` while capturing both streams runs one poll loop over the
@@ -153,10 +155,23 @@ private func isolated(binary: String, arguments: List[String]) -> Result[Capture
   `Signaled` or `TimedOut`, up to three trailing bytes of a cut-off character
   are dropped first, so a timeout is not reported as bad text.
 - The parent's SIGCHLD disposition must be the default, and it is never
-  changed.
-- `find_program` skips empty and relative PATH entries (Go's `ErrDot`), and
-  accepts a regular file the process may execute
-  (`faccessat(X_OK, AT_EACCESS)`).
+  changed. If foreign code has changed it, `capture` is
+  `LaunchFailed(OtherOs(ECHILD))`, decided before anything starts, since the
+  system would reap the child itself and the wait would report ECHILD.
+- A timeout of 0 or less is `Ok` with `TimedOut` and empty output as soon as
+  the command is validated, without starting the program.
+- A `directory` containing NUL is `DirectoryFailed` with `PathContainsNul`,
+  as `fs` reports a path, before any system call.
+- `find_program` skips empty and relative PATH entries (Go's `ErrDot`) and
+  entries that are not UTF-8, and accepts a regular file the process may
+  execute (`faccessat(X_OK, AT_EACCESS)`). A name that is empty or contains
+  `/` is `NotOnPath` without a search; one with NUL is `ContainsNul`.
+- A reply the library cannot decode (an exit that is not decimal text of a
+  known Exit code, an error tag the C side does not build, a list of another
+  length) is a runtime defect, never an outcome (P5): the C side checks every
+  code before replying, and the library's unreachable branches call the
+  `process.fault` native, which prints "blorp: process runtime defect:" and
+  the message, then aborts.
 - Inherited descriptors rely on `O_CLOEXEC`, which the runtime already uses
   everywhere, as Go and Rust do.
 - `fork` stays. `posix_spawn` reports a missing directory and a missing
@@ -202,6 +217,21 @@ private func isolated(binary: String, arguments: List[String]) -> Result[Capture
   It would move the table into the compiler rather than remove it, and every
   new error kind would then need a compiler change and a rotation. Revisit it
   as one general design if several libraries come to need it.
+- **P5, the native reply boundary** (Keith, 2026-11-09). `capture`'s native
+  replies `Ok([exit, stdout, stderr])`, the exit as the decimal text of its
+  Int code that `snprintf` writes, or `Err(code)` with the error's tag and
+  detail; `find_program`'s replies the path or such a code. Keith first chose
+  to carry the exit as an Int that needs no parsing (A) with an abort for
+  impossible replies (C). A proved unbuildable: a native returns one value,
+  an Int, a String, a `List[String]` or Void, so an Int cannot travel beside
+  two Strings without a handle table of finished captures or a new tuple
+  payload in the compiler. He then chose C alone: keep the decimal text, and
+  treat every reply the C side cannot produce as an internal defect. The
+  natives and the library ship together, so these states are unreachable;
+  aborting is honest, while decoding them into a `ProcessError` such as
+  `LaunchFailed(OtherOs(0))` would invent a failure the operating system never
+  reported. The C side checks each code as it builds it, and the library calls
+  the `process.fault` native from its impossible branches.
 
 Removed during review:
 - the `Environment` and `Input` unions, because a Dict and an Option say the

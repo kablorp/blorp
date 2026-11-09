@@ -29,21 +29,19 @@ done.
     `io/`.
   - **Waits on Keith:** O1, a user's own `print`, before landing 5.
   - **Afterwards:** `Stringable` and interpolation, errors as `Stringable`
-    (deleting `describe`), the `io/` move, `print` in the prelude, a seed
-    rotation, process L1 as `io/process`, then `Path`.
+    (deleting `describe`, `process`'s included), the `io/` move (`process`
+    becomes `io/process`), `print` in the prelude, a seed rotation that also
+    carries the process natives, then `Path`.
 - **Process API:** [`PROCESS_DECISIONS.md`](PROCESS_DECISIONS.md).
   - **Status:** L0 is implemented and independently reviewed; final combined
     landing gates and four-platform CI pass; L0 is published. Shared
     errors/formatting belong to `io`,
     with one internal native-code decoder. Existing imports are migrated.
     [`L0 results`](../benchmarks/results/blorp-process-l0-2026-11-08.md).
-  - **Next:** L1, the natives and library. Settle the primitive native reply
-    boundary before production implementation; do not invent OS failures for
-    invalid transport data.
-  - **Afterwards:**
-    - L1, the `process.capture` and `process.find_program` natives, the C core
-      and `process.brp`;
-    - L2, migrating the 17 `run_to_files` call sites and deleting it.
+    L1 is implemented: the `process.capture`, `process.find_program` and
+    `process.fault` natives, the C core and `process.brp`. A reply the C side
+    never builds aborts through `process.fault`.
+  - **Next:** L2, migrating the 17 `run_to_files` call sites and deleting it.
   - **Later:** binary capture after `Bytes`, and `run` with streaming.
 - **LSP foundations:**
   - **Status:** the pure `json` codec is implemented and independently
@@ -94,6 +92,13 @@ None of these is planned yet. Each wants its own short design or brief.
     not (`benchmarks/results/blorp_fs_lines_2026-11-05.md`).
   - **`max` and `min` are receiver-only.** `max(a, b)` reports "unknown
     function", so only `a.max(b)` works.
+- **No never-returning type.** `process.brp`'s `fault` calls the `process.fault`
+  native, which aborts, and then a second function that is never reached, to
+  give the call every type. A never-returning builtin result, or a bottom type,
+  would replace the pair; do not copy it as a pattern.
+- **Native tables repeat `process_helpers = False`** in 14 entries of
+  `src/compile/runtime/system.brp`. A default, or one grouped constructor,
+  could remove them.
 - **Constants cannot call functions,** so a `Bytes` constant such as a file
   signature must be written as a function.
 

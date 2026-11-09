@@ -9,7 +9,7 @@ decisions left open.
 - **Flat library.** The standard library is flat, and a bare import path names
   one file under the library root. Related modules cannot be grouped, so `io`
   mixes console output (`print`, `print_error`) with the error identity that
-  `fs`, and soon `process`, share (`IOError`, `IOErrorKind`, `describe`).
+  `fs` and `process` share (`IOError`, `IOErrorKind`, `describe`).
 - **Colliding `describe`.** Each library error type gets its own `describe`:
   `io`'s today, JSON's with its pending review fix (`blorp/json-review-fixes`),
   and `process`'s with the process API. A program that imports two of them by
@@ -52,8 +52,9 @@ decisions left open.
    - `describe` is deleted, with no alias;
    - JSON's `ParseError` gets the same treatment, once its `describe` lands
      with the pending JSON review fix;
-   - `process` has no error type yet: `ProcessError` is `Stringable` from
-     the start (landing 7);
+   - `process`'s `ProcessError` and `ProcessErrorKind` get the same
+     treatment (process L1 landed before this plan's landings; see
+     "Landings");
    - code still branches on `error.kind`, never on the text.
 6. **The `io/` layout.**
 
@@ -178,24 +179,31 @@ Probed on 2026-11-09 against `390945503`, with scratch programs only.
      Int's plain `to_string`, including `5.to_string()`. If the seed rejects
      it, the rotation (landing 6) moves ahead of this landing.
 3. **Errors become `Stringable`.**
-   - `IOErrorKind`, `IOError` and JSON's `ParseError` implement it.
+   - `IOErrorKind`, `IOError`, JSON's `ParseError` and `process`'s
+     `ProcessErrorKind` and `ProcessError` implement it.
    - `describe` is deleted, and every caller and README is migrated. Code the
      seed builds (`src/main.brp`, `load.brp`, `scripts/embed_library.brp`)
      uses `.to_string()` calls and lambdas, unless the seed is shown to
      accept `.map_err(to_string)`, and can't write `"${error}"` until
      landing 6.
 4. **The `io/` move,** as in decision 6, with every import migrated: the
-   compiler, the tests and the docs. It needs landing 1.
+   compiler, the tests and the docs. `process.brp` becomes `io/process.brp`.
+   It needs landing 1.
 5. **The prelude:** `print` and `print_error` (decision 7), with R3 amended.
    It is blocked until Keith answers O1.
 6. **A seed rotation.** It lets library and compiler code interpolate
    non-Strings, and carries the pending seed-family switch and the seed's
    move to the `blorp compile` command line (`UINT8_BYTES_PLAN.md`, L2). It can
    go any time after landing 2, and the `"${error}"` clean-up in seed-built
-   code follows it.
-7. **Process API L1 as `io/process`,** with a `Stringable` `ProcessError`,
-   updating `PROCESS_DECISIONS.md` and `RUN_AND_TEST_PLAN.md`.
-8. **`Path` (D13),** with its own brief and decisions.
+   code follows it. The new seed also knows the process natives, which
+   `blorp run` and `blorp test` need (`RUN_AND_TEST_PLAN.md`).
+7. **`Path` (D13),** with its own brief and decisions.
+
+Process API L1 was planned here as a landing after the rotation, as
+`io/process` with a `Stringable` `ProcessError`. On 2026-11-09 Keith chose to
+land it first instead, as `process.brp` with its own `describe`, so that the
+rotation in landing 6 carries its natives and `blorp run` needs no second
+rotation. Landings 3 and 4 migrate it with the other error types.
 
 Each landing gets its own brief, with ceilings set before implementation. The
 landings that touch the compiler record matched self-compile and fixed-input

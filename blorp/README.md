@@ -967,7 +967,8 @@ directory to a callback (`with_temporary_directory`). The
 [library README](standard_library/README.md#the-fs-module) owns every
 operation's contract, edge cases and limits.
 
-`process: run_to_files` runs a child process; its contract is in the
+`process` runs a program and captures its output (`command`, `capture`,
+`output`, `find_program`); its contract is in the
 [standard library README](standard_library/README.md#process-execution).
 
 ### Tests

@@ -1,8 +1,377 @@
+-- The process library: run a program, wait for it, and keep what it printed.
+-- The natives can return only Ints, Strings and Lists of them, so how a child
+-- ended arrives as text and why a launch failed as an Int code, which the pure
+-- functions here decode. src/compile/runtime/process.brp owns the C side.
 import:
-    _base: Int, String, List, Result
+    _base: Int, String, Void, List, Bool(True, False), Option(Some, None), Result(Ok, Err)
+    _io_errors: decode_error
+    bool: Bool methods
+    dict: Dict
+    int: Int methods
+    io: IOError, IOErrorKind
+    list: List methods
+    option: Option methods
+    result: Result methods
+    string: String methods
 
 
--- Explicit program path; arguments excludes argv[0]. Capture files must be new.
+-- What to run. Build one with `command`, then change fields by record update.
+record Command {
+    -- A path; find_program searches PATH.
+    program: String,
+    -- Without argv[0]; each is passed literally.
+    arguments: List[String],
+    -- None runs in the parent's directory.
+    directory: Option[String],
+    -- Some sets, None removes, and every other variable is inherited.
+    environment: Dict[String, Option[String]],
+    -- None is /dev/null; Some is written, then closed.
+    stdin: Option[String],
+    -- None waits; Some(n) with n <= 0 times out at once, without starting the
+    -- program.
+    timeout_ms: Option[Int],
+}
+
+
+-- How the child ended. Each is an outcome, not an error.
+fixed union Exit:
+    -- Its status, 0 to 255.
+    Exited(Int)
+    -- The signal number.
+    Signaled(Int)
+    -- The deadline passed, and the child's process group was killed.
+    TimedOut
+
+
+record Captured { exit: Exit, stdout: String, stderr: String }
+
+
+-- `program` is exactly what the caller passed: the name for find_program, the
+-- path for everything else.
+record ProcessError { program: String, kind: ProcessErrorKind }
+
+
+union ProcessErrorKind:
+    -- find_program: no executable file of that name.
+    NotOnPath
+    -- Exec, fork or a pipe failed, as io words the errno.
+    LaunchFailed(IOErrorKind)
+    -- ENOEXEC: a file the system cannot run, such as a script without #!.
+    NotExecutable
+    -- The child could not enter `directory`; the error names it.
+    DirectoryFailed(IOError)
+    -- In the program, an argument or the environment; before any system call.
+    ContainsNul
+    -- Empty, or contains "="; before any system call.
+    InvalidVariableName(String)
+    -- The output, which is not UTF-8, is dropped; how the child ended is kept.
+    StdoutNotUtf8(Exit)
+    StderrNotUtf8(Exit)
+    -- output only: anything but Exited(0).
+    Unsuccessful(Captured)
+
+
+-- The codes of src/compile/runtime/process.brp's PROCESS_HELPERS_RUNTIME enums,
+-- which agree with it only by the tests. An Exit is its kind times
+-- EXIT_KIND_SPAN plus its status or signal, always below the span. An error is
+-- its detail times ERROR_TAG_SPAN plus its tag: the detail is an I/O error code
+-- (_io_errors), an Exit code for the UTF-8 kinds, or 0.
+private EXIT_KIND_SPAN: Int = 256
+private EXITED_KIND: Int = 0
+private SIGNALED_KIND: Int = 1
+private TIMED_OUT_KIND: Int = 2
+
+private ERROR_TAG_SPAN: Int = 16
+private LAUNCH_FAILED_TAG: Int = 1
+private NOT_EXECUTABLE_TAG: Int = 2
+private DIRECTORY_FAILED_TAG: Int = 3
+private CONTAINS_NUL_TAG: Int = 4
+private STDOUT_NOT_UTF8_TAG: Int = 5
+private STDERR_NOT_UTF8_TAG: Int = 6
+private NOT_ON_PATH_TAG: Int = 7
+
+-- The native's timeout when there is none; any other is at least 0.
+private NO_TIMEOUT: Int = -1
+
+private EQUALS_BYTE: Int = 61
+
+
+-- Program, arguments, then the directory and stdin as lists of zero or one
+-- element, the environment as "NAME=value" to set and "NAME" to remove, and
+-- the timeout. Ok holds the Exit code as decimal text, then stdout and stderr.
+private func native_capture(
+    program: String,
+    arguments: List[String],
+    directory: List[String],
+    environment: List[String],
+    stdin: List[String],
+    timeout_ms: Int,
+) -> Result[List[String], Int]:
+    builtin("process.capture")
+
+
+private func native_find_program(name: String) -> Result[String, Int]:
+    builtin("process.find_program")
+
+
+pure func command(program: String, arguments: List[String]) -> Command:
+    {
+        program = program,
+        arguments = arguments,
+        directory = None,
+        environment = {},
+        stdin = None,
+        timeout_ms = None,
+    }
+
+
+pure func succeeded(exit: Exit) -> Bool:
+    match exit:
+        Exited(status): status == 0
+        Signaled(_) | TimedOut: False
+
+
+private pure func decode_exit(code: Int) -> Option[Exit]:
+    kind = code / EXIT_KIND_SPAN
+    value = code % EXIT_KIND_SPAN
+    if code < 0:
+        None
+    else if kind == EXITED_KIND:
+        Some(Exited(value))
+    else if kind == SIGNALED_KIND:
+        Some(Signaled(value))
+    else if (kind == TIMED_OUT_KIND).and(value == 0):
+        Some(TimedOut)
+    else:
+        None
+
+
+-- What capture's native can send; None is anything else, which the caller faults. The tag
+-- is taken so that it is never negative, since I/O error codes for an unnamed errno are,
+-- and then the rest divides exactly whichever way `/` rounds.
+private pure func decode_capture_error(
+    code: Int,
+    directory: Option[String],
+) -> Option[ProcessErrorKind]:
+    tag = (code % ERROR_TAG_SPAN + ERROR_TAG_SPAN) % ERROR_TAG_SPAN
+    detail = (code - tag) / ERROR_TAG_SPAN
+    if tag == LAUNCH_FAILED_TAG:
+        Some(LaunchFailed(detail.decode_error()))
+    else if (tag == NOT_EXECUTABLE_TAG).and(detail == 0):
+        Some(NotExecutable)
+    else if tag == DIRECTORY_FAILED_TAG:
+        directory.map(
+            pure func(path: String) -> ProcessErrorKind: DirectoryFailed({
+                path = path,
+                destination = None,
+                kind = detail.decode_error(),
+            }),
+        )
+    else if (tag == CONTAINS_NUL_TAG).and(detail == 0):
+        Some(ContainsNul)
+    else if tag == STDOUT_NOT_UTF8_TAG:
+        detail
+            .decode_exit()
+            .map(pure func(exit: Exit) -> ProcessErrorKind: StdoutNotUtf8(exit))
+    else if tag == STDERR_NOT_UTF8_TAG:
+        detail
+            .decode_exit()
+            .map(pure func(exit: Exit) -> ProcessErrorKind: StderrNotUtf8(exit))
+    else:
+        None
+
+
+private pure func decode_find_program_error(code: Int) -> Option[ProcessErrorKind]:
+    if code == NOT_ON_PATH_TAG:
+        Some(NotOnPath)
+    else if code == CONTAINS_NUL_TAG:
+        Some(ContainsNul)
+    else:
+        None
+
+
+private pure func decode_captured(reply: List[String]) -> Option[Captured]:
+    match (reply.get(0), reply.get(1), reply.get(2), reply.get(3)):
+        (Some(code), Some(stdout), Some(stderr), None):
+            exit = code
+                .parse_int()
+                .map(decode_exit)
+            match exit:
+                Some(Some(decoded)): Some({ exit = decoded, stdout = stdout, stderr = stderr })
+                _: None
+        _:
+            None
+
+
+-- Aborts with the message: a reply the natives never send is a runtime defect,
+-- not a ProcessError (PROCESS_DECISIONS.md, P5).
+private func native_fault(message: String) -> Result[Void, Int]:
+    builtin("process.fault")
+
+
+-- Never returns. A workaround, not a pattern: Blorp has no type for a call that
+-- cannot return, so the call to fault_again, which never runs, gives fault every
+-- type; calling itself would fail C's -Winfinite-recursion.
+private func fault[T](message: String) -> T:
+    ignored = native_fault(message)
+    fault_again(message)
+
+
+private func fault_again[T](message: String) -> T:
+    fault(message)
+
+
+private pure func is_variable_name(name: String) -> Bool:
+    var valid = name.length() > 0
+    for position in 0..name.length():
+        match name.byte_at(position):
+            Some(byte): valid = valid.and(byte != EQUALS_BYTE)
+            None: void
+    valid
+
+
+-- The first name that is empty or contains "=", in insertion order.
+private pure func invalid_variable_name(
+    environment: Dict[String, Option[String]],
+) -> Option[String]:
+    environment
+        .keys()
+        .find(
+            pure func(name: String) -> Bool: name
+                .is_variable_name()
+                .not(),
+        )
+
+
+private pure func environment_entry(entry: (String, Option[String])) -> String:
+    match entry:
+        (name, Some(value)): "${name}=${value}"
+        (name, None): name
+
+
+private pure func zero_or_one(value: Option[String]) -> List[String]:
+    match value:
+        Some(present): [present]
+        None: []
+
+
+private pure func native_timeout(timeout_ms: Option[Int]) -> Int:
+    timeout_ms
+        .map(pure func(milliseconds: Int) -> Int: milliseconds.max(0))
+        .get_or(NO_TIMEOUT)
+
+
+-- Runs the program with no shell and no PATH search, writes `stdin`, and
+-- returns when the child has ended: every Exit is Ok. When the child exits or
+-- the deadline passes, its process group is killed and only what is already
+-- buffered is read, so a grandchild that holds a pipe open cannot hang the
+-- call. After Signaled or TimedOut, up to three bytes of a character cut off
+-- at the end of either stream are dropped before the UTF-8 check.
+--
+-- A directory that contains NUL is DirectoryFailed with PathContainsNul. With
+-- SIGCHLD not at its default, which only foreign code can change, the call is
+-- LaunchFailed(OtherOs(ECHILD)) before anything starts: the system would reap
+-- the child itself.
+func capture(invocation: Command) -> Result[Captured, ProcessError]:
+    failed = pure func(kind: ProcessErrorKind) -> ProcessError: {
+        program = invocation.program,
+        kind = kind,
+    }
+    match invocation.environment.invalid_variable_name():
+        Some(name):
+            Err(failed(InvalidVariableName(name)))
+        None:
+            reply = native_capture(
+                invocation.program,
+                invocation.arguments,
+                invocation.directory.zero_or_one(),
+                invocation.environment
+                    .entries()
+                    .map(environment_entry),
+                invocation.stdin.zero_or_one(),
+                invocation.timeout_ms.native_timeout(),
+            )
+            match reply:
+                Ok(elements):
+                    match elements.decode_captured():
+                        Some(captured):
+                            Ok(captured)
+                        None:
+                            fault(
+                                "process.capture replied with ${elements.length().to_string()} elements it cannot send",
+                            )
+                Err(code):
+                    match code.decode_capture_error(invocation.directory):
+                        Some(kind):
+                            Err(failed(kind))
+                        None:
+                            fault("process.capture replied with the error code ${code.to_string()}")
+
+
+-- capture that insists on success: stdout after Exited(0), and otherwise
+-- Unsuccessful with everything the child printed.
+func output(invocation: Command) -> Result[String, ProcessError]:
+    captured ?= capture(invocation)
+    if captured.exit.succeeded():
+        Ok(captured.stdout)
+    else:
+        Err({ program = invocation.program, kind = Unsuccessful(captured) })
+
+
+-- The first absolute PATH entry holding a regular file of this name that the
+-- process may execute, joined as "entry/name". Empty and relative entries
+-- are skipped, so the current directory is never searched (Go's ErrDot), and
+-- so are entries that are not UTF-8. A name that is empty or contains "/" is
+-- NotOnPath without a search; one that contains NUL is ContainsNul.
+func find_program(name: String) -> Result[String, ProcessError]:
+    match native_find_program(name):
+        Ok(path):
+            Ok(path)
+        Err(code):
+            match code.decode_find_program_error():
+                Some(kind): Err({ program = name, kind = kind })
+                None: fault("process.find_program replied with the error code ${code.to_string()}")
+
+
+private pure func exit_phrase(exit: Exit) -> String:
+    match exit:
+        Exited(status): "exited ${status.to_string()}"
+        Signaled(signal): "killed by signal ${signal.to_string()}"
+        TimedOut: "timed out"
+
+
+-- "<program>: <phrase>". Unsuccessful is "make: exited 2", then a newline and
+-- the child's stderr when it printed any; every other kind is fixed text, as
+-- in io.describe.
+pure func describe(error: ProcessError) -> String:
+    program = error.program
+    match error.kind:
+        NotOnPath:
+            "${program}: not found on PATH"
+        LaunchFailed(kind):
+            launched: IOError = { path = program, destination = None, kind = kind }
+            launched.describe()
+        NotExecutable:
+            "${program}: not a program the system can run; a script needs a #! line"
+        DirectoryFailed(directory):
+            "${program}: cannot enter ${directory.describe()}"
+        ContainsNul:
+            "${program}: the program, an argument or the environment contains a NUL byte"
+        InvalidVariableName(name):
+            "${program}: invalid environment variable name \"${name}\"; a name is nonempty and has no ="
+        StdoutNotUtf8(exit):
+            "${program}: ${exit.exit_phrase()}, and its stdout is not UTF-8"
+        StderrNotUtf8(exit):
+            "${program}: ${exit.exit_phrase()}, and its stderr is not UTF-8"
+        Unsuccessful(captured):
+            summary = "${program}: ${captured.exit.exit_phrase()}"
+            if captured.stderr.length() == 0:
+                summary
+            else:
+                "${summary}\n${captured.stderr}"
+
+
+-- Removed in L2. Program path; arguments exclude argv[0]; capture files must be new.
 func run_to_files(
     program: String,
     arguments: List[String],

@@ -575,6 +575,69 @@ pass. `run_suite_result` prints results and returns `TestCounts { passed, failed
 
 ## Process execution
 
+`process` runs a program, waits for it and keeps what it printed. The prelude
+and compiler source do not import it. [PROCESS_DECISIONS.md](../PROCESS_DECISIONS.md)
+records the design and its decisions.
+
+```blorp
+import:
+    process: Command, Exit(Exited, Signaled, TimedOut), Captured, ProcessError, command, capture, output, find_program
+
+func current_commit(repository: String) -> Result[String, ProcessError]:
+    git ?= find_program("git")
+    output({ command(git, ["rev-parse", "HEAD"]) | directory = Some(repository) })
+```
+
+- `command(program, arguments)` builds a `Command`; change its `directory`,
+  `environment` (`Some` sets a variable, `None` removes it, the rest is
+  inherited), `stdin` (`None` is `/dev/null`) and `timeout_ms` by record
+  update. `program` is a path: there is no shell and no PATH search, and every
+  argument is literal. A relative program is found from `directory`.
+- `capture(command)` returns `Ok(Captured { exit, stdout, stderr })` for
+  every way the child can end: `Exited(status)`, `Signaled(signal)` or
+  `TimedOut`. `output(command)` returns stdout after `Exited(0)` and
+  otherwise `Unsuccessful(captured)`, so `?=` over `output` stops a sequence
+  at the first failure with everything the command printed.
+- The child never outlives the call: when it exits or the deadline passes,
+  its process group is killed and only what is already buffered is read, so a
+  grandchild holding a pipe open cannot hang the call. A process that left the
+  group, through `setsid` for example, is outside this guarantee, and at most
+  16 MiB more of its output per stream is read.
+- `stdin` is written while both outputs are read; a child that exits without
+  reading it is not an error. SIGPIPE is blocked in the calling thread only
+  while writing, the SIGPIPE a write raised is consumed, and no signal
+  disposition changes. A timeout of 0 or less is `TimedOut` at once, without
+  starting the program.
+- Output must be UTF-8: otherwise the error is `StdoutNotUtf8(exit)` or
+  `StderrNotUtf8(exit)`. After `Signaled` or `TimedOut`, up to three bytes of a
+  character cut off at the end of a stream are dropped first.
+- Errors name the program as the caller passed it. `InvalidVariableName` (an
+  empty name or one with `=`) and `ContainsNul` (in the program, an argument or
+  the environment) are found before any system call. A directory the child
+  cannot enter is `DirectoryFailed`, whose `IOError` names it; one containing
+  NUL is `DirectoryFailed` with `PathContainsNul`. `NotExecutable` is ENOEXEC,
+  such as a script without `#!`; every other launch failure is
+  `LaunchFailed(kind)`, worded as `io` words the errno, so a missing program is
+  `LaunchFailed(NotFound)`.
+- SIGCHLD must keep its default disposition, which a Blorp program cannot
+  change. If foreign code has changed it, `capture` is
+  `LaunchFailed(OtherOs(ECHILD))` before anything starts.
+- `find_program(name)` returns the first absolute PATH entry holding a regular
+  file of that name the process may execute, as "entry/name". Empty and
+  relative entries, and entries that are not UTF-8, are skipped, so the current
+  directory is never searched. A name that is empty or contains `/` is
+  `NotOnPath` without a search.
+- A reply from the runtime that the library cannot decode is a defect in the
+  runtime, not an outcome: the program prints
+  "blorp: process runtime defect: ..." and aborts.
+- `exit.succeeded()` is `Exited(0)`, and `error.describe()` renders
+  "<program>: <phrase>"; `Unsuccessful` is "make: exited 2" followed by the
+  child's stderr. Selecting `Exit` and `ProcessError` makes both available as
+  methods, so `process`'s `describe` never collides with `io`'s.
+
+### run_to_files
+
+`run_to_files` remains until its callers move to `capture`.
 Explicitly import `process: run_to_files`; the prelude and compiler source do not
 import it. This is a target-only impure operation:
 
