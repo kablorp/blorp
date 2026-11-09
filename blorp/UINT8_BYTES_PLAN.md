@@ -10,8 +10,8 @@ eventually anyway", and `opaque type Bytes = List[UInt8]`, with no separate
 - **2026-11-07:** U1 as (a), after the S0 spike, and the spike's ceilings.
 
 **Status:** S0 and L0 implementation/local qualification are complete. Full
-instruction-enabled tests, fixpoint, fixture parity and independent code/test
-reviews pass; four-platform branch CI remains before publication. L1 has not
+instruction-enabled tests, fixpoint, fixture parity, independent code/test
+reviews and four-platform CI pass. L0 is published on origin/main. L1 has not
 started. The corrected L0 line allowance is recorded under Ceilings;
 performance caps are unchanged. See the
 [L0 measurement report](../benchmarks/results/blorp-integer-model-l0-2026-11-08.md).
@@ -319,7 +319,7 @@ keeps what a later landing needs. What it found:
      `824f3d4ee` deleted 329 unparsable old-syntax tests.
    - **Proof.** Fixed-input self C is byte-identical, and all e2e fixtures
      give identical output.
-   - **Execution, 2026-11-08 (not landed).** Both TypeRefs and all eight
+   - **Execution, 2026-11-08 (landed).** Both TypeRefs and all eight
      integer operations carry the sole Int64 format. Format-dependent facts
      are exhaustive at their owning phases; generic layout and ownership
      consumers ignore the payload. The focused active selection passes
@@ -328,7 +328,7 @@ keeps what a later landing needs. What it found:
      allocations are unchanged and median instructions increase 0.013792%; all
      eight C outputs are identical. Own-source allocations increase
      0.207757%; one normal instruction observation increases 0.168146%.
-     Full local gates and final reviews pass; branch CI remains;
+     Full local gates, final reviews and four-platform CI pass;
      the report records raw paths, provenance and failed deferred selections.
 3. **L1, the compiler learns UInt8.** This landing adds:
    - the role, which stays optional until L3, so that today's `_base`, which

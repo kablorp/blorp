@@ -1080,6 +1080,12 @@ the output may already be new.
    prelude and every imported module once per logically normalized path
    (symlinks are not resolved), lexes and parses each, and publishes the
    `ParsedProgram` with the source inventory diagnostics render from.
+   `load_program_with_sources(root_path, library, sources)` accepts frozen
+   `SourceFile` contents for file-backed modules, including unsaved files.
+   Paths use the same working directory and lexical normalization as loading;
+   duplicate normalized paths and NUL-containing caller paths reject through
+   `SourceLoadFailure`. Supplied contents are authoritative, including invalid
+   or empty text; embedded library modules retain their embedded contents.
 4. **Namespace** ([`namespace`](src/compile/namespace/namespace.brp)), the first step
    of checking, gives each module one frozen scope in dependency order: its
    declarations, its imports and, for a user module, the prelude. A spelling

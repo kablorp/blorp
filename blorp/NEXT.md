@@ -1,6 +1,6 @@
 # What's next
 
-An index of open work, as of 2026-11-08. Each entry says where the work
+An index of open work, as of 2026-11-09. Each entry says where the work
 stands, its next step, any decision it waits on, and the document that owns
 it. The owning document is the authority; this file only points to it.
 Update the entry when a workstream moves, and delete it when the work is
@@ -11,10 +11,10 @@ done.
 - **UInt8 and Bytes:** [`UINT8_BYTES_PLAN.md`](UINT8_BYTES_PLAN.md).
   - **Status:** U1 to U9 and B1 to B3 are decided. S0 and the L0
     `IntegerType(Int64Format)` refactor are implemented and independently
-    reviewed; combined local gates pass, with platform CI remaining. Matched costs
+    reviewed and published; combined local gates and four-platform CI pass. Matched costs
     pass unchanged performance ceilings; see
     [`L0 results`](../benchmarks/results/blorp-integer-model-l0-2026-11-08.md).
-  - **Next:** L1, adding UInt8 with deferred integer literals, after L0 lands.
+  - **Next:** L1, adding UInt8 with deferred integer literals.
   - **Afterwards:**
     - L1, the compiler learns `UInt8`, with deferred integer literals;
     - L2, a seed rotation, which also switches the seed family;
@@ -23,7 +23,8 @@ done.
     - L4, `String.byte_at` returns `Option[UInt8]`.
 - **Process API:** [`PROCESS_DECISIONS.md`](PROCESS_DECISIONS.md).
   - **Status:** L0 is implemented and independently reviewed; final combined
-    landing gates pass locally, with platform CI remaining. Shared errors/formatting belong to `io`,
+    landing gates and four-platform CI pass; L0 is published. Shared
+    errors/formatting belong to `io`,
     with one internal native-code decoder. Existing imports are migrated.
     [`L0 results`](../benchmarks/results/blorp-process-l0-2026-11-08.md).
   - **Next:** L1, the natives and library. Settle the primitive native reply
@@ -36,11 +37,12 @@ done.
   - **Later:** binary capture after `Bytes`, and `run` with streaming.
 - **LSP foundations:**
   - **Status:** the pure `json` codec is implemented and independently
-    reviewed; combined local gates pass, with platform CI remaining.
+    reviewed and published; combined local gates and four-platform CI pass.
     [`JSON results`](../benchmarks/results/blorp-json-foundation-2026-11-08.md).
-    Loader source overrides are being implemented in a separate bounded slice.
-  - **Next:** finish loader overlay tests and matched costs, then expose module
-    analysis without a required executable entrypoint. Neither editor state nor
+    Loader source overrides pass focused tests, matched costs, full
+    instruction-enabled tests, fixpoint and independent reviews.
+    [`Snapshot results`](../benchmarks/results/blorp-source-snapshots-2026-11-09.md).
+  - **Next:** expose module analysis without a required executable entrypoint. Neither editor state nor
     transport belongs in the compiler pipeline.
 - **Filesystem:** [`FILESYSTEM_DECISIONS.md`](FILESYSTEM_DECISIONS.md).
   - **Status:** Part 1 has landed through `fold_lines`. Part 2, lent

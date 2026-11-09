@@ -8,7 +8,7 @@ range rules, hashes, List names, C types and helper selection. No UInt8,
 inference, library or native behavior was added.
 
 Local qualification and independent code/test reviews pass. Four-platform
-branch CI remains before publication; the combined evidence is recorded below.
+branch CI passes; the combined evidence is recorded below.
 
 ## Source and toolchain
 
@@ -107,7 +107,7 @@ over retained evidence. Its compile command is `BINARY compile SOURCE
   `final-focused.log` retain the deferred-selection failures.
 
 Recommendation: accept the bounded L0 implementation and unchanged cost caps,
-subject to four-platform branch CI.
+with four-platform branch CI also passed.
 
 ## Combined landing qualification
 
@@ -130,6 +130,10 @@ through the corrected gates.
 Evidence: coordinator `blorp/build/roadmap-coordination/integration/RESULTS.json`,
 `make-test.log`, `make-test-corrected.log`, `bootstrap.log`, `fixpoint.log`,
 source manifests and `fixture-exit-audit.json`; full fixpoint artifacts remain
-in `blorp/build/fixpoint/`. Tested staged tree:
+in `blorp/build/roadmap-coordination/integration/fixpoint-first3/`. Tested staged tree:
 `a76917735c2dbbe56fa7df6de5f3c1c360da98ed` (subsequent edits are reports/index
-status only). Four-platform branch CI remains required before publication.
+status only). Four-platform branch CI passes for commit
+`23f25d7d33cc987dcbd5d2d91d8b65b10802178e`:
+[qualification run](https://github.com/kablorp/blorp/actions/runs/42558963381).
+Linux x64 Clang/GCC, Linux ARM64 Clang and macOS ARM64 Clang all pass.
+The three implementation commits are published on origin/main.

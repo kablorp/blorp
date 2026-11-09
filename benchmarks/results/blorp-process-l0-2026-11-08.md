@@ -59,7 +59,7 @@ The script retains exact compile/time commands and flags. Worker focused and
 mutation evidence is under `/Users/keithphilpott/.codex/worktrees/process-api-resume/blorp/build/process-roadmap/`.
 
 Focused behavior, sanitizer and cost evidence is followed by the combined
-local qualification below. Four-platform branch CI remains before publication.
+local qualification below. Four-platform branch CI passes.
 
 ## Combined landing qualification
 
@@ -82,6 +82,10 @@ through the corrected gates.
 Evidence: coordinator `blorp/build/roadmap-coordination/integration/RESULTS.json`,
 `make-test.log`, `make-test-corrected.log`, `bootstrap.log`, `fixpoint.log`,
 source manifests and `fixture-exit-audit.json`; full fixpoint artifacts remain
-in `blorp/build/fixpoint/`. Tested staged tree:
+in `blorp/build/roadmap-coordination/integration/fixpoint-first3/`. Tested staged tree:
 `a76917735c2dbbe56fa7df6de5f3c1c360da98ed` (subsequent edits are reports/index
-status only). Four-platform branch CI remains required before publication.
+status only). Four-platform branch CI passes for commit
+`23f25d7d33cc987dcbd5d2d91d8b65b10802178e`:
+[qualification run](https://github.com/kablorp/blorp/actions/runs/42558963381).
+Linux x64 Clang/GCC, Linux ARM64 Clang and macOS ARM64 Clang all pass.
+The three implementation commits are published on origin/main.

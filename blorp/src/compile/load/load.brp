@@ -1,4 +1,5 @@
 import:
+    dict: empty, Dict methods
     fs: read_text
     int: Int methods
     io: describe
@@ -55,6 +56,13 @@ record LoadedProgram { sources: SourceInputs, program: ParsedProgram }
 
 
 record LoadFailure { sources: SourceInputs, diagnostic: Diagnostic }
+
+
+-- Caller path admission is distinct from failures while loading a program.
+union SourceLoadFailure:
+    DuplicateSourcePath(String)
+    SourcePathContainsNul(String)
+    LoadingFailed(LoadFailure)
 
 
 private pure func failure(modules: List[SourceFile], error: Diagnostic) -> LoadFailure:
@@ -276,16 +284,21 @@ private pure func unreadable(reason: String, site: Option[Span], role: ModuleKin
 private func read_module(
     layout: LibraryLayout,
     current: RequestedModule,
+    sources: Dict[String, String],
 ) -> Result[String, Diagnostic]:
     store ?= module_store(layout, current.role, current.path)
     match store:
         DiskFile:
-            match current.path.read_text():
-                Ok(contents):
+            match sources.get(current.path):
+                Some(contents):
                     Ok(contents)
-                Err(error):
-                    -- describe names the path: "missing.brp: no such file".
-                    Err(unreadable(error.describe(), current.site, current.role))
+                None:
+                    match current.path.read_text():
+                        Ok(contents):
+                            Ok(contents)
+                        Err(error):
+                            -- describe names the path: "missing.brp: no such file".
+                            Err(unreadable(error.describe(), current.site, current.role))
         EmbeddedFile(relative):
             match embedded_library_file(relative):
                 Some(contents): Ok(contents)
@@ -296,6 +309,7 @@ private func read_module(
 -- one row, so the row count is the next file's queue position.
 private record LoadState {
     layout: LibraryLayout,
+    sources: Dict[String, String],
     root_path: String,
     requests: List[RequestedModule],
     assembly: ParsedAssembly,
@@ -423,7 +437,7 @@ private func load_module(
     state: LoadState,
     current: RequestedModule,
 ) -> Result[LoadState, LoadFailure]:
-    match state.layout.read_module(current):
+    match state.layout.read_module(current, state.sources):
         Err(error):
             Err(failure(state.modules, error))
         Ok(contents):
@@ -540,7 +554,8 @@ pure func working_directory_result(result: Result[String, String]) -> Result[Str
 
 -- Every queued path has one identity, role, read, and parse in this invocation.
 func load_program(root_path: String, library: LibrarySource) -> Result[LoadedProgram, LoadFailure]:
-    root_path.load_input(library, ApplicationInput)
+    directory ?= get_current_directory().working_directory_result()
+    root_path.load_input(library, ApplicationInput, directory, empty())
 
 
 func load_test_program(
@@ -548,7 +563,58 @@ func load_test_program(
     grouped_paths: List[String],
     library: LibrarySource,
 ) -> Result[LoadedProgram, LoadFailure]:
-    root_path.load_input(library, TestSuiteInput(grouped_paths))
+    directory ?= get_current_directory().working_directory_result()
+    root_path.load_input(library, TestSuiteInput(grouped_paths), directory, empty())
+
+
+-- Check raw paths before normalization can erase an invalid component.
+private pure func contains_nul(path: String) -> Bool:
+    var position = 0
+    var found: Bool = False
+    while position < path.length():
+        match path.byte_at(position):
+            Some(byte):
+                if byte == 0:
+                    found = True
+                    break
+            _:
+                void
+        position = position + 1
+    found
+
+
+func load_program_with_sources(
+    root_path: String,
+    library: LibrarySource,
+    sources: List[SourceFile],
+) -> Result[LoadedProgram, SourceLoadFailure]:
+    _: Void ?= if root_path.contains_nul():
+        Err(SourcePathContainsNul(root_path))
+    else:
+        Ok(void)
+    directory: String ?= match get_current_directory().working_directory_result():
+        Ok(present): Ok(present)
+        Err(error): Err(LoadingFailed(error))
+    var overrides: Dict[String, String] = empty()
+    var invalid: Option[SourceLoadFailure] = None
+    for source in sources:
+        if source.path.contains_nul():
+            invalid = Some(SourcePathContainsNul(source.path))
+            break
+        path = Path.normalize(Path.join(directory, source.path))
+        match overrides.get(path):
+            Some(_):
+                invalid = Some(DuplicateSourcePath(path))
+                break
+            None:
+                overrides = overrides.set(path, source.contents)
+    match invalid:
+        Some(error):
+            Err(error)
+        None:
+            match root_path.load_input(library, ApplicationInput, directory, overrides):
+                Ok(loaded): Ok(loaded)
+                Err(error): Err(LoadingFailed(error))
 
 
 -- The later test suite roots, queued after the foundation inputs in
@@ -597,8 +663,9 @@ private func load_input(
     root_path: String,
     library: LibrarySource,
     mode: LoadMode,
+    working_directory: String,
+    overrides: Dict[String, String],
 ) -> Result[LoadedProgram, LoadFailure]:
-    working_directory ?= get_current_directory().working_directory_result()
     layout = library_layout(library, working_directory)
     foundation = layout_contents(layout)
     root_file = Path.normalize(Path.join(working_directory, root_path))
@@ -631,6 +698,7 @@ private func load_input(
         TestSuiteInput(paths): working_directory.queue_roots(paths, designated_inputs, [])
     initial ?= load_queue({
         layout = layout,
+        sources = overrides,
         root_path = root_path,
         requests = designated_inputs.concat(later),
         assembly = begin_program(),
