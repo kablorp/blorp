@@ -160,7 +160,7 @@ How Int and Float are built in today:
     `to_uint8`, written in Blorp, with the same strictness as `parse_int`;
   - no wrapping or truncating conversion until a consumer needs one.
 - **U6, traits.** *Recommended:* `Equatable`, `Orderable`, `Hashable`,
-  `DictKey`, `Addable`, `Subtractable`, `Multipliable`, `Divisible` and
+  `Addable`, `Subtractable`, `Multipliable`, `Divisible` and
   `Modulable`. A fixed record may hold a `UInt8` field, which needs one arm in
   `declarations.brp:991` (`fixed_storage`).
 - **U7, bit operations.** *Recommended:* not in this plan. Int has none
@@ -195,7 +195,6 @@ How Int and Float are built in today:
   implements Equatable for Bytes
   implements Addable for Bytes                            -- concatenation
   implements Hashable for Bytes                           -- delegates to List's
-  implements DictKey for Bytes
   ```
 
   `String.slice` returns `Option` only because it must not cut a UTF-8

@@ -718,7 +718,7 @@ type arguments compiles to its own C function. A generic recursion that would
 need unboundedly many instances, by nesting a parameter inside a type
 application on each call, is rejected.
 
-`[T: Equatable + Hashable]` bounds a parameter with traits joined by `+`. A
+`[T: Orderable + Hashable]` bounds a parameter with traits joined by `+`. A
 record, union or opaque type may bound its parameters too, and the bound is
 part of the type: every use of the type meets it under the bounds in scope.
 Nothing is implied, so each signature restates it:
@@ -836,8 +836,9 @@ bound. An unused type with a field that is not Equatable is legal; using `==`
 on it is rejected at that field. Tuples, opaque types and callables get no
 automatic equality.
 
-`Hashable` requires `hash(value: Self) -> Int`, and equal values must hash
-equally. It is never derived; Int, String and Bool implement it.
+`Hashable: Equatable` requires `hash(value: Self) -> Int`, and equal values must
+hash equally, so implementing it needs an `Equatable` implementation, written or
+automatic. It is never derived; Int, String, Bool and List of Hashable implement it.
 
 ### Modules, imports and the prelude
 
@@ -903,11 +904,11 @@ func main() -> Int:
     scores.get_or("alice", 0) + literal.get_or("alice", 0) + none.length()
 ```
 
-This exits 194. `Dict[K: DictKey, V]` is an insertion-ordered map from the
+This exits 194. `Dict[K: Hashable, V]` is an insertion-ordered map from the
 `dict` module; the prelude supplies the type and its methods, and `empty` and
-`dict` come through an import. `DictKey` is the bundle `Hashable + Equatable`;
-Int, String and Bool are keys and Float is not. A key type writes `Hashable`
-(and `Equatable` unless it is automatic), then `implements DictKey for T`.
+`dict` come through an import. Int, String, Bool and Lists of keys are keys and
+Float is not. A key type writes `Hashable` (and `Equatable` unless it is
+automatic); `Hashable` requires `Equatable`, so nothing else is needed.
 
 `{}` is an empty Dict whose types come from the expected type; without one it
 is rejected with "an empty Dict needs its type". `{k => v, ...}` builds a Dict
@@ -1019,10 +1020,10 @@ absent object names from null. Parse errors report UTF-8 byte offsets.
 The library is ordinary Blorp under [`standard_library/`](standard_library/).
 `_base.brp` declares the builtin types `Int`, `Float`, `String`, `Void` and
 `List`, the unions `Bool`, `Option`, `Result` and `MathError`, and the
-`Orderable`, `Hashable` and arithmetic traits; only it may declare builtin
-types. `traits.brp` declares `Equatable`, `prelude.brp` is the implicit
-import, and the operation modules implement the traits and provide functions,
-some with `builtin("label")` bodies that name a compiler-known operation. The
+`Equatable`, `Orderable`, `Hashable` and arithmetic traits; only it may declare
+builtin types. `prelude.brp` is the implicit import, and the operation modules
+implement the traits and provide functions, some with `builtin("label")` bodies
+that name a compiler-known operation. The
 [standard library README](standard_library/README.md) owns every contract.
 
 ## Compiler architecture

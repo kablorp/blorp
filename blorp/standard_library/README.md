@@ -13,18 +13,18 @@ measurement provenance; current commands use `blorp/standard_library`.
 The library root contains two designated foundation modules:
 
 - `_base.brp` owns Int, Float, String, Void, List, Bool, Option, Result, the
-  `Orderable` and `Hashable` traits and the arithmetic traits `Addable`,
-  `Subtractable`, `Multipliable`, `Divisible`, `Modulable` and `Negatable`,
-  plus the checked-arithmetic error `MathError`. It is the only module that may
-  declare builtin types. Any module may import it as `_base`.
+  `Equatable`, `Orderable` and `Hashable` traits and the arithmetic traits
+  `Addable`, `Subtractable`, `Multipliable`, `Divisible`, `Modulable` and
+  `Negatable`, plus the checked-arithmetic error `MathError`. It is the only
+  module that may declare builtin types. Any module may import it as `_base`.
 - `prelude.brp` imports the base types and the operation modules' methods. It
   is the only implicit import: application roots and ordinary user helper
   modules receive its selections, and it cannot be imported explicitly.
 
 Library modules receive nothing implicitly. Each one imports what it uses,
 including base types, for example `_base: Int, Bool(True, False)` in `int.brp`.
-`traits.brp` owns canonical Equatable and imports only Bool and its constructors
-from _base. The prelude selects that trait; operation modules provide written
+`_base.brp` owns canonical Equatable beside the other core traits. The prelude
+selects that trait; operation modules provide written
 Int/Float/String/List implementations. Equality imports name this one family,
 so aliases and contextual callable references dispatch by the actual receiver.
 `Orderable` requires `less_than` and defaults `greater_than`, `less_than_or_equal`
@@ -85,10 +85,11 @@ it writes its own `less_than_or_equal` and `greater_than_or_equal`.
 route; direct calls use `int: hash`. Int's written implementation returns its
 value unchanged, including negative values and `INT_MIN`. Hashes may be any
 signed Int. For values compared by equality, equal values must have equal hashes;
-distinct values may collide. Hashable has no supertraits and is never derived.
+distinct values may collide. Hashable requires Equatable, written or
+automatic, so a hashed type also has `==`. A hash is never derived.
 String writes its hash in `string.brp` (a fold of its bytes from a fixed basis,
 unseeded) and Bool in `bool.brp` (`False` 0, `True` 1). The compiler's
-`Dict[K, V]` (`K: DictKey`, a bundle of `Hashable + Equatable`) uses this method
+`Dict[K, V]` (`K: Hashable`) uses this method
 for home slots and still compares keys by equality when probing collisions.
 
 `Int` and `Float` are declared once in `_base.brp`. Other
@@ -141,10 +142,9 @@ work is linear in the output bytes and the C stack is constant.
 
 ### Dict
 
-`dict.brp` declares `trait DictKey: Hashable + Equatable` and the opaque
-`Dict[K: DictKey, V]`, an insertion-ordered map over parallel Lists and an
-open-addressing index. Int, String and Bool implement `DictKey` with a bodyless
-`implements DictKey for T`; a record or opaque key writes its own `Hashable` and
+`dict.brp` declares the opaque `Dict[K: Hashable, V]`, an insertion-ordered map
+over parallel Lists and an open-addressing index. Int, String, Bool and Lists of
+keys are keys; a record or opaque key writes its own `Hashable` and
 `Equatable` first, except that a record or union whose fields are all Equatable
 already has `==` and writes only `Hashable`. A key with several parts hashes them
 with `combine_hash(seed, value) = (seed + value) * 1099511628211`, wrapping:
@@ -167,17 +167,17 @@ cost.
 
 | Function | Contract |
 | --- | --- |
-| `empty[K: DictKey, V]() -> Dict[K, V]` | No entries. |
-| `dict[K: DictKey, V](initial_capacity) -> Dict[K, V]` | Room for `initial_capacity` entries before the index grows; at most 1,048,576 are reserved, a larger or negative count is only a hint. |
+| `empty[K: Hashable, V]() -> Dict[K, V]` | No entries. |
+| `dict[K: Hashable, V](initial_capacity) -> Dict[K, V]` | Room for `initial_capacity` entries before the index grows; at most 1,048,576 are reserved, a larger or negative count is only a hint. |
 | `get(self, key) -> Option[V]`, `get_or(self, key, default) -> V`, `contains(self, key) -> Bool` | O(1) average lookups; a missing key is `None` or the eagerly evaluated default. |
 | `set(self, key, value) -> Dict[K, V]` | Insert, or replace the value and keep the key's position. O(1) amortized. |
 | `remove(self, key) -> Dict[K, V]` | Without the key, order of the rest kept; unchanged when absent. O(1) amortized. |
 | `keys(self) -> List[K]`, `values(self) -> List[V]`, `entries(self) -> List[(K, V)]` | Live entries in first-insertion order; a key removed and set again goes last. |
 | `length(self) -> Int`, `is_empty(self) -> Bool` | The live entry count, in O(1). |
 
-`Equatable` for `Dict[K: DictKey, V: Equatable]` compares lengths, then looks up
-each key of one Dict in the other, whatever the order. A Dict is neither
-`Hashable` nor a `DictKey`, and Float is not a key. An update to a uniquely owned
+`Equatable` for `Dict[K: Hashable, V: Equatable]` compares lengths, then looks up
+each key of one Dict in the other, whatever the order. A Dict is not
+`Hashable`, and Float is not a key. An update to a uniquely owned
 Dict appends to or sets its field Lists in place; a shared Dict copies on write.
 Home slots multiply the hash by an odd constant first, so sequential Int hashes
 do not form one long run; slot counts are 2^k - 1, and a rebuild at half load
