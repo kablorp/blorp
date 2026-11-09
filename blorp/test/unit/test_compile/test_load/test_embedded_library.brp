@@ -7,8 +7,8 @@ The generated module is built by `make -C blorp test-compiler`, so these tests
 run against the library as it was at the last build.
 ---
 import:
-    bool: and, not
-    fs: EntryKind(File), list_directory, read_text
+    bool: Bool methods, and, not
+    fs: Entry, EntryKind(File, Directory), list_directory, read_text
     int: Int methods
     io: print_error, describe
     list: List methods
@@ -22,6 +22,9 @@ import:
     ../../../../src/compile/load/load:
         LibrarySource(EmbeddedLibrary, LibraryDirectory),
         LibraryLayout,
+        ambiguous_stem_diagnostic,
+        embedded_stem_ambiguity,
+        embedded_stem_is_ambiguous,
         import_path,
         library_layout,
         load_program,
@@ -32,6 +35,8 @@ import:
     ../../../../src/syntax/source:
         ModuleKind(UserModule, LibraryModule, FoundationTypesModule, FoundationPreludeModule),
         compiler_source,
+    ../../../../src/syntax/syntax: Span
+    ../../../../src/utils/text: byte_order_before
 
 
 private LIBRARY_ROOT: String = "blorp/standard_library"
@@ -39,14 +44,36 @@ private LIBRARY_ROOT: String = "blorp/standard_library"
 private PROGRAM: String = "blorp/test/e2e/fixtures/return/zero.brp"
 
 
--- The library files directly under the library directory, in byte order.
-private func library_file_names() -> Result[List[String], String]:
-    entries ?= list_directory(LIBRARY_ROOT).map_err(describe)
-    Ok(
-        entries
-            .filter(pure func(entry): and(entry.kind == File, entry.name.has_source_suffix()))
-            .map(pure func(entry): entry.name),
-    )
+-- The library files among `entries`, which are those of the library folder
+-- `folder` ("" or "io/"), and below it at any depth, as paths relative to the
+-- library root in discovery order.
+private func files_among(
+    folder: String,
+    entries: List[Entry],
+    found: List[String],
+) -> Result[List[String], String]:
+    match entries:
+        []:
+            Ok(found)
+        [entry, ...later]:
+            relative = "${folder}${entry.name}"
+            match entry.kind:
+                Directory:
+                    match library_file_names("${relative}/"):
+                        Ok(nested): files_among(folder, later, found.concat(nested))
+                        Err(message): Err(message)
+                File:
+                    if entry.name.has_source_suffix():
+                        files_among(folder, later, found.append(relative))
+                    else:
+                        files_among(folder, later, found)
+                _:
+                    files_among(folder, later, found)
+
+
+private func library_file_names(folder: String) -> Result[List[String], String]:
+    entries ?= list_directory("${LIBRARY_ROOT}/${folder}").map_err(describe)
+    files_among(folder, entries, [])
 
 
 -- The first file whose embedded text differs from the file on disk.
@@ -65,10 +92,27 @@ private func stale_file(names: List[String]) -> Result[Option[String], String]:
                         Ok(Some(name))
 
 
+-- Whether each path sorts strictly before the next, in bytes.
+private pure func in_byte_order(paths: List[String]) -> Bool:
+    var ordered: Bool = True
+    for position in 1..paths.length():
+        match (paths.get(position - 1), paths.get(position)):
+            (Some(earlier), Some(later)): ordered = ordered.and(byte_order_before(earlier, later))
+            _: ordered = False
+    ordered
+
+
+-- The embedded paths are the directory's files, each once, in byte order.
+private pure func same_paths(names: List[String]) -> Bool:
+    (EMBEDDED_LIBRARY_PATHS.length() == names.length())
+        .and(names.all(pure func(name): EMBEDDED_LIBRARY_PATHS.contains(name)))
+        .and(in_byte_order(EMBEDDED_LIBRARY_PATHS))
+
+
 private func freshness_problem() -> Result[Void, String]:
-    names ?= library_file_names()
+    names ?= library_file_names("")
     stale ?= stale_file(names)
-    if EMBEDDED_LIBRARY_PATHS != names:
+    if not(same_paths(names)):
         Err(
             "embedded paths [${EMBEDDED_LIBRARY_PATHS.join(", ")}] differ from the directory's [${names.join(", ")}]; run make -C blorp compiler",
         )
@@ -135,7 +179,7 @@ pure func test_a_directory_layout_joins_a_relative_root_to_the_working_directory
     )
 
 
-pure func test_an_embedded_library_import_has_the_embedded_path() -> Bool:
+func test_an_embedded_library_import_has_the_embedded_path() -> Bool:
     part = intern_names(program_names().names, ["int"])
     request: ParsedImport = {
         path = { origin = LibraryImport, parts = part.ids },
@@ -209,9 +253,70 @@ func test_the_test_entry_is_read_from_the_embedded_library() -> Bool:
             paths.contains("<standard library>/test.brp")
 
 
+private NESTED_PATHS: List[String] = ["a.brp", "io.brp", "io/error.brp", "shadow/inner.brp"]
+
+
+-- A stem is ambiguous when the paths hold its module file and a path below it.
+pure func test_an_embedded_module_beside_its_folder_is_ambiguous() -> Bool:
+    embedded_stem_is_ambiguous(NESTED_PATHS, "io")
+        .and(not(embedded_stem_is_ambiguous(NESTED_PATHS, "a")))
+        .and(not(embedded_stem_is_ambiguous(NESTED_PATHS, "shadow")))
+        .and(not(embedded_stem_is_ambiguous(NESTED_PATHS, "io/error")))
+
+
+-- The embedded layout turns an absolute stem into one relative to the library
+-- root before looking it up; a user path and a directory layout have no answer.
+pure func test_an_embedded_stem_is_looked_up_relative_to_the_library_root() -> Bool:
+    directory = library_layout(LibraryDirectory("std"), "/project")
+    (embedded_stem_ambiguity(embedded_layout(), NESTED_PATHS, "<standard library>/io") == Some(True))
+        .and(
+            (
+                embedded_stem_ambiguity(embedded_layout(), NESTED_PATHS, "<standard library>/a")
+                == Some(False)
+            ),
+        )
+        .and(
+            (
+                embedded_stem_ambiguity(
+                    embedded_layout(),
+                    NESTED_PATHS,
+                    "<standard library>/io/error",
+                )
+                == Some(False)
+            ),
+        )
+        .and(embedded_stem_ambiguity(embedded_layout(), NESTED_PATHS, "/project/io").is_none())
+        .and(embedded_stem_ambiguity(directory, NESTED_PATHS, "/project/std/io").is_none())
+
+
+pure func test_an_embedded_collision_names_the_embedded_files() -> Bool:
+    site: Span = { source = compiler_source(), start = 3, end = 9 }
+    error = ambiguous_stem_diagnostic("<standard library>/io", site)
+    (error.message == "<standard library>/io.brp sits beside the folder <standard library>/io/, so the import path names both a module and a folder")
+        .and(
+            (
+                error.help
+                == "rename one of them; a module that belongs with the folder can move into it"
+            ),
+        )
+        .and(error.span == site)
+
+
 tests: TestSuite = {
     description = "Blorp embedded standard library",
     tests = [
+        (
+            "an embedded module beside its folder is ambiguous",
+            test_an_embedded_module_beside_its_folder_is_ambiguous,
+        ),
+        (
+            "an embedded stem is looked up relative to the library root",
+            test_an_embedded_stem_is_looked_up_relative_to_the_library_root,
+        ),
+        (
+            "an embedded collision names the embedded files",
+            test_an_embedded_collision_names_the_embedded_files,
+        ),
         (
             "embedded library is the library directory",
             test_embedded_library_is_the_library_directory,

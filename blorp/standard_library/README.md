@@ -21,6 +21,12 @@ The library root contains two designated foundation modules:
   is the only implicit import: application roots and ordinary user helper
   modules receive its selections, and it cannot be imported explicitly.
 
+A library module may live in a folder, as `io/error.brp` imported
+as `io/error`. A module file may not sit beside a folder of the same name; the
+loader rejects an import that passes through such a name. On disk any folder
+counts, but the embedded library records only `.brp` files, so a folder with none
+(a README alone) does not count there.
+
 Library modules receive nothing implicitly. Each one imports what it uses,
 including base types, for example `_base: Int, Bool(True, False)` in `int.brp`.
 `_base.brp` owns canonical Equatable beside the other core traits. The prelude

@@ -40,18 +40,20 @@ EMBEDDED_LIBRARY := build/generated/embedded_library.brp
 compiler: generate-compiler
 	@$(MAKE) --no-print-directory link-compiler
 
-# A pinned-seed change (bootstrap.env) rebuilds the generator too. -O1: the
-# generator loops over every library byte, which -O0 makes needlessly slow.
-$(EMBED_LIBRARY): scripts/embed_library.brp bootstrap.env
+# A pinned-seed change (bootstrap.env) or a change to the shared text helper it
+# imports rebuilds the generator too. -O1: the generator loops over every
+# library byte, which -O0 makes needlessly slow.
+$(EMBED_LIBRARY): scripts/embed_library.brp src/utils/text.brp bootstrap.env
 	@echo 'Build blorp/$(EMBED_LIBRARY)'
 	@cd .. && mkdir -p "$$(dirname "blorp/$(EMBED_LIBRARY)")" \
 		&& scripts/blorp-compiler-bootstrap --library-root blorp/standard_library \
 			blorp/scripts/embed_library.brp "blorp/$(EMBED_LIBRARY).c" \
 		&& "$(BLORP_CC)" -O1 "blorp/$(EMBED_LIBRARY).c" -o "blorp/$(EMBED_LIBRARY)" $(TEST_COMPILER_LIBRARIES)
 
-# The directory is a prerequisite so that a deleted or renamed library file,
-# which no wildcard match can name, regenerates the module.
-$(EMBEDDED_LIBRARY): $(EMBED_LIBRARY) standard_library $(wildcard standard_library/*.brp)
+# Every folder under the library is a prerequisite so that a deleted or renamed
+# library file, which no match can name, regenerates the module; the files are
+# found at any depth so that an edit inside a subfolder does too.
+$(EMBEDDED_LIBRARY): $(EMBED_LIBRARY) $(shell find standard_library \( -type d -o -name '*.brp' \))
 	@echo 'Generate blorp/$(EMBEDDED_LIBRARY)'
 	@cd .. && "blorp/$(EMBED_LIBRARY)" blorp/standard_library "blorp/$(EMBEDDED_LIBRARY)"
 

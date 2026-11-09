@@ -7,12 +7,13 @@ scratch=$(mktemp -d "${TMPDIR:-/tmp}/blorp bootstrap.XXXXXX")
 trap 'chmod -R u+w "$scratch"; rm -rf "$scratch"' EXIT
 fixture="$scratch/repo with spaces"
 tools="$scratch/fake tools"
-mkdir -p "$fixture/scripts" "$fixture/blorp/src" "$fixture/blorp/scripts" "$fixture/blorp/standard_library" "$tools"
+mkdir -p "$fixture/scripts" "$fixture/blorp/src/utils" "$fixture/blorp/scripts" "$fixture/blorp/standard_library" "$tools"
 fixture=$(cd "$fixture" && pwd -P)
 cp "$repo_root/blorp/Makefile" "$fixture/blorp/Makefile"
 # The embedded library's generator source and one library file: the fake seed
 # "compiles" the first and the file target's prerequisites name the second.
 printf '%s\n' '# stub generator' >"$fixture/blorp/scripts/embed_library.brp"
+printf '%s\n' '-- stub text helper the generator imports' >"$fixture/blorp/src/utils/text.brp"
 printf '%s\n' '-- stub library file' >"$fixture/blorp/standard_library/stub.brp"
 if [ -f "$repo_root/scripts/blorp-compiler-bootstrap" ]; then
 	cp "$repo_root/scripts/blorp-compiler-bootstrap" "$fixture/scripts/"
@@ -333,13 +334,32 @@ make -s -C "$fixture/blorp" BLORP_CC="$tools/fake cc" >"$scratch/make.stdout" 2>
 : >"$TEST_CC_LOG"
 # Every input is older than the generator, which is older than the module, so only
 # the directory's modification time, made by the removal, can rebuild it.
-touch -t "$long_ago" "$fixture/blorp/standard_library/stub.brp" "$fixture/blorp/scripts/embed_library.brp" "$fixture/blorp/bootstrap.env"
+touch -t "$long_ago" "$fixture/blorp/standard_library/stub.brp" "$fixture/blorp/scripts/embed_library.brp" "$fixture/blorp/src/utils/text.brp" "$fixture/blorp/bootstrap.env"
 touch -t 200006010000 "$generated/embed_library"
 touch -t 200101010000 "$generated/embedded_library.brp"
 rm "$fixture/blorp/standard_library/second.brp"
 make -s -C "$fixture/blorp" BLORP_CC="$tools/fake cc" >"$scratch/make.stdout" 2>"$scratch/make.stderr" || { cat "$scratch/make.stderr" >&2; fail 'build after a library file was deleted'; }
 printf 'built\nseed\nlink:0\n' >"$scratch/expected"
 cmp -s "$TEST_CC_LOG" "$scratch/expected" || { cat "$TEST_CC_LOG" >&2; fail 'a deleted library file must regenerate the module'; }
+# A file in a subfolder is an input too: only it changes, so only the module
+# regenerates.
+mkdir "$fixture/blorp/standard_library/nested"
+printf '%s\n' '-- nested stub' >"$fixture/blorp/standard_library/nested/deep.brp"
+touch -t "$long_ago" "$fixture/blorp/standard_library" "$fixture/blorp/standard_library/nested" "$fixture/blorp/standard_library/nested/deep.brp" "$fixture/blorp/standard_library/stub.brp"
+touch -t 200101010000 "$generated/embedded_library.brp"
+: >"$TEST_CC_LOG"
+touch "$fixture/blorp/standard_library/nested/deep.brp"
+make -s -C "$fixture/blorp" BLORP_CC="$tools/fake cc" >"$scratch/make.stdout" 2>"$scratch/make.stderr" || { cat "$scratch/make.stderr" >&2; fail 'build after a nested library file changed'; }
+printf 'built\nseed\nlink:0\n' >"$scratch/expected"
+cmp -s "$TEST_CC_LOG" "$scratch/expected" || { cat "$TEST_CC_LOG" >&2; fail 'a nested library file change must regenerate the module'; }
+# Deleting that file leaves nothing for a match to name; the subfolder's own
+# modification time regenerates the module.
+touch -t "$long_ago" "$fixture/blorp/standard_library" "$fixture/blorp/standard_library/nested" "$fixture/blorp/standard_library/stub.brp"
+touch -t 200101010000 "$generated/embedded_library.brp"
+: >"$TEST_CC_LOG"
+rm "$fixture/blorp/standard_library/nested/deep.brp"
+make -s -C "$fixture/blorp" BLORP_CC="$tools/fake cc" >"$scratch/make.stdout" 2>"$scratch/make.stderr" || { cat "$scratch/make.stderr" >&2; fail 'build after a nested library file was deleted'; }
+cmp -s "$TEST_CC_LOG" "$scratch/expected" || { cat "$TEST_CC_LOG" >&2; fail 'a deleted nested library file must regenerate the module'; }
 pass 'the embedded library module is regenerated only when its inputs change'
 
 : >"$TEST_CC_LOG"

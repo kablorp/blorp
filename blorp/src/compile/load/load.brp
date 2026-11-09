@@ -1,8 +1,10 @@
 import:
+    bool: Bool methods
     dict: empty, Dict methods
-    fs: read_text
+    fs: EntryKind(File, Directory), entry_kind, read_text
     int: Int methods
     io: describe
+    list: List methods
     option: Option methods
     path as Path
     string: String methods
@@ -10,7 +12,7 @@ import:
     -- The one import that leaves src/: the module is generated into the build
     -- directory (see EMBEDDED_LIBRARY_PLAN.md), so build it first with
     -- `make -C blorp compiler`.
-    ../../../build/generated/embedded_library: embedded_library_file
+    ../../../build/generated/embedded_library: EMBEDDED_LIBRARY_PATHS, embedded_library_file
     ../../syntax/lex: lex
     ../../syntax/names: NameId, NameTable
     ../../syntax/parse:
@@ -39,6 +41,9 @@ import:
         SealFailure(MalformedBundle, ImportCycle),
         begin_program,
 
+
+-- Every module file ends in this; a name without it is a folder or another file.
+private LIBRARY_SUFFIX: String = ".brp"
 
 private FOUNDATION_TYPES_PATH: String = "_base.brp"
 
@@ -172,11 +177,13 @@ pure func module_role(layout: LibraryLayout, path: String) -> ModuleKind:
         UserModule
 
 
-private pure func join_parts(
+private func join_parts(
     directory: String,
     parts: List[NameId],
     position: Int,
     names: NameTable,
+    layout: LibraryLayout,
+    site: Span,
 ) -> Result[String, Diagnostic]:
     match parts.get(position):
         None:
@@ -190,13 +197,78 @@ private pure func join_parts(
                         "import path references an invalid spelling identity",
                     )
             ):
-                Ok(spelling): Path.join(directory, spelling).join_parts(parts, position + 1, names)
-                Err(error): Err(error)
+                Ok(spelling):
+                    stem = Path.join(directory, spelling)
+                    if layout.stem_is_ambiguous(stem):
+                        Err(ambiguous_stem_diagnostic(stem, site))
+                    else:
+                        stem.join_parts(parts, position + 1, names, layout, site)
+                Err(error):
+                    Err(error)
+
+
+-- `a.brp` beside the folder `a/` would make the import `a` or `a/b` read two
+-- ways, so an import path that passes through such a name is refused.
+pure func ambiguous_stem_diagnostic(stem: String, site: Span) -> Diagnostic:
+    diagnostic(
+        site,
+        "${stem}${LIBRARY_SUFFIX} sits beside the folder ${stem}/, so the import path names both a module and a folder",
+        "rename one of them; a module that belongs with the folder can move into it",
+    )
+
+
+-- Whether the embedded paths hold both a module file and a folder for `stem`,
+-- which is relative to the library root. Embedded paths are the files, so a
+-- folder exists when some path starts with `stem/`.
+pure func embedded_stem_is_ambiguous(paths: List[String], stem: String) -> Bool:
+    folder = "${stem}/"
+    paths
+        .contains("${stem}${LIBRARY_SUFFIX}")
+        .and(paths.any(pure func(path): path.starts_with(folder)))
+
+
+-- The embedded library's answer for `stem`, which is None when the layout does
+-- not embed it: a directory layout, or a user module's path.
+pure func embedded_stem_ambiguity(
+    layout: LibraryLayout,
+    paths: List[String],
+    stem: String,
+) -> Option[Bool]:
+    match from_opaque LibraryLayout(layout):
+        ReadFromDirectory(_):
+            None
+        ReadFromEmbedded:
+            prefix = embedded_contents().prefix
+            if stem.starts_with(prefix):
+                stem
+                    .slice(prefix.length(), stem.length())
+                    .map(pure func(relative): embedded_stem_is_ambiguous(paths, relative))
+            else:
+                None
+
+
+-- Whether `stem` names both a module file and a folder, which would make an
+-- import path through it (`a`, `a/b`) read two ways. On disk a folder counts
+-- even if it holds no module; the embedded library records only library files,
+-- so there a folder counts only when it holds one. A stem whose kind cannot be
+-- read counts as absent: reading the module reports that failure.
+private func stem_is_ambiguous(layout: LibraryLayout, stem: String) -> Bool:
+    match embedded_stem_ambiguity(layout, EMBEDDED_LIBRARY_PATHS, stem):
+        Some(ambiguous):
+            ambiguous
+        None:
+            match "${stem}${LIBRARY_SUFFIX}".entry_kind():
+                Ok(Some(File)):
+                    match stem.entry_kind():
+                        Ok(Some(Directory)): True
+                        _: False
+                _:
+                    False
 
 
 -- This projection belongs to source loading, where filesystem paths are needed.
 -- Semantic import resolution receives ModuleId targets instead of these strings.
-pure func import_path(
+func import_path(
     importer: String,
     request: ParsedImport,
     names: NameTable,
@@ -212,12 +284,12 @@ pure func import_path(
                 directory = Path.dirname(directory)
                 remaining = remaining - 1
             directory
-    directory ?= base.join_parts(request.path.parts, 0, names)
+    directory ?= base.join_parts(request.path.parts, 0, names, layout, request.span)
     -- Already normal: the importer and library root are normalized, relative parents
     -- are resolved with dirname on that normal path, and the parser admits only
     -- identifier parts ("interior dot segments are rejected" in
     -- test_grammar/test_imports.brp), so normalizing again would only reallocate.
-    Ok("${directory}.brp")
+    Ok("${directory}${LIBRARY_SUFFIX}")
 
 
 -- The site is the import that discovered the file; designated inputs have none.
@@ -420,7 +492,7 @@ private pure func import_allowed(
                         None: Err(internal_error(compiler_span(), "module inventory is too large"))
 
 
-private pure func resolve_imports(cursor: ImportCursor) -> Result[ImportCursor, Diagnostic]:
+private func resolve_imports(cursor: ImportCursor) -> Result[ImportCursor, Diagnostic]:
     match cursor.imports.get(cursor.targets.length()):
         None:
             Ok(cursor)
@@ -446,7 +518,7 @@ private pure func resolve_imports(cursor: ImportCursor) -> Result[ImportCursor, 
 
 
 -- Parse one file, resolve its imports, and add it to the assembly.
-private pure func link_module(
+private func link_module(
     state: LoadState,
     current: RequestedModule,
     contents: String,

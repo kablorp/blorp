@@ -861,7 +861,13 @@ Each file is a module. An import block comes before the declarations, and each
 row names one module:
 
 - `./name` and `../name` are relative to the importing file, without `.brp`;
-  a bare path such as `int` is a module under the library root.
+  a bare path such as `int` is a module under the library root. A path may
+  pass through folders, as in `io/error` or `./shared/names`, which name
+  `io/error.brp` under the library root or `shared/names.brp` beside the
+  importing file. A module file beside a folder of the same name (`io.brp` and
+  `io/`) is rejected at an import that passes through that name, such as `io`,
+  `io/error` or `./io/error`, because the path would read as both a module and
+  a folder. Other imports are unaffected.
 - `module: answer, Shape(Circle, Square)` selects functions and types. A union
   selection lists the constructors it imports, and `Shape()` imports the type
   alone. A selected type also makes the module's functions on it available
@@ -1242,9 +1248,11 @@ links. The compiler's own source can use only what the seed supports.
 The embedded standard library is a generated module,
 `blorp/build/generated/embedded_library.brp`, which `src/compile/load/load.brp`
 imports. The seed builds [`scripts/embed_library.brp`](scripts/embed_library.brp),
-and `make -C blorp compiler` runs it whenever a library file or the generator
-changes. Anything that compiles `src/main.brp` directly (a benchmark recipe, a
-seed workflow) must run `make -C blorp build/generated/embedded_library.brp`
+and `make -C blorp compiler` runs it whenever a library file, a library folder
+or the generator changes. It embeds every `.brp` file under the library at any
+depth, named by its path below the root, such as `io/error.brp`. Anything that
+compiles `src/main.brp` directly (a benchmark recipe, a seed workflow) must run
+`make -C blorp build/generated/embedded_library.brp`
 first. The generated file is not formatted, and the repository formatting
 gate does not walk `blorp/build`; format the files you changed rather than
 running `blorp format blorp`. The gate's roots are `blorp/scripts`, `blorp/src`,

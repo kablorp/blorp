@@ -9,7 +9,7 @@ so it uses only what the seed supports. Make runs it again whenever a library
 file or this program changes; see EMBEDDED_LIBRARY_PLAN.md.
 ---
 import:
-    bool: and, or
+    bool: Bool methods, and, or
     fs: Entry, EntryKind(File, Directory, Symlink, Other), list_directory, read_text, write_text
     int: Int methods
     io: print_error, describe
@@ -18,6 +18,7 @@ import:
     path: join
     result: Result methods
     string: String methods
+    ../src/utils/text: byte_order_before
 
 
 private LIBRARY_SUFFIX: String = ".brp"
@@ -183,36 +184,19 @@ private pure func has_library_suffix(name: String) -> Bool:
     and(start >= 0, name.slice(start, name.length()) == Some(LIBRARY_SUFFIX))
 
 
--- The row of one directory entry: Some((name, text)) for a library file, None
--- for a file that is not library code, such as the README. A subdirectory is
--- an error until the library has one, so that no module is dropped without a
--- word.
-private func library_row(root: String, entry: Entry) -> Result[Option[(String, String)], String]:
-    path = join(root, entry.name)
-    match entry.kind:
-        Directory:
-            Err(
-                "${path} is a directory; the embedded library holds only the files directly under its root",
-            )
-        File:
-            if has_library_suffix(entry.name):
-                read_text(path)
-                    .map_err(describe)
-                    .map(pure func(contents: String): Some((entry.name, contents)))
-            else:
-                Ok(None)
-        Symlink | Other:
-            if has_library_suffix(entry.name):
-                Err("${path} is not a regular file")
-            else:
-                Ok(None)
+-- The rows of the folder at `relative` below `root` ("" for the root), in
+-- discovery order.
+private func folder_rows(root: String, relative: String) -> Result[List[(String, String)], String]:
+    entries ?= list_directory(join(root, relative)).map_err(describe)
+    read_entries(root, relative, entries, [])
 
 
--- The (name, text) rows of the library files directly under `root`, in the
--- order list_directory returns them: sorted by name bytes. Recursion depth is
--- the file count of the library.
+-- The (relative path, text) rows of `entries`, the entries of the folder at
+-- `relative`, and of every folder beneath it, in discovery order. Recursion
+-- depth is the depth of the folders plus the file count of the library.
 private func read_entries(
     root: String,
+    relative: String,
     entries: List[Entry],
     files: List[(String, String)],
 ) -> Result[List[(String, String)], String]:
@@ -220,15 +204,65 @@ private func read_entries(
         []:
             Ok(files)
         [entry, ...later]:
-            match library_row(root, entry):
-                Err(message): Err(message)
-                Ok(Some(file)): read_entries(root, later, files.append(file))
-                Ok(None): read_entries(root, later, files)
+            match entry.kind:
+                Directory:
+                    match folder_rows(root, "${relative}${entry.name}/"):
+                        Err(message): Err(message)
+                        Ok(nested): read_entries(root, relative, later, files.concat(nested))
+                File:
+                    if has_library_suffix(entry.name):
+                        name = "${relative}${entry.name}"
+                        match read_text(join(root, name)).map_err(describe):
+                            Err(message):
+                                Err(message)
+                            Ok(contents):
+                                read_entries(root, relative, later, files.append((name, contents)))
+                    else:
+                        read_entries(root, relative, later, files)
+                Symlink | Other:
+                    if has_library_suffix(entry.name):
+                        Err("${join(root, relative)}${entry.name} is not a regular file")
+                    else:
+                        read_entries(root, relative, later, files)
+
+
+private pure func path_before(left: (String, String), right: (String, String)) -> Bool:
+    (left_path, _) = left
+    (right_path, _) = right
+    byte_order_before(left_path, right_path)
+
+
+-- Insertion sort by path bytes, which is the order EMBEDDED_LIBRARY_PATHS
+-- documents. A library has tens of files, and a folder's rows can precede a
+-- sibling file such as `io.brp` that sorts before `io/`, so the walk's order
+-- is not enough.
+private pure func sorted_by_path(rows: List[(String, String)]) -> List[(String, String)]:
+    var sorted: List[(String, String)] = []
+    for row in rows:
+        var position = sorted.length()
+        var moving: Bool = True
+        while moving.and(position > 0):
+            moving = match sorted.get(position - 1):
+                Some(previous): path_before(row, previous)
+                None: False
+            if moving:
+                position = position - 1
+        sorted = sorted
+            .take(position)
+            .append(row)
+            .concat(sorted.drop(position))
+    sorted
+
+
+-- The (relative path, text) rows of every library file under `root`, at any
+-- depth, in path byte order.
+func library_rows(root: String) -> Result[List[(String, String)], String]:
+    files ?= folder_rows(root, "")
+    Ok(sorted_by_path(files))
 
 
 private func write_module(root: String, output: String) -> Result[Void, String]:
-    entries ?= list_directory(root).map_err(describe)
-    files ?= read_entries(root, entries, [])
+    files ?= library_rows(root)
     text ?= render_embedded_library(files)
     write_text(output, text).map_err(describe)
 
