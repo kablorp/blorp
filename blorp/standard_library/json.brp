@@ -45,9 +45,6 @@ union ParseErrorKind:
     TrailingData
     -- A container opens deeper than MAX_NESTING_DEPTH.
     TooDeep
-    -- A slice would cut inside a UTF-8 character. Every cut is at an ASCII
-    -- delimiter or an endpoint, so this reports a defect in this module.
-    SplitCharacter
 
 
 -- `offset` is a zero-based UTF-8 byte offset into the parsed text.
@@ -58,7 +55,7 @@ record ParseError { offset: Int, kind: ParseErrorKind }
 -- parse, one more is TooDeep. Real documents rarely pass a few dozen levels
 -- (serde_json stops at 128). Measured under AddressSanitizer and
 -- UndefinedBehaviorSanitizer on macOS with an 8 MB stack: 8192 levels parsed
--- and 65536 overflowed, so 512 leaves a wide margin; Linux CI passes at 512.
+-- and 65536 overflowed, so 512 leaves a wide margin.
 MAX_NESTING_DEPTH: Int = 512
 
 
@@ -106,7 +103,6 @@ private pure func phrase(kind: ParseErrorKind) -> String:
         UnpairedSurrogate: "unpaired Unicode surrogate"
         TrailingData: "unexpected data after JSON value"
         TooDeep: "JSON nesting is deeper than ${MAX_NESTING_DEPTH.to_string()} levels"
-        SplitCharacter: "internal error: JSON text split inside a UTF-8 character"
 
 
 -- The fixed wording for an error, without its offset: "expected a JSON value".
@@ -126,17 +122,10 @@ private pure func reading(status: ScanStatus) -> Bool:
         _: False
 
 
--- Every parsing caller cuts at ASCII delimiters or the String's endpoints,
--- hence scalar boundaries; a cut that is not one is reported, not repaired.
-private pure func segment(text: String, start: Int, end: Int) -> Result[String, ParseError]:
-    match text.slice(start, end):
-        Some(value): Ok(value)
-        None: Err({ offset = start, kind = SplitCharacter })
-
-
--- Rendering is infallible. Its cuts are at ASCII escapes or the endpoints of a
--- String, so the None arm is unreachable; an empty piece is the only fallback.
-private pure func rendered_segment(text: String, start: Int, end: Int) -> String:
+-- Every caller, parsing and rendering, cuts at ASCII delimiters or the
+-- String's endpoints, hence scalar boundaries. The None arm is unreachable for
+-- these private ranges.
+private pure func segment(text: String, start: Int, end: Int) -> String:
     text
         .slice(start, end)
         .get_or("")
@@ -199,8 +188,7 @@ private pure func parse_number(text: String, start: Int) -> Result[Parsed[JsonNu
     else:
         Ok(fraction_end)
     end ?= exponential
-    lexeme ?= segment(text, start, end)
-    Ok({ value = into_opaque JsonNumber(lexeme), next = end })
+    Ok({ value = into_opaque JsonNumber(segment(text, start, end)), next = end })
 
 
 -- Validate a whole number lexeme, without surrounding whitespace.
@@ -326,26 +314,18 @@ private pure func parse_string(text: String, start: Int) -> Result[Parsed[String
     while reading(status).and(position < text.length()):
         current = byte(text, position)
         if current == QUOTE:
-            match segment(text, literal_start, position):
-                Err(error):
-                    status = Failed(error)
-                Ok(literal):
-                    decoded = decoded + literal
-                    position = position + 1
-                    status = Complete
+            decoded = decoded + segment(text, literal_start, position)
+            position = position + 1
+            status = Complete
         else if current == BACKSLASH:
-            match segment(text, literal_start, position):
+            decoded = decoded + segment(text, literal_start, position)
+            match parse_escape(text, position):
                 Err(error):
                     status = Failed(error)
-                Ok(literal):
-                    decoded = decoded + literal
-                    match parse_escape(text, position):
-                        Err(error):
-                            status = Failed(error)
-                        Ok(escaped):
-                            decoded = decoded + escaped.value
-                            position = escaped.next
-                            literal_start = position
+                Ok(escaped):
+                    decoded = decoded + escaped.value
+                    position = escaped.next
+                    literal_start = position
         else if current < 32:
             status = Failed({ offset = position, kind = UnescapedControl })
         else:
@@ -509,26 +489,6 @@ pure func parse(text: String) -> Result[Json, ParseError]:
         Err({ offset = end, kind = TrailingData })
 
 
-private pure func hex_digit(value: Int) -> String:
-    match value:
-        0: "0"
-        1: "1"
-        2: "2"
-        3: "3"
-        4: "4"
-        5: "5"
-        6: "6"
-        7: "7"
-        8: "8"
-        9: "9"
-        10: "a"
-        11: "b"
-        12: "c"
-        13: "d"
-        14: "e"
-        _: "f"
-
-
 private pure func append_quoted(output: String, text: String) -> String:
     var rendered = output + "\""
     var literal_start = 0
@@ -552,17 +512,24 @@ private pure func append_quoted(output: String, text: String) -> String:
             _:
                 if current < 32:
                     -- A JSON control escape has exactly four hex digits.
-                    Some("\\u00" + hex_digit(current / 16) + hex_digit(current % 16))
+                    hex = "0123456789abcdef"
+                    Some(
+                        (
+                            "\\u00"
+                            + segment(hex, current / 16, current / 16 + 1)
+                            + segment(hex, current % 16, current % 16 + 1)
+                        ),
+                    )
                 else:
                     None
         match escaped:
             None:
                 void
             Some(spelling):
-                rendered = rendered + rendered_segment(text, literal_start, position)
+                rendered = rendered + segment(text, literal_start, position)
                 rendered = rendered + spelling
                 literal_start = position + 1
-    rendered + rendered_segment(text, literal_start, text.length()) + "\""
+    rendered + segment(text, literal_start, text.length()) + "\""
 
 
 -- One output accumulator flows through nesting and sibling loops. No
