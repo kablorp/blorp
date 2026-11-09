@@ -275,6 +275,11 @@ keeps what a later landing needs. What it found:
     `InferenceSlot` an origin variant instead.
   - The spike wrote `IntegerType(_)` where the format matters. L0 routes every
     such site through an exhaustive format function.
+- **One format-blind site no match will flag.** Emit writes every integer
+  literal as `INT64_C(…)` from its `IntegerValue`, without looking at the
+  format (`emit.brp`, `IntegerValue` in `lower.brp` and `own.brp`). C converts
+  it to `uint8_t` silently, and only check's `integer_fits` guards the range.
+  L1 makes the literal's emission follow its format.
 
 ## Landings
 
