@@ -6,7 +6,7 @@ the resolved requirement-to-body mapping consumed by checking and specialization
 import:
     bool: Bool methods
     int: Int methods
-    list: List methods
+    list: List methods, repeat
     option: Option methods
     ../../syntax/names: NameTable, NameId
     ../../syntax/source: ModuleId, equality_label, ModuleKind(LibraryModule)
@@ -18,6 +18,7 @@ import:
         Visibility(Public, Private),
         Span,
         compiler_span,
+    ../../utils/stack: push_at
     ../assemble: ParsedContents
     ../ids:
         DeclarationInventory,
@@ -262,31 +263,39 @@ private pure func accept_trait(
 
 
 -- Walks up from `root`; `walked` ends at `current`. An edge back to the root
--- closes a cycle, reported at that edge with the walk. A trait already on the
--- walk ends it: that cycle is reported from its own traits' walks.
+-- closes a cycle, reported at that edge with the walk. `explored`, indexed by
+-- trait number, marks every trait this root's walk has entered, and the walk
+-- returns it with the traits it entered added. An explored trait is not
+-- entered again. If it is on the walk, its cycle is reported from its own
+-- traits' walks. If the walk has left it, every trait it reaches is on the walk
+-- or has had all its edges checked, so no edge back to the root lies beyond
+-- it. A diamond therefore costs one visit, not one per route, and the first
+-- closing edge is the one a walk of every route would find.
 private pure func supertrait_cycle(
     traits: List[AcceptedTrait],
     root: TraitId,
     current: TraitId,
     walked: List[TraitId],
-) -> Result[Void, CheckError]:
+    explored: List[Bool],
+) -> Result[List[Bool], CheckError]:
+    var entered = explored.set(current.trait_number(), True)
     var failure: Option[CheckError] = None
     for supertrait in traits.direct_supertraits(current):
         next = supertrait.required_trait
         if failure.is_none():
             if next == root:
                 failure = Some(trait_error(supertrait.span, SupertraitCycle(walked.append(next))))
-            else if (
-                walked
-                    .any(pure func(earlier): earlier == next)
-                    .not()
-            ):
-                match traits.supertrait_cycle(root, next, walked.append(next)):
-                    Ok(_): void
-                    Err(error): failure = Some(error)
+            else:
+                match entered.get(next.trait_number()):
+                    Some(False):
+                        match traits.supertrait_cycle(root, next, walked.append(next), entered):
+                            Ok(after): entered = after
+                            Err(error): failure = Some(error)
+                    _:
+                        void
     match failure:
         Some(error): Err(error)
-        None: Ok(void)
+        None: Ok(entered)
 
 
 -- Every issued TraitId has its accepted row, so the `None` arm never runs.
@@ -299,15 +308,42 @@ private pure func direct_supertraits(
         None: []
 
 
--- A held bound proves itself and every trait above it. Acceptance rejects
--- supertrait cycles before any proof runs, so the walk ends.
+-- A held bound proves itself and every trait above it. Each trait is queued
+-- once, so a diamond or a repeated supertrait costs one visit however many
+-- routes reach it, and a failed proof ends after every trait above `held`.
 pure func entails(traits: List[AcceptedTrait], held: TraitId, required: TraitId) -> Bool:
     if held == required:
         True
     else:
-        traits
-            .direct_supertraits(held)
-            .any(pure func(supertrait): traits.entails(supertrait.required_trait, required))
+        var queued: List[Bool] = repeat(False, traits.length())
+        queued = queued.set(held.trait_number(), True)
+        var pending: List[TraitId] = [held]
+        var pending_count: Int = 1
+        var found: Bool = False
+        while (
+            found
+                .not()
+                .and(pending_count > 0)
+        ):
+            pending_count = pending_count - 1
+            match pending.get(pending_count):
+                Some(current):
+                    for supertrait in traits.direct_supertraits(current):
+                        next = supertrait.required_trait
+                        if next == required:
+                            found = True
+                        else:
+                            match queued.get(next.trait_number()):
+                                Some(False):
+                                    queued = queued.set(next.trait_number(), True)
+                                    pending = pending.push_at(pending_count, next)
+                                    pending_count = pending_count + 1
+                                _:
+                                    void
+                -- `pending` holds at least `pending_count` traits, so this arm never runs.
+                None:
+                    void
+        found
 
 
 private pure func canonical_header(
@@ -1007,7 +1043,12 @@ pure func accept_trait_contracts(
             break
     for accepted in declarations:
         if failure.is_none():
-            match declarations.supertrait_cycle(accepted.id, accepted.id, [accepted.id]):
+            match declarations.supertrait_cycle(
+                accepted.id,
+                accepted.id,
+                [accepted.id],
+                repeat(False, declarations.length()),
+            ):
                 Ok(_): void
                 Err(error): failure = Some(error)
     match failure:
