@@ -347,18 +347,41 @@ Duplicate decoded object names also reject, including `"a"` and `"\u0061"`
 in the same object; nested objects have independent names. There are no
 comments, trailing commas, non-JSON whitespace or byte order mark extensions.
 
+`as_int(number) -> Option[Int]` is `Some` only when the whole lexeme is an
+optional minus and decimal digits that fit Int64; `-0` is `Some(0)`. A
+fraction or exponent makes it `None` even when the value is whole (`1.0`,
+`1e3`), as does a value outside Int64 (`9223372036854775808`). It never
+rounds, and `number_text` still returns the exact spelling.
+
 `ParseError` has `offset: Int`, a zero-based UTF-8 byte offset, and
-`message: String`, a fixed explanation. End-of-input errors point at byte
-length; a duplicate name points at its second opening quote. An invalid
-present escape points at its backslash, and a bad hex digit points at that
-digit. A missing escape byte at end of input points at byte length.
-For example, `["é",x]` fails at byte 6 with `expected a JSON value`.
+`kind: ParseErrorKind`. Match on the kind; `describe(error) -> String`
+returns its fixed wording, such as `expected a JSON value`, without the
+offset. The kinds are `ExpectedValue`, `ExpectedNull`, `ExpectedTrue`,
+`ExpectedFalse`, `ExpectedNumberDigit`, `ExpectedFractionDigit`,
+`ExpectedExponentDigit`, `TrailingNumberData` (from `number` only),
+`ExpectedArrayDelimiter`, `ExpectedObjectName`, `ExpectedColon`,
+`ExpectedObjectDelimiter`, `DuplicateName`, `UnclosedString`,
+`UnescapedControl`, `ExpectedEscape`, `ExpectedHexDigits`,
+`UnpairedSurrogate`, `TrailingData` and `TooDeep`.
+End-of-input errors point at byte length; a duplicate name points at its
+second opening quote. An invalid present escape points at its backslash,
+and a bad hex digit points at that digit. A missing escape byte at end of
+input points at byte length. For example, `["é",x]` fails at byte 6 with
+kind `ExpectedValue`.
+
+Parsing rejects containers nested deeper than `MAX_NESTING_DEPTH` (512)
+with `TooDeep`, at the bracket that opens too deep: `[` repeated 513 times
+fails at byte 512, while 512 levels parse. This bounds the native stack
+for untrusted input; real documents rarely pass a few dozen levels.
+`render` does not bound depth: it uses one native frame per level of the
+tree it is given, which the caller built, so a tree deeper than a few
+thousand levels can exhaust the stack. Every tree from `parse` is safe. The
+comment on `MAX_NESTING_DEPTH` in `json.brp` records how the limit was chosen.
 
 Parsing rendered values reconstructs their scalar contents, container members
 and exact numeric lexemes. Source whitespace and escape spelling normalize.
-There is no library size, digit-count or nesting limit. Memory follows the
-input and result; parsing and rendering use native stack proportional to
-container nesting, so sufficiently deep documents can exhaust the stack.
+There is no library size or digit-count limit. Memory follows the input and
+result, and parsing and rendering cost time linear in them.
 
 ### The fs module
 
