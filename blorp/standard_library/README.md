@@ -372,6 +372,16 @@ for untrusted input; real documents rarely pass a few dozen levels.
 `render` does not bound depth: it uses one native frame per level of the
 tree it is given, which the caller built, so a tree deeper than a few
 thousand levels can exhaust the stack. Every tree from `parse` is safe.
+The limit was chosen by measurement: under AddressSanitizer and
+UndefinedBehaviorSanitizer on macOS with an 8 MB stack, 8192 levels parsed
+and 65536 overflowed; Linux CI passes at 512. With the check loosened to
+4000 levels, exactly the two depth tests fail (past-the-limit and hostile
+unclosed nesting).
+
+Rendering also assumes that every cut of a string falls on an escape or a
+string end, which holds because escapes are ASCII; it has no way to report a
+violation, so it would drop the affected run instead. Making that failure
+visible is a follow-up candidate.
 
 Parsing rendered values reconstructs their scalar contents, container members
 and exact numeric lexemes. Source whitespace and escape spelling normalize.
