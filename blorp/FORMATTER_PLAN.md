@@ -109,6 +109,13 @@ What the formatter reuses (surveyed 2026-11-06):
     `else if` and `else` are always blocks by grammar, so nothing changes
     there.
 
+14. (Keith, 2026-11-09: "record declarations should always be split across
+    lines".) Every `record` and `fixed record` declaration, public or
+    private, generic or not, puts each field on its own line inside the
+    braces with a trailing comma, at any width and even with a single field.
+    Record literals, record updates, union variants and every other
+    construct keep their rules.
+
 Settled without a choice: one space around binary operators, `=` and
 annotation `:`, and after commas; a space inside record braces and none inside
 `[]` or `()`; no column alignment; `if` is always a block, and an `else:`
@@ -202,7 +209,8 @@ chain of two or more calls (decision 12), break it by its
 one rule (one item per line, one chain link per line, or parenthesized
 operands with the operator first), then lay out each child the same way.
 A `match` lays out all its arms as blocks when any one needs a block
-(decision 13). Only the outermost operator chain of a value breaks; its operands stay flat
+(decision 13), and a record declaration always lists one field per line
+(decision 14). Only the outermost operator chain of a value breaks; its operands stay flat
 unless they are themselves parenthesized or bracketed. There is no cost
 function and no search across siblings, so an edit changes the layout of the
 constructs containing it and of nothing beside them.
