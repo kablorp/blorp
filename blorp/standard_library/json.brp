@@ -21,7 +21,45 @@ union Json:
     Object(Dict[String, Json])
 
 
-record ParseError { offset: Int, message: String }
+-- Why parsing stopped. `describe` owns the wording; callers match on the kind.
+union ParseErrorKind:
+    ExpectedValue
+    ExpectedNull
+    ExpectedTrue
+    ExpectedFalse
+    ExpectedNumberDigit
+    ExpectedFractionDigit
+    ExpectedExponentDigit
+    -- Only from `number`, which checks a whole lexeme.
+    TrailingNumberData
+    ExpectedArrayDelimiter
+    ExpectedObjectName
+    ExpectedColon
+    ExpectedObjectDelimiter
+    DuplicateName
+    UnclosedString
+    UnescapedControl
+    ExpectedEscape
+    ExpectedHexDigits
+    UnpairedSurrogate
+    TrailingData
+    -- A container opens deeper than MAX_NESTING_DEPTH.
+    TooDeep
+    -- A slice would cut inside a UTF-8 character. Every cut is at an ASCII
+    -- delimiter or an endpoint, so this reports a defect in this module.
+    SplitCharacter
+
+
+-- `offset` is a zero-based UTF-8 byte offset into the parsed text.
+record ParseError { offset: Int, kind: ParseErrorKind }
+
+
+-- The deepest container nesting `parse` accepts: this many brackets in a row
+-- parse, one more is TooDeep. Real documents rarely pass a few dozen levels
+-- (serde_json stops at 128). Parsing spends two native frames per level;
+-- 512 levels use well under the 8 MB default stack, even in AddressSanitizer
+-- builds whose frames are the largest, so no platform needs a special case.
+MAX_NESTING_DEPTH: Int = 512
 
 
 private record Parsed[T] { value: T, next: Int }
@@ -46,6 +84,36 @@ private SURROGATE_RADIX: Int = 1024
 private SUPPLEMENTARY_FIRST: Int = 65536
 
 
+private pure func phrase(kind: ParseErrorKind) -> String:
+    match kind:
+        ExpectedValue: "expected a JSON value"
+        ExpectedNull: "expected 'null'"
+        ExpectedTrue: "expected 'true'"
+        ExpectedFalse: "expected 'false'"
+        ExpectedNumberDigit: "expected a digit in JSON number"
+        ExpectedFractionDigit: "expected a digit after decimal point"
+        ExpectedExponentDigit: "expected a digit in exponent"
+        TrailingNumberData: "unexpected data after JSON number"
+        ExpectedArrayDelimiter: "expected ',' or ']' after array value"
+        ExpectedObjectName: "expected a quoted object name"
+        ExpectedColon: "expected ':' after object name"
+        ExpectedObjectDelimiter: "expected ',' or '}' after object value"
+        DuplicateName: "duplicate object name"
+        UnclosedString: "expected closing quote for JSON string"
+        UnescapedControl: "control character must be escaped in JSON string"
+        ExpectedEscape: "expected a JSON escape after backslash"
+        ExpectedHexDigits: "expected four hexadecimal digits after \\u"
+        UnpairedSurrogate: "unpaired Unicode surrogate"
+        TrailingData: "unexpected data after JSON value"
+        TooDeep: "JSON nesting is deeper than ${MAX_NESTING_DEPTH.to_string()} levels"
+        SplitCharacter: "internal error: JSON text split inside a UTF-8 character"
+
+
+-- The fixed wording for an error, without its offset: "expected a JSON value".
+pure func describe(error: ParseError) -> String:
+    error.kind.phrase()
+
+
 private pure func byte(text: String, offset: Int) -> Int:
     text
         .byte_at(offset)
@@ -58,9 +126,17 @@ private pure func reading(status: ScanStatus) -> Bool:
         _: False
 
 
--- Every caller cuts at ASCII delimiters or the String's endpoints, hence
--- scalar boundaries. The None arm is unreachable for these private ranges.
-private pure func segment(text: String, start: Int, end: Int) -> String:
+-- Every parsing caller cuts at ASCII delimiters or the String's endpoints,
+-- hence scalar boundaries; a cut that is not one is reported, not repaired.
+private pure func segment(text: String, start: Int, end: Int) -> Result[String, ParseError]:
+    match text.slice(start, end):
+        Some(value): Ok(value)
+        None: Err({ offset = start, kind = SplitCharacter })
+
+
+-- Rendering is infallible. Its cuts are at ASCII escapes or the endpoints of a
+-- String, so the None arm is unreachable; an empty piece is the only fallback.
+private pure func rendered_segment(text: String, start: Int, end: Int) -> String:
     text
         .slice(start, end)
         .get_or("")
@@ -99,13 +175,13 @@ private pure func parse_number(text: String, start: Int) -> Result[Parsed[JsonNu
     else if (first >= 49).and(first <= 57):
         Ok(digits_end(text, beginning + 1))
     else:
-        Err({ offset = beginning, message = "expected a digit in JSON number" })
+        Err({ offset = beginning, kind = ExpectedNumberDigit })
     integer_end ?= integral
     fractional: Result[Int, ParseError] = if byte(text, integer_end) == 46:
         if digit(byte(text, integer_end + 1)):
             Ok(digits_end(text, integer_end + 2))
         else:
-            Err({ offset = integer_end + 1, message = "expected a digit after decimal point" })
+            Err({ offset = integer_end + 1, kind = ExpectedFractionDigit })
     else:
         Ok(integer_end)
     fraction_end ?= fractional
@@ -119,11 +195,12 @@ private pure func parse_number(text: String, start: Int) -> Result[Parsed[JsonNu
         if digit(byte(text, exponent_start)):
             Ok(digits_end(text, exponent_start + 1))
         else:
-            Err({ offset = exponent_start, message = "expected a digit in exponent" })
+            Err({ offset = exponent_start, kind = ExpectedExponentDigit })
     else:
         Ok(fraction_end)
     end ?= exponential
-    Ok({ value = into_opaque JsonNumber(segment(text, start, end)), next = end })
+    lexeme ?= segment(text, start, end)
+    Ok({ value = into_opaque JsonNumber(lexeme), next = end })
 
 
 -- Validate a whole number lexeme, without surrounding whitespace.
@@ -132,7 +209,7 @@ pure func number(text: String) -> Result[JsonNumber, ParseError]:
     if parsed.next == text.length():
         Ok(parsed.value)
     else:
-        Err({ offset = parsed.next, message = "unexpected data after JSON number" })
+        Err({ offset = parsed.next, kind = TrailingNumberData })
 
 
 pure func number_text(value: JsonNumber) -> String:
@@ -143,27 +220,37 @@ pure func integer(value: Int) -> JsonNumber:
     into_opaque JsonNumber("".append_int(value))
 
 
+-- Some only when the whole lexeme is an optional minus and decimal digits that
+-- fit Int64, so `-0` is 0. A fraction or exponent makes it None even when its
+-- value is whole: `1.0` and `1e3` are not integer spellings. Never rounds.
+pure func as_int(value: JsonNumber) -> Option[Int]:
+    value
+        .number_text()
+        .parse_int()
+
+
+private pure func hex_value(current: Int) -> Option[Int]:
+    -- ASCII hex digit ranges, accepting both letter cases.
+    if digit(current):
+        Some(current - 48)
+    else if (current >= 65).and(current <= 70):
+        Some(current - 65 + 10)
+    else if (current >= 97).and(current <= 102):
+        Some(current - 97 + 10)
+    else:
+        None
+
+
 private pure func hex_quad(text: String, start: Int) -> Result[Int, ParseError]:
     var point = 0
     var failure: Option[ParseError] = None
     for position in start..(start + 4):
-        current = byte(text, position)
-        -- ASCII hex digit ranges, accepting both letter cases.
-        value = if digit(current):
-            current - 48
-        else if (current >= 65).and(current <= 70):
-            current - 65 + 10
-        else if (current >= 97).and(current <= 102):
-            current - 97 + 10
-        else:
-            END_OF_INPUT
-        if value == END_OF_INPUT:
-            failure = Some({
-                offset = position.min(text.length()),
-                message = "expected four hexadecimal digits after \\u",
-            })
-            break
-        point = point * 16 + value
+        match hex_value(byte(text, position)):
+            Some(value):
+                point = point * 16 + value
+            None:
+                failure = Some({ offset = position.min(text.length()), kind = ExpectedHexDigits })
+                break
     match failure:
         Some(error): Err(error)
         None: Ok(point)
@@ -190,18 +277,18 @@ private pure func unicode_escape(text: String, slash: Int) -> Result[Parsed[Stri
                             next = slash + 12,
                         })
                     else:
-                        Err({ offset = slash, message = "unpaired Unicode surrogate" })
+                        Err({ offset = slash, kind = UnpairedSurrogate })
         else:
-            Err({ offset = slash, message = "unpaired Unicode surrogate" })
+            Err({ offset = slash, kind = UnpairedSurrogate })
     else if (first >= LOW_SURROGATE_FIRST).and(first <= LOW_SURROGATE_LAST):
-        Err({ offset = slash, message = "unpaired Unicode surrogate" })
+        Err({ offset = slash, kind = UnpairedSurrogate })
     else:
         Ok({ value = first, next = slash + 6 })
     decoded ?= scalar
     -- Four hex digits or a proved surrogate pair always make a scalar.
     match from_codepoint(decoded.value):
         Some(value): Ok({ value = value, next = decoded.next })
-        None: Err({ offset = slash, message = "unpaired Unicode surrogate" })
+        None: Err({ offset = slash, kind = UnpairedSurrogate })
 
 
 private pure func parse_escape(text: String, slash: Int) -> Result[Parsed[String], ParseError]:
@@ -228,7 +315,7 @@ private pure func parse_escape(text: String, slash: Int) -> Result[Parsed[String
                     text.length()
                 else:
                     slash
-                Err({ offset = error_offset, message = "expected a JSON escape after backslash" })
+                Err({ offset = error_offset, kind = ExpectedEscape })
 
 
 private pure func parse_string(text: String, start: Int) -> Result[Parsed[String], ParseError]:
@@ -239,28 +326,33 @@ private pure func parse_string(text: String, start: Int) -> Result[Parsed[String
     while reading(status).and(position < text.length()):
         current = byte(text, position)
         if current == QUOTE:
-            decoded = decoded + segment(text, literal_start, position)
-            position = position + 1
-            status = Complete
-        else if current == BACKSLASH:
-            decoded = decoded + segment(text, literal_start, position)
-            match parse_escape(text, position):
+            match segment(text, literal_start, position):
                 Err(error):
                     status = Failed(error)
-                Ok(escaped):
-                    decoded = decoded + escaped.value
-                    position = escaped.next
-                    literal_start = position
+                Ok(literal):
+                    decoded = decoded + literal
+                    position = position + 1
+                    status = Complete
+        else if current == BACKSLASH:
+            match segment(text, literal_start, position):
+                Err(error):
+                    status = Failed(error)
+                Ok(literal):
+                    decoded = decoded + literal
+                    match parse_escape(text, position):
+                        Err(error):
+                            status = Failed(error)
+                        Ok(escaped):
+                            decoded = decoded + escaped.value
+                            position = escaped.next
+                            literal_start = position
         else if current < 32:
-            status = Failed({
-                offset = position,
-                message = "control character must be escaped in JSON string",
-            })
+            status = Failed({ offset = position, kind = UnescapedControl })
         else:
             position = position + 1
     match status:
         Failed(error): Err(error)
-        Reading: Err({ offset = text.length(), message = "expected closing quote for JSON string" })
+        Reading: Err({ offset = text.length(), kind = UnclosedString })
         Complete: Ok({ value = decoded, next = position })
 
 
@@ -269,6 +361,7 @@ private pure func parse_literal(
     start: Int,
     spelling: String,
     value: Json,
+    mismatch: ParseErrorKind,
 ) -> Result[Parsed[Json], ParseError]:
     var offset = 0
     while offset < spelling.length():
@@ -278,13 +371,15 @@ private pure func parse_literal(
     if offset == spelling.length():
         Ok({ value = value, next = start + offset })
     else:
-        Err({
-            offset = (start + offset).min(text.length()),
-            message = "expected '" + spelling + "'",
-        })
+        Err({ offset = (start + offset).min(text.length()), kind = mismatch })
 
 
-private pure func parse_array(text: String, start: Int) -> Result[Parsed[Json], ParseError]:
+-- `depth` counts the containers already open around this array.
+private pure func parse_array(
+    text: String,
+    start: Int,
+    depth: Int,
+) -> Result[Parsed[Json], ParseError]:
     var position = whitespace(text, start + 1)
     var values: List[Json] = []
     var status: ScanStatus = Reading
@@ -292,7 +387,7 @@ private pure func parse_array(text: String, start: Int) -> Result[Parsed[Json], 
         position = position + 1
         status = Complete
     while reading(status).and(position < text.length()):
-        match parse_value(text, position):
+        match parse_value(text, position, depth + 1):
             Err(error):
                 status = Failed(error)
             Ok(parsed):
@@ -305,17 +400,19 @@ private pure func parse_array(text: String, start: Int) -> Result[Parsed[Json], 
                     44:
                         position = whitespace(text, position + 1)
                     _:
-                        status = Failed({
-                            offset = position,
-                            message = "expected ',' or ']' after array value",
-                        })
+                        status = Failed({ offset = position, kind = ExpectedArrayDelimiter })
     match status:
         Failed(error): Err(error)
-        Reading: Err({ offset = position, message = "expected a JSON value" })
+        Reading: Err({ offset = position, kind = ExpectedValue })
         Complete: Ok({ value = Array(values), next = position })
 
 
-private pure func parse_object(text: String, start: Int) -> Result[Parsed[Json], ParseError]:
+-- `depth` counts the containers already open around this object.
+private pure func parse_object(
+    text: String,
+    start: Int,
+    depth: Int,
+) -> Result[Parsed[Json], ParseError]:
     var position = whitespace(text, start + 1)
     var fields: Dict[String, Json] = empty()
     var status: ScanStatus = Reading
@@ -324,23 +421,20 @@ private pure func parse_object(text: String, start: Int) -> Result[Parsed[Json],
         status = Complete
     while reading(status).and(position < text.length()):
         if byte(text, position) != QUOTE:
-            status = Failed({ offset = position, message = "expected a quoted object name" })
+            status = Failed({ offset = position, kind = ExpectedObjectName })
         else:
             match parse_string(text, position):
                 Err(error):
                     status = Failed(error)
                 Ok(name):
                     if fields.contains(name.value):
-                        status = Failed({ offset = position, message = "duplicate object name" })
+                        status = Failed({ offset = position, kind = DuplicateName })
                     else:
                         position = whitespace(text, name.next)
                         if byte(text, position) != 58:
-                            status = Failed({
-                                offset = position,
-                                message = "expected ':' after object name",
-                            })
+                            status = Failed({ offset = position, kind = ExpectedColon })
                         else:
-                            match parse_value(text, position + 1):
+                            match parse_value(text, position + 1, depth + 1):
                                 Err(error):
                                     status = Failed(error)
                                 Ok(parsed):
@@ -355,15 +449,21 @@ private pure func parse_object(text: String, start: Int) -> Result[Parsed[Json],
                                         _:
                                             status = Failed({
                                                 offset = position,
-                                                message = "expected ',' or '}' after object value",
+                                                kind = ExpectedObjectDelimiter,
                                             })
     match status:
         Failed(error): Err(error)
-        Reading: Err({ offset = position, message = "expected a quoted object name" })
+        Reading: Err({ offset = position, kind = ExpectedObjectName })
         Complete: Ok({ value = Object(fields), next = position })
 
 
-private pure func parse_value(text: String, start: Int) -> Result[Parsed[Json], ParseError]:
+-- `depth` counts the containers open around this value; an array or object
+-- here would be nesting level depth + 1.
+private pure func parse_value(
+    text: String,
+    start: Int,
+    depth: Int,
+) -> Result[Parsed[Json], ParseError]:
     position = whitespace(text, start)
     current = byte(text, position)
     match current:
@@ -372,34 +472,61 @@ private pure func parse_value(text: String, start: Int) -> Result[Parsed[Json], 
                 Err(error): Err(error)
                 Ok(parsed): Ok({ value = Text(parsed.value), next = parsed.next })
         91:
-            parse_array(text, position)
+            if depth >= MAX_NESTING_DEPTH:
+                Err({ offset = position, kind = TooDeep })
+            else:
+                parse_array(text, position, depth)
         123:
-            parse_object(text, position)
+            if depth >= MAX_NESTING_DEPTH:
+                Err({ offset = position, kind = TooDeep })
+            else:
+                parse_object(text, position, depth)
         110:
-            parse_literal(text, position, "null", Null)
+            parse_literal(text, position, "null", Null, ExpectedNull)
         116:
-            parse_literal(text, position, "true", Boolean(True))
+            parse_literal(text, position, "true", Boolean(True), ExpectedTrue)
         102:
-            parse_literal(text, position, "false", Boolean(False))
+            parse_literal(text, position, "false", Boolean(False), ExpectedFalse)
         _:
             if (current == 45).or(digit(current)):
                 match parse_number(text, position):
                     Err(error): Err(error)
                     Ok(parsed): Ok({ value = Number(parsed.value), next = parsed.next })
             else:
-                Err({ offset = position, message = "expected a JSON value" })
+                Err({ offset = position, kind = ExpectedValue })
 
 
 -- Offsets count UTF-8 bytes; EOF is the input byte length. Duplicate decoded
--- object names and unpaired UTF-16 surrogate escapes reject. There is no
--- library size/depth ceiling: native stack grows with container nesting.
+-- object names and unpaired UTF-16 surrogate escapes reject. Containers nested
+-- deeper than MAX_NESTING_DEPTH reject at the bracket that opens too deep, so
+-- native stack is bounded; there is no other size ceiling.
 pure func parse(text: String) -> Result[Json, ParseError]:
-    parsed ?= parse_value(text, 0)
+    parsed ?= parse_value(text, 0, 0)
     end = whitespace(text, parsed.next)
     if end == text.length():
         Ok(parsed.value)
     else:
-        Err({ offset = end, message = "unexpected data after JSON value" })
+        Err({ offset = end, kind = TrailingData })
+
+
+private pure func hex_digit(value: Int) -> String:
+    match value:
+        0: "0"
+        1: "1"
+        2: "2"
+        3: "3"
+        4: "4"
+        5: "5"
+        6: "6"
+        7: "7"
+        8: "8"
+        9: "9"
+        10: "a"
+        11: "b"
+        12: "c"
+        13: "d"
+        14: "e"
+        _: "f"
 
 
 private pure func append_quoted(output: String, text: String) -> String:
@@ -425,24 +552,17 @@ private pure func append_quoted(output: String, text: String) -> String:
             _:
                 if current < 32:
                     -- A JSON control escape has exactly four hex digits.
-                    hex = "0123456789abcdef"
-                    Some(
-                        (
-                            "\\u00"
-                            + segment(hex, current / 16, current / 16 + 1)
-                            + segment(hex, current % 16, current % 16 + 1)
-                        ),
-                    )
+                    Some("\\u00" + hex_digit(current / 16) + hex_digit(current % 16))
                 else:
                     None
         match escaped:
             None:
                 void
             Some(spelling):
-                rendered = rendered + segment(text, literal_start, position)
+                rendered = rendered + rendered_segment(text, literal_start, position)
                 rendered = rendered + spelling
                 literal_start = position + 1
-    rendered + segment(text, literal_start, text.length()) + "\""
+    rendered + rendered_segment(text, literal_start, text.length()) + "\""
 
 
 -- One output accumulator flows through nesting and sibling loops. No
@@ -472,21 +592,20 @@ private pure func append_value(output: String, value: Json) -> String:
         Object(fields):
             var rendered = output + "{"
             var first: Bool = True
-            for key in fields.keys():
+            for (name, element) in fields.entries():
                 if first:
                     first = False
                 else:
                     rendered = rendered + ","
-                rendered = append_quoted(rendered, key)
+                rendered = append_quoted(rendered, name)
                 rendered = rendered + ":"
-                -- keys publishes only live members, so None is unreachable.
-                match fields.get(key):
-                    Some(element): rendered = append_value(rendered, element)
-                    None: void
+                rendered = append_value(rendered, element)
             rendered + "}"
 
 
 -- Compact output retains exact numeric lexemes and Dict insertion order.
--- Native stack grows with container nesting, with no library depth ceiling.
+-- Rendering uses one native frame per nesting level of the tree it is given
+-- and does not bound it: a caller builds that tree, and a failing render
+-- would burden every use. Trees from `parse` stay within MAX_NESTING_DEPTH.
 pure func render(value: Json) -> String:
     append_value("", value)
