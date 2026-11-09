@@ -9,10 +9,12 @@ eventually anyway", and `opaque type Bytes = List[UInt8]`, with no separate
 - **2026-11-06:** U2 to U9 and B1 to B3, approved as recommended;
 - **2026-11-07:** U1 as (a), after the S0 spike, and the spike's ceilings.
 
-**Status:** S0 is done (see "S0 results"). L0 is next. One ceiling is open:
-see Ceilings. L0's first brief was written and reviewed outside the
-repository, and its content is folded into the L0 entry under Landings; a new
-brief re-derives the citations from current main.
+**Status:** S0 and L0 implementation/local qualification are complete. Full
+instruction-enabled tests, fixpoint, fixture parity and independent code/test
+reviews pass; four-platform branch CI remains before publication. L1 has not
+started. The corrected L0 line allowance is recorded under Ceilings;
+performance caps are unchanged. See the
+[L0 measurement report](../benchmarks/results/blorp-integer-model-l0-2026-11-08.md).
 
 **Stale citations.** The `src/` layout split (`065e5e9ce`) and the
 repository-wide formatting (`1ca080abd`) landed after revision 2:
@@ -317,6 +319,17 @@ keeps what a later landing needs. What it found:
      `824f3d4ee` deleted 329 unparsable old-syntax tests.
    - **Proof.** Fixed-input self C is byte-identical, and all e2e fixtures
      give identical output.
+   - **Execution, 2026-11-08 (not landed).** Both TypeRefs and all eight
+     integer operations carry the sole Int64 format. Format-dependent facts
+     are exhaustive at their owning phases; generic layout and ownership
+     consumers ignore the payload. The focused active selection passes
+     322 callbacks in 32 suites, including nine new callbacks. Six mutation
+     witnesses fail as intended and were restored. Matched fixed-input
+     allocations are unchanged and median instructions increase 0.013792%; all
+     eight C outputs are identical. Own-source allocations increase
+     0.207757%; one normal instruction observation increases 0.168146%.
+     Full local gates and final reviews pass; branch CI remains;
+     the report records raw paths, provenance and failed deferred selections.
 3. **L1, the compiler learns UInt8.** This landing adds:
    - the role, which stays optional until L3, so that today's `_base`, which
      cannot declare it before the rotation, still compiles;
@@ -364,7 +377,7 @@ Keith approved the S0 spike's ceilings on 2026-11-07:
 
 | Landing | Production lines | Self-compile allocations and instructions | Fixed input |
 | --- | --- | --- | --- |
-| L0 | see below | at most +0.3% | self C byte-identical; allocations +0; instructions at most +0.1% |
+| L0 | at most 550 gross changed / +180 net | at most +0.3% | self C byte-identical; allocations +0; instructions at most +0.1% |
 | L1 | at most +700 compiler lines | at most +2.0% | instructions at most +0.2%; allocations at most +0.05% |
 | L3 | library lines reported | at most +0.3% | — |
 | L4 | compiler call sites only | at most +0.1% | — |
@@ -373,12 +386,14 @@ L1's self-compile ceiling is high because compiling the added source alone
 costs about 0.3% per 100 lines, so the fixed-input ceiling is what guards the
 new machinery's own cost.
 
-**Open, for Keith: L0's line ceiling.** The approved figure was net at most +40,
-with at most 150 lines changed. The spike itself measured 217 lines changed
-(+114 −103) before the format functions L0 adds, so it cannot hold. The
-proposed correction, from the L0 brief's review, is at most 260 lines added
-plus removed and net at most +60, by `git diff --numstat` over `blorp/src`.
-L0 should not start until Keith decides.
+**L0's corrected line allowance.** The coordinator set at most 550 lines
+added plus removed and +180 net over `blorp/src`, under Keith's standing
+delegation for routine budget corrections. The spike's old compact layout
+and incomplete format projections understated the canonical formatted scope.
+The implementation is +301 −164: 465 gross changed and +137 net production
+lines. Test changes are separate: +441 −179, 620 gross and +262 net, including
+the mechanical migration and nine new callbacks. No performance exception
+was needed; the original allocation and instruction caps remain unchanged.
 
 ## Risks and unknowns
 
