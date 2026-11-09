@@ -1084,8 +1084,14 @@ the output may already be new.
    `SourceFile` contents for file-backed modules, including unsaved files.
    Paths use the same working directory and lexical normalization as loading;
    duplicate normalized paths and NUL-containing caller paths reject through
-   `SourceLoadFailure`. Supplied contents are authoritative, including invalid
-   or empty text; embedded library modules retain their embedded contents.
+   `SourceLoadFailure`; `DuplicateSourcePath` reports the normalized path.
+   Supplied contents are authoritative, including invalid or empty text. They
+   apply to every file-backed module, including a `--library-root` directory
+   library's modules and its foundation and prelude files; embedded library
+   modules retain their embedded contents. Normalization is lexical and
+   case-sensitive, so `A.brp` and `a.brp` are distinct keys even on a
+   case-insensitive filesystem. A row for a path outside the root's directory,
+   or for a module nothing imports, is accepted and unused.
 4. **Namespace** ([`namespace`](src/compile/namespace/namespace.brp)), the first step
    of checking, gives each module one frozen scope in dependency order: its
    declarations, its imports and, for a user module, the prelude. A spelling
