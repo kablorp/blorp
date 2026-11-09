@@ -21,6 +21,16 @@ done.
     - L3, the library: `_base`, `uint8.brp`, `bytes.brp`, and
       `fs.read_bytes`/`write_bytes`;
     - L4, `String.byte_at` returns `Option[UInt8]`.
+- **Nested modules, `Stringable`, `io/` and the prelude:**
+  [`MODULES_AND_STRINGABLE_PLAN.md`](MODULES_AND_STRINGABLE_PLAN.md).
+  - **Status:** decided 2026-11-09 and probed; nothing is implemented.
+  - **Next:** landing 1, nested library modules: the embedded-library
+    generator recurses into folders, and the loader rejects `io.brp` beside
+    `io/`.
+  - **Waits on Keith:** O1, a user's own `print`, before landing 5.
+  - **Afterwards:** `Stringable` and interpolation, errors as `Stringable`
+    (deleting `describe`), the `io/` move, `print` in the prelude, a seed
+    rotation, process L1 as `io/process`, then `Path`.
 - **Process API:** [`PROCESS_DECISIONS.md`](PROCESS_DECISIONS.md).
   - **Status:** L0 is implemented and independently reviewed; final combined
     landing gates and four-platform CI pass; L0 is published. Shared
