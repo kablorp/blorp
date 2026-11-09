@@ -1010,6 +1010,10 @@ compile to its retired-instruction ceiling, read from macOS `/usr/bin/time -l`.
 
 ## The standard library
 
+The explicit [`json` module](standard_library/README.md#json) parses and
+renders pure JSON values, preserving exact numeric spelling and distinguishing
+absent object names from null. Parse errors report UTF-8 byte offsets.
+
 The library is ordinary Blorp under [`standard_library/`](standard_library/).
 `_base.brp` declares the builtin types `Int`, `Float`, `String`, `Void` and
 `List`, the unions `Bool`, `Option`, `Result` and `MathError`, and the

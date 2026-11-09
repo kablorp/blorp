@@ -300,6 +300,54 @@ It borrows its input, writes counted bytes to stderr once, and attempts LF only
 following a full transfer; short writes (including EINTR) stop without retry.
 The host attempts LF after short writes as well. Neither API reports delivery.
 
+### JSON
+
+Explicitly import `json` for a pure JSON codec:
+
+```blorp
+import:
+    json: Json(Null, Boolean, Number, Text, Array, Object), parse, render, integer
+
+pure func response() -> String:
+    render(Array([Number(integer(42)), Text("ready"), Null]))
+```
+
+This returns `[42,"ready",null]`. `parse(text) -> Result[Json, ParseError]`
+accepts one complete JSON value with optional JSON whitespace. `Json` carries
+`Null`, `Boolean(Bool)`, `Number(JsonNumber)`, `Text(String)`,
+`Array(List[Json])` or `Object(Dict[String, Json])`. An object's `get` returns
+`None` for an absent name and `Some(Null)` for explicit null.
+
+`number(text) -> Result[JsonNumber, ParseError]` validates an entire number
+lexeme without whitespace. `number_text(number) -> String` returns its exact
+spelling; `integer(Int) -> JsonNumber` constructs one infallibly. The opaque
+number retains every decimal digit, exponent spelling and negative zero;
+parsing and rendering never convert it to Float. Thus `9007199254740993` and
+`1E400` survive unchanged.
+
+`render(value) -> String` produces compact JSON, preserving object insertion
+order and exact number spelling. It escapes quotation marks, backslashes and
+controls, leaving other Unicode literal. Parsing decodes every JSON escape,
+including UTF-16 surrogate pairs. Unpaired surrogate escapes reject: this
+codec accepts Unicode scalar strings, a character-content restriction under
+[RFC 8259 section 9](https://www.rfc-editor.org/rfc/rfc8259#section-9).
+Duplicate decoded object names also reject, including `"a"` and `"\u0061"`
+in the same object; nested objects have independent names. There are no
+comments, trailing commas, non-JSON whitespace or byte order mark extensions.
+
+`ParseError` has `offset: Int`, a zero-based UTF-8 byte offset, and
+`message: String`, a fixed explanation. End-of-input errors point at byte
+length; a duplicate name points at its second opening quote. An invalid
+present escape points at its backslash, and a bad hex digit points at that
+digit. A missing escape byte at end of input points at byte length.
+For example, `["é",x]` fails at byte 6 with `expected a JSON value`.
+
+Parsing rendered values reconstructs their scalar contents, container members
+and exact numeric lexemes. Source whitespace and escape spelling normalize.
+There is no library size, digit-count or nesting limit. Memory follows the
+input and result; parsing and rendering use native stack proportional to
+container nesting, so sufficiently deep documents can exhaust the stack.
+
 ### The fs module
 
 `fs.brp` is the typed filesystem library; import it explicitly. It declares

@@ -1,0 +1,324 @@
+import:
+    bool: and
+    dict: Dict, empty
+    int: INT_MIN, INT_MAX
+    json:
+        Json(Null, Boolean, Number, Text, Array, Object),
+        JsonNumber,
+        ParseError,
+        parse,
+        render,
+        number,
+        number_text,
+        integer,
+    string: from_codepoint
+    test: TestSuite
+
+
+private pure func test_numeric_id_keeps_every_digit() -> Bool:
+    match parse("{\"id\":9007199254740993,\"result\":null}"):
+        Ok(Object(fields)):
+            match fields.get("id"):
+                Some(Number(value)): number_text(value) == "9007199254740993"
+                _: False
+        _:
+            False
+
+
+private pure func test_surrogate_pair_decodes_to_scalar() -> Bool:
+    match parse("\"\\uD834\\uDD1E\""):
+        Ok(Text(value)): value == "𝄞"
+        _: False
+
+
+private pure func test_explicit_null_differs_from_absent_name() -> Bool:
+    match parse("{\"result\":null}"):
+        Ok(Object(fields)):
+            present: Bool = match fields.get("result"):
+                Some(Null): True
+                _: False
+            absent: Bool = match fields.get("missing"):
+                None: True
+                _: False
+            and(present, absent)
+        _:
+            False
+
+
+private pure func renders(source: String, expected: String) -> Bool:
+    match parse(source):
+        Err(_):
+            False
+        Ok(value):
+            first = render(value)
+            match parse(first):
+                Err(_): False
+                Ok(reparsed): and(first == expected, render(reparsed) == expected)
+
+
+private pure func rejects(source: String, offset: Int, message: String) -> Bool:
+    match parse(source):
+        Ok(_): False
+        Err(error): and(error.offset == offset, error.message == message)
+
+
+private pure func test_scalars_containers_and_whitespace() -> Bool:
+    cases: List[(String, String)] = [
+        (" \t\r\nnull\r\n", "null"),
+        (" true ", "true"),
+        (" false ", "false"),
+        (" [ ] ", "[]"),
+        (" { } ", "{}"),
+        ("[null,true,false,[],{}]", "[null,true,false,[],{}]"),
+        (
+            " { \"b\" : [1, -2.00e+003], \"a\": {\"x\":false} } ",
+            "{\"b\":[1,-2.00e+003],\"a\":{\"x\":false}}",
+        ),
+        ("{\"a\":{\"a\":1}}", "{\"a\":{\"a\":1}}"),
+    ]
+    var correct: Bool = True
+    for (source, expected) in cases:
+        correct = and(correct, renders(source, expected))
+    correct
+
+
+private pure func test_numbers_keep_spelling_without_float_conversion() -> Bool:
+    var correct: Bool = True
+    for spelling in [
+        "0",
+        "-0",
+        "-0.0",
+        "9007199254740993",
+        "18446744073709551616",
+        "1E400",
+        "1e-9999",
+        "-123.456789012345678901234567890E+003",
+    ]:
+        match number(spelling):
+            Err(_):
+                correct = False
+            Ok(value):
+                correct = and(correct, number_text(value) == spelling)
+                correct = and(correct, render(Number(value)) == spelling)
+                correct = and(correct, renders(spelling, spelling))
+    and(
+        correct,
+        and(
+            number_text(integer(INT_MIN)) == "-9223372036854775808",
+            number_text(integer(INT_MAX)) == "9223372036854775807",
+        ),
+    )
+
+
+private pure func test_number_constructor_rejects_nonlexemes() -> Bool:
+    cases: List[(String, Int, String)] = [
+        ("", 0, "expected a digit in JSON number"),
+        ("-", 1, "expected a digit in JSON number"),
+        ("+1", 0, "expected a digit in JSON number"),
+        ("01", 1, "unexpected data after JSON number"),
+        (" 1", 0, "expected a digit in JSON number"),
+        ("1 ", 1, "unexpected data after JSON number"),
+        ("1e", 2, "expected a digit in exponent"),
+        ("1.", 2, "expected a digit after decimal point"),
+        ("NaN", 0, "expected a digit in JSON number"),
+        ("Infinity", 0, "expected a digit in JSON number"),
+    ]
+    var correct: Bool = True
+    for (source, offset, message) in cases:
+        match number(source):
+            Ok(_):
+                correct = False
+            Err(error):
+                correct = and(correct, and(error.offset == offset, error.message == message))
+    correct
+
+
+private pure func test_all_short_escapes_and_embedded_nul() -> Bool:
+    source = "\"\\\"\\\\\\/\\b\\f\\n\\r\\t\\u0000\""
+    match parse(source):
+        Ok(Text(text)):
+            expected = "\"\\/\u{8}\u{C}\n\r\t\0"
+            and(text == expected, renders(source, "\"\\\"\\\\/\\b\\f\\n\\r\\t\\u0000\""))
+        _:
+            False
+
+
+private pure func test_unicode_spelling_and_scalar_boundaries() -> Bool:
+    cases: List[(String, String)] = [
+        ("\"\\u0041\\u00e9\\u00E9\"", "\"Aéé\""),
+        ("\"é𝄞😀\"", "\"é𝄞😀\""),
+        ("\"\\uD834\\uDd1e\"", "\"𝄞\""),
+        ("\"\\ud800\\udc00\"", "\"𐀀\""),
+        ("\"\\uDBFF\\uDFFF\"", "\"\u{10FFFF}\""),
+        ("\"\\uD7FF\\uE000\"", "\"\u{D7FF}\u{E000}\""),
+        ("{\"\\u0061\":\"é\"}", "{\"a\":\"é\"}"),
+        ("{\"é\":1,\"e\\u0301\":2}", "{\"é\":1,\"é\":2}"),
+    ]
+    var correct: Bool = True
+    for (source, expected) in cases:
+        correct = and(correct, renders(source, expected))
+    correct
+
+
+private pure func test_all_control_bytes_render_and_parse() -> Bool:
+    var text = ""
+    for point in 0..32:
+        match from_codepoint(point):
+            Some(character): text = text + character
+            None: void
+    encoded = render(Text(text))
+    match parse(encoded):
+        Ok(Text(decoded)): and(decoded == text, renders(encoded, encoded))
+        _: False
+
+
+private pure func test_rejects_invalid_tokens_and_container_grammar() -> Bool:
+    cases: List[(String, Int, String)] = [
+        ("", 0, "expected a JSON value"),
+        (" ", 1, "expected a JSON value"),
+        ("True", 0, "expected a JSON value"),
+        ("tru", 3, "expected 'true'"),
+        ("nulx", 3, "expected 'null'"),
+        ("true false", 5, "unexpected data after JSON value"),
+        ("/*comment*/null", 0, "expected a JSON value"),
+        ("\u{FEFF}null", 0, "expected a JSON value"),
+        ("\u{A0}null", 0, "expected a JSON value"),
+        ("NaN", 0, "expected a JSON value"),
+        ("Infinity", 0, "expected a JSON value"),
+        ("+1", 0, "expected a JSON value"),
+        (".1", 0, "expected a JSON value"),
+        ("01", 1, "unexpected data after JSON value"),
+        ("-", 1, "expected a digit in JSON number"),
+        ("1.", 2, "expected a digit after decimal point"),
+        ("1e+", 3, "expected a digit in exponent"),
+        ("[", 1, "expected a JSON value"),
+        ("[0", 2, "expected ',' or ']' after array value"),
+        ("[0,]", 3, "expected a JSON value"),
+        ("[0 1]", 3, "expected ',' or ']' after array value"),
+        ("{", 1, "expected a quoted object name"),
+        ("{a:0}", 1, "expected a quoted object name"),
+        ("{\"a\" 0}", 5, "expected ':' after object name"),
+        ("{\"a\":}", 5, "expected a JSON value"),
+        ("{\"a\":0,}", 7, "expected a quoted object name"),
+        ("{\"a\":0 \"b\":1}", 7, "expected ',' or '}' after object value"),
+        ("[\"é\",x]", 6, "expected a JSON value"),
+        ("null\0", 4, "unexpected data after JSON value"),
+    ]
+    var correct: Bool = True
+    for (source, offset, message) in cases:
+        correct = and(correct, rejects(source, offset, message))
+    correct
+
+
+private pure func test_rejects_bad_escapes_and_unpaired_surrogates() -> Bool:
+    cases: List[(String, Int, String)] = [
+        ("\"text", 5, "expected closing quote for JSON string"),
+        ("\"\\x\"", 1, "expected a JSON escape after backslash"),
+        ("\"\\", 2, "expected a JSON escape after backslash"),
+        ("\"\n\"", 1, "control character must be escaped in JSON string"),
+        ("\"\0\"", 1, "control character must be escaped in JSON string"),
+        ("\"\\u12x4\"", 5, "expected four hexadecimal digits after \\u"),
+        ("\"\\u12\"", 5, "expected four hexadecimal digits after \\u"),
+        ("\"\\u12", 5, "expected four hexadecimal digits after \\u"),
+        ("\"\\uD800\"", 1, "unpaired Unicode surrogate"),
+        ("\"\\uDEAD\"", 1, "unpaired Unicode surrogate"),
+        ("\"\\uD800\\u0041\"", 1, "unpaired Unicode surrogate"),
+        ("\"\\uD800\\uD800\"", 1, "unpaired Unicode surrogate"),
+        ("\"\\uD800\\uZZZZ\"", 9, "expected four hexadecimal digits after \\u"),
+    ]
+    var correct: Bool = True
+    for (source, offset, message) in cases:
+        correct = and(correct, rejects(source, offset, message))
+    correct
+
+
+private pure func test_duplicate_decoded_object_names_reject_at_second_quote() -> Bool:
+    and(
+        rejects("{\"a\":1,\"a\":2}", 7, "duplicate object name"),
+        and(
+            rejects("{\"a\":1,\"\\u0061\":2}", 7, "duplicate object name"),
+            and(
+                rejects("{\"é\":1,\"\\u00e9\":2}", 8, "duplicate object name"),
+                rejects("{\"a\":0,\"a\"", 7, "duplicate object name"),
+            ),
+        ),
+    )
+
+
+private pure func test_constructed_tree_roundtrips_and_keeps_object_order() -> Bool:
+    var fields: Dict[String, Json] = empty()
+    fields = fields.set("b", Array([Null, Boolean(True), Number(integer(-12)), Text("é\0")]))
+    fields = fields.set("a", Object(empty()))
+    value: Json = Object(fields)
+    expected = "{\"b\":[null,true,-12,\"é\\u0000\"],\"a\":{}}"
+    and(render(value) == expected, renders(render(value), expected))
+
+
+private pure func test_moderate_nesting_and_many_siblings() -> Bool:
+    var nested: Json = Null
+    var nested_source = "null"
+    for _ in 0..96:
+        nested = Array([nested])
+        nested_source = "[" + nested_source + "]"
+    var values: List[Json] = []
+    for value in 0..256:
+        values = values.append(Number(integer(value)))
+    wide: Json = Array(values)
+    wide_correct = match parse(render(wide)):
+        Ok(Array(found)):
+            var correct = found.length() == 256
+            for index in 0..256:
+                match found.get(index):
+                    Some(Number(value)):
+                        correct = and(correct, number_text(value) == index.to_string())
+                    _:
+                        correct = False
+            correct
+        _:
+            False
+    and(renders(render(nested), nested_source), wide_correct)
+
+
+tests: TestSuite = {
+    description = "Pure JSON codec",
+    tests = [
+        ("numeric IDs keep every decimal digit", test_numeric_id_keeps_every_digit),
+        ("UTF-16 surrogate pair becomes one scalar", test_surrogate_pair_decodes_to_scalar),
+        (
+            "explicit null differs from an absent object name",
+            test_explicit_null_differs_from_absent_name,
+        ),
+        ("all value kinds and JSON whitespace roundtrip", test_scalars_containers_and_whitespace),
+        (
+            "number spelling survives without Float conversion",
+            test_numbers_keep_spelling_without_float_conversion,
+        ),
+        (
+            "number constructor rejects nonlexemes with exact errors",
+            test_number_constructor_rejects_nonlexemes,
+        ),
+        ("all JSON short escapes and embedded NUL decode", test_all_short_escapes_and_embedded_nul),
+        (
+            "Unicode scalar boundaries and spellings roundtrip",
+            test_unicode_spelling_and_scalar_boundaries,
+        ),
+        ("every control byte renders and parses", test_all_control_bytes_render_and_parse),
+        (
+            "invalid token and container grammar errors have exact byte offsets",
+            test_rejects_invalid_tokens_and_container_grammar,
+        ),
+        (
+            "bad escapes and unpaired surrogate errors are exact",
+            test_rejects_bad_escapes_and_unpaired_surrogates,
+        ),
+        (
+            "duplicate decoded names reject at their second quote",
+            test_duplicate_decoded_object_names_reject_at_second_quote,
+        ),
+        (
+            "constructed values roundtrip with object order",
+            test_constructed_tree_roundtrips_and_keeps_object_order,
+        ),
+        ("moderate nesting and sibling width roundtrip", test_moderate_nesting_and_many_siblings),
+    ],
+}
