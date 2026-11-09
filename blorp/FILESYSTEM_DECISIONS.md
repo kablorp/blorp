@@ -53,8 +53,10 @@ has risen by about 0.18%.
 - **D2, 2026-11-02, the contract.** `SystemCall`, with one match per compiler
   phase, replaces twelve hand-maintained label sites.
 - **D3, 2026-11-02, typed results: Int codes.** Natives return Int codes,
-  lists or Strings, and Blorp decoders in `fs.brp` turn them into kinds and
-  entries, so the compiler knows no `fs` type. The rejected option had the
+  lists or Strings, and Blorp decoders turn them into kinds and entries, so
+  the compiler knows no `fs` type. Since `23f25d7d3`, the error decoder lives
+  in `_io_errors.brp`, shared with the process API (`PROCESS_DECISIONS.md`
+  P4), while the entry decoder stays in `fs.brp`. The rejected option had the
   compiler own the `fs` enums, so both sides agreed by construction; for the
   same five operations the phase 0 spike measured +517 compiler lines and
   +2.0% self-compile instructions for it, against +141 and +0.64%. The cost

@@ -304,8 +304,13 @@ The host attempts LF after short writes as well. Neither API reports delivery.
 the pure `describe(error)` function. Select `io: IOError` to name the error
 and call `error.describe()` through UFCS; select `describe` explicitly when
 passing it as a function value. The filesystem library uses these identities;
-the planned process API will use them too. `_io_errors.brp` is the internal native-code decoder;
-programs use the public `io` kinds instead of depending on numeric codes.
+the planned process API will use them too. `_io_errors.brp` is the library's
+native-code decoder; programs use the public `io` kinds instead of depending
+on numeric codes. `_io_errors` is internal by convention only: Blorp has
+neither re-exports nor module-private imports, so its functions are public
+by necessity, but they are not part of the library's API. Programs should not
+import it, and it may change without notice. (`_base`, the foundation module,
+is the other underscore module, and any module may import it.)
 
 ### JSON
 

@@ -178,16 +178,24 @@ private func isolated(binary: String, arguments: List[String]) -> Result[Capture
   streaming. `run_to_files` goes: it is `capture` plus two `fs.write_text`
   calls.
 - **P4, one code table.** Natives can return only Ints, Strings and Lists of
-  them, so `fs.brp` mirrors the C runtime's error enum in private Int
-  constants (`NOT_FOUND_CODE` and the rest) and decodes them in
-  `decode_error`. `LaunchFailed(IOErrorKind)` and `DirectoryFailed(IOError)`
-  need the same decoder. So fs's code constants and `decode_error` move into
-  `_io_errors`, which `process` also uses. On 2026-11-08 Keith chose to move
-  the public `IOErrorKind`, `IOError` and their `describe` formatting to the
-  existing `io` module, updating all imports. `fs` and `_io_errors` import
-  those types from `io`; `io` imports neither, so there is no cycle. Modules
-  do not reexport imported names: callers import errors and `describe` from
-  `io`, and filesystem operations and entry types from `fs`.
+  them, so Blorp mirrors the C runtime's error enum in Int constants
+  (`NOT_FOUND_CODE` and the rest) and decodes them in `decode_error`.
+  `LaunchFailed(IOErrorKind)` and `DirectoryFailed(IOError)` need the same
+  decoder as `fs`, so there is one: `standard_library/_io_errors.brp`, which
+  `fs` uses and `process` will use.
+
+  On 2026-11-08 Keith chose to move the public `IOErrorKind`, `IOError` and
+  `describe` to the existing `io` module, and all imports were updated (landed
+  in `23f25d7d3`).
+  - `fs` and `_io_errors` import those types from `io`, and `io` imports
+    neither, so there is no cycle.
+  - Modules do not reexport imported names, so callers import errors and
+    `describe` from `io`, and filesystem operations and entry types from `fs`.
+  - This replaced a decision from earlier the same day (`163da8a37`): keep the
+    table in `fs` and make `decode_error` public. That was chosen because
+    Blorp has no re-exports, so a shared decoder module seemed to require
+    moving `IOErrorKind` out of `fs`. Moving the public identities to `io`
+    resolved that.
 
   Letting a native return a library `fixed union` instead was estimated at 250
   to 300 compiler lines, plus a seed rotation with a dual-accept transition.
