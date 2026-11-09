@@ -6,7 +6,7 @@ No semantic declaration identity is invented or erased by this analysis.
 import:
     bool: Bool methods
     int: INT_MAX, Int methods
-    option: Option methods
+    list: repeat
 
 
 union PathOperation:
@@ -41,63 +41,51 @@ private pure func pair_key(count: Int, source: Int, target: Int) -> Int:
     source * count + target
 
 
-private pure func has_pair(
-    paths: Dict[Int, PathPair],
+-- The pair relation over `count` controls. `present` is indexed by pair_key,
+-- so membership needs no hashing; `pairs` keeps insertion order, which is also
+-- the closure's worklist order. `present[key]` is True exactly when the pair is
+-- in `pairs`, so a relation is built only by no_pairs and insert. The table is
+-- sized count * count up front, so entry validation's overflow check is also
+-- its only size bound: the producer issues one control per path position.
+private record PathPairs {
     count: Int,
-    source: Int,
-    target: Int,
-) -> Bool:
-    paths
-        .get(pair_key(count, source, target))
-        .is_some()
+    present: List[Bool],
+    pairs: List[PathPair],
+}
 
 
-private pure func insert(
-    paths: Dict[Int, PathPair],
-    count: Int,
-    source: Int,
-    target: Int,
-) -> Dict[Int, PathPair]:
-    key = pair_key(count, source, target)
-    if (
-        paths
-            .get(key)
-            .is_some()
-    ):
+private pure func no_pairs(count: Int) -> PathPairs:
+    { count = count, present = repeat(False, count * count), pairs = [] }
+
+
+private pure func has_pair(paths: PathPairs, source: Int, target: Int) -> Bool:
+    paths.present.get_or(pair_key(paths.count, source, target), False)
+
+
+private pure func insert(paths: PathPairs, source: Int, target: Int) -> PathPairs:
+    key = pair_key(paths.count, source, target)
+    if paths.present.get_or(key, False):
         paths
     else:
         pair: PathPair = { source = source, target = target }
-        paths.set(key, pair)
+        { paths | present = paths.present.set(key, True), pairs = paths.pairs.append(pair) }
 
 
--- The insertion-ordered map is also the worklist: each new pair is processed
+-- The insertion-ordered pair list is also the worklist: each new pair is processed
 -- once. Empty matching transitions request plain transitive closure.
-private pure func close_paths(
-    initial: Dict[Int, PathPair],
-    count: Int,
-    matching: List[InstantiationPath],
-) -> Dict[Int, PathPair]:
+private pure func close_paths(initial: PathPairs, matching: List[InstantiationPath]) -> PathPairs:
     var paths = initial
     var position = 0
-    while (
-        position
-        < paths
-            .values()
-            .length()
-    ):
-        match (
-            paths
-                .values()
-                .get(position)
-        ):
+    while position < paths.pairs.length():
+        match paths.pairs.get(position):
             None:
                 void
             Some(pair):
-                for control in 0..count:
-                    if paths.has_pair(count, control, pair.source):
-                        paths = paths.insert(count, control, pair.target)
-                    if paths.has_pair(count, pair.target, control):
-                        paths = paths.insert(count, pair.source, control)
+                for control in 0..paths.count:
+                    if paths.has_pair(control, pair.source):
+                        paths = paths.insert(control, pair.target)
+                    if paths.has_pair(pair.target, control):
+                        paths = paths.insert(pair.source, control)
                 for opening in matching:
                     match opening.operation:
                         PushPath(symbol):
@@ -106,11 +94,7 @@ private pure func close_paths(
                                     match closing.operation:
                                         PopPath(other):
                                             if (symbol == other).and(closing.source == pair.target):
-                                                paths = paths.insert(
-                                                    count,
-                                                    opening.source,
-                                                    closing.target,
-                                                )
+                                                paths = paths.insert(opening.source, closing.target)
                                         _:
                                             void
                         _:
@@ -120,8 +104,7 @@ private pure func close_paths(
 
 
 private pure func pump_edge(
-    reachable: Dict[Int, PathPair],
-    count: Int,
+    reachable: PathPairs,
     anchors: List[Int],
     source: Int,
     target: Int,
@@ -130,8 +113,8 @@ private pure func pump_edge(
     for anchor in anchors:
         if (
             reachable
-                .has_pair(count, anchor, source)
-                .and(reachable.has_pair(count, target, anchor))
+                .has_pair(anchor, source)
+                .and(reachable.has_pair(target, anchor))
         ):
             found = True
             break
@@ -141,8 +124,7 @@ private pure func pump_edge(
 -- Each anchor denotes a positive SCC in balanced-plus-push reachability.
 -- Choices of anchor affect no membership result; no first-witness pruning.
 private pure func pump_anchors(
-    reachable: Dict[Int, PathPair],
-    count: Int,
+    reachable: PathPairs,
     transitions: List[InstantiationPath],
 ) -> List[Int]:
     var anchors: List[Int] = []
@@ -151,10 +133,10 @@ private pure func pump_anchors(
             PushPath(_):
                 if (
                     reachable
-                        .has_pair(count, transition.target, transition.source)
+                        .has_pair(transition.target, transition.source)
                         .and(
                             reachable
-                                .pump_edge(count, anchors, transition.source, transition.target)
+                                .pump_edge(anchors, transition.source, transition.target)
                                 .not(),
                         )
                 ):
@@ -174,49 +156,39 @@ private pure func mark(marked: List[Int], position: Int) -> List[Int]:
 -- Mark EVERY derivation of a balanced pair, not only its first producer.
 -- Space is quadratic in controls; split/matching scans have product time.
 private pure func pump_transitions(
-    balanced: Dict[Int, PathPair],
-    reachable: Dict[Int, PathPair],
-    count: Int,
+    balanced: PathPairs,
+    reachable: PathPairs,
     anchors: List[Int],
     transitions: List[InstantiationPath],
 ) -> List[Int]:
-    var pairs: Dict[Int, PathPair] = {}
-    for pair in balanced.values():
-        if reachable.pump_edge(count, anchors, pair.source, pair.target):
-            pairs = pairs.insert(count, pair.source, pair.target)
+    var pairs = no_pairs(balanced.count)
+    for pair in balanced.pairs:
+        if reachable.pump_edge(anchors, pair.source, pair.target):
+            pairs = pairs.insert(pair.source, pair.target)
     var marked: List[Int] = []
     var edge_position = 0
     for transition in transitions:
         match transition.operation:
             PushPath(_):
-                if reachable.pump_edge(count, anchors, transition.source, transition.target):
+                if reachable.pump_edge(anchors, transition.source, transition.target):
                     marked = marked.mark(edge_position)
             _:
                 void
         edge_position = edge_position + 1
     var cursor = 0
-    while (
-        cursor
-        < pairs
-            .values()
-            .length()
-    ):
-        match (
-            pairs
-                .values()
-                .get(cursor)
-        ):
+    while cursor < pairs.pairs.length():
+        match pairs.pairs.get(cursor):
             None:
                 void
             Some(pair):
-                for split in 0..count:
+                for split in 0..balanced.count:
                     if (
                         balanced
-                            .has_pair(count, pair.source, split)
-                            .and(balanced.has_pair(count, split, pair.target))
+                            .has_pair(pair.source, split)
+                            .and(balanced.has_pair(split, pair.target))
                     ):
-                        pairs = pairs.insert(count, pair.source, split)
-                        pairs = pairs.insert(count, split, pair.target)
+                        pairs = pairs.insert(pair.source, split)
+                        pairs = pairs.insert(split, pair.target)
                 var opening_position = 0
                 for opening in transitions:
                     if opening.source == pair.source:
@@ -232,7 +204,6 @@ private pure func pump_transitions(
                                             PopPath(other):
                                                 if (symbol == other).and(
                                                     balanced.has_pair(
-                                                        count,
                                                         opening.target,
                                                         closing.source,
                                                     ),
@@ -240,7 +211,6 @@ private pure func pump_transitions(
                                                     marked = marked.mark(opening_position)
                                                     marked = marked.mark(closing_position)
                                                     pairs = pairs.insert(
-                                                        count,
                                                         opening.target,
                                                         closing.source,
                                                     )
@@ -277,22 +247,22 @@ pure func bound_instantiation_paths(
     if valid.not():
         None
     else:
-        var initial: Dict[Int, PathPair] = {}
+        var initial = no_pairs(count)
         for control in 0..count:
-            initial = initial.insert(count, control, control)
+            initial = initial.insert(control, control)
         for transition in transitions:
             match transition.operation:
-                KeepPath: initial = initial.insert(count, transition.source, transition.target)
+                KeepPath: initial = initial.insert(transition.source, transition.target)
                 _: void
-        balanced = initial.close_paths(count, transitions)
+        balanced = initial.close_paths(transitions)
         var forward = balanced
         for transition in transitions:
             match transition.operation:
-                PushPath(_): forward = forward.insert(count, transition.source, transition.target)
+                PushPath(_): forward = forward.insert(transition.source, transition.target)
                 _: void
-        reachable = forward.close_paths(count, [])
-        anchors = reachable.pump_anchors(count, transitions)
+        reachable = forward.close_paths([])
+        anchors = reachable.pump_anchors(transitions)
         if anchors.is_empty():
             Some(BoundedPaths)
         else:
-            Some(UnboundedPaths(balanced.pump_transitions(reachable, count, anchors, transitions)))
+            Some(UnboundedPaths(balanced.pump_transitions(reachable, anchors, transitions)))
