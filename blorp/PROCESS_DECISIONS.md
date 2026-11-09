@@ -180,8 +180,12 @@ private func isolated(binary: String, arguments: List[String]) -> Result[Capture
   them, so `fs.brp` mirrors the C runtime's error enum in private Int
   constants (`NOT_FOUND_CODE` and the rest) and decodes them in
   `decode_error`. `LaunchFailed(IOErrorKind)` and `DirectoryFailed(IOError)`
-  need the same decoder. So fs's code constants and `decode_error` move into
-  one shared internal module, which `process` also uses.
+  need the same decoder. So the table stays in `fs`, and `decode_error`
+  becomes public there for `process` to import: one copy, no new module.
+  (Revised by Keith on 2026-11-08. The first wording moved the codes and the
+  decoder into a shared internal module, but Blorp has no re-exports and
+  rejects import cycles, so `IOErrorKind` would have had to move too,
+  changing every program that imports it from `fs`.)
 
   Letting a native return a library `fixed union` instead was estimated at 250
   to 300 compiler lines, plus a seed rotation with a dual-accept transition.
@@ -200,11 +204,12 @@ Removed during review:
 
 ## Landings
 
-There is no seed rotation: the compiler never imports `process`.
+The process API itself needs no seed rotation, since the compiler does not
+import `process` yet. `blorp run` and `blorp test` (`RUN_AND_TEST_PLAN.md`)
+will make it import `process`, and that needs a rotation first.
 
-1. **L0, the shared code table** (P4). Move fs's codes and `decode_error` into
-   one internal module, with no behaviour change. The compiler imports `fs`,
-   so this landing measures self-compile cost.
+1. **L0** is folded into L1 (P4, revised): L1 makes `fs.decode_error`
+   public when `process` starts importing it.
 2. **L1, the natives and the library.**
    - The natives `process.capture` and `process.find_program`, at about 10
      compiler lines.
