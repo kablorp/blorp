@@ -945,14 +945,15 @@ OS failure. It prints nothing. See the
 
 #### The fs library
 
-`fs` is the typed filesystem library; import it explicitly. Every operation
-except the pure `describe` and `default_if_not_found` is impure and returns a
-`Result` whose error is an `IOError`, which holds the caller's path and an
-`IOErrorKind` such as `NotFound` or `OtherOs(errno)`:
+`fs` is the typed filesystem library; import it explicitly. Its operations
+are impure except for `default_if_not_found`. Their `Result` error is the
+shared `io.IOError`, which holds the caller's path and an `io.IOErrorKind`
+such as `NotFound` or `OtherOs(errno)`:
 
 ```blorp
 import:
-    fs: IOError, read_text, default_if_not_found
+    fs: read_text, default_if_not_found
+    io: IOError
 func load_settings(path: String) -> Result[String, IOError]:
     default_if_not_found(read_text(path), "defaults")
 ```

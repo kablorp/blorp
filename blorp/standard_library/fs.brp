@@ -1,52 +1,15 @@
 -- The filesystem library. A native reports a failure as an Int code, and the
--- pure functions here decode it into an IOError that names the caller's path.
+-- shared internal decoder supplies io.IOErrorKind; this module names the caller's path.
 import:
     _base: Int, String, Void, List, Bool(True, False), Option(Some, None), Result(Ok, Err)
+    _io_errors: decode_error
     bool: Bool methods
     int: Int methods
+    io: IOError, IOErrorKind(NotFound)
     list: List methods
     option: Option methods
     result: Result methods
     string: String methods
-
-
--- What went wrong. Every kind but OtherOs is a fact about the world that a
--- caller can act on; OtherOs keeps the operating system's own number, which
--- differs between macOS and Linux.
-fixed union IOErrorKind:
-    NotFound
-    PermissionDenied
-    AlreadyExists
-    NotADirectory
-    IsADirectory
-    DirectoryNotEmpty
-    NotARegularFile
-    ReadOnlyFilesystem
-    -- ENOSPC and EDQUOT.
-    NoSpace
-    -- EFBIG and EOVERFLOW, or contents beyond the String capacity.
-    FileTooLarge
-    -- EXDEV from rename, so the caller can fall back to copying, and a mount
-    -- point or another device met by remove_directory_tree.
-    CrossesDevices
-    -- Found before any operating system call.
-    PathContainsNul
-    -- Found after reading bytes.
-    InvalidUtf8
-    -- Another process moved a directory while remove_directory_tree walked it.
-    ChangedDuringRemoval
-    -- Any other errno, such as ELOOP, ENAMETOOLONG or EMFILE.
-    OtherOs(Int)
-
-
--- `path` is always the path the caller passed, even when the operating system
--- refused a parent directory, so "x: permission denied" does not say whether x
--- or one of its parents refused. The one exception is with_temporary_directory
--- failing to remove its directory, which names that directory: the body was
--- given the path, and nothing else says what was left behind. `destination` is
--- the second path of a two-path operation, and is None for every operation that
--- has one path.
-record IOError { path: String, destination: Option[String], kind: IOErrorKind }
 
 
 -- What a path names without following a link.
@@ -62,69 +25,11 @@ fixed union EntryKind:
 record Entry { name: String, kind: EntryKind }
 
 
--- Codes from src/compile/runtime/fs.brp's FS_HELPERS_RUNTIME enum. A named kind has a
--- positive code; any other errno arrives negated, so OtherOs keeps the
--- platform's number. The two sides agree only by the tests that name each
--- code as a literal.
-private NOT_FOUND_CODE: Int = 1
-private PERMISSION_DENIED_CODE: Int = 2
-private ALREADY_EXISTS_CODE: Int = 3
-private NOT_A_DIRECTORY_CODE: Int = 4
-private IS_A_DIRECTORY_CODE: Int = 5
-private DIRECTORY_NOT_EMPTY_CODE: Int = 6
-private NOT_A_REGULAR_FILE_CODE: Int = 7
-private READ_ONLY_FILESYSTEM_CODE: Int = 8
-private NO_SPACE_CODE: Int = 9
-private FILE_TOO_LARGE_CODE: Int = 10
-private CROSSES_DEVICES_CODE: Int = 11
-private PATH_CONTAINS_NUL_CODE: Int = 12
-private INVALID_UTF8_CODE: Int = 13
--- Nothing deterministic produces this code: it needs another process to move a
--- directory during a walk. The C test of remove_directory_tree proves the
--- runtime sends it; that this file decodes it is checked by review alone.
-private CHANGED_DURING_REMOVAL_CODE: Int = 14
-
 -- The entry codes of FS_HELPERS_RUNTIME's second enum.
 private ABSENT_ENTRY_CODE: Int = 0
 private FILE_ENTRY_CODE: Int = 1
 private DIRECTORY_ENTRY_CODE: Int = 2
 private SYMLINK_ENTRY_CODE: Int = 3
-
-
-private pure func decode_error(code: Int) -> IOErrorKind:
-    if code == NOT_FOUND_CODE:
-        NotFound
-    else if code == PERMISSION_DENIED_CODE:
-        PermissionDenied
-    else if code == ALREADY_EXISTS_CODE:
-        AlreadyExists
-    else if code == NOT_A_DIRECTORY_CODE:
-        NotADirectory
-    else if code == IS_A_DIRECTORY_CODE:
-        IsADirectory
-    else if code == DIRECTORY_NOT_EMPTY_CODE:
-        DirectoryNotEmpty
-    else if code == NOT_A_REGULAR_FILE_CODE:
-        NotARegularFile
-    else if code == READ_ONLY_FILESYSTEM_CODE:
-        ReadOnlyFilesystem
-    else if code == NO_SPACE_CODE:
-        NoSpace
-    else if code == FILE_TOO_LARGE_CODE:
-        FileTooLarge
-    else if code == CROSSES_DEVICES_CODE:
-        CrossesDevices
-    else if code == PATH_CONTAINS_NUL_CODE:
-        PathContainsNul
-    else if code == INVALID_UTF8_CODE:
-        InvalidUtf8
-    else if code == CHANGED_DURING_REMOVAL_CODE:
-        ChangedDuringRemoval
-    else:
-        -- A positive code that no constant names is a disagreement between the
-        -- two tables. It stays visible as a negative OtherOs number, which no
-        -- real errno produces.
-        OtherOs(0 - code)
 
 
 -- Every code that is not a named kind is Other, because the C side sends
@@ -251,33 +156,6 @@ private func native_next_lines(descriptor: Int, carried: String) -> Result[List[
 
 private func native_close(descriptor: Int) -> Result[Void, Int]:
     builtin("fs.close")
-
-
-private pure func phrase(kind: IOErrorKind) -> String:
-    match kind:
-        NotFound: "no such file"
-        PermissionDenied: "permission denied"
-        AlreadyExists: "already exists"
-        NotADirectory: "not a directory"
-        IsADirectory: "is a directory"
-        DirectoryNotEmpty: "directory not empty"
-        NotARegularFile: "not a regular file"
-        ReadOnlyFilesystem: "read-only file system"
-        NoSpace: "no space left on device"
-        FileTooLarge: "file too large"
-        CrossesDevices: "crosses devices"
-        PathContainsNul: "path contains a NUL byte"
-        InvalidUtf8: "contents are not valid UTF-8"
-        ChangedDuringRemoval: "changed during removal"
-        OtherOs(number): "operating system error ${number.to_string()}"
-
-
--- "settings.conf: no such file"; "a -> b: crosses devices". The text is fixed
--- per kind, never the operating system's own wording.
-pure func describe(error: IOError) -> String:
-    match error.destination:
-        Some(destination): "${error.path} -> ${destination}: ${error.kind.phrase()}"
-        None: "${error.path}: ${error.kind.phrase()}"
 
 
 -- The common idiom: a missing file means a default. Any other failure stays.

@@ -9,12 +9,12 @@ done.
 ## Workstreams
 
 - **UInt8 and Bytes:** [`UINT8_BYTES_PLAN.md`](UINT8_BYTES_PLAN.md).
-  - **Status:** U1 to U9 and B1 to B3 are decided. The S0 spike is done.
-  - **Next:** L0, a pure refactor that models Int as
-    `IntegerType(Int64Format)`, with byte-identical C.
-  - **Waits on Keith:** L0's corrected line ceiling (see the plan's
-    Ceilings). L0's brief must be rewritten from the plan, because the first
-    one lives outside the repository.
+  - **Status:** U1 to U9 and B1 to B3 are decided. S0 and the L0
+    `IntegerType(Int64Format)` refactor are implemented and independently
+    reviewed; combined local gates pass, with platform CI remaining. Matched costs
+    pass unchanged performance ceilings; see
+    [`L0 results`](../benchmarks/results/blorp-integer-model-l0-2026-11-08.md).
+  - **Next:** L1, adding UInt8 with deferred integer literals, after L0 lands.
   - **Afterwards:**
     - L1, the compiler learns `UInt8`, with deferred integer literals;
     - L2, a seed rotation, which also switches the seed family;
@@ -22,15 +22,26 @@ done.
       `fs.read_bytes`/`write_bytes`;
     - L4, `String.byte_at` returns `Option[UInt8]`.
 - **Process API:** [`PROCESS_DECISIONS.md`](PROCESS_DECISIONS.md).
-  - **Status:** approved; nothing is implemented.
-  - **Next:** L0, moving fs's errno codes (the private `…_CODE` constants
-    in `standard_library/fs.brp`) and `decode_error` into one shared internal
-    module. It changes no behaviour and is independent of the UInt8 work.
+  - **Status:** L0 is implemented and independently reviewed; final combined
+    landing gates pass locally, with platform CI remaining. Shared errors/formatting belong to `io`,
+    with one internal native-code decoder. Existing imports are migrated.
+    [`L0 results`](../benchmarks/results/blorp-process-l0-2026-11-08.md).
+  - **Next:** L1, the natives and library. Settle the primitive native reply
+    boundary before production implementation; do not invent OS failures for
+    invalid transport data.
   - **Afterwards:**
     - L1, the `process.capture` and `process.find_program` natives, the C core
       and `process.brp`;
     - L2, migrating the 17 `run_to_files` call sites and deleting it.
   - **Later:** binary capture after `Bytes`, and `run` with streaming.
+- **LSP foundations:**
+  - **Status:** the pure `json` codec is implemented and independently
+    reviewed; combined local gates pass, with platform CI remaining.
+    [`JSON results`](../benchmarks/results/blorp-json-foundation-2026-11-08.md).
+    Loader source overrides are being implemented in a separate bounded slice.
+  - **Next:** finish loader overlay tests and matched costs, then expose module
+    analysis without a required executable entrypoint. Neither editor state nor
+    transport belongs in the compiler pipeline.
 - **Filesystem:** [`FILESYSTEM_DECISIONS.md`](FILESYSTEM_DECISIONS.md).
   - **Status:** Part 1 has landed through `fold_lines`. Part 2, lent
     resources, waits for a consumer.
@@ -79,7 +90,7 @@ None of these is planned yet. Each wants its own short design or brief.
 - **Never run compiled binaries in parallel with another session's** on macOS.
   Before each build, gate or measurement, wait for
   `pgrep -f '^[^ ]*self-hosted-tests/driver/driver'` and
-  `pgrep -f '^[^ ]*blorp/build/(compiler|fixpoint)'` to come back empty. The
+  `pgrep -f '^[^ ]*blorp/build/(blorp|compiler|fixpoint)'` to come back empty. The
   pattern is anchored so that a waiting shell never matches itself.
 - **A subagent's commands move to the background after about 180 s.** Put the
   busy check inside your own scripts, start long scripts in the background,

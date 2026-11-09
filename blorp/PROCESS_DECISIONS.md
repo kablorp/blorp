@@ -11,8 +11,8 @@ Earlier, Keith had approved the direction:
 - streaming later;
 - `Exit` as a `fixed union`.
 
-Nothing is implemented yet. The feasibility review prototyped the C core on
-macOS 26 and Linux arm64, and compiled every declaration and example below
+L0 is implemented; L1 and L2 are not implemented. The feasibility review
+prototyped the C core on macOS 26 and Linux arm64, and compiled every declaration and example below
 against a scratch library. Those spikes were not kept.
 
 ## Problem
@@ -35,6 +35,7 @@ Five types and six functions:
 
 ```blorp
 import:
+    io: IOError, IOErrorKind
     process:
         Command, Exit(Exited, Signaled, TimedOut), Captured, ProcessError, ProcessErrorKind(...),
         command, capture, output, find_program
@@ -63,7 +64,7 @@ record ProcessError { program: String, kind: ProcessErrorKind }
 
 union ProcessErrorKind:
     NotOnPath                      -- find_program: no executable file of that name
-    LaunchFailed(IOErrorKind)      -- exec, fork or a pipe failed, as fs words the errno
+    LaunchFailed(IOErrorKind)      -- exec, fork or a pipe failed, as io words the errno
     NotExecutable                  -- ENOEXEC: a file the system cannot run, such as a script without #!
     DirectoryFailed(IOError)       -- the child could not enter `directory`; the error names it
     ContainsNul                    -- in the program, an argument or the environment; before any system call
@@ -87,12 +88,12 @@ Go's `Output`. `?=` over `output` runs a sequence and stops at the first
 failure, carrying everything the failed command printed. It shows nothing
 until the command ends; live output comes with streaming. `describe` renders
 `Unsuccessful` as "make: exited 2" followed by its stderr, and every other
-kind with fixed text, as `fs.describe` does.
+kind with fixed text, as `io.describe` does.
 
 `succeeded` and `describe` need no import. Selecting `Exit` and
 `ProcessError` makes them available as `exit.succeeded()` and
 `error.describe()`, which also keeps `process`'s `describe` from colliding
-with `fs`'s. A program that passes `describe` as a value aliases the module,
+with `io`'s. A program that passes `describe` as a value aliases the module,
 as `process as Process`, and writes `.map_err(Process.describe)`.
 
 ## Examples
@@ -180,12 +181,13 @@ private func isolated(binary: String, arguments: List[String]) -> Result[Capture
   them, so `fs.brp` mirrors the C runtime's error enum in private Int
   constants (`NOT_FOUND_CODE` and the rest) and decodes them in
   `decode_error`. `LaunchFailed(IOErrorKind)` and `DirectoryFailed(IOError)`
-  need the same decoder. So the table stays in `fs`, and `decode_error`
-  becomes public there for `process` to import: one copy, no new module.
-  (Revised by Keith on 2026-11-08. The first wording moved the codes and the
-  decoder into a shared internal module, but Blorp has no re-exports and
-  rejects import cycles, so `IOErrorKind` would have had to move too,
-  changing every program that imports it from `fs`.)
+  need the same decoder. So fs's code constants and `decode_error` move into
+  `_io_errors`, which `process` also uses. On 2026-11-08 Keith chose to move
+  the public `IOErrorKind`, `IOError` and their `describe` formatting to the
+  existing `io` module, updating all imports. `fs` and `_io_errors` import
+  those types from `io`; `io` imports neither, so there is no cycle. Modules
+  do not reexport imported names: callers import errors and `describe` from
+  `io`, and filesystem operations and entry types from `fs`.
 
   Letting a native return a library `fixed union` instead was estimated at 250
   to 300 compiler lines, plus a seed rotation with a dual-accept transition.
@@ -208,8 +210,11 @@ The process API itself needs no seed rotation, since the compiler does not
 import `process` yet. `blorp run` and `blorp test` (`RUN_AND_TEST_PLAN.md`)
 will make it import `process`, and that needs a rotation first.
 
-1. **L0** is folded into L1 (P4, revised): L1 makes `fs.decode_error`
-   public when `process` starts importing it.
+1. **L0, the shared code table** (P4). Move fs's codes and `decode_error` into
+   `_io_errors`, with shared public error types/formatting owned by `io` and
+   all caller imports migrated. Error values and wording do not change.
+   The compiler imports `fs`,
+   so this landing measures self-compile cost.
 2. **L1, the natives and the library.**
    - The natives `process.capture` and `process.find_program`, at about 10
      compiler lines.

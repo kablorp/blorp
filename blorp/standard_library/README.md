@@ -300,6 +300,13 @@ It borrows its input, writes counted bytes to stderr once, and attempts LF only
 following a full transfer; short writes (including EINTR) stop without retry.
 The host attempts LF after short writes as well. Neither API reports delivery.
 
+`io` also owns the shared fixed union `IOErrorKind`, the record `IOError`, and
+the pure `describe(error)` function. Select `io: IOError` to name the error
+and call `error.describe()` through UFCS; select `describe` explicitly when
+passing it as a function value. The filesystem library uses these identities;
+the planned process API will use them too. `_io_errors.brp` is the internal native-code decoder;
+programs use the public `io` kinds instead of depending on numeric codes.
+
 ### JSON
 
 Explicitly import `json` for a pure JSON codec:
@@ -351,11 +358,12 @@ container nesting, so sufficiently deep documents can exhaust the stack.
 ### The fs module
 
 `fs.brp` is the typed filesystem library; import it explicitly. It declares
-the fixed unions `IOErrorKind` and `EntryKind`, the records `IOError` and
-`Entry`, the pure `describe` and `default_if_not_found`, and the impure
-operations below, each returning a `Result` whose error is an `IOError`. Its
-natives return Int codes (or a list or String) that private decoders turn
-into kinds and entries; the codes are named in `src/compile/runtime/fs.brp`. The
+the fixed union `EntryKind`, the record `Entry`, the pure
+`default_if_not_found`, and the impure operations below. Their `Result` error
+is `IOError`, imported from `io` along with `IOErrorKind` and `describe`.
+Natives return Int codes (or a list or String); the shared `_io_errors`
+decoder produces `io` kinds, while the entry decoder stays private to `fs`.
+The native codes are named in `src/compile/runtime/fs.brp`. The
 language README's [I/O overview](../README.md#effects-and-io) shows where it
 fits beside `print` and the other effects, and
 [FILESYSTEM_DECISIONS.md](../FILESYSTEM_DECISIONS.md) records why the library
@@ -464,7 +472,8 @@ is shaped this way and what is still open.
 
   ```blorp
   import:
-      fs: IOError, fold_lines
+      fs: fold_lines
+      io: IOError
       string: String methods
 
   union ScoreError:
@@ -481,7 +490,7 @@ is shaped this way and what is still open.
   func total_score(path: String) -> Result[Int, ScoreError]:
       fold_lines(path, 0, add_score, pure func(error: IOError) -> ScoreError: Unreadable(error))
   ```
-- `IOError` holds the caller's `path`, an optional `destination` for
+- `io.IOError` holds the caller's `path`, an optional `destination` for
   two-path operations, and an `IOErrorKind`: `NotFound`, `PermissionDenied`,
   `AlreadyExists`, `NotADirectory`, `IsADirectory`, `DirectoryNotEmpty`,
   `NotARegularFile`, `ReadOnlyFilesystem`, `NoSpace`, `FileTooLarge`,
@@ -489,7 +498,7 @@ is shaped this way and what is still open.
   and `OtherOs(Int)`, which keeps the platform's errno. The path is the one
   the caller passed, so `x: permission denied` does not say whether `x` or a
   parent refused, except for the cleanup failure above.
-- `describe(error)` gives `"<path>: <phrase>"` with fixed text per kind, never
+- `io.describe(error)` gives `"<path>: <phrase>"` with fixed text per kind, never
   `strerror` text. `default_if_not_found(result, fallback)` turns `NotFound`
   into `Ok(fallback)` and leaves every other result alone.
 
