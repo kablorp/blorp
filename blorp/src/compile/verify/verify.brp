@@ -96,15 +96,36 @@ import:
         runtime_type_ref,
 
 
+-- A record or union of a verified program, by its catalogue position in that
+-- program. Positions mean nothing apart from the program, so the order below
+-- is published only inside the seal.
+union AggregateDefinition:
+    RecordDefinition(Int)
+    UnionDefinition(Int)
+
+
+-- The order lists every record and union exactly once, each after every
+-- aggregate it stores by value: the completion order of the layout walk.
+private record VerifiedContents {
+    program: OwnershipProgram,
+    aggregate_order: List[AggregateDefinition],
+}
+
+
 -- Concrete representation is an upstream fact, shared with insertion.
 -- Verification independently validates the actual raw operations and layouts;
 -- it does not consume insertion's decisions about owners or borrow lifetimes.
--- This seal belongs to the exact operations and contracts checked below.
-opaque type VerifiedProgram = OwnershipProgram
+-- This seal belongs to the exact operations, contracts and layout order
+-- checked below.
+opaque type VerifiedProgram = VerifiedContents
 
 
 pure func verified_contents(program: VerifiedProgram) -> OwnershipProgram:
-    from_opaque VerifiedProgram(program)
+    from_opaque VerifiedProgram(program).program
+
+
+pure func aggregate_order(program: VerifiedProgram) -> List[AggregateDefinition]:
+    from_opaque VerifiedProgram(program).aggregate_order
 
 
 private pure func verification_error(span: Span, message: String) -> Diagnostic:
@@ -932,12 +953,15 @@ private pure func list_terminal_presence(
 -- The by-value storage graph of the layouts must be acyclic: every cycle
 -- passes through a managed record, a boxed union or a List, which the walk
 -- does not follow. Each layout is also walked as a root, and a record's
--- storage summary is checked once its fields are known.
+-- storage summary is checked once its fields are known. It returns the
+-- layouts in the order the walk completed them, so each follows every
+-- layout it stores by value.
 private pure func verify_layout_graph(
     records: List[ConcreteRecord],
     unions: List[ConcreteUnion],
-) -> Result[Void, Diagnostic]:
+) -> Result[List[AggregateDefinition], Diagnostic]:
     span: Span = compiler_span()
+    var completed: List[AggregateDefinition] = []
     -- A local traversal owns each state vector throughout every update.
     var record_visits = records.map(pure func(_) -> LayoutVisit: UnvisitedLayout)
     var union_visits = unions.map(pure func(_) -> LayoutVisit: UnvisitedLayout)
@@ -1132,6 +1156,7 @@ private pure func verify_layout_graph(
                                                     break
                     FinishUnionLayout(index):
                         union_visits = union_visits.set(index, CompleteLayout)
+                        completed = completed.append(UnionDefinition(index))
                     FinishRecordLayout(index):
                         match records.get(index):
                             None:
@@ -1198,6 +1223,7 @@ private pure func verify_layout_graph(
                                 ):
                                     if matches:
                                         record_visits = record_visits.set(index, CompleteLayout)
+                                        completed = completed.append(RecordDefinition(index))
                                     else:
                                         invalid = Some(
                                             verification_error(
@@ -1208,7 +1234,7 @@ private pure func verify_layout_graph(
 
     match invalid:
         Some(error): Err(error)
-        None: Ok(void)
+        None: Ok(completed)
 
 
 private pure func record_layout(
@@ -4571,7 +4597,7 @@ pure func verify(program: OwnershipProgram) -> Result[VerifiedProgram, Diagnosti
             Ok(_):
                 union_position = union_position + 1
 
-    complete_layouts: Void ?= match invalid:
+    layout_order: List[AggregateDefinition] ?= match invalid:
         Some(error): Err(error)
         None: program.records.verify_layout_graph(program.unions)
 
@@ -4633,5 +4659,12 @@ pure func verify(program: OwnershipProgram) -> Result[VerifiedProgram, Diagnosti
             Err(error)
         None:
             match entry.verify_entry(program.entrypoint):
-                Ok(valid_entry): Ok(into_opaque VerifiedProgram(program))
-                Err(error): Err(error)
+                Ok(valid_entry):
+                    Ok(
+                        into_opaque VerifiedProgram({
+                            program = program,
+                            aggregate_order = layout_order,
+                        }),
+                    )
+                Err(error):
+                    Err(error)

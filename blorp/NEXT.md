@@ -76,6 +76,11 @@ done.
   [`EMBEDDED_LIBRARY_PLAN.md`](EMBEDDED_LIBRARY_PLAN.md). Other sessions own
   them; see each plan's status line, and `git log` for what has landed since
   (the embedded library landed in `1a68dbd3b`).
+- **Aggregate definition order:** [`AGGREGATE_ORDER_PLAN.md`](AGGREGATE_ORDER_PLAN.md).
+  - **Status:** approved 2026-11-10 (K1 to K4 as recommended); implemented
+    and gated on `claude/aggregate-order-plan`, not landed. Test lines are 11
+    over their ceiling, awaiting the coordinator.
+  - **Next:** land it on `main` after Keith approves the push.
 
 ## Smaller follow-ups
 

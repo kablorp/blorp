@@ -139,7 +139,10 @@ import:
         VariantFieldInstanceId,
         VariantInstanceId,
         function_number,
-    ../verify/verify: VerifiedProgram
+    ../verify/verify:
+        AggregateDefinition(RecordDefinition, UnionDefinition),
+        VerifiedProgram,
+        aggregate_order,
     ./diagnostics:
         AggregateKind(RecordAggregate, UnionAggregate),
         EmissionFailure(
@@ -154,12 +157,7 @@ import:
             MissingEnclosingLoop,
             StatementOnlyValue,
             InvalidOperationShape,
-            MissingAggregateWorkItem,
-            MissingAggregateVisit,
-            CyclicByValueAggregate,
             MissingAggregateLayout,
-            MissingAggregateMember,
-            MissingUnionPayloadField,
             MissingInPlaceHelper,
         ),
         render,
@@ -866,281 +864,40 @@ private pure func append_union(
         Ok(result)
 
 
-private union AggregateDefinition:
-    RecordDefinition(Int)
-    UnionDefinition(Int)
-
-
-private union AggregateVisit:
-    UnvisitedAggregate
-    VisitingAggregate
-    EmittedAggregate
-
-
-private union AggregateVisitStep:
-    PrepareAggregate(AggregateDefinition)
-    EmitAggregate(AggregateDefinition)
-
-
--- Whether a stored type must be defined before its parent: only storage by
--- value (an inline record or inline union) is a definition dependency. A
--- managed record, a boxed union and a List are pointers to forward-declared
--- types, which is what lets a layout group refer back to itself.
-private pure func stored_by_value(
-    value_type: TypeRef,
-    records: List[ConcreteRecord],
-    unions: List[ConcreteUnion],
-) -> Option[AggregateDefinition]:
-    match value_type:
-        RecordType(id):
-            match records.get(id.record_number()):
-                Some(layout):
-                    match layout:
-                        InlineFields(_) | ValueFields(_): Some(RecordDefinition(id.record_number()))
-                        CountedFields(_): None
-                None:
-                    None
-        UnionType(id):
-            match unions.get(id.union_number()):
-                Some(layout):
-                    match layout.union_is_boxed():
-                        False: Some(UnionDefinition(id.union_number()))
-                        True: None
-                None:
-                    None
-        _:
-            None
-
-
+-- Verification sealed every record and union in an order that puts each
+-- by-value child first, so each C definition follows the definitions it
+-- stores. Pointer edges need only the forward declarations emitted earlier.
+-- Verify read each index from this program's own catalogues, so a missing
+-- layout means a broken seal and is reported as a compiler error.
 private pure func append_aggregate_definitions(
-    records: List[ConcreteRecord],
-    unions: List[ConcreteUnion],
+    program: VerifiedProgram,
 ) -> Result[String, Diagnostic]:
-    -- State vectors and fragments remain local owners while dependencies are
-    -- visited. No recursive carrier retains their previous roots.
-    var record_visits = records.map(pure func(_) -> AggregateVisit: UnvisitedAggregate)
-    var union_visits = unions.map(pure func(_) -> AggregateVisit: UnvisitedAggregate)
+    checked = program.verified_contents()
     var fragments: List[String] = []
-    var pending: List[AggregateVisitStep] = []
-    var pending_count = 0
-    var position = unions.length()
+    var failure: Option[Diagnostic] = None
 
-    while position > 0:
-        position = position - 1
-        pending = pending.push_at(pending_count, PrepareAggregate(UnionDefinition(position)))
-        pending_count = pending_count + 1
+    for definition in program.aggregate_order():
+        rendered = match definition:
+            RecordDefinition(index):
+                match checked.records.get(index):
+                    Some(layout):
+                        "".append_record(layout, index, checked.unions)
+                    None:
+                        Err(render(compiler_span(), MissingAggregateLayout(RecordAggregate, index)))
+            UnionDefinition(index):
+                match checked.unions.get(index):
+                    Some(layout):
+                        "".append_union(layout, index, checked.unions)
+                    None:
+                        Err(render(compiler_span(), MissingAggregateLayout(UnionAggregate, index)))
+        match rendered:
+            Ok(text):
+                fragments = fragments.append(text)
+            Err(error):
+                failure = Some(error)
+                break
 
-    position = records.length()
-
-    while position > 0:
-        position = position - 1
-        pending = pending.push_at(pending_count, PrepareAggregate(RecordDefinition(position)))
-        pending_count = pending_count + 1
-
-    var invalid: Option[Diagnostic] = None
-
-    while (pending_count > 0).and(
-        invalid
-            .is_some()
-            .not(),
-    ):
-        pending_count = pending_count - 1
-
-        match pending.get(pending_count):
-            None:
-                invalid = Some(render(compiler_span(), MissingAggregateWorkItem(pending_count)))
-            Some(step):
-                match step:
-                    PrepareAggregate(definition):
-                        status = match definition:
-                            RecordDefinition(index): record_visits.get(index)
-                            UnionDefinition(index): union_visits.get(index)
-
-                        match status:
-                            None:
-                                missing: EmissionFailure = match definition:
-                                    RecordDefinition(index):
-                                        MissingAggregateVisit(RecordAggregate, index)
-                                    UnionDefinition(index):
-                                        MissingAggregateVisit(UnionAggregate, index)
-                                invalid = Some(render(compiler_span(), missing))
-                            Some(EmittedAggregate):
-                                void
-                            Some(VisitingAggregate):
-                                cycle: EmissionFailure = match definition:
-                                    RecordDefinition(index):
-                                        CyclicByValueAggregate(RecordAggregate, index)
-                                    UnionDefinition(index):
-                                        CyclicByValueAggregate(UnionAggregate, index)
-                                invalid = Some(render(compiler_span(), cycle))
-                            Some(UnvisitedAggregate):
-                                pending = pending.push_at(pending_count, EmitAggregate(definition))
-                                pending_count = pending_count + 1
-
-                                match definition:
-                                    RecordDefinition(index):
-                                        record_visits = record_visits.set(index, VisitingAggregate)
-
-                                        match records.get(index):
-                                            None:
-                                                invalid = Some(
-                                                    render(
-                                                        compiler_span(),
-                                                        MissingAggregateLayout(
-                                                            RecordAggregate,
-                                                            index,
-                                                        ),
-                                                    ),
-                                                )
-                                            Some(layout):
-                                                fields = layout.record_fields()
-                                                var child = fields.length()
-
-                                                while child > 0:
-                                                    child = child - 1
-
-                                                    match fields.get(child):
-                                                        Some(field):
-                                                            match field.stored_by_value(
-                                                                records,
-                                                                unions,
-                                                            ):
-                                                                Some(dependency):
-                                                                    pending = pending.push_at(
-                                                                        pending_count,
-                                                                        PrepareAggregate(
-                                                                            dependency,
-                                                                        ),
-                                                                    )
-                                                                    pending_count = (
-                                                                        pending_count
-                                                                        + 1
-                                                                    )
-                                                                None:
-                                                                    void
-                                                        None:
-                                                            invalid = Some(
-                                                                render(
-                                                                    compiler_span(),
-                                                                    MissingAggregateMember(
-                                                                        RecordAggregate,
-                                                                        index,
-                                                                        child,
-                                                                    ),
-                                                                ),
-                                                            )
-                                                            break
-                                    UnionDefinition(index):
-                                        union_visits = union_visits.set(index, VisitingAggregate)
-
-                                        match unions.get(index):
-                                            None:
-                                                invalid = Some(
-                                                    render(
-                                                        compiler_span(),
-                                                        MissingAggregateLayout(
-                                                            UnionAggregate,
-                                                            index,
-                                                        ),
-                                                    ),
-                                                )
-                                            Some(layout):
-                                                variants = layout.union_variants()
-                                                var child = variants.length()
-
-                                                while child > 0:
-                                                    child = child - 1
-
-                                                    match variants.get(child):
-                                                        Some(fields):
-                                                            var field_position = fields.length()
-                                                            while field_position > 0:
-                                                                field_position = field_position - 1
-                                                                match fields.get(field_position):
-                                                                    Some(field):
-                                                                        match field.stored_by_value(
-                                                                            records,
-                                                                            unions,
-                                                                        ):
-                                                                            Some(dependency):
-                                                                                pending = pending.push_at(
-                                                                                    pending_count,
-                                                                                    PrepareAggregate(
-                                                                                        dependency,
-                                                                                    ),
-                                                                                )
-                                                                                pending_count = (
-                                                                                    pending_count
-                                                                                    + 1
-                                                                                )
-                                                                            None:
-                                                                                void
-                                                                    None:
-                                                                        invalid = Some(
-                                                                            render(
-                                                                                compiler_span(),
-                                                                                MissingUnionPayloadField(
-                                                                                    index,
-                                                                                    child,
-                                                                                    field_position,
-                                                                                ),
-                                                                            ),
-                                                                        )
-                                                                        break
-                                                        None:
-                                                            invalid = Some(
-                                                                render(
-                                                                    compiler_span(),
-                                                                    MissingAggregateMember(
-                                                                        UnionAggregate,
-                                                                        index,
-                                                                        child,
-                                                                    ),
-                                                                ),
-                                                            )
-                                                            break
-                    EmitAggregate(definition):
-                        match definition:
-                            RecordDefinition(index):
-                                match records.get(index):
-                                    None:
-                                        invalid = Some(
-                                            render(
-                                                compiler_span(),
-                                                MissingAggregateLayout(RecordAggregate, index),
-                                            ),
-                                        )
-                                    Some(layout):
-                                        match "".append_record(layout, index, unions):
-                                            Ok(record_definition):
-                                                fragments = fragments.append(record_definition)
-                                                record_visits = record_visits.set(
-                                                    index,
-                                                    EmittedAggregate,
-                                                )
-                                            Err(error):
-                                                invalid = Some(error)
-                            UnionDefinition(index):
-                                match unions.get(index):
-                                    None:
-                                        invalid = Some(
-                                            render(
-                                                compiler_span(),
-                                                MissingAggregateLayout(UnionAggregate, index),
-                                            ),
-                                        )
-                                    Some(layout):
-                                        match "".append_union(layout, index, unions):
-                                            Ok(union_definition):
-                                                fragments = fragments.append(union_definition)
-                                                union_visits = union_visits.set(
-                                                    index,
-                                                    EmittedAggregate,
-                                                )
-                                            Err(error):
-                                                invalid = Some(error)
-
-    match invalid:
+    match failure:
         Some(error): Err(error)
         None: Ok(fragments.join("\n"))
 
@@ -3766,14 +3523,15 @@ private pure func append_list_runtime(
 
 
 private pure func aggregate_runtime_contents(
-    checked: OwnershipProgram,
+    program: VerifiedProgram,
     lists: List[ListLayout],
     helpers: List[ListUpdateHelper],
     callables: List[TypeRef],
 ) -> Result[String, Diagnostic]:
+    checked = program.verified_contents()
     -- The host copies a `var` list on each append after a `?=` that follows its declaration.
     -- Both `?=` therefore precede `fragments`; `ready ?=` follows the loops and costs one copy.
-    ordered ?= checked.records.append_aggregate_definitions(checked.unions)
+    ordered ?= program.append_aggregate_definitions()
     completed ?= "".append_list_runtime(lists, checked.unions, checked.records)
     updates ?= "".append_list_updates(helpers, checked.unions, checked.records)
     ops ?= callables.callable_ops(checked.unions)
@@ -3844,7 +3602,7 @@ private pure func has_boxed_union(unions: List[ConcreteUnion]) -> Bool:
 pure func aggregate_runtime(program: VerifiedProgram) -> Result[String, Diagnostic]:
     checked = program.verified_contents()
     inventory = checked.program_inventory()
-    checked.aggregate_runtime_contents(
+    program.aggregate_runtime_contents(
         inventory.list_layouts(),
         inventory.list_update_helpers(),
         inventory.callable_types,
@@ -3873,7 +3631,7 @@ pure func emit(program: VerifiedProgram) -> Result[String, Diagnostic]:
     inventory = checked.program_inventory()
     requirements = inventory.runtime_requirements()
     lists = inventory.list_layouts()
-    aggregates ?= checked.aggregate_runtime_contents(
+    aggregates ?= program.aggregate_runtime_contents(
         lists,
         inventory.list_update_helpers(),
         inventory.callable_types,

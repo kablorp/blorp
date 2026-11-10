@@ -1154,10 +1154,14 @@ the output may already be new.
    independently and alone produces a `VerifiedProgram`. It rejects dead or
    wrong owners, invalid borrows, undischarged obligations, calls that disagree
    with their callee's labels and malformed selection graphs, and checks the
-   entrypoint conventions. It never repairs the IR.
+   entrypoint conventions. It never repairs the IR. Its proof that no layouts
+   form a by-value cycle also yields the aggregate order, every record and
+   union after the layouts it stores by value, which the `VerifiedProgram`
+   carries.
 10. **Emit** ([`emit`](src/compile/emit/emit.brp)) projects the verified program to C
    without repeating any check; retains and releases are exactly the explicit
-   operations.
+   operations, and record and union definitions follow the verified aggregate
+   order.
 
 ### C conventions
 
