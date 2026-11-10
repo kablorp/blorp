@@ -87,10 +87,9 @@ done.
   them; see each plan's status line, and `git log` for what has landed since
   (the embedded library landed in `1a68dbd3b`).
 - **Aggregate definition order:** [`AGGREGATE_ORDER_PLAN.md`](AGGREGATE_ORDER_PLAN.md).
-  - **Status:** approved 2026-11-10 (K1 to K4 as recommended); implemented
-    and gated on `claude/aggregate-order-plan`, not landed. Test lines are 11
-    over their ceiling, awaiting the coordinator.
-  - **Next:** land it on `main` after Keith approves the push.
+  - **Status:** landed 2026-11-10 as `bcc6bfdb1`. Test lines came to +461
+    against a +450 ceiling, awaiting the coordinator's budget correction.
+  - **Next:** none; remove this entry once the ceiling is settled.
 
 ## Smaller follow-ups
 

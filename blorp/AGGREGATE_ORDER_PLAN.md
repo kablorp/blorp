@@ -1,7 +1,7 @@
 # Emit aggregates in the order Verify proved
 
 Status: approved by Keith on 2026-11-10, with the recommended answer to each
-of K1–K4. Implemented on 2026-11-10 and not yet landed; the evidence is in
+of K1–K4. Landed on 2026-11-10 as `bcc6bfdb1`; the evidence is in
 [`blorp-aggregate-order-2026-11-10.md`](../benchmarks/results/blorp-aggregate-order-2026-11-10.md).
 Test lines came to +461 against the +450 ceiling. Written against
 `ce8753b6f` on 2026-11-09.
