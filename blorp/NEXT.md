@@ -33,8 +33,9 @@ done.
     family `blorp`, and the `compile` command line. Seed-built code now
     interpolates values directly (`68df72215`).
   - **Next:** `Path` (landing 7), planned in [`PATH_PLAN.md`](PATH_PLAN.md):
-    qualified union variants first, then `Path`, path literals, exact I/O
-    error kinds and the prelude.
+    qualified union variants, the `Path` type and a current-directory native,
+    a seed rotation, exact I/O errors in type-oriented modules, then `Path`
+    in the prelude.
 - **Process API:** [`PROCESS_DECISIONS.md`](PROCESS_DECISIONS.md).
   - **Status:** L0 is implemented and independently reviewed; final combined
     landing gates and four-platform CI pass; L0 is published. Shared
