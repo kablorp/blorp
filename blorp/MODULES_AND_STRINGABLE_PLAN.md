@@ -179,9 +179,9 @@ Probed on 2026-11-09 against `390945503`, with scratch programs only.
      Int's plain `to_string`, including `5.to_string()`. If the seed rejects
      it, the rotation (landing 6) moves ahead of this landing.
    - **Budget correction (coordinator, 2026-11-09):** the production-line
-     ceiling went from +70 net to +72 net. The smallest design measured +72,
+     ceiling went from +70 net to +75 net. The smallest design measured +72,
      and 8 of those lines are the formatter putting `string.brp`'s imports one
-     per line. The allocation (+0.3%) and instruction (+0.5%) ceilings are
+     per line. Review then asked for 3 lines of comment. The allocation (+0.3%) and instruction (+0.5%) ceilings are
      unchanged; it measured +0.026% and +0.044%.
 3. **Errors become `Stringable`.**
    - `IOErrorKind`, `IOError`, JSON's `ParseError` and `process`'s

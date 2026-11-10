@@ -898,8 +898,7 @@ loaded once. Every loaded module is checked, including unused declarations.
 The [prelude](standard_library/prelude.brp) is the only implicit import. User
 modules receive its selections: the base types, `Bool`, `Option` and `Result`
 with their constructors, the operator traits, `Equatable`, `Hashable`,
-`Stringable`, `Dict`,
-and the methods of Int, Float, String and List, so
+`Stringable`, `Dict`, and the methods of Int, Float, String and List, so
 `(42 + 1).to_string().length()` needs no import. Direct calls need named
 imports, and I/O is always explicit. Library modules receive nothing
 implicitly and cannot import user modules. Any module may import the
@@ -1035,8 +1034,8 @@ absent object names from null. Parse errors report UTF-8 byte offsets.
 The library is ordinary Blorp under [`standard_library/`](standard_library/).
 `_base.brp` declares the builtin types `Int`, `Float`, `String`, `Void` and
 `List`, the unions `Bool`, `Option`, `Result` and `MathError`, and the
-`Equatable`, `Orderable`, `Hashable`, `Stringable` and arithmetic traits; only it may declare
-builtin types. `prelude.brp` is the implicit import, and the operation modules
+`Equatable`, `Orderable`, `Hashable`, `Stringable` and arithmetic traits; only
+it may declare builtin types. `prelude.brp` is the implicit import, and the operation modules
 implement the traits and provide functions, some with `builtin("label")` bodies
 that name a compiler-known operation. The
 [standard library README](standard_library/README.md) owns every contract.
