@@ -98,8 +98,6 @@ formatter from `git blame`.
 ### Programs and main
 
 ```blorp
-import:
-    io: print
 func main() -> Int:
     print("Hello, World!")
     0
@@ -280,8 +278,6 @@ scalar. Raw control bytes, DEL, malformed UTF-8 and unknown escapes are
 rejected. Embedded NUL bytes count toward length and are preserved.
 
 ```blorp
-import:
-    io: print
 pure func describe(name: String, count: Int) -> String:
     "${name}: ${count}"
 func main() -> Int:
@@ -898,9 +894,13 @@ loaded once. Every loaded module is checked, including unused declarations.
 The [prelude](standard_library/prelude.brp) is the only implicit import. User
 modules receive its selections: the base types, `Bool`, `Option` and `Result`
 with their constructors, the operator traits, `Equatable`, `Hashable`,
-`Stringable`, `Dict`, and the methods of Int, Float, String and List, so
-`(42 + 1).to_string().length()` needs no import. Direct calls need named
-imports, and I/O is always explicit. Library modules receive nothing
+`Stringable`, `Dict`, the console functions `print` and `print_error`, and
+the methods of Int, Float, String and List, so `(42 + 1).to_string().length()`
+needs no import. Other direct calls need named imports: console output is in
+the prelude, while files, processes and the environment are explicit imports.
+A user module cannot declare `print` or `print_error` ("print is provided by
+the prelude"). Selecting them from `io` as well is redundant but accepted: an
+import of a name already in scope enters once. Library modules receive nothing
 implicitly and cannot import user modules. Any module may import the
 foundation module as `_base`.
 
@@ -934,8 +934,8 @@ a Dict. The full contract is in the
 
 ### Effects and I/O
 
-`io: print` writes a String and LF to stdout, and `io: print_error` writes to
-stderr. Both are impure and write every byte, including NUL. `print_error`
+The prelude's `print` writes a String and LF to stdout, and `print_error` writes
+to stderr. Both are impure and write every byte, including NUL. `print_error`
 writes the LF only after the text was written in full, and never retries.
 
 #### Command-line input

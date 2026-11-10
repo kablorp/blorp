@@ -202,6 +202,20 @@ Probed on 2026-11-09 against `390945503`, with scratch programs only.
    It needs landing 1.
 5. **The prelude:** `print` and `print_error` (decision 7), with R3 amended.
    O1 is decided: a user's own `print` is an error.
+   - **Ran before landing 4 (coordinator, 2026-11-10).** In this order the
+     prelude change deletes about 315 `io: print` selections once. The other
+     order would have rewritten them to `io/console` and then deleted them.
+   - The existing namespace rules gave O1 with no compiler change. A redundant
+     `io: print` stays accepted: an import of an entity the module already
+     sees enters once, as `_base: Option(Some)` does.
+   - **Budget correction (coordinator, 2026-11-10):** every program now loads
+     `io` through the prelude, which costs 5,159 more compile allocations for
+     a program that didn't import it before (90,432 → 95,591 for
+     `string_literal/long_unreached`). Two e2e ceilings in
+     `self_hosted_strings.brp` were raised with their old margins: 94,167 →
+     99,539 and 96,967 → 102,341. Landing 4 should lower the cost, because
+     the prelude then loads only `io/console`. Self-compile: allocations
+     +0.005%, instructions −0.02%.
 6. **A seed rotation.** It lets library and compiler code interpolate
    non-Strings, and carries the pending seed-family switch and the seed's
    move to the `blorp compile` command line (`UINT8_BYTES_PLAN.md`, L2). It can
