@@ -973,6 +973,10 @@ func load_settings(path: String) -> Result[String, IOError]:
     default_if_not_found(read_text(path), "defaults")
 ```
 
+`IOError` implements `Stringable`: `"${error}"` reads `settings.conf: no such
+file`. `json.ParseError` and `process.ProcessError` do the same; match on
+`error.kind`, never on the text.
+
 It reads and atomically writes UTF-8 text files (`read_text`, `write_text`),
 inspects and lists directories (`entry_kind`, `list_directory`), creates,
 removes and renames entries (`create_directory`, `create_directories`,

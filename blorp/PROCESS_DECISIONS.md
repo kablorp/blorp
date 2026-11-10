@@ -1,5 +1,8 @@
 # Process API
 
+`describe` below is history: `ProcessError` implements `Stringable` instead
+(MODULES_AND_STRINGABLE_PLAN.md, landing 3).
+
 Status: approved by Keith on 2026-11-06 (revision 3, after ergonomics,
 data-model and feasibility reviews), with P1 to P4 decided as recommended.
 Earlier, Keith had approved the direction:

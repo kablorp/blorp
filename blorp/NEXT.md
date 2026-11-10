@@ -29,7 +29,7 @@ done.
     `io/`.
   - **O1 decided:** a user's own `print` is an error (landing 5).
   - **Afterwards:** `Stringable` and interpolation, errors as `Stringable`
-    (deleting `describe`, `process`'s included), the `io/` move (`process`
+    (landing 3 deleted `describe`, `process`'s included), the `io/` move (`process`
     becomes `io/process`), `print` in the prelude, a seed rotation that also
     carries the process natives, then `Path`.
 - **Process API:** [`PROCESS_DECISIONS.md`](PROCESS_DECISIONS.md).

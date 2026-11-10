@@ -312,9 +312,9 @@ following a full transfer; short writes (including EINTR) stop without retry.
 The host attempts LF after short writes as well. Neither API reports delivery.
 
 `io` also owns the shared fixed union `IOErrorKind`, the record `IOError`, and
-the pure `describe(error)` function. Select `io: IOError` to name the error
-and call `error.describe()` through UFCS; select `describe` explicitly when
-passing it as a function value. The filesystem library uses these identities;
+the `Stringable` text of both. Select `io: IOError` to name the error, then
+write `"${error}"` or `error.to_string()`; select `to_string` to pass it as a
+function value. The filesystem library uses these identities;
 the planned process API will use them too. `_io_errors.brp` is the library's
 native-code decoder; programs use the public `io` kinds instead of depending
 on numeric codes. `_io_errors` is internal by convention only: Blorp has
@@ -365,8 +365,8 @@ fraction or exponent makes it `None` even when the value is whole (`1.0`,
 rounds, and `number_text` still returns the exact spelling.
 
 `ParseError` has `offset: Int`, a zero-based UTF-8 byte offset, and
-`kind: ParseErrorKind`. Match on the kind; `describe(error) -> String`
-returns its fixed wording, such as `expected a JSON value`, without the
+`kind: ParseErrorKind`. Match on the kind; `error.to_string()` and
+`"${error}"` give its fixed wording, such as `expected a JSON value`, without the
 offset. The kinds are `ExpectedValue`, `ExpectedNull`, `ExpectedTrue`,
 `ExpectedFalse`, `ExpectedNumberDigit`, `ExpectedFractionDigit`,
 `ExpectedExponentDigit`, `TrailingNumberData` (from `number` only),
@@ -399,7 +399,7 @@ result, and parsing and rendering cost time linear in them.
 `fs.brp` is the typed filesystem library; import it explicitly. It declares
 the fixed union `EntryKind`, the record `Entry`, the pure
 `default_if_not_found`, and the impure operations below. Their `Result` error
-is `IOError`, imported from `io` along with `IOErrorKind` and `describe`.
+is `IOError`, imported from `io` along with `IOErrorKind`.
 Natives return Int codes (or a list or String); the shared `_io_errors`
 decoder produces `io` kinds, while the entry decoder stays private to `fs`.
 The native codes are named in `src/compile/runtime/fs.brp`. The
@@ -485,7 +485,7 @@ is shaped this way and what is still open.
   directory (mode 0700) directly in `parent`, runs `body(directory)` and
   removes the directory and its contents before returning. It is generic in
   the body's error type: `io_error` turns its own `IOError` into that type
-  (`describe` for a `String` error,
+  (`to_string` for a `String` error,
   `pure func(error: IOError) -> IOError: error` for `IOError`). The converter
   must be pure, so a plain `func` lambda is rejected. The result is the body's
   `Err`, else the removal's `Err`, else the body's `Ok`, so a body error hides a
@@ -537,9 +537,10 @@ is shaped this way and what is still open.
   and `OtherOs(Int)`, which keeps the platform's errno. The path is the one
   the caller passed, so `x: permission denied` does not say whether `x` or a
   parent refused, except for the cleanup failure above.
-- `io.describe(error)` gives `"<path>: <phrase>"` with fixed text per kind, never
-  `strerror` text. `default_if_not_found(result, fallback)` turns `NotFound`
-  into `Ok(fallback)` and leaves every other result alone.
+- `IOError` is `Stringable`: `"${error}"` gives `"<path>: <phrase>"` with
+  fixed text per kind, never `strerror` text.
+  `default_if_not_found(result, fallback)` turns `NotFound` into
+  `Ok(fallback)` and leaves every other result alone.
 
 The runtime C is tested by `test/runtime/fs_suite.brp`, and the examples
 `test/e2e/fixtures/fs/read.brp`, `lines.brp`, `write.brp` and `directories.brp`
@@ -641,10 +642,9 @@ func current_commit(repository: String) -> Result[String, ProcessError]:
 - A reply from the runtime that the library cannot decode is a defect in the
   runtime, not an outcome: the program prints
   "blorp: process runtime defect: ..." and aborts.
-- `exit.succeeded()` is `Exited(0)`, and `error.describe()` renders
-  "<program>: <phrase>"; `Unsuccessful` is "make: exited 2" followed by the
-  child's stderr. Selecting `Exit` and `ProcessError` makes both available as
-  methods, so `process`'s `describe` never collides with `io`'s.
+- `exit.succeeded()` is `Exited(0)`, and `ProcessError` is `Stringable`:
+  `"${error}"` renders "<program>: <phrase>", and `Unsuccessful` is "make:
+  exited 2" followed by the child's stderr.
 
 ### run_to_files
 
