@@ -899,7 +899,8 @@ the methods of Int, Float, String and List, so `(42 + 1).to_string().length()`
 needs no import. Other direct calls need named imports: console output is in
 the prelude, while files, processes and the environment are explicit imports.
 A user module cannot declare `print` or `print_error` ("print is provided by
-the prelude"), and selecting them from `io` is rejected as already in scope. Library modules receive nothing
+the prelude"). Selecting them from `io` as well is redundant but accepted: an
+import of a name already in scope enters once. Library modules receive nothing
 implicitly and cannot import user modules. Any module may import the
 foundation module as `_base`.
 

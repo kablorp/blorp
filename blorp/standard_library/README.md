@@ -113,9 +113,9 @@ Pass `blorp/standard_library` explicitly as the argument to `blorp compile --lib
 imports still resolve beside their importer. There is no host-library fallback.
 
 `io.brp` adapts the legacy
-[`standard_library/src/io.brp`](https://github.com/kablorp/blorp/blob/ee9e001c6de8911ee486fd992419bef5bc628e8b/standard_library/src/io.brp). Its active
-`print(String) -> Void` is concrete and impure, supplied by the prelude, mapped to the closed
-`string.print` operation. It borrows the String,
+[`standard_library/src/io.brp`](https://github.com/kablorp/blorp/blob/ee9e001c6de8911ee486fd992419bef5bc628e8b/standard_library/src/io.brp). The prelude
+supplies `print` and `print_error`. `print(String) -> Void` is concrete and
+impure, mapped to the closed `string.print` operation. It borrows the String,
 writes every byte and appends LF. Program input arrives explicitly through
 `main(args: List[String])`, including the executable name at index 0.
 Other IO declarations remain in the original module. `Void` is declared once in `_base.brp`.
