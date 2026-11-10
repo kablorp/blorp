@@ -191,6 +191,12 @@ Probed on 2026-11-09 against `390945503`, with scratch programs only.
      uses `.to_string()` calls and lambdas, unless the seed is shown to
      accept `.map_err(to_string)`, and can't write `"${error}"` until
      landing 6.
+   - **Budget correction (coordinator, 2026-11-09):** the production-line
+     ceiling went from +15 net to +26 net. Adding `Stringable` to the `_base`
+     import in `json.brp` and `process.brp` passes 100 columns, so the
+     formatter puts each name on its own line: 16 forced lines. The change is
+     +10 without them. Allocations measured +0.003% (ceiling +0.1%) and
+     instructions −0.02% (ceiling +0.2%).
 4. **The `io/` move,** as in decision 6, with every import migrated: the
    compiler, the tests and the docs. `process.brp` becomes `io/process.brp`.
    It needs landing 1.
