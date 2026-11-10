@@ -49,7 +49,8 @@ done.
     [`JSON results`](../benchmarks/results/blorp-json-foundation-2026-11-08.md).
     Loader source overrides pass focused tests, matched costs, full
     instruction-enabled tests, fixpoint and independent reviews.
-    [`Snapshot results`](../benchmarks/results/blorp-source-snapshots-2026-11-09.md).
+    [`Snapshot results`](../benchmarks/results/blorp-source-snapshots-2026-11-09.md);
+    approved as built, [`SOURCE_SNAPSHOTS_DECISIONS.md`](SOURCE_SNAPSHOTS_DECISIONS.md).
   - **Next:** expose module analysis without a required executable entrypoint. Neither editor state nor
     transport belongs in the compiler pipeline.
 - **Filesystem:** [`FILESYSTEM_DECISIONS.md`](FILESYSTEM_DECISIONS.md).
