@@ -1,5 +1,8 @@
 # Filesystem decisions
 
+`fs`, `io` and `system` are now `io/fs`, `io/error` and `io/environment`
+(MODULES_AND_STRINGABLE_PLAN.md, landing 4); names below are as written then.
+
 This file records the decisions behind the `fs` library and the lent-resource
 design that would follow it, so they outlive the plan they were made in. The
 contract of each operation lives in the

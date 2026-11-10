@@ -23,15 +23,14 @@ done.
     - L4, `String.byte_at` returns `Option[UInt8]`.
 - **Nested modules, `Stringable`, `io/` and the prelude:**
   [`MODULES_AND_STRINGABLE_PLAN.md`](MODULES_AND_STRINGABLE_PLAN.md).
-  - **Status:** decided 2026-11-09 and probed; nothing is implemented.
-  - **Next:** landing 1, nested library modules: the embedded-library
-    generator recurses into folders, and the loader rejects `io.brp` beside
-    `io/`.
-  - **O1 decided:** a user's own `print` is an error (landing 5).
-  - **Afterwards:** `Stringable` and interpolation, errors as `Stringable`
-    (landing 3 deleted `describe`, `process`'s included), the `io/` move (`process`
-    becomes `io/process`), `print` in the prelude, a seed rotation that also
-    carries the process natives, then `Path`.
+  - **Status:** landings 1 to 5 are on main: nested library modules,
+    `Stringable` interpolation, library errors as `Stringable` (`describe`
+    deleted), `print` and `print_error` in the prelude (run before the move),
+    and the `io/` layout (`io/console`, `io/error`, `io/fs`, `io/process`,
+    `io/environment`, `io/_codes`).
+  - **Next:** landing 6, a seed rotation that also switches the seed family and
+    its command line, and carries the process natives. Then seed-built code can
+    write `"${error}"`.
   - **`Path`:** decisions P1 to P12 are proposed in
     [`PATH_DECISIONS.md`](PATH_DECISIONS.md) and await Keith.
 - **Process API:** [`PROCESS_DECISIONS.md`](PROCESS_DECISIONS.md).
