@@ -1,6 +1,8 @@
 # Nested modules, `Stringable`, `io/` and the prelude
 
-Plan revision 2, 2026-11-09. Keith decided every point in "Decisions" below in
+Plan revision 2, 2026-11-09. **Status, 2026-11-10:** landings 1 to 6 and the
+interpolation clean-up are on main; landing 7, `Path`, waits on
+`PATH_DECISIONS.md`. Keith decided every point in "Decisions" below in
 discussion on 2026-11-09. "Probe results" answers the technical questions the
 decisions left open.
 

@@ -30,8 +30,9 @@ done.
     and the `io/` layout (`io/console`, `io/error`, `io/fs`, `io/process`,
     `io/environment`, `io/_codes`).
   - **Landing 6:** the seed rotation is done: pin `blorp-seed-10c8053d2399`,
-    family `blorp`, and the `compile` command line.
-  - **Next:** the `"${error}"` clean-up in seed-built code, then `Path`.
+    family `blorp`, and the `compile` command line. Seed-built code now
+    interpolates values directly (`68df72215`).
+  - **Next:** `Path` (landing 7), once Keith decides P1 to P12.
   - **`Path`:** decisions P1 to P12 are proposed in
     [`PATH_DECISIONS.md`](PATH_DECISIONS.md) and await Keith.
 - **Process API:** [`PROCESS_DECISIONS.md`](PROCESS_DECISIONS.md).
@@ -89,6 +90,13 @@ None of these is planned yet. Each wants its own short design or brief.
   - `slice(start, end)`;
   - `starts_with` and `index_of` for `T: Equatable`;
   - lexicographic `Orderable` for `List[T: Orderable]`.
+- **Tooling found broken or quiet while landing work:**
+  - `scripts/attribution/patch_emit_markers.py` anchors on tab-indented text,
+    but `emit.brp` is indented with spaces, so `scripts/attribution/run
+    --stage markers` fails at its first anchor. The `copies` and `rc`
+    patchers after it are unverified. Repair the anchors or retire the stages.
+  - `scripts/blorp-compiler-bootstrap` prints nothing when it downloads or
+    reuses a cached seed, so a build log cannot show which seed it used.
 - **Compiler costs found while landing work:**
   - **A named lambda costs one allocation per call.** Binding a lambda to a
     local before passing it costs an allocation that an inline lambda does
