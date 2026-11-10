@@ -48,16 +48,26 @@ done.
   - **Next:** L2, migrating the 17 `run_to_files` call sites and deleting it,
     after `PATH_PLAN.md`'s landing 6 changes the process errors.
   - **Later:** binary capture after `Bytes`, and `run` with streaming.
+- **Source layout by command:** [`SOURCE_LAYOUT_PLAN.md`](SOURCE_LAYOUT_PLAN.md).
+  - **Status:** Keith directed on 2026-11-10 that `src/` be organized by
+    command, with shared code under `common/`, and approved the plan's four
+    choices the same day.
+  - **Next:** step 1, the directory move, at a quiet point agreed with the
+    Bytes session. It comes before any other material change to `src/`.
 - **Language server (`blorp lsp`):** [`LSP_PLAN.md`](LSP_PLAN.md).
-  - **Status:** the plan was written on 2026-11-10 and awaits Keith's review,
-    including three open choices: the first editor, the console API and
-    when occurrences are recorded. Its foundations have landed: the `json`
-    codec
+  - **Status:** the plan was written on 2026-11-10 and awaits Keith's review.
+    Four choices are open: the first editor, the console API, when
+    occurrences are recorded, and serving broken files. Its foundations have
+    landed: the `json` codec
     ([results](../benchmarks/results/blorp-json-foundation-2026-11-08.md))
     and loader source snapshots
     ([results](../benchmarks/results/blorp-source-snapshots-2026-11-09.md),
     [`SOURCE_SNAPSHOTS_DECISIONS.md`](SOURCE_SNAPSHOTS_DECISIONS.md)).
-  - **Next:** the plan's landing 1, analysis without an entry point.
+  - **Revision still to make:** key name uses by the compiler's existing
+    identities rather than by copied definition spans, and record which
+    files each analysis read.
+  - **Next:** after the source layout lands, the plan's landing 1, analysis
+    without an entry point.
 - **String code points:** [`STRING_PLAN.md`](STRING_PLAN.md).
   - **Status:** approved on 2026-11-10: `length` counts code points, from a
     count stored in each String, and byte work uses `byte_*` functions. S0
