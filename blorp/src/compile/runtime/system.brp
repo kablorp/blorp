@@ -2,6 +2,7 @@ import:
     ../../syntax/syntax:
         SystemOperation(
             GetCurrentDirectory,
+            CurrentDirectory,
             RunToFiles,
             ProcessCapture,
             ProcessFindProgram,
@@ -112,12 +113,56 @@ SYSTEM_CURRENT_DIRECTORY_RUNTIME: String =
         |
 
 
+-- The same query as above (PATH_PLAN.md landing 6 deletes that one), failing with an Int
+-- code of the shared fs protocol (fs.brp), which io/_codes.brp decodes. A path
+-- the OS names but that is empty or not absolute (Linux's "(unreachable)/...")
+-- is Unreachable; a path longer than any String is OtherOs(EOVERFLOW).
+SYSTEM_CURRENT_DIRECTORY_CODE_RUNTIME: String =
+    raw
+        |enum {BLORP_CURRENT_DIRECTORY_CODE_INITIAL_CAPACITY=256};
+        |/* The limit is a parameter so that a test can reach it without a huge allocation. */
+        |static uint8_t blorp_system_current_directory_within(struct blorp_string **directory,int64_t *error,size_t maximum_capacity){
+        |size_t capacity=BLORP_CURRENT_DIRECTORY_CODE_INITIAL_CAPACITY;
+        |char *buffer=blorp_memory_allocate(capacity);
+        |if(buffer==NULL){abort();}
+        |for(;;){
+        |errno=0;
+        |if(getcwd(buffer,capacity)!=NULL){
+        |const size_t length=strlen(buffer);
+        |const int usable=length>0&&buffer[0]=='/';
+        |const int valid=usable&&blorp_utf8_is_valid(buffer,length);
+        |if(valid){*directory=blorp_string_from_bytes(buffer,(int64_t)length);}
+        |blorp_memory_release(buffer);
+        |if(valid){return BLORP_FS_SUCCEEDED;}
+        |*error=usable?BLORP_FS_INVALID_UTF8:BLORP_FS_UNREACHABLE;
+        |return BLORP_FS_FAILED;
+        |}
+        |const int saved_errno=errno;
+        |if(saved_errno!=ERANGE||capacity==maximum_capacity){
+        |blorp_memory_release(buffer);
+        |*error=saved_errno==ERANGE?blorp_fs_other_os_code(EOVERFLOW):blorp_fs_errno_code(saved_errno);
+        |return BLORP_FS_FAILED;
+        |}
+        |const size_t grown_capacity=capacity>maximum_capacity/2?maximum_capacity:capacity*2;
+        |char *grown=blorp_memory_resize(buffer,grown_capacity);
+        |if(grown==NULL){abort();}
+        |buffer=grown;
+        |capacity=grown_capacity;
+        |}
+        |}
+        |uint8_t blorp_system_current_directory(struct blorp_string **directory,int64_t *error){
+        |return blorp_system_current_directory_within(directory,error,blorp_string_maximum_capacity()+1);
+        |}
+        |
+
+
 -- The C symbol each system operation calls. Its fragment defines it with the
 -- emitter's one shape: borrowed arguments, then one out-parameter per non-Void
 -- Result payload, success first, returning whether the call succeeded.
 pure func system_symbol(operation: SystemOperation) -> String:
     match operation:
         GetCurrentDirectory: "blorp_get_current_directory"
+        CurrentDirectory: "blorp_system_current_directory"
         RunToFiles: "blorp_process_run_to_files"
         ProcessCapture: "blorp_process_capture"
         ProcessFindProgram: "blorp_process_find_program"
@@ -161,6 +206,14 @@ pure func system_runtime(operation: SystemOperation, string_list_type: String) -
                 posix_declarations = False,
                 failure_helpers = True,
                 fs_helpers = False,
+                process_helpers = False,
+            }
+        CurrentDirectory:
+            {
+                fragment = SYSTEM_CURRENT_DIRECTORY_CODE_RUNTIME,
+                posix_declarations = True,
+                failure_helpers = False,
+                fs_helpers = True,
                 process_helpers = False,
             }
         RunToFiles:
