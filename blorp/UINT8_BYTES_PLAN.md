@@ -347,21 +347,10 @@ keeps what a later landing needs. What it found:
 
    Tests use fixtures with their own `_base`, so nothing the seed parses uses
    `UInt8` yet.
-4. **L2, seed rotation** onto L1. It is the first rotation since both the
-   rename to Blorp (`d49241001`) and the `blorp` command, so in the same change
-   as the pin it must also switch:
-   - the pin, in `blorp/bootstrap.env`, to a `blorp-seed-*` release, with its
-     three digests;
-   - `seed_release_family` in `scripts/blorp-compiler-bootstrap`, from
-     `blorp2` to `blorp`;
-   - the `family=` line in `blorp/test/tooling/test_bootstrap.sh`;
-   - the seed's old command line (`--library-root DIR INPUT OUTPUT`), which
-     moves to `compile INPUT --library-root DIR -o OUTPUT` in
-     `generate-compiler` and the generator target in `blorp/Makefile`, the seed
-     step of `blorp-seed.yml`, and the fake seed's two argument lists in
-     `test_bootstrap.sh`.
-
-   `scripts/README.md` lists these.
+4. **L2, seed rotation** onto L1: a plain rotation (`scripts/README.md`,
+   "Rotating the seed pin"). The seed family switch to `blorp` and the move to
+   the `compile INPUT --library-root DIR -o OUTPUT` command line landed with
+   the modules plan's landing 6, so L2 changes only the pin.
 5. **L3, the library.** This landing adds:
    - `type UInt8 = builtin` in `_base`, which makes the role mandatory, and
      the prelude exports;

@@ -17,20 +17,21 @@ done.
   - **Next:** L1, adding UInt8 with deferred integer literals.
   - **Afterwards:**
     - L1, the compiler learns `UInt8`, with deferred integer literals;
-    - L2, a seed rotation, which also switches the seed family;
+    - L2, a plain seed rotation onto L1 (the family and command-line switch landed
+      with the modules plan's landing 6);
     - L3, the library: `_base`, `uint8.brp`, `bytes.brp`, and
       `fs.read_bytes`/`write_bytes`;
     - L4, `String.byte_at` returns `Option[UInt8]`.
 - **Nested modules, `Stringable`, `io/` and the prelude:**
   [`MODULES_AND_STRINGABLE_PLAN.md`](MODULES_AND_STRINGABLE_PLAN.md).
-  - **Status:** landings 1 to 5 are on main: nested library modules,
+  - **Status:** landings 1 to 6 are done: nested library modules,
     `Stringable` interpolation, library errors as `Stringable` (`describe`
     deleted), `print` and `print_error` in the prelude (run before the move),
     and the `io/` layout (`io/console`, `io/error`, `io/fs`, `io/process`,
     `io/environment`, `io/_codes`).
-  - **Next:** landing 6, a seed rotation that also switches the seed family and
-    its command line, and carries the process natives. Then seed-built code can
-    write `"${error}"`.
+  - **Landing 6:** the seed rotation is done: pin `blorp-seed-10c8053d2399`,
+    family `blorp`, and the `compile` command line.
+  - **Next:** the `"${error}"` clean-up in seed-built code, then `Path`.
   - **`Path`:** decisions P1 to P12 are proposed in
     [`PATH_DECISIONS.md`](PATH_DECISIONS.md) and await Keith.
 - **Process API:** [`PROCESS_DECISIONS.md`](PROCESS_DECISIONS.md).

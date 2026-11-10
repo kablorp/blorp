@@ -46,8 +46,8 @@ compiler: generate-compiler
 $(EMBED_LIBRARY): scripts/embed_library.brp src/utils/text.brp bootstrap.env
 	@echo 'Build blorp/$(EMBED_LIBRARY)'
 	@cd .. && mkdir -p "$$(dirname "blorp/$(EMBED_LIBRARY)")" \
-		&& scripts/blorp-compiler-bootstrap --library-root blorp/standard_library \
-			blorp/scripts/embed_library.brp "blorp/$(EMBED_LIBRARY).c" \
+		&& scripts/blorp-compiler-bootstrap compile blorp/scripts/embed_library.brp \
+			--library-root blorp/standard_library -o "blorp/$(EMBED_LIBRARY).c" \
 		&& "$(BLORP_CC)" -O1 "blorp/$(EMBED_LIBRARY).c" -o "blorp/$(EMBED_LIBRARY)" $(TEST_COMPILER_LIBRARIES)
 
 # Every folder under the library is a prerequisite so that a deleted or renamed
@@ -60,8 +60,8 @@ $(EMBEDDED_LIBRARY): $(EMBED_LIBRARY) $(shell find standard_library \( -type d -
 generate-compiler: $(EMBEDDED_LIBRARY)
 	@echo 'Generate $(BLORP_COMPILER_C)'
 	@cd .. && mkdir -p "$$(dirname "$(BLORP_COMPILER_C)")" \
-		&& scripts/blorp-compiler-bootstrap --library-root blorp/standard_library \
-			blorp/src/main.brp "$(BLORP_COMPILER_C)"
+		&& scripts/blorp-compiler-bootstrap compile blorp/src/main.brp \
+			--library-root blorp/standard_library -o "$(BLORP_COMPILER_C)"
 
 link-compiler:
 	@echo 'Link $(BLORP_COMPILER)'
