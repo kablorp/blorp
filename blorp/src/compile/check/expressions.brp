@@ -143,7 +143,7 @@ import:
         ConstructorError(ConstructorNeedsExpectedType),
         RecordError(RecordNeedsExpectedType, FieldRequiresRecord),
         ValueError(
-            InterpolationRequiresString,
+            InterpolationRequiresStringable,
             TupleIndexRequiresTuple,
             TupleIndexMustBeLiteral,
             TupleIndexOutOfRange,
@@ -207,7 +207,6 @@ import:
         PendingOperation(AcceptedTupleElement, AcceptedField, PendingInvocation),
         InferenceType(AcceptedType, CallVariable, InferredTuple, InferredCallable),
         ConstraintOrigin(
-            InterpolationConstraint,
             LambdaConstraint,
             ArgumentConstraint,
             RecordFieldConstraint,
@@ -321,7 +320,7 @@ import:
             ConstantTarget,
         ),
         callable_parameter,
-        CallTarget(RuntimeFunction),
+        CallTarget(RuntimeFunction, TraitMethod),
         TypeRef(
             ParameterType,
             CallableType,
@@ -2376,16 +2375,7 @@ private pure func elaborate_value(
                                                         Some(part):
                                                             work = work.push_at(
                                                                 work_count,
-                                                                Some(
-                                                                    EnterExpression(
-                                                                        part,
-                                                                        Some(
-                                                                            AcceptedType(
-                                                                                StringType,
-                                                                            ),
-                                                                        ),
-                                                                    ),
-                                                                ),
+                                                                Some(EnterExpression(part, None)),
                                                             )
                                                             work_count = work_count + 1
                                             PlannedTuple(elements, hints):
@@ -2496,16 +2486,6 @@ private pure func elaborate_value(
                                 }
                                 operands = operands.push_at(operand_count, Some(value))
                                 operand_count = operand_count + 1
-                                for part in parts:
-                                    equality: InferenceEquality = {
-                                        expected = AcceptedType(StringType),
-                                        actual = part.pending_type(),
-                                        origin = InterpolationConstraint(part.span),
-                                        relation = RequireEquality,
-                                        parameter = None,
-                                    }
-                                    work = work.push_at(work_count, Some(SolveConstraint(equality)))
-                                    work_count = work_count + 1
                     FinishTuple(range, base_span, span):
                         match operands.call_operands(range, span):
                             Err(error):
@@ -3224,8 +3204,6 @@ private pure func elaborate_value(
                             ArgumentConstraint(_, _, _, _):
                                 void
                             OpaqueOperandConstraint(_, _):
-                                void
-                            InterpolationConstraint(_):
                                 void
                             VariantConstraint(_, _):
                                 void
@@ -4078,14 +4056,47 @@ private pure func freeze_interpolated(
                 if value.value_type == StringType:
                     checked = checked.append(value)
                 else:
-                    failure = Some(
-                        value_error(part.span, InterpolationRequiresString(value.value_type)),
-                    )
-                    break
+                    match value.hole_to_string(part.span, assumptions, traits):
+                        Ok(text):
+                            checked = checked.append(text)
+                        Err(error):
+                            failure = Some(error)
+                            break
     _: Void ?= match failure:
         Some(error): Err(error)
         None: Ok(void)
     checked.concat_checked_parts(0, checked.length(), span)
+
+
+-- A hole is entered with no expected type. Once frozen, a String hole is its
+-- own text; any other calls the prelude-selected Stringable's member, which
+-- needs an implementation for a concrete type and a bound for a parameter. A
+-- concrete type is checked here first so that its error names the hole, not a
+-- trait method call.
+private pure func hole_to_string(
+    value: CheckedExpr,
+    span: Span,
+    assumptions: List[Checked.TraitRequirement],
+    traits: TraitAvailability,
+) -> Result[CheckedExpr, CheckError]:
+    accepted = traits.accepted_traits()
+    stringable ?= accepted.canonical.stringable.selected_contract(Errors.StringableFamily, span)
+    member = stringable.canonical_operation_member()
+    implemented: Result[Void, CheckError] = match value.value_type:
+        ParameterType(_):
+            Ok(void)
+        _:
+            match Checked.method_body(accepted, Checked.accepted_method(member, value.value_type)):
+                Some(_): Ok(void)
+                None: Err(value_error(span, InterpolationRequiresStringable(value.value_type)))
+    _: Void ?= implemented
+    method ?= traits.accept_method_call(member, value.value_type, assumptions, span)
+    call: CheckedCall = {
+        target = TraitMethod(method),
+        operands = [ValueOperand(value)],
+        span = span,
+    }
+    Ok({ form = InvokeFunction(call), value_type = StringType, span = span })
 
 
 -- A direct call and the value it forms: one link of a left-nested chain of

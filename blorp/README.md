@@ -283,7 +283,7 @@ rejected. Embedded NUL bytes count toward length and are preserved.
 import:
     io: print
 pure func describe(name: String, count: Int) -> String:
-    "${name}: ${count.to_string()}"
+    "${name}: ${count}"
 func main() -> Int:
     print(describe("apples", 3) + "!")
     text =
@@ -294,9 +294,11 @@ func main() -> Int:
 ```
 
 This prints `apples: 3!`, `first line` and `pipes and | bars`. A
-`${expression}` hole holds one expression on one line and must be a `String`;
-convert `Int` and `Float` with `to_string` ("interpolation hole has type Int;
-expected String"). Holes run once, in written order, and cannot contain
+`${expression}` hole holds one expression on one line, of any type that
+implements [`Stringable`](#operators): the hole calls its `to_string`, except
+that a String hole is used as it is. Any other type is an error
+("interpolation hole has type Point, which does not implement Stringable").
+Holes run once, in written order, and cannot contain
 another interpolated String. Write `$\{` for a literal `${`. `+` concatenates
 two Strings; joining a String to another type with `+` is a type error whose
 help suggests interpolation.
@@ -769,7 +771,8 @@ A method name names a family across receivers: importing `int: equals` makes
 traits that declare the same method name are different families and need an
 alias to be used together. A method can be a function value when the expected
 callable type determines `Self`: with `int: hash` imported,
-`callback: pure (Int) -> Int = hash` is Int's `hash`.
+`callback: pure (Int) -> Int = hash` is Int's `hash`, and with `int: to_string`
+imported, `ratios.map(to_string)` converts a List of Float.
 
 A generic receiver takes fresh parameters, as in
 `implements Describe for Box[Element: Describe]`; partial, concrete or nested
@@ -814,6 +817,7 @@ trait or function with the same spelling cannot redirect it.
 | `a + b`, `a - b` | `Addable.add`, `Subtractable.subtract` |
 | `a * b`, `a / b`, `a % b` | `Multipliable.multiply`, `Divisible.divide`, `Modulable.remainder` |
 | `-a` | `Negatable.negate` |
+| `"${a}"` | `Stringable.to_string`, except for a String |
 
 Both operands have the same type `Self` and are evaluated once, left then
 right; an arithmetic result is `Self`. No operator is rewritten into another:
@@ -821,6 +825,10 @@ right; an arithmetic result is `Self`. No operator is rewritten into another:
 `a + -b`. Int and Float implement all of these traits, String implements
 `Equatable` and `Addable`, and List implements `Equatable`. A type without an
 implementation reports, for example, "receiver does not implement Orderable".
+`Stringable` means only that a value can be converted to a String, with no
+rule about human or program text. Int, Float, String and Bool implement it,
+and nothing derives it, so a record is interpolated once its author writes
+the implementation.
 `Orderable` requires `less_than` and defaults the other three; it is never
 derived and does not provide `==`. A Bool result does not decide an operand's
 type, so `[] == []` needs a typed binding.
@@ -889,8 +897,8 @@ loaded once. Every loaded module is checked, including unused declarations.
 
 The [prelude](standard_library/prelude.brp) is the only implicit import. User
 modules receive its selections: the base types, `Bool`, `Option` and `Result`
-with their constructors, the operator traits, `Equatable`, `Hashable`, `Dict`,
-and the methods of Int, Float, String and List, so
+with their constructors, the operator traits, `Equatable`, `Hashable`,
+`Stringable`, `Dict`, and the methods of Int, Float, String and List, so
 `(42 + 1).to_string().length()` needs no import. Direct calls need named
 imports, and I/O is always explicit. Library modules receive nothing
 implicitly and cannot import user modules. Any module may import the
@@ -1026,8 +1034,8 @@ absent object names from null. Parse errors report UTF-8 byte offsets.
 The library is ordinary Blorp under [`standard_library/`](standard_library/).
 `_base.brp` declares the builtin types `Int`, `Float`, `String`, `Void` and
 `List`, the unions `Bool`, `Option`, `Result` and `MathError`, and the
-`Equatable`, `Orderable`, `Hashable` and arithmetic traits; only it may declare
-builtin types. `prelude.brp` is the implicit import, and the operation modules
+`Equatable`, `Orderable`, `Hashable`, `Stringable` and arithmetic traits; only
+it may declare builtin types. `prelude.brp` is the implicit import, and the operation modules
 implement the traits and provide functions, some with `builtin("label")` bodies
 that name a compiler-known operation. The
 [standard library README](standard_library/README.md) owns every contract.

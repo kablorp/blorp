@@ -1,0 +1,216 @@
+import:
+    bool: and
+    list: List methods
+    option: Option methods
+    string: String methods
+    test: TestSuite
+    ../../../../src/compile/assemble: ParsedProgram, parsed_contents
+    ../../../../src/compile/check/check: check, checked_functions
+    ../../../../src/compile/check/model as Model
+    ../../../../src/compile/check/render: render_failure
+    ../../../../src/compile/ids:
+        TraitMethodId,
+        inventory_traits,
+        trait_method_header,
+        trait_method_number,
+        trait_method_owner,
+        trait_number,
+    ../../../../src/compile/load/load: LibrarySource(LibraryDirectory), load_program
+    ../../../../src/compile/namespace/builtins: IntegerFormat(Int64Format)
+    ../../../../src/syntax/names: name_spelling
+    ../../../../src/syntax/source: module_source, root_module_id
+
+
+-- These fixtures check against the configured library, so holes reach
+-- Stringable as _base declares it and int, float, bool and string implement it.
+private FIXTURES: String = "blorp/test/unit/test_compile/test_check/fixtures/stringable/"
+private LIBRARY_ROOT: String = "blorp/standard_library"
+
+
+private record CheckedFixture {
+    parsed: ParsedProgram,
+    functions: List[Model.CheckedFunction],
+}
+
+
+private func checked_fixture(name: String) -> Option[CheckedFixture]:
+    match load_program(FIXTURES + name + ".brp", LibraryDirectory(LIBRARY_ROOT)):
+        Err(_):
+            None
+        Ok(loaded):
+            match check(loaded.program):
+                Err(_):
+                    None
+                Ok(checked):
+                    Some({
+                        parsed = loaded.program,
+                        functions = checked_functions(checked).functions,
+                    })
+
+
+private pure func member_spelling(parsed: ParsedProgram, method: TraitMethodId) -> Option[String]:
+    contents = parsed_contents(parsed)
+    match inventory_traits(contents.declarations).get(trait_number(trait_method_owner(method))):
+        None:
+            None
+        Some(row):
+            match row.methods.get(trait_method_number(method)):
+                None:
+                    None
+                Some(written):
+                    match trait_method_header(written, contents.declarations):
+                        None: None
+                        Some(header): name_spelling(contents.names, header.function_name.id)
+
+
+-- The receivers of the first function's trait-method calls, in visiting
+-- order; a call to a member other than `to_string` appears as None.
+private pure func to_string_receivers(fixture: CheckedFixture) -> List[Option[Model.TypeRef]]:
+    var receivers: List[Option[Model.TypeRef]] = []
+    match fixture.functions.get(0):
+        None:
+            receivers = [None]
+        Some(function):
+            for call in Model.function_calls(function):
+                match call.target:
+                    Model.TraitMethod(accepted):
+                        spelling = member_spelling(fixture.parsed, Model.method_identity(accepted))
+                        if spelling == Some("to_string"):
+                            receivers = receivers.append(Some(Model.method_receiver(accepted)))
+                        else:
+                            receivers = receivers.append(None)
+                    _:
+                        void
+    receivers
+
+
+-- The single diagnostic, in the fixture itself, compared exactly.
+private func rejects(name: String, start: Int, end: Int, message: String, help: String) -> Bool:
+    match load_program(FIXTURES + name + ".brp", LibraryDirectory(LIBRARY_ROOT)):
+        Err(_):
+            False
+        Ok(loaded):
+            match check(loaded.program):
+                Ok(_):
+                    False
+                Err(failure):
+                    diagnostics = render_failure(failure)
+                    first = diagnostics.first
+                    (first.span.source == module_source(root_module_id()))
+                        .and(first.span.start == start)
+                        .and(first.span.end == end)
+                        .and(first.message == message)
+                        .and(first.help == help)
+                        .and(first.note.is_none())
+                        .and(diagnostics.remaining.is_empty())
+
+
+-- An Int, a Float, a Bool binding and an Int literal each call `to_string`
+-- on their own type, in written order.
+func test_holes_call_to_string_on_their_type() -> Bool:
+    match checked_fixture("holes"):
+        None:
+            False
+        Some(fixture):
+            match fixture.to_string_receivers():
+                [Some(Model.IntegerType(Int64Format)), Some(Model.FloatType), Some(Model.NominalType(_, [])), Some(Model.IntegerType(Int64Format))]:
+                    True
+                _:
+                    False
+
+
+-- A hole whose solved type is String is its own value: freezing calls no
+-- member, even when only a call's arguments solve the type.
+func test_string_holes_call_no_member() -> Bool:
+    match checked_fixture("string_holes"):
+        None:
+            False
+        Some(fixture):
+            fixture
+                .to_string_receivers()
+                .is_empty()
+
+
+func test_a_bounded_parameter_hole_calls_to_string() -> Bool:
+    match checked_fixture("bounded"):
+        None:
+            False
+        Some(fixture):
+            match fixture.to_string_receivers():
+                [Some(Model.ParameterType(_))]: True
+                _: False
+
+
+func test_a_hole_without_an_implementation_names_the_trait() -> Bool:
+    rejects(
+        "point",
+        90,
+        95,
+        "interpolation hole has type Point, which does not implement Stringable",
+        "implement Stringable for Point, or interpolate a value that implements it",
+    )
+
+
+-- A type parameter's missing bound is the ordinary bound error, as for `+`.
+func test_an_unbounded_parameter_hole_needs_the_bound() -> Bool:
+    rejects(
+        "unbounded",
+        55,
+        60,
+        "type does not satisfy the required trait bound",
+        "add the required trait to this function's type parameter bounds, or provide an implementation for the concrete receiver",
+    )
+
+
+-- A hole gives its expression no expected type, so a bare constructor gets
+-- the constructor rule's error, as `True.to_string()` does.
+func test_a_constructor_hole_needs_an_expected_type() -> Bool:
+    rejects(
+        "constructor",
+        37,
+        41,
+        "constructor needs an expected union type",
+        "pass an already-typed union value or call a concrete helper returning the union",
+    )
+
+
+-- With no String expected, an empty List in a hole has no element type, and
+-- gets the empty-literal error rather than the Stringable one.
+func test_an_empty_list_hole_needs_an_element_type() -> Bool:
+    rejects(
+        "empty_list",
+        37,
+        39,
+        "cannot infer the element type of an empty list literal",
+        "give it a context with a List type, such as a List parameter, return type or append argument",
+    )
+
+
+-- Named as a value, `to_string` is the trait's member: importing it from int
+-- reaches Float's implementation as well.
+func test_to_string_as_a_value_is_the_member() -> Bool:
+    checked_fixture("values").is_some()
+
+
+tests: TestSuite = {
+    description = "interpolation through Stringable",
+    tests = [
+        ("holes call to_string on their type", test_holes_call_to_string_on_their_type),
+        ("String holes call no member", test_string_holes_call_no_member),
+        ("a bounded parameter hole calls to_string", test_a_bounded_parameter_hole_calls_to_string),
+        (
+            "a hole without an implementation names the trait",
+            test_a_hole_without_an_implementation_names_the_trait,
+        ),
+        (
+            "an unbounded parameter hole needs the bound",
+            test_an_unbounded_parameter_hole_needs_the_bound,
+        ),
+        (
+            "a constructor hole needs an expected type",
+            test_a_constructor_hole_needs_an_expected_type,
+        ),
+        ("an empty list hole needs an element type", test_an_empty_list_hole_needs_an_element_type),
+        ("to_string as a value is the member", test_to_string_as_a_value_is_the_member),
+    ],
+}
