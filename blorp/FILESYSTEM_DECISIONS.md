@@ -42,6 +42,8 @@ has risen by about 0.18%.
 - **R2, 2026-11-02.** A helper may borrow a resource, provided every rejection
   and limitation has a clear explanation.
 - **R3.** IO stays an explicit import, and the prelude does not change.
+  Amended 2026-11-09: `print` and `print_error` are in the prelude
+  (MODULES_AND_STRINGABLE_PLAN.md decision 7).
 - **R4, from the roadmap.** Paths stay `String`. Errors carry fixed text, never `strerror` text.
   A NUL in a path is rejected before the system call.
 
