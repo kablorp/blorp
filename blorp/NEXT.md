@@ -45,7 +45,8 @@ done.
     L1 is implemented: the `process.capture`, `process.find_program` and
     `process.fault` natives, the C core and `process.brp`. A reply the C side
     never builds aborts through `process.fault`.
-  - **Next:** L2, migrating the 17 `run_to_files` call sites and deleting it.
+  - **Next:** L2, migrating the 17 `run_to_files` call sites and deleting it,
+    after `PATH_PLAN.md`'s landing 6 changes the process errors.
   - **Later:** binary capture after `Bytes`, and `run` with streaming.
 - **LSP foundations:**
   - **Status:** the pure `json` codec is implemented and independently

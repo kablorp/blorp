@@ -6,7 +6,7 @@ to P12 of the earlier `PATH_DECISIONS.md` (full text, with its precedent
 survey and the alternatives each point weighed, at `4b5b7fe65`) with the
 changes recorded under "Decisions". Revision 1 (`541f55f9d`) let unions in
 one module share variant names; Keith rejected that, and the choices it left
-open are decided below. This plan is landing 7 of
+open are decided below. This plan is the `Path` landing (item 7) of
 `MODULES_AND_STRINGABLE_PLAN.md`. When the landings are done it amends
 `FILESYSTEM_DECISIONS.md` R3, R4, D8, D13 and D14, `PROCESS_DECISIONS.md`'s
 error types, and decision 8 of `MODULES_AND_STRINGABLE_PLAN.md`. Keep it
@@ -335,7 +335,7 @@ reachable only on 32-bit systems is left out.
   `remove_file` on a directory is ID on both, because the runtime already
   rewrites macOS's EPERM.
 - **`rename`'s ID** (EISDIR, a file renamed onto a directory) is missing from
-  `FILESYSTEM_DECISIONS.md` today; landing 6 documents it.
+  `FILESYSTEM_DECISIONS.md` today; landing 7 documents it.
 - **`io/fs.brp`** is deleted, and `io/error.brp` with it.
 
 **`io/environment`.** `get_current_directory` returns
@@ -445,10 +445,11 @@ unchanged; messages that print a process error add the program the same way.
    - Review: the brief goes through parser and ergonomics review before
      implementation; documenter review after.
 3. **`Path` in `path.brp`, beside the String functions.** P2 to P5, P10's
-   methods, `PathError` and unit tests. No compiler change. `join` and
-   `normalize` already name String functions in `path.brp`, and a module
-   cannot declare one name twice, so their `Path` forms arrive in landing 6,
-   which deletes the String ones.
+   methods except three, `PathError` and unit tests. No compiler change.
+   `join` and `normalize` already name String functions in `path.brp`, and a
+   module cannot declare one name twice, so their `Path` forms arrive in
+   landing 7, which deletes the String ones. `with_extension` waits for the
+   same landing and for the open question under "Audit".
    - Ceilings: production lines at most +130; self-compile allocations and
      instructions each at most +0.3%.
 4. **The current-directory native.** A new builtin returning a code, beside
@@ -457,18 +458,28 @@ unchanged; messages that print a process error add the program the same way.
 5. **Seed rotation** after landings 2 and 4, so seed-built code (`src/`,
    `scripts/`, the library the compiler embeds) may use qualified variants
    and the new native. Until then it uses neither.
-6. **Signatures move to `Path`, with exact errors.** The `io/fs/` modules,
-   `io/environment` and `io/process`. `io/fs.brp`, `io/error.brp`,
-   `IOErrorKind`, `default_if_not_found`, the old current-directory builtin,
-   the String functions in `path.brp`, `cli.file_name` and `module_stem` are
-   deleted. Every caller, both READMEs, `FILESYSTEM_DECISIONS.md` and
-   `PROCESS_DECISIONS.md` are updated. The rest of process L2
-   (`Command.program`, removing `run_to_files`) stays in the process plan.
-   - Ceilings, estimates: compiler production lines at most +40 net;
-     standard library at most +300 net, mostly the unions, their decoders and
+6. **Process and environment errors.** `io/environment` and `io/process`:
+   `CurrentDirectoryError` on the new builtin, the process unions,
+   `Command.directory: Option[Path]`, `find_program` returning `Path`, and
+   their callers and tests. The old current-directory builtin is deleted.
+   `PROCESS_DECISIONS.md` and both READMEs' process and environment sections
+   are updated. The rest of process L2 (`Command.program`, removing
+   `run_to_files`) stays in the process plan.
+   - Ceilings, estimates: compiler production lines at most +10 net;
+     standard library at most +80 net. Self-compile allocations and
+     instructions each at most +0.2%.
+7. **Files.** The `io/fs/` modules with `Path` signatures and exact errors;
+   `join`, `normalize` and `with_extension` on `Path`, in the form the open
+   question under "Audit" settles. `io/fs.brp`, `io/error.brp`,
+   `IOErrorKind`, `default_if_not_found`, the String functions in `path.brp`,
+   `cli.file_name` and `module_stem` are deleted. Every caller, both READMEs'
+   file sections and `FILESYSTEM_DECISIONS.md` are updated.
+   - Ceilings, estimates: compiler production lines at most +30 net;
+     standard library at most +220 net, mostly the unions, their decoders and
      their text. Self-compile allocations and instructions each at most
-     +0.5%. Test growth reported separately.
-7. **The prelude.** `Path` and `to_path`. The prelude loads all of
+     +0.3%. Test growth reported separately. With landing 6, these keep the
+     single landing's budget (+40, +300, +0.5%).
+8. **The prelude.** `Path` and `to_path`. The prelude loads all of
    `path.brp`, and every loaded module is checked in full; today's
    `path.brp`, with similar functions, cost +13,222 allocations and +10.7%
    instructions to compile an empty program (measured at about `ce8753b6f`,
@@ -479,7 +490,62 @@ unchanged; messages that print a process error add the program the same way.
    recorded.
 
 Landings 1, 3 and 4 are independent. Landing 2 needs 1; landing 5 needs 2 and
-4; landing 6 needs 3 and 5; landing 7 needs 6.
+4; landing 6 needs 3 and 5; landing 7 needs 6; landing 8 needs 7.
+
+## Audit, 2026-11-10
+
+A re-audit of the plan against the code, the other plans and the work in
+flight found the following.
+
+**Open, for Keith:**
+
+- **`join` and `with_extension` can make an invalid `Path`.** Their String
+  argument can hold a NUL byte, and `with_extension`'s can hold a `/`, so a
+  total function would produce a `Path` that P2 says cannot exist. Options:
+  - (a) Fallible: `join(Path, String) -> Result[Path, PathError]`, and the
+    same for `with_extension`, whose error also refuses a `/`. Every join
+    with a literal is then matched or `?=`'d.
+  - (b) Validated arguments: `join(Path, Path)`, so the child goes through
+    `to_path` first; `with_extension` still needs (a).
+  - *Recommended: (a).* One error type, and the cost lands only where a
+    String becomes part of a path. Joining a directory entry's name, which
+    the system never gives with a NUL, is fallible too under either option.
+
+**Decided by the coordinator, from the decisions above** (Keith may
+overturn any; the `fault` handling and the exit status change behaviour):
+
+- **Paths the system gives the library** (the working directory, a found
+  program, a temporary directory) never hold NUL and are never empty, but
+  only `path.brp` can build a `Path` directly (`into_opaque` is private to the
+  defining module). The library builds them with `to_path`, and an `Err`
+  there is a disagreement between runtime and library, handled with
+  `io/process`'s existing `fault`, as a reply the C side never builds is
+  today.
+- **Landing 6 is split** into process and environment errors (6) and files
+  (7), so each is one change, within the single landing's budget; the
+  prelude becomes landing 8.
+- **Order with other plans.** Process L2 (the 17 `run_to_files` call sites)
+  follows landing 6, and `RUN_AND_TEST_PLAN.md`'s CLI landing, which also
+  uses files, follows landing 7, so their call sites are written once,
+  against the final errors and `Path`.
+- **Command-line paths.** In landing 7, a `blorp` path argument that is
+  empty is a usage error (exit 2, `CLI_PLAN.md` D6) with `PathError`'s text.
+  Arguments cannot hold NUL.
+- **Prelude names.** Landing 8 makes `Path` and `to_path` prelude names, so a
+  user type `Path` or function `to_path` is "provided by the prelude". None
+  exists in the repository today.
+- **Naming migration scope,** added to landing 1's brief:
+  `benchmarks/blorp/dict_ops.brp`, the examples in both READMEs,
+  `blorp/AGENTS.md`'s test-suite sentence and `docs/CODE_STYLE.md`'s naming
+  section. `benchmarks/legacy/` belongs to the pinned legacy compiler and
+  the deferred suites are not compiled, so neither changes.
+- **Landing order among 1, 3 and 4.** Whichever lands after landing 1
+  rebases onto it and conforms to the naming rules before it lands.
+
+**Checked and fine:** no local or remote branch other than these landings
+has unmerged work (checked 2026-11-10); `Hashable` (with `Equatable`) is all a `Dict` key needs; the
+embedded-library generator already emits `EMBEDDED_LIBRARY_PATHS`;
+`FILESYSTEM_DECISIONS.md` D40 (`String.lines()`) is pure and independent.
 
 ## Out of scope
 
@@ -496,8 +562,8 @@ which today give unrelated parse errors.
 - The line ceilings, which are estimates, and the prelude cost of the full
   `Path` module, which landing 3 measures.
 - The variant sets come from reading the runtime and the system calls'
-  manual pages; "race only" entries are judgement. Landing 6's tests cover
-  each deterministic variant per operation.
+  manual pages; "race only" entries are judgement. Landings 6 and 7's tests
+  cover each deterministic variant per operation.
 - `Err(ReadError.NotFound)` was probed with a module-qualified variant
   (`Err(read.NotFound)`), which nests today; the union-qualified form is
   landing 2's.
