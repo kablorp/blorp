@@ -71,8 +71,10 @@ for errors.
 Recorded from Keith, 2026-11-10. P1 to P12 are the earlier proposal's
 numbers; each is approved as drafted there unless amended here.
 
-- **P1, construction:** `"a/b".to_path()`. No `Path` literals: a String
-  literal never becomes a `Path`, because that would confuse readers.
+- **P1, construction:** `"a/b".to_path()` is the only way to make a `Path`
+  from a String; no other function takes a String and returns a `Path`. No
+  `Path` literals: a String literal never becomes a `Path`, because that
+  would confuse readers.
 - **P2, validation (amended):** `to_path(String) -> Result[Path, PathError]`.
   `PathError` is `Empty` or `ContainsNul`. Nothing else is checked: a String
   is always UTF-8, and length limits depend on the filesystem, so the system
@@ -81,8 +83,11 @@ numbers; each is approved as drafted there unless amended here.
   environment values cannot. A `Path` never holds NUL, so no operation that
   takes one reports it.
 - **P3:** no normalization at construction; `normalize()` stays explicit.
-- **P4:** `join(Path, String) -> Path`, no `/`. An absolute child replaces
-  the base.
+- **P4 (amended):** `join(Path, Path) -> Path` puts the second path under
+  the first, even when the second is absolute (`/a` joined with `/b` is
+  `/a/b`), so it cannot fail and its name says what it does. `Path`
+  implements `Addable`: `+` concatenates the spellings exactly as String `+`
+  does (`a + b` is `ab`, never `a/b`). No `/`.
 - **P5:** `Stringable`, `Equatable` and `Hashable` on the spelling, so
   `a//b != a/b`; no `Orderable`.
 - **P6:** operations take only `Path`.
@@ -102,12 +107,12 @@ numbers; each is approved as drafted there unless amended here.
 
   | Today | `Path` method |
   | --- | --- |
-  | `join` | `join(Path, String) -> Path` |
+  | `join` | `join(Path, Path) -> Path`, the second under the first |
   | `dirname` | `parent(Path) -> Path`, total: `"a"` is `.` and `/` is `/` |
   | `normalize` | `normalize(Path) -> Path` |
   | `cli.file_name` | `name(Path) -> Option[String]`, `None` for `/` and `..` |
   | `source.module_stem` | `stem` and `extension(Path) -> Option[String]` |
-  | `prefix + ".c"` | `with_extension(Path, String) -> Path` |
+  | `prefix + ".c"` | `prefix + extension`, `extension ?= ".c".to_path()` first |
   | three containment checks | `is_within(Path, Path) -> Bool`, by component |
 
 - **P11:** migrate only at the filesystem boundary. The compiler's
@@ -444,12 +449,11 @@ unchanged; messages that print a process error add the program the same way.
      retired instructions each at most +0.3%.
    - Review: the brief goes through parser and ergonomics review before
      implementation; documenter review after.
-3. **`Path` in `path.brp`, beside the String functions.** P2 to P5, P10's
-   methods except three, `PathError` and unit tests. No compiler change.
+3. **`Path` in `path.brp`, beside the String functions.** P2 to P5, `+`,
+   P10's methods except two, `PathError` and unit tests. No compiler change.
    `join` and `normalize` already name String functions in `path.brp`, and a
    module cannot declare one name twice, so their `Path` forms arrive in
-   landing 7, which deletes the String ones. `with_extension` waits for the
-   same landing and for the open question under "Audit".
+   landing 7, which deletes the String ones.
    - Ceilings: production lines at most +130; self-compile allocations and
      instructions each at most +0.3%.
 4. **The current-directory native.** A new builtin returning a code, beside
@@ -469,8 +473,7 @@ unchanged; messages that print a process error add the program the same way.
      standard library at most +80 net. Self-compile allocations and
      instructions each at most +0.2%.
 7. **Files.** The `io/fs/` modules with `Path` signatures and exact errors;
-   `join`, `normalize` and `with_extension` on `Path`, in the form the open
-   question under "Audit" settles. `io/fs.brp`, `io/error.brp`,
+   `join` and `normalize` on `Path`. `io/fs.brp`, `io/error.brp`,
    `IOErrorKind`, `default_if_not_found`, the String functions in `path.brp`,
    `cli.file_name` and `module_stem` are deleted. Every caller, both READMEs'
    file sections and `FILESYSTEM_DECISIONS.md` are updated.
@@ -497,19 +500,21 @@ Landings 1, 3 and 4 are independent. Landing 2 needs 1; landing 5 needs 2 and
 A re-audit of the plan against the code, the other plans and the work in
 flight found the following.
 
-**Open, for Keith:**
+**Settled by Keith:** `join` and `with_extension` could have built a `Path`
+holding a NUL byte from their String argument. Keith decided that `to_path`
+is the only way from a String to a `Path`, that `join` takes two paths and
+puts the second under the first, that `+` concatenates, and that
+`with_extension` is dropped (recorded under P1, P4 and P10). Every path
+piece written as a literal now goes through `to_path` and its own `?=`:
 
-- **`join` and `with_extension` can make an invalid `Path`.** Their String
-  argument can hold a NUL byte, and `with_extension`'s can hold a `/`, so a
-  total function would produce a `Path` that P2 says cannot exist. Options:
-  - (a) Fallible: `join(Path, String) -> Result[Path, PathError]`, and the
-    same for `with_extension`, whose error also refuses a `/`. Every join
-    with a literal is then matched or `?=`'d.
-  - (b) Validated arguments: `join(Path, Path)`, so the child goes through
-    `to_path` first; `with_extension` still needs (a).
-  - *Recommended: (a).* One error type, and the cost lands only where a
-    String becomes part of a path. Joining a directory entry's name, which
-    the system never gives with a NUL, is fallible too under either option.
+```blorp
+suffix ?= "${name}_test".to_path()
+executable = directory.join(suffix)
+```
+
+A directory entry's name stays a String (P8), so joining it also goes
+through `to_path`, although the system never gives an empty name or one
+holding NUL.
 
 **Decided by the coordinator, from the decisions above** (Keith may
 overturn any; the `fault` handling and the exit status change behaviour):
