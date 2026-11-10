@@ -169,15 +169,20 @@ Probed on 2026-11-09 against `390945503`, with scratch programs only.
 2. **`Stringable`.**
    - The trait in `_base.brp` and the prelude.
    - Implementations for Int, Float, String and Bool. Int's and Float's plain
-     `to_string` become their implementations, and `to_string` reaches user
-     code through the prelude's import of the trait. Library modules get no
-     prelude, so those that call `to_string` (`test.brp`, `io.brp` and
-     others) import it from `_base`.
+     `to_string` become their implementations. A `.to_string()` call reaches
+     the member through its receiver, so no module's imports change, library
+     modules included. Only `to_string` named as a value needs an import, as
+     `int: to_string`, which follows `int: equals`.
    - `${…}` accepts implementors. Freezing replaces the call with its
      argument when a hole's solved type is String.
    - **First step:** run the seed on a library with the trait in place of
      Int's plain `to_string`, including `5.to_string()`. If the seed rejects
      it, the rotation (landing 6) moves ahead of this landing.
+   - **Budget correction (coordinator, 2026-11-09):** the production-line
+     ceiling went from +70 net to +72 net. The smallest design measured +72,
+     and 8 of those lines are the formatter putting `string.brp`'s imports one
+     per line. The allocation (+0.3%) and instruction (+0.5%) ceilings are
+     unchanged; it measured +0.026% and +0.044%.
 3. **Errors become `Stringable`.**
    - `IOErrorKind`, `IOError`, JSON's `ParseError` and `process`'s
      `ProcessErrorKind` and `ProcessError` implement it.

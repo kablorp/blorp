@@ -13,7 +13,7 @@ measurement provenance; current commands use `blorp/standard_library`.
 The library root contains two designated foundation modules:
 
 - `_base.brp` owns Int, Float, String, Void, List, Bool, Option, Result, the
-  `Equatable`, `Orderable` and `Hashable` traits and the arithmetic traits
+  `Equatable`, `Orderable`, `Hashable` and `Stringable` traits and the arithmetic traits
   `Addable`, `Subtractable`, `Multipliable`, `Divisible`, `Modulable` and
   `Negatable`, plus the checked-arithmetic error `MathError`. It is the only
   module that may declare builtin types. Any module may import it as `_base`.
@@ -39,6 +39,9 @@ module may implement a trait declared in `_base`, or the canonical Equatable, fo
 a type declared in `_base`: `int.brp`
 and `float.brp` implement Equatable, Orderable and the six arithmetic traits,
 `string.brp` implements Equatable and Addable, and `list.brp` implements Equatable.
+`Stringable` has one member, `to_string(value: Self) -> String`, which every
+interpolation hole that is not already a String calls. Int, Float, String
+(as the identity) and Bool (`True` and `False`) implement it.
 Each arithmetic trait has one member: `add`, `subtract`, `multiply`, `divide` and
 `remainder` take `(left: Self, right: Self)`, `negate` takes `(value: Self)`, and
 each returns `Self`. The prelude's selection makes them the canonical traits of
@@ -70,7 +73,8 @@ Neither branch prints. The native helper uses the target String ABI.
 `int.brp` adapts the legacy
 [`standard_library/src/int.brp`](https://github.com/kablorp/blorp/blob/ee9e001c6de8911ee486fd992419bef5bc628e8b/standard_library/src/int.brp). Its
 arithmetic implementations have builtin bodies except `negate`, which is
-`subtract(0, value)` and so wraps `INT_MIN` to itself; `to_string` is concrete.
+`subtract(0, value)` and so wraps `INT_MIN` to itself; `to_string` implements
+`Stringable` with a builtin body.
 Its six `_checked` functions are ordinary pure functions returning
 `Result[Int, MathError]`. `add_checked` and `subtract_checked` compare the
 operands with `INT_MIN` and `INT_MAX` without wrapping; `multiply_checked`
@@ -80,8 +84,9 @@ prelude selects neither MathError nor its cases, so `Overflow` and
 `DivisionByZero` stay free for user declarations; naming the type or a case
 requires `_base: MathError(DivisionByZero, Overflow)`.
 The Float adapter implements the same six traits for Float64, with `negate` as
-`multiply(value, -1.0)` so that the sign of zero flips, plus concrete
-`to_string`, `copysign`, `equals`, `is_nan`, `is_finite` and `abs`. `is_nan`
+`multiply(value, -1.0)` so that the sign of zero flips, `Stringable` with a
+builtin `to_string`, plus concrete `copysign`, `equals`, `is_nan`, `is_finite`
+and `abs`. `is_nan`
 uses ordinary self-equality, and `is_finite` compares
 ordinary self-subtraction with zero; neither requires a builtin label.
 Float implements `Orderable`: every comparison with NaN is false, so
