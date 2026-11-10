@@ -135,9 +135,9 @@ private pure func rc_acquire_pair(operations: List[OwnershipOperation], position
 private pure func rc_marked(operations: List[OwnershipOperation], position: Int, operation: OwnershipOperation, emitted: String) -> String:
 	match operation:
 		AcquireOwner(owner, borrowed, _):
-			"/*RC:B A ${rc_reason(operations, position, value_number(borrowed.value))} ${rc_source_name(borrowed.source)} ${rc_acquire_pair(operations, position, borrowed.source)} ${owner_number(owner).to_string()}*/${emitted}/*RC:E*/"
+			"/*RC:B A ${rc_reason(operations, position, value_number(borrowed.value))} ${rc_source_name(borrowed.source)} ${rc_acquire_pair(operations, position, borrowed.source)} ${owner_number(owner)}*/${emitted}/*RC:E*/"
 		DropOwner(owner, _):
-			"/*RC:B D ${owner_number(owner).to_string()} ${rc_partner_reason(operations, position.subtract(1), owner_number(owner), 1)}*/${emitted}/*RC:E*/"
+			"/*RC:B D ${owner_number(owner)} ${rc_partner_reason(operations, position.subtract(1), owner_number(owner), 1)}*/${emitted}/*RC:E*/"
 		_: emitted
 
 
@@ -192,24 +192,24 @@ EDITS = [
 			Ok(acquired): entered = acquired
 ''',
         '''		match append_ownership_operation("", AcquireOwner(acquisition.owner, acquisition.borrow, join_parameter(loop.result).span), unions, types, records, None):
-			Ok(acquired): entered = "${entered}/*RC:B A loop_entry ${rc_source_name(acquisition.borrow.source)} solo ${owner_number(acquisition.owner).to_string()}*/${acquired}/*RC:E*/"
+			Ok(acquired): entered = "${entered}/*RC:B A loop_entry ${rc_source_name(acquisition.borrow.source)} solo ${owner_number(acquisition.owner)}*/${acquired}/*RC:E*/"
 ''',
     ),
     # Say what kind of definition created each owner it owns.
     (
         '''				Ok(binding): Ok("${value}${binding}")
 ''',
-        '''				Ok(binding): Ok("${value}${binding}/*RC:K ${owner_number(owner).to_string()} ${rc_definition_kind(definition.operation)}*/")
+        '''				Ok(binding): Ok("${value}${binding}/*RC:K ${owner_number(owner)} ${rc_definition_kind(definition.operation)}*/")
 ''',
     ),
     # Mark the owners that control edges create (they have no definition): a
     # loop or arm input owner, a loop header and a join output.
     ('Ok(binding): result = "${result}${binding}"',
-     'Ok(binding): result = "${result}${binding}/*RC:K ${owner_number(owner).to_string()} input_owner*/"'),
+     'Ok(binding): result = "${result}${binding}/*RC:K ${owner_number(owner)} input_owner*/"'),
     ('Ok(binding): snapshots = "${snapshots}${binding}"',
-     'Ok(binding): snapshots = "${snapshots}${binding}/*RC:K ${owner_number(owner).to_string()} loop_header*/"'),
+     'Ok(binding): snapshots = "${snapshots}${binding}/*RC:K ${owner_number(owner)} loop_header*/"'),
     ('Ok(binding): joined = "${joined}${binding}"',
-     'Ok(binding): joined = "${joined}${binding}/*RC:K ${owner_number(owner).to_string()} join_output*/"'),
+     'Ok(binding): joined = "${joined}${binding}/*RC:K ${owner_number(owner)} join_output*/"'),
     # The helper functions sit before their first use.
     (
         "private pure func append_ownership_operation(\n",
