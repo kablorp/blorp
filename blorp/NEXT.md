@@ -32,6 +32,8 @@ done.
     (landing 3 deleted `describe`, `process`'s included), the `io/` move (`process`
     becomes `io/process`), `print` in the prelude, a seed rotation that also
     carries the process natives, then `Path`.
+  - **`Path`:** decisions P1 to P12 are proposed in
+    [`PATH_DECISIONS.md`](PATH_DECISIONS.md) and await Keith.
 - **Process API:** [`PROCESS_DECISIONS.md`](PROCESS_DECISIONS.md).
   - **Status:** L0 is implemented and independently reviewed; final combined
     landing gates and four-platform CI pass; L0 is published. Shared
