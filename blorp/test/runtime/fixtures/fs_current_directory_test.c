@@ -102,7 +102,7 @@ static int case_success(const char *scripted, size_t expected_calls) {
 
 static int case_unreachable(const char *scripted) {
     path = scripted;
-    return expect_code(BLORP_FS_UNREACHABLE);
+    return expect_code(15);
 }
 
 /* The path is longer than the limit, so the buffer grows to it and the next ERANGE
@@ -129,13 +129,16 @@ int main(int argc, char **argv) {
      * has something to balance. */
     blorp_string_release(blorp_string_from_bytes(name, (int64_t)strlen(name)));
     int status = 2;
-    if (strcmp(name, "not_found") == 0) status = case_failure(ENOENT, BLORP_FS_NOT_FOUND);
-    if (strcmp(name, "permission_denied") == 0) status = case_failure(EACCES, BLORP_FS_PERMISSION_DENIED);
-    if (strcmp(name, "other_errno") == 0) status = case_failure(EIO, -(int64_t)EIO);
+    if (strcmp(name, "not_found") == 0) status = case_failure(ENOENT, 1);
+    if (strcmp(name, "permission_denied") == 0) status = case_failure(EACCES, 2);
+    /* EIO and EINTR are 5 and 4 on every supported platform. */
+    if (strcmp(name, "other_errno") == 0) status = case_failure(EIO, -5);
     if (strcmp(name, "interrupted_is_not_retried") == 0) {
-        status = case_failure(EINTR, -(int64_t)EINTR) + (calls == 1 ? 0 : 1);
+        /* Not retrying is deliberate: it matches the old fragment, and POSIX lists no
+         * EINTR for getcwd. */
+        status = case_failure(EINTR, -4) + (calls == 1 ? 0 : 1);
     }
-    if (strcmp(name, "short_path") == 0) status = case_success("/grown", 1);
+    if (strcmp(name, "short_path") == 0) status = case_success("/short", 1);
     if (strcmp(name, "grows_past_initial") == 0) {
         char long_path[600];
         memset(long_path, 'a', sizeof long_path - 1);
@@ -147,7 +150,7 @@ int main(int argc, char **argv) {
     if (strcmp(name, "empty") == 0) status = case_unreachable("");
     if (strcmp(name, "invalid_utf8") == 0) {
         path = "/\xc0\x80";
-        status = expect_code(BLORP_FS_INVALID_UTF8);
+        status = expect_code(13);
     }
     if (strcmp(name, "capacity_limit") == 0) status = case_capacity_limit();
     return blorp_memory_finish(status);
