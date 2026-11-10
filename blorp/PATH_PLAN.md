@@ -1,14 +1,15 @@
-# `Path`, exact I/O errors and qualified variants
+# `Path`, exact I/O errors, naming rules and qualified variants
 
-**Status: plan, 2026-11-10, revision 2.** Keith approved P1 to P12 of the
-earlier `PATH_DECISIONS.md` (full text, with its precedent survey and the
-alternatives each point weighed, at `4b5b7fe65`) with the changes recorded
-under "Decisions". Revision 1 (`541f55f9d`) let unions in one module share
-variant names; Keith rejected that, and the choices it left open are decided
-below. This plan is landing 7 of `MODULES_AND_STRINGABLE_PLAN.md`. When the
-landings are done it amends `FILESYSTEM_DECISIONS.md` R3, R4, D8, D13 and D14,
-`PROCESS_DECISIONS.md`'s error types, and decision 8 of
-`MODULES_AND_STRINGABLE_PLAN.md`. Keep it
+**Status: plan, 2026-11-10, revision 3.** Revision 3 adds the naming rules
+Keith adopted, which make qualified variants a parser rule. Keith approved P1
+to P12 of the earlier `PATH_DECISIONS.md` (full text, with its precedent
+survey and the alternatives each point weighed, at `4b5b7fe65`) with the
+changes recorded under "Decisions". Revision 1 (`541f55f9d`) let unions in
+one module share variant names; Keith rejected that, and the choices it left
+open are decided below. This plan is landing 7 of
+`MODULES_AND_STRINGABLE_PLAN.md`. When the landings are done it amends
+`FILESYSTEM_DECISIONS.md` R3, R4, D8, D13 and D14, `PROCESS_DECISIONS.md`'s
+error types, and decision 8 of `MODULES_AND_STRINGABLE_PLAN.md`. Keep it
 small: no traits, no subset unions, no wrapper records and no library helpers
 for errors.
 
@@ -27,6 +28,38 @@ for errors.
   case must write arms for them, or a `_` that also hides any kind added
   later. `find_program` can produce 2 of `ProcessErrorKind`'s 9 variants.
   `get_current_directory` returns `Result[String, String]`.
+- **Naming case is not enforced.** Only type parameters must start with a
+  capital (`syntax/parse.brp`, `valid_type_parameter_name`). This compiles
+  at 9f29a0ebc:
+
+  ```blorp
+  union shape_kind:
+      circle
+      Square
+
+  record point_2d {
+      X: Int,
+  }
+
+  lower_constant: Int = 3
+
+  pure func Area(Width: Int) -> Int:
+      Kind = Width
+      Kind + lower_constant
+  ```
+
+  By rough grep at 9f29a0ebc, `src/`, the library and `scripts/` follow the
+  conventions except for 3 capitalized import aliases in `src/` (`Builtins`
+  in `verify/verify.brp`, `D` in `namespace.brp` and `specialize.brp`). The
+  tests break them in more places:
+  - about 185 test files' `tests` suite constants, and a fixture's
+    `private tests: TestSuite`;
+  - about 370 capitalized import aliases (`D`, `Own`, `Lower`, `Native`,
+    `FsTests`), each with its use sites, including `tests = Native.tests`;
+  - about 12 lowercase constants in programs embedded in test strings;
+  - 3 test function names with capitals (`test_target_numeric_API_…`);
+  - the fixture function `Foo`
+    (`test/e2e/fixtures/namespace/declared_function_imported_type/`).
 - **A variant cannot name its union.** `ReadError.NotFound` reports "unknown
   module alias ReadError" (probed at 70f8b7479): only an import alias may
   stand before the dot. So a caller must import each variant it matches by
@@ -92,6 +125,20 @@ numbers; each is approved as drafted there unless amended here.
 - **No helpers:** no traits or library functions over errors.
   `default_if_not_found` is deleted; its callers match `NotFound` themselves.
 - **`rename`:** left to the coordinator's judgement.
+- **Naming rules,** enforced by the compiler:
+
+  | Names | Form | Spelling |
+  | --- | --- | --- |
+  | Types, variants, traits, type parameters | CapitalizedCamelCase | `[A-Z][A-Za-z0-9]*` |
+  | Module constants | UPPER_SNAKE_CASE | `[A-Z][A-Z0-9]*(_[A-Z0-9]+)*` |
+  | Functions, methods, parameters, locals, captures, fields, aliases | lower_snake_case | `[a-z][a-z0-9]*(_[a-z0-9]+)*` |
+
+  Consecutive capitals are allowed, so `IOError` and `UInt8` stay valid. A
+  single word in capitals, such as `MAX` or `T`, fits both of the first two
+  forms. `_` stays the discard; no other name starts with an underscore.
+  Module paths such as `_base` are paths, not names, and are unaffected. A
+  test file's suite constant becomes `TESTS`; `TestSuite`'s `tests` field
+  stays.
 
 ## Coordinator choices, for Keith to confirm
 
@@ -110,8 +157,6 @@ the rest of the plan.
   `RenameError` like every other operation.
 - **Names:** `SystemCallError` for the cause inside `capture`'s errors, and
   `NameContainsNul` for `find_program`.
-- **Qualified-variant details:** a local wins over a union of the same name
-  in an expression; no new rule restricts binding names.
 - **Order and ceilings:** the seed rotation's place and every ceiling in
   "Landings".
 - **Information lost with the path:** when `with_temporary_directory`
@@ -119,6 +164,67 @@ the rest of the plan.
   the caller has only the body's `Path`.
 
 ## Proposed solution
+
+### Naming rules
+
+**Classified once, at the lexer.** The lexer already scans each identifier's
+bytes; it records the result on the token as a closed type, so no later phase
+reads a spelling to decide anything (`valid_type_parameter_name`'s comment in
+`syntax/parse.brp` anticipates this). A single capital word fits two forms,
+so the type has one case for it:
+
+```blorp
+fixed union NameForm:
+    LowerSnake          -- read_text, x1, utf8_valid
+    UpperSnake          -- MAX_DEPTH, HTTP_2: an underscore, no lowercase
+    SingleCapitalWord   -- MAX, T, IO: a constant or a type
+    CapitalizedCamel    -- ReadError, IOError, UInt8: a lowercase letter
+    Malformed           -- _x, a__b, a_, A_b, mixedCase
+```
+
+The form lives on the token rather than in the name table, because filling
+the name table is a host call that would need a seed rotation.
+
+**Checked once, where a name is declared.** Today every name goes through
+`consume_name(message)`, about 30 call sites, some of which consume a name
+being used rather than declared. Each declaring site calls
+`consume_declared_name(role)` instead, where `role` is a closed type
+(type, constant, value, and so on), so a site cannot forget its check. The
+declaring sites are every declaring production in `grammar.ebnf`: unions,
+records, opaque types, traits, variants and their payloads, type
+parameters, constants, functions, trait and `implements` methods,
+parameters of functions, methods and lambdas, locals, `var`s, pattern,
+list-rest (`...rest`), tuple and `?=` binders, loop binders, fields and import
+aliases. `foreign func` is not yet parsed on main; when it is, its Blorp name
+is checked and its C symbol is not. Module paths, builtin labels and keywords
+are exempt. A name in the wrong form is a parse error whose help gives the
+converted name:
+
+```text
+error: a local is written in lower_snake_case
+help: write `kind`
+```
+
+Conversion to lower_snake_case splits before a capital that follows a
+lowercase letter or digit, and before the last capital of a run that is
+followed by a lowercase letter: `ReadError` is `read_error`, `IOError` is
+`io_error`, `UInt8` is `u_int8`. To UPPER_SNAKE_CASE it is the same split,
+upper-cased. Both are tested.
+
+**Used names.** A name that is used refers to a declaration that passed its
+check, so it needs none, with one exception: after a lowercase receiver,
+`x.Foo` cannot be a field or a method, and is a parse error ("fields and
+methods are lower_snake_case"). In a pattern, case now tells a variant
+(`Empty`) from a binding (`empty`), so the parser can record which it is.
+
+**Aliases and locals.** An import alias shares the value namespace with
+locals and parameters (`grammar.ebnf`, binding reuse), which is likely why
+tests chose capitals. Lowercase aliases may now collide with a local of the
+same name; the migration renames whichever is clearer. `grammar.ebnf`'s
+"`_name` remains an identifier" changes with the leading-underscore rule.
+
+Assembly's suite discovery looks for `TESTS` instead of `tests`, and every
+test file, the test driver and both READMEs change with it.
 
 ### Qualified variants
 
@@ -152,41 +258,38 @@ union's variants reachable qualified. Importing `A(NotFound)` and
 
 - **Declaration.** Unchanged: variant names are unique across a module's
   unions, and every other value-namespace conflict stays.
-- **Patterns.** The parser already reads `X.Y` in a pattern head as
-  qualified. If `X` is an import alias it qualifies as today; otherwise `X`
-  must be a visible union type, equal to the scrutinee's, and `Y` one of its
-  variants ("ReadError has no variant Missing"). An alias and a type cannot
-  share a spelling already (`claimant`, `namespace/namespace.brp`).
-- **Expressions.** The parser is unchanged: Blorp has no capitalization rule,
-  so `X.y` cannot be told from a method call by spelling, and the parser
-  mints a qualified form only for an import alias. The checker reads `X.Y`
-  or `X.Y(…)` as a qualified variant when `X` is not an import alias, not a
-  local, parameter or capture, and not a name in the module's value namespace
-  (constant, constructor, function, method), and names a visible union type.
-  So a local wins: with a local `Kind`, `Kind.NotFound` is a field read, as
-  today. Programs that compile today keep their meaning, including
-  `union Unit: Unit` with `Unit.size()` (`Unit` is a constructor) and a local
-  `Kind = 3` beside `union Kind`.
-- **One rewrite point.** `X.Y` arrives as a name plus a field or receiver
-  postfix (`syntax/syntax.brp`), at five sites in `check/expressions.brp`,
-  including constant initializers, which today reject any postfix, and the
-  callable-operand classifiers. One normalizer at the top of expression
-  planning serves all of them, so `DEFAULT: Kind = Kind.A` works as the alias
-  form does today.
-- **Privacy.** A qualified variant passes the same offer check as
-  `alias.Name` and `Union(Name)`, so a private or opaque union's variants
-  stay hidden.
+- **Syntax.** With the naming rules, the tokens' forms settle what `X.Y` is,
+  in an expression and a pattern alike. An import alias, a method and a
+  field are lower_snake_case, so `X.Y` where `X` starts with a capital and
+  `Y` is CapitalizedCamelCase can only be a qualified variant. The parser
+  mints it in every expression position, constant initializers included, as
+  its own syntax (`VariantName`, `VariantApplication`, and `UnionHead` in a
+  pattern) rather than reusing `ParsedQualified`, whose `module` field would
+  otherwise mean an alias or a union. The parser no longer needs its set of
+  aliases to tell the forms apart. `alias.Variant` keeps its current meaning.
+- **Chains.** `Kind.A.to_string()` is a method call on the variant;
+  `Kind.A.B` is a parse error ("a variant has no variants").
+- **Resolution.** The checker resolves `X` as a visible union type and `Y` as
+  one of its variants ("ReadError has no variant Missing"), through the same
+  offer check as `alias.Name` and `Union(Name)`, so a private or opaque
+  union's variants stay hidden. In a pattern, the union must be the
+  scrutinee's. An `X` that is not a visible union is an error: "MAX is a
+  constant, not a union", "Point is a record, not a union", or, for a name
+  the module could import, the help "import ReadError".
 - **No expected type needed.** A qualified variant of a non-generic union
   names its type, so `x = ReadError.NotFound` checks without an annotation;
   the "constructor needs an expected union type" help suggests the qualified
-  form.
-- **Representation.** None changes: the checker resolves a qualified variant
-  to the variant id a bare one gets. `grammar.ebnf`'s "bare variants resolve
-  in the expected union type" is inaccurate today (the name picks the
-  variant, and the expected type only checks it) and is corrected.
-- **Formatter.** No change. Its chain rule counts `ReadError.Failed(x)` as a
-  call link, so `ReadError.Failed(x).to_string()` breaks where a module call
-  would not; the brief records this with a formatter test.
+  form. A generic union's variant (`Result.Ok(x)`, `Option.None`) still needs
+  an expected type to fix its type arguments.
+- **Representation.** None changes: a qualified variant resolves to the
+  variant id a bare one gets. `grammar.ebnf`'s "bare variants resolve in the
+  expected union type" is inaccurate today (the name picks the variant, and
+  the expected type only checks it) and is corrected.
+- **Formatter.** New syntax nodes, formatted as `alias.name` is
+  (`format/flat.brp`, `format/layout.brp`). The chain
+  rule counts `ReadError.Failed(x)` as a call link, so
+  `ReadError.Failed(x).to_string()` breaks where a module call would not;
+  the brief records this with a formatter test.
 
 ### Exact errors
 
@@ -232,7 +335,7 @@ reachable only on 32-bit systems is left out.
   `remove_file` on a directory is ID on both, because the runtime already
   rewrites macOS's EPERM.
 - **`rename`'s ID** (EISDIR, a file renamed onto a directory) is missing from
-  `FILESYSTEM_DECISIONS.md` today; landing 5 documents it.
+  `FILESYSTEM_DECISIONS.md` today; landing 6 documents it.
 - **`io/fs.brp`** is deleted, and `io/error.brp` with it.
 
 **`io/environment`.** `get_current_directory` returns
@@ -309,36 +412,49 @@ unchanged; messages that print a process error add the program the same way.
 
 ## Landings
 
-1. **Qualified variants.** Checker (`check/expressions.brp`,
-   `constructors.brp`, `patterns.brp`), diagnostics (`errors.brp`,
-   `render.brp`) and a namespace query from a union and variant name to its
-   id; the parser changes only message wording ("after the qualifier").
-   `README.md` and `grammar.ebnf`: the qualified-form and pattern-head
-   comments, the expected-type sentence, and that a local wins over a union
-   of the same name. No library change.
+1. **Naming rules.** `NameForm` on identifier tokens, folded into the
+   lexer's existing scan; `consume_declared_name(role)` and its messages;
+   `TESTS` discovery; the migration of `src/`'s 3 aliases and of every test
+   file, fixture and embedded program that breaks a rule. `README.md` and
+   `grammar.ebnf` (the identifier productions and the `_name` sentence). No
+   seed rotation: the seed does not enforce the rules. The compiler under
+   test compiles its own source and the tests in the fixpoint, so `src/` and
+   the test migration both land here.
+   - Tests: each role with a name in each wrong form and its help; the
+     conversion cases above; `x.Foo`; `_` still a discard; `TESTS`
+     discovery, and a lowercase `tests` refused.
+   - Ceilings: production lines at most +200. Self-compile allocations and
+     retired instructions each at most +0.3%. Test changes reported
+     separately.
+2. **Qualified variants.** The parser's new syntax (`syntax/syntax.brp`,
+   `parse.brp`), the checker's resolution (`check/constructors.brp`,
+   `patterns.brp`, `expressions.brp`, `bodies.brp`), diagnostics
+   (`errors.brp`, `render.brp`), a namespace query from a union and variant
+   name to its id, the formatter, `README.md` and `grammar.ebnf` (the
+   qualified-form and pattern-head comments, the expected-type sentence).
+   No library change.
    - Tests: qualified constructors and patterns; two imported unions that
      share a variant name, used qualified; `x = Kind.NotFound` unannotated; a
      constant `DEFAULT: Kind = Kind.A`; a wrong-union and an unknown variant
      (`Kind.Missing`); a private variant and an opaque union refused; a union
-     not imported, with the help "import ReadError"; `union Unit: Unit` with
-     `Unit.size()`; a local beside a same-named union, where the local wins;
+     not imported, with its help; `MAX.Foo` and `Point.X` refused;
+     `Kind.A.B` refused; `Result.Ok(x)` with and without an expected type;
      the formatter's chain case.
-   - Ceilings: production lines at most +250, which assumes the one rewrite
-     point. Self-compile allocations and retired instructions each at most
-     +0.3%.
+   - Ceilings: production lines at most +300. Self-compile allocations and
+     retired instructions each at most +0.3%.
    - Review: the brief goes through parser and ergonomics review before
      implementation; documenter review after.
-2. **`Path` in `path.brp`, beside the String functions.** P2 to P5, P10's
+3. **`Path` in `path.brp`, beside the String functions.** P2 to P5, P10's
    methods, `PathError` and unit tests. No compiler change.
    - Ceilings: production lines at most +130; self-compile allocations and
      instructions each at most +0.3%.
-3. **The current-directory native.** A new builtin returning a code, beside
+4. **The current-directory native.** A new builtin returning a code, beside
    the old one, with no library caller yet.
    - Ceilings: production lines at most +60; self-compile unchanged.
-4. **Seed rotation** after landings 1 and 3, so seed-built code (`src/`,
+5. **Seed rotation** after landings 2 and 4, so seed-built code (`src/`,
    `scripts/`, the library the compiler embeds) may use qualified variants
    and the new native. Until then it uses neither.
-5. **Signatures move to `Path`, with exact errors.** The `io/fs/` modules,
+6. **Signatures move to `Path`, with exact errors.** The `io/fs/` modules,
    `io/environment` and `io/process`. `io/fs.brp`, `io/error.brp`,
    `IOErrorKind`, `default_if_not_found`, the old current-directory builtin,
    the String functions in `path.brp`, `cli.file_name` and `module_stem` are
@@ -349,18 +465,18 @@ unchanged; messages that print a process error add the program the same way.
      standard library at most +300 net, mostly the unions, their decoders and
      their text. Self-compile allocations and instructions each at most
      +0.5%. Test growth reported separately.
-6. **The prelude.** `Path` and `to_path`. The prelude loads all of
+7. **The prelude.** `Path` and `to_path`. The prelude loads all of
    `path.brp`, and every loaded module is checked in full; today's
    `path.brp`, with similar functions, cost +13,222 allocations and +10.7%
    instructions to compile an empty program (measured at about `ce8753b6f`,
    against 89,222 allocations and 333.6 M instructions). Ceilings: the
    empty-program compile at most +15,000 allocations and +12% instructions,
-   remeasured on landing 2's module before this landing starts; self-compile
+   remeasured on landing 3's module before this landing starts; self-compile
    at most +0.1%; e2e ceilings reset with their existing margins and
    recorded.
 
-Landings 1, 2 and 3 are independent. Landing 4 needs 1 and 3; landing 5
-needs 2 and 4; landing 6 needs 5.
+Landings 1, 3 and 4 are independent. Landing 2 needs 1; landing 5 needs 2 and
+4; landing 6 needs 3 and 5; landing 7 needs 6.
 
 ## Out of scope
 
@@ -375,12 +491,12 @@ which today give unrelated parse errors.
 ## Not verified
 
 - The line ceilings, which are estimates, and the prelude cost of the full
-  `Path` module, which landing 2 measures.
+  `Path` module, which landing 3 measures.
 - The variant sets come from reading the runtime and the system calls'
-  manual pages; "race only" entries are judgement. Landing 5's tests cover
+  manual pages; "race only" entries are judgement. Landing 6's tests cover
   each deterministic variant per operation.
 - `Err(ReadError.NotFound)` was probed with a module-qualified variant
   (`Err(read.NotFound)`), which nests today; the union-qualified form is
-  landing 1's.
-- That the qualified-variant rule keeps every existing program compiling
-  beyond the two cases probed; landing 1's full suite shows it.
+  landing 2's.
+- The migration counts are rough greps; landing 1's brief recounts them, and
+  its line ceiling covers production code only.
