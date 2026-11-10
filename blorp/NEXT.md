@@ -92,10 +92,6 @@ None of these is planned yet. Each wants its own short design or brief.
   - `starts_with` and `index_of` for `T: Equatable`;
   - lexicographic `Orderable` for `List[T: Orderable]`.
 - **Tooling found broken or quiet while landing work:**
-  - `scripts/attribution/patch_emit_markers.py` anchors on tab-indented text,
-    but `emit.brp` is indented with spaces, so `scripts/attribution/run
-    --stage markers` fails at its first anchor. The `copies` and `rc`
-    patchers after it are unverified. Repair the anchors or retire the stages.
   - `scripts/blorp-compiler-bootstrap` prints nothing when it downloads or
     reuses a cached seed, so a build log cannot show which seed it used.
 - **Compiler costs found while landing work:**
