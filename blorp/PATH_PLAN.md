@@ -140,10 +140,10 @@ numbers; each is approved as drafted there unless amended here.
   test file's suite constant becomes `TESTS`; `TestSuite`'s `tests` field
   stays.
 
-## Coordinator choices, for Keith to confirm
+## Coordinator choices, confirmed by Keith
 
-Made to fill gaps in the decisions above; each can change without touching
-the rest of the plan.
+Made to fill gaps in the decisions above, and confirmed by Keith on
+2026-11-10.
 
 - **Defaulted, unanswered:** `InvalidPrefix` and `Unreachable` (below);
   `output`'s error wraps `capture`'s; races count, so a variant that another
@@ -445,7 +445,10 @@ unchanged; messages that print a process error add the program the same way.
    - Review: the brief goes through parser and ergonomics review before
      implementation; documenter review after.
 3. **`Path` in `path.brp`, beside the String functions.** P2 to P5, P10's
-   methods, `PathError` and unit tests. No compiler change.
+   methods, `PathError` and unit tests. No compiler change. `join` and
+   `normalize` already name String functions in `path.brp`, and a module
+   cannot declare one name twice, so their `Path` forms arrive in landing 6,
+   which deletes the String ones.
    - Ceilings: production lines at most +130; self-compile allocations and
      instructions each at most +0.3%.
 4. **The current-directory native.** A new builtin returning a code, beside
