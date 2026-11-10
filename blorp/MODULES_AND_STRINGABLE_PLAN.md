@@ -202,7 +202,9 @@ Probed on 2026-11-09 against `390945503`, with scratch programs only.
    It needs landing 1.
    - The prelude now loads only `io/console`, so a program that prints
      nothing costs 4,614 fewer compile allocations than after landing 5
-     (`string_literal/long_unreached`: 95,601 → 90,987). The two e2e ceilings
+     (`string_literal/long_unreached`: 95,601 → 90,987, measured with this
+     landing's own diagnostic builds; landing 5's 95,591 came from another
+     build of the same source). The two e2e ceilings
      landing 5 raised came back down with their margins kept: 99,539 → 94,925
      and 102,341 → 97,728.
 5. **The prelude:** `print` and `print_error` (decision 7), with R3 amended.

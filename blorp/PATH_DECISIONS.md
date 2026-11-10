@@ -6,7 +6,10 @@ the `io/` layout of MODULES_AND_STRINGABLE_PLAN.md decision 6 (`io/fs`,
 frame: a String-backed opaque `Path` that carries the filesystem operations as
 methods, `Path` and `IOError` in the prelude, and no `File` handle. These
 decisions settle the details. Once approved they amend `FILESYSTEM_DECISIONS.md`:
-R4 ("Paths stay `String`"), D8, D13, and R3 a second time.
+R4 ("Paths stay `String`"), D8, D13, and R3 a second time. Its line
+citations point at the layout before the `io/` move: `standard_library/fs.brp`
+is now `io/fs.brp`, `io.brp` is `io/console.brp` and `io/error.brp`, and
+`_io_errors.brp` is `io/_codes.brp`.
 
 ## Problem
 
