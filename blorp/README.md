@@ -1246,6 +1246,15 @@ atomic ones. Its stages are `build`, `markers`, `copies`, `rc`, `allocations`,
 `profile`, `timing` and `report`, which `--help` describes. Raw data and the
 markdown tables go to the ignored `build/attribution/`.
 
+The `markers` stage builds a compiler from a scratch copy of `src` whose
+`emit.brp` is patched to mark each reference-count operation with its source;
+the `copies` and `rc` stages rewrite the generated C. Their patchers anchor on
+exact lines of `emit.brp` and on the runtime helpers' C shapes, so an edit to
+either can break them, and no gate runs them. A patcher that no longer fits
+stops its stage and names the anchor or pattern; update it in
+[`patch_emit_markers.py`](scripts/attribution/patch_emit_markers.py) or the
+instrumenter.
+
 ## Bootstrap
 
 `make -C blorp` builds the compiler with a pinned seed: an earlier compiler,
