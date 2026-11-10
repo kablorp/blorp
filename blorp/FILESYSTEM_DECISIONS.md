@@ -6,6 +6,8 @@ contract of each operation lives in the
 [standard library README](standard_library/README.md#the-fs-module); this
 file says why it is that way and what is still open. Every decision below was
 approved by Keith on the date given, except those marked open or deferred.
+`io.describe` below is history: `IOError` and `IOErrorKind` implement
+`Stringable` instead (MODULES_AND_STRINGABLE_PLAN.md, landing 3).
 
 ## Where it stands
 
