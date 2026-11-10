@@ -58,6 +58,13 @@ done.
     approved as built, [`SOURCE_SNAPSHOTS_DECISIONS.md`](SOURCE_SNAPSHOTS_DECISIONS.md).
   - **Next:** expose module analysis without a required executable entrypoint. Neither editor state nor
     transport belongs in the compiler pipeline.
+- **String code points:** [`STRING_PLAN.md`](STRING_PLAN.md).
+  - **Status:** approved on 2026-11-10: `length` counts code points, from a
+    count stored in each String, and byte work uses `byte_*` functions. S0
+    measured the count's cost, and S3 to S9 and the ceilings are approved as
+    recommended.
+  - **Next:** L1, where the runtime keeps the count and the compiler learns
+    the new operations, then a seed rotation and the breaking switch (L3).
 - **Filesystem:** [`FILESYSTEM_DECISIONS.md`](FILESYSTEM_DECISIONS.md).
   - **Status:** Part 1 has landed through `fold_lines`. Part 2, lent
     resources, waits for a consumer.
