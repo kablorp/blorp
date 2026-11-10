@@ -286,11 +286,10 @@ files; `--version`; the pinned seed.
 
 ## Risks and unknowns
 
-- **The seed keeps the old interface.** The next rotation after P1 must
-  change, together: `blorp/bootstrap.env`, `seed_release_family` in
-  `scripts/blorp-compiler-bootstrap`, `blorp/Makefile:36`,
-  `.github/workflows/blorp-seed.yml:79` and the fake seed in
-  `test_bootstrap.sh`. P1's handback lists these for that rotation.
+- **The seed keeps the old interface.** Done: the rotation to
+  `blorp-seed-10c8053d2399` (MODULES_AND_STRINGABLE_PLAN.md landing 6) moved
+  the pin, the seed family, the Makefile, the seed workflow and the fake seed
+  in `test_bootstrap.sh` to the `compile` command line together.
 - **Exit statuses during the window.** Until the rotation, the seed still
   exits 1 for internal faults. `classify()` sees only current-source
   compilers, so this does not affect it; the seed's own call in Make treats

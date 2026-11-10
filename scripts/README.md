@@ -98,7 +98,7 @@ Before the compiler C, the same seed builds `blorp/scripts/embed_library.brp`,
 whose output `blorp/build/generated/embedded_library.brp` holds the standard
 library the compiler embeds. Both are Make file targets, so they are rebuilt only
 when the library or the generator changes; `blorp-seed.yml` runs the target
-before reference A. The generator uses the seed's old command line too.
+before reference A.
 `blorp/bootstrap.env` names the seed release and its three SHA-256 values.
 Rotate the tag, source commit and all three digests together, and only after
 `blorp-seed.yml` has published and qualified the release for every target.
