@@ -223,7 +223,8 @@ Probed on 2026-11-09 against `390945503`, with scratch programs only.
      99,539 and 96,967 → 102,341. Landing 4 should lower the cost, because
      the prelude then loads only `io/console`. Self-compile: allocations
      +0.005%, instructions −0.02%.
-6. **A seed rotation.** It lets library and compiler code interpolate
+6. **A seed rotation (done).** Pin `blorp-seed-10c8053d2399`; the family
+   switch and the `compile` command line landed with it. It lets library and compiler code interpolate
    non-Strings, and carries the pending seed-family switch and the seed's
    move to the `blorp compile` command line (`UINT8_BYTES_PLAN.md`, L2). It can
    go any time after landing 2, and the `"${error}"` clean-up in seed-built

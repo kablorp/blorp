@@ -54,8 +54,7 @@ three native seed assets were qualified. It validates the full source commit, ma
 immutable `<family>-seed-<12hex>` tag and all three SHA-256 values. It downloads
 `<family>-<target>` from that release and rehashes cached bytes before every use.
 The release family is one named value in the resolver, `seed_release_family`. It
-is still `blorp2`, the family of the pinned release, which predates the rename
-to Blorp; the workflow publishes the family `blorp`.
+is `blorp`, the family the seed workflow publishes.
 The separate cache defaults to `$XDG_CACHE_HOME/blorp/seed` or
 `$HOME/.cache/blorp/seed`; `BLORP_COMPILER_BOOTSTRAP_CACHE_DIR`
 is its only explicit override. Relative cache paths resolve from the repository
@@ -102,18 +101,12 @@ when the library or the generator changes; `blorp-seed.yml` runs the target
 before reference A. The generator uses the seed's old command line too.
 `blorp/bootstrap.env` names the seed release and its three SHA-256 values.
 Rotate the tag, source commit and all three digests together, and only after
-`blorp-seed.yml` has published and qualified the release for every target. The
-first rotation after the rename also switches `seed_release_family` in
-`scripts/blorp-compiler-bootstrap` from `blorp2` to `blorp`, in the same
-change as the pin.
-The seed still has the old command line (`--library-root DIR INPUT OUTPUT`), so
-`generate-compiler` and the generator target in `blorp/Makefile`, the seed step of `blorp-seed.yml` and
-the fake seed in `blorp/test/tooling/test_bootstrap.sh` keep it. The first
-rotation to a seed that has the `blorp compile` command moves those three to
-`compile INPUT --library-root DIR -o OUTPUT` in the same change as the pin, and
-the resolver's `seed_release_family` with it. Also in that change:
-`blorp/bootstrap.env`, and the seed's expected arguments at
-`blorp/test/tooling/test_bootstrap.sh` (the two seed argument lists).
+`blorp-seed.yml` has published and qualified the release for every target.
+
+The seed is driven as `compile INPUT --library-root DIR -o OUTPUT` by
+`generate-compiler` and the generator target in `blorp/Makefile`, the seed step of
+`blorp-seed.yml`, and the fake seed in `blorp/test/tooling/test_bootstrap.sh` (its
+two seed argument lists). A change to the seed's command line moves those with the pin.
 
 The seed workflow's fixture parity step deliberately accepts only exit 0 and 1
 for a fixture: an exit 4 (a fault in blorp) or 2 or 3 fails the step.

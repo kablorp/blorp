@@ -43,8 +43,8 @@ set -euo pipefail
 printf 'cwd:%s\0' "$PWD" >>"$TEST_SEED_LOG"
 for argument in "$@"; do printf 'arg:%s\0' "$argument" >>"$TEST_SEED_LOG"; done
 printf 'seed\n' >>"$TEST_CC_LOG"
-if [ "${1:-}" = --library-root ]; then
-	printf '/* fake generated C */\n' >"$4"
+if [ "${1:-}" = compile ]; then
+	printf '/* fake generated C */\n' >"$6"
 fi
 SH
 chmod +x "$TEST_SEED"
@@ -118,9 +118,8 @@ SH
 chmod +x "$tools/"*
 export PATH="$tools:$PATH"
 commit=0123456789abcdef0123456789abcdef01234567
-# The release family the resolver accepts, its seed_release_family. The next seed
-# rotation switches this one line, together with the resolver and the pin, to blorp.
-family=blorp2
+# The release family the resolver accepts, its seed_release_family.
+family=blorp
 tag=$family-seed-0123456789ab
 digest=$(sha256_file "$TEST_SEED")
 manifest="$fixture/blorp/bootstrap.env"
@@ -286,11 +285,11 @@ make -s -C "$fixture/blorp" -j compiler test-compiler BLORP_CC="$tools/fake cc" 
 printf 'seed\nlink:example\nbuilt\nseed\nlink:0\nlink:1\n' >"$scratch/expected"
 cmp -s "$TEST_CC_LOG" "$scratch/expected" || fail 'generation/link ordering or diagnostic modes'
 [ -s "$fixture/blorp/build/generated/embedded_library.brp" ] || fail 'generator did not write the embedded library module'
-printf 'cwd:%s\0arg:%s\0arg:%s\0arg:%s\0arg:%s\0' "$fixture" \
-	--library-root blorp/standard_library blorp/scripts/embed_library.brp blorp/build/generated/embed_library.c \
+printf 'cwd:%s\0arg:%s\0arg:%s\0arg:%s\0arg:%s\0arg:%s\0arg:%s\0' "$fixture" \
+	compile blorp/scripts/embed_library.brp --library-root blorp/standard_library -o blorp/build/generated/embed_library.c \
 	>"$scratch/expected"
-printf 'cwd:%s\0arg:%s\0arg:%s\0arg:%s\0arg:%s\0' "$fixture" \
-	--library-root blorp/standard_library blorp/src/main.brp blorp/build/blorp.c >>"$scratch/expected"
+printf 'cwd:%s\0arg:%s\0arg:%s\0arg:%s\0arg:%s\0arg:%s\0arg:%s\0' "$fixture" \
+	compile blorp/src/main.brp --library-root blorp/standard_library -o blorp/build/blorp.c >>"$scratch/expected"
 cmp -s "$TEST_SEED_LOG" "$scratch/expected" || fail 'make seed CLI or generation count'
 printf '%s\0' -O1 blorp/build/generated/embed_library.c -o blorp/build/generated/embed_library -lm -lpthread \
 	-O0 -DBLORP_MEMORY_DIAGNOSTICS=0 blorp/build/blorp.c -o blorp/build/blorp -lm -lpthread \
