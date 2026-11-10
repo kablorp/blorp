@@ -48,16 +48,16 @@ done.
   - **Next:** L2, migrating the 17 `run_to_files` call sites and deleting it,
     after `PATH_PLAN.md`'s landing 6 changes the process errors.
   - **Later:** binary capture after `Bytes`, and `run` with streaming.
-- **LSP foundations:**
-  - **Status:** the pure `json` codec is implemented and independently
-    reviewed and published; combined local gates and four-platform CI pass.
-    [`JSON results`](../benchmarks/results/blorp-json-foundation-2026-11-08.md).
-    Loader source overrides pass focused tests, matched costs, full
-    instruction-enabled tests, fixpoint and independent reviews.
-    [`Snapshot results`](../benchmarks/results/blorp-source-snapshots-2026-11-09.md);
-    approved as built, [`SOURCE_SNAPSHOTS_DECISIONS.md`](SOURCE_SNAPSHOTS_DECISIONS.md).
-  - **Next:** expose module analysis without a required executable entrypoint. Neither editor state nor
-    transport belongs in the compiler pipeline.
+- **Language server (`blorp lsp`):** [`LSP_PLAN.md`](LSP_PLAN.md).
+  - **Status:** the plan was written on 2026-11-10 and awaits Keith's review,
+    including three open choices: the first editor, the console API and
+    when occurrences are recorded. Its foundations have landed: the `json`
+    codec
+    ([results](../benchmarks/results/blorp-json-foundation-2026-11-08.md))
+    and loader source snapshots
+    ([results](../benchmarks/results/blorp-source-snapshots-2026-11-09.md),
+    [`SOURCE_SNAPSHOTS_DECISIONS.md`](SOURCE_SNAPSHOTS_DECISIONS.md)).
+  - **Next:** the plan's landing 1, analysis without an entry point.
 - **String code points:** [`STRING_PLAN.md`](STRING_PLAN.md).
   - **Status:** approved on 2026-11-10: `length` counts code points, from a
     count stored in each String, and byte work uses `byte_*` functions. S0
