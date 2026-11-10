@@ -538,8 +538,9 @@ is shaped this way and what is still open.
   the caller passed, so `x: permission denied` does not say whether `x` or a
   parent refused, except for the cleanup failure above.
 - `IOError` is `Stringable`: `"${error}"` gives `"<path>: <phrase>"` with
-  fixed text per kind, never `strerror` text. `default_if_not_found(result, fallback)` turns `NotFound`
-  into `Ok(fallback)` and leaves every other result alone.
+  fixed text per kind, never `strerror` text.
+  `default_if_not_found(result, fallback)` turns `NotFound` into
+  `Ok(fallback)` and leaves every other result alone.
 
 The runtime C is tested by `test/runtime/fs_suite.brp`, and the examples
 `test/e2e/fixtures/fs/read.brp`, `lines.brp`, `write.brp` and `directories.brp`
