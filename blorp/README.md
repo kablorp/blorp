@@ -899,10 +899,10 @@ the methods of Int, Float, String and List, so `(42 + 1).to_string().length()`
 needs no import. Other direct calls need named imports: console output is in
 the prelude, while files, processes and the environment are explicit imports.
 A user module cannot declare `print` or `print_error` ("print is provided by
-the prelude"). Selecting them from `io` as well is redundant but accepted: an
-import of a name already in scope enters once. Library modules receive nothing
-implicitly and cannot import user modules. Any module may import the
-foundation module as `_base`.
+the prelude"). Selecting them from `io/console` as well is redundant but
+accepted: an import of a name already in scope enters once. Library modules
+receive nothing implicitly and cannot import user modules. Any module may
+import the foundation module as `_base`.
 
 ### Dict
 
@@ -952,7 +952,7 @@ in order, and ignore extra arguments.
 
 #### Current directory
 
-`system: get_current_directory` is the impure
+`io/environment: get_current_directory` is the impure
 `get_current_directory() -> Result[String, String]`. Success is a nonempty
 absolute UTF-8 path; failure is a readable error that includes the errno of an
 OS failure. It prints nothing. See the
@@ -960,15 +960,15 @@ OS failure. It prints nothing. See the
 
 #### The fs library
 
-`fs` is the typed filesystem library; import it explicitly. Its operations
+`io/fs` is the typed filesystem library; import it explicitly. Its operations
 are impure except for `default_if_not_found`. Their `Result` error is the
-shared `io.IOError`, which holds the caller's path and an `io.IOErrorKind`
+shared `io/error.IOError`, which holds the caller's path and an `IOErrorKind`
 such as `NotFound` or `OtherOs(errno)`:
 
 ```blorp
 import:
-    fs: read_text, default_if_not_found
-    io: IOError
+    io/fs: read_text, default_if_not_found
+    io/error: IOError
 func load_settings(path: String) -> Result[String, IOError]:
     default_if_not_found(read_text(path), "defaults")
 ```
@@ -986,7 +986,7 @@ directory to a callback (`with_temporary_directory`). The
 [library README](standard_library/README.md#the-fs-module) owns every
 operation's contract, edge cases and limits.
 
-`process` runs a program and captures its output (`command`, `capture`,
+`io/process` runs a program and captures its output (`command`, `capture`,
 `output`, `find_program`); its contract is in the
 [standard library README](standard_library/README.md#process-execution).
 

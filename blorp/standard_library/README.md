@@ -18,7 +18,7 @@ The library root contains two designated foundation modules:
   `Negatable`, plus the checked-arithmetic error `MathError`. It is the only
   module that may declare builtin types. Any module may import it as `_base`.
 - `prelude.brp` imports the base types, the operation modules' methods and
-  `io`'s `print` and `print_error`. It
+  `io/console`'s `print` and `print_error`. It
   is the only implicit import: application roots and ordinary user helper
   modules receive its selections, and it cannot be imported explicitly.
 
@@ -67,7 +67,7 @@ trait default. Imported `INT_MIN`
 and `INT_MAX` are closed scalar literals, with no runtime global storage.
 The [imports design](../README.md#modules-imports-and-the-prelude) defines the full rules.
 
-`system.brp`'s explicit `get_current_directory()` import returns `Result[String, String]`:
+`io/environment.brp`'s explicit `get_current_directory()` import returns `Result[String, String]`:
 an owned nonempty absolute UTF-8 path or an owned valid-text error.
 Neither branch prints. The native helper uses the target String ABI.
 
@@ -112,7 +112,7 @@ The original modules are preserved in the legacy
 Pass `blorp/standard_library` explicitly as the argument to `blorp compile --library-root`. Bare `int: add` imports resolve here; relative
 imports still resolve beside their importer. There is no host-library fallback.
 
-`io.brp` adapts the legacy
+`io/console.brp` adapts the legacy
 [`standard_library/src/io.brp`](https://github.com/kablorp/blorp/blob/ee9e001c6de8911ee486fd992419bef5bc628e8b/standard_library/src/io.brp). The prelude
 supplies `print` and `print_error`. `print(String) -> Void` is concrete and
 impure, mapped to the closed `string.print` operation. It borrows the String,
@@ -307,18 +307,18 @@ rejected and `int: Int methods` uses `int`'s functions on Int; no module
 reexports another module's types or methods. The prelude is a compiler input and
 cannot be imported explicitly.
 
-`io.print_error(String) -> Void` concretely adapts the host Stringable API.
+`io/console.print_error(String) -> Void` concretely adapts the host Stringable API.
 It borrows its input, writes counted bytes to stderr once, and attempts LF only
 following a full transfer; short writes (including EINTR) stop without retry.
 The host attempts LF after short writes as well. Neither API reports delivery.
 
-`io` also owns the shared fixed union `IOErrorKind`, the record `IOError`, and
-the `Stringable` text of both. Select `io: IOError` to name the error, then
+`io/error` owns the shared fixed union `IOErrorKind`, the record `IOError`, and
+the `Stringable` text of both. Select `io/error: IOError` to name the error, then
 write `"${error}"` or `error.to_string()`; select `to_string` to pass it as a
 function value. The filesystem library uses these identities;
-the planned process API will use them too. `_io_errors.brp` is the library's
-native-code decoder; programs use the public `io` kinds instead of depending
-on numeric codes. `_io_errors` is internal by convention only: Blorp has
+the planned process API will use them too. `io/_codes.brp` is the library's
+native-code decoder; programs use the public `io/error` kinds instead of depending
+on numeric codes. `io/_codes` is internal by convention only: Blorp has
 neither re-exports nor module-private imports, so its functions are public
 by necessity, but they are not part of the library's API. Programs should not
 import it, and it may change without notice. (`_base`, the foundation module,
@@ -397,12 +397,12 @@ result, and parsing and rendering cost time linear in them.
 
 ### The fs module
 
-`fs.brp` is the typed filesystem library; import it explicitly. It declares
+`io/fs.brp` is the typed filesystem library; import it explicitly. It declares
 the fixed union `EntryKind`, the record `Entry`, the pure
 `default_if_not_found`, and the impure operations below. Their `Result` error
-is `IOError`, imported from `io` along with `IOErrorKind`.
-Natives return Int codes (or a list or String); the shared `_io_errors`
-decoder produces `io` kinds, while the entry decoder stays private to `fs`.
+is `IOError`, imported from `io/error` along with `IOErrorKind`.
+Natives return Int codes (or a list or String); the shared `io/_codes`
+decoder produces `io/error` kinds, while the entry decoder stays private to `fs`.
 The native codes are named in `src/compile/runtime/fs.brp`. The
 language README's [I/O overview](../README.md#effects-and-io) shows where it
 fits beside `print` and the other effects, and
@@ -512,8 +512,8 @@ is shaped this way and what is still open.
 
   ```blorp
   import:
-      fs: fold_lines
-      io: IOError
+      io/fs: fold_lines
+      io/error: IOError
       string: String methods
 
   union ScoreError:
@@ -530,7 +530,7 @@ is shaped this way and what is still open.
   func total_score(path: String) -> Result[Int, ScoreError]:
       fold_lines(path, 0, add_score, pure func(error: IOError) -> ScoreError: Unreadable(error))
   ```
-- `io.IOError` holds the caller's `path`, an optional `destination` for
+- `io/error.IOError` holds the caller's `path`, an optional `destination` for
   two-path operations, and an `IOErrorKind`: `NotFound`, `PermissionDenied`,
   `AlreadyExists`, `NotADirectory`, `IsADirectory`, `DirectoryNotEmpty`,
   `NotARegularFile`, `ReadOnlyFilesystem`, `NoSpace`, `FileTooLarge`,
@@ -588,13 +588,13 @@ pass. `run_suite_result` prints results and returns `TestCounts { passed, failed
 
 ## Process execution
 
-`process` runs a program, waits for it and keeps what it printed. The prelude
+`io/process` runs a program, waits for it and keeps what it printed. The prelude
 and compiler source do not import it. [PROCESS_DECISIONS.md](../PROCESS_DECISIONS.md)
 records the design and its decisions.
 
 ```blorp
 import:
-    process: Command, Exit(Exited, Signaled, TimedOut), Captured, ProcessError, command, capture, output, find_program
+    io/process: Command, Exit(Exited, Signaled, TimedOut), Captured, ProcessError, command, capture, output, find_program
 
 func current_commit(repository: String) -> Result[String, ProcessError]:
     git ?= find_program("git")
@@ -630,7 +630,7 @@ func current_commit(repository: String) -> Result[String, ProcessError]:
   cannot enter is `DirectoryFailed`, whose `IOError` names it; one containing
   NUL is `DirectoryFailed` with `PathContainsNul`. `NotExecutable` is ENOEXEC,
   such as a script without `#!`; every other launch failure is
-  `LaunchFailed(kind)`, worded as `io` words the errno, so a missing program is
+  `LaunchFailed(kind)`, worded as `io/error` words the errno, so a missing program is
   `LaunchFailed(NotFound)`.
 - SIGCHLD must keep its default disposition, which a Blorp program cannot
   change. If foreign code has changed it, `capture` is
@@ -650,7 +650,7 @@ func current_commit(repository: String) -> Result[String, ProcessError]:
 ### run_to_files
 
 `run_to_files` remains until its callers move to `capture`.
-Explicitly import `process: run_to_files`; the prelude and compiler source do not
+Explicitly import `io/process: run_to_files`; the prelude and compiler source do not
 import it. This is a target-only impure operation:
 
 ```blorp

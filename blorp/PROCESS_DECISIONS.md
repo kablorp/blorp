@@ -1,7 +1,8 @@
 # Process API
 
 `describe` below is history: `ProcessError` implements `Stringable` instead
-(MODULES_AND_STRINGABLE_PLAN.md, landing 3).
+(MODULES_AND_STRINGABLE_PLAN.md, landing 3). The modules are now `io/process`
+and `io/error` (landing 4); names below are as written then.
 
 Status: approved by Keith on 2026-11-06 (revision 3, after ergonomics,
 data-model and feasibility reviews), with P1 to P4 decided as recommended.
@@ -39,8 +40,8 @@ Five types and six functions:
 
 ```blorp
 import:
-    io: IOError, IOErrorKind
-    process:
+    io/error: IOError, IOErrorKind
+    io/process:
         Command, Exit(Exited, Signaled, TimedOut), Captured, ProcessError, ProcessErrorKind(...),
         command, capture, output, find_program
 
