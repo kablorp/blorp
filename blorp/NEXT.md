@@ -32,9 +32,9 @@ done.
   - **Landing 6:** the seed rotation is done: pin `blorp-seed-10c8053d2399`,
     family `blorp`, and the `compile` command line. Seed-built code now
     interpolates values directly (`68df72215`).
-  - **Next:** `Path` (landing 7), once Keith decides P1 to P12.
-  - **`Path`:** decisions P1 to P12 are proposed in
-    [`PATH_DECISIONS.md`](PATH_DECISIONS.md) and await Keith.
+  - **Next:** `Path` (landing 7), planned in [`PATH_PLAN.md`](PATH_PLAN.md):
+    qualified union variants first, then `Path`, path literals, exact I/O
+    error kinds and the prelude.
 - **Process API:** [`PROCESS_DECISIONS.md`](PROCESS_DECISIONS.md).
   - **Status:** L0 is implemented and independently reviewed; final combined
     landing gates and four-platform CI pass; L0 is published. Shared
