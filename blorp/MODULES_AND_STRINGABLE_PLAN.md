@@ -84,12 +84,12 @@ decisions left open.
    decisions when its brief is written, and amend D13 in
    `FILESYSTEM_DECISIONS.md`.
 
-## Open, for Keith
+## O1, decided
 
-- **O1, a user's own `print`.** Once `print` is in the prelude, a user module
-  that declares its own `print` either gets an error, as redeclaring a prelude
-  constructor does today, or its own declaration wins. *Recommended:* an error,
-  matching the existing rule for prelude constructors, with help to rename.
+- **A user's own `print` is an error** (Keith, 2026-11-09). Once `print` and
+  `print_error` are in the prelude, a user module that declares either gets
+  the error that redeclaring a prelude constructor gets today, with help to
+  rename it.
 
 ## Probe results
 
@@ -190,7 +190,7 @@ Probed on 2026-11-09 against `390945503`, with scratch programs only.
    compiler, the tests and the docs. `process.brp` becomes `io/process.brp`.
    It needs landing 1.
 5. **The prelude:** `print` and `print_error` (decision 7), with R3 amended.
-   It is blocked until Keith answers O1.
+   O1 is decided: a user's own `print` is an error.
 6. **A seed rotation.** It lets library and compiler code interpolate
    non-Strings, and carries the pending seed-family switch and the seed's
    move to the `blorp compile` command line (`UINT8_BYTES_PLAN.md`, L2). It can

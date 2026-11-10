@@ -27,7 +27,7 @@ done.
   - **Next:** landing 1, nested library modules: the embedded-library
     generator recurses into folders, and the loader rejects `io.brp` beside
     `io/`.
-  - **Waits on Keith:** O1, a user's own `print`, before landing 5.
+  - **O1 decided:** a user's own `print` is an error (landing 5).
   - **Afterwards:** `Stringable` and interpolation, errors as `Stringable`
     (deleting `describe`, `process`'s included), the `io/` move (`process`
     becomes `io/process`), `print` in the prelude, a seed rotation that also
