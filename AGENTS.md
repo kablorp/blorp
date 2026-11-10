@@ -159,7 +159,11 @@ acceptable merely because the model is cleaner or another metric improves.
 Necessary correctness-test growth is allowed; do not hide growth through
 compressed formatting or deleted coverage. Set numerical cost ceilings before
 implementation, investigate repeatable increases at the owning phase, and
-reject or rescope a change that exceeds them.
+reject or rescope a change that exceeds them. Keith has given the coordinating
+agent a standing delegation for routine budget corrections (confirmed
+2026-11-09). The coordinator, not the implementer, makes such a correction, and
+records it in the owning plan or results file with the old and new figures and
+the reason.
 
 ### Naming
 
