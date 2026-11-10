@@ -200,6 +200,11 @@ Probed on 2026-11-09 against `390945503`, with scratch programs only.
 4. **The `io/` move,** as in decision 6, with every import migrated: the
    compiler, the tests and the docs. `process.brp` becomes `io/process.brp`.
    It needs landing 1.
+   - The prelude now loads only `io/console`, so a program that prints
+     nothing costs 4,614 fewer compile allocations than after landing 5
+     (`string_literal/long_unreached`: 95,601 → 90,987). The two e2e ceilings
+     landing 5 raised came back down with their margins kept: 99,539 → 94,925
+     and 102,341 → 97,728.
 5. **The prelude:** `print` and `print_error` (decision 7), with R3 amended.
    O1 is decided: a user's own `print` is an error.
    - **Ran before landing 4 (coordinator, 2026-11-10).** In this order the
