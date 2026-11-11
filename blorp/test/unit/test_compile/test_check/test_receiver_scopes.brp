@@ -9,8 +9,8 @@ import:
     ../../../../src/compile/assemble: ParsedProgram, parsed_contents
     ../../../../src/compile/check/check: check, check_errors, checked_functions
     ../../../../src/compile/check/declarations: validate_declarations
-    ../../../../src/compile/check/errors as Errors
-    ../../../../src/compile/check/model as Model
+    ../../../../src/compile/check/errors as errors
+    ../../../../src/compile/check/model as model
     ../../../../src/compile/check/receiver_clashes: admit_receivers
     ../../../../src/compile/check/render: render_failure, render_check_error
     ../../../../src/compile/check/traits: accepted_traits
@@ -25,7 +25,7 @@ import:
         Span,
         diagnostic,
         compiler_span,
-    ../../input as Inputs: prepare_signatures
+    ../../input as input_helpers: prepare_signatures
     ../../module_input: ModuleInput, parse_modules, parse_modules_with_prelude
 
 
@@ -124,12 +124,12 @@ private pure func calls_are(
                         None:
                             False
                         Some(function):
-                            calls = Model.function_calls(function)
+                            calls = model.function_calls(function)
                             var matches = calls.length() == expected.length()
                             var position: Int = 0
                             for call in calls:
                                 selected = match (call.target, expected.get(position)):
-                                    (Model.UserFunction(id, _), Some(ordinal)):
+                                    (model.UserFunction(id, _), Some(ordinal)):
                                         match checked_functions(program).functions.get(ordinal):
                                             Some(declaration): id == declaration.id
                                             None: False
@@ -169,14 +169,14 @@ private pure func trait_target_is_selected() -> Bool:
                 ([owner], Ok(program)):
                     match (owner.methods, checked_functions(program).functions.get(0)):
                         ([method], Some(main)):
-                            match Model.function_calls(main):
+                            match model.function_calls(main):
                                 [call]:
                                     match call.target:
-                                        Model.TraitMethod(accepted):
-                                            (Model.method_identity(accepted) == method.id).and(
+                                        model.TraitMethod(accepted):
+                                            (model.method_identity(accepted) == method.id).and(
                                                 (
-                                                    Model.method_receiver(accepted)
-                                                    == Model.IntegerType(Int64Format)
+                                                    model.method_receiver(accepted)
+                                                    == model.IntegerType(Int64Format)
                                                 ),
                                             )
                                         _:
@@ -284,8 +284,8 @@ private pure func earliest_dependency_error() -> Bool:
     -- family conflict; checking every family's scope first changes this error.
     root =
         |import:
-        |    ./early as Early
-        |    ./late as Late
+        |    ./early as early
+        |    ./late as late
         |func main() -> Int:
         |    0
         |
@@ -430,7 +430,7 @@ private pure func malformed_modules(duplicate: Bool) -> Result[Bool, Diagnostic]
     prepared ?= prepare_signatures(program, namespace).map_err(
         pure func(error): render_check_error(program, error),
     )
-    availability ?= Inputs.accepted_traits(program, namespace, prepared, declarations).map_err(
+    availability ?= input_helpers.accepted_traits(program, namespace, prepared, declarations).map_err(
         pure func(error): render_check_error(program, error),
     )
     match parsed.dependency_order.get(0):
@@ -457,7 +457,7 @@ private pure func malformed_modules(duplicate: Bool) -> Result[Bool, Diagnostic]
                 Err(error):
                     actual = render_check_error(program, error)
                     match error.kind:
-                        Errors.InternalInvariant(Errors.InvalidReceiverScope):
+                        errors.InternalInvariant(errors.InvalidReceiverScope):
                             Ok(
                                 (error.span == span)
                                     .and(actual.span == span)
@@ -532,19 +532,21 @@ private pure func test_missing_name_is_a_semantic_lookup_miss() -> Bool:
     missing("func main() -> Int:\n    7.", "absent", "()\n", [])
 
 
-private pure func test_constructor_miss_retains_its_ufcs_diagnostic() -> Bool:
+-- A constructor name is capitalized and a method name is not, so `7.Payload()`
+-- is a parse error before the checker sees a constructor in method position.
+private pure func test_a_capitalized_method_name_is_rejected_by_the_parser() -> Bool:
     prefix =
         |union Token:
         |    Payload(Int)
         |func main() -> Int:
         |    7.
-    rejects(ordinary(prefix + "Payload()\n", []), {
-        span = site(0, prefix, "Payload"),
-        kind = ProgramProblem,
-        note = None,
-        message = "constructors do not support UFCS in this increment",
-        help = "write the constructor directly, such as Number(value)",
-    })
+    match ordinary(prefix + "Payload()\n", []):
+        Err(error):
+            (error.message == "fields and methods are lower_snake_case")
+                .and(error.help == "write `payload`")
+                .and(error.span == site(0, prefix, "Payload"))
+        Ok(_):
+            False
 
 
 private pure func test_zero_parameter_local_function_remains_an_arity_rejection() -> Bool:
@@ -688,7 +690,7 @@ private pure func test_unused_overlaps_keep_the_first_qualifying_duplicate_impor
     )
 
 
-tests: TestSuite = {
+TESTS: TestSuite = {
     description = "Complete admitted receiver scopes",
     tests = [
         (
@@ -717,8 +719,8 @@ tests: TestSuite = {
         ),
         ("missing name is a semantic lookup miss", test_missing_name_is_a_semantic_lookup_miss),
         (
-            "constructor miss retains its UFCS diagnostic",
-            test_constructor_miss_retains_its_ufcs_diagnostic,
+            "a capitalized method name is rejected by the parser",
+            test_a_capitalized_method_name_is_rejected_by_the_parser,
         ),
         (
             "zero-parameter local function remains an arity rejection",

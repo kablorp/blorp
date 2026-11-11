@@ -11,6 +11,8 @@ import:
     ../../src/syntax/source: module_source, root_module_id
     ../../src/syntax/syntax:
         Diagnostic,
+        ParsedBinder(NamedBinder, DiscardBinder),
+        ParsedParameter,
         ExpressionBase(
             IntegerExpression,
             NameExpression,
@@ -28,6 +30,7 @@ import:
         LiteralPattern(ExactInt),
         ParsedPattern(
             PatternName,
+            PatternVariantName,
             PatternWildcard,
             PatternConstructor,
             PatternLiteral,
@@ -61,7 +64,7 @@ private HEADER: String = "func main() -> Int:\n"
 private MATCH_HEADER: String = "func f(value: V) -> Int:\n\tmatch value:\n"
 
 
-private IDENTIFIER_HELP: String = "use an ASCII identifier starting with a letter or underscore; keywords and lone '_' are reserved"
+private IDENTIFIER_HELP: String = "use an ASCII identifier starting with a letter; keywords and lone '_' are reserved"
 
 
 private BUILTIN_LABEL_HELP: String = "use system.get_current_directory, system.current_directory, process.run_to_files, process.capture, process.find_program, process.fault, fs.read_text, fs.write_text, fs.entry_kind, fs.list_directory, fs.create_directory, fs.create_directories, fs.remove_file, fs.remove_directory, fs.rename, fs.remove_directory_tree, fs.create_temporary_directory, fs.open_read, fs.next_lines, fs.close, int.equals, int.less_than, int.add, int.subtract, int.multiply, int.divide, int.remainder, int.to_string, float.add, float.subtract, float.multiply, float.divide, float.remainder, float.to_string, float.copysign, float.equals, float.less_than, string.length, string.add, string.append_int, string.print, string.print_error, string.parse_int, string.parse_float, string.byte_at, string.from_codepoint, string.slice, string.equals, list.repeat, list.length, list.get, list.append, list.set or list.concat"
@@ -397,6 +400,19 @@ private pure func written_name_is(
         .and(name.span.end == end)
 
 
+-- A parameter that binds a name, spelled and placed as given; a discard binds none.
+private pure func parameter_name_is(
+    names: NameTable,
+    parameter: ParsedParameter,
+    spelling: String,
+    start: Int,
+    end: Int,
+) -> Bool:
+    match parameter.binder:
+        NamedBinder(name): written_name_is(names, name, spelling, start, end)
+        DiscardBinder(_): False
+
+
 private pure func rejects_identifier(source: String, start: Int, end: Int, message: String) -> Bool:
     rejects(source, start, end, message, IDENTIFIER_HELP)
 
@@ -442,13 +458,13 @@ pure func test_indent_alternatives_and_final_lf() -> Bool:
 
 pure func test_identifier_start_alternatives() -> Bool:
     accepts("func a()->Z:\n\t0", "a", 5, 6, "Z", 10, 11)
-        .and(accepts("func _n()->_t:\n\t0", "_n", 5, 7, "_t", 11, 13))
-        .and(accepts("func A()->z:\n\t0", "A", 5, 6, "z", 10, 11))
+        .and(accepts("func n()->_t:\n\t0", "n", 5, 6, "_t", 10, 12))
+        .and(accepts("func b()->z:\n\t0", "b", 5, 6, "z", 10, 11))
 
 
 pure func test_identifier_continuation_repetition() -> Bool:
     accepts("func a0()->Z_:\n\t0", "a0", 5, 7, "Z_", 11, 13)
-        .and(accepts("func A0_bZ9()->a9_Zb0:\n\t0", "A0_bZ9", 5, 11, "a9_Zb0", 15, 21))
+        .and(accepts("func a0_b9()->a9_Zb0:\n\t0", "a0_b9", 5, 10, "a9_Zb0", 14, 20))
         .and(accepts("func funcx()->func0:\n\t0", "funcx", 5, 10, "func0", 14, 19))
 
 
@@ -925,16 +941,14 @@ pure func test_parameter_and_nested_call_are_valid_syntax() -> Bool:
                                                         .and(function.function_name.span.start == 5)
                                                         .and(function.function_name.span.end == 6)
                                                         .and(
-                                                            (
-                                                                name_spelling(
-                                                                    program.names,
-                                                                    parameter.name.id,
-                                                                )
-                                                                == Some("value")
+                                                            parameter_name_is(
+                                                                program.names,
+                                                                parameter,
+                                                                "value",
+                                                                7,
+                                                                12,
                                                             ),
                                                         )
-                                                        .and(parameter.name.span.start == 7)
-                                                        .and(parameter.name.span.end == 12)
                                                         .and(
                                                             written_type_is(
                                                                 program.names,
@@ -1397,7 +1411,7 @@ private pure func unwrap_match_shape(names: NameTable, body: ParsedMatch) -> Boo
     match body.arms:
         [empty, number]:
             match empty.pattern:
-                PatternName(empty_name):
+                PatternVariantName(empty_name):
                     match number.pattern:
                         PatternConstructor(BareHead(number_name), [PatternName(field)], span):
                             match arm_base(empty):
@@ -1451,7 +1465,7 @@ private pure func unwrap_function_shape(names: NameTable, function: ParsedFuncti
                     unwrap_match_shape(names, body)
                         .and(function.purity == Pure)
                         .and(written_name_is(names, function.function_name, "unwrap", 43, 49))
-                        .and(written_name_is(names, parameter.name, "value", 50, 55))
+                        .and(parameter_name_is(names, parameter, "value", 50, 55))
                         .and(written_type_is(names, parameter.type_name, "Value", 57, 62))
                         .and(return_type_is(names, function.return_type, "Int", 67, 70))
                 _:
@@ -1598,7 +1612,7 @@ pure func test_pattern_alternatives_space_layout_and_following_union() -> Bool:
                                         6,
                                     ),
                                 )
-                                .and(written_name_is(program.names, parameter.name, "value", 7, 12))
+                                .and(parameter_name_is(program.names, parameter, "value", 7, 12))
                                 .and(
                                     written_type_is(
                                         program.names,
@@ -1755,9 +1769,9 @@ private pure func single_wildcard_match_is(source: String, eof: Int) -> Bool:
                                                             ),
                                                         )
                                                         .and(
-                                                            written_name_is(
+                                                            parameter_name_is(
                                                                 program.names,
-                                                                parameter.name,
+                                                                parameter,
                                                                 "value",
                                                                 7,
                                                                 12,
@@ -1836,14 +1850,7 @@ pure func test_match_and_wildcard_are_reserved_in_name_contexts() -> Bool:
         .and(rejects_keyword("func match() -> Int:\n\t0", 5, 10, "match"))
         .and(rejects_identifier("func main() -> _:\n\t0", 15, 16, "expected a return type"))
         .and(rejects_keyword("func main() -> match:\n\t0", 15, 20, "match"))
-        .and(
-            rejects_identifier(
-                "func f(_: Int) -> Int:\n\t0",
-                7,
-                8,
-                "expected a parameter name or ')'",
-            ),
-        )
+        .and(rejects_identifier("record R {\n\t_: Int,\n}", 12, 13, "expected a record field name"))
         .and(rejects_keyword("func f(match: Int) -> Int:\n\t0", 7, 12, "match"))
         .and(rejects_identifier("func f(x: _) -> Int:\n\t0", 10, 11, "expected a parameter type"))
         .and(rejects_keyword("func f(x: match) -> Int:\n\t0", 10, 15, "match"))
@@ -2616,22 +2623,19 @@ private pure func rejects_marked(
 
 
 pure func test_generic_parameter_names_are_validated_by_parser() -> Bool:
-    help = (
-        "start with a capital ASCII letter and use only ASCII letters and digits, such "
-        + "as T or Element2"
-    )
+    help = "write `T`"
     rejects_marked(
         "func f[",
         "t",
         "](value: t) -> t:\n\tvalue",
-        "invalid type parameter name",
+        "a type parameter is written in CapitalizedCamelCase",
         help,
     ).and(
         rejects_marked(
             "func f[",
             "T_",
             "](value: T_) -> T_:\n\tvalue",
-            "invalid type parameter name",
+            "a type parameter is written in CapitalizedCamelCase",
             help,
         ),
     )
@@ -2833,11 +2837,8 @@ pure func test_written_application_requires_nonempty_comma_separated_arguments()
                 "union Box[",
                 "t",
                 "]:\n\tValue",
-                "invalid type parameter name",
-                (
-                    "start with a capital ASCII letter and use only ASCII letters and digits, such "
-                    + "as T or Element2"
-                ),
+                "a type parameter is written in CapitalizedCamelCase",
+                "write `T`",
             ),
         )
 
@@ -3035,7 +3036,7 @@ pure func test_comparison_production_rejects_a_second_symbol() -> Bool:
     )
 
 
-tests: TestSuite = {
+TESTS: TestSuite = {
     description = "Blorp EBNF syntax conformance",
     tests = [
         (

@@ -6,6 +6,22 @@ import:
     result: Result methods
     string: from_codepoint, String methods
     ./names: ContextualWords, NameId, NameTable
+    ./naming:
+        NameRole(
+            DeclaredType,
+            DeclaredVariant,
+            DeclaredTrait,
+            DeclaredTypeParameter,
+            DeclaredConstant,
+            DeclaredFunction,
+            DeclaredParameter,
+            DeclaredLocal,
+            DeclaredField,
+            DeclaredImportAlias,
+        ),
+        accepts,
+        misnamed_help,
+        misnamed_message,
     ./source: ModuleId
     ./syntax:
         Diagnostic,
@@ -102,9 +118,11 @@ import:
         ParsedFunctionGroup(FreeFunction, ImplementationGroup),
         ParsedMatchArm,
         ParsedOpaque,
+        ParsedField,
         ParsedParameter,
         ParsedPattern(
             PatternName,
+            PatternVariantName,
             PatternWildcard,
             PatternConstructor,
             PatternOr,
@@ -227,6 +245,7 @@ import:
             StringEnd,
             CharLiteral,
         ),
+        NameForm(CapitalizedCamel, LowerSnake, Malformed, SingleCapitalWord, UpperSnake),
         StringForm(QuotedStringForm, PipeStringForm),
         TypeSyntax(AtomicType, AppliedType, QualifiedType, CallableTypeSyntax, TupleTypeSyntax),
         UTF8_CONTINUATION_END,
@@ -300,7 +319,7 @@ union ImportSelection:
     MethodsSelection(WrittenName, Span)
 
 
--- `alias` is the module alias written as `path as Alias`; its selections may
+-- `alias` is the module alias written as `path as alias`; its selections may
 -- be empty.
 record ParsedImport {
     path: ModulePath,
@@ -349,7 +368,7 @@ private IMPORT_IN_BODY_MESSAGE: String = "imports belong at module scope"
 private IMPORT_IN_BODY_HELP: String = "move import: and its selected functions before the module's declarations at column 1"
 
 
-private IDENTIFIER_HELP: String = "use an ASCII identifier starting with a letter or underscore; keywords and lone '_' are reserved"
+private IDENTIFIER_HELP: String = "use an ASCII identifier starting with a letter; keywords and lone '_' are reserved"
 
 
 private EXPRESSION_HELP: String = "use a literal, a parameter or variant name, or a call as the entire body"
@@ -372,15 +391,13 @@ private MAX_UNICODE_HEX_DIGITS: Int = 6
 
 private HEX_RADIX: Int = 16
 
--- ASCII codes used by literal decoding and type-parameter classification.
+-- ASCII codes used by literal decoding.
 private ZERO_BYTE: Int = 48
 private NINE_BYTE: Int = 57
 private UPPER_A_BYTE: Int = 65
 private UPPER_F_BYTE: Int = 70
-private UPPER_Z_BYTE: Int = 90
 private LOWER_A_BYTE: Int = 97
 private LOWER_F_BYTE: Int = 102
-private LOWER_Z_BYTE: Int = 122
 private LOWER_N_BYTE: Int = 110
 private LOWER_R_BYTE: Int = 114
 private LOWER_T_BYTE: Int = 116
@@ -670,7 +687,7 @@ private pure func at_word(state: ParserState, word: NameId) -> Bool:
     match state.current_token():
         Some(token):
             match token.kind:
-                IdentifierToken(id): id == word
+                IdentifierToken(id, _): id == word
                 _: False
         None:
             False
@@ -680,7 +697,7 @@ private pure func at_identifier(state: ParserState) -> Bool:
     match state.current_token():
         Some(token):
             match token.kind:
-                IdentifierToken(_): True
+                IdentifierToken(_, _): True
                 _: False
         None:
             False
@@ -834,21 +851,30 @@ private pure func statement_as_value(state: ParserState, message: String) -> Dia
     )
 
 
+-- A name as written, with the form the lexer classified it in.
 private record ParsedName {
     name: WrittenName,
+    form: NameForm,
     next: ParserState,
 }
 
 
-private pure func consume_name(
+-- A name that refers to a declaration made elsewhere: it needs no check, since
+-- the declaration passed its own. A name this parser declares goes through
+-- `consume_declared_name` instead, which takes the role it declares.
+private pure func consume_used_name(
     state: ParserState,
     message: String,
 ) -> Result[ParsedName, Diagnostic]:
     match state.current_token():
         Some(token):
             match token.kind:
-                IdentifierToken(id):
-                    Ok({ name = { id = id, span = token.span }, next = state.shifted(1) })
+                IdentifierToken(id, form):
+                    Ok({
+                        name = { id = id, span = token.span },
+                        form = form,
+                        next = state.shifted(1),
+                    })
                 SymbolToken(AtSign):
                     Err(misplaced_annotation(state))
                 KeywordToken(_):
@@ -863,6 +889,42 @@ private pure func consume_name(
             Err(expected_syntax(state, message, IDENTIFIER_HELP))
 
 
+-- The one place a declared name's form is checked against its role.
+private pure func check_declared_name(
+    names: NameTable,
+    role: NameRole,
+    name: WrittenName,
+    form: NameForm,
+) -> Result[Void, Diagnostic]:
+    if role.accepts(form):
+        Ok(void)
+    else:
+        Err(
+            diagnostic(
+                name.span,
+                role.misnamed_message(),
+                role.misnamed_help(names.spelling_of(name.id)),
+            ),
+        )
+
+
+-- Every ID came from the lexed table, so the empty default never applies.
+private pure func spelling_of(names: NameTable, id: NameId) -> String:
+    names
+        .name_spelling(id)
+        .get_or("")
+
+
+private pure func consume_declared_name(
+    state: ParserState,
+    role: NameRole,
+    message: String,
+) -> Result[ParsedName, Diagnostic]:
+    name ?= state.consume_used_name(message)
+    _: Void ?= state.input.names.check_declared_name(role, name.name, name.form)
+    Ok(name)
+
+
 private record BinderResult {
     binder: ParsedBinder,
     next: ParserState,
@@ -872,12 +934,13 @@ private record BinderResult {
 -- `_` or a name (the host's binder_name).
 private pure func consume_binder(
     state: ParserState,
+    role: NameRole,
     message: String,
 ) -> Result[BinderResult, Diagnostic]:
     if state.at_wildcard():
         Ok({ binder = DiscardBinder(state.parser_span()), next = state.shifted(1) })
     else:
-        match state.consume_name(message):
+        match state.consume_declared_name(role, message):
             Ok(name): Ok({ binder = NamedBinder(name.name), next = name.next })
             Err(error): Err(error)
 
@@ -1418,7 +1481,7 @@ private pure func is_module_alias(state: ParserState, id: NameId) -> Bool:
 private pure func consume_qualified(module: ParsedName) -> Result[ParsedBase, Diagnostic]:
     member ?= module.next
         .shifted(1)
-        .consume_name("expected a name after the module alias and '.'")
+        .consume_used_name("expected a name after the module alias and '.'")
     qualified: ParsedQualified = { module = module.name, name = member.name }
 
     if member.next.at_left_paren():
@@ -1440,7 +1503,7 @@ private pure func consume_qualified(module: ParsedName) -> Result[ParsedBase, Di
 
 
 private pure func consume_name_or_call(start: ParserState) -> Result[ParsedBase, Diagnostic]:
-    name ?= start.consume_name("expected a value name")
+    name ?= start.consume_used_name("expected a value name")
     after_dot = name.next.shifted(1)
 
     if name.next.at_left_paren():
@@ -1648,7 +1711,7 @@ private pure func consume_base(start: ParserState, token: Token) -> Result[Parse
                     "use a one-character String literal such as \"a\"",
                 ),
             )
-        IdentifierToken(_):
+        IdentifierToken(_, _):
             start.consume_name_or_call()
         KeywordToken(IntoOpaqueKeyword):
             start.consume_opaque_conversion(Wrapping)
@@ -1692,7 +1755,7 @@ private pure func consume_opaque_conversion(
     keyword = state.parser_span()
     name ?= state
         .shifted(1)
-        .consume_name("expected an opaque type name")
+        .consume_used_name("expected an opaque type name")
     -- Blorp has no explicit type arguments: the operand and the expected type supply them.
     _: Void ?= if name.next.at_left_bracket():
         Err(
@@ -1731,7 +1794,17 @@ private record ParsedPostfix {
 
 -- `state` follows the dot.
 private pure func consume_postfix(state: ParserState) -> Result[ParsedPostfix, Diagnostic]:
-    name ?= state.consume_name("expected a field or function name after '.'")
+    name ?= state.consume_used_name("expected a field or function name after '.'")
+    _: Void ?= if DeclaredField.accepts(name.form):
+        Ok(void)
+    else:
+        Err(
+            diagnostic(
+                name.name.span,
+                "fields and methods are lower_snake_case",
+                DeclaredField.misnamed_help(state.input.names.spelling_of(name.name.id)),
+            ),
+        )
 
     if name.next.at_left_paren():
         match name.next.consume_call_arguments():
@@ -2404,12 +2477,12 @@ private pure func consume_lambda(start: ParserState) -> Result[ParsedValue, Diag
     })
 
 
-private LAMBDA_PARAMETER_HELP: String = "write an identifier here; it starts with a letter or `_` and is not a reserved keyword"
+private LAMBDA_PARAMETER_HELP: String = "write an identifier here; it starts with a letter, or is `_`, and is not a reserved keyword"
 
 
 -- A name or `_`, then an optional annotation.
 private pure func consume_lambda_parameter(
-    _count: Int,
+    count: Int,
     state: ParserState,
 ) -> Result[ParsedItem[LambdaParameter], Diagnostic]:
     binder ?= state.consume_lambda_binder()
@@ -2429,7 +2502,7 @@ private pure func consume_lambda_binder(state: ParserState) -> Result[BinderResu
             .or(state.at_identifier())
             .or(state.at_any_keyword())
     ):
-        state.consume_binder("expected lambda parameter")
+        state.consume_binder(DeclaredParameter, "expected lambda parameter")
     else:
         Err(expected_syntax(state, "expected lambda parameter", LAMBDA_PARAMETER_HELP))
 
@@ -2667,13 +2740,16 @@ private TUPLE_BINDER_ANNOTATION_HELP: String = "annotate the tuple value before 
 -- line is parsed once, then '=' distinguishes declaration from expression.
 -- This avoids rescanning tokens or recovering binders from expression shapes.
 private union EnclosedMember:
-    BareMember(ParsedBinder)
+    -- A name or `_` that may turn out to be a destructuring binder: its form is
+    -- kept so the declaration can be checked once '=' shows it is one.
+    BareMember(WrittenName, NameForm)
+    BareDiscard(Span)
     ValueMember(ValueExpression)
 
 
 private pure func enclosed_value(member: EnclosedMember) -> Result[ValueExpression, Diagnostic]:
     match member:
-        BareMember(NamedBinder(name)):
+        BareMember(name, _):
             Ok({
                 base = NameExpression(name),
                 base_span = name.span,
@@ -2681,7 +2757,7 @@ private pure func enclosed_value(member: EnclosedMember) -> Result[ValueExpressi
                 parentheses = [],
                 span = name.span,
             })
-        BareMember(DiscardBinder(span)):
+        BareDiscard(span):
             Err(diagnostic(span, DISCARD_VALUE_MESSAGE, DISCARD_VALUE_HELP))
         ValueMember(value):
             Ok(value)
@@ -2717,8 +2793,12 @@ private pure func consume_enclosed_member(
 private pure func consume_bare_member(
     state: ParserState,
 ) -> Result[ParsedItem[EnclosedMember], Diagnostic]:
-    binder ?= state.consume_binder("expected a tuple element")
-    Ok({ item = BareMember(binder.binder), next = binder.next })
+    if state.at_wildcard():
+        Ok({ item = BareDiscard(state.parser_span()), next = state.shifted(1) })
+    else:
+        match state.consume_used_name("expected a tuple element"):
+            Ok(name): Ok({ item = BareMember(name.name, name.form), next = name.next })
+            Err(error): Err(error)
 
 
 private union EnclosedContents:
@@ -2806,8 +2886,8 @@ private pure func consume_tuple_element(
     member ?= state.consume_enclosed_member()
     if count == TUPLE_MAXIMUM_ELEMENTS:
         span = match member.item:
-            BareMember(NamedBinder(name)): name.span
-            BareMember(DiscardBinder(span)): span
+            BareMember(name, _): name.span
+            BareDiscard(span): span
             ValueMember(value): value.span
         Err(diagnostic(span, "tuples support two to four elements", TUPLE_SIZE_HELP))
     else:
@@ -3055,13 +3135,13 @@ private pure func consume_named_type(
     state: ParserState,
     message: String,
 ) -> Result[ParsedType, Diagnostic]:
-    name ?= state.consume_name(message)
+    name ?= state.consume_used_name(message)
 
     if name.next.at_dot():
         match (
             name.next
                 .shifted(1)
-                .consume_name("expected a type name after the module alias and '.'")
+                .consume_used_name("expected a type name after the module alias and '.'")
         ):
             Ok(member):
                 match member.next.consume_optional_type_arguments(member.name.span.end):
@@ -3115,18 +3195,22 @@ private record ParameterResult {
 }
 
 
+-- `name: Type` or `_: Type`.
 private pure func consume_parameter(
     state: ParserState,
     message: String,
 ) -> Result[ParameterResult, Diagnostic]:
-    name ?= state.consume_name(message)
-    after_colon ?= name.next.expect(
-        name.next.at_colon(),
+    binder ?= state.consume_binder(DeclaredParameter, message)
+    after_colon ?= binder.next.expect(
+        binder.next.at_colon(),
         "expected ':' after the parameter name",
         "write each parameter as name: Type",
     )
     type_name ?= after_colon.consume_type("expected a parameter type")
-    Ok({ parameter = { name = name.name, type_name = type_name.written }, next = type_name.next })
+    Ok({
+        parameter = { binder = binder.binder, type_name = type_name.written },
+        next = type_name.next,
+    })
 
 
 private record ParsedParameters {
@@ -3135,7 +3219,6 @@ private record ParsedParameters {
 }
 
 
--- Parses `name: Type { , name: Type }` for function parameters and record fields.
 private pure func consume_parameter_list(
     state: ParserState,
     message: String,
@@ -3147,6 +3230,37 @@ private pure func consume_parameter_list(
     match parameter.next.list_separator():
         ListContinues(next): next.consume_parameter_list(message, gathered)
         ListEnds(next): Ok({ parameters = gathered, next = next })
+
+
+private record FieldResult {
+    field: ParsedField,
+    next: ParserState,
+}
+
+
+private record ParsedFields {
+    fields: List[ParsedField],
+    next: ParserState,
+}
+
+
+-- `name: Type { , name: Type }` in a record declaration.
+private pure func consume_field_list(
+    state: ParserState,
+    fields: List[ParsedField],
+) -> Result[ParsedFields, Diagnostic]:
+    name ?= state.consume_declared_name(DeclaredField, "expected a record field name")
+    after_colon ?= name.next.expect(
+        name.next.at_colon(),
+        "expected ':' after the field name",
+        "write each field as name: Type",
+    )
+    type_name ?= after_colon.consume_type("expected a field type")
+    gathered = fields.append({ name = name.name, type_name = type_name.written })
+
+    match type_name.next.list_separator():
+        ListContinues(next): next.consume_field_list(gathered)
+        ListEnds(next): Ok({ fields = gathered, next = next })
 
 
 private pure func consume_parameters(start: ParserState) -> Result[ParsedParameters, Diagnostic]:
@@ -3191,7 +3305,7 @@ private pure func consume_pattern_fields(state: ParserState) -> Result[PatternFi
 
 
 private pure func consume_pattern_field(
-    _count: Int,
+    count: Int,
     state: ParserState,
 ) -> Result[ParsedItem[ParsedPattern], Diagnostic]:
     field ?= state.consume_pattern()
@@ -3223,7 +3337,7 @@ private pure func consume_spread(state: ParserState) -> Result[ParsedSpread, Dia
     if state.at_wildcard():
         Ok({ target = SpreadWildcard(state.parser_span()), next = state.shifted(1) })
     else:
-        match state.consume_name("expected a name or '_' after '...'"):
+        match state.consume_declared_name(DeclaredLocal, "expected a name or '_' after '...'"):
             Ok(name): Ok({ target = SpreadName(name.name), next = name.next })
             Err(error): Err(error)
 
@@ -3477,13 +3591,13 @@ private pure func consume_named_alternative(
     state: ParserState,
     message: String,
 ) -> Result[PatternResult, Diagnostic]:
-    name ?= state.consume_name(message)
+    name ?= state.consume_used_name(message)
 
     if name.next.at_dot():
         match (
             name.next
                 .shifted(1)
-                .consume_name("expected a constructor name after the module alias and '.'")
+                .consume_used_name("expected a constructor name after the module alias and '.'")
         ):
             Ok(member):
                 head: PatternHead = QualifiedHead({ module = name.name, name = member.name })
@@ -3502,7 +3616,19 @@ private pure func consume_named_alternative(
     else if name.next.at_left_paren():
         name.next.consume_constructor_pattern(name.name.span, BareHead(name.name))
     else:
-        Ok({ pattern = PatternName(name.name), span = name.name.span, next = name.next })
+        -- A capitalized bare name is a variant; any other form can only be a binder.
+        if DeclaredVariant.accepts(name.form):
+            Ok({ pattern = PatternVariantName(name.name), span = name.name.span, next = name.next })
+        else:
+            match state.input.names.check_declared_name(DeclaredLocal, name.name, name.form):
+                Ok(_):
+                    Ok({
+                        pattern = PatternName(name.name),
+                        span = name.name.span,
+                        next = name.next,
+                    })
+                Err(error):
+                    Err(error)
 
 
 -- A pattern is one alternative, or several separated by '|', which span
@@ -3689,11 +3815,11 @@ private pure func consume_binding(state: ParserState) -> Result[LineForm, Diagno
         )
     else:
         if mutable:
-            match after_keyword.consume_name("expected a binding name"):
+            match after_keyword.consume_declared_name(DeclaredLocal, "expected a binding name"):
                 Ok(name): Ok({ binder = NamedBinder(name.name), next = name.next })
                 Err(error): Err(error)
         else:
-            after_keyword.consume_binder("expected a binding name")
+            after_keyword.consume_binder(DeclaredLocal, "expected a binding name")
     annotation ?= target.next.consume_optional_annotation("expected the binding's type after ':'")
     binder_span = match target.binder:
         NamedBinder(name): name.span
@@ -3799,8 +3925,19 @@ private pure func tuple_declaration_binders(
             var failure: Option[Diagnostic] = None
             for member in members:
                 match member:
-                    BareMember(binder):
-                        binders = binders.append(binder)
+                    BareMember(name, form):
+                        match enclosed.next.input.names.check_declared_name(
+                            DeclaredLocal,
+                            name,
+                            form,
+                        ):
+                            Ok(_):
+                                binders = binders.append(NamedBinder(name))
+                            Err(error):
+                                failure = Some(error)
+                                break
+                    BareDiscard(span):
+                        binders = binders.append(DiscardBinder(span))
                     ValueMember(value):
                         failure = Some(diagnostic(value.span, FLAT_TUPLE_MESSAGE, FLAT_TUPLE_HELP))
                         break
@@ -4008,7 +4145,7 @@ private pure func consume_for_binder(state: ParserState) -> Result[ForBinderResu
     if state.at_left_paren():
         state.consume_tuple_for_binder()
     else:
-        match state.consume_binder("expected a loop variable after `for`"):
+        match state.consume_binder(DeclaredLocal, "expected a loop variable after `for`"):
             Ok(binder): Ok({ binder = SingleForBinder(binder.binder), next = binder.next })
             Err(error): Err(error)
 
@@ -4040,7 +4177,7 @@ private pure func consume_tuple_binder(
     if state.at_left_paren():
         Err(expected_syntax(state, FLAT_TUPLE_MESSAGE, FLAT_TUPLE_HELP))
     else:
-        match state.consume_binder(FLAT_TUPLE_MESSAGE):
+        match state.consume_binder(DeclaredLocal, FLAT_TUPLE_MESSAGE):
             Err(error):
                 Err(error)
             Ok(binder):
@@ -4596,61 +4733,17 @@ private pure func consume_builtin_lines(
         Err(builtin_not_alone(state))
 
 
--- A capital ASCII letter followed by ASCII letters and digits.
-private pure func valid_type_parameter_name(spelling: String) -> Bool:
-    var valid = spelling.length() > 0
-    var position = 0
-    while valid.and(position < spelling.length()):
-        valid = match spelling.byte_at(position):
-            Some(byte):
-                upper = (byte >= UPPER_A_BYTE).and(byte <= UPPER_Z_BYTE)
-                lower = (byte >= LOWER_A_BYTE).and(byte <= LOWER_Z_BYTE)
-                digit = (byte >= ZERO_BYTE).and(byte <= NINE_BYTE)
-                upper.or((position > 0).and(lower.or(digit)))
-            None:
-                False
-        position = position + 1
-    valid
-
-
 private pure func consume_type_parameter(state: ParserState) -> Result[ParsedName, Diagnostic]:
-    match state.current_token():
-        Some(token):
-            match token.kind:
-                IdentifierToken(id):
-                    -- The capital rule reads the spelling by ID until the lexer
-                    -- distinguishes upper and lower identifiers. Every ID came
-                    -- from the lexed table, so the `None` arm never runs.
-                    valid = match state.input.names.name_spelling(id):
-                        Some(spelling): spelling.valid_type_parameter_name()
-                        None: False
-
-                    if valid:
-                        state.consume_name("expected a type parameter name")
-                    else:
-                        Err(
-                            diagnostic(
-                                token.span,
-                                "invalid type parameter name",
-                                "start with a capital ASCII letter and use only ASCII letters and digits, such as T or Element2",
-                            ),
-                        )
-                _:
-                    Err(
-                        expected_syntax(
-                            state,
-                            "expected a type parameter name",
-                            "declare type parameters separated by commas, such as [A, B]",
-                        ),
-                    )
-        None:
-            Err(
-                expected_syntax(
-                    state,
-                    "expected a type parameter name",
-                    "declare type parameters separated by commas, such as [A, B]",
-                ),
-            )
+    if state.at_identifier():
+        state.consume_declared_name(DeclaredTypeParameter, "expected a type parameter name")
+    else:
+        Err(
+            expected_syntax(
+                state,
+                "expected a type parameter name",
+                "declare type parameters separated by commas, such as [A, B]",
+            ),
+        )
 
 
 private record TypeParameterList {
@@ -4777,7 +4870,7 @@ private pure func consume_signature(start: ParserState) -> Result[HeaderResult, 
                 "expected a function declaration at column 1",
                 "start with func main() -> Int:",
             )
-    function ?= after_func.consume_name("expected a function name")
+    function ?= after_func.consume_declared_name(DeclaredFunction, "expected a function name")
     type_parameters ?= function.next.consume_type_parameters()
     after_open ?= type_parameters.next.expect(
         type_parameters.next.at_left_paren(),
@@ -5088,7 +5181,7 @@ private pure func consume_trait(
 ) -> Result[TraitResult, Diagnostic]:
     name ?= start
         .shifted(1)
-        .consume_name("expected a trait name")
+        .consume_declared_name(DeclaredTrait, "expected a trait name")
     _: Void ?= if name.next.at_left_bracket():
         Err(
             expected_syntax(
@@ -5172,12 +5265,12 @@ private record ReceiverHeadResult {
 private pure func consume_receiver_head(
     state: ParserState,
 ) -> Result[ReceiverHeadResult, Diagnostic]:
-    name ?= state.consume_name("expected a named implementation receiver")
+    name ?= state.consume_used_name("expected a named implementation receiver")
     if name.next.at_dot():
         match (
             name.next
                 .shifted(1)
-                .consume_name("expected a receiver type after the module alias and '.'")
+                .consume_used_name("expected a receiver type after the module alias and '.'")
         ):
             Ok(member):
                 Ok({
@@ -5280,7 +5373,7 @@ private record VariantResult {
 
 
 private pure func consume_variant(state: ParserState) -> Result[VariantResult, Diagnostic]:
-    name ?= state.consume_name("expected a union variant name")
+    name ?= state.consume_declared_name(DeclaredVariant, "expected a union variant name")
 
     if name.next.at_left_paren():
         var current = name.next.shifted(1)
@@ -5396,7 +5489,7 @@ private pure func consume_union(
 ) -> Result[UnionResult, Diagnostic]:
     name ?= start
         .shifted(1)
-        .consume_name("expected a union type name")
+        .consume_declared_name(DeclaredType, "expected a union type name")
     type_parameters ?= name.next.consume_type_parameters()
     _: Void ?= name.next.reject_fixed_type_parameters(type_parameters, fixed, "union")
     colon ?= type_parameters.next.expect(
@@ -5439,7 +5532,7 @@ private pure func consume_literal_fields(
     state: ParserState,
     fields: List[ParsedRecordField],
 ) -> Result[ParsedLiteralFields, Diagnostic]:
-    name ?= state.consume_name("expected a record field name")
+    name ?= state.consume_used_name("expected a record field name")
     after_equals ?= name.next.expect(
         name.next.at_equals(),
         "expected '=' after the record field name",
@@ -5629,7 +5722,7 @@ private pure func consume_record(
 ) -> Result[ParsedRecordResult, Diagnostic]:
     name ?= start
         .shifted(1)
-        .consume_name("expected a record type name")
+        .consume_declared_name(DeclaredType, "expected a record type name")
     type_parameters ?= name.next.consume_type_parameters()
     _: Void ?= name.next.reject_fixed_type_parameters(type_parameters, fixed, "record")
     opened: ParserState ?= match type_parameters.next.current_symbol():
@@ -5643,7 +5736,7 @@ private pure func consume_record(
                     "write record Name { field: Int }",
                 ),
             )
-    fields ?= opened.consume_parameter_list("expected a record field name", [])
+    fields ?= opened.consume_field_list([])
     closed ?= fields.next.expect(
         fields.next.at_right_brace(),
         "expected '}' after the record declaration",
@@ -5657,7 +5750,7 @@ private pure func consume_record(
             visibility = visibility,
             type_name = name.name,
             type_parameters = type_parameters.parameters,
-            fields = fields.parameters,
+            fields = fields.fields,
             fixed = fixed,
         },
         next = next,
@@ -5680,7 +5773,10 @@ private pure func consume_list_parameter(state: ParserState) -> Result[ParsedNam
         "List requires one type parameter",
         "write type List[T] = builtin",
     )
-    parameter ?= opened.consume_name("expected the List type parameter")
+    parameter ?= opened.consume_declared_name(
+        DeclaredTypeParameter,
+        "expected the List type parameter",
+    )
     closed ?= parameter.next.expect(
         parameter.next.at_right_bracket(),
         "List requires exactly one type parameter",
@@ -5710,7 +5806,7 @@ private pure func unknown_builtin_type(state: ParserState) -> Diagnostic:
 private pure func consume_builtin_type(start: ParserState) -> Result[BuiltinTypeResult, Diagnostic]:
     after_type ?= start.expect(start.at_type_keyword(), "expected 'type'", DECLARATION_WORD_HELP)
     name ?= if after_type.at_identifier():
-        after_type.consume_name("expected a builtin type name")
+        after_type.consume_declared_name(DeclaredType, "expected a builtin type name")
     else:
         Err(unknown_builtin_type(after_type))
     head ?= after_type.consume_builtin_head(name)
@@ -5785,7 +5881,7 @@ private pure func consume_path_parts(
         )
     else:
         Ok(void)
-    part ?= state.consume_name("expected a module name in the import path")
+    part ?= state.consume_used_name("expected a module name in the import path")
     gathered = parts.append(part.name.id)
 
     if part.next.at_slash():
@@ -5915,7 +6011,7 @@ private pure func consume_constructor_names(
     state: ParserState,
     names: List[WrittenName],
 ) -> Result[NameList, Diagnostic]:
-    name ?= state.consume_name("expected an imported constructor name")
+    name ?= state.consume_used_name("expected an imported constructor name")
     _: Void ?= match names.listed_at(name.name):
         Some(first):
             Err(
@@ -6022,7 +6118,7 @@ private pure func consume_import_symbol(
                 ),
             )
         _:
-            match state.consume_name("expected an imported function or type name"):
+            match state.consume_used_name("expected an imported function or type name"):
                 Ok(name):
 
                     if name.next.at_as():
@@ -6030,7 +6126,7 @@ private pure func consume_import_symbol(
                             expected_syntax(
                                 name.next,
                                 "selection aliases are not supported yet",
-                                "select the name by its declared spelling, such as ./helper: answer; a module alias is written path as Alias",
+                                "select the name by its declared spelling, such as ./helper: answer; a module alias is written path as alias",
                             ),
                         )
                     else if name.next.at_left_paren():
@@ -6139,7 +6235,7 @@ private record ParsedAlias {
 }
 
 
--- `path as Alias` names the module; the alias joins the parser's alias set.
+-- `path as alias` names the module; the alias joins the parser's alias set.
 private pure func consume_module_alias(state: ParserState) -> Result[ParsedAlias, Diagnostic]:
     if (
         state
@@ -6151,7 +6247,10 @@ private pure func consume_module_alias(state: ParserState) -> Result[ParsedAlias
         match (
             state
                 .shifted(1)
-                .consume_name("expected a module alias name after 'as'")
+                .consume_declared_name(
+                    DeclaredImportAlias,
+                    "expected a module alias name after 'as'",
+                )
         ):
             Ok(name):
                 Ok({
@@ -6162,7 +6261,7 @@ private pure func consume_module_alias(state: ParserState) -> Result[ParsedAlias
                 Err(error)
 
 
--- A row is `path: selections`, `path as Alias`, or `path as Alias: selections`.
+-- A row is `path: selections`, `path as alias`, or `path as alias: selections`.
 private pure func consume_import_row(start: ParserState) -> Result[ImportResult, Diagnostic]:
     path ?= start.consume_module_path()
     _: Void ?= if path.next.at_dot():
@@ -6200,7 +6299,7 @@ private pure func consume_import_row(start: ParserState) -> Result[ImportResult,
             Some(module_alias):
                 match aliased.next.consume_line_end(
                     "expected a newline after the module alias",
-                    "write path as Alias, or path as Alias: followed by selected names",
+                    "write path as alias, or path as alias: followed by selected names",
                 ):
                     Ok(next):
                         Ok({
@@ -6288,7 +6387,7 @@ private pure func consume_constant(
     module: ModuleId,
     visibility: Visibility,
 ) -> Result[ParsedConstantResult, Diagnostic]:
-    name ?= start.consume_name("expected a constant name")
+    name ?= start.consume_declared_name(DeclaredConstant, "expected a constant name")
     colon ?= name.next.expect(
         name.next.at_colon(),
         "expected ':' after the constant name",
@@ -6342,7 +6441,7 @@ private pure func consume_opaque(
                 OPAQUE_DECLARATION_HELP,
             ),
         )
-    name ?= type_word.consume_name("expected an opaque type name")
+    name ?= type_word.consume_declared_name(DeclaredType, "expected an opaque type name")
     type_parameters ?= name.next.consume_type_parameters()
     equals ?= type_parameters.next.expect(
         type_parameters.next.at_equals(),

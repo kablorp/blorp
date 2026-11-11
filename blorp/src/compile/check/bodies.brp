@@ -11,6 +11,7 @@ import:
     ../../syntax/source: ModuleId
     ../../syntax/syntax:
         ParsedBinding,
+        binder_span,
         ParsedPropagation,
         compiler_span,
         ExpressionBase(MatchExpression, IfExpression, VoidExpression, RangeExpression),
@@ -127,7 +128,7 @@ import:
         CheckedConstant,
         BindingDefinition,
         BindingId,
-        BindingOrigin(BodyLocal, MatchCapture, ParameterBinding),
+        BindingOrigin(BodyLocal, MatchCapture, ParameterBinding, CallableParameterBinding),
         CallTarget(RuntimeFunction),
         CheckedArm,
         CheckedBody(CheckedMatchBody, CheckedValueBody),
@@ -172,7 +173,7 @@ import:
         UnionOccurrence,
         callable_parameter,
         binding_id,
-    ./patterns as Patterns: ParsedPattern methods, TypeRef methods
+    ./patterns as patterns: ParsedPattern methods, TypeRef methods
     ./recursion: check_execution
     ./scope:
         ScopedValue(DataLocal, CallableLocal),
@@ -186,7 +187,7 @@ import:
 
 
 private record MatchContext {
-    subject: Patterns.PatternSubject,
+    subject: patterns.PatternSubject,
     scope: List[ScopedValue],
 }
 
@@ -239,7 +240,7 @@ private pure func start_match(
 
 
 private record ResolvedArmPrefix {
-    rows: List[Patterns.PatternRow],
+    rows: List[patterns.PatternRow],
     inputs: List[BindingId],
     block: ResolvedStatements,
 }
@@ -248,7 +249,7 @@ private record ResolvedArmPrefix {
 private pure func resolve_arm_prefix(
     arm: ParsedMatchArm,
     match_context: MatchContext,
-    previous: List[Patterns.PatternRow],
+    previous: List[patterns.PatternRow],
     id: MatchArmId,
     bindings: List[BindingDefinition],
     context: ResolutionContext,
@@ -297,7 +298,7 @@ private pure func resolve_match(
         },
         context,
     )
-    selected ?= Patterns.finish_selection(
+    selected ?= patterns.finish_selection(
         resolved.cases,
         started.match_context.subject,
         body.keyword_span,
@@ -356,7 +357,7 @@ private record ResolvedValue {
 private record JoinProgress {
     lambdas: List[LambdaRow],
     arms: List[CheckedJoinArm],
-    cases: List[Patterns.PatternRow],
+    cases: List[patterns.PatternRow],
     bindings: List[BindingDefinition],
     expectation: ValueExpectation,
     reassigned: List[BindingId],
@@ -531,7 +532,7 @@ private pure func resolve_join(
         },
         context,
     )
-    selected ?= Patterns.finish_selection(
+    selected ?= patterns.finish_selection(
         resolved.cases,
         started.match_context.subject,
         body.keyword_span,
@@ -633,62 +634,98 @@ private pure func resolve_join_arms(
                     Err(error)
 
 
+-- What the parameters bind: the names the body can see, and every parameter's
+-- definition in runtime order, including each discarded `_`.
+private record ParameterScope {
+    scope: List[ScopedValue],
+    definitions: List[BindingDefinition],
+}
+
+
 -- The signature was resolved from these parameters, one type each.
 private pure func parameter_scope(
     parameters: List[ParsedParameter],
     types: List[TypeUse],
     scope: List[ScopedValue],
     context: ResolutionContext,
-) -> Result[List[ScopedValue], CheckError]:
+) -> Result[ParameterScope, CheckError]:
     var resolved = scope
-    var data_ordinal = 0
+    var definitions: List[BindingDefinition] = []
     var position = 0
     var failure: Option[CheckError] = None
     for parameter in parameters:
         match types.get(position):
             None:
                 failure = Some(
-                    checker_invariant(parameter.name.span, InvalidResolvedParameter(position)),
+                    checker_invariant(
+                        parameter.binder.binder_span(),
+                        InvalidResolvedParameter(position),
+                    ),
                 )
             Some(value_type):
-                binding_result = match value_type.value_type:
-                    CallableType(_, _, _):
-                        accepted = resolved.bind_callable(
-                            context.namespace,
-                            context.module,
-                            parameter.name,
-                            callable_parameter(context.root_function, position),
-                            value_type,
-                            context.caller.body,
-                            binding_id(data_ordinal),
-                        )
-                        data_ordinal = data_ordinal + 1
-                        accepted
-                    _:
-                        definition: BindingDefinition = {
-                            origin = ParameterBinding(data_ordinal),
+                data_ordinal = definitions.length()
+                match parameter.binder:
+                    DiscardBinder(span):
+                        -- A function-typed formal keeps its callable identity even when
+                        -- unnamed, so call sites erase or pass its argument as for any other.
+                        origin: BindingOrigin = match value_type.value_type:
+                            CallableType(_, _, _):
+                                CallableParameterBinding(
+                                    callable_parameter(context.root_function, position),
+                                )
+                            _:
+                                ParameterBinding(data_ordinal)
+                        definitions = definitions.append({
+                            origin = origin,
                             mutable = False,
                             value_type = value_type.value_type,
-                            span = parameter.name.span,
-                        }
-                        data_ordinal = data_ordinal + 1
-                        resolved.bind_local(
-                            context.namespace,
-                            context.module,
-                            context.caller.body,
-                            parameter.name,
-                            binding_id(data_ordinal - 1),
-                            definition,
-                        )
-                match binding_result:
-                    Ok(binding): resolved = resolved.append(binding)
-                    Err(error): failure = Some(error)
+                            span = span,
+                        })
+                    NamedBinder(name):
+                        binding_result = match value_type.value_type:
+                            CallableType(_, _, _):
+                                resolved.bind_callable(
+                                    context.namespace,
+                                    context.module,
+                                    name,
+                                    callable_parameter(context.root_function, position),
+                                    value_type,
+                                    context.caller.body,
+                                    binding_id(data_ordinal),
+                                )
+                            _:
+                                resolved.bind_local(
+                                    context.namespace,
+                                    context.module,
+                                    context.caller.body,
+                                    name,
+                                    binding_id(data_ordinal),
+                                    {
+                                        origin = ParameterBinding(data_ordinal),
+                                        mutable = False,
+                                        value_type = value_type.value_type,
+                                        span = name.span,
+                                    },
+                                )
+                        match binding_result:
+                            Ok(binding):
+                                resolved = resolved.append(binding)
+                                definition = match binding:
+                                    DataLocal(data):
+                                        data.binding_definition()
+                                    CallableLocal(callable):
+                                        callable
+                                            .callable_local()
+                                            .binding_definition()
+                                definitions = definitions.append(definition)
+                            Err(error):
+                                failure = Some(error)
         if failure.is_some():
             break
         position = position + 1
     match failure:
         Some(error): Err(error)
-        None: Ok(resolved)
+        None: Ok({ scope = resolved, definitions = definitions })
 
 
 -- A block's checked statements, the scope after them and the function's
@@ -978,7 +1015,7 @@ private pure func resolve_if(
             .concat(selected.block.reassigned)
             .concat(other.block.reassigned),
     )
-    matched_selection ?= Patterns.union_selection(
+    matched_selection ?= patterns.union_selection(
         [
             {
                 arm = match_arm_id(0),
@@ -1504,22 +1541,11 @@ private pure func resolve_body(
             else:
                 Ok(void)
     tail_contract ?= tail_decision
-    initial ?= accepted.declaration.parameters.parameter_scope(signature.parameters, [], context)
-    var parameter_bindings: List[BindingDefinition] = []
-    for binding in initial:
-        match binding:
-            DataLocal(data):
-                definition = data.binding_definition()
-                parameter_bindings = parameter_bindings.append(definition)
-            CallableLocal(callable):
-                parameter_bindings = parameter_bindings.append(
-                    callable
-                        .callable_local()
-                        .binding_definition(),
-                )
+    bound ?= accepted.declaration.parameters.parameter_scope(signature.parameters, [], context)
+    initial = bound.scope
     block: ResolvedStatements = {
         lambdas = lambdas,
-        bindings = parameter_bindings,
+        bindings = bound.definitions,
         scope = initial,
         statements = [],
         reassigned = [],
@@ -1606,7 +1632,7 @@ private pure func finish_body(
                 bindings = prefix.bindings,
                 statements = prefix.statements,
                 body = CheckedValueBody(
-                    ReturnExpression(signature.builtin_value(initial, operation, span)),
+                    ReturnExpression(signature.builtin_value(prefix.bindings, operation, span)),
                 ),
             })
         ValueBody(body):
@@ -1662,26 +1688,30 @@ private pure func finish_body(
                     Err(error)
 
 
+-- A builtin body stands alone, so the bindings so far are exactly the parameters,
+-- in runtime order and including each discarded `_`, which the native still
+-- receives as an argument.
 private pure func builtin_value(
     signature: FunctionSignature,
-    initial: List[ScopedValue],
+    parameters: List[BindingDefinition],
     operation: RuntimeOperation[VariantId, TypeRef],
     span: Span,
 ) -> CheckedExpr:
     var operands: List[CheckedCallOperand] = []
-    for binding in initial:
-        match binding:
-            DataLocal(data):
-                definition = data.binding_definition()
+    var position = 0
+    for definition in parameters:
+        match definition.origin:
+            CallableParameterBinding(_):
+                void
+            _:
                 operands = operands.append(
                     ValueOperand({
-                        form = ReadBinding(data.local_binding_id()),
+                        form = ReadBinding(binding_id(position)),
                         value_type = definition.value_type,
                         span = definition.span,
                     }),
                 )
-            CallableLocal(_):
-                void
+        position = position + 1
     {
         form = InvokeFunction({
             target = RuntimeFunction(operation),
@@ -1743,7 +1773,7 @@ private pure func resolve_result_prefix(
                     )
                 BuiltinBody(operation, span):
                     Ok({
-                        value = accepted.signature.builtin_value(initial, operation, span),
+                        value = accepted.signature.builtin_value(block.bindings, operation, span),
                         lambdas = block.lambdas,
                         bindings = block.bindings,
                         reassigned = block.reassigned,
@@ -1867,14 +1897,11 @@ private pure func resolve_propagation(
     }
     bindings = source.bindings.append(source_definition)
     success = binding_id(bindings.length())
-    binder_span = match written.binder:
-        NamedBinder(name): name.span
-        DiscardBinder(span): span
     definition: BindingDefinition = {
         origin = MatchCapture,
         mutable = False,
         value_type = success_type,
-        span = binder_span,
+        span = written.binder.binder_span(),
     }
     -- Keep the internal capture for ownership; only named binders extend scope.
     scope: List[ScopedValue] ?= match written.binder:
@@ -1917,7 +1944,7 @@ private pure func resolve_propagation(
         span = written.value.span,
     }
     root: CheckedPatternPlace = { value_type = source.value.value_type, route = MatchRoot }
-    matched_selection ?= Patterns.union_selection(
+    matched_selection ?= patterns.union_selection(
         [
             {
                 arm = match_arm_id(0),

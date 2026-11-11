@@ -1,0 +1,177 @@
+import:
+    bool: Bool methods
+    int: Int methods
+    option: Option methods
+    string: String methods, from_codepoint
+    ./lex: word_kind
+    ./syntax: NameForm(CapitalizedCamel, LowerSnake, SingleCapitalWord, UpperSnake)
+
+
+-- What a declaration introduces. The role decides which form the declared name
+-- may take and the noun a diagnostic uses, so the parser cannot declare a name
+-- without saying what it is.
+fixed union NameRole:
+    DeclaredType
+    DeclaredVariant
+    DeclaredTrait
+    DeclaredTypeParameter
+    DeclaredConstant
+    DeclaredFunction
+    DeclaredParameter
+    DeclaredLocal
+    DeclaredField
+    DeclaredImportAlias
+
+
+-- The spelling a role requires; a NameForm is the spelling that was written.
+private fixed union NameStyle:
+    CapitalizedCamelCase
+    UpperSnakeCase
+    LowerSnakeCase
+
+
+private ASCII_ZERO: Int = 48
+private ASCII_NINE: Int = 57
+private ASCII_UPPER_A: Int = 65
+private ASCII_UPPER_Z: Int = 90
+private ASCII_UNDERSCORE: Int = 95
+private ASCII_LOWER_A: Int = 97
+private ASCII_LOWER_Z: Int = 122
+
+-- An ASCII capital is the lowercase letter this far below it.
+private ASCII_CASE_OFFSET: Int = 32
+
+
+private pure func role_noun(role: NameRole) -> String:
+    match role:
+        DeclaredType: "type"
+        DeclaredVariant: "variant"
+        DeclaredTrait: "trait"
+        DeclaredTypeParameter: "type parameter"
+        DeclaredConstant: "constant"
+        DeclaredFunction: "function"
+        DeclaredParameter: "parameter"
+        DeclaredLocal: "local"
+        DeclaredField: "field"
+        DeclaredImportAlias: "module alias"
+
+
+private pure func role_style(role: NameRole) -> NameStyle:
+    match role:
+        DeclaredType | DeclaredVariant | DeclaredTrait | DeclaredTypeParameter:
+            CapitalizedCamelCase
+        DeclaredConstant:
+            UpperSnakeCase
+        DeclaredFunction | DeclaredParameter | DeclaredLocal | DeclaredField | DeclaredImportAlias:
+            LowerSnakeCase
+
+
+private pure func style_name(style: NameStyle) -> String:
+    match style:
+        CapitalizedCamelCase: "CapitalizedCamelCase"
+        UpperSnakeCase: "UPPER_SNAKE_CASE"
+        LowerSnakeCase: "lower_snake_case"
+
+
+-- A single capital word, such as `T` or `MAX`, is both a type and a constant.
+pure func accepts(role: NameRole, form: NameForm) -> Bool:
+    match (role.role_style(), form):
+        (CapitalizedCamelCase, CapitalizedCamel | SingleCapitalWord): True
+        (UpperSnakeCase, UpperSnake | SingleCapitalWord): True
+        (LowerSnakeCase, LowerSnake): True
+        _: False
+
+
+pure func misnamed_message(role: NameRole) -> String:
+    "a ${role.role_noun()} is written in ${role.role_style().style_name()}"
+
+
+pure func misnamed_help(role: NameRole, spelling: String) -> String:
+    match spelling.converted(role.role_style()):
+        Some(name):
+            match name.word_kind():
+                Some(_): "`${name}` is a reserved word; choose another name"
+                None: "write `${name}`"
+        None:
+            "start the name with a letter and write it in ${role.role_style().style_name()}"
+
+
+private pure func within(value: Int, first: Int, last: Int) -> Bool:
+    (value >= first).and(value <= last)
+
+
+private pure func cased(byte: Int, upper: Bool) -> Int:
+    if upper.and(byte.within(ASCII_LOWER_A, ASCII_LOWER_Z)):
+        byte - ASCII_CASE_OFFSET
+    else if (
+        upper
+            .not()
+            .and(byte.within(ASCII_UPPER_A, ASCII_UPPER_Z))
+    ):
+        byte + ASCII_CASE_OFFSET
+    else:
+        byte
+
+
+-- The spelling in `style`, or None when it would not begin with a letter
+-- (`_1x`, `__`), where no single rewrite is the obvious one. A word starts
+-- after an underscore, before a capital that follows a lowercase letter or
+-- digit, and before the last capital of a run followed by a lowercase letter:
+-- `IOError` is `io_error` and `UInt8` is `u_int8`.
+private pure func converted(spelling: String, style: NameStyle) -> Option[String]:
+    separator = match style:
+        CapitalizedCamelCase: ""
+        _: "_"
+    var text = ""
+    var previous = ASCII_UNDERSCORE
+    var position = 0
+
+    while position < spelling.length():
+        byte = spelling
+            .byte_at(position)
+            .get_or(0)
+        following = spelling
+            .byte_at(position + 1)
+            .get_or(0)
+
+        if byte != ASCII_UNDERSCORE:
+            after_lower_or_digit = previous
+                .within(ASCII_LOWER_A, ASCII_LOWER_Z)
+                .or(previous.within(ASCII_ZERO, ASCII_NINE))
+            ends_capital_run = previous
+                .within(ASCII_UPPER_A, ASCII_UPPER_Z)
+                .and(following.within(ASCII_LOWER_A, ASCII_LOWER_Z))
+            starts_word = (previous == ASCII_UNDERSCORE).or(
+                byte
+                    .within(ASCII_UPPER_A, ASCII_UPPER_Z)
+                    .and(after_lower_or_digit.or(ends_capital_run)),
+            )
+            upper = match style:
+                CapitalizedCamelCase: starts_word
+                UpperSnakeCase: True
+                LowerSnakeCase: False
+
+            if starts_word.and(text.length() > 0):
+                text = text + separator
+            text = (
+                text
+                + byte
+                    .cased(upper)
+                    .from_codepoint()
+                    .get_or("")
+            )
+        previous = byte
+        position = position + 1
+
+    first = text
+        .byte_at(0)
+        .get_or(0)
+
+    if (
+        first
+            .within(ASCII_UPPER_A, ASCII_UPPER_Z)
+            .or(first.within(ASCII_LOWER_A, ASCII_LOWER_Z))
+    ):
+        Some(text)
+    else:
+        None

@@ -25,7 +25,10 @@
      `fixed`, `methods`, `tail_recursive` and the base type names are
      names in the host too: the syntax recognises them by identity where a
      declaration or annotation begins, and they remain valid names elsewhere.
-     Lone `_` is a wildcard token; `_name` remains an identifier.
+     Lone `_` is a wildcard token. The lexer also classifies every other
+     identifier by its case (type_name, constant_name, value_name below, or
+     none of them); the parser checks the class of each name it declares, so
+     a name starting with an underscore is a declaration error.
    - Integer tokens use the longest consecutive digit run; a number never
      starts with a sign. Parsing folds a prefix minus applied directly to a
      numeric literal into one negative literal (see negative_literal), then
@@ -98,14 +101,15 @@
      indentation has no layout meaning. Only lines containing code produce
      layout tokens, retaining their original byte offsets (see Layout below).
 
-   Syntax accepts any unreserved function, parameter and type identifier.
+   Syntax accepts an unreserved identifier in each declared position, in the form
+   that position requires (see type_name, constant_name and value_name).
    `fixed` is a contextual word in record and union declaration headers and remains a valid
-   function, type, parameter and variant identifier elsewhere; the reserved
+   function, parameter or field name elsewhere; the reserved
    words listed under Lexical contract remain keyword tokens.
    Import blocks precede the module's declarations and select functions by their declared names from explicit ./ or leading
    ../ paths, or bare paths under an explicitly supplied target-library root.
    Paths omit .brp and contain adjacent identifier components; interior
-   dot segments, wildcards and reexports are unsupported. `path as Alias`
+   dot segments, wildcards and reexports are unsupported. `path as alias`
    names the module; the alias may stand alone or precede ':' and
    selections. Symbol aliases are unsupported. A row names each selection, and
    each listed constructor, once; repetition is rejected during parsing. Explicit
@@ -340,6 +344,21 @@ identifier       = (identifier_start { identifier_byte })
                     | "union" | "builtin" | "as" | "opaque" | "into_opaque" | "from_opaque" | "if" | "else"
                     | "while" | "for" | "in" | "break" | "continue") ;
 
+(* Naming rules. A declared name has the form its role requires, else it is a
+   parse error naming the role with the converted spelling as help. A single
+   capital word such as `T` or `MAX` is both a type_name and a constant_name.
+   Used names are not rechecked, except that a field or method after a dot is a
+   value_name. Module paths and builtin labels are not names. *)
+upper            = "A".."Z" ;
+lower            = "a".."z" ;
+(* Types, variants, traits and type parameters: CapitalizedCamelCase. *)
+type_name        = upper { letter | digit } ;
+(* Module constants: UPPER_SNAKE_CASE. *)
+constant_name    = upper { upper | digit } { "_" ( upper | digit ) { upper | digit } } ;
+(* Functions, methods, parameters, locals, captures, fields and import aliases:
+   lower_snake_case. *)
+value_name       = lower { lower | digit } { "_" ( lower | digit ) { lower | digit } } ;
+
 space            = " " ;
 (* A line break inside an open bracket is trivia: a bracket_break may stand
    wherever spaces may, but only while more "(", "[" or "{" than ")", "]" or
@@ -486,8 +505,8 @@ qualified_call   = qualified_name spaces "(" spaces [ arguments ] spaces ")" ;
 list_literal     = "[" spaces [ arguments ] spaces "]" ;
 primary          = "void" | float | integer | string_literal | interpolated_string | pipe_string | raw_string | qualified_call | qualified_name
                  | opaque_conversion | identifier | direct_call | list_literal | record_literal | record_update | dict_literal | group | tuple ;
-receiver_call    = spaces "." spaces identifier spaces "(" spaces [ arguments ] spaces ")" ;
-field_read       = spaces "." spaces identifier ;
+receiver_call    = spaces "." spaces value_name spaces "(" spaces [ arguments ] spaces ")" ;
+field_read       = spaces "." spaces value_name ;
 tuple_index      = spaces "[" spaces expression spaces "]" ;
 (* Precedence, lowest first: comparison, "..", "+ -", "* / %", prefix "-",
    then postfix operations. Both binary arithmetic levels associate left, so
@@ -513,7 +532,7 @@ control          = if_expr | match_body | lambda ;
    (host 4.9): a closing bracket on the block's last line is an error. *)
 lambda           = [ "pure" required_spaces ] "func" spaces "(" spaces [ lambda_param { spaces "," spaces lambda_param } trailing_comma ] spaces ")"
                    [ spaces "->" spaces type_annotation ] spaces ":" ( spaces expression | NEWLINE INDENT block DEDENT ) ;
-lambda_param     = ( identifier | "_" ) [ spaces ":" spaces type_annotation ] ;
+lambda_param     = ( value_name | "_" ) [ spaces ":" spaces type_annotation ] ;
 if_expr          = "if" spaces expression spaces ":" NEWLINE INDENT block DEDENT [ else_branch ] ;
 else_branch      = "else" spaces ":" NEWLINE INDENT block DEDENT | "else" required_spaces if_expr ;
 (* Checking accepts a bare if at a return, initializer, condition or arm value,
@@ -570,8 +589,11 @@ function_type    = [ "pure" spaces ] "(" spaces [ type_annotation { spaces "," s
    callbacks retain ordinary direct-call specialization. Stored callables retain
    their concrete signature and managed environment through ordinary ownership.
    Invocation uses a local name; field-call precedence is unchanged. *)
-parameter        = identifier spaces ":" spaces type_annotation ;
-type_parameter   = "A".."Z" { letter | digit } ;
+(* A parameter named `_` discards its argument: it binds no name, so the body
+   cannot refer to it, and a signature may repeat it. A discarded parameter
+   cannot have a callable type. *)
+parameter        = ( value_name | "_" ) spaces ":" spaces type_annotation ;
+type_parameter   = type_name ;
 (* Function, implementation receiver, record, union and opaque type parameters
    take bounds. Parse retains each located annotation; Check requires visible
    parameterless trait names, including module-qualified names, and rejects
@@ -582,7 +604,7 @@ type_parameter   = "A".."Z" { letter | digit } ;
 type_bounds      = type_annotation { spaces "+" spaces type_annotation } ;
 bounded_parameter = type_parameter [ spaces ":" spaces type_bounds ] ;
 bounded_parameters = "[" spaces bounded_parameter { spaces "," spaces bounded_parameter } trailing_comma spaces "]" spaces ;
-function_signature = [ "pure" required_spaces ] "func" required_spaces identifier spaces [ bounded_parameters ] "(" spaces
+function_signature = [ "pure" required_spaces ] "func" required_spaces value_name spaces [ bounded_parameters ] "(" spaces
                    [ parameter { spaces "," spaces parameter } trailing_comma ] spaces ")" spaces [ "->" spaces type_annotation spaces ] ;
 function_header  = function_signature ":" NEWLINE ;
 tail_annotation  = "@tail_recursive" (required_spaces | NEWLINE) ;
@@ -593,7 +615,7 @@ function         = [ tail_annotation ] function_header INDENT body DEDENT ;
    A list pattern takes no trailing comma, as in the host; the rest comes last.
    Without a rest it requires an exact length; with a rest it requires at
    least the number of explicit elements. *)
-spread_target    = "..." spaces ( identifier | "_" ) ;
+spread_target    = "..." spaces ( value_name | "_" ) ;
 list_pattern     = "[" spaces ( [ spread_target ] | pattern { spaces "," spaces pattern } [ spaces "," spaces spread_target ] ) spaces "]" ;
 tuple_pattern    = "(" spaces pattern spaces "," spaces pattern
                    [ spaces "," spaces pattern [ spaces "," spaces pattern ] ] trailing_comma spaces ")" ;
@@ -614,9 +636,9 @@ pattern          = alternative { spaces "|" spaces alternative } ;
 initializer      = spaces expression NEWLINE | NEWLINE INDENT expression NEWLINE DEDENT ;
 (* An annotation supplies the initializer's expected type. It declares a new
    binding under the same no-shadowing rule as var. *)
-binding          = [ "var" required_spaces ] identifier [ spaces ":" spaces type_annotation ] spaces "=" initializer ;
-tuple_binder     = "(" spaces ( identifier | "_" ) spaces "," spaces ( identifier | "_" )
-                   [ spaces "," spaces ( identifier | "_" ) [ spaces "," spaces ( identifier | "_" ) ] ] trailing_comma spaces ")" ;
+binding          = [ "var" required_spaces ] value_name [ spaces ":" spaces type_annotation ] spaces "=" initializer ;
+tuple_binder     = "(" spaces ( value_name | "_" ) spaces "," spaces ( value_name | "_" )
+                   [ spaces "," spaces ( value_name | "_" ) [ spaces "," spaces ( value_name | "_" ) ] ] trailing_comma spaces ")" ;
 tuple_binding    = tuple_binder spaces "=" initializer ;
 (* `name ?= value` binds the success payload; `_ ?= value` discards it.
    Both return the failure without evaluating the continuation. Propagation is
@@ -627,7 +649,7 @@ tuple_binding    = tuple_binder spaces "=" initializer ;
    propagation with the enclosing function's error type; the success binding
    and function result types may differ. Option and annotated tail-recursive
    functions remain outside this increment. *)
-propagation      = ( identifier | "_" ) [ spaces ":" spaces type_annotation ] spaces "?=" initializer ;
+propagation      = ( value_name | "_" ) [ spaces ":" spaces type_annotation ] spaces "?=" initializer ;
 (* Loops are statements with no value. `break` and `continue` are valid only
    inside a loop body (host 5.3); neither may sit in an `if` or `match` used as
    a value within a loop (owner rule). A function body starts a new context.
@@ -641,7 +663,7 @@ propagation      = ( identifier | "_" ) [ spaces ":" spaces type_annotation ] sp
    older aliases and borrowed outer values remain valid. Managed annotated tail loops
    remain unsupported. *)
 while_loop       = "while" spaces expression spaces ":" NEWLINE INDENT block DEDENT ;
-for_loop         = "for" required_spaces ( identifier | "_" | tuple_binder ) required_spaces "in" required_spaces expression spaces ":" NEWLINE INDENT block DEDENT ;
+for_loop         = "for" required_spaces ( value_name | "_" | tuple_binder ) required_spaces "in" required_spaces expression spaces ":" NEWLINE INDENT block DEDENT ;
 statement        = binding | tuple_binding | while_loop | for_loop | "break" NEWLINE | "continue" NEWLINE | expression NEWLINE ;
 function_statement = propagation | statement ;
 (* A block's value is its last item when that item is an expression; a block
@@ -659,11 +681,11 @@ match_body       = "match" required_spaces expression spaces ":" NEWLINE INDENT 
    lines is an expression statement. *)
 tail             = expression NEWLINE | match_body ;
 body             = { function_statement } tail | builtin_body ;
-variant          = identifier spaces [ "(" spaces type_annotation { spaces "," spaces type_annotation } trailing_comma spaces ")" ] NEWLINE ;
-union_decl       = [ "fixed" required_spaces ] "union" required_spaces identifier spaces [ bounded_parameters ] ":"
+variant          = type_name spaces [ "(" spaces type_annotation { spaces "," spaces type_annotation } trailing_comma spaces ")" ] NEWLINE ;
+union_decl       = [ "fixed" required_spaces ] "union" required_spaces type_name spaces [ bounded_parameters ] ":"
                    NEWLINE INDENT variant { variant } DEDENT ;
-record_member    = identifier spaces ":" spaces type_annotation ;
-record_decl      = [ "fixed" required_spaces ] "record" required_spaces identifier spaces [ bounded_parameters ] "{" spaces
+record_member    = value_name spaces ":" spaces type_annotation ;
+record_decl      = [ "fixed" required_spaces ] "record" required_spaces type_name spaces [ bounded_parameters ] "{" spaces
                    record_member { spaces "," spaces record_member } trailing_comma spaces "}" NEWLINE ;
 (* Opaque declarations are nominal during checking and may declare type
    parameters, which need not appear in the underlying type. Only their
@@ -671,7 +693,7 @@ record_decl      = [ "fixed" required_spaces ] "record" required_spaces identifi
    supply runtime layouts; conversions evaluate their one operand once.
    Recursive opaque representations are rejected, independently recursive
    aggregate representations are allowed. *)
-opaque_type      = "opaque" required_spaces "type" required_spaces identifier spaces [ bounded_parameters ] "=" spaces type_annotation NEWLINE ;
+opaque_type      = "opaque" required_spaces "type" required_spaces type_name spaces [ bounded_parameters ] "=" spaces type_annotation NEWLINE ;
 (* Module constants require an explicit annotation. Checking admits closed
    scalar/Void literals, constructors, records, Lists, tuples and named function
    references, including a negative numeric literal. Calls, operators, other
@@ -680,7 +702,7 @@ opaque_type      = "opaque" required_spaces "type" required_spaces identifier sp
    All constant annotations precede signatures/entrypoint diagnostics, then
    initializer checking and function bodies. Each read constructs an ordinary
    value; callable constants admit direct and qualified invocation. *)
-constant         = identifier spaces ":" spaces type_annotation spaces "=" initializer ;
+constant         = constant_name spaces ":" spaces type_annotation spaces "=" initializer ;
 (* Trait requirements have no colon/body; defaults have ordinary bodies.
    Checking requires pure, nongeneric signatures with first parameter exactly
    scoped Self and no top-level callable formals. An omitted result means Void.
@@ -700,7 +722,7 @@ constant         = identifier spaces ":" spaces type_annotation spaces "=" initi
    Check requires a callable expectation that determines Self. *)
 trait_method     = function_signature ( NEWLINE | ":" NEWLINE INDENT body DEDENT ) ;
 trait_methods    = INDENT trait_method { trait_method } DEDENT ;
-trait_declaration = "trait" required_spaces identifier spaces ":"
+trait_declaration = "trait" required_spaces type_name spaces ":"
                     ( NEWLINE trait_methods
                     | spaces type_bounds ( spaces ":" NEWLINE trait_methods | NEWLINE ) ) ;
 receiver_head    = identifier [ spaces "." spaces identifier ] ;
@@ -716,7 +738,7 @@ import_selection = import_symbol { spaces "," spaces import_symbol } trailing_co
 (* The selections follow the path on its line, or on an indented block of
    lines, each holding one or more selections. *)
 selection_line   = import_selection NEWLINE ;
-module_alias     = required_spaces "as" required_spaces identifier ;
+module_alias     = required_spaces "as" required_spaces value_name ;
 import_row       = module_path ( [ module_alias ] spaces ":" ( spaces import_selection NEWLINE
                    | NEWLINE INDENT selection_line { selection_line } DEDENT )
                    | module_alias NEWLINE ) ;
@@ -727,7 +749,7 @@ program          = { import_block } { declaration } EOF ;
    An empty module parses; designated foundation validation requires five builtins
    and the three designated unions. *)
 builtin_type     = "type" required_spaces (("Int" | "Float" | "String" | "Void") spaces
-                   | "List" spaces "[" spaces identifier spaces "]" spaces) "=" spaces "builtin" NEWLINE ;
+                   | "List" spaces "[" spaces type_parameter spaces "]" spaces) "=" spaces "builtin" NEWLINE ;
 builtin_label    = "\"int.to_string\"" | "\"string.length\"" | "\"string.add\"" | "\"string.print\"" | "\"string.print_error\""
                    | "\"string.append_int\""
                    | "\"int.add\"" | "\"int.subtract\"" | "\"int.multiply\""

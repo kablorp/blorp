@@ -61,6 +61,12 @@ the length: a two-line loop can use `i`, a module export needs a full name,
 and nothing needs a sentence. If a name needs a sentence, the function is
 probably doing two things. See also "Naming" in `AGENTS.md`.
 
+The compiler enforces case: types, variants, traits and type parameters are
+`CapitalizedCamelCase`; module constants are `UPPER_SNAKE_CASE`; functions,
+methods, parameters, locals, captures, fields and import aliases are
+`lower_snake_case`. The rules and their diagnostics are in the "Naming" section
+of [`blorp/README.md`](../blorp/README.md).
+
 ## Where these rules do not apply
 
 - Accessors and constructors of opaque types: they exist to hold the boundary.

@@ -1,7 +1,7 @@
 # `Path`, exact I/O errors, naming rules and qualified variants
 
-**Status: plan, 2026-11-10, revision 3. Landings 4 (`7d8a92f25`) and 3 have
-landed; landing 1 is in review.** Revision 3 adds the naming rules
+**Status: plan, 2026-11-10, revision 3. Landings 4 (`7d8a92f25`), 3 (`4024ef09d`)
+and 1 have landed.** Revision 3 adds the naming rules
 Keith adopted, which make qualified variants a parser rule. Keith approved P1
 to P12 of the earlier `PATH_DECISIONS.md` (full text, with its precedent
 survey and the alternatives each point weighed, at `4b5b7fe65`) with the
@@ -145,6 +145,10 @@ numbers; each is approved as drafted there unless amended here.
   Module paths such as `_base` are paths, not names, and are unaffected. A
   test file's suite constant becomes `TESTS`; `TestSuite`'s `tests` field
   stays.
+- **`_` parameters (added during landing 1):** a function, method or
+  requirement parameter may be `_`, as a lambda's already may, and one
+  signature may have several. A `_` cannot be used: any use in the body is an
+  error. This holds for every parameter type, function types included.
 
 ## Coordinator choices, confirmed by Keith
 
@@ -429,9 +433,28 @@ unchanged; messages that print a process error add the program the same way.
    - Tests: each role with a name in each wrong form and its help; the
      conversion cases above; `x.Foo`; `_` still a discard; `TESTS`
      discovery, and a lowercase `tests` refused.
-   - Ceilings: production lines at most +200. Self-compile allocations and
-     retired instructions each at most +0.3%. Test changes reported
-     separately.
+   - Ceilings: production lines at most +380 (was +200). Self-compile
+     allocations and retired instructions each at most +0.3%. Test changes
+     reported separately.
+   - Coordinator correction, 2026-11-10: production measures +379 net
+     (+1929 −1550) against `4024ef09d`; self-compile +0.039% allocations
+     and +0.226% instructions, with identical C. The +200 predates the scope
+     that landed here:
+     - Keith's `_` parameters, about +100. `ParsedParameter` holds a
+       binder, record fields became their own `ParsedField`, `builtin`
+       bodies take operands by position, and the formatter changed.
+     - The reviews' fixes: a capitalized pattern name is always a variant,
+       the dead `ConstructorUFCS` error is deleted, and a conversion that
+       is a keyword gets its own help.
+     - `src/` had 25 capitalized aliases, not 3.
+   - Follow-ups, not done here:
+     - an opaque `DeclaredName`, so a declaring site cannot skip its check
+       even by calling the token reader directly;
+     - one shared set of ASCII class helpers for the lexer and `naming.brp`;
+     - `import: dict` alone gives no qualified access, so tests alias it as
+       `dict_ops`;
+     - the two `count` parameters in `parse.brp` become `_` after landing 5,
+       because the pinned seed cannot parse `_` parameters.
 2. **Qualified variants.** The parser's new syntax (`syntax/syntax.brp`,
    `parse.brp`), the checker's resolution (`check/constructors.brp`,
    `patterns.brp`, `expressions.brp`, `bodies.brp`), diagnostics

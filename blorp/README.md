@@ -143,6 +143,44 @@ Identifiers are ASCII letters, digits and `_`, not starting with a digit.
 "`match` is a reserved keyword and cannot be used as a name". `fixed`,
 `methods`, `tail_recursive`, `and`, `or` and `not` are ordinary names.
 
+### Naming
+
+The case of a declared name says what it is, and the compiler enforces it:
+
+| Names | Form | Examples |
+| --- | --- | --- |
+| Types, variants, traits, type parameters | `CapitalizedCamelCase` | `ReadError`, `IOError`, `UInt8`, `T` |
+| Module constants | `UPPER_SNAKE_CASE` | `MAX_DEPTH`, `TESTS`, `MAX` |
+| Functions, methods, parameters, locals, captures, fields, import aliases | `lower_snake_case` | `read_text`, `utf8_valid`, `x1` |
+
+Consecutive capitals are allowed, so `IOError` and `UInt8` stay valid. A single
+capital word such as `MAX` or `T` fits both the first two forms. `_` is the
+discard; no other name starts with an underscore, and underscores are never
+doubled or trailing. Module paths such as `_base` are paths, not names. A
+declared name in the wrong form is a parse error whose help gives the
+converted name:
+
+```text
+error: a local is written in lower_snake_case
+help: write `kind`
+```
+
+Conversion splits before a capital that follows a lowercase letter or digit and
+before the last capital of a run followed by a lowercase letter, so `IOError`
+becomes `io_error` and `UInt8` becomes `u_int8`. A name that is used is not
+checked again, except that a field or method after a dot is lower_snake_case: `x.Foo`
+is rejected ("fields and methods are lower_snake_case"). A bare name in a
+pattern that starts with a capital is a variant, and one that no visible variant
+has is an error, never a binding; any other bare name is a binding and is
+checked as a local. An import alias shares the value namespace
+with locals and parameters, so choose one that no local in the file uses.
+
+A function, method or requirement parameter may be `_`, as a lambda parameter
+can: `pure func second(_: Int, value: Int, _: Int) -> Int`. It takes an
+argument and binds no name, any number of them may appear in one signature,
+and using `_` in the body is an error ("`_` is not a value"). A discarded
+parameter cannot have a function type; name it.
+
 ### Functions and purity
 
 ```blorp
@@ -536,7 +574,7 @@ Patterns nest:
   the literal, as in an expression, so `-9223372036854775808` is a pattern. A
   Float literal is not a pattern, because NaN never equals itself: bind the
   value and compare it in the arm.
-- `Alias.Variant` names a constructor through a module alias.
+- `alias.Variant` names a constructor through a module alias.
 
 Arms must be exhaustive and each must be reachable. Literals never cover every
 String or Int, so a String or Int that literals test needs a catch-all, and a
@@ -878,8 +916,8 @@ row names one module:
   through UFCS.
 - `module: Shape methods` makes the module's functions on `Shape` available
   through UFCS when `Shape` is already visible, without importing it.
-- `module as Alias` gives qualified access, as in `Alias.answer()`,
-  `Alias.Circle(2)` and `Alias.Shape`; it may precede `:` and selections.
+- `module as alias` gives qualified access, as in `alias.answer()`,
+  `alias.Circle(2)` and `alias.Shape`; it may precede `:` and selections.
 - Selections may continue on an indented block of lines under `module:`.
 
 A module offers only its own public declarations and never reexports what it
@@ -908,9 +946,9 @@ import the foundation module as `_base`.
 
 ```blorp
 import:
-    dict as D
+    dict as dict_ops
 func main() -> Int:
-    var scores: D.Dict[String, Int] = D.empty()
+    var scores: dict_ops.Dict[String, Int] = dict_ops.empty()
     scores = scores.set("alice", 95).set("bob", 80)
     scores = scores.remove("bob").set("bob", 81)
     none: Dict[String, Int] = {}
@@ -997,15 +1035,16 @@ import:
     test: TestSuite
 private pure func adds() -> Bool:
     1 + 1 == 2
-tests: TestSuite = {
+TESTS: TestSuite = {
     description = "arithmetic",
     tests = [("adds", adds)]
 }
 ```
 
-A test file declares a `tests: TestSuite` constant whose entries are named
-callbacks returning `Bool`; a `tests` function, an imported `tests` and inline
-lambdas are rejected. Compile one or more suite files into one program:
+A test file declares a `TESTS: TestSuite` constant whose entries are named
+callbacks returning `Bool`; a `TESTS` function, an imported `TESTS` and inline
+lambdas are rejected. A lowercase `tests` constant is a naming error that
+says to write `TESTS`. Compile one or more suite files into one program:
 
 ```sh
 bin/blorp compile --test-suite blorp/test/unit/test_utils/test_text.brp \

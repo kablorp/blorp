@@ -132,7 +132,7 @@ folder under `src/`: a module `src/<dir>/<name>.brp` has its suite in
 `test/unit/test_<dir>/`, and a module that has a folder of its own
 (`src/syntax/lex.brp` is `test/unit/test_syntax/test_lex/`) gets a subfolder. Grammar cases live under
 [test/test_grammar/](test/test_grammar/) and change with the EBNF.
-Target component suites declare an ordinary `tests: TestSuite` constant in the
+Target component suites declare an ordinary `TESTS: TestSuite` constant in the
 suite file itself.
 `make -C blorp test` builds Blorp, runs the explicit component selection
 (`COMPONENT_SOURCES` in [test/e2e/self_hosted.brp](test/e2e/self_hosted.brp))

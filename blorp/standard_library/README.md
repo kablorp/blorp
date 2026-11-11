@@ -166,7 +166,7 @@ Hashable, combining its length and then each element in order, and a List of key
 key; both live in `dict.brp` beside `combine_hash`, since `list.brp` is imported
 by `dict.brp`. The prelude imports `dict: Dict`, so
 the type and its receiver methods are implicit; `empty` and `dict` are
-reached as `import: dict as D`. All functions are pure.
+reached as `import: dict as dict_ops`. All functions are pure.
 
 Literals need no import. `{}` is `empty()` and takes its key and value types from
 the expected type; without one it is rejected with "an empty Dict needs its
@@ -596,9 +596,9 @@ functions:
 ### Test registration
 
 `test: TestSuite` holds `description: String` and
-`tests: List[(String, () -> Bool)]`. Declare a `tests: TestSuite` constant with
-named callback entries in each suite file itself; a `tests()` function or an
-imported `tests` is rejected. `blorp compile --test-suite` accepts one or more such files: its
+`tests: List[(String, () -> Bool)]`. Declare a `TESTS: TestSuite` constant with
+named callback entries in each suite file itself; a `TESTS()` function or an
+imported `TESTS` is rejected. `blorp compile --test-suite` accepts one or more such files: its
 entry passes each file's constant to `run_suite_result` in command-line order
 and returns `suites_exit_status` of the counts. Both pure and impure callbacks
 run in registration order, including entries after a False result. Empty suites

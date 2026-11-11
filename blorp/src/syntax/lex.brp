@@ -3,7 +3,7 @@ import:
     int: Int methods
     option: Option methods
     string: String methods
-    ../utils/text as Text
+    ../utils/text as text_utils
     ./names: NameTable
     ./source: SourceId
     ./syntax:
@@ -81,6 +81,7 @@ import:
             DotDot,
             Ellipsis,
         ),
+        NameForm(CapitalizedCamel, LowerSnake, Malformed, SingleCapitalWord, UpperSnake),
         Token,
         TokenKind(
             IdentifierToken,
@@ -759,7 +760,7 @@ private pure func numeric_token(text: SourceText, start: Int) -> Result[Token, D
 -- The words the parser still recognises by seeded id (`fixed`, `methods`,
 -- `tail_recursive`, the base type names) are names in the host too, so they
 -- stay identifiers, as do `True`, `False` and `Self` in this compiler.
-private pure func word_kind(spelling: String) -> Option[TokenKind]:
+pure func word_kind(spelling: String) -> Option[TokenKind]:
     match spelling:
         "func": Some(KeywordToken(FunctionKeyword))
         "pure": Some(KeywordToken(PureKeyword))
@@ -802,7 +803,7 @@ private pure func word_kind(spelling: String) -> Option[TokenKind]:
 -- identifier keeps its spelling and byte range. The scan's word arm reads the
 -- spelling once, into the batch `intern_names` receives.
 private union ScannedToken:
-    WordToken(String, Int, Int)
+    WordToken(String, Int, Int, NameForm)
     ReadyToken(Token)
 
 
@@ -840,18 +841,81 @@ private pure func punctuation(byte: Int) -> Option[Symbol]:
         None
 
 
+-- A word's end and case, read in the one pass that finds its end. A leading,
+-- doubled or trailing underscore is Malformed in every form, so the pass
+-- records whether any underscore was out of place.
+private fixed record ScannedWord {
+    end: Int,
+    form: NameForm,
+}
+
+
+-- `start` is the word's first byte, a letter or underscore.
+private pure func scan_word(text: SourceText, start: Int) -> ScannedWord:
+    var has_lower: Bool = False
+    var has_upper: Bool = False
+    var has_underscore: Bool = False
+    -- Starts True so that an underscore in first position counts as doubled.
+    var after_underscore: Bool = True
+    var stray_underscore: Bool = False
+    var end: Int = start
+    first_lower = text.bytes
+        .byte_at(start)
+        .get_or(0)
+        .within(ASCII_LOWER_A, ASCII_LOWER_Z)
+
+    while True:
+        byte = text.bytes
+            .byte_at(end)
+            .get_or(0)
+
+        if byte == ASCII_UNDERSCORE:
+            has_underscore = True
+            stray_underscore = stray_underscore.or(after_underscore)
+            after_underscore = True
+        else if byte.within(ASCII_LOWER_A, ASCII_LOWER_Z):
+            has_lower = True
+            after_underscore = False
+        else if byte.within(ASCII_UPPER_A, ASCII_UPPER_Z):
+            has_upper = True
+            after_underscore = False
+        else if byte.in_class(DecimalDigit):
+            after_underscore = False
+        else:
+            break
+        end = end + 1
+
+    form: NameForm = if stray_underscore.or(after_underscore):
+        Malformed
+    else if first_lower:
+        if has_upper:
+            Malformed
+        else:
+            LowerSnake
+    else if has_underscore:
+        if has_lower:
+            Malformed
+        else:
+            UpperSnake
+    else if has_lower:
+        CapitalizedCamel
+    else:
+        SingleCapitalWord
+    { end = end, form = form }
+
+
 -- Scans the code token at `cursor`; the caller handles spaces, comments and LF.
 private pure func code_token(text: SourceText, cursor: Int) -> Result[ScannedToken, Diagnostic]:
     if text.byte_in(cursor, IdentifierStart):
-        end = text.run_end(cursor + 1, IdentifierByte)
-        -- IdentifierByte accepts ASCII only; run_end cannot cross a scalar boundary.
+        word = text.scan_word(cursor)
+        -- Identifier bytes are ASCII only; the scan cannot cross a scalar boundary.
         spelling = text.bytes
-            .slice(cursor, end)
+            .slice(cursor, word.end)
             .get_or("")
 
         match spelling.word_kind():
-            Some(kind): Ok(ReadyToken(token(text, kind, cursor, end)))
-            None: Ok(WordToken(spelling, cursor, end))
+            Some(kind): Ok(ReadyToken(token(text, kind, cursor, word.end)))
+            None: Ok(WordToken(spelling, cursor, word.end, word.form))
     else:
         match text.literal_or_symbol(cursor):
             Ok(scanned): Ok(ReadyToken(scanned))
@@ -1027,7 +1091,7 @@ private pure func interpolation_tokens(
                         Ok(scanned):
                             tokens = tokens.append(scanned)
                             match scanned:
-                                WordToken(_, _, end):
+                                WordToken(_, _, end, _):
                                     Ok(end)
                                 ReadyToken(ready):
                                     match ready.kind:
@@ -1122,7 +1186,7 @@ private pure func code_comment_end(
     cursor: Int,
 ) -> Result[Int, Diagnostic]:
     after_value: Bool = match previous:
-        Some(WordToken(_, _, end)):
+        Some(WordToken(_, _, end, _)):
             end == cursor
         Some(ReadyToken(ready)):
             match ready.kind:
@@ -1417,7 +1481,7 @@ private pure func pipe_block(
                         line_text = text.bytes
                             .slice(text_start, line_end)
                             .get_or("")
-                        value = Text.concat(value, line_text)
+                        value = text_utils.concat(value, line_text)
                         end = line_end
 
                         match text.continuing_marker(line_end, first):
@@ -1696,7 +1760,7 @@ private pure func word_spellings(tokens: List[ScannedToken]) -> List[String]:
     var spellings: List[String] = []
     for scanned in tokens:
         match scanned:
-            WordToken(spelling, _, _): spellings = spellings.append(spelling)
+            WordToken(spelling, _, _, _): spellings = spellings.append(spelling)
             ReadyToken(_): void
     spellings
 
@@ -1860,7 +1924,7 @@ pure func lex(
                                         tokens = tokens.append(scanned)
 
                                         match scanned:
-                                            WordToken(_, _, end):
+                                            WordToken(_, _, end, _):
                                                 last_colon = False
                                                 Ok(end)
                                             ReadyToken(ready):
@@ -1896,10 +1960,10 @@ pure func lex(
         match scanned:
             ReadyToken(ready):
                 lexed = lexed.append(ready)
-            WordToken(_, start, end):
+            WordToken(_, start, end, form):
                 match interned.ids.get(word_position):
                     Some(id):
-                        lexed = lexed.append(token(text, IdentifierToken(id), start, end))
+                        lexed = lexed.append(token(text, IdentifierToken(id, form), start, end))
                     None:
                         missing = Some(
                             internal_error(
