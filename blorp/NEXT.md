@@ -36,9 +36,11 @@ done.
     enforced naming rules, qualified union variants, the `Path` type and a
     current-directory native, a seed rotation, exact I/O errors in
     type-oriented modules, then `Path` in the prelude. Landings 1 (naming
-    rules), 2 (qualified variants), 3 (the `Path` type) and 4 (the
-    current-directory native) have landed. Landing 5, the seed rotation,
-    is next.
+    rules), 2 (qualified variants), 3 (the `Path` type), 4 (the
+    current-directory native) and 5 (the seed rotation, pinning
+    `blorp-seed-4acd2377961d`) have landed. Seed-built code may now use
+    `Union.Variant` and the new native. Landing 6, process and environment
+    errors, is next.
 - **Process API:** [`PROCESS_DECISIONS.md`](PROCESS_DECISIONS.md).
   - **Status:** L0 is implemented and independently reviewed; final combined
     landing gates and four-platform CI pass; L0 is published. Shared

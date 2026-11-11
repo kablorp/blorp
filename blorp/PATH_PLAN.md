@@ -1,9 +1,10 @@
 # `Path`, exact I/O errors, naming rules and qualified variants
 
 **Status: plan, 2026-11-10, revision 4. Landings 4 (`7d8a92f25`), 3
-(`4024ef09d`), 1 (`be98099e6`) and 2 (qualified variants) have landed.
-Landing 5, the seed rotation, is next.** Revision 4 folds in
-landing 2's parser and ergonomics review. Revision 3 adds the naming rules
+(`4024ef09d`), 1 (`be98099e6`), 2 (`4acd23779`) and 5 (the seed rotation)
+have landed. Landing 6, process and environment errors, is next.**
+Revision 4 folds in landing 2's parser and ergonomics review. Revision 3
+adds the naming rules
 Keith adopted, which make qualified variants a parser rule. Keith approved P1
 to P12 of the earlier `PATH_DECISIONS.md` (full text, with its precedent
 survey and the alternatives each point weighed, at `4b5b7fe65`) with the
@@ -537,9 +538,10 @@ unchanged; messages that print a process error add the program the same way.
 4. **The current-directory native.** A new builtin returning a code, beside
    the old one, with no library caller yet.
    - Ceilings: production lines at most +60; self-compile unchanged.
-5. **Seed rotation** after landings 2 and 4, so seed-built code (`src/`,
-   `scripts/`, the library the compiler embeds) may use qualified variants
-   and the new native. Until then it uses neither.
+5. **Seed rotation (done)** after landings 2 and 4, so seed-built code
+   (`src/`, `scripts/`, the library the compiler embeds) may use qualified
+   variants and the new native. It pins `blorp-seed-4acd2377961d`, which
+   main's CI published from landing 2's commit `4acd23779`.
 6. **Process and environment errors.** `io/environment` and `io/process`:
    `CurrentDirectoryError` on the new builtin, the process unions,
    `Command.directory: Option[Path]`, `find_program` returning `Path`, and
