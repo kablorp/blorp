@@ -612,6 +612,8 @@ spelling), `Equatable` and `Hashable` (byte equality of the spelling), and
   not begin it: `x.test.brp` is `x.test` and `brp`, `.hidden` has no extension,
   `a.` has the empty extension, and `...` has stem `..` and the empty extension. Both are `None` where `name` is.
 - `is_absolute(path)` is true when the spelling starts with a separator.
+- `ends_in_separator(path)` is true when the spelling ends with a separator: `a/`
+  and `/` do, `a` does not. Such a path names a directory.
 - `is_within(path, root)` compares components, never bytes; both must be
   absolute or both relative, `.` components and repeated separators are
   ignored, and a `..` after the root's components makes the answer `False`
