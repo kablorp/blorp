@@ -1,7 +1,9 @@
 -- The process library: run a program, wait for it, and keep what it printed.
 -- The natives can return only Ints, Strings and Lists of them, so how a child
 -- ended arrives as text and why a launch failed as an Int code, which the pure
--- functions here decode. src/common/codegen/runtime/process.brp owns the C side.
+-- functions here decode. Each operation has its own error union, with no
+-- program or directory inside: the caller has its Command.
+-- src/common/codegen/runtime/process.brp owns the C side.
 import:
     _base:
         Int,
@@ -17,10 +19,10 @@ import:
     int: Int methods
     list: List methods
     option: Option methods
+    path: Path, to_path
     result: Result methods
     string: String methods
-    ./_codes: decode_error
-    ./error: IOError, IOErrorKind
+    ./_codes: NOT_FOUND_CODE, PERMISSION_DENIED_CODE, NOT_A_DIRECTORY_CODE
 
 
 -- What to run. Build one with `command`, then change fields by record update.
@@ -30,7 +32,7 @@ record Command {
     -- Without argv[0]; each is passed literally.
     arguments: List[String],
     -- None runs in the parent's directory.
-    directory: Option[String],
+    directory: Option[Path],
     -- Some sets, None removes, and every other variable is inherited.
     environment: Dict[String, Option[String]],
     -- None is /dev/null; Some is written, then closed.
@@ -58,38 +60,47 @@ record Captured {
 }
 
 
--- `program` is exactly what the caller passed: the name for find_program, the
--- path for everything else.
-record ProcessError {
-    program: String,
-    kind: ProcessErrorKind,
-}
+-- Why an exec, fork, pipe or chdir failed.
+union SystemCallError:
+    NotFound
+    PermissionDenied
+    NotADirectory
+    -- Any other errno, as the platform numbers it.
+    OtherOs(Int)
 
 
-union ProcessErrorKind:
-    -- find_program: no executable file of that name.
+union FindProgramError:
+    -- No executable regular file of that name on an absolute PATH entry.
     NotOnPath
-    -- Exec, fork or a pipe failed, as io words the errno.
-    LaunchFailed(IOErrorKind)
-    -- ENOEXEC: a file the system cannot run, such as a script without #!.
-    NotExecutable
-    -- The child could not enter `directory`; the error names it.
-    DirectoryFailed(IOError)
-    -- In the program, an argument or the environment; before any system call.
-    ContainsNul
+    NameContainsNul
+
+
+union CaptureError:
     -- Empty, or contains "="; before any system call.
     InvalidVariableName(String)
+    -- In the program, an argument or the environment.
+    ContainsNul
+    -- Exec, fork or a pipe failed.
+    LaunchFailed(SystemCallError)
+    -- ENOEXEC: a file the system cannot run, such as a script without #!.
+    NotExecutable
+    -- The child could not enter `directory`.
+    DirectoryFailed(SystemCallError)
     -- The output, which is not UTF-8, is dropped; how the child ended is kept.
     StdoutNotUtf8(Exit)
     StderrNotUtf8(Exit)
-    -- output only: anything but Exited(0).
+
+
+union OutputError:
+    CaptureFailed(CaptureError)
+    -- Anything but Exited(0), with everything the child printed.
     Unsuccessful(Captured)
 
 
 -- The codes of src/common/codegen/runtime/process.brp's PROCESS_HELPERS_RUNTIME enums,
 -- which agree with it only by the tests. An Exit is its kind times
 -- EXIT_KIND_SPAN plus its status or signal, always below the span. An error is
--- its detail times ERROR_TAG_SPAN plus its tag: the detail is an I/O error code
+-- its detail times ERROR_TAG_SPAN plus its tag: the detail is a file-protocol code
 -- (io/_codes), an Exit code for the UTF-8 kinds, or 0.
 private EXIT_KIND_SPAN: Int = 256
 private EXITED_KIND: Int = 0
@@ -161,46 +172,54 @@ private pure func decode_exit(code: Int) -> Option[Exit]:
         None
 
 
+-- The decoders below are public so that process_suite binds them to literal
+-- native codes; they are not part of the process API.
+--
+-- Any code but the named ones is OtherOs with the code negated, as io/_codes
+-- does: an unnamed errno arrives negated, so OtherOs keeps the platform's
+-- number, and a positive code no constant names stays visible as a negative.
+pure func decode_system_call_error(code: Int) -> SystemCallError:
+    if code == NOT_FOUND_CODE:
+        NotFound
+    else if code == PERMISSION_DENIED_CODE:
+        PermissionDenied
+    else if code == NOT_A_DIRECTORY_CODE:
+        NotADirectory
+    else:
+        OtherOs(0 - code)
+
+
 -- What capture's native can send; None is anything else, which the caller faults. The tag
--- is taken so that it is never negative, since I/O error codes for an unnamed errno are,
+-- is taken so that it is never negative, since file-protocol codes for an unnamed errno are,
 -- and then the rest divides exactly whichever way `/` rounds.
-private pure func decode_capture_error(
-    code: Int,
-    directory: Option[String],
-) -> Option[ProcessErrorKind]:
+pure func decode_capture_error(code: Int) -> Option[CaptureError]:
     tag = (code % ERROR_TAG_SPAN + ERROR_TAG_SPAN) % ERROR_TAG_SPAN
     detail = (code - tag) / ERROR_TAG_SPAN
     if tag == LAUNCH_FAILED_TAG:
-        Some(LaunchFailed(detail.decode_error()))
+        Some(LaunchFailed(detail.decode_system_call_error()))
     else if (tag == NOT_EXECUTABLE_TAG).and(detail == 0):
         Some(NotExecutable)
     else if tag == DIRECTORY_FAILED_TAG:
-        directory.map(
-            pure func(path: String) -> ProcessErrorKind: DirectoryFailed({
-                path = path,
-                destination = None,
-                kind = detail.decode_error(),
-            }),
-        )
+        Some(DirectoryFailed(detail.decode_system_call_error()))
     else if (tag == CONTAINS_NUL_TAG).and(detail == 0):
         Some(ContainsNul)
     else if tag == STDOUT_NOT_UTF8_TAG:
         detail
             .decode_exit()
-            .map(pure func(exit: Exit) -> ProcessErrorKind: StdoutNotUtf8(exit))
+            .map(pure func(exit: Exit) -> CaptureError: StdoutNotUtf8(exit))
     else if tag == STDERR_NOT_UTF8_TAG:
         detail
             .decode_exit()
-            .map(pure func(exit: Exit) -> ProcessErrorKind: StderrNotUtf8(exit))
+            .map(pure func(exit: Exit) -> CaptureError: StderrNotUtf8(exit))
     else:
         None
 
 
-private pure func decode_find_program_error(code: Int) -> Option[ProcessErrorKind]:
+pure func decode_find_program_error(code: Int) -> Option[FindProgramError]:
     if code == NOT_ON_PATH_TAG:
         Some(NotOnPath)
     else if code == CONTAINS_NUL_TAG:
-        Some(ContainsNul)
+        Some(NameContainsNul)
     else:
         None
 
@@ -219,7 +238,7 @@ private pure func decode_captured(reply: List[String]) -> Option[Captured]:
 
 
 -- Aborts with the message: a reply the natives never send is a runtime defect,
--- not a ProcessError (PROCESS_DECISIONS.md, P5).
+-- not an error value (PROCESS_DECISIONS.md, P5).
 private func native_fault(message: String) -> Result[Void, Int]:
     builtin("process.fault")
 
@@ -283,23 +302,20 @@ private pure func native_timeout(timeout_ms: Option[Int]) -> Int:
 -- call. After Signaled or TimedOut, up to three bytes of a character cut off
 -- at the end of either stream are dropped before the UTF-8 check.
 --
--- A directory that contains NUL is DirectoryFailed with PathContainsNul. With
--- SIGCHLD not at its default, which only foreign code can change, the call is
+-- With SIGCHLD not at its default, which only foreign code can change, the call is
 -- LaunchFailed(OtherOs(ECHILD)) before anything starts: the system would reap
 -- the child itself.
-func capture(invocation: Command) -> Result[Captured, ProcessError]:
-    failed = pure func(kind: ProcessErrorKind) -> ProcessError: {
-        program = invocation.program,
-        kind = kind,
-    }
+func capture(invocation: Command) -> Result[Captured, CaptureError]:
     match invocation.environment.invalid_variable_name():
         Some(name):
-            Err(failed(InvalidVariableName(name)))
+            Err(InvalidVariableName(name))
         None:
             reply = native_capture(
                 invocation.program,
                 invocation.arguments,
-                invocation.directory.zero_or_one(),
+                invocation.directory
+                    .map(pure func(directory: Path) -> String: directory.to_string())
+                    .zero_or_one(),
                 invocation.environment
                     .entries()
                     .map(environment_entry),
@@ -316,33 +332,40 @@ func capture(invocation: Command) -> Result[Captured, ProcessError]:
                                 "process.capture replied with ${elements.length()} elements it cannot send",
                             )
                 Err(code):
-                    match code.decode_capture_error(invocation.directory):
-                        Some(kind): Err(failed(kind))
+                    match code.decode_capture_error():
+                        Some(error): Err(error)
                         None: fault("process.capture replied with the error code ${code}")
 
 
 -- capture that insists on success: stdout after Exited(0), and otherwise
 -- Unsuccessful with everything the child printed.
-func output(invocation: Command) -> Result[String, ProcessError]:
-    captured ?= capture(invocation)
-    if captured.exit.succeeded():
-        Ok(captured.stdout)
-    else:
-        Err({ program = invocation.program, kind = Unsuccessful(captured) })
+func output(invocation: Command) -> Result[String, OutputError]:
+    match capture(invocation):
+        Ok(captured):
+            if captured.exit.succeeded():
+                Ok(captured.stdout)
+            else:
+                Err(Unsuccessful(captured))
+        Err(error):
+            Err(CaptureFailed(error))
 
 
 -- The first absolute PATH entry holding a regular file of this name that the
 -- process may execute, joined as "entry/name". Empty and relative entries
 -- are skipped, so the current directory is never searched (Go's ErrDot), and
 -- so are entries that are not UTF-8. A name that is empty or contains "/" is
--- NotOnPath without a search; one that contains NUL is ContainsNul.
-func find_program(name: String) -> Result[String, ProcessError]:
+-- NotOnPath without a search; one that contains NUL is NameContainsNul.
+func find_program(name: String) -> Result[Path, FindProgramError]:
     match native_find_program(name):
-        Ok(path):
-            Ok(path)
+        Ok(found):
+            -- The native joins an absolute entry and the name, so the reply is
+            -- never empty and never holds NUL.
+            match found.to_path():
+                Ok(program): Ok(program)
+                Err(_): fault("process.find_program replied with a path it cannot send")
         Err(code):
             match code.decode_find_program_error():
-                Some(kind): Err({ program = name, kind = kind })
+                Some(error): Err(error)
                 None: fault("process.find_program replied with the error code ${code}")
 
 
@@ -353,40 +376,56 @@ private pure func exit_phrase(exit: Exit) -> String:
         TimedOut: "timed out"
 
 
--- What happened, without the program: "not found on PATH". Unsuccessful is
--- "exited 2", then a newline and the child's stderr when it printed any; every
--- other kind is fixed text, as in IOErrorKind.
-implements Stringable for ProcessErrorKind:
+-- The fixed phrase for a cause, as io/error words the same kinds.
+implements Stringable for SystemCallError:
     pure func to_string(value: Self) -> String:
         match value:
-            NotOnPath:
-                "not found on PATH"
-            LaunchFailed(kind):
-                kind.to_string()
-            NotExecutable:
-                "not a program the system can run; a script needs a #! line"
-            DirectoryFailed(directory):
-                "cannot enter ${directory}"
-            ContainsNul:
-                "the program, an argument or the environment contains a NUL byte"
+            NotFound: "no such file"
+            PermissionDenied: "permission denied"
+            NotADirectory: "not a directory"
+            OtherOs(number): "operating system error ${number}"
+
+
+implements Stringable for FindProgramError:
+    pure func to_string(value: Self) -> String:
+        match value:
+            NotOnPath: "not found on PATH"
+            NameContainsNul: "the program name contains a NUL byte"
+
+
+-- What happened, without the program: every variant is fixed text.
+implements Stringable for CaptureError:
+    pure func to_string(value: Self) -> String:
+        match value:
             InvalidVariableName(name):
                 "invalid environment variable name \"${name}\"; a name is nonempty and has no ="
+            ContainsNul:
+                "the program, an argument or the environment contains a NUL byte"
+            LaunchFailed(cause):
+                cause.to_string()
+            NotExecutable:
+                "not a program the system can run; a script needs a #! line"
+            DirectoryFailed(cause):
+                "cannot enter the directory: ${cause}"
             StdoutNotUtf8(exit):
                 "${exit.exit_phrase()}, and its stdout is not UTF-8"
             StderrNotUtf8(exit):
                 "${exit.exit_phrase()}, and its stderr is not UTF-8"
+
+
+-- Unsuccessful is "exited 2", then a newline and the child's stderr when it
+-- printed any.
+implements Stringable for OutputError:
+    pure func to_string(value: Self) -> String:
+        match value:
+            CaptureFailed(error):
+                error.to_string()
             Unsuccessful(captured):
                 summary = captured.exit.exit_phrase()
                 if captured.stderr.length() == 0:
                     summary
                 else:
                     "${summary}\n${captured.stderr}"
-
-
--- "<program>: <kind text>", as "make: exited 2".
-implements Stringable for ProcessError:
-    pure func to_string(value: Self) -> String:
-        "${value.program}: ${value.kind}"
 
 
 -- Removed in L2. Program path; arguments exclude argv[0]; capture files must be new.

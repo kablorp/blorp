@@ -37,10 +37,9 @@ done.
     current-directory native, a seed rotation, exact I/O errors in
     type-oriented modules, then `Path` in the prelude. Landings 1 (naming
     rules), 2 (qualified variants), 3 (the `Path` type), 4 (the
-    current-directory native) and 5 (the seed rotation, pinning
-    `blorp-seed-4acd2377961d`) have landed. Seed-built code may now use
-    `Union.Variant` and the new native. Landing 6, process and environment
-    errors, is next.
+    current-directory native), 5 (the seed rotation, pinning
+    `blorp-seed-4acd2377961d`) and 6 (exact process and environment errors)
+    have landed. Landing 7, files, is next.
 - **Process API:** [`PROCESS_DECISIONS.md`](PROCESS_DECISIONS.md).
   - **Status:** L0 is implemented and independently reviewed; final combined
     landing gates and four-platform CI pass; L0 is published. Shared
@@ -50,8 +49,8 @@ done.
     L1 is implemented: the `process.capture`, `process.find_program` and
     `process.fault` natives, the C core and `process.brp`. A reply the C side
     never builds aborts through `process.fault`.
-  - **Next:** L2, migrating the 17 `run_to_files` call sites and deleting it,
-    after `PATH_PLAN.md`'s landing 6 changes the process errors.
+  - **Next:** L2, migrating the 17 `run_to_files` call sites and deleting it.
+    `PATH_PLAN.md`'s landing 6 has given the process API its exact errors.
   - **Later:** binary capture after `Bytes`, and `run` with streaming.
 - **Language server (`blorp lsp`):** [`LSP_PLAN.md`](LSP_PLAN.md).
   - **Status:** the plan was written and revised on 2026-11-10 (name uses

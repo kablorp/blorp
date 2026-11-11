@@ -14,7 +14,7 @@ import:
         FunctionExecution(OrdinaryCalls),
         Entrypoint(NoArguments),
         EntryResult(IntegerExitStatus),
-        SystemOperation(GetCurrentDirectory),
+        SystemOperation(CurrentDirectory),
     ../../../current_directory_inputs:
         CurrentDirectorySeed,
         current_directory_seed,
@@ -33,7 +33,7 @@ private pure func raw_result(
     unions: List[specialized.ConcreteUnion],
 ) -> own.OwnershipProgram:
     call: specialized.CallTarget = specialized.RuntimeFunction(
-        builtins.SystemCall(GetCurrentDirectory, constructors),
+        builtins.SystemCall(CurrentDirectory, constructors),
     )
     result: own.OwnedDefinition = {
         id = ids.first,
@@ -102,10 +102,7 @@ pure func test_verifier_rejects_wrong_error_payload() -> Bool:
         (Ok(seed), Ok(ids)):
             program = valid_result(seed, ids)
             wrong: List[specialized.ConcreteUnion] = [
-                specialized.OwningCases([
-                    [specialized.StringType],
-                    [specialized.IntegerType(Int64Format)],
-                ]),
+                specialized.OwningCases([[specialized.StringType], [specialized.StringType]]),
             ]
             rejects(
                 { program | unions = wrong },
@@ -116,17 +113,52 @@ pure func test_verifier_rejects_wrong_error_payload() -> Bool:
             False
 
 
-pure func test_verifier_rejects_duplicate_result_constructor() -> Bool:
+-- A designated Bool result whose two constructors are one variant: the union has
+-- the right shape and payloads, so only the distinctness condition rejects it.
+pure func test_verifier_rejects_duplicate_bool_result_constructor() -> Bool:
     match (current_directory_seed(test_base()), input_ids()):
         (Ok(seed), Ok(ids)):
-            program = raw_result(
-                ids,
-                { seed.constructors | err = seed.constructors.ok },
-                own.OwnedResult(own.owner_id(0)),
-                [own.DropOwner(own.owner_id(0), span(40))],
-                lower.lowered_functions(seed.lowered).unions,
+            same = seed.constructors.ok
+            call: specialized.CallTarget = specialized.RuntimeFunction(
+                builtins.IntegerEquals(Int64Format, { true_variant = same, false_variant = same }),
             )
-            rejects(program, "runtime Result constructors do not cover one result union", 30)
+            integer_type = specialized.IntegerType(Int64Format)
+            left: own.OwnedDefinition = {
+                id = ids.first,
+                value_type = integer_type,
+                operation = own.IntegerDefinition(0),
+                result = own.UnmanagedResult,
+                span = span(10),
+            }
+            right: own.OwnedDefinition = { left | id = ids.second, span = span(20) }
+            comparison: own.OwnedDefinition = {
+                id = ids.third,
+                value_type = specialized.UnionType(specialized.variant_owner(same)),
+                operation = own.CallDefinition(call, [
+                    own.UnmanagedArgument(ids.first),
+                    own.UnmanagedArgument(ids.second),
+                ]),
+                result = own.UnmanagedResult,
+                span = span(30),
+            }
+            function: own.OwnedFunction = {
+                label = placeholder_label("main"),
+                parameters = [],
+                return_type = integer_type,
+                operations = [
+                    own.DefineValue(left),
+                    own.DefineValue(right),
+                    own.DefineValue(comparison),
+                ],
+                result = own.UnmanagedReturn(ids.first),
+            }
+            program: own.OwnershipProgram = {
+                records = [],
+                unions = [specialized.PlainCases([[], []])],
+                functions = [function],
+                entrypoint = NoArguments(ids.entrypoint, IntegerExitStatus),
+            }
+            rejects(program, "runtime Bool constructors do not cover one result union", 30)
         _:
             False
 
@@ -201,15 +233,15 @@ pure func test_verifier_rejects_duplicate_result_drop() -> Bool:
 func test_verifier_rejects_cross_owner_error_constructor() -> Bool:
     source: String =
         |union Other:
-        |    Outside(String)
-        |func query() -> Result[String, String]:
-        |    builtin("system.get_current_directory")
+        |    Outside(Int)
+        |func query() -> Result[String, Int]:
+        |    builtin("system.current_directory")
         |func escape() -> String:
         |    match query():
         |        Ok(path): path
-        |        Err(error): error
+        |        Err(_): ""
         |pure func make_other() -> Other:
-        |    Outside("x")
+        |    Outside(0)
         |func main() -> Int:
         |    unused = query()
         |    escaped = escape()
@@ -291,8 +323,8 @@ TESTS: TestSuite = {
         ("missing Result constructor rejects", test_verifier_rejects_missing_result_constructor),
         ("duplicate Result drop rejects", test_verifier_rejects_duplicate_result_drop),
         (
-            "Result constructors must be distinct",
-            test_verifier_rejects_duplicate_result_constructor,
+            "Bool constructors must be distinct",
+            test_verifier_rejects_duplicate_bool_result_constructor,
         ),
         ("Result must own its String", test_verifier_rejects_unmanaged_result),
         ("Result owner must be dropped", test_verifier_rejects_missing_result_drop),

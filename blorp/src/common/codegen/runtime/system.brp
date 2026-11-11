@@ -1,7 +1,6 @@
 import:
     ../../syntax/syntax:
         SystemOperation(
-            GetCurrentDirectory,
             CurrentDirectory,
             RunToFiles,
             ProcessCapture,
@@ -44,80 +43,11 @@ import:
         PROCESS_FAULT_RUNTIME,
 
 
--- The failure helpers the system fragments share. A failure publishes one
--- fresh counted String into the error out-parameter, which its branch owns.
-SYSTEM_FAILURE_RUNTIME: String =
-    raw
-        |enum {BLORP_SYSTEM_FAILED=0,BLORP_SYSTEM_SUCCEEDED=1};
-        |static uint8_t blorp_system_failure(struct blorp_string **result,const char *message){
-        |*result=blorp_string_from_bytes(message,(int64_t)strlen(message));
-        |return BLORP_SYSTEM_FAILED;
-        |}
-        |/* The String is sized to the formatted text, so no prefix can overflow it. */
-        |static uint8_t blorp_system_error(struct blorp_string **result,const char *prefix,int error){
-        |const int length=snprintf(NULL,0,"%s%d",prefix,error);
-        |if(length<0){abort();}
-        |struct blorp_string *message=blorp_string_allocate(length);
-        |(void)snprintf(message->bytes,(size_t)length+1,"%s%d",prefix,error);
-        |*result=message;
-        |return BLORP_SYSTEM_FAILED;
-        |}
-        |
-
-
--- Private native staging becomes exactly one owned String on either branch,
--- in the out-parameter of that branch.
+-- The working directory, failing with an Int code of the shared fs protocol
+-- (fs.brp), which io/_codes.brp decodes. A path the OS names but that is empty
+-- or not absolute (Linux's "(unreachable)/...") is Unreachable; a path longer
+-- than any String is OtherOs(EOVERFLOW).
 SYSTEM_CURRENT_DIRECTORY_RUNTIME: String =
-    raw
-        |#include <errno.h>
-        |#include <limits.h>
-        |#include <unistd.h>
-        |enum {BLORP_CURRENT_DIRECTORY_INITIAL_CAPACITY=256};
-        |uint8_t blorp_get_current_directory(struct blorp_string **directory,struct blorp_string **error){
-        |const size_t maximum_capacity=blorp_string_maximum_capacity()+1;
-        |size_t capacity=BLORP_CURRENT_DIRECTORY_INITIAL_CAPACITY;
-        |char *buffer=blorp_memory_allocate(capacity);
-        |if(buffer==NULL){abort();}
-        |for(;;){
-        |errno=0;
-        |if(getcwd(buffer,capacity)!=NULL){
-        |const size_t length=strlen(buffer);
-        |if(length==0||buffer[0]!='/'){
-        |blorp_memory_release(buffer);
-        |return blorp_system_failure(error,"get_current_directory: native path must be nonempty and absolute");
-        |}
-        |if(!blorp_utf8_is_valid(buffer,length)){
-        |blorp_memory_release(buffer);
-        |return blorp_system_failure(error,"get_current_directory: invalid UTF-8; use a working directory with a UTF-8 path");
-        |}
-        |*directory=blorp_string_from_bytes(buffer,(int64_t)length);
-        |blorp_memory_release(buffer);
-        |return BLORP_SYSTEM_SUCCEEDED;
-        |}
-        |const int saved_errno=errno;
-        |if(saved_errno!=ERANGE){
-        |blorp_memory_release(buffer);
-        |return blorp_system_error(error,"get_current_directory: failed; errno=",saved_errno);
-        |}
-        |if(capacity==maximum_capacity){
-        |blorp_memory_release(buffer);
-        |return blorp_system_error(error,"get_current_directory: failed; errno=",EOVERFLOW);
-        |}
-        |const size_t grown_capacity=capacity>maximum_capacity/2?maximum_capacity:capacity*2;
-        |char *grown=blorp_memory_resize(buffer,grown_capacity);
-        |if(grown==NULL){abort();}
-        |buffer=grown;
-        |capacity=grown_capacity;
-        |}
-        |}
-        |
-
-
--- The same query as above (PATH_PLAN.md landing 6 deletes that one), failing with an Int
--- code of the shared fs protocol (fs.brp), which io/_codes.brp decodes. A path
--- the OS names but that is empty or not absolute (Linux's "(unreachable)/...")
--- is Unreachable; a path longer than any String is OtherOs(EOVERFLOW).
-SYSTEM_CURRENT_DIRECTORY_CODE_RUNTIME: String =
     raw
         |enum {BLORP_CURRENT_DIRECTORY_CODE_INITIAL_CAPACITY=256};
         |/* The limit is a parameter so that a test can reach it without a huge allocation. */
@@ -161,7 +91,6 @@ SYSTEM_CURRENT_DIRECTORY_CODE_RUNTIME: String =
 -- Result payload, success first, returning whether the call succeeded.
 pure func system_symbol(operation: SystemOperation) -> String:
     match operation:
-        GetCurrentDirectory: "blorp_get_current_directory"
         CurrentDirectory: "blorp_system_current_directory"
         RunToFiles: "blorp_process_run_to_files"
         ProcessCapture: "blorp_process_capture"
@@ -185,13 +114,11 @@ pure func system_symbol(operation: SystemOperation) -> String:
 
 -- `posix_declarations` requests POSIX.1-2008, with the XSI and Darwin
 -- extensions, before any header;
--- `failure_helpers` needs SYSTEM_FAILURE_RUNTIME emitted before the fragment,
 -- `fs_helpers` needs FS_HELPERS_RUNTIME, and `process_helpers` needs
 -- PROCESS_HELPERS_RUNTIME after it.
 record SystemRuntime {
     fragment: String,
     posix_declarations: Bool,
-    failure_helpers: Bool,
     fs_helpers: Bool,
     process_helpers: Bool,
 }
@@ -200,19 +127,10 @@ record SystemRuntime {
 -- The emitter supplies the String-list C type from its existing typed key.
 pure func system_runtime(operation: SystemOperation, string_list_type: String) -> SystemRuntime:
     match operation:
-        GetCurrentDirectory:
-            {
-                fragment = SYSTEM_CURRENT_DIRECTORY_RUNTIME,
-                posix_declarations = False,
-                failure_helpers = True,
-                fs_helpers = False,
-                process_helpers = False,
-            }
         CurrentDirectory:
             {
-                fragment = SYSTEM_CURRENT_DIRECTORY_CODE_RUNTIME,
+                fragment = SYSTEM_CURRENT_DIRECTORY_RUNTIME,
                 posix_declarations = True,
-                failure_helpers = False,
                 fs_helpers = True,
                 process_helpers = False,
             }
@@ -220,7 +138,6 @@ pure func system_runtime(operation: SystemOperation, string_list_type: String) -
             {
                 fragment = process_runtime(string_list_type),
                 posix_declarations = True,
-                failure_helpers = False,
                 fs_helpers = False,
                 process_helpers = True,
             }
@@ -228,7 +145,6 @@ pure func system_runtime(operation: SystemOperation, string_list_type: String) -
             {
                 fragment = process_capture_runtime(string_list_type),
                 posix_declarations = True,
-                failure_helpers = False,
                 fs_helpers = True,
                 process_helpers = True,
             }
@@ -236,7 +152,6 @@ pure func system_runtime(operation: SystemOperation, string_list_type: String) -
             {
                 fragment = PROCESS_FIND_PROGRAM_RUNTIME,
                 posix_declarations = True,
-                failure_helpers = False,
                 fs_helpers = True,
                 process_helpers = True,
             }
@@ -244,7 +159,6 @@ pure func system_runtime(operation: SystemOperation, string_list_type: String) -
             {
                 fragment = PROCESS_FAULT_RUNTIME,
                 posix_declarations = True,
-                failure_helpers = False,
                 fs_helpers = False,
                 process_helpers = True,
             }
@@ -252,7 +166,6 @@ pure func system_runtime(operation: SystemOperation, string_list_type: String) -
             {
                 fragment = FS_READ_TEXT_RUNTIME,
                 posix_declarations = True,
-                failure_helpers = False,
                 fs_helpers = True,
                 process_helpers = False,
             }
@@ -260,7 +173,6 @@ pure func system_runtime(operation: SystemOperation, string_list_type: String) -
             {
                 fragment = FS_WRITE_TEXT_RUNTIME,
                 posix_declarations = True,
-                failure_helpers = False,
                 fs_helpers = True,
                 process_helpers = False,
             }
@@ -268,7 +180,6 @@ pure func system_runtime(operation: SystemOperation, string_list_type: String) -
             {
                 fragment = FS_ENTRY_KIND_RUNTIME,
                 posix_declarations = True,
-                failure_helpers = False,
                 fs_helpers = True,
                 process_helpers = False,
             }
@@ -276,7 +187,6 @@ pure func system_runtime(operation: SystemOperation, string_list_type: String) -
             {
                 fragment = fs_list_directory_runtime(string_list_type),
                 posix_declarations = True,
-                failure_helpers = False,
                 fs_helpers = True,
                 process_helpers = False,
             }
@@ -284,7 +194,6 @@ pure func system_runtime(operation: SystemOperation, string_list_type: String) -
             {
                 fragment = FS_CREATE_DIRECTORY_RUNTIME,
                 posix_declarations = True,
-                failure_helpers = False,
                 fs_helpers = True,
                 process_helpers = False,
             }
@@ -292,7 +201,6 @@ pure func system_runtime(operation: SystemOperation, string_list_type: String) -
             {
                 fragment = FS_CREATE_DIRECTORIES_RUNTIME,
                 posix_declarations = True,
-                failure_helpers = False,
                 fs_helpers = True,
                 process_helpers = False,
             }
@@ -300,7 +208,6 @@ pure func system_runtime(operation: SystemOperation, string_list_type: String) -
             {
                 fragment = FS_REMOVE_FILE_RUNTIME,
                 posix_declarations = True,
-                failure_helpers = False,
                 fs_helpers = True,
                 process_helpers = False,
             }
@@ -308,7 +215,6 @@ pure func system_runtime(operation: SystemOperation, string_list_type: String) -
             {
                 fragment = FS_REMOVE_DIRECTORY_RUNTIME,
                 posix_declarations = True,
-                failure_helpers = False,
                 fs_helpers = True,
                 process_helpers = False,
             }
@@ -316,7 +222,6 @@ pure func system_runtime(operation: SystemOperation, string_list_type: String) -
             {
                 fragment = FS_RENAME_RUNTIME,
                 posix_declarations = True,
-                failure_helpers = False,
                 fs_helpers = True,
                 process_helpers = False,
             }
@@ -324,7 +229,6 @@ pure func system_runtime(operation: SystemOperation, string_list_type: String) -
             {
                 fragment = FS_REMOVE_DIRECTORY_TREE_RUNTIME,
                 posix_declarations = True,
-                failure_helpers = False,
                 fs_helpers = True,
                 process_helpers = False,
             }
@@ -332,7 +236,6 @@ pure func system_runtime(operation: SystemOperation, string_list_type: String) -
             {
                 fragment = FS_CREATE_TEMPORARY_DIRECTORY_RUNTIME,
                 posix_declarations = True,
-                failure_helpers = False,
                 fs_helpers = True,
                 process_helpers = False,
             }
@@ -340,7 +243,6 @@ pure func system_runtime(operation: SystemOperation, string_list_type: String) -
             {
                 fragment = FS_OPEN_READ_RUNTIME,
                 posix_declarations = True,
-                failure_helpers = False,
                 fs_helpers = True,
                 process_helpers = False,
             }
@@ -348,7 +250,6 @@ pure func system_runtime(operation: SystemOperation, string_list_type: String) -
             {
                 fragment = fs_next_lines_runtime(string_list_type),
                 posix_declarations = True,
-                failure_helpers = False,
                 fs_helpers = True,
                 process_helpers = False,
             }
@@ -356,7 +257,6 @@ pure func system_runtime(operation: SystemOperation, string_list_type: String) -
             {
                 fragment = FS_CLOSE_RUNTIME,
                 posix_declarations = True,
-                failure_helpers = False,
                 fs_helpers = True,
                 process_helpers = False,
             }

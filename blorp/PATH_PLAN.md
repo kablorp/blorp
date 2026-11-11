@@ -1,8 +1,8 @@
 # `Path`, exact I/O errors, naming rules and qualified variants
 
-**Status: plan, 2026-11-10, revision 4. Landings 4 (`7d8a92f25`), 3
-(`4024ef09d`), 1 (`be98099e6`), 2 (`4acd23779`) and 5 (the seed rotation)
-have landed. Landing 6, process and environment errors, is next.**
+**Status: plan, 2026-11-11, revision 4. Landings 4 (`7d8a92f25`), 3
+(`4024ef09d`), 1 (`be98099e6`), 2 (`4acd23779`), 5 (`c0512c385`) and 6
+(process and environment errors) have landed. Landing 7, files, is next.**
 Revision 4 folds in landing 2's parser and ergonomics review. Revision 3
 adds the naming rules
 Keith adopted, which make qualified variants a parser rule. Keith approved P1
@@ -550,8 +550,28 @@ unchanged; messages that print a process error add the program the same way.
    are updated. The rest of process L2 (`Command.program`, removing
    `run_to_files`) stays in the process plan.
    - Ceilings, estimates: compiler production lines at most +10 net;
-     standard library at most +80 net. Self-compile allocations and
-     instructions each at most +0.2%.
+     standard library at most +100 net (was +80). Self-compile allocations
+     and instructions each at most +0.2%.
+   - Coordinator correction, 2026-11-11: the standard library measures +100
+     net (`_codes` +3, `environment` +58, `process` +39). The estimate did
+     not count the `Stringable` text that every new union needs. Compiler
+     production is −106, because deleting the old builtin removed its C.
+     Self-compile cost is −1 allocation and −0.003% instructions, the median
+     of 11 interleaved `-O2` rounds, with byte-identical compiler C. The
+     `current_directory` e2e fixtures now import `Path`, which loads all of
+     `path.brp`. Their allocation ceilings rose about 38% to their measured
+     value plus the usual margin, a first look at landing 8's prelude cost.
+   - Follow-ups, not done here:
+     - The process runtime encodes every errno through the shared file
+       protocol. So a named code that `SystemCallError` lacks would decode as
+       `OtherOs` of the negated protocol code, not the errno. The only
+       reachable case is Linux `execve`'s `EISDIR`, when an ELF interpreter
+       is a directory. Fix it by having the process natives send
+       `other_os_code(errno)` for errnos the union does not name.
+     - The decoders in `io/environment` and `io/process` are public, with a
+       "not API" comment, so that tests can pass them literal codes. Blorp
+       has no test-visible form of `private`; `io/_codes`'s `decode_error`
+       is public by the same convention.
 7. **Files.** The `io/fs/` modules with `Path` signatures and exact errors;
    `join` and `normalize` on `Path`. `io/fs.brp`, `io/error.brp`,
    `IOErrorKind`, `default_if_not_found`, the String functions in `path.brp`,

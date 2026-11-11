@@ -2,31 +2,35 @@ import:
     bool: and
     dict: Dict
     int: Int methods
-    io/error: IOError, IOErrorKind(NotFound, PermissionDenied), to_string
+    io/error: to_string
     io/fs: create_directory, read_text, write_text
     io/process:
         Captured,
         Command,
         Exit(Exited, Signaled, TimedOut),
-        ProcessError,
-        ProcessErrorKind(
-            NotOnPath,
+        CaptureError(
+            InvalidVariableName,
+            ContainsNul,
             LaunchFailed,
             NotExecutable,
             DirectoryFailed,
-            ContainsNul,
-            InvalidVariableName,
             StdoutNotUtf8,
             StderrNotUtf8,
-            Unsuccessful,
         ),
+        FindProgramError(NotOnPath, NameContainsNul),
+        OutputError(CaptureFailed, Unsuccessful),
+        SystemCallError(NotFound, PermissionDenied, NotADirectory, OtherOs),
         capture,
         command,
+        decode_capture_error,
+        decode_find_program_error,
+        decode_system_call_error,
         find_program,
         output,
         run_to_files,
     list: List methods
     option: Option methods
+    path: Path, PathError, to_path
     result: Result methods
     string: String methods
     test: TestSuite
@@ -372,8 +376,8 @@ private func native_probe(child: String, directory: String, mode: String) -> Res
     verify_accounting(report, True)
 
 
--- The capture tests render every outcome as text, independently of
--- ProcessError's Stringable text, and compare it exactly.
+-- The capture tests render every outcome as text, independently of the
+-- errors' Stringable text, and compare it exactly.
 private pure func exit_text(exit: Exit) -> String:
     match exit:
         Exited(status): "Exited(${status})"
@@ -385,32 +389,35 @@ private pure func captured_text(captured: Captured) -> String:
     "${captured.exit.exit_text()} [${captured.stdout}] [${captured.stderr}]"
 
 
-private pure func io_kind_text(kind: IOErrorKind) -> String:
-    error: IOError = { path = "", destination = None, kind = kind }
-    error.to_string()
+private pure func cause_text(cause: SystemCallError) -> String:
+    match cause:
+        NotFound: "NotFound"
+        PermissionDenied: "PermissionDenied"
+        NotADirectory: "NotADirectory"
+        OtherOs(number): "OtherOs(${number})"
 
 
-private pure func kind_text(kind: ProcessErrorKind) -> String:
-    match kind:
-        NotOnPath: "NotOnPath"
-        LaunchFailed(io): "LaunchFailed(${io.io_kind_text()})"
-        NotExecutable: "NotExecutable"
-        DirectoryFailed(error): "DirectoryFailed(${error})"
-        ContainsNul: "ContainsNul"
+private pure func capture_error_text(error: CaptureError) -> String:
+    match error:
         InvalidVariableName(name): "InvalidVariableName(${name})"
+        ContainsNul: "ContainsNul"
+        LaunchFailed(cause): "LaunchFailed(${cause.cause_text()})"
+        NotExecutable: "NotExecutable"
+        DirectoryFailed(cause): "DirectoryFailed(${cause.cause_text()})"
         StdoutNotUtf8(exit): "StdoutNotUtf8(${exit.exit_text()})"
         StderrNotUtf8(exit): "StderrNotUtf8(${exit.exit_text()})"
+
+
+private pure func output_error_text(error: OutputError) -> String:
+    match error:
+        CaptureFailed(cause): "CaptureFailed(${cause.capture_error_text()})"
         Unsuccessful(captured): "Unsuccessful(${captured.captured_text()})"
 
 
-private pure func error_text(error: ProcessError) -> String:
-    "${error.program}: ${error.kind.kind_text()}"
-
-
-private pure func outcome(result: Result[Captured, ProcessError]) -> String:
+private pure func outcome(result: Result[Captured, CaptureError]) -> String:
     match result:
         Ok(captured): captured.captured_text()
-        Err(error): error.error_text()
+        Err(error): error.capture_error_text()
 
 
 private pure func expect_text(actual: String, expected: String) -> Result[Void, String]:
@@ -471,10 +478,8 @@ private func grandchild_case(child: String, directory: String) -> Result[Void, S
 
 
 private func utf8_case(child: String) -> Result[Void, String]:
-    _ ?= child_command(child, ["cut-off-exit", "4"]).captured_as(
-        "${child}: StdoutNotUtf8(Exited(4))",
-    )
-    child_command(child, ["invalid-stderr", "0"]).captured_as("${child}: StderrNotUtf8(Exited(0))")
+    _ ?= child_command(child, ["cut-off-exit", "4"]).captured_as("StdoutNotUtf8(Exited(4))")
+    child_command(child, ["invalid-stderr", "0"]).captured_as("StderrNotUtf8(Exited(0))")
 
 
 -- 256 KiB, four times a pipe buffer, so the child blocks writing unless the
@@ -496,7 +501,7 @@ private func stdin_case(child: String) -> Result[Void, String]:
             else:
                 Err("stdin was not echoed whole: ${captured.stdout.length()} bytes")
         Err(error):
-            Err(error.error_text())
+            Err(error.capture_error_text())
     _ ?= child_command(child, ["stdin"]).captured_as("Exited(0) [] []")
     { child_command(child, ["stdin"]) | stdin = Some("") }.captured_as("Exited(0) [] []")
 
@@ -546,7 +551,7 @@ private func environment_case() -> Result[Void, String]:
         .set("PATH", None)
         .set("HOME", Some("/replaced"))
     listed: Captured ?= capture({ command(ENVIRONMENT_TOOL, []) | environment = changed }).map_err(
-        error_text,
+        capture_error_text,
     )
     _ ?= expect_text(
         [
@@ -558,7 +563,7 @@ private func environment_case() -> Result[Void, String]:
         ].join(" | "),
         "Exited(0) | BLORP_PROCESS_SET=one=two |  | HOME=/replaced | ",
     )
-    inherited: Captured ?= capture(command(ENVIRONMENT_TOOL, [])).map_err(error_text)
+    inherited: Captured ?= capture(command(ENVIRONMENT_TOOL, [])).map_err(capture_error_text)
     if (
         inherited.stdout
             .entries_named("PATH=/")
@@ -575,46 +580,52 @@ private func environment_case() -> Result[Void, String]:
 private func rejection_case(directory: String) -> Result[Void, String]:
     missing = directory + "/no-such-program"
     _ ?= { command(missing, []) | environment = { "" => Some("x") } }.captured_as(
-        "${missing}: InvalidVariableName()",
+        "InvalidVariableName()",
     )
     _ ?= { command(missing, []) | environment = { "A=B" => None } }.captured_as(
-        "${missing}: InvalidVariableName(A=B)",
+        "InvalidVariableName(A=B)",
     )
-    _ ?= command(missing + "\0", []).captured_as("${missing}\0: ContainsNul")
-    _ ?= command(missing, ["a\0b"]).captured_as("${missing}: ContainsNul")
+    _ ?= command(missing + "\0", []).captured_as("ContainsNul")
+    _ ?= command(missing, ["a\0b"]).captured_as("ContainsNul")
     _ ?= { command(missing, []) | environment = { "NAME" => Some("a\0b") } }.captured_as(
-        "${missing}: ContainsNul",
+        "ContainsNul",
     )
-    { command(missing, []) | environment = { "NA\0ME" => None } }.captured_as(
-        "${missing}: ContainsNul",
-    )
+    { command(missing, []) | environment = { "NA\0ME" => None } }.captured_as("ContainsNul")
+
+
+-- A fixture path is built here, so one the constructor refuses is a defect in
+-- the test.
+private pure func path_of(text: String) -> Result[Path, String]:
+    to_path(text).map_err(pure func(error: PathError) -> String: "${text}: ${error}")
 
 
 private func directory_case(child: String, directory: String) -> Result[Void, String]:
     place = directory + "/capture-place"
     _ ?= create_directory(place).map_err(to_string)
     _ ?= write_text(place + "/marker.txt", "marked\n").map_err(to_string)
-    _ ?= { child_command(child, ["cat-file", "marker.txt"]) | directory = Some(place) }.captured_as(
+    place_path ?= path_of(place)
+    _ ?= { child_command(child, ["cat-file", "marker.txt"]) | directory = Some(place_path) }.captured_as(
         "Exited(0) [marked\n] []",
     )
-    missing = directory + "/capture-missing"
+    missing ?= path_of(directory + "/capture-missing")
     _ ?= { child_command(child, []) | directory = Some(missing) }.captured_as(
-        "${child}: DirectoryFailed(${missing}: no such file)",
+        "DirectoryFailed(NotFound)",
     )
-    { child_command(child, []) | directory = Some("bad\0place") }.captured_as(
-        "${child}: DirectoryFailed(bad\0place: path contains a NUL byte)",
+    inside_file ?= path_of(place + "/marker.txt")
+    { child_command(child, []) | directory = Some(inside_file) }.captured_as(
+        "DirectoryFailed(NotADirectory)",
     )
 
 
 private func launch_case(child: String, directory: String) -> Result[Void, String]:
     missing = directory + "/capture-missing-program"
-    _ ?= command(missing, []).captured_as("${missing}: LaunchFailed(: no such file)")
+    _ ?= command(missing, []).captured_as("LaunchFailed(NotFound)")
     plain = directory + "/capture-plain-file"
     _ ?= write_text(plain, "not a program\n").map_err(to_string)
-    _ ?= command(plain, []).captured_as("${plain}: LaunchFailed(: permission denied)")
+    _ ?= command(plain, []).captured_as("LaunchFailed(PermissionDenied)")
     script = directory + "/capture-invalid-executable"
     _ ?= child_command(child, ["invalid-executable", script]).captured_as("Exited(0) [] []")
-    command(script, []).captured_as("${script}: NotExecutable")
+    command(script, []).captured_as("NotExecutable")
 
 
 private func zero_timeout_case(directory: String) -> Result[Void, String]:
@@ -623,15 +634,25 @@ private func zero_timeout_case(directory: String) -> Result[Void, String]:
     { command(missing, []) | timeout_ms = Some(-5) }.captured_as("TimedOut [] []")
 
 
-private func output_case(child: String) -> Result[Void, String]:
+private pure func expect_output_error(
+    result: Result[String, OutputError],
+    expected: String,
+) -> Result[Void, String]:
+    match result:
+        Ok(text): Err("expected an OutputError, got Ok: " + text)
+        Err(error): expect_text(error.output_error_text(), expected)
+
+
+private func output_case(child: String, directory: String) -> Result[Void, String]:
     _ ?= match output(child_command(child, ["streams"])):
         Ok(text): expect_text(text, "stdout text\n")
-        Err(error): Err(error.error_text())
-    match output(child_command(child, ["fail-streams"])):
-        Ok(text):
-            Err("Unsuccessful became Ok: " + text)
-        Err(error):
-            expect_text(error.error_text(), "${child}: Unsuccessful(Exited(7) [out\n] [err\n])")
+        Err(error): Err(error.output_error_text())
+    _ ?= output(command(directory + "/output-missing-program", [])).expect_output_error(
+        "CaptureFailed(LaunchFailed(NotFound))",
+    )
+    output(child_command(child, ["fail-streams"])).expect_output_error(
+        "Unsuccessful(Exited(7) [out\n] [err\n])",
+    )
 
 
 -- SIGABRT is 6 on macOS and Linux.
@@ -647,37 +668,44 @@ private func defect_case(child: String) -> Result[Void, String]:
     )
 
 
-private pure func found_text(result: Result[String, ProcessError]) -> String:
+private pure func found_text(result: Result[Path, FindProgramError]) -> String:
     match result:
-        Ok(path): "Ok(${path})"
-        Err(error): error.error_text()
+        Ok(found): "Ok(${found})"
+        Err(error): error.found_error_text()
+
+
+private pure func found_error_text(error: FindProgramError) -> String:
+    match error:
+        NotOnPath: "NotOnPath"
+        NameContainsNul: "NameContainsNul"
 
 
 private func find_program_case() -> Result[Void, String]:
     _ ?= find_program("blorp-process-suite-missing")
         .found_text()
-        .expect_text("blorp-process-suite-missing: NotOnPath")
+        .expect_text("NotOnPath")
     _ ?= find_program("../bin/sh")
         .found_text()
-        .expect_text("../bin/sh: NotOnPath")
+        .expect_text("NotOnPath")
     _ ?= find_program("")
         .found_text()
-        .expect_text(": NotOnPath")
+        .expect_text("NotOnPath")
     _ ?= find_program("s\0h")
         .found_text()
-        .expect_text("s\0h: ContainsNul")
+        .expect_text("NameContainsNul")
     match find_program("sh"):
-        Ok(path):
+        Ok(found):
+            text = "${found}"
             if (
-                path
+                text
                     .starts_with("/")
-                    .and(path.ends_with_sh())
+                    .and(text.ends_with_sh())
             ):
                 Ok(void)
             else:
-                Err("find_program(sh) gave " + path)
+                Err("find_program(sh) gave " + text)
         Err(error):
-            Err(error.error_text())
+            Err("${error}")
 
 
 private pure func ends_with_sh(path: String) -> Bool:
@@ -686,41 +714,141 @@ private pure func ends_with_sh(path: String) -> Bool:
         None: False
 
 
-private pure func make_error_text(kind: ProcessErrorKind) -> String:
-    error: ProcessError = { program = "make", kind = kind }
-    error.to_string()
-
-
-private pure func test_to_string_words_every_kind() -> Bool:
-    directory: IOError = { path = "/work", destination = None, kind = NotFound }
-    quiet_failure: Captured = { exit = Signaled(9), stdout = "", stderr = "" }
-    loud_failure: Captured = { exit = Exited(2), stdout = "partial", stderr = "no rule\n" }
-    cases: List[(ProcessErrorKind, String)] = [
-        (NotOnPath, "make: not found on PATH"),
-        (LaunchFailed(PermissionDenied), "make: permission denied"),
-        (NotExecutable, "make: not a program the system can run; a script needs a #! line"),
-        (DirectoryFailed(directory), "make: cannot enter /work: no such file"),
-        (ContainsNul, "make: the program, an argument or the environment contains a NUL byte"),
-        (
-            InvalidVariableName("A=B"),
-            "make: invalid environment variable name \"A=B\"; a name is nonempty and has no =",
-        ),
-        (StdoutNotUtf8(Exited(0)), "make: exited 0, and its stdout is not UTF-8"),
-        (StderrNotUtf8(TimedOut), "make: timed out, and its stderr is not UTF-8"),
-        (Unsuccessful(quiet_failure), "make: killed by signal 9"),
-        (Unsuccessful(loud_failure), "make: exited 2\nno rule\n"),
-    ]
-    cases.all(pure func(case: (ProcessErrorKind, String)) -> Bool:
+private pure func cases_hold(cases: List[(String, String)]) -> Bool:
+    cases.all(pure func(case: (String, String)) -> Bool:
         match case:
-            (kind, expected): kind.make_error_text() == expected
+            (actual, expected): actual == expected
     )
 
 
-private pure func test_interpolation_and_to_string_agree_on_an_unsuccessful_exit() -> Bool:
-    failed: Captured = { exit = Exited(2), stdout = "partial", stderr = "no rule\n" }
-    error: ProcessError = { program = "make", kind = Unsuccessful(failed) }
-    ("${error}" == "make: exited 2\nno rule\n").and(
-        error.to_string() == "make: exited 2\nno rule\n",
+-- Literal codes bind the decoders to the native protocol independently: the
+-- file protocol's NotFound is 1, PermissionDenied 2 and NotADirectory 4, and a
+-- process error is its detail times 16 plus its tag.
+private pure func test_system_call_decoder_names_three_codes_and_keeps_the_rest() -> Bool:
+    cases_hold([
+        (decode_system_call_error(1).cause_text(), "NotFound"),
+        (decode_system_call_error(2).cause_text(), "PermissionDenied"),
+        (decode_system_call_error(4).cause_text(), "NotADirectory"),
+        -- A negative code is an unnamed errno, negated by the native.
+        (decode_system_call_error(-62).cause_text(), "OtherOs(62)"),
+        -- A positive code no constant names is a disagreement, kept visible.
+        (decode_system_call_error(5).cause_text(), "OtherOs(-5)"),
+        (decode_system_call_error(0).cause_text(), "OtherOs(0)"),
+    ])
+
+
+private pure func decoded_text(code: Int) -> String:
+    match decode_capture_error(code):
+        Some(error): error.capture_error_text()
+        None: "None"
+
+
+private pure func test_capture_decoder_maps_every_tag() -> Bool:
+    cases_hold([
+        (decoded_text(1 + 16 * 1), "LaunchFailed(NotFound)"),
+        (decoded_text(1 + 16 * (0 - 62)), "LaunchFailed(OtherOs(62))"),
+        (decoded_text(2), "NotExecutable"),
+        (decoded_text(3 + 16 * 2), "DirectoryFailed(PermissionDenied)"),
+        (decoded_text(3 + 16 * 4), "DirectoryFailed(NotADirectory)"),
+        (decoded_text(4), "ContainsNul"),
+        (decoded_text(5 + 16 * 4), "StdoutNotUtf8(Exited(4))"),
+        (decoded_text(6 + 16 * 265), "StderrNotUtf8(Signaled(9))"),
+        (decoded_text(5 + 16 * 512), "StdoutNotUtf8(TimedOut)"),
+    ])
+
+
+private pure func test_capture_decoder_refuses_what_the_native_never_sends() -> Bool:
+    cases_hold([
+        (decoded_text(0), "None"),
+        -- A tag that find_program alone sends.
+        (decoded_text(7), "None"),
+        (decoded_text(8), "None"),
+        (decoded_text(15), "None"),
+        -- NotExecutable and ContainsNul carry no detail.
+        (decoded_text(2 + 16 * 1), "None"),
+        (decoded_text(4 + 16 * 1), "None"),
+        -- An Exit code outside the three kinds.
+        (decoded_text(5 + 16 * 768), "None"),
+        (decoded_text(5 + 16 * (0 - 1)), "None"),
+    ])
+
+
+private pure func decoded_find_program_text(code: Int) -> String:
+    match decode_find_program_error(code):
+        Some(error): error.found_error_text()
+        None: "None"
+
+
+private pure func test_find_program_decoder_maps_two_tags() -> Bool:
+    cases_hold([
+        (decoded_find_program_text(7), "NotOnPath"),
+        (decoded_find_program_text(4), "NameContainsNul"),
+        (decoded_find_program_text(0), "None"),
+        (decoded_find_program_text(1), "None"),
+        (decoded_find_program_text(23), "None"),
+    ])
+
+
+private pure func test_to_string_words_every_cause() -> Bool:
+    cases: List[(SystemCallError, String)] = [
+        (NotFound, "no such file"),
+        (PermissionDenied, "permission denied"),
+        (NotADirectory, "not a directory"),
+        (OtherOs(62), "operating system error 62"),
+    ]
+    cases.all(pure func(case: (SystemCallError, String)) -> Bool:
+        match case:
+            (error, expected): error.to_string() == expected
+    )
+
+
+private pure func test_to_string_words_every_find_program_error() -> Bool:
+    cases: List[(FindProgramError, String)] = [
+        (NotOnPath, "not found on PATH"),
+        (NameContainsNul, "the program name contains a NUL byte"),
+    ]
+    cases.all(pure func(case: (FindProgramError, String)) -> Bool:
+        match case:
+            (error, expected): error.to_string() == expected
+    )
+
+
+private pure func test_to_string_words_every_capture_error() -> Bool:
+    cases: List[(CaptureError, String)] = [
+        (
+            InvalidVariableName("A=B"),
+            "invalid environment variable name \"A=B\"; a name is nonempty and has no =",
+        ),
+        (ContainsNul, "the program, an argument or the environment contains a NUL byte"),
+        (LaunchFailed(PermissionDenied), "permission denied"),
+        (LaunchFailed(OtherOs(7)), "operating system error 7"),
+        (NotExecutable, "not a program the system can run; a script needs a #! line"),
+        (DirectoryFailed(NotFound), "cannot enter the directory: no such file"),
+        (StdoutNotUtf8(Exited(0)), "exited 0, and its stdout is not UTF-8"),
+        (StderrNotUtf8(TimedOut), "timed out, and its stderr is not UTF-8"),
+        (StdoutNotUtf8(Signaled(9)), "killed by signal 9, and its stdout is not UTF-8"),
+    ]
+    cases.all(pure func(case: (CaptureError, String)) -> Bool:
+        match case:
+            (error, expected): error.to_string() == expected
+    )
+
+
+private pure func test_to_string_words_every_output_error() -> Bool:
+    quiet_failure: Captured = { exit = Signaled(9), stdout = "", stderr = "" }
+    loud_failure: Captured = { exit = Exited(2), stdout = "partial", stderr = "no rule\n" }
+    cases: List[(OutputError, String)] = [
+        (CaptureFailed(LaunchFailed(NotFound)), "no such file"),
+        (
+            CaptureFailed(DirectoryFailed(NotADirectory)),
+            "cannot enter the directory: not a directory",
+        ),
+        (Unsuccessful(quiet_failure), "killed by signal 9"),
+        (Unsuccessful(loud_failure), "exited 2\nno rule\n"),
+    ]
+    cases.all(pure func(case: (OutputError, String)) -> Bool:
+        match case:
+            (error, expected): ("${error}" == expected).and(error.to_string() == expected)
     )
 
 
@@ -789,7 +917,7 @@ private func capture_tests(child: String, directory: String) -> List[(String, ()
         ),
         (
             "output: stdout after Exited(0), and Unsuccessful carrying the capture otherwise",
-            func(): reported(output_case(child)),
+            func(): reported(output_case(child, directory)),
         ),
         (
             "find_program: finds sh; a missing name, a name with a / or an empty one is NotOnPath, NUL ContainsNul",
@@ -799,11 +927,20 @@ private func capture_tests(child: String, directory: String) -> List[(String, ()
             "a code the library cannot decode, and process.fault, abort with the defect named",
             func(): reported(defect_case(child)),
         ),
-        ("to_string words every kind", test_to_string_words_every_kind),
         (
-            "interpolation and to_string agree on an unsuccessful exit",
-            test_interpolation_and_to_string_agree_on_an_unsuccessful_exit,
+            "the system call decoder keeps unnamed codes",
+            test_system_call_decoder_names_three_codes_and_keeps_the_rest,
         ),
+        ("the capture decoder maps every tag", test_capture_decoder_maps_every_tag),
+        (
+            "the capture decoder refuses what the native never sends",
+            test_capture_decoder_refuses_what_the_native_never_sends,
+        ),
+        ("the find_program decoder maps two tags", test_find_program_decoder_maps_two_tags),
+        ("to_string words every cause", test_to_string_words_every_cause),
+        ("to_string words every find_program error", test_to_string_words_every_find_program_error),
+        ("to_string words every capture error", test_to_string_words_every_capture_error),
+        ("to_string words every output error", test_to_string_words_every_output_error),
         ("succeeded is Exited(0) alone", test_succeeded_is_exited_zero),
         (
             "capture leaves SIGCHLD and the signal mask as they were and consumes only its own SIGPIPE",

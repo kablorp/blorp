@@ -1007,9 +1007,11 @@ in order, and ignore extra arguments.
 #### Current directory
 
 `io/environment: get_current_directory` is the impure
-`get_current_directory() -> Result[String, String]`. Success is a nonempty
-absolute UTF-8 path; failure is a readable error that includes the errno of an
-OS failure. It prints nothing. See the
+`get_current_directory() -> Result[Path, CurrentDirectoryError]`. Success is a
+`Path`: a nonempty absolute UTF-8 spelling. Failure is `NotFound`,
+`PermissionDenied`, `InvalidUtf8`, `Unreachable` (Linux's working directory
+outside the process's root) or `OtherOs(errno)`; match on the variant, and
+`"${error}"` reads as text. It prints nothing. See the
 [complete program](test/e2e/fixtures/current_directory/basic.brp).
 
 #### The fs library
@@ -1028,8 +1030,8 @@ func load_settings(path: String) -> Result[String, IOError]:
 ```
 
 `IOError` implements `Stringable`: `"${error}"` reads `settings.conf: no such
-file`. `json.ParseError` and `process.ProcessError` do the same; match on
-`error.kind`, never on the text.
+file`. `json.ParseError` and the `io/process` errors do the same; match on
+the variant, never on the text.
 
 It reads and atomically writes UTF-8 text files (`read_text`, `write_text`),
 inspects and lists directories (`entry_kind`, `list_directory`), creates,

@@ -1,8 +1,11 @@
 # Process API
 
-`describe` below is history: `ProcessError` implements `Stringable` instead
-(MODULES_AND_STRINGABLE_PLAN.md, landing 3). The modules are now `io/process`
-and `io/error` (landing 4); names below are as written then.
+`describe` below is history: the error unions implement `Stringable` instead
+(MODULES_AND_STRINGABLE_PLAN.md, landing 3). The module is now `io/process`
+(landing 4). PATH_PLAN.md landing 6 replaced `ProcessError` and
+`ProcessErrorKind` with one exact union per operation, none holding the
+program or the directory, and made `Command.directory` an `Option[Path]` and
+`find_program` return a `Path`; the types below are as they are now.
 
 Status: approved by Keith on 2026-11-06 (revision 3, after ergonomics,
 data-model and feasibility reviews), with P1 to P4 decided as recommended.
@@ -40,16 +43,17 @@ Five types and six functions:
 
 ```blorp
 import:
-    io/error: IOError, IOErrorKind
     io/process:
-        Command, Exit(Exited, Signaled, TimedOut), Captured, ProcessError, ProcessErrorKind(...),
+        Command, Exit(Exited, Signaled, TimedOut), Captured, SystemCallError(...),
+        FindProgramError(...), CaptureError(...), OutputError(...),
         command, capture, output, find_program
+    path: Path
 
 -- What to run. Build one with `command`, then change fields by record update.
 record Command {
     program: String,                             -- a path; find_program searches PATH
     arguments: List[String],                     -- without argv[0]; each passed literally
-    directory: Option[String],                   -- None runs in the parent's directory
+    directory: Option[Path],                     -- None runs in the parent's directory
     environment: Dict[String, Option[String]],   -- Some sets, None removes, the rest is inherited
     stdin: Option[String],                       -- None is /dev/null; Some is written, then closed
     timeout_ms: Option[Int],                     -- None waits; Some(n) with n <= 0 times out at once
@@ -63,67 +67,77 @@ fixed union Exit:
 
 record Captured { exit: Exit, stdout: String, stderr: String }
 
--- `program` is exactly what the caller passed: the name for find_program,
--- the path for everything else.
-record ProcessError { program: String, kind: ProcessErrorKind }
+-- Why an exec, fork, pipe or chdir failed.
+union SystemCallError:
+    NotFound
+    PermissionDenied
+    NotADirectory
+    OtherOs(Int)                   -- any other errno, as the platform numbers it
 
-union ProcessErrorKind:
-    NotOnPath                      -- find_program: no executable file of that name
-    LaunchFailed(IOErrorKind)      -- exec, fork or a pipe failed, as io words the errno
-    NotExecutable                  -- ENOEXEC: a file the system cannot run, such as a script without #!
-    DirectoryFailed(IOError)       -- the child could not enter `directory`; the error names it
-    ContainsNul                    -- in the program, an argument or the environment; before any system call
+union FindProgramError:
+    NotOnPath                      -- no executable regular file of that name on an absolute PATH entry
+    NameContainsNul
+
+union CaptureError:
     InvalidVariableName(String)    -- empty, or contains "="; before any system call
+    ContainsNul                    -- in the program, an argument or the environment; before any system call
+    LaunchFailed(SystemCallError)  -- exec, fork or a pipe failed
+    NotExecutable                  -- ENOEXEC: a file the system cannot run, such as a script without #!
+    DirectoryFailed(SystemCallError)  -- the child could not enter `directory`
     StdoutNotUtf8(Exit)            -- P1: carries how the child ended
     StderrNotUtf8(Exit)
-    Unsuccessful(Captured)         -- output only: anything but Exited(0)
+
+union OutputError:
+    CaptureFailed(CaptureError)
+    Unsuccessful(Captured)         -- anything but Exited(0), with everything the child printed
 
 pure func command(program: String, arguments: List[String]) -> Command
 -- { program, arguments, directory = None, environment = {}, stdin = None, timeout_ms = None }
 
-func capture(invocation: Command) -> Result[Captured, ProcessError]     -- every Exit is Ok
-func output(invocation: Command) -> Result[String, ProcessError]        -- stdout, or Unsuccessful
-func find_program(name: String) -> Result[String, ProcessError]         -- absolute PATH entries only
-pure func succeeded(exit: Exit) -> Bool                                 -- Exited(0)
-pure func describe(error: ProcessError) -> String                       -- "<program>: <phrase>"
+func capture(invocation: Command) -> Result[Captured, CaptureError]    -- every Exit is Ok
+func output(invocation: Command) -> Result[String, OutputError]        -- stdout, or Unsuccessful
+func find_program(name: String) -> Result[Path, FindProgramError]      -- absolute PATH entries only
+pure func succeeded(exit: Exit) -> Bool                                -- Exited(0)
 ```
 
 `output` is `capture` that insists on success, like Python's `check=True` and
 Go's `Output`. `?=` over `output` runs a sequence and stops at the first
 failure, carrying everything the failed command printed. It shows nothing
-until the command ends; live output comes with streaming. `describe` renders
-`Unsuccessful` as "make: exited 2" followed by its stderr, and every other
-kind with fixed text, as `io.describe` does.
-
-`succeeded` and `describe` need no import. Selecting `Exit` and
-`ProcessError` makes them available as `exit.succeeded()` and
-`error.describe()`, which also keeps `process`'s `describe` from colliding
-with `io`'s. A program that passes `describe` as a value aliases the module,
-as `process as Process`, and writes `.map_err(Process.describe)`.
+until the command ends; live output comes with streaming. `Stringable` renders
+`Unsuccessful` as "exited 2" followed by its stderr, `DirectoryFailed(cause)`
+as "cannot enter the directory: <cause>", and every other variant with fixed
+text. No text names the program or the directory: the caller has its `Command`.
 
 ## Examples
 
 ```blorp
+-- A caller that mixes operations writes its own error type; a constructor is
+-- not a function value, so the wrapping is a lambda or a match.
+union CommitError:
+    GitMissing(FindProgramError)
+    GitFailed(OutputError)
+
 -- Run, require success, use stdout.
-func current_commit(repository: String) -> Result[String, ProcessError]:
-    git ?= find_program("git")
-    output({ command(git, ["rev-parse", "HEAD"]) | directory = Some(repository) })
+func current_commit(repository: Path) -> Result[String, CommitError]:
+    git ?= find_program("git").map_err(pure func(error: FindProgramError): GitMissing(error))
+    output({ command("${git}", ["rev-parse", "HEAD"]) | directory = Some(repository) })
+        .map_err(pure func(error: OutputError): GitFailed(error))
 
 -- A sequence that stops at the first failure, sharing one base command.
-func rebuild(make: String, project: String) -> Result[Void, ProcessError]:
+func rebuild(make: String, project: Path) -> Result[Void, OutputError]:
     base = { command(make, []) | directory = Some(project) }
     _ ?= output({ base | arguments = ["clean"] })
     _ ?= output({ base | arguments = ["all"] })
     Ok(void)
 
 -- Input text and a timeout.
-func sorted(sort: String, text: String) -> Result[String, ProcessError]:
+func sorted(sort: String, text: String) -> Result[String, OutputError]:
     output({ command(sort, []) | stdin = Some(text), timeout_ms = Some(5000) })
 
 -- Every outcome is a value.
-func report(result: Result[Captured, ProcessError]) -> Void:
+func report(result: Result[Captured, CaptureError]) -> Void:
     match result:
-        Err(error): print_error(error.describe())
+        Err(error): print_error("${error}")
         Ok(captured):
             match captured.exit:
                 Exited(0): print(captured.stdout)
@@ -137,7 +151,7 @@ func report(result: Result[Captured, ProcessError]) -> Void:
 The e2e harness after migration needs no `/usr/bin/env` and no capture files:
 
 ```blorp
-private func isolated(binary: String, arguments: List[String]) -> Result[Captured, ProcessError]:
+private func isolated(binary: String, arguments: List[String]) -> Result[Captured, CaptureError]:
     capture({ command(binary, arguments) |
         environment = { "BLORP_LEAK_CHECK" => None, "BLORP_MEMORY_STATS" => None },
         timeout_ms = Some(CHILD_TIMEOUT_MS) })
@@ -164,12 +178,12 @@ private func isolated(binary: String, arguments: List[String]) -> Result[Capture
   system would reap the child itself and the wait would report ECHILD.
 - A timeout of 0 or less is `Ok` with `TimedOut` and empty output as soon as
   the command is validated, without starting the program.
-- A `directory` containing NUL is `DirectoryFailed` with `PathContainsNul`,
-  as `fs` reports a path, before any system call.
+- A `directory` is a `Path`, which cannot hold NUL, so `DirectoryFailed`
+  has no NUL case.
 - `find_program` skips empty and relative PATH entries (Go's `ErrDot`) and
   entries that are not UTF-8, and accepts a regular file the process may
   execute (`faccessat(X_OK, AT_EACCESS)`). A name that is empty or contains
-  `/` is `NotOnPath` without a search; one with NUL is `ContainsNul`.
+  `/` is `NotOnPath` without a search; one with NUL is `NameContainsNul`.
 - A reply the library cannot decode (an exit that is not decimal text of a
   known Exit code, an error tag the C side does not build, a list of another
   length) is a runtime defect, never an outcome (P5): the C side checks every
@@ -232,7 +246,7 @@ private func isolated(binary: String, arguments: List[String]) -> Result[Capture
   payload in the compiler. He then chose C alone: keep the decimal text, and
   treat every reply the C side cannot produce as an internal defect. The
   natives and the library ship together, so these states are unreachable;
-  aborting is honest, while decoding them into a `ProcessError` such as
+  aborting is honest, while decoding them into a `CaptureError` such as
   `LaunchFailed(OtherOs(0))` would invent a failure the operating system never
   reported. The C side checks each code as it builds it, and the library calls
   the `process.fault` native from its impossible branches.

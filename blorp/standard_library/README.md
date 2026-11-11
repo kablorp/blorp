@@ -67,9 +67,11 @@ trait default. Imported `INT_MIN`
 and `INT_MAX` are closed scalar literals, with no runtime global storage.
 The [imports design](../README.md#modules-imports-and-the-prelude) defines the full rules.
 
-`io/environment.brp`'s explicit `get_current_directory()` import returns `Result[String, String]`:
-an owned nonempty absolute UTF-8 path or an owned valid-text error.
-Neither branch prints. The native helper uses the target String ABI.
+`io/environment.brp`'s explicit `get_current_directory()` import returns
+`Result[Path, CurrentDirectoryError]`: a `Path`, or `NotFound`, `PermissionDenied`,
+`InvalidUtf8`, `Unreachable` or `OtherOs(Int)`. The `system.current_directory`
+native returns the path as a String or an Int code of the file protocol, which a
+decoder in the module (public for its test, not API) turns into the union. Neither branch prints.
 
 `int.brp` adapts the legacy
 [`standard_library/src/int.brp`](https://github.com/kablorp/blorp/blob/ee9e001c6de8911ee486fd992419bef5bc628e8b/standard_library/src/int.brp). Its
@@ -615,22 +617,36 @@ records the design and its decisions.
 
 ```blorp
 import:
-    io/process: Command, Exit(Exited, Signaled, TimedOut), Captured, ProcessError, command, capture, output, find_program
+    io/process:
+        Command, Exit(Exited, Signaled, TimedOut), Captured, CaptureError, FindProgramError,
+        OutputError, command, capture, output, find_program
+    path: Path
 
-func current_commit(repository: String) -> Result[String, ProcessError]:
-    git ?= find_program("git")
-    output({ command(git, ["rev-parse", "HEAD"]) | directory = Some(repository) })
+union CommitError:
+    GitMissing(FindProgramError)
+    GitFailed(OutputError)
+
+func current_commit(repository: Path) -> Result[String, CommitError]:
+    git ?= find_program("git").map_err(pure func(error: FindProgramError): GitMissing(error))
+    output({ command("${git}", ["rev-parse", "HEAD"]) | directory = Some(repository) })
+        .map_err(pure func(error: OutputError): GitFailed(error))
 ```
+
+Each operation has its own error union, and none holds the program or the
+directory: the caller has its `Command`. A caller that mixes operations writes
+its own error type, as `CommitError` does; a constructor is not a function
+value, so the wrapping is a `match` or a lambda.
 
 - `command(program, arguments)` builds a `Command`; change its `directory`,
   `environment` (`Some` sets a variable, `None` removes it, the rest is
   inherited), `stdin` (`None` is `/dev/null`) and `timeout_ms` by record
-  update. `program` is a path: there is no shell and no PATH search, and every
+  update. `directory` is an `Option[Path]`. `program` is a path: there is no shell and no PATH search, and every
   argument is literal. A relative program is found from `directory`.
 - `capture(command)` returns `Ok(Captured { exit, stdout, stderr })` for
   every way the child can end: `Exited(status)`, `Signaled(signal)` or
-  `TimedOut`. `output(command)` returns stdout after `Exited(0)` and
-  otherwise `Unsuccessful(captured)`, so `?=` over `output` stops a sequence
+  `TimedOut`; its error is a `CaptureError`. `output(command)` returns stdout
+  after `Exited(0)`, `CaptureFailed(error)` when `capture` failed, and
+  otherwise `Unsuccessful(captured)` in an `OutputError`, so `?=` over `output` stops a sequence
   at the first failure with everything the command printed.
 - The child never outlives the call: when it exits or the deadline passes,
   its process group is killed and only what is already buffered is read, so a
@@ -645,28 +661,30 @@ func current_commit(repository: String) -> Result[String, ProcessError]:
 - Output must be UTF-8: otherwise the error is `StdoutNotUtf8(exit)` or
   `StderrNotUtf8(exit)`. After `Signaled` or `TimedOut`, up to three bytes of a
   character cut off at the end of a stream are dropped first.
-- Errors name the program as the caller passed it. `InvalidVariableName` (an
-  empty name or one with `=`) and `ContainsNul` (in the program, an argument or
-  the environment) are found before any system call. A directory the child
-  cannot enter is `DirectoryFailed`, whose `IOError` names it; one containing
-  NUL is `DirectoryFailed` with `PathContainsNul`. `NotExecutable` is ENOEXEC,
-  such as a script without `#!`; every other launch failure is
-  `LaunchFailed(kind)`, worded as `io/error` words the errno, so a missing program is
-  `LaunchFailed(NotFound)`.
+- `CaptureError` has no program in it. `InvalidVariableName` (an empty name
+  or one with `=`) and `ContainsNul` (in the program, an argument or the
+  environment) are found before any system call. A directory the child cannot
+  enter is `DirectoryFailed(cause)`. `NotExecutable` is ENOEXEC, such as a
+  script without `#!`; every other launch failure is `LaunchFailed(cause)`. A
+  cause is a `SystemCallError`: `NotFound`, `PermissionDenied`, `NotADirectory`
+  or `OtherOs(errno)`, so a missing program is `LaunchFailed(NotFound)`.
 - SIGCHLD must keep its default disposition, which a Blorp program cannot
   change. If foreign code has changed it, `capture` is
   `LaunchFailed(OtherOs(ECHILD))` before anything starts.
 - `find_program(name)` returns the first absolute PATH entry holding a regular
   file of that name the process may execute, as "entry/name". Empty and
   relative entries, and entries that are not UTF-8, are skipped, so the current
-  directory is never searched. A name that is empty or contains `/` is
-  `NotOnPath` without a search.
+  directory is never searched. It returns a `Path`, or a `FindProgramError`:
+  `NotOnPath`, which a name that is empty or contains `/` is without a search,
+  or `NameContainsNul`.
 - A reply from the runtime that the library cannot decode is a defect in the
   runtime, not an outcome: the program prints
   "blorp: process runtime defect: ..." and aborts.
-- `exit.succeeded()` is `Exited(0)`, and `ProcessError` is `Stringable`:
-  `"${error}"` renders "<program>: <phrase>", and `Unsuccessful` is "make:
-  exited 2" followed by the child's stderr.
+- `exit.succeeded()` is `Exited(0)`. Every error union is `Stringable`
+  with fixed text and no program or directory: `Unsuccessful` is "exited 2"
+  followed by the child's stderr, and `DirectoryFailed(cause)` is "cannot
+  enter the directory: <cause>". A `SystemCallError` is worded as `io/error`
+  words the errno.
 
 ### run_to_files
 

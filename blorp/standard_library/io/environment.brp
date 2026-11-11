@@ -1,6 +1,64 @@
 import:
-    _base: String, Result
+    _base: Int, String, Result(Ok, Err), Stringable
+    int: Int methods
+    path: Path, to_path
+    ./_codes: NOT_FOUND_CODE, PERMISSION_DENIED_CODE, INVALID_UTF8_CODE, UNREACHABLE_CODE
 
 
-func get_current_directory() -> Result[String, String]:
-    builtin("system.get_current_directory")
+-- Why the working directory has no name the program can use.
+union CurrentDirectoryError:
+    NotFound
+    PermissionDenied
+    InvalidUtf8
+    -- The system names no usable absolute path: on Linux, a working directory
+    -- outside the process's root.
+    Unreachable
+    -- Any other errno, as the platform numbers it.
+    OtherOs(Int)
+
+
+-- Public so that its test binds it to literal native codes; it is not API for
+-- programs. The codes are those of src/common/codegen/runtime/fs.brp, which
+-- agree with it only by the tests. A code this union does not name is OtherOs
+-- with the code negated, as io/_codes does: a negative code is an unnamed errno
+-- that arrives negated, so OtherOs keeps the platform's number, and a positive
+-- one is a disagreement between the two tables that stays visible as a negative.
+pure func decode_current_directory_error(code: Int) -> CurrentDirectoryError:
+    if code == NOT_FOUND_CODE:
+        NotFound
+    else if code == PERMISSION_DENIED_CODE:
+        PermissionDenied
+    else if code == INVALID_UTF8_CODE:
+        InvalidUtf8
+    else if code == UNREACHABLE_CODE:
+        Unreachable
+    else:
+        OtherOs(0 - code)
+
+
+private func native_current_directory() -> Result[String, Int]:
+    builtin("system.current_directory")
+
+
+-- The phrases of the kinds io/error shares are the same, byte for byte.
+implements Stringable for CurrentDirectoryError:
+    pure func to_string(value: Self) -> String:
+        match value:
+            NotFound: "no such file"
+            PermissionDenied: "permission denied"
+            InvalidUtf8: "contents are not valid UTF-8"
+            Unreachable: "the working directory has no usable absolute path"
+            OtherOs(number): "operating system error ${number}"
+
+
+func get_current_directory() -> Result[Path, CurrentDirectoryError]:
+    match native_current_directory():
+        Ok(text):
+            -- The native refuses an empty path, and a C path cannot hold NUL,
+            -- so `to_path` cannot fail on its reply. If it ever did, the path
+            -- would be one the system cannot use: Unreachable.
+            match text.to_path():
+                Ok(path): Ok(path)
+                Err(_): Err(Unreachable)
+        Err(code):
+            Err(code.decode_current_directory_error())
