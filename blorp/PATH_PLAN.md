@@ -1,6 +1,7 @@
 # `Path`, exact I/O errors, naming rules and qualified variants
 
-**Status: plan, 2026-11-10, revision 3.** Revision 3 adds the naming rules
+**Status: plan, 2026-11-10, revision 3. Landings 4 (`7d8a92f25`) and 3 have
+landed; landing 1 is in review.** Revision 3 adds the naming rules
 Keith adopted, which make qualified variants a parser rule. Keith approved P1
 to P12 of the earlier `PATH_DECISIONS.md` (full text, with its precedent
 survey and the alternatives each point weighed, at `4b5b7fe65`) with the
@@ -454,8 +455,13 @@ unchanged; messages that print a process error add the program the same way.
    `join` and `normalize` already name String functions in `path.brp`, and a
    module cannot declare one name twice, so their `Path` forms arrive in
    landing 7, which deletes the String ones.
-   - Ceilings: production lines at most +130; self-compile allocations and
-     instructions each at most +0.3%.
+   - Ceilings: production lines at most +185 (was +130); self-compile
+     allocations and instructions each at most +0.3%.
+   - Coordinator correction, 2026-11-10: `path.brp` measures +185 net by
+     `git diff --numstat` (130 without blank and comment lines). The +130
+     was set before Keith added `+` (`Addable`), and did not count
+     `PathError`'s `Stringable`, the wider import block, or the comments
+     that document each edge-case rule.
 4. **The current-directory native.** A new builtin returning a code, beside
    the old one, with no library caller yet.
    - Ceilings: production lines at most +60; self-compile unchanged.

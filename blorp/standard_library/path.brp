@@ -1,12 +1,28 @@
 -- Pure logical paths; only ASCII '/' is a separator.
 import:
-    _base: Int, String, List, Bool(True, False), Option(Some, None)
+    _base:
+        Int,
+        String,
+        List,
+        Bool(True, False),
+        Option(Some, None),
+        Result(Ok, Err),
+        Addable,
+        Equatable,
+        Hashable,
+        Stringable,
+    bool: Bool methods, and, or
     int: Int methods
     list: List methods
+    option: Option methods
     string: String methods
 
 
 private PATH_SEPARATOR_BYTE: Int = 47
+
+private DOT_BYTE: Int = 46
+
+private NUL_BYTE: Int = 0
 
 
 private pure func is_separator(path: String, position: Int) -> Bool:
@@ -61,7 +77,7 @@ pure func dirname(path: String) -> String:
             -- 0 < end <= byte length, and byte[end] is ASCII '/'.
             -- Both endpoints are scalar boundaries; checked Slice cannot fail.
             match path.slice(0, end):
-                Some(parent): parent
+                Some(prefix): prefix
                 None: "."
 
 
@@ -131,3 +147,172 @@ pure func normalize(path: String) -> String:
             ):
                 True: "."
                 False: joined
+
+
+-- Never empty, never holding NUL: `to_path` is the only constructor.
+opaque type Path = String
+
+
+fixed union PathError:
+    Empty
+    ContainsNul
+
+
+implements Stringable for PathError:
+    pure func to_string(value: Self) -> String:
+        match value:
+            Empty: "a path cannot be empty"
+            ContainsNul: "a path cannot contain a NUL byte"
+
+
+implements Stringable for Path:
+    pure func to_string(value: Self) -> String:
+        from_opaque Path(value)
+
+
+implements Equatable for Path:
+    pure func equals(left: Self, right: Self) -> Bool:
+        from_opaque Path(left) == from_opaque Path(right)
+
+
+implements Addable for Path:
+    pure func add(left: Self, right: Self) -> Self:
+        into_opaque Path(from_opaque Path(left) + from_opaque Path(right))
+
+
+implements Hashable for Path:
+    pure func hash(value: Self) -> Int:
+        from_opaque Path(value).hash()
+
+
+private pure func has_byte(text: String, wanted: Int) -> Bool:
+    var found: Bool = False
+    for position in 0..text.length():
+        match text.byte_at(position):
+            Some(byte):
+                if byte == wanted:
+                    found = True
+                    break
+            None:
+                void
+    found
+
+
+pure func to_path(text: String) -> Result[Path, PathError]:
+    if text.length() == 0:
+        Err(Empty)
+    else if text.has_byte(NUL_BYTE):
+        Err(ContainsNul)
+    else:
+        Ok(into_opaque Path(text))
+
+
+-- The last component, ignoring trailing separators, split at its last dot that
+-- does not begin it, like the compiler's `module_stem`: `x.test.brp` is
+-- `x.test` and `brp`, `.hidden` has no extension, `a.` has the empty one, `...`
+-- is `..` and the empty one. `/`, `.` and `..` name no entry, so no parts.
+private record NameParts {
+    name: String,
+    stem: String,
+    extension: Option[String],
+}
+
+
+private pure func name_parts(spelling: String) -> Option[NameParts]:
+    var end = spelling.length()
+    while end > 0:
+        if spelling.is_separator(end - 1):
+            end = end - 1
+        else:
+            break
+    var start = end
+    while start > 0:
+        if spelling.is_separator(start - 1):
+            break
+        else:
+            start = start - 1
+    text = spelling
+        .slice(start, end)
+        .get_or("")
+    if or(text.length() == 0, or(text == ".", text == "..")):
+        None
+    else:
+        var dot: Option[Int] = None
+        for position in (start + 1)..end:
+            if spelling.byte_at(position) == Some(DOT_BYTE):
+                dot = Some(position)
+        match dot:
+            Some(index):
+                before = spelling
+                    .slice(start, index)
+                    .get_or("")
+                Some({ name = text, stem = before, extension = spelling.slice(index + 1, end) })
+            None:
+                Some({ name = text, stem = text, extension = None })
+
+
+-- Total: a path with no parent component is `.`, and root is its own parent,
+-- as `dirname` has it. `.` and `..` are components like any other.
+pure func parent(path: Path) -> Path:
+    into_opaque Path(from_opaque Path(path).dirname())
+
+
+-- The last component, ignoring trailing separators: `a/b/` is `b`.
+pure func name(path: Path) -> Option[String]:
+    match from_opaque Path(path).name_parts():
+        Some(parts): Some(parts.name)
+        None: None
+
+
+-- The name up to its extension: `x.test.brp` is `x.test`, `.hidden` is itself.
+pure func stem(path: Path) -> Option[String]:
+    match from_opaque Path(path).name_parts():
+        Some(parts): Some(parts.stem)
+        None: None
+
+
+-- The part after the name's last dot, without the dot: `x.brp` is `brp`, `a.`
+-- is the empty String, `.hidden` and `a` are None.
+pure func extension(path: Path) -> Option[String]:
+    match from_opaque Path(path).name_parts():
+        Some(parts): parts.extension
+        None: None
+
+
+-- Non-empty components, without `.`: it names the directory it is in, so
+-- skipping it changes nothing lexically.
+private pure func path_components(spelling: String) -> List[String]:
+    var result: List[String] = []
+    var start = 0
+    for position in 0..(spelling.length() + 1):
+        if or(spelling.is_separator(position), position == spelling.length()):
+            component = spelling
+                .slice(start, position)
+                .get_or("")
+            if and(start < position, component != "."):
+                result = result.append(component)
+            start = position + 1
+    result
+
+
+-- Whether `path` is `root` or lies below it, comparing components, never
+-- bytes: `a/b/c` is within `a/b`, `a/bc` is not. Both must be absolute or both
+-- relative, and `.` components and repeated separators are ignored. Nothing is
+-- resolved, so a `..` after the root's components could leave it and the
+-- answer is False: `a/../b` is not within `a`, and `../a` is not within `.`.
+-- Lexical only. It does not resolve symlinks, so it is not a sandbox check.
+pure func is_within(path: Path, root: Path) -> Bool:
+    path_text = from_opaque Path(path)
+    root_text = from_opaque Path(root)
+    path_parts = path_text.path_components()
+    root_parts = root_text.path_components()
+    below = path_parts.drop(root_parts.length())
+    and(
+        path_text.is_separator(0) == root_text.is_separator(0),
+        and(
+            path_parts.take(root_parts.length()) == root_parts,
+            below
+                .contains("..")
+                .not(),
+        ),
+    )

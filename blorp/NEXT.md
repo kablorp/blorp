@@ -35,7 +35,8 @@ done.
   - **Next:** `Path` (landing 7), planned in [`PATH_PLAN.md`](PATH_PLAN.md):
     enforced naming rules, qualified union variants, the `Path` type and a
     current-directory native, a seed rotation, exact I/O errors in
-    type-oriented modules, then `Path` in the prelude.
+    type-oriented modules, then `Path` in the prelude. Landings 3 (the
+    `Path` type) and 4 (the current-directory native) have landed.
 - **Process API:** [`PROCESS_DECISIONS.md`](PROCESS_DECISIONS.md).
   - **Status:** L0 is implemented and independently reviewed; final combined
     landing gates and four-platform CI pass; L0 is published. Shared

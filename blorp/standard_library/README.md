@@ -572,6 +572,27 @@ are preserved. OS operations independently reject NUL paths.
 The byte scan/materialization is linear, and List take and String joining build
 their results in one pass.
 
+`Path` is an opaque type over a String spelling. `to_path(text)` is the only way
+to make one and returns `Err(Empty)` or `Err(ContainsNul)` (`PathError`, with
+fixed text) otherwise; nothing else is checked and nothing is normalized, so
+`a//b` and `a/b` are different paths. `Path` is `Stringable` (its spelling),
+`Equatable` and `Hashable` (byte equality of the spelling), and `Addable`, where
+`+` concatenates the spellings exactly as String `+` does (`a` + `b` is `ab`,
+never `a/b`). It is not `Orderable`. Its methods are lexical like the String
+functions:
+
+- `parent(path)` is total: `a` is `.` and `/` is `/`, as `dirname`.
+- `name(path)` is the last component ignoring trailing separators (`a/b/` is
+  `b`); `None` for `/`, `.` and `..`.
+- `stem(path)` and `extension(path)` split the name at its last dot that does
+  not begin it: `x.test.brp` is `x.test` and `brp`, `.hidden` has no extension,
+  `a.` has the empty extension, and `...` has stem `..` and the empty extension. Both are `None` where `name` is.
+- `is_within(path, root)` compares components, never bytes; both must be
+  absolute or both relative, `.` components and repeated separators are
+  ignored, and a `..` after the root's components makes the answer `False`
+  because nothing is resolved. Lexical only: it does not resolve symlinks, so
+  it is not a sandbox check.
+
 ### Test registration
 
 `test: TestSuite` holds `description: String` and
