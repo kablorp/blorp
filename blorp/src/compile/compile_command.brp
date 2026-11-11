@@ -1,0 +1,246 @@
+---
+`blorp compile`: reads its options into a request, and runs the request:
+load the program, generate its C and publish the file.
+---
+import:
+    int: Int methods
+    io/fs: write_text
+    list: List methods
+    option: Option methods
+    path: normalize
+    result: Result methods
+    string: String methods
+    ../common/analysis/load/load:
+        LibrarySource(EmbeddedLibrary, LibraryDirectory),
+        load_program,
+        load_test_program,
+    ../common/cli/report: report_failure
+    ../common/cli/usage:
+        EXIT_PATH,
+        SOURCE_SUFFIX,
+        error_message,
+        file_name,
+        given_twice,
+        has_source_suffix,
+        option_value,
+        unknown_option,
+    ../common/codegen/generate_c: generate_c
+    ../common/syntax/syntax: singleton_diagnostic
+    ../common/utils/results: first_error
+
+
+record CompileRequest {
+    inputs: CompileInputs,
+    output: String,
+    library: LibrarySource,
+}
+
+
+-- A suite list is never empty: the first suite owns the entry, and the rest
+-- follow it in command-line order.
+union CompileInputs:
+    ProgramInput(String)
+    SuiteInputs(String, List[String])
+
+
+COMPILE_HELP: String =
+    |usage: blorp compile INPUT.brp [-o OUTPUT.c] [--library-root DIRECTORY]
+    |       blorp compile --test-suite SUITE.brp [SUITE.brp ...] -o OUTPUT.c [--library-root DIRECTORY]
+    |
+    |Writes the C for INPUT.brp and the modules it imports. Without -o the C goes
+    |to the input's name with .c, in the current directory: blorp compile
+    |src/main.brp writes ./main.c.
+    |
+    |options:
+    |  -o OUTPUT.c              where to write the C (required with --test-suite)
+    |  --library-root DIRECTORY use this standard library directory instead of the one
+    |                           built into blorp
+    |  --test-suite             compile the listed test suite files into one program
+    |  -h, --help               show this help
+
+
+-- What `blorp compile` read from its words, before the rules that join them.
+private record CompileOptions {
+    paths: List[String],
+    output: Option[String],
+    library_root: Option[String],
+    test_suite: Bool,
+}
+
+
+private pure func read_compile_options(
+    words: List[String],
+    options: CompileOptions,
+) -> Result[CompileOptions, String]:
+    match words:
+        []:
+            Ok(options)
+        ["-o", ...following]:
+            if options.output.is_some():
+                Err(given_twice("-o"))
+            else:
+                option_value("-o", "OUTPUT.c", following).and_then(
+                    pure func(path: String): following
+                        .drop(1)
+                        .read_compile_options({ options | output = Some(path) }),
+                )
+        ["--library-root", ...following]:
+            if options.library_root.is_some():
+                Err(given_twice("--library-root"))
+            else:
+                option_value("--library-root", "DIRECTORY", following).and_then(
+                    pure func(root: String): following
+                        .drop(1)
+                        .read_compile_options({ options | library_root = Some(root) }),
+                )
+        ["--test-suite", ...following]:
+            if options.test_suite:
+                Err(given_twice("--test-suite"))
+            else:
+                following.read_compile_options({ options | test_suite = True })
+        [word, ...following]:
+            if word.starts_with("-"):
+                Err(unknown_option(word, "compile"))
+            else:
+                following.read_compile_options({ options | paths = options.paths.append(word) })
+
+
+-- The C goes beside the working directory's other files unless -o says
+-- otherwise: `src/main.brp` becomes `main.c`.
+private pure func default_output(input: String) -> String:
+    name = input.file_name()
+    (
+        name
+            .slice(0, name.length() - SOURCE_SUFFIX.length())
+            .get_or(name)
+        + OBJECT_SUFFIX
+    )
+
+
+private pure func output_is_input(output: String, inputs: List[String]) -> Result[Void, String]:
+    if inputs.any(pure func(input: String): input.normalize() == output.normalize()):
+        Err(
+            error_message(
+                "the output `${output}` is also an input",
+                "write the C to a different file with -o",
+            ),
+        )
+    else:
+        Ok(void)
+
+
+private pure func suite_inputs(suites: List[String]) -> Result[CompileInputs, String]:
+    match suites:
+        []:
+            Err(
+                error_message(
+                    "blorp compile --test-suite needs at least one suite file",
+                    "list the suite files, such as --test-suite a.brp b.brp",
+                ),
+            )
+        [first, ...later]:
+            Ok(SuiteInputs(first, later))
+
+
+private pure func suite_request(
+    suites: List[String],
+    output: Option[String],
+    library: LibrarySource,
+) -> Result[CompileRequest, String]:
+    written ?= output.to_result(
+        error_message(
+            "blorp compile --test-suite needs -o",
+            "pass -o OUTPUT.c, the C file for the suite program",
+        ),
+    )
+    _ ?= suites.first_error(source_file)
+    _ ?= written.output_is_input(suites)
+    inputs ?= suite_inputs(suites)
+    Ok({ inputs = inputs, output = written, library = library })
+
+
+private pure func single_input(inputs: List[String]) -> Result[String, String]:
+    match inputs:
+        []:
+            Err(
+                error_message(
+                    "blorp compile needs an input file",
+                    "run blorp compile INPUT.brp, or blorp help compile",
+                ),
+            )
+        [input]:
+            Ok(input)
+        [_, extra, ..._]:
+            Err(
+                error_message(
+                    "blorp compile takes one input file, but `${extra}` follows it",
+                    "pass one INPUT.brp, or use --test-suite to compile several suite files into one program",
+                ),
+            )
+
+
+private pure func program_request(
+    paths: List[String],
+    output: Option[String],
+    library: LibrarySource,
+) -> Result[CompileRequest, String]:
+    input ?= single_input(paths)
+    _ ?= input.source_file()
+    written = output.get_or(input.default_output())
+    _ ?= written.output_is_input([input])
+    Ok({ inputs = ProgramInput(input), output = written, library = library })
+
+
+private pure func source_file(path: String) -> Result[Void, String]:
+    if path.has_source_suffix():
+        Ok(void)
+    else:
+        Err(
+            error_message(
+                "`${path}` is not a .brp source file",
+                "name a file that ends in .brp and has a name before it, such as main.brp",
+            ),
+        )
+
+
+pure func parse_compile(words: List[String]) -> Result[CompileRequest, String]:
+    options ?= words.read_compile_options({
+        paths = [],
+        output = None,
+        library_root = None,
+        test_suite = False,
+    })
+    library: LibrarySource = match options.library_root:
+        Some(root): LibraryDirectory(root)
+        None: EmbeddedLibrary
+    if options.test_suite:
+        suite_request(options.paths, options.output, library)
+    else:
+        program_request(options.paths, options.output, library)
+
+
+private OBJECT_SUFFIX: String = ".c"
+
+
+-- write_text replaces the output atomically, so a failed or interrupted
+-- compile never leaves a truncated C file behind.
+private func publish(path: String, generated_c: String) -> Int:
+    match path.write_text(generated_c):
+        Err(error):
+            print_error(error_message("could not write ${error}", "provide a writable output path"))
+            EXIT_PATH
+        Ok(_):
+            0
+
+
+func compile_request(request: CompileRequest) -> Int:
+    loaded = match request.inputs:
+        ProgramInput(input): input.load_program(request.library)
+        SuiteInputs(first, later): first.load_test_program(later, request.library)
+    match loaded:
+        Err(failure):
+            failure.sources.report_failure(failure.diagnostic.singleton_diagnostic())
+        Ok(program):
+            match program.program.generate_c():
+                Err(errors): program.sources.report_failure(errors)
+                Ok(generated_c): request.output.publish(generated_c)

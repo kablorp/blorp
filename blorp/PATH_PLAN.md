@@ -23,7 +23,7 @@ for errors.
   `rename(source, destination)`). Callers join paths by hand: about 120 `+ "/" +`
   or `"${dir}/…"` sites in `test/`. The separator is declared three times, the
   last component is parsed twice, and "under this directory" is written three
-  ways (`src/cli.brp`, `src/common/syntax/source.brp`, `src/format/source_walk.brp`,
+  ways (`src/common/cli/usage.brp`, `src/common/syntax/source.brp`, `src/format/source_walk.brp`,
   `src/common/analysis/load/load.brp`).
 - **Errors are broader than the operation.** Every `io/fs` operation returns
   `IOError`, whose kind has 15 variants. `read_text` cannot return

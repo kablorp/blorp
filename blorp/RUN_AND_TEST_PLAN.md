@@ -110,8 +110,8 @@ blorp run [--cc PATH] [--release] [--library-root DIR] INPUT.brp [ARGUMENT ...]
 blorp test [--cc PATH] [--library-root DIR] SUITE.brp [SUITE.brp ...]
 ```
 
-1. Parsing: `RunRequest` and `TestRequest` in `src/cli.brp`. The CLI's
-   `Command` union (`src/cli.brp:34`) is renamed `CliCommand`, with
+1. Parsing: `RunRequest` and `TestRequest` in `src/run/run_command.brp`. The
+   CLI's `Command` union (`src/main.brp:15`) is renamed `CliCommand`, with
    `parse_command` and its callers, so `process.Command` keeps its name.
 2. `test` compiles exactly as `compile --test-suite` does: the first suite
    owns the entry, later suites follow in order, a suite listed twice is
@@ -143,7 +143,7 @@ e2e driver onto `blorp test`, watch modes, `--link`, Windows.
 
 ## Testing
 
-- `src/cli.brp` unit tests for both commands' parses and usage errors,
+- `test/unit/test_main/` unit tests for both commands' parses and usage errors,
   including R6's argument handling.
 - e2e cases in `self_hosted_cli.brp`, exact output and status, every row of
   R5: a program that prints and exits 3; arguments with `--flag` words; a

@@ -68,7 +68,7 @@ Interpolation lowers to `+`.
 - `common/syntax/lex.brp` (19 `length`, 10 `byte_at`, 8 `slice`), `common/syntax/parse.brp`
   and `common/syntax/source.brp`;
 - the formatter (`printer`, `trivia`, `layout`, `flat`, `format`);
-- `cli.brp`, `main.brp`, `common/utils/text.brp` and `common/analysis/load/load.brp`;
+- `common/cli/usage.brp`, `common/cli/report.brp`, `common/utils/text.brp` and `common/analysis/load/load.brp`;
 - `common/codegen/emit/emit.brp:327` (`append_byte_array`) and
   `common/codegen/emit/float_literal.brp:72`;
 - `scripts/embed_library.brp:61-184`, which the seed builds and whose output
@@ -80,7 +80,7 @@ Spans are byte ranges and stay so.
   `path.brp`, `io/fs.brp` and `io/process.brp` also work in bytes.
 - **Formatter widths:** `display_width` (`format/printer.brp:112`) already
   counts code points by hand.
-- **Diagnostic columns:** they count bytes (`main.brp:82-98`).
+- **Diagnostic columns:** they count bytes (`common/cli/report.brp:39-56`).
 
 **The bootstrap constraint.** The parser accepts only the builtin labels it
 knows (`common/syntax/parse.brp:4398-4439`). The pinned seed builds the compiler
@@ -173,7 +173,7 @@ S1 and S2 are Keith's direction. Keith approved S3 to S9 as recommended on
     mutating a shared immutable value, which needs atomics, and nothing
     measured needs it.
   - Defer (b) until a profile shows the quadratic loop.
-- **S7, diagnostic columns.** `render_file_location` (`main.brp:82-98`)
+- **S7, diagnostic columns.** `render_file_location` (`common/cli/report.brp:39-56`)
   counts every byte as a column. *Recommended:* count code points, so a
   column agrees with the new `length` and with rustc's convention. Spans stay
   byte ranges inside the compiler.
@@ -287,7 +287,7 @@ pure func display_width(written_text: String) -> Int:
     written_text.length()
 ```
 
-**Diagnostic columns** (`main.brp:82-98`, S7). The loop advances one byte
+**Diagnostic columns** (`common/cli/report.brp:39-56`, S7). The loop advances one byte
 at a time and adds a column for every byte. After the change, it adds one
 only at the first byte of a character:
 

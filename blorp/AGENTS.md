@@ -132,7 +132,10 @@ folder under `src/`: a module `src/<dir>/<name>.brp` has its suite in
 `test/unit/test_<dir>/`. A module `src/common/<layer>/<name>.brp` has its
 suite in `test/unit/test_common/test_<layer>/`. A module that has a folder of
 its own (`src/common/syntax/lex.brp` is
-`test/unit/test_common/test_syntax/test_lex/`) gets a subfolder. Grammar cases live under
+`test/unit/test_common/test_syntax/test_lex/`) gets a subfolder. `src/main.brp`'s
+suite is in `test/unit/test_main/`. [test/unit/test_layout/](test/unit/test_layout/)
+enforces which directory may import which, and fails for a `.brp` file under
+`src/` that no layer owns. Grammar cases live under
 [test/test_grammar/](test/test_grammar/) and change with the EBNF.
 Target component suites declare an ordinary `TESTS: TestSuite` constant in the
 suite file itself.

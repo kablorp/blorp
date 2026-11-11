@@ -5,7 +5,10 @@ pattern matching, traits and value semantics. Its compiler is written in
 Blorp, compiles itself and emits C. Memory is managed by reference counting:
 there is no garbage collector and no shared mutable state.
 
-The compiler is in [`src/`](src/): `common/` holds the code the commands share (the front end, the analysis phases and the code-generation phases), `format/` is the formatter. Programs compile
+The compiler is in [`src/`](src/): `main.brp` dispatches each command to its
+folder (`compile/`, and `format/` with the formatter), and `common/` holds
+what the commands share (the front end, the analysis and code-generation
+phases, and command-line reporting). Programs compile
 against [`standard_library/`](standard_library/), whose
 [README](standard_library/README.md) owns its API contracts. Tests are in
 [`test/`](test/), and [`grammar.ebnf`](grammar.ebnf) is the formal grammar.
@@ -1098,8 +1101,11 @@ that name a compiler-known operation. The
 
 ## Compiler architecture
 
-[`src/main.brp`](src/main.brp) is the command. It loads the program, runs the
-pure pipeline and writes the C:
+[`src/main.brp`](src/main.brp) reads the command word and dispatches to
+[`compile/compile_command.brp`](src/compile/compile_command.brp) or
+[`format/format_command.brp`](src/format/format_command.brp). The compile
+command loads the program, runs the pure pipeline
+([`generate_c`](src/common/codegen/generate_c.brp)) and writes the C:
 
 ```text
 lex -> parse -> load -> namespace -> check -> specialize -> lower -> own -> verify -> emit
@@ -1108,20 +1114,27 @@ lex -> parse -> load -> namespace -> check -> specialize -> lower -> own -> veri
 Load drives lexing and parsing of each module, and checking begins by
 building the namespace.
 
-`src/` has `common/`, `format/`, and the entry point (`main.brp`, `cli.brp`).
-`common/` holds what the commands share, one folder per layer. `utils/` holds
-helpers with no Blorp knowledge. `syntax/` is the front end both tools share:
+`src/` has `compile/` and `format/`, one folder per command (each holds its
+`*_command.brp`: options, help text and shell), `common/`, and the entry
+point `main.brp`. `common/` holds what the commands share, one folder per
+layer. `utils/` holds helpers with no Blorp knowledge. `syntax/` is the front
+end both tools share:
 the lexer, the parser, and the token, source and name tables they build.
 `analysis/` holds load, namespace and check (plus `assemble.brp` and
 `ids.brp`). `codegen/` holds the phases after checking, specialize through
-emit, plus `runtime` for the C fragments `emit` embeds. `format/` is the
-formatter. Layers import only downward: `utils/` imports itself; `syntax/`
-imports `utils/`; `analysis/` imports `syntax/` and `utils/`; `codegen/`
-imports `analysis/`, `syntax/` and `utils/`; `format/` imports `syntax/` and
-`utils/` and never `analysis/` or `codegen/`. Inside `analysis/` and
-`codegen/`, a folder imports only earlier folders; compiler imports are
-relative paths, and bare paths name library
-modules. Only the shell is impure: it reads modules with `fs.read_text`,
+emit, plus `runtime` for the C fragments `emit` embeds, and `generate_c`, the
+pipeline from a parsed program to C. `cli/` holds what the commands' command
+lines share: exit statuses, usage errors and diagnostic reports. `format/` is
+the formatter and the format command. Layers import only downward: `utils/`
+imports itself; `syntax/` imports `utils/`; `analysis/` imports `syntax/` and
+`utils/`; `codegen/` imports `analysis/`, `syntax/` and `utils/`; `cli/`
+imports `syntax/` and `utils/`. A command folder imports itself and
+`common/`, never another command or `main.brp`; `format/` imports only
+`common/syntax/`, `common/cli/` and `common/utils/`, never `analysis/` or
+`codegen/`. `main.brp` imports the commands and `common/cli/`. Inside
+`analysis/` and `codegen/`, a folder imports only earlier folders; compiler
+imports are relative paths, and bare paths name library modules. Only the
+shell is impure: it reads modules with `fs.read_text`,
 prints diagnostics and writes the output with `fs.write_text`. Everything in
 between, diagnostic rendering included, is pure and reads no filesystem,
 environment or clock. Each phase consumes its predecessor's sealed product and
@@ -1130,7 +1143,7 @@ returns a new one or its first error.
 [`src/format`](src/format/format.brp) is not a phase: the
 [formatter](#formatting) lexes and parses one file with the front end and
 prints its tree, taking comments, blank lines and literal spellings from the
-source between tokens. It imports only `common/syntax/` and `common/utils/`.
+source between tokens. It imports only `common/syntax/`, `common/cli/` and `common/utils/`.
 
 The output is replaced atomically, as by
 [`write_text`](standard_library/README.md#the-fs-module): a symlinked output

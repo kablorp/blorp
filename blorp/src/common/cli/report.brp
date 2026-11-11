@@ -1,0 +1,194 @@
+---
+Diagnostic reports: renders a failure as located text for the error stream and
+maps its kinds to the exit status.
+---
+import:
+    int: Int methods
+    list: List methods
+    option: Option methods
+    result: Result methods
+    string: String methods
+    ../syntax/source:
+        ModuleId,
+        SourceFile,
+        SourceId,
+        SourceInputs,
+        SourceRole(CompilerRole, ModuleRole, InvalidRole),
+    ../syntax/syntax:
+        Diagnostic,
+        DiagnosticNote(
+            UnionPayloadDeclaration,
+            RecordFieldDeclaration,
+            PreviousField,
+            PreviousDeclaration,
+            CompetingDeclarations,
+            Declaration,
+            NoteLines,
+        ),
+        DiagnosticKind(ProgramProblem, PathProblem, CompilerFault),
+        Diagnostics,
+        NoteLine,
+        Span,
+    ../utils/text: concat
+    ./usage: EXIT_INTERNAL, EXIT_PATH, EXIT_REJECTED, error_message
+
+
+private LINE_FEED_BYTE: Int = 10
+
+
+private pure func render_file_location(file: SourceFile, span: Span) -> String:
+    var line: Int = 1
+    var column: Int = 1
+    var cursor: Int = 0
+
+    while cursor < span.start:
+        line_feed = match file.contents.byte_at(cursor):
+            Some(byte): byte == LINE_FEED_BYTE
+            None: False
+        if line_feed:
+            line = line + 1
+            column = 1
+        else:
+            column = column + 1
+
+        cursor = cursor + 1
+
+    "${file.path}:${line}:${column}"
+
+
+private pure func render_location(inputs: SourceInputs, span: Span) -> Result[String, String]:
+    match span.source.source_role():
+        CompilerRole:
+            Ok("blorp")
+        ModuleRole:
+            match (
+                span.source
+                    .source_module()
+                    .to_result("invalid module source identity in diagnostic")
+            ):
+                Ok(id):
+                    match (
+                        inputs.modules
+                            .get(id.module_number())
+                            .to_result("diagnostic references a missing module source")
+                    ):
+                        Ok(file): Ok(file.render_file_location(span))
+                        Err(error): Err(error)
+                Err(error):
+                    Err(error)
+        InvalidRole:
+            Err("invalid source identity in diagnostic")
+
+
+private pure func note_lines(note: DiagnosticNote) -> List[NoteLine]:
+    match note:
+        NoteLines(lines):
+            lines
+        UnionPayloadDeclaration(span):
+            [{ span = span, text = "union payload declared here" }]
+        Declaration(span):
+            [{ span = span, text = "declared here" }]
+        RecordFieldDeclaration(span):
+            [{ span = span, text = "record field declared here" }]
+        PreviousField(span):
+            [{ span = span, text = "previous field written here" }]
+        PreviousDeclaration(span):
+            [{ span = span, text = "previous declaration or import here" }]
+        CompetingDeclarations(spans):
+            spans.map(
+                pure func(location: Span) -> NoteLine: {
+                    span = location,
+                    text = "candidate declaration or import here",
+                },
+            )
+
+
+-- Every rendered line is a source location followed by its text, so a diagnostic
+-- and its notes render the same way.
+private record LocatedText {
+    span: Span,
+    text: String,
+}
+
+
+private pure func located_texts(diagnostic: Diagnostic) -> List[LocatedText]:
+    headline = ": error: ${diagnostic.message}\nhelp: ${diagnostic.help}"
+    var lines: List[LocatedText] = [{ span = diagnostic.span, text = headline }]
+    match diagnostic.note:
+        None:
+            void
+        Some(note):
+            for note_line in note.note_lines():
+                lines = lines.append({ span = note_line.span, text = ": note: ${note_line.text}" })
+    lines
+
+
+-- Recursion depth is the line count: each phase reports its first error, so a
+-- compilation yields a handful. The host handles tens of thousands of frames
+-- (30,000 ran, 50,000 overflowed the stack).
+private pure func render_lines(
+    inputs: SourceInputs,
+    lines: List[LocatedText],
+    rendered: List[String],
+) -> Result[List[String], String]:
+    match lines.get(rendered.length()):
+        None:
+            Ok(rendered)
+        Some(line):
+            match inputs.render_location(line.span):
+                Ok(location):
+                    inputs.render_lines(lines, rendered.append(location.concat(line.text)))
+                Err(error):
+                    Err(error)
+
+
+-- The rendered report, or why it could not be rendered: a defect in blorp.
+private pure func rendered_report(
+    inputs: SourceInputs,
+    errors: Diagnostics,
+) -> Result[String, String]:
+    var lines: List[LocatedText] = []
+    for error in [errors.first].concat(errors.remaining):
+        lines = lines.concat(error.located_texts())
+    inputs
+        .render_lines(lines, [])
+        .map(pure func(rendered: List[String]): rendered.join("\n"))
+
+
+private pure func render_fault(fault: String) -> String:
+    error_message(fault, "report this compiler error with the input program")
+
+
+pure func render_diagnostics(inputs: SourceInputs, errors: Diagnostics) -> String:
+    match inputs.rendered_report(errors):
+        Ok(rendered): rendered
+        Err(fault): render_fault(fault)
+
+
+pure func kind_status(kind: DiagnosticKind) -> Int:
+    match kind:
+        ProgramProblem: EXIT_REJECTED
+        PathProblem: EXIT_PATH
+        CompilerFault: EXIT_INTERNAL
+
+
+-- The most severe status any of the diagnostics asks for: a fault in blorp
+-- over a path problem over a problem in the program.
+pure func diagnostics_status(errors: Diagnostics) -> Int:
+    var status: Int = 0
+    for error in [errors.first].concat(errors.remaining):
+        kind = error.kind.kind_status()
+        if kind > status:
+            status = kind
+    status
+
+
+-- Prints the diagnostics and returns the status their kinds ask for.
+func report_failure(inputs: SourceInputs, errors: Diagnostics) -> Int:
+    match inputs.rendered_report(errors):
+        Err(fault):
+            print_error(render_fault(fault))
+            EXIT_INTERNAL
+        Ok(report):
+            print_error(report)
+            errors.diagnostics_status()

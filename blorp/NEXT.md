@@ -53,12 +53,6 @@ done.
   - **Next:** L2, migrating the 17 `run_to_files` call sites and deleting it,
     after `PATH_PLAN.md`'s landing 6 changes the process errors.
   - **Later:** binary capture after `Bytes`, and `run` with streaming.
-- **Source layout by command:** [`SOURCE_LAYOUT_PLAN.md`](SOURCE_LAYOUT_PLAN.md).
-  - **Status:** Keith directed on 2026-11-10 that `src/` be organized by
-    command, with shared code under `common/`, and approved the plan's four
-    choices the same day.
-  - **Next:** step 1, the directory move, at a quiet point agreed with the
-    Bytes session. It comes before any other material change to `src/`.
 - **Language server (`blorp lsp`):** [`LSP_PLAN.md`](LSP_PLAN.md).
   - **Status:** the plan was written on 2026-11-10 and awaits Keith's review.
     Four choices are open: the first editor, the console API, when
@@ -71,8 +65,9 @@ done.
   - **Revision still to make:** key name uses by the compiler's existing
     identities rather than by copied definition spans, and record which
     files each analysis read.
-  - **Next:** after the source layout lands, the plan's landing 1, analysis
-    without an entry point.
+  - **Next:** that revision, then the plan's landing 1, analysis without an
+    entry point. The source layout it waited for has landed
+    ([`SOURCE_LAYOUT_PLAN.md`](SOURCE_LAYOUT_PLAN.md)).
 - **String code points:** [`STRING_PLAN.md`](STRING_PLAN.md).
   - **Status:** approved on 2026-11-10: `length` counts code points, from a
     count stored in each String, and byte work uses `byte_*` functions. S0
@@ -121,6 +116,9 @@ None of these is planned yet. Each wants its own short design or brief.
 - **Tooling found broken or quiet while landing work:**
   - `scripts/blorp-compiler-bootstrap` prints nothing when it downloads or
     reuses a cached seed, so a build log cannot show which seed it used.
+  - **Unit files outside `COMPONENT_SOURCES` rot unseen.** No gate compiles
+    them: `test_check/test_structural_patterns.brp` no longer compiles
+    (`is_ok` is unknown), and ten test imports name files that are gone.
 - **Compiler costs found while landing work:**
   - **A named lambda costs one allocation per call.** Binding a lambda to a
     local before passing it costs an allocation that an inline lambda does

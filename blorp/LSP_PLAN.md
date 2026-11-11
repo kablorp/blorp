@@ -15,7 +15,7 @@ $ echo $?
 2
 ```
 
-(`src/cli.brp:128`; 2 is `EXIT_USAGE`.)
+(`src/common/cli/usage.brp:18`; 2 is `EXIT_USAGE`.)
 
 We want a `blorp lsp` that speaks the Language Server Protocol over standard
 input and output, launched by a minimal editor plugin. Keith's priorities
@@ -92,8 +92,8 @@ are highlighting, then go-to-definition, then find-references.
   - `positions`: byte offsets to and from LSP positions.
   - `tokens`: semantic-token encoding.
   - `server`: open documents, one step per message.
-- **Transport** (`src/main.brp`), the only impure code: read, step, analyse
-  on request, write.
+- **Transport** (`src/lsp/lsp_command.brp`, the command shell), the only impure
+  code: read, step, analyse on request, write.
 - **Editor plugin** (`editor/intellij/`): it launches `blorp lsp`.
 
 ### Analysis without an entry point
@@ -503,8 +503,8 @@ pure func receive(server: Server, message: Json) -> Step
 pure func analysed(server: Server, path: String, result: DocumentAnalysis) -> Step
 ```
 
-**`Command`** (`src/cli.brp:42`) gains a case, and the overview text
-(`src/cli.brp:71`) gains a line:
+**`Command`** (`src/main.brp:15`) gains a case, and the overview text
+(`src/main.brp:24`) gains a line:
 
 ```blorp
 union Command:
@@ -521,7 +521,7 @@ union Command:
 - `src/common/analysis/{check,namespace,load}/`, for the analysis product and its
   rows;
 - new code: `src/common/analysis/occurrences.brp` and `src/lsp/`;
-- `src/cli.brp` and `src/main.brp`;
+- `src/main.brp`, for the `Command` case and the overview text;
 - `io/console`, the runtime and the builtin tables;
 - `editor/`, the README and the tests.
 

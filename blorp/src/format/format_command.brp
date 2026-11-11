@@ -1,0 +1,162 @@
+---
+`blorp format`: reads its options into a request, and runs the request over
+every source file the walk finds.
+---
+import:
+    io/fs: read_text, write_text
+    list: List methods
+    option: Option methods
+    path: normalize
+    result: Result methods
+    string: String methods
+    ../common/cli/report: report_failure
+    ../common/cli/usage:
+        EXIT_PATH,
+        EXIT_REJECTED,
+        EXIT_USAGE,
+        error_message,
+        given_twice,
+        option_value,
+        unknown_option,
+    ../common/syntax/source: SourceInputs
+    ../common/syntax/syntax: singleton_diagnostic
+    ./format: first_changed_line, format_source
+    ./source_walk: walk_sources
+
+
+-- `roots` and `excluded` are normalized; `roots` is never empty.
+record FormatRequest {
+    roots: List[String],
+    excluded: List[String],
+    check_only: Bool,
+}
+
+
+FORMAT_HELP: String =
+    |usage: blorp format [--check] [--exclude PATH]... [PATH ...]
+    |
+    |Puts .brp files in the canonical layout. Each PATH is a .brp file or a
+    |directory, which is searched recursively; with no PATH it formats the current
+    |directory. While searching, names that begin with a dot and symbolic links
+    |are skipped; a PATH written on the command line is always used. A file that
+    |does not parse is reported and left as it is, and the command exits with
+    |status 1.
+    |
+    |options:
+    |  --check         change nothing; list each file that would be reformatted
+    |  --exclude PATH  skip a file, or a directory and everything below it;
+    |                  repeat it for several paths
+    |  -h, --help      show this help
+
+
+private record FormatOptions {
+    paths: List[String],
+    excluded: List[String],
+    check_only: Bool,
+}
+
+
+private pure func read_format_options(
+    words: List[String],
+    options: FormatOptions,
+) -> Result[FormatOptions, String]:
+    match words:
+        []:
+            Ok(options)
+        ["--check", ...following]:
+            if options.check_only:
+                Err(given_twice("--check"))
+            else:
+                following.read_format_options({ options | check_only = True })
+        ["--exclude", ...following]:
+            option_value("--exclude", "PATH", following).and_then(
+                pure func(path: String): following
+                    .drop(1)
+                    .read_format_options({ options | excluded = options.excluded.append(path) }),
+            )
+        [word, ...following]:
+            if word.starts_with("-"):
+                Err(unknown_option(word, "format"))
+            else:
+                following.read_format_options({ options | paths = options.paths.append(word) })
+
+
+pure func parse_format(words: List[String]) -> Result[FormatRequest, String]:
+    options ?= words.read_format_options({ paths = [], excluded = [], check_only = False })
+    roots = if options.paths.is_empty():
+        [CURRENT_DIRECTORY]
+    else:
+        options.paths.map(normalize)
+    Ok({
+        roots = roots,
+        excluded = options.excluded.map(normalize),
+        check_only = options.check_only,
+    })
+
+
+private CURRENT_DIRECTORY: String = "."
+
+
+-- Formats one source file: 0 when it needed nothing or was rewritten, 1 when it
+-- did not parse, has a comment the layout cannot keep, or `--check` found it
+-- unformatted, 3 when it could not be read or written, 4 when blorp broke one of
+-- its own invariants. A file that fails prints its diagnostic and is left
+-- untouched.
+private func format_file(path: String, check_only: Bool) -> Int:
+    match path.read_text():
+        Err(error):
+            print_error(
+                error_message(
+                    "could not read ${error}",
+                    "check that the file exists and can be read",
+                ),
+            )
+            EXIT_PATH
+        Ok(original):
+            match original.format_source():
+                Err(diagnostic):
+                    sources: SourceInputs = { modules = [{ path = path, contents = original }] }
+                    sources.report_failure(diagnostic.singleton_diagnostic())
+                Ok(formatted):
+                    if formatted == original:
+                        0
+                    else if check_only:
+                        print("${path}:${first_changed_line(original, formatted)}: would reformat")
+                        EXIT_REJECTED
+                    else:
+                        -- write_text replaces the file atomically, as `publish` does.
+                        match path.write_text(formatted):
+                            Err(error):
+                                print_error(
+                                    error_message(
+                                        "could not write ${error}",
+                                        "make the source file writable, then format it again",
+                                    ),
+                                )
+                                EXIT_PATH
+                            Ok(_):
+                                0
+
+
+-- Every file is processed, whatever happens to the others. The status is the
+-- most severe one any of them had.
+func format_request(request: FormatRequest) -> Int:
+    match walk_sources(request.roots, request.excluded):
+        Err(usage):
+            print_error(usage)
+            EXIT_USAGE
+        Ok(walk):
+            var status: Int = 0
+            for error in walk.unreadable:
+                print_error(
+                    error_message(
+                        "could not read ${error}",
+                        "check that the path exists and can be read",
+                    ),
+                )
+                status = EXIT_PATH
+            for path in walk.files:
+                file_status = path.format_file(request.check_only)
+                if file_status > status:
+                    status = file_status
+            status

@@ -1,210 +1,112 @@
+---
+The `blorp` command: reads the command word, dispatches to the command that owns
+it, and answers `blorp help`.
+---
 import:
-    int: Int methods
-    io/fs: read_text, write_text
     list: List methods
-    option: Option methods
     result: Result methods
     string: String methods
-    ./cli:
-        Command(Compile, Format, Help),
-        CompileInputs(ProgramInput, SuiteInputs),
-        CompileRequest,
-        EXIT_INTERNAL,
-        EXIT_PATH,
-        EXIT_REJECTED,
-        EXIT_USAGE,
-        FormatRequest,
-        error_message,
-        parse_command,
-    ./common/analysis/assemble: ParsedProgram
-    ./common/analysis/check/check: check
-    ./common/analysis/check/render: render_failure
-    ./common/analysis/load/load:
-        LoadedProgram,
-        LoadFailure,
-        SourceFile,
-        SourceInputs,
-        load_program,
-        load_test_program,
-    ./common/codegen/emit/emit: emit
-    ./common/codegen/lower/lower: lower
-    ./common/codegen/own/own: own
-    ./common/codegen/specialize/specialize: specialize
-    ./common/codegen/verify/verify: verify
-    ./common/syntax/source: SourceRole(CompilerRole, ModuleRole, InvalidRole), ModuleId, SourceId
-    ./common/syntax/syntax:
-        Diagnostic,
-        DiagnosticNote(
-            UnionPayloadDeclaration,
-            RecordFieldDeclaration,
-            PreviousField,
-            PreviousDeclaration,
-            CompetingDeclarations,
-            Declaration,
-            NoteLines,
-        ),
-        DiagnosticKind(ProgramProblem, PathProblem, CompilerFault),
-        Diagnostics,
-        NoteLine,
-        Span,
-        singleton_diagnostic,
-    ./common/utils/text: concat
-    ./format/format: first_changed_line, format_source
-    ./format/source_walk: walk_sources
+    ./common/cli/usage: EXIT_USAGE, error_message
+    ./compile/compile_command: COMPILE_HELP, CompileRequest, compile_request, parse_compile
+    ./format/format_command: FORMAT_HELP, FormatRequest, format_request, parse_format
 
 
--- Source loading publishes complete syntax and identities. Every stage here is pure.
-pure func compile(program: ParsedProgram) -> Result[String, Diagnostics]:
-    checked ?= program
-        .check()
-        .map_err(render_failure)
-    specialized ?= checked
-        .specialize()
-        .map_err(singleton_diagnostic)
-    lowered ?= specialized
-        .lower()
-        .map_err(singleton_diagnostic)
-    owned ?= lowered
-        .own()
-        .map_err(singleton_diagnostic)
-    verified ?= owned
-        .verify()
-        .map_err(singleton_diagnostic)
-    verified
-        .emit()
-        .map_err(singleton_diagnostic)
+-- What the command line asks for. `Help` holds the text to print.
+union Command:
+    Compile(CompileRequest)
+    Format(FormatRequest)
+    Help(String)
 
 
-private LINE_FEED_BYTE: Int = 10
+private HELP_FLAGS: List[String] = ["-h", "--help"]
 
 
-private pure func render_file_location(file: SourceFile, span: Span) -> String:
-    var line: Int = 1
-    var column: Int = 1
-    var cursor: Int = 0
-
-    while cursor < span.start:
-        line_feed = match file.contents.byte_at(cursor):
-            Some(byte): byte == LINE_FEED_BYTE
-            None: False
-        if line_feed:
-            line = line + 1
-            column = 1
-        else:
-            column = column + 1
-
-        cursor = cursor + 1
-
-    "${file.path}:${line}:${column}"
+private OVERVIEW: String =
+    |blorp compiles Blorp programs to C and formats Blorp source.
+    |
+    |usage: blorp COMMAND [ARGUMENT ...]
+    |
+    |commands:
+    |  compile  write the C for a program
+    |  format   put source files in the canonical layout
+    |  help     show this overview, or the help of one command
+    |
+    |run blorp help COMMAND for the options of a command
+    |
+    |exit status: 0 success; 1 the code needs fixing; 2 bad usage;
+    |3 a path could not be read or written; 4 a fault in blorp (report it)
 
 
-private pure func render_location(inputs: SourceInputs, span: Span) -> Result[String, String]:
-    match span.source.source_role():
-        CompilerRole:
-            Ok("blorp")
-        ModuleRole:
-            match (
-                span.source
-                    .source_module()
-                    .to_result("invalid module source identity in diagnostic")
-            ):
-                Ok(id):
-                    match (
-                        inputs.modules
-                            .get(id.module_number())
-                            .to_result("diagnostic references a missing module source")
-                    ):
-                        Ok(file): Ok(file.render_file_location(span))
-                        Err(error): Err(error)
-                Err(error):
-                    Err(error)
-        InvalidRole:
-            Err("invalid source identity in diagnostic")
+private HELP_HELP: String =
+    |usage: blorp help [COMMAND]
+    |
+    |Shows the overview of blorp, or the options of one command.
 
 
-private pure func note_lines(note: DiagnosticNote) -> List[NoteLine]:
-    match note:
-        NoteLines(lines):
-            lines
-        UnionPayloadDeclaration(span):
-            [{ span = span, text = "union payload declared here" }]
-        Declaration(span):
-            [{ span = span, text = "declared here" }]
-        RecordFieldDeclaration(span):
-            [{ span = span, text = "record field declared here" }]
-        PreviousField(span):
-            [{ span = span, text = "previous field written here" }]
-        PreviousDeclaration(span):
-            [{ span = span, text = "previous declaration or import here" }]
-        CompetingDeclarations(spans):
-            spans.map(
-                pure func(location: Span) -> NoteLine: {
-                    span = location,
-                    text = "candidate declaration or import here",
-                },
+private pure func unknown_command(command: String) -> String:
+    error_message("unknown command `${command}`", "run blorp help to list the commands")
+
+
+private pure func parse_help(words: List[String]) -> Result[Command, String]:
+    match words:
+        []:
+            Ok(Help(OVERVIEW))
+        ["compile"]:
+            Ok(Help(COMPILE_HELP))
+        ["format"]:
+            Ok(Help(FORMAT_HELP))
+        ["help"]:
+            Ok(Help(HELP_HELP))
+        [command]:
+            Err(unknown_command(command))
+        [command, extra, ..._]:
+            Err(
+                error_message(
+                    "blorp help takes at most one command, but `${extra}` follows `${command}`",
+                    "run blorp help COMMAND",
+                ),
             )
 
 
--- Every rendered line is a source location followed by its text, so a diagnostic
--- and its notes render the same way.
-private record LocatedText {
-    span: Span,
-    text: String,
-}
-
-
-private pure func located_texts(diagnostic: Diagnostic) -> List[LocatedText]:
-    headline = ": error: ${diagnostic.message}\nhelp: ${diagnostic.help}"
-    var lines: List[LocatedText] = [{ span = diagnostic.span, text = headline }]
-    match diagnostic.note:
-        None:
-            void
-        Some(note):
-            for note_line in note.note_lines():
-                lines = lines.append({ span = note_line.span, text = ": note: ${note_line.text}" })
-    lines
-
-
--- Recursion depth is the line count: each phase reports its first error, so a
--- compilation yields a handful. The host handles tens of thousands of frames
--- (30,000 ran, 50,000 overflowed the stack).
-private pure func render_lines(
-    inputs: SourceInputs,
-    lines: List[LocatedText],
-    rendered: List[String],
-) -> Result[List[String], String]:
-    match lines.get(rendered.length()):
-        None:
-            Ok(rendered)
-        Some(line):
-            match inputs.render_location(line.span):
-                Ok(location):
-                    inputs.render_lines(lines, rendered.append(location.concat(line.text)))
-                Err(error):
-                    Err(error)
-
-
--- The rendered report, or why it could not be rendered: a defect in blorp.
-private pure func rendered_report(
-    inputs: SourceInputs,
-    errors: Diagnostics,
-) -> Result[String, String]:
-    var lines: List[LocatedText] = []
-    for error in [errors.first].concat(errors.remaining):
-        lines = lines.concat(error.located_texts())
-    inputs
-        .render_lines(lines, [])
-        .map(pure func(rendered: List[String]): rendered.join("\n"))
-
-
-private pure func render_fault(fault: String) -> String:
-    error_message(fault, "report this compiler error with the input program")
-
-
-pure func render_diagnostics(inputs: SourceInputs, errors: Diagnostics) -> String:
-    match inputs.rendered_report(errors):
-        Ok(rendered): rendered
-        Err(fault): render_fault(fault)
+-- `words` are the command line after the program name.
+pure func parse_command(words: List[String]) -> Result[Command, String]:
+    match words:
+        []:
+            Err(OVERVIEW)
+        [command, ...arguments]:
+            wants_help = HELP_FLAGS.any(pure func(flag: String): arguments.contains(flag))
+            match command:
+                "compile":
+                    if wants_help:
+                        Ok(Help(COMPILE_HELP))
+                    else:
+                        arguments
+                            .parse_compile()
+                            .map(pure func(request: CompileRequest): Compile(request))
+                "format":
+                    if wants_help:
+                        Ok(Help(FORMAT_HELP))
+                    else:
+                        arguments
+                            .parse_format()
+                            .map(pure func(request: FormatRequest): Format(request))
+                "help":
+                    if wants_help:
+                        Ok(Help(HELP_HELP))
+                    else:
+                        arguments.parse_help()
+                _:
+                    if HELP_FLAGS.contains(command):
+                        Ok(Help(OVERVIEW))
+                    else if command.starts_with("-"):
+                        Err(
+                            error_message(
+                                "unknown option `${command}`",
+                                "options follow a command; run blorp help to list the commands",
+                            ),
+                        )
+                    else:
+                        Err(unknown_command(command))
 
 
 func main(args: List[String]) -> Int:
@@ -223,121 +125,3 @@ func main(args: List[String]) -> Int:
         Err(usage):
             print_error(usage)
             EXIT_USAGE
-
-
-pure func kind_status(kind: DiagnosticKind) -> Int:
-    match kind:
-        ProgramProblem: EXIT_REJECTED
-        PathProblem: EXIT_PATH
-        CompilerFault: EXIT_INTERNAL
-
-
--- The most severe status any of the diagnostics asks for: a fault in blorp
--- over a path problem over a problem in the program.
-pure func diagnostics_status(errors: Diagnostics) -> Int:
-    var status: Int = 0
-    for error in [errors.first].concat(errors.remaining):
-        kind = error.kind.kind_status()
-        if kind > status:
-            status = kind
-    status
-
-
--- Prints the diagnostics and returns the status their kinds ask for.
-private func report_failure(inputs: SourceInputs, errors: Diagnostics) -> Int:
-    match inputs.rendered_report(errors):
-        Err(fault):
-            print_error(render_fault(fault))
-            EXIT_INTERNAL
-        Ok(report):
-            print_error(report)
-            errors.diagnostics_status()
-
-
--- Formats one source file: 0 when it needed nothing or was rewritten, 1 when it
--- did not parse, has a comment the layout cannot keep, or `--check` found it
--- unformatted, 3 when it could not be read or written, 4 when blorp broke one of
--- its own invariants. A file that fails prints its diagnostic and is left
--- untouched.
-private func format_file(path: String, check_only: Bool) -> Int:
-    match path.read_text():
-        Err(error):
-            print_error(
-                error_message(
-                    "could not read ${error}",
-                    "check that the file exists and can be read",
-                ),
-            )
-            EXIT_PATH
-        Ok(original):
-            match original.format_source():
-                Err(diagnostic):
-                    sources: SourceInputs = { modules = [{ path = path, contents = original }] }
-                    sources.report_failure(diagnostic.singleton_diagnostic())
-                Ok(formatted):
-                    if formatted == original:
-                        0
-                    else if check_only:
-                        print("${path}:${first_changed_line(original, formatted)}: would reformat")
-                        EXIT_REJECTED
-                    else:
-                        -- write_text replaces the file atomically, as `publish` does.
-                        match path.write_text(formatted):
-                            Err(error):
-                                print_error(
-                                    error_message(
-                                        "could not write ${error}",
-                                        "make the source file writable, then format it again",
-                                    ),
-                                )
-                                EXIT_PATH
-                            Ok(_):
-                                0
-
-
--- Every file is processed, whatever happens to the others. The status is the
--- most severe one any of them had.
-private func format_request(request: FormatRequest) -> Int:
-    match walk_sources(request.roots, request.excluded):
-        Err(usage):
-            print_error(usage)
-            EXIT_USAGE
-        Ok(walk):
-            var status: Int = 0
-            for error in walk.unreadable:
-                print_error(
-                    error_message(
-                        "could not read ${error}",
-                        "check that the path exists and can be read",
-                    ),
-                )
-                status = EXIT_PATH
-            for path in walk.files:
-                file_status = path.format_file(request.check_only)
-                if file_status > status:
-                    status = file_status
-            status
-
-
--- write_text replaces the output atomically, so a failed or interrupted
--- compile never leaves a truncated C file behind.
-private func publish(path: String, generated_c: String) -> Int:
-    match path.write_text(generated_c):
-        Err(error):
-            print_error(error_message("could not write ${error}", "provide a writable output path"))
-            EXIT_PATH
-        Ok(_):
-            0
-
-
-private func compile_request(request: CompileRequest) -> Int:
-    loaded = match request.inputs:
-        ProgramInput(input): input.load_program(request.library)
-        SuiteInputs(first, later): first.load_test_program(later, request.library)
-    match loaded:
-        Err(failure):
-            failure.sources.report_failure(failure.diagnostic.singleton_diagnostic())
-        Ok(program):
-            match program.program.compile():
-                Err(errors): program.sources.report_failure(errors)
-                Ok(generated_c): request.output.publish(generated_c)

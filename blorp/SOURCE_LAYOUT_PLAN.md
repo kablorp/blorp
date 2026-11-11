@@ -2,7 +2,9 @@
 
 **Status: approved by Keith on 2026-11-10, with its four choices as
 recommended.** It lands before the language server (`LSP_PLAN.md`) and
-before any other material change to `src/`.
+before any other material change to `src/`. Both steps have landed: step 1
+as `acecd2a5c`, and step 2 in the commit that splits `main.brp` and `cli.brp`
+([results](../benchmarks/results/blorp-source-layout-step2-2026-11-10.md)).
 
 ## Problem
 
@@ -342,7 +344,7 @@ rewrite script in reverse.
 | Step | Ceiling |
 | --- | --- |
 | 1 | The self-compile C is byte-identical to its parent's. Production lines are unchanged; only import lines differ. |
-| 2 | Self-compile instructions within ±0.2%. Allocations within ±0.01%. At most +40 net production lines, for new module headers and imports. |
+| 2 | Self-compile instructions within ±0.2%. Allocations within ±0.01%. At most +40 net production lines, for new module headers and imports; raised to +62 on 2026-11-10, when the headers and imports measured that (see the results). |
 
 ## Testing
 
