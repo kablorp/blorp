@@ -481,10 +481,21 @@ func main() -> Int:
 
 This exits 10. A variant is bare or has ordered fields, as in
 `Pair(String, String)`; `Unit(Void)` has one field, written `Unit(void)`, and
-`Variant()` is invalid. A constructor needs an expected union type from a
+`Variant()` is invalid. A bare constructor needs an expected union type from a
 parameter, return type, annotation or reassignment: an unannotated `x = Empty`
 reports "constructor needs an expected union type", and `match Empty:` is
 rejected too.
+
+A variant can also be written through its union, `Shape.Empty` and
+`Shape.Circle(3)`, in values and in patterns. The name picks the variant, so
+`x = Shape.Empty` needs no annotation, and it works whether or not the variant
+itself was imported, so long as the union is visible. A generic union still
+takes its type arguments from the expected type (`x: Option[Int] = Option.None`).
+Both names are capitalized and the dot follows the union on the same line:
+`Shape.Empty.Circle` and `read.Shape.Empty` (a module alias before a union)
+are not forms. Write `read.Empty` for a variant through a module alias. A
+pattern's union must be the matched value's: matching a `Shape` with
+`Other.Empty` reports that `Other.Empty` is a variant of `Other`.
 
 Variant names share one namespace with the module's functions and are unique
 across its unions; a user module cannot declare a prelude constructor ("True
@@ -574,7 +585,9 @@ Patterns nest:
   the literal, as in an expression, so `-9223372036854775808` is a pattern. A
   Float literal is not a pattern, because NaN never equals itself: bind the
   value and compare it in the arm.
-- `alias.Variant` names a constructor through a module alias.
+- `alias.Variant` names a constructor through a module alias, and
+  `Union.Variant` names it through its union; the union must be the matched
+  value's.
 
 Arms must be exhaustive and each must be reachable. Literals never cover every
 String or Int, so a String or Int that literals test needs a catch-all, and a

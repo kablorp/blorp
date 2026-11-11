@@ -36,6 +36,8 @@ import:
             DirectApplication,
             QualifiedName,
             QualifiedApplication,
+            VariantName,
+            VariantApplication,
             OpaqueWrap,
             OpaqueUnwrap,
             ListExpression,
@@ -69,6 +71,7 @@ import:
         ElseBranch(ElseIf, ElseBlock),
         ParsedIf,
         ParsedQualified,
+        ParsedUnionVariant,
         ParsedBinder(NamedBinder, DiscardBinder),
         ForBinder(SingleForBinder, TupleForBinder),
         LambdaParameter,
@@ -132,7 +135,7 @@ import:
             PatternChar,
         ),
         LiteralPattern(ExactBytes, ExactInt),
-        PatternHead(BareHead, QualifiedHead),
+        PatternHead(BareHead, QualifiedHead, UnionVariantHead),
         ParsedRecord,
         ParsedRecordField,
         ParsedDictEntry,
@@ -1476,6 +1479,38 @@ private pure func is_module_alias(state: ParserState, id: NameId) -> Bool:
     found
 
 
+private FIELD_NAME_MESSAGE: String = "fields and methods are lower_snake_case"
+
+
+private ALIAS_UNION_VARIANT_HELP: String = "name the variant through its union, as in `Union.Variant`, or through the alias alone, as in `alias.Variant`; `alias.Union.Variant` is not a form"
+
+
+private VARIANT_POSTFIX_HELP: String = "a field or method is lower_snake_case; a variant cannot be followed by another variant"
+
+
+-- A base followed by `.` and a capitalized name cannot take that name as a
+-- postfix. The caller's help says what to write instead.
+private pure func reject_capitalized_postfix(
+    parsed: ParsedBase,
+    help: String,
+) -> Result[ParsedBase, Diagnostic]:
+    if parsed.next.at_dot():
+        match (
+            parsed.next
+                .shifted(1)
+                .consume_used_name("expected a field or function name after '.'")
+        ):
+            Ok(member):
+                if DeclaredType.accepts(member.form):
+                    Err(diagnostic(member.name.span, FIELD_NAME_MESSAGE, help))
+                else:
+                    Ok(parsed)
+            Err(_):
+                Ok(parsed)
+    else:
+        Ok(parsed)
+
+
 -- `Alias.name` and `Alias.name(arguments)` where Alias is a declared module
 -- alias; `module` is the alias just consumed.
 private pure func consume_qualified(module: ParsedName) -> Result[ParsedBase, Diagnostic]:
@@ -1483,8 +1518,7 @@ private pure func consume_qualified(module: ParsedName) -> Result[ParsedBase, Di
         .shifted(1)
         .consume_used_name("expected a name after the module alias and '.'")
     qualified: ParsedQualified = { module = module.name, name = member.name }
-
-    if member.next.at_left_paren():
+    parsed: ParsedBase ?= if member.next.at_left_paren():
         match member.next.consume_call_arguments():
             Ok(call):
                 Ok({
@@ -1500,6 +1534,64 @@ private pure func consume_qualified(module: ParsedName) -> Result[ParsedBase, Di
             span = { module.name.span | end = member.name.span.end },
             next = member.next,
         })
+
+    if DeclaredType.accepts(member.form):
+        parsed.reject_capitalized_postfix(ALIAS_UNION_VARIANT_HELP)
+    else:
+        Ok(parsed)
+
+
+-- `Union.Variant` and `Union.Variant(arguments)`; `variant` is the name just
+-- after the dot.
+private pure func consume_union_variant(
+    union_name: ParsedName,
+    variant: ParsedName,
+) -> Result[ParsedBase, Diagnostic]:
+    written: ParsedUnionVariant = { union_name = union_name.name, variant = variant.name }
+    parsed: ParsedBase ?= if variant.next.at_left_paren():
+        match variant.next.consume_call_arguments():
+            Ok(call):
+                Ok({
+                    base = VariantApplication(written, call.arguments),
+                    span = { union_name.name.span | end = call.end },
+                    next = call.next,
+                })
+            Err(error):
+                Err(error)
+    else:
+        Ok({
+            base = VariantName(written),
+            span = { union_name.name.span | end = variant.name.span.end },
+            next = variant.next,
+        })
+
+    parsed.reject_capitalized_postfix(VARIANT_POSTFIX_HELP)
+
+
+-- The variant name of `Union.Variant`, when `union_name` is followed directly by
+-- `.` and a variant name. Both are capitalized and an alias never is, so no
+-- alias set decides. A newline token between them ends the name, so the dot is
+-- on the same line.
+private pure func variant_after(union_name: ParsedName) -> Option[ParsedName]:
+    if (
+        DeclaredType
+            .accepts(union_name.form)
+            .and(union_name.next.at_dot())
+    ):
+        match (
+            union_name.next
+                .shifted(1)
+                .consume_used_name("expected a variant name after the union and '.'")
+        ):
+            Ok(variant):
+                if DeclaredVariant.accepts(variant.form):
+                    Some(variant)
+                else:
+                    None
+            Err(_):
+                None
+    else:
+        None
 
 
 private pure func consume_name_or_call(start: ParserState) -> Result[ParsedBase, Diagnostic]:
@@ -1517,18 +1609,26 @@ private pure func consume_name_or_call(start: ParserState) -> Result[ParsedBase,
             Err(error):
                 Err(error)
     else:
-        qualified_alias = match name.next.at_dot():
-            True:
-                match after_dot.at_identifier():
-                    True: start.is_module_alias(name.name.id)
-                    False: False
-            False:
-                False
+        match name.variant_after():
+            Some(variant):
+                name.consume_union_variant(variant)
+            None:
+                qualified_alias = match name.next.at_dot():
+                    True:
+                        match after_dot.at_identifier():
+                            True: start.is_module_alias(name.name.id)
+                            False: False
+                    False:
+                        False
 
-        if qualified_alias:
-            name.consume_qualified()
-        else:
-            Ok({ base = NameExpression(name.name), span = name.name.span, next = name.next })
+                if qualified_alias:
+                    name.consume_qualified()
+                else:
+                    Ok({
+                        base = NameExpression(name.name),
+                        span = name.name.span,
+                        next = name.next,
+                    })
 
 
 private record StringTextPiece {
@@ -1801,7 +1901,7 @@ private pure func consume_postfix(state: ParserState) -> Result[ParsedPostfix, D
         Err(
             diagnostic(
                 name.name.span,
-                "fields and methods are lower_snake_case",
+                FIELD_NAME_MESSAGE,
                 DeclaredField.misnamed_help(state.input.names.spelling_of(name.name.id)),
             ),
         )
@@ -3130,12 +3230,36 @@ private pure func consume_callable_result(
     })
 
 
+private QUALIFIED_TYPE_MESSAGE: String = "only a module alias can qualify a type, and aliases are lower_snake_case"
+
+
+private QUALIFIED_TYPE_HELP: String = "write `alias.Type` with an alias from the import block; a union's variants are not types"
+
+
+-- A capitalized name before the dot of a type is never a module alias; the
+-- checker would report an unknown alias with a help that cannot work.
+private pure func reject_unqualifiable_type_qualifier(name: ParsedName) -> Result[Void, Diagnostic]:
+    if (
+        name.next
+            .at_dot()
+            .and(
+                DeclaredImportAlias
+                    .accepts(name.form)
+                    .not(),
+            )
+    ):
+        Err(diagnostic(name.name.span, QUALIFIED_TYPE_MESSAGE, QUALIFIED_TYPE_HELP))
+    else:
+        Ok(void)
+
+
 -- A dot in a named type can only qualify, so no alias set is consulted here.
 private pure func consume_named_type(
     state: ParserState,
     message: String,
 ) -> Result[ParsedType, Diagnostic]:
     name ?= state.consume_used_name(message)
+    _: Void ?= name.reject_unqualifiable_type_qualifier()
 
     if name.next.at_dot():
         match (
@@ -3584,9 +3708,10 @@ private pure func consume_alternative(
             None: state.consume_named_alternative(message)
 
 
--- A name, `Name(fields)`, or `Module.Name[(fields)]`: a dot in a pattern can
--- only qualify, so no alias set is consulted, as in a type. A qualified head
--- without fields is still a constructor pattern.
+-- A name, `Name(fields)`, `alias.Name[(fields)]` or `Union.Name[(fields)]`: a
+-- dot in a pattern can only qualify, so no alias set is consulted, as in a
+-- type; a capitalized qualifier before a variant name is a union. A qualified
+-- head without fields is still a constructor pattern.
 private pure func consume_named_alternative(
     state: ParserState,
     message: String,
@@ -3600,7 +3725,14 @@ private pure func consume_named_alternative(
                 .consume_used_name("expected a constructor name after the module alias and '.'")
         ):
             Ok(member):
-                head: PatternHead = QualifiedHead({ module = name.name, name = member.name })
+                head: PatternHead = if (
+                    DeclaredType
+                        .accepts(name.form)
+                        .and(DeclaredVariant.accepts(member.form))
+                ):
+                    UnionVariantHead({ union_name = name.name, variant = member.name })
+                else:
+                    QualifiedHead({ module = name.name, name = member.name })
 
                 if member.next.at_left_paren():
                     member.next.consume_constructor_pattern(name.name.span, head)

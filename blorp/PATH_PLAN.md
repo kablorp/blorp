@@ -1,7 +1,8 @@
 # `Path`, exact I/O errors, naming rules and qualified variants
 
 **Status: plan, 2026-11-10, revision 4. Landings 4 (`7d8a92f25`), 3
-(`4024ef09d`) and 1 (`be98099e6`) have landed.** Revision 4 folds in
+(`4024ef09d`), 1 (`be98099e6`) and 2 (qualified variants) have landed.
+Landing 5, the seed rotation, is next.** Revision 4 folds in
 landing 2's parser and ergonomics review. Revision 3 adds the naming rules
 Keith adopted, which make qualified variants a parser rule. Keith approved P1
 to P12 of the earlier `PATH_DECISIONS.md` (full text, with its precedent
@@ -284,8 +285,9 @@ union's variants reachable qualified. Importing `A(NotFound)` and
   `x.y` is still an alias call or a field, decided by the parser's alias set
   as today; the new rule sits beside that check and removes nothing.
   `alias.Variant` keeps its current meaning. `alias.Union.Variant` is not
-  supported unless Keith decides otherwise (asked 2026-11-10), because
-  `read.NotFound` already names that variant.
+  supported, because `read.NotFound` already names that variant. Keith,
+  2026-11-10: not for now, since leaving it out is simpler. It is a parse
+  error whose help names both supported forms.
 - **Chains.** `Kind.A.to_string()` is a method call on the variant;
   `Kind.A.B` is a parse error whose help says a variant cannot be followed
   by another variant.
@@ -493,11 +495,33 @@ unchanged; messages that print a process error add the program the same way.
      or constant as `X`, a union declared after its use, `alias.func` and
      `alias.Variant` unchanged, identical C to the bare form, and the two
      e2e fixtures whose capitalized `X.Y` changes meaning.
-   - Ceilings: production lines at most +300. Self-compile allocations and
-     retired instructions each at most +0.3%.
+   - Ceilings: production lines at most +525 (was +300). Self-compile
+     allocations and retired instructions each at most +0.3%.
+   - Coordinator correction, 2026-11-10: production measures +523 net
+     (+620 −97) against `e972c56ea`. Self-compile cost is +59 allocations
+     (+0.0004%) and +0.028% instructions, the medians of 11 interleaved
+     `-O2` rounds at the review-fix commit. The core is about 300 lines:
+     the syntax, the parser rule, the resolver and the formatter. The
+     +300 came from the review's estimate of 250 to 300, which did not
+     cost the diagnostics the same review then specified:
+     - the table's messages and helps, with the spelling helpers that
+       name a union's variants and parameters;
+     - the type-position parse error for a capitalized qualifier (the
+       review's item 7);
+     - the `Kind.A.B` and `alias.Union.Variant` messages;
+     - the help for a bare variant that several visible unions declare,
+       which names every candidate.
+
+     The code review trimmed the checker's lookups, and its one
+     classifying resolver also fixed type-parameter shadowing in the
+     helps. Its suggested flat render helpers grew the file by 103 lines,
+     so the nested arms were restored.
    - Review: parser and ergonomics review done 2026-11-10 (no blockers;
-     its corrections are in "Qualified variants" above); documenter review
-     after.
+     its corrections are in "Qualified variants" above). Code review: no
+     blockers, four should-fixes, applied except the shared union-row
+     read, which cost more lines than it saved on an error path. The
+     code-reviewer also did the documenter review of `README.md` and
+     `grammar.ebnf`.
 3. **`Path` in `path.brp`, beside the String functions.** P2 to P5, `+`,
    P10's methods except two, `PathError` and unit tests. No compiler change.
    `join` and `normalize` already name String functions in `path.brp`, and a

@@ -540,7 +540,11 @@ private pure func render_conflict(
                             Implicit:
                                 "omit ${name} from this selection, or reach it through a module alias"
                             Imported | Declared(_):
-                                "select ${name} from one module only, and reach the other through a module alias"
+                                match (conflict.incoming.entity, conflict.previous.entity):
+                                    (Constructor(_), Constructor(_)):
+                                        "select ${name} from one module only, reach the other through a module alias, or import both unions and write the variant through its union, as Union.${name}"
+                                    _:
+                                        "select ${name} from one module only, and reach the other through a module alias"
             noted(span, message, help, PreviousDeclaration(conflict.previous.name.span))
 
 
@@ -1233,23 +1237,132 @@ private pure func render_method_error(
             )
 
 
+-- A union's written names, read from the declaration inventory.
+private record UnionSpelling {
+    name: String,
+    parameters: List[String],
+    variants: List[String],
+}
+
+
+-- A variant's written name with its union's, and where it is declared.
+private record VariantSpelling {
+    name: String,
+    owner: UnionSpelling,
+    declared_at: Span,
+}
+
+
+private pure func union_spelling(
+    owner: UnionId,
+    context: RenderContext,
+    span: Span,
+) -> Result[UnionSpelling, Diagnostic]:
+    row ?= context.parsed.declarations
+        .inventory_unions()
+        .get(owner.union_number())
+        .or_render_fault(span, errors.InvalidResolvedUnion(owner))
+    name ?= row.type_name.id.parsed_spelling(context.parsed.names, span)
+    parameters ?= row.type_parameters.translated_list(
+        pure func(parameter) -> Result[String, Diagnostic]: parameter.name.id.parsed_spelling(
+            context.parsed.names,
+            span,
+        ),
+    )
+    variants ?= row.variants.translated_list(
+        pure func(variant) -> Result[String, Diagnostic]: variant.declaration.name.id.parsed_spelling(
+            context.parsed.names,
+            span,
+        ),
+    )
+    Ok({ name = name, parameters = parameters, variants = variants })
+
+
+private pure func variant_spelling(
+    id: VariantId,
+    context: RenderContext,
+    span: Span,
+) -> Result[VariantSpelling, Diagnostic]:
+    owner = id.variant_owner()
+    owner_spelling ?= owner.union_spelling(context, span)
+    row ?= context.parsed.declarations
+        .inventory_unions()
+        .get(owner.union_number())
+        .or_render_fault(span, errors.InvalidResolvedUnion(owner))
+    variant ?= row.variants
+        .get(id.variant_number())
+        .or_render_fault(span, errors.InvalidResolvedVariant(id))
+    name ?= variant.declaration.name.id.parsed_spelling(context.parsed.names, span)
+    Ok({ name = name, owner = owner_spelling, declared_at = variant.declaration.name.span })
+
+
+private pure func qualifier_noun(kind: errors.QualifierKind) -> String:
+    match kind:
+        errors.RecordQualifier: "a record"
+        errors.ConstantQualifier: "a constant"
+        errors.BuiltinTypeQualifier: "a builtin type"
+        errors.OpaqueTypeQualifier: "an opaque type"
+        errors.TraitQualifier: "a trait"
+        errors.TypeParameterQualifier: "a type parameter"
+
+
 private pure func render_constructor_error(
     span: Span,
     rejection: errors.ConstructorError,
     context: RenderContext,
 ) -> Diagnostic:
     match rejection:
-        errors.ConstructorNeedsExpectedType(_):
-            rendered(
-                span,
-                "constructor needs an expected union type",
-                "pass an already-typed union value or call a concrete helper returning the union",
-            )
+        errors.ConstructorNeedsExpectedType(id):
+            match id.variant_spelling(context, span):
+                Err(error):
+                    error
+                Ok(variant):
+                    declared = variant.owner
+                    written = "${declared.name}.${variant.name}"
+                    help = if declared.parameters.is_empty():
+                        "write ${written}, which names its union"
+                    else:
+                        "annotate the binding: x: ${declared.name}[${declared.parameters.comma_separated()}] = ${written}"
+                    rendered(span, "constructor needs an expected union type", help)
+        errors.QualifierNotUnion(name, kind):
+            match name.parsed_spelling(context.parsed.names, span):
+                Err(error):
+                    error
+                Ok(spelled):
+                    rendered(
+                        span,
+                        "${spelled} is ${kind.qualifier_noun()}, not a union",
+                        "only a union's variants are written Type.Variant",
+                    )
+        errors.UnknownUnion(name):
+            match name.parsed_spelling(context.parsed.names, span):
+                Err(error):
+                    error
+                Ok(spelled):
+                    rendered(
+                        span,
+                        "${spelled} is not a union in scope",
+                        "import the union from the module that declares it, as in `module_name: ${spelled}`",
+                    )
+        errors.UnionHasNoVariant(owner, name):
+            match owner.union_spelling(context, span):
+                Err(error):
+                    error
+                Ok(declared):
+                    match name.parsed_spelling(context.parsed.names, span):
+                        Err(error):
+                            error
+                        Ok(spelled):
+                            rendered(
+                                span,
+                                "${declared.name} has no variant ${spelled}",
+                                "its variants are ${declared.variants.comma_separated()}",
+                            )
         errors.PayloadFreeVariantCalled(_):
             rendered(
                 span,
                 "payload-free variants cannot be called",
-                "use the bare variant name without parentheses",
+                "remove the parentheses: a payload-free variant is written without a call",
             )
 
         errors.ConstructorFieldCountMismatch(_, expected, actual):
@@ -1413,6 +1526,39 @@ private pure func render_value_error(
                 "unknown value",
                 "use this function's parameter name, a declared variant, or a call",
             )
+        errors.UnimportedVariantValue(first, rest):
+            match (rest.translated_list(
+                pure func(id) -> Result[VariantSpelling, Diagnostic]: id.variant_spelling(
+                    context,
+                    span,
+                ),
+            )):
+                Err(error):
+                    error
+                Ok(others):
+                    match first.variant_spelling(context, span):
+                        Err(error):
+                            error
+                        Ok(variant):
+                            name = variant.name
+                            union_name = variant.owner.name
+                            if others.is_empty():
+                                rendered(
+                                    span,
+                                    "${name} is a variant of ${union_name} but is not imported",
+                                    "write ${union_name}.${name}, or import it as ${union_name}(${name})",
+                                )
+                            else:
+                                candidates = [variant].concat(others)
+                                unions = candidates.map(pure func(candidate): candidate.owner.name)
+                                written = candidates.map(
+                                    pure func(candidate): "${candidate.owner.name}.${candidate.name}",
+                                )
+                                rendered(
+                                    span,
+                                    "${name} is a variant of several unions in scope: ${unions.comma_separated()}",
+                                    "write it through one of them: ${written.comma_separated()}",
+                                )
         errors.ExpressionTypeMismatch(mismatch):
             match mismatch.expected_site:
                 errors.FirstIfBranchValue:
@@ -1659,43 +1805,39 @@ private pure func render_match_error(
                 "a bare name in a match arm is a constructor; use `_` to match anything",
                 "use a visible constructor of the matched union, or write `_` and use the match's scrutinee in the arm",
             )
-        errors.UnimportedConstructorPattern(id):
-            match (
-                context.parsed.declarations
-                    .inventory_unions()
-                    .get(
-                        id
-                            .variant_owner()
-                            .union_number(),
+        errors.UnimportedConstructorPattern(id, union_in_scope):
+            match id.variant_spelling(context, span):
+                Err(error):
+                    error
+                Ok(variant):
+                    union_name = variant.owner.name
+                    name = variant.name
+                    import_help = "import ${name} with its union: ${union_name}(${name})"
+                    help = if union_in_scope:
+                        "write ${union_name}.${name}, or ${import_help}"
+                    else:
+                        "${import_help}, from the module that declares ${union_name}"
+                    noted(
+                        span,
+                        "${name} is a constructor of ${union_name} but is not imported",
+                        help,
+                        PreviousDeclaration(variant.declared_at),
                     )
-            ):
-                None:
-                    render_fault(span, errors.InvalidResolvedUnion(id.variant_owner()))
-                Some(declaration):
-                    match declaration.variants.get(id.variant_number()):
-                        None:
-                            render_fault(span, errors.InvalidResolvedVariant(id))
-                        Some(variant):
-                            match variant.declaration.name.id.parsed_spelling(
-                                context.parsed.names,
+        errors.WrongUnionPattern(id, matched):
+            match id.variant_spelling(context, span):
+                Err(error):
+                    error
+                Ok(variant):
+                    match matched.union_spelling(context, span):
+                        Err(error):
+                            error
+                        Ok(scrutinee):
+                            union_name = variant.owner.name
+                            rendered(
                                 span,
-                            ):
-                                Err(error):
-                                    error
-                                Ok(name):
-                                    match declaration.type_name.id.parsed_spelling(
-                                        context.parsed.names,
-                                        span,
-                                    ):
-                                        Err(error):
-                                            error
-                                        Ok(owner):
-                                            noted(
-                                                span,
-                                                "${name} is a constructor of ${owner} but is not imported",
-                                                "import ${name} with its union: ${owner}(${name}), from the module that declares ${owner}",
-                                                PreviousDeclaration(variant.declaration.name.span),
-                                            )
+                                "${union_name}.${variant.name} is a variant of ${union_name}, but the matched value has type ${scrutinee.name}",
+                                "match a variant of ${scrutinee.name}, or match a value of type ${union_name}",
+                            )
         errors.UnknownConstructorPattern(_, _):
             rendered(
                 span,

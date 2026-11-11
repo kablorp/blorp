@@ -8,6 +8,7 @@ import:
     int: Int methods
     option: Option methods
     result: Result methods
+    ../../syntax/names: NameId
     ../../syntax/source: ModuleId
     ../../syntax/syntax:
         Span,
@@ -16,24 +17,42 @@ import:
         ParsedRecordField,
         ParsedDictEntry,
         ParsedQualified,
+        ParsedUnionVariant,
     ../../utils/results: first_error
     ../ids: RecordId, UnionId, VariantId
     ../namespace/namespace:
         Namespace,
-        NamedValue(NamedConstructor),
+        NamedValue(NamedConstant, NamedConstructor),
         OfferedValue(OfferedConstructor),
+        TypeHead(ListHead, OpaqueHead, PrimitiveHead, RecordHead, UnionHead),
     ./callables: FunctionContract, ResolutionContext
-    ./declarations: Namespace methods, find_field, occurrence_fields, previous_declaration
+    ./declarations:
+        Namespace methods,
+        LocalTypeParameter,
+        find_field,
+        occurrence_fields,
+        previous_declaration,
     ./errors:
         CheckError,
         ExpectedTypeSite(SourceAnnotation),
         CallError(ArgumentTypeMismatch),
-        MatchError(UnimportedConstructorPattern),
+        MatchError(UnimportedConstructorPattern, WrongUnionPattern),
+        QualifierKind(
+            RecordQualifier,
+            ConstantQualifier,
+            BuiltinTypeQualifier,
+            OpaqueTypeQualifier,
+            TraitQualifier,
+            TypeParameterQualifier,
+        ),
         QualifiedError(QualifiedNotOffered),
         match_error,
         qualified_error,
         ConstructorError(
             ConstructorNeedsExpectedType,
+            QualifierNotUnion,
+            UnknownUnion,
+            UnionHasNoVariant,
             VariantNotInExpectedType,
             PayloadFreeVariantCalled,
             ConstructorFieldCountMismatch,
@@ -47,7 +66,12 @@ import:
             MissingRecordField,
             RecordFieldTypeMismatch,
         ),
-        ValueError(EmptyListNeedsElementType, ListElementTypeMismatch),
+        ValueError(
+            EmptyListNeedsElementType,
+            ListElementTypeMismatch,
+            UnimportedVariantValue,
+            UnknownValue,
+        ),
         ListElementReference(EarlierElement, ExpectedElement),
         CheckerInvariant(
             InvalidCheckedUnion,
@@ -97,11 +121,14 @@ import:
 
 
 -- Construction reads declarations and module visibility, never a body owner.
+-- `type_parameters` are the enclosing declaration's own, so that `T.Foo`
+-- says what `T` is.
 record ConstructionContext {
     module: ModuleId,
     namespace: Namespace,
     records: List[CheckedRecord],
     unions: List[CheckedUnion],
+    type_parameters: List[LocalTypeParameter],
 }
 
 
@@ -111,6 +138,7 @@ pure func construction_context(context: ResolutionContext) -> ConstructionContex
         namespace = context.namespace,
         records = context.records,
         unions = context.unions,
+        type_parameters = context.body_types.parameters,
     }
 
 
@@ -182,16 +210,17 @@ pure func find_variant(
                 None:
                     Err(checker_invariant(name.span, InvalidCheckedUnion(occurrence.owner)))
                 Some(declaration):
-                    var failure: Option[CheckError] = None
-                    for variant in declaration.variants:
-                        if variant.name.id == name.id:
-                            failure = Some(
-                                match_error(name.span, UnimportedConstructorPattern(variant.id)),
+                    match declaration.variant_named(name.id):
+                        Some(variant):
+                            in_scope = context.union_in_scope(declaration)
+                            Err(
+                                match_error(
+                                    name.span,
+                                    UnimportedConstructorPattern(variant, in_scope),
+                                ),
                             )
-                            break
-                    match failure:
-                        Some(error): Err(error)
-                        None: Ok(None)
+                        None:
+                            Ok(None)
         Some(variant):
             match variant.instantiate_pattern_variant(occurrence):
                 Ok(contract): Ok(Some(contract))
@@ -230,6 +259,143 @@ pure func find_qualified_variant(
             match variant.instantiate_pattern_variant(occurrence):
                 Ok(contract): Ok(Some(contract))
                 Err(error): Err(error)
+
+
+-- The variant of `declaration` written `name`.
+private pure func variant_named(declaration: CheckedUnion, name: NameId) -> Option[VariantId]:
+    var found: Option[VariantId] = None
+
+    for variant in declaration.variants:
+        if variant.name.id == name:
+            found = Some(variant.id)
+
+    found
+
+
+-- The union a type name denotes in this module, or why it is no union. A type
+-- parameter never shares a visible type's name (`TypeParameterTypeNameConflict`),
+-- so testing it first only names what `T` is. This is the one definition of
+-- which unions `Union.Variant` can reach.
+private pure func union_named(
+    context: ConstructionContext,
+    name: NameId,
+) -> Result[UnionId, ConstructorError]:
+    if context.type_parameters.any(pure func(parameter): parameter.name.id == name):
+        Err(QualifierNotUnion(name, TypeParameterQualifier))
+    else:
+        match context.namespace.named_type(context.module, name):
+            Some(named):
+                match named.head:
+                    UnionHead(owner): Ok(owner)
+                    RecordHead(_): Err(QualifierNotUnion(name, RecordQualifier))
+                    OpaqueHead(_): Err(QualifierNotUnion(name, OpaqueTypeQualifier))
+                    PrimitiveHead(_) | ListHead: Err(QualifierNotUnion(name, BuiltinTypeQualifier))
+            None:
+                match context.namespace.named_trait(context.module, name):
+                    Some(_):
+                        Err(QualifierNotUnion(name, TraitQualifier))
+                    None:
+                        match context.namespace.named_value(context.module, name):
+                            Some(NamedConstant(_)): Err(QualifierNotUnion(name, ConstantQualifier))
+                            _: Err(UnknownUnion(name))
+
+
+-- Whether `Union.Variant` reaches this union: its own declared name resolves to it.
+private pure func union_in_scope(context: ConstructionContext, declaration: CheckedUnion) -> Bool:
+    match context.union_named(declaration.name.id):
+        Ok(owner): owner == declaration.id
+        Err(_): False
+
+
+-- The rejection of a bare name that no value answers to. A variant of that name
+-- in a union `Union.Variant` reaches, whether or not the variant itself was
+-- imported, is written through its union; only this error path asks.
+pure func unknown_value_error(context: ConstructionContext, name: WrittenName) -> CheckError:
+    var reached: List[VariantId] = []
+
+    for declaration in context.unions:
+        match declaration.variant_named(name.id):
+            Some(variant):
+                if context.union_in_scope(declaration):
+                    reached = reached.append(variant)
+            None:
+                void
+
+    match reached:
+        [first, ...rest]: value_error(name.span, UnimportedVariantValue(first, rest))
+        []: value_error(name.span, UnknownValue(name.id))
+
+
+private pure func variant_of_union(
+    context: ConstructionContext,
+    owner: UnionId,
+    written: ParsedUnionVariant,
+) -> Result[VariantId, CheckError]:
+    declaration ?= context.unions
+        .get(owner.union_number())
+        .or_checker_invariant(written.union_name.span, InvalidCheckedUnion(owner))
+    match declaration.variant_named(written.variant.id):
+        Some(variant):
+            Ok(variant)
+        None:
+            Err(
+                constructor_error(
+                    written.variant.span,
+                    UnionHasNoVariant(owner, written.variant.id),
+                ),
+            )
+
+
+-- `X.Y` names variant `Y` of the union type `X` visible in this module.
+pure func resolve_union_variant(
+    context: ConstructionContext,
+    written: ParsedUnionVariant,
+) -> Result[VariantId, CheckError]:
+    match context.union_named(written.union_name.id):
+        Ok(owner): context.variant_of_union(owner, written)
+        Err(problem): Err(constructor_error(written.union_name.span, problem))
+
+
+-- `Union.Variant` in a value: the same planning as `alias.Variant`, with the
+-- union found by name instead of through a module alias.
+pure func plan_union_variant(
+    written: ParsedUnionVariant,
+    arguments: List[ValueExpression],
+    called: Bool,
+    expected: Option[InferenceType],
+    context: ConstructionContext,
+    slots: List[InferenceSlot],
+) -> Result[PlannedBase, CheckError]:
+    variant ?= context.resolve_union_variant(written)
+    variant
+        .variant_owner()
+        .plan_qualified_variant(
+            variant,
+            written.variant,
+            arguments,
+            called,
+            expected,
+            context,
+            slots,
+        )
+
+
+-- `Union.Variant` in a pattern: the variant must belong to the matched union.
+pure func find_union_variant(
+    context: ConstructionContext,
+    occurrence: UnionOccurrence,
+    written: ParsedUnionVariant,
+    span: Span,
+) -> Result[Option[VariantContract], CheckError]:
+    variant ?= context.resolve_union_variant(written)
+    _: Void ?= if variant.variant_owner() == occurrence.owner:
+        Ok(void)
+    else:
+        Err(match_error(span, WrongUnionPattern(variant, occurrence.owner)))
+    declared ?= context.declared_variant_contract(occurrence.owner, variant, span)
+    contract ?= declared.or_checker_invariant(span, InvalidCheckedUnion(occurrence.owner))
+    instantiated ?= contract.instantiate_pattern_variant(occurrence)
+    Ok(Some(instantiated))
 
 
 private pure func instantiate_pattern_variant(
@@ -652,14 +818,14 @@ private pure func pending_variant(
 ) -> Result[PendingVariantContract, CheckError]:
     term: InferenceType ?= match expected:
         Some(present): Ok(present)
-        None: Err(constructor_error(name.span, ConstructorNeedsExpectedType(name.id)))
+        None: Err(constructor_error(name.span, ConstructorNeedsExpectedType(variant_id)))
     head ?= term.inference_head(slots, name.span)
     shape = head.inference_shape()
     owner_result: Result[UnionId, CheckError] = match shape:
         InferredNominal(AggregateNominal(UnionAggregate(owner)), _):
             Ok(owner)
         CallVariable(_):
-            Err(constructor_error(name.span, ConstructorNeedsExpectedType(name.id)))
+            Err(constructor_error(name.span, ConstructorNeedsExpectedType(variant_id)))
         _:
             match head.publish_inference_type(slots, DiagnosticInference, name.span):
                 Ok(snapshot):
@@ -744,7 +910,7 @@ private pure func pending_qualified_variant(
     ):
         Ok(void)
     else:
-        Err(constructor_error(name.span, ConstructorNeedsExpectedType(name.id)))
+        Err(constructor_error(name.span, ConstructorNeedsExpectedType(declared.variant)))
     declared.instantiate_variant(head, arguments, name)
 
 
@@ -809,7 +975,7 @@ pure func plan_variant(
 ) -> Result[PlannedBase, CheckError]:
     term: InferenceType ?= match expected:
         Some(present): Ok(present)
-        None: Err(constructor_error(name.span, ConstructorNeedsExpectedType(name.id)))
+        None: Err(constructor_error(name.span, ConstructorNeedsExpectedType(variant)))
     head ?= term.inference_head(slots, name.span)
     match head:
         CallVariable(_):
@@ -1080,10 +1246,10 @@ pure func construction_context_error(written: SuspendedConstruction) -> CheckErr
     match written:
         SuspendedRecord(_, span):
             record_error(span, RecordNeedsExpectedType)
-        SuspendedVariant(_, name, _, _):
-            constructor_error(name.span, ConstructorNeedsExpectedType(name.id))
-        SuspendedQualifiedVariant(_, name, _, _):
-            constructor_error(name.span, ConstructorNeedsExpectedType(name.id))
+        SuspendedVariant(variant, name, _, _):
+            constructor_error(name.span, ConstructorNeedsExpectedType(variant))
+        SuspendedQualifiedVariant(declared, name, _, _):
+            constructor_error(name.span, ConstructorNeedsExpectedType(declared.variant))
 
 
 union PlannedBase:

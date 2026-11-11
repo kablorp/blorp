@@ -108,6 +108,7 @@ FORMAT_EXCLUDED := \
 	blorp/test/e2e/fixtures/opaque/generic/explicit_arguments.brp \
 	blorp/test/e2e/fixtures/unsupported/propagation_if.brp \
 	blorp/test/e2e/fixtures/unsupported/propagation_match.brp \
+	blorp/test/e2e/fixtures/variants/alias_union_variant.brp \
 	blorp/test/e2e/trait_inputs/operators/reject_chain.brp
 
 format-check:

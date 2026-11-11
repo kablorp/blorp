@@ -1,0 +1,290 @@
+import:
+    bool: and
+    int: Int methods
+    list: List methods
+    option: Option methods
+    string: String methods
+    test: TestSuite
+    ../../../../../src/common/syntax/lex: lex
+    ../../../../../src/common/syntax/names: program_names
+    ../../../../../src/common/syntax/parse: ParsedModule, module_contents, parse_module
+    ../../../../../src/common/syntax/source: module_source, root_module_id
+    ../../../../../src/common/syntax/syntax:
+        Diagnostic,
+        ValueExpression,
+        ExpressionBase(NameExpression, VariantName, VariantApplication),
+        ParsedBody(ParsedValueBody, ParsedMatchBody),
+        ParsedMatch,
+        ParsedPattern(PatternConstructor),
+        PatternHead(QualifiedHead, UnionVariantHead),
+        PostfixOperation(ReceiverInvocation),
+    ../../../parse_function_inputs: free_functions
+
+
+-- A capitalized `Union.Variant` on one line is a union variant. An alias is
+-- lower_snake_case, so the alias set plays no part in telling them apart.
+
+private HEADER: String = "func main() -> Int:\n"
+
+
+private pure func parse_source(source: String) -> Result[ParsedModule, Diagnostic]:
+    tokens ?= lex(module_source(root_module_id()), source, program_names().names)
+    parse_module(tokens, root_module_id())
+
+
+-- The body of `main` after HEADER, which is 20 bytes, so a body written as
+-- "\t..." starts its expression at byte 21.
+private pure func main_body(source: String) -> Option[ParsedBody]:
+    match parse_source(HEADER + source):
+        Err(_):
+            None
+        Ok(parsed):
+            free_functions(module_contents(parsed).functions)
+                .get(0)
+                .map(pure func(function): function.body)
+
+
+private pure func value(source: String) -> Option[ValueExpression]:
+    match main_body(source):
+        Some(ParsedValueBody(body)): Some(body)
+        _: None
+
+
+private pure func matched(source: String) -> Option[ParsedMatch]:
+    match main_body(source):
+        Some(ParsedMatchBody(body)): Some(body)
+        _: None
+
+
+-- `marked` sits between `prefix` and `suffix`; the error spans exactly it.
+private pure func rejects_marked(
+    prefix: String,
+    marked: String,
+    suffix: String,
+    message: String,
+    help: String,
+) -> Bool:
+    match parse_source(prefix + marked + suffix):
+        Ok(_):
+            False
+        Err(error):
+            error.span.start
+                .equals(prefix.length())
+                .and(error.span.end.equals(prefix.length() + marked.length()))
+                .and(error.message == message)
+                .and(error.help == help)
+
+
+private FIELD_MESSAGE: String = "fields and methods are lower_snake_case"
+
+
+private VARIANT_POSTFIX_HELP: String = "a field or method is lower_snake_case; a variant cannot be followed by another variant"
+
+
+pure func test_a_capitalized_pair_is_a_variant_name() -> Bool:
+    match value("\tKind.NotFound\n"):
+        Some(body):
+            match body.base:
+                VariantName(written):
+                    written.union_name.span.start
+                        .equals(21)
+                        .and(written.union_name.span.end.equals(25))
+                        .and(written.variant.span.start.equals(26))
+                        .and(written.variant.span.end.equals(34))
+                        .and(body.span.end.equals(34))
+                _:
+                    False
+        None:
+            False
+
+
+pure func test_a_single_capital_word_is_a_union_or_variant_name() -> Bool:
+    match value("\tK.A\n"):
+        Some(body):
+            match body.base:
+                VariantName(_): True
+                _: False
+        None:
+            False
+
+
+pure func test_a_call_after_the_pair_is_a_variant_application() -> Bool:
+    match value("\tKind.Other(1, 2)\n"):
+        Some(body):
+            match body.base:
+                VariantApplication(written, [_, _]):
+                    written.variant.span.start
+                        .equals(26)
+                        .and(body.span.end.equals(37))
+                        .and(body.applications.is_empty())
+                _:
+                    False
+        None:
+            False
+
+
+pure func test_a_method_chain_follows_a_variant_application() -> Bool:
+    match value("\tKind.Other(1).to_string()\n"):
+        Some(body):
+            match body.base:
+                VariantApplication(_, [_]):
+                    match body.applications:
+                        [ReceiverInvocation(_)]: True
+                        _: False
+                _:
+                    False
+        None:
+            False
+
+
+pure func test_a_variant_is_a_call_argument_and_a_hole() -> Bool:
+    value("\tshow(Kind.A, Kind.Other(1))\n")
+        .is_some()
+        .and(value("\t\"kind $" + "{Kind.A}\"\n").is_some())
+
+
+pure func test_a_lowercase_pair_is_still_a_field_access() -> Bool:
+    match value("\tkind.a\n"):
+        Some(body):
+            match body.base:
+                NameExpression(_): body.applications.length() == 1
+                _: False
+        None:
+            False
+
+
+pure func test_a_pattern_pair_is_a_union_head() -> Bool:
+    source = "\tmatch kind:\n\t\tKind.A: 1\n\t\tKind.Other(n): n\n"
+    match matched(source):
+        Some(parsed):
+            match (
+                parsed.arms
+                    .get(0)
+                    .map(pure func(arm): arm.pattern),
+                parsed.arms
+                    .get(1)
+                    .map(pure func(arm): arm.pattern),
+            ):
+                (Some(PatternConstructor(UnionVariantHead(first), [], _)), Some(PatternConstructor(UnionVariantHead(second), [_], _))):
+                    first.union_name.span.start
+                        .equals(HEADER.length() + "\tmatch kind:\n\t\t".length())
+                        .and(
+                            second.variant.span.start.equals(
+                                (
+                                    HEADER.length()
+                                    + "\tmatch kind:\n\t\tKind.A: 1\n\t\tKind.".length()
+                                ),
+                            ),
+                        )
+                _:
+                    False
+        None:
+            False
+
+
+pure func test_a_lowercase_qualifier_in_a_pattern_stays_an_alias_head() -> Bool:
+    match matched("\tmatch kind:\n\t\tkinds.A: 1\n\t\t_: 2\n"):
+        Some(parsed):
+            match (
+                parsed.arms
+                    .get(0)
+                    .map(pure func(arm): arm.pattern)
+            ):
+                Some(PatternConstructor(QualifiedHead(_), [], _)): True
+                _: False
+        None:
+            False
+
+
+pure func test_a_variant_cannot_be_followed_by_a_variant() -> Bool:
+    rejects_marked("func main() -> Int:\n\tKind.A.", "B", "\n", FIELD_MESSAGE, VARIANT_POSTFIX_HELP).and(
+        rejects_marked(
+            "func main() -> Int:\n\tKind.Other(1).",
+            "B",
+            "\n",
+            FIELD_MESSAGE,
+            VARIANT_POSTFIX_HELP,
+        ),
+    )
+
+
+pure func test_a_postfix_after_an_ordinary_value_keeps_its_help() -> Bool:
+    rejects_marked("func main() -> Int:\n\tx.", "Foo", "\n", FIELD_MESSAGE, "write `foo`")
+
+
+-- `read` is a declared alias here, so `read.ReadError` is an alias member and
+-- the second capital is a postfix.
+pure func test_an_alias_cannot_name_a_union_variant() -> Bool:
+    rejects_marked(
+        "import:\n\t./reads as read\n\n\nfunc main() -> Int:\n\tread.ReadError.",
+        "NotFound",
+        "\n",
+        FIELD_MESSAGE,
+        "name the variant through its union, as in `Union.Variant`, or through the alias alone, as in `alias.Variant`; `alias.Union.Variant` is not a form",
+    )
+
+
+pure func test_a_dot_on_the_next_line_is_not_a_variant() -> Bool:
+    rejects_marked("func main() -> Int:\n\tKind\n\t\t.", "A", "\n", FIELD_MESSAGE, "write `a`")
+
+
+pure func test_an_upper_snake_member_keeps_its_message() -> Bool:
+    rejects_marked(
+        "func main() -> Int:\n\tKind.",
+        "MAX_SIZE",
+        "\n",
+        FIELD_MESSAGE,
+        "write `max_size`",
+    )
+
+
+pure func test_a_capitalized_qualifier_of_a_type_is_refused() -> Bool:
+    rejects_marked(
+        "func f(k: ",
+        "Kind",
+        ".A) -> Int:\n\t0\n",
+        "only a module alias can qualify a type, and aliases are lower_snake_case",
+        "write `alias.Type` with an alias from the import block; a union's variants are not types",
+    )
+
+
+TESTS: TestSuite = {
+    description = "qualified union variants parse as union variants",
+    tests = [
+        ("a capitalized pair is a variant name", test_a_capitalized_pair_is_a_variant_name),
+        (
+            "a single capital word is a union or variant name",
+            test_a_single_capital_word_is_a_union_or_variant_name,
+        ),
+        (
+            "a call after the pair is a variant application",
+            test_a_call_after_the_pair_is_a_variant_application,
+        ),
+        (
+            "a method chain follows a variant application",
+            test_a_method_chain_follows_a_variant_application,
+        ),
+        ("a variant is a call argument and a hole", test_a_variant_is_a_call_argument_and_a_hole),
+        ("a lowercase pair is still a field access", test_a_lowercase_pair_is_still_a_field_access),
+        ("a pattern pair is a union head", test_a_pattern_pair_is_a_union_head),
+        (
+            "a lowercase qualifier in a pattern stays an alias head",
+            test_a_lowercase_qualifier_in_a_pattern_stays_an_alias_head,
+        ),
+        (
+            "a variant cannot be followed by a variant",
+            test_a_variant_cannot_be_followed_by_a_variant,
+        ),
+        (
+            "a postfix after an ordinary value keeps its help",
+            test_a_postfix_after_an_ordinary_value_keeps_its_help,
+        ),
+        ("an alias cannot name a union variant", test_an_alias_cannot_name_a_union_variant),
+        ("a dot on the next line is not a variant", test_a_dot_on_the_next_line_is_not_a_variant),
+        ("an upper snake member keeps its message", test_an_upper_snake_member_keeps_its_message),
+        (
+            "a capitalized qualifier of a type is refused",
+            test_a_capitalized_qualifier_of_a_type_is_refused,
+        ),
+    ],
+}
