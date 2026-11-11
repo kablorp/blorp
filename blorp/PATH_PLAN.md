@@ -1,7 +1,8 @@
 # `Path`, exact I/O errors, naming rules and qualified variants
 
-**Status: plan, 2026-11-10, revision 3. Landings 4 (`7d8a92f25`), 3 (`4024ef09d`)
-and 1 have landed.** Revision 3 adds the naming rules
+**Status: plan, 2026-11-10, revision 4. Landings 4 (`7d8a92f25`), 3
+(`4024ef09d`) and 1 (`be98099e6`) have landed.** Revision 4 folds in
+landing 2's parser and ergonomics review. Revision 3 adds the naming rules
 Keith adopted, which make qualified variants a parser rule. Keith approved P1
 to P12 of the earlier `PATH_DECISIONS.md` (full text, with its precedent
 survey and the alternatives each point weighed, at `4b5b7fe65`) with the
@@ -268,24 +269,39 @@ union's variants reachable qualified. Importing `A(NotFound)` and
 
 - **Declaration.** Unchanged: variant names are unique across a module's
   unions, and every other value-namespace conflict stays.
-- **Syntax.** With the naming rules, the tokens' forms settle what `X.Y` is,
-  in an expression and a pattern alike. An import alias, a method and a
-  field are lower_snake_case, so `X.Y` where `X` starts with a capital and
-  `Y` is CapitalizedCamelCase can only be a qualified variant. The parser
-  mints it in every expression position, constant initializers included, as
-  its own syntax (`VariantName`, `VariantApplication`, and `UnionHead` in a
-  pattern) rather than reusing `ParsedQualified`, whose `module` field would
-  otherwise mean an alias or a union. The parser no longer needs its set of
-  aliases to tell the forms apart. `alias.Variant` keeps its current meaning.
+- **Syntax.** With the naming rules, the tokens' forms settle a
+  capitalized `X.Y`, in an expression and a pattern alike. An import alias,
+  a method and a field are lower_snake_case, so `X.Y` on one line, where `X`
+  is a type's form and `Y` a variant's (each `CapitalizedCamel` or a single
+  capital word, so `Kind.A` qualifies), can only be a qualified variant.
+  Today every capitalized name after a dot is a parse error, so no valid
+  program changes meaning. The parser mints the form in every expression
+  position, constant initializers included, as its own syntax over one
+  record, `ParsedUnionVariant { union_name, variant }`: `VariantName`,
+  `VariantApplication`, and `UnionHead` in a pattern. `ParsedQualified`
+  stays alias-only, because it is shared with qualified types and receiver
+  names, where a union qualifier would be an illegal state. A lowercase
+  `x.y` is still an alias call or a field, decided by the parser's alias set
+  as today; the new rule sits beside that check and removes nothing.
+  `alias.Variant` keeps its current meaning. `alias.Union.Variant` is not
+  supported unless Keith decides otherwise (asked 2026-11-10), because
+  `read.NotFound` already names that variant.
 - **Chains.** `Kind.A.to_string()` is a method call on the variant;
-  `Kind.A.B` is a parse error ("a variant has no variants").
-- **Resolution.** The checker resolves `X` as a visible union type and `Y` as
-  one of its variants ("ReadError has no variant Missing"), through the same
-  offer check as `alias.Name` and `Union(Name)`, so a private or opaque
-  union's variants stay hidden. In a pattern, the union must be the
-  scrutinee's. An `X` that is not a visible union is an error: "MAX is a
-  constant, not a union", "Point is a record, not a union", or, for a name
-  the module could import, the help "import ReadError".
+  `Kind.A.B` is a parse error whose help says a variant cannot be followed
+  by another variant.
+- **Resolution.** A variant is exactly as visible as its union, which the
+  namespace already records, so no new query or offer check is needed. One
+  checker function resolves `X` as a visible union type and `Y` in its
+  declared variants ("ReadError has no variant Missing", with the variants
+  listed), and feeds the existing qualified-variant planning. An opaque type
+  is not a union, so its representation stays hidden. In a pattern, the
+  union must be the scrutinee's, with its own error ("ReadError.NotFound is
+  a variant of ReadError, but the matched value is a WriteError"). An `X`
+  that is not a visible union is an error naming what it is: "MAX is a
+  constant, not a union", "Point is a record, not a union", "Int is a
+  builtin type, not a union", or "ReadError is not a union in scope" with
+  the help to import its module. The compiler knows only loaded modules, so
+  it does not guess which module to import.
 - **No expected type needed.** A qualified variant of a non-generic union
   names its type, so `x = ReadError.NotFound` checks without an annotation;
   the "constructor needs an expected union type" help suggests the qualified
@@ -296,10 +312,13 @@ union's variants reachable qualified. Importing `A(NotFound)` and
   expected union type" is inaccurate today (the name picks the variant, and
   the expected type only checks it) and is corrected.
 - **Formatter.** New syntax nodes, formatted as `alias.name` is
-  (`format/flat.brp`, `format/layout.brp`). The chain
-  rule counts `ReadError.Failed(x)` as a call link, so
-  `ReadError.Failed(x).to_string()` breaks where a module call would not;
-  the brief records this with a formatter test.
+  (`format/flat.brp`, `format/layout.brp`). A qualified variant is an atom:
+  the chain rule links only postfix calls, so
+  `ReadError.Failed(x).to_string()` has one link, as `alias.f(x).g()` does.
+- **Helps that point to the qualified form.** Where a bare variant fails
+  today, the help names `ReadError.NotFound`: a non-generic variant with no
+  expected type, a variant of an imported union that was not itself
+  imported, and two imported variants that share a name.
 
 ### Exact errors
 
@@ -458,21 +477,27 @@ unchanged; messages that print a process error add the program the same way.
 2. **Qualified variants.** The parser's new syntax (`common/syntax/syntax.brp`,
    `parse.brp`), the checker's resolution (`check/constructors.brp`,
    `patterns.brp`, `expressions.brp`, `bodies.brp`), diagnostics
-   (`errors.brp`, `render.brp`), a namespace query from a union and variant
-   name to its id, the formatter, `README.md` and `grammar.ebnf` (the
-   qualified-form and pattern-head comments, the expected-type sentence).
-   No library change.
+   (`errors.brp`, `render.brp`), the formatter, `README.md` and
+   `grammar.ebnf` (the qualified-form and pattern-head productions and
+   comments, the expected-type sentence). No library change, and no use of
+   the form in `src/` until the seed rotation.
    - Tests: qualified constructors and patterns; two imported unions that
      share a variant name, used qualified; `x = Kind.NotFound` unannotated; a
      constant `DEFAULT: Kind = Kind.A`; a wrong-union and an unknown variant
      (`Kind.Missing`); a private variant and an opaque union refused; a union
      not imported, with its help; `MAX.Foo` and `Point.X` refused;
      `Kind.A.B` refused; `Result.Ok(x)` with and without an expected type;
-     the formatter's chain case.
+     the formatter's chain case. The parser and ergonomics review
+     (2026-11-10) added: interpolation, nested and or-patterns, payload
+     arity, `Option` patterns, a type parameter, builtin, opaque type, trait
+     or constant as `X`, a union declared after its use, `alias.func` and
+     `alias.Variant` unchanged, identical C to the bare form, and the two
+     e2e fixtures whose capitalized `X.Y` changes meaning.
    - Ceilings: production lines at most +300. Self-compile allocations and
      retired instructions each at most +0.3%.
-   - Review: the brief goes through parser and ergonomics review before
-     implementation; documenter review after.
+   - Review: parser and ergonomics review done 2026-11-10 (no blockers;
+     its corrections are in "Qualified variants" above); documenter review
+     after.
 3. **`Path` in `path.brp`, beside the String functions.** P2 to P5, `+`,
    P10's methods except two, `PathError` and unit tests. No compiler change.
    `join` and `normalize` already name String functions in `path.brp`, and a
