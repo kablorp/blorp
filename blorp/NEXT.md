@@ -51,16 +51,17 @@ done.
 - **Language server (`blorp lsp`):** [`LSP_PLAN.md`](LSP_PLAN.md).
   - **Status:** the plan was written and revised on 2026-11-10 (name uses
     keyed by the compiler's identities; each analysis records the files it
-    read) and awaits Keith's review. Four choices are open: the first editor,
-    the console API, when name uses are recorded, and serving broken files.
-    Its foundations have
+    read). Keith settled its open decisions on 2026-11-11: CLion first,
+    `read_exact` returns `Bytes` (so landing 8 waits for the UInt8 plan's
+    L3), name uses always recorded, and broken files served from the last
+    good analysis in a landing after the plugin. Its foundations have
     landed: the `json` codec
     ([results](../benchmarks/results/blorp-json-foundation-2026-11-08.md))
     and loader source snapshots
     ([results](../benchmarks/results/blorp-source-snapshots-2026-11-09.md),
     [`SOURCE_SNAPSHOTS_DECISIONS.md`](SOURCE_SNAPSHOTS_DECISIONS.md)).
-  - **Next:** Keith's review, then the plan's landing 1, analysis without an
-    entry point. The source layout it waited for has landed
+  - **Next:** the plan's landing 1, analysis without an entry point. The
+    source layout it waited for has landed
     ([`SOURCE_LAYOUT_PLAN.md`](SOURCE_LAYOUT_PLAN.md)).
 - **String code points:** [`STRING_PLAN.md`](STRING_PLAN.md).
   - **Status:** approved on 2026-11-10: `length` counts code points, from a

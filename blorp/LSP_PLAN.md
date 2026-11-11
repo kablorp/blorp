@@ -1,8 +1,7 @@
 # Language server: `blorp lsp`
 
-**Status: plan, 2026-11-10, revised the same day. Name uses are now keyed by
-the compiler's identities, each analysis records the files it read, and the
-paths follow `SOURCE_LAYOUT_PLAN.md`. Four decisions await Keith.**
+**Status: plan, 2026-11-10, revised the same day; Keith settled its open
+decisions on 2026-11-11. Next: landing 1.**
 
 ## Problem
 
@@ -31,41 +30,30 @@ grammar; comments as lexer output; a limited v1 root, documented; library
 go-to through a temporary folder; the cleanest rotation path; and an
 ergonomic way to write without a newline (not `put`).
 
+**On 2026-11-11:** CLion first; `read_exact` returns `Bytes`, since a byte
+count can end inside a character; name uses always recorded, with no spike;
+and broken files served from the last good analysis, after the plugin. The
+console names and flushing await approval at landing 8.
+
 **What exists:** the `json` codec; loader source snapshots
-(`load_program_with_sources`, `analysis/load/load.brp:722`); the embedded
+(`load_program_with_sources`, `analysis/load/load.brp:823`); the embedded
 library; byte-range spans on every token (`syntax/syntax.brp:8`); and
 process `capture`, which can feed standard input.
 
 **What is missing:**
 
 - **`check` requires `main`**, failing with `MissingMain`
-  (`common/analysis/check/signatures.brp:188`).
+  (`common/analysis/check/signatures.brp:189`).
 - **Name uses go unrecorded.**
 - **The lexer skips comments**, and the formatter finds them again
   (`format/trivia.brp:185`).
 - **A failed lex keeps no tokens**, because names are interned only after a
-  successful scan (`common/syntax/lex.brp:1890`).
+  successful scan (`common/syntax/lex.brp:1954`).
 - **The console cannot read**, and `print` always adds a newline.
 - **Each phase reports only its first error.**
 
 **Related plans:** `STRING_PLAN.md` moves byte work to `byte_*` functions,
 and `PATH_PLAN.md`'s naming and exact-error rules apply here.
-
-## Open decisions
-
-1. **First editor.** I recommend **CLion**, Keith's editor: JetBrains
-   supports `semanticTokens/full` from 2024.2.2, and the old plugin
-   (`ee9e001c6de8:editor/intellij/`) has a launcher. VS Code documents them
-   better.
-2. **The console API:** the names below, and every read flushing standard
-   output first, an implicit behaviour that needs approval.
-3. **Recording name uses.** If recording them on every compile fits the
-   ceilings, the checker always records them. Otherwise only analysis does,
-   behind an explicit argument. A spike decides.
-4. **Serving broken files.** I recommend keeping each document's last
-   successful analysis and mapping positions through the edit. Without it,
-   every transient error while typing drops identifier colour and go-to. As
-   a per-document cache, it needs approval.
 
 ## Proposed solution
 
@@ -83,7 +71,9 @@ and `PATH_PLAN.md`'s naming and exact-error rules apply here.
   The layer suite (`test/unit/test_layout/test_dependencies.brp`) gains an
   `lsp/` layer that imports itself and `common/`. `main.brp` dispatches
   `lsp` there.
-- **Editor plugin** (`editor/intellij/`): it launches `blorp lsp`.
+- **CLion plugin** (`editor/intellij/`): it launches `blorp lsp`, as the
+  old plugin's launcher did (`ee9e001c6de8:editor/intellij/`). JetBrains
+  supports `semanticTokens/full` from 2024.2.2.
 
 ### Analysis without an entry point
 
@@ -98,10 +88,10 @@ holds `Entrypoint[FunctionId]`, so the types keep the cases apart.
 
 The lexer records each comment where it consumes one:
 
-- `code_comment_end` (`src/common/syntax/lex.brp:1119`), reached from 1012 and
-  1846;
-- `next_code_line` (1249);
-- `doc_block_end` (1196).
+- `code_comment_end` (`src/common/syntax/lex.brp:1183`), reached from 1077 and
+  1911;
+- `next_code_line` (1313);
+- `doc_block_end` (1260).
 
 The list is returned beside the tokens, and the parser never sees it.
 `source_trivia` takes it instead of scanning gaps for comments; it still
@@ -143,10 +133,9 @@ test wrapper) get none.
 none, so go-to returns `null`. A module's declaration is the start of its
 file. A trait's `Self` resolves to the trait's name.
 
-**Where.** `check`'s body walk records uses (always, or only for
-`analyze`: decision 3), in a new `check/name_uses.brp`, because fields, type
-parameters and bindings are Check's identities. Import selections name only
-declarations, which `namespace` resolves (`import_row`,
+**Where.** `check`'s body walk always records uses, in a new
+`check/name_uses.brp`, because fields, type parameters and bindings are
+Check's identities. Import selections name only declarations, which `namespace` resolves (`import_row`,
 `namespace/namespace.brp:1058`) but keeps no spans for. It gains a table of
 each selection's span and entity, which `check` turns into uses.
 
@@ -180,14 +169,16 @@ no read follows.
 **`read_line`** drops LF or CRLF, as `fold_lines` does. A last line without
 LF is returned as is.
 
-**`read_exact`** returns `None` only when input has already ended,
-`Some("")` for a count of zero or less, and an error when input ends
-part-way. Both reads share one buffer. Input that is not UTF-8 is an error.
-Each read has its own exact error union, per `PATH_PLAN.md`.
+**`read_exact`** returns `Bytes`: `None` only when input has already ended,
+empty for a count of zero or less, and an error when input ends part-way.
+The server decodes a body with `bytes.to_text`, answering -32700 for
+invalid UTF-8. A line that is not UTF-8 is a `read_line` error. Both reads
+share one buffer, and each has its own exact error union, per
+`PATH_PLAN.md`.
 
 **Rejected:** `print(text, ending = "")` (named optional arguments),
-dropping `print`'s newline (breaks every call), and `read_text(n)` (clashes
-with `fs.read_text`).
+dropping `print`'s newline (breaks every call), and `read_bytes(n)` (clashes
+with `fs.read_bytes`).
 
 ### The server
 
@@ -224,8 +215,10 @@ name uses and the declaration tables. Only the protocol's standard types and
 modifiers are used. String pieces are separate lexer tokens that stop at
 `${`, so no token overlaps another, and multiline tokens are split per line.
 
-**Broken files** (open decision 4). When analysis fails, the server keeps
-the last successful analysis sealed, with each file's text then. A file's
+**Broken files.** In landing 9, while a root fails to analyse, its files
+get only the lexer's tokens (the prefix, if lexing failed), definition
+returns `null` and references `[]`. Landing 11 then keeps the last
+successful analysis sealed, with each file's text then. A file's
 edits since form one window, between the longest common prefix and the
 longest non-overlapping common suffix. Positions before it are unchanged,
 positions after shift by the change in length, and positions inside find
@@ -249,7 +242,7 @@ before `initialize` get -32002, unknown requests -32601, invalid JSON
 Go-to and references cover the open file's program: the file, its imports
 and the library. References from importers are missed: asked in
 `common/syntax/lex.brp`, references to `lex` miss
-`common/analysis/load/load.brp:526`. The README documents this. A later
+`common/analysis/load/load.brp:582`. The README documents this. A later
 landing has the plugin pass the workspace's roots in
 `initializationOptions.roots`, and once packages exist a manifest does.
 
@@ -266,7 +259,7 @@ landing has the plugin pass the workspace's roots in
 ## Code
 
 **Analysis without `main`.** Today the missing entry is an error inside
-signature checking (`src/common/analysis/check/signatures.brp:176`):
+signature checking (`src/common/analysis/check/signatures.brp:179`):
 
 ```blorp
     entrypoint: Option[FunctionId] = match namespace.named_value(
@@ -306,8 +299,8 @@ pure func check(program: ParsedProgram) -> Result[CheckedProgram, CheckFailure]:
         None: Err(program.missing_main(analysis))
 ```
 
-**Comments.** Today `LexedProgram` (`src/common/syntax/syntax.brp:246`) has no
-comments, and `lex` (`src/common/syntax/lex.brp:1717`) fails with a bare
+**Comments.** Today `LexedProgram` (`src/common/syntax/syntax.brp:258`) has no
+comments, and `lex` (`src/common/syntax/lex.brp:1781`) fails with a bare
 `Diagnostic`:
 
 ```blorp
@@ -408,12 +401,11 @@ pure func declaration_span(analysis: Analysis, referent: Referent) -> Option[Spa
 pure func declarations(analysis: Analysis) -> List[Referent]
 ```
 
-Today's `check` (`check.brp:189`, above) records six uses:
-`ParsedProgram`, `CheckedProgram` and `CheckFailure` (`TypeReferent` of an
-`OpaqueHead`), `Result` (of a `UnionHead`), `program` in the body
-(`BindingReferent`, binding 0 of `check`'s `DeclaredBody`) and
-`check_program` (`FunctionReferent`). The declarations of `check` and
-`program` come from the function table and `check`'s `bindings`.
+Today's `check` (above) records six uses: `ParsedProgram`, `CheckedProgram`
+and `CheckFailure` (`TypeReferent` of an `OpaqueHead`), `Result` (of a
+`UnionHead`), `program` (`BindingReferent`) and `check_program`
+(`FunctionReferent`). The declarations of `check` and `program` come from
+the function table and `check`'s `bindings`.
 
 **The console.** Today all of `standard_library/io/console.brp` is:
 
@@ -437,9 +429,9 @@ func flush() -> Void
 -- The next line without its LF or CRLF; a last line with no LF as it is;
 -- None once input has ended.
 func read_line() -> Result[Option[String], ReadLineError]
--- Exactly `byte_count` bytes as text; None once input has ended; Some("")
--- for a count of zero or less; an error if input ends part-way.
-func read_exact(byte_count: Int) -> Result[Option[String], ReadExactError]
+-- Exactly `byte_count` bytes; None once input has ended; empty for a count
+-- of zero or less; an error if input ends part-way.
+func read_exact(byte_count: Int) -> Result[Option[Bytes], ReadExactError]
 ```
 
 A first-time user's prompt needs no flush:
@@ -499,32 +491,32 @@ union Command:
 the builtin tables, `editor/`, the README and the tests.
 
 **Not:** completion, hover, rename, formatting through the server, TextMate,
-threads, incremental analysis, `Bytes` input, or grammar changes.
+threads, incremental analysis, or grammar changes.
 
-**Concurrent work:** the Bytes session's `PATH_PLAN.md` landings 6 to 8
-edit the same builtin tables and `io/`, so coordinate before our landings 6
-and 8. Of the String plan's breaking switch and this work, whichever lands
-second migrates the other's `length` and `slice` uses.
+**Concurrent work:** `UINT8_BYTES_PLAN.md` edits the same builtin tables,
+so coordinate before our landings 6 and 8; its L3 adds `Bytes`. Of the
+String plan's breaking switch and this work, whichever lands second migrates
+the other's `length` and `slice` uses.
 
 ## Risks and unknowns
 
-- **Can name uses always be recorded?** A one-day spike on a scratch
-  branch records uses for the whole compiler over the fixed identities and
-  measures a stage-2 self-compile. The ceilings decide.
+- **Recording cost.** Every compile records name uses; landing 5 measures
+  the cost.
 - **Do semantic tokens alone colour a file in CLion?** The plugin landing
   probes it first with a stub server, with `null` and error replies too. If
   nothing colours, stop and ask.
 - **Bootstrap.** A library call to a `builtin` label the seed lacks stops
-  the seed parsing the library (`common/syntax/parse.brp:4439`). So the
+  the seed parsing the library (`common/syntax/parse.brp:4708`). So the
   console labels land alone, a rotation follows, and then the library.
 - **Latency.** Analysing `blorp/src/main.brp` may be slow.
 
 ## Dependencies
 
 - Landing 5 follows 1 and 4; landings 6, 7 and 8 go strictly in order.
-- Landing 8 needs Keith's console answer; landing 9, decision 4; landing
-  10, the editor choice.
+- Landing 8 needs `Bytes` (`UINT8_BYTES_PLAN.md`'s L3), and Keith's approval
+  of the names and of reads flushing.
 - Landing 9's pure modules follow landings 1, 3 and 5; its transport, 8.
+- Landing 11 follows 10.
 
 ## Release strategy
 
@@ -536,14 +528,15 @@ backs it out; for landing 7, re-pinning the previous seed does.
 3. **The lexer keeps its prefix on failure.**
 4. **Fixed identities:** the seven types become `fixed`, with matched
    before/after measurements, as a data-model refactor requires.
-5. **Name uses**, after the spike.
+5. **Name uses**, always recorded.
 6. **Console labels:** builtin labels, runtime and emission, no library.
 7. **Seed rotation**, a plain one (`PATH_PLAN.md`'s landed as `c0512c385`).
 8. **The `io/console` functions**, after ergonomics review and Keith's
    approval.
 9. **`blorp lsp`:** the `src/lsp/` modules (buildable during landings 6
    to 8), the transport, and the README's v1 limitation.
-10. **The editor plugin.**
+10. **The CLion plugin.**
+11. **Broken files** served from the last good analysis.
 
 **Ceilings** are against the parent commit, as a stage-2 self-compile
 unless stated, with test lines counted apart. Compile cost must also fit the
@@ -555,11 +548,11 @@ e2e instruction ceilings' 15% margin.
 | 2 comments | ≤ +0.5%, and formatting the repository ≤ +0.5% | ≤ +0.3% | ≤ +0.3% | ≤ +60 net |
 | 3 prefix | ≤ +0.1% | ≤ +0.01% | ≤ +0.1% | ≤ +60 net |
 | 4 fixed identities | ≤ +0.1% | no increase | ≤ +0.1% | ≤ +20 net |
-| 5 name uses, always recorded | ≤ +1% | ≤ +0.5% | ≤ +0.5% | ≤ +650 net |
-| 5 name uses, on request | compile path ≤ +0.2% | ≤ +0.01% | ≤ +0.1% | ≤ +700 net |
+| 5 name uses | ≤ +1% | ≤ +0.5% | ≤ +0.5% | ≤ +650 net |
 | 6 console labels | ≤ +0.1% | ≤ +0.01% | ≤ +0.1% | ≤ +150 net |
 | 8 console functions | ≤ +0.1% | ≤ +0.01% | ≤ +0.1% | ≤ +60 net |
-| 9 server | ≤ +3% (more source to compile) | ≤ +3% | ≤ +3% | ≤ +2,000 |
+| 9 server | ≤ +3% (more source to compile) | ≤ +3% | ≤ +3% | ≤ +1,700 |
+| 11 broken files | ≤ +0.5% (more source to compile) | ≤ +0.5% | ≤ +0.5% | ≤ +300 |
 
 **Latency.** Per request after one change, on this host: ≤ 1.0 s for
 `blorp/src/main.brp`, and ≤ 50 ms for a one-module program. Landing 1
@@ -577,9 +570,10 @@ Each landing starts with a failing test.
 | 4 | Existing suites, unchanged. |
 | 5 | One case per `Referent` case, checking the use's span and, through `declaration_span`, its declaration's. Mutation proof: stop recording one case, and only its test fails. |
 | 6 | Direct C tests of the natives, under `test/runtime/`. |
-| 8 | e2e programs through `capture`: LF and CRLF, a last line without LF, header and body in one chunk, a short `read_exact`, a zero count, invalid UTF-8, and `write` output before a read. |
-| 9 | `test/unit/test_lsp/`: framing; positions for `é`, an astral emoji and `\r`; token splitting; lifecycle errors; broken-file windows; staleness after a new import, a late open, a shared file's edit and a close; each request through `receive`. An e2e session in `self_hosted_cli.brp` runs `initialize` through `exit` and checks replies, a diagnostic and the status. |
+| 8 | e2e programs through `capture`: LF and CRLF, a last line without LF, header and body in one chunk, a short `read_exact`, a zero count, input that is not UTF-8 to each read, and `write` output before a read. |
+| 9 | `test/unit/test_lsp/`: framing; a body that is not UTF-8; positions for `é`, an astral emoji and `\r`; token splitting; a broken file's lexer tokens; lifecycle errors; staleness after a new import, a late open, a shared file's edit and a close; each request through `receive`. An e2e session in `self_hosted_cli.brp` runs `initialize` through `exit` and checks replies, a diagnostic and the status. |
 | 10 | A manual checklist in the plugin's README. |
+| 11 | `test/unit/test_lsp/`: edit windows, with positions before, inside and after one, and two distant edits. |
 
 **Commands:** `make -C blorp test-target-components
 TARGET_COMPONENT_SOURCES=<suite>` to iterate; then `make -C blorp test`;
@@ -594,14 +588,19 @@ test-e2e INSTRUCTION_CHECK=on` when compile cost changes.
   unchanged, and only the lexer recognises comments.
 - [ ] **4.** Output identity holds on the e2e fixtures, and the
   measurements are recorded.
-- [ ] **5.** Every `Referent` case passes. The spike's numbers and the
-  chosen form are in `benchmarks/results/`.
+- [ ] **5.** Every `Referent` case passes, and the measurements are in
+  `benchmarks/results/`.
 - [ ] **7.** `scripts/blorp-fixpoint --prove` passes with the new seed.
-- [ ] **8.** The console e2e programs pass on all four CI platforms.
-- [ ] **9.** The e2e replies match exactly. Definition on `print` lands in
-  the temporary folder, which is gone after `exit`. Latency is in ceiling.
-- [ ] **10.** The editor colours a file while it has an error, and definition
-  and references work, into the library too.
+- [ ] **8.** The console e2e programs pass on all four CI platforms, and
+  `read_exact` returns bytes that are not UTF-8 unchanged.
+- [ ] **9.** The e2e replies match exactly, with -32700 for a body that is
+  not UTF-8. A broken file gets only lexer tokens. Definition on `print`
+  lands in the temporary folder, which is gone after `exit`. Latency is in
+  ceiling.
+- [ ] **10.** CLion colours a file, and definition and references work,
+  into the library too.
+- [ ] **11.** CLion colours a file while it has an error, and definition
+  works above and below the edit.
 - [ ] **Every landing** meets its ceilings, passes `make -C blorp test`, and
   is reviewed and test-run.
 
@@ -614,6 +613,6 @@ Stop and ask if:
 - a ceiling is exceeded;
 - CLion shows no colour;
 - a name use needs information the checker has discarded;
-- the console errors conflict with the Bytes session's design.
+- the console errors conflict with `UINT8_BYTES_PLAN.md`.
 
 Console API changes go to Keith.
