@@ -44,7 +44,7 @@ character. The rules are documented in:
 - `grammar.ebnf:77-79`;
 - `standard_library/README.md:278-285`.
 
-**The runtime** (`src/compile/runtime/string.brp:44`):
+**The runtime** (`src/common/codegen/runtime/string.brp:44`):
 
 ```c
 struct blorp_string {
@@ -65,12 +65,12 @@ Every external input is already validated as UTF-8 (`blorp_utf8_is_valid`).
 Interpolation lowers to `+`.
 
 **Who depends on bytes.** The compiler's own text handling does:
-- `syntax/lex.brp` (19 `length`, 10 `byte_at`, 8 `slice`), `syntax/parse.brp`
-  and `syntax/source.brp`;
+- `common/syntax/lex.brp` (19 `length`, 10 `byte_at`, 8 `slice`), `common/syntax/parse.brp`
+  and `common/syntax/source.brp`;
 - the formatter (`printer`, `trivia`, `layout`, `flat`, `format`);
-- `cli.brp`, `main.brp`, `utils/text.brp` and `compile/load/load.brp`;
-- `compile/emit/emit.brp:327` (`append_byte_array`) and
-  `compile/emit/float_literal.brp:72`;
+- `cli.brp`, `main.brp`, `common/utils/text.brp` and `common/analysis/load/load.brp`;
+- `common/codegen/emit/emit.brp:327` (`append_byte_array`) and
+  `common/codegen/emit/float_literal.brp:72`;
 - `scripts/embed_library.brp:61-184`, which the seed builds and whose output
   is the embedded library, so a missed rename there changes the compiler
   silently.
@@ -83,7 +83,7 @@ Spans are byte ranges and stay so.
 - **Diagnostic columns:** they count bytes (`main.brp:82-98`).
 
 **The bootstrap constraint.** The parser accepts only the builtin labels it
-knows (`syntax/parse.brp:4398-4439`). The pinned seed builds the compiler
+knows (`common/syntax/parse.brp:4398-4439`). The pinned seed builds the compiler
 with `--library-root blorp/standard_library`, so it parses this tree's
 `string.brp`. A new `string.*` label therefore cannot appear in `string.brp`
 until a seed knows it. Every landing below is shaped by that.
@@ -308,10 +308,10 @@ only at the first byte of a character:
 ```
 
 `starts_character` is a small byte test in the compiler's text utilities
-(`utils/text.brp`), with named bounds rather than literals.
+(`common/utils/text.brp`), with named bounds rather than literals.
 
 The lexer's byte work only renames: `text.bytes.length()` becomes
-`text.bytes.byte_length()` at `syntax/lex.brp:507, 596, 639, ...`, and its
+`text.bytes.byte_length()` at `common/syntax/lex.brp:507, 596, 639, ...`, and its
 `slice` calls become `byte_slice`.
 
 ## S0 results

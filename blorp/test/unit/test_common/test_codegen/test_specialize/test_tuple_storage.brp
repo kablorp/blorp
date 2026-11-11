@@ -1,0 +1,128 @@
+---
+A structural tuple follows the record storage rule: it stays inline when every
+element is a number, an inline record or a fixed union, and is counted when any
+element is managed or is a layout still in progress.
+---
+import:
+    test: TestSuite
+    ../../../../../src/common/analysis/check/check: check
+    ../../../../../src/common/analysis/namespace/builtins: IntegerFormat(Int64Format)
+    ../../../../../src/common/codegen/specialize/specialize as specialized
+    ../../../module_input: parse_modules
+
+
+-- Each layout has its own element shape, so a tuple is found by shape.
+private SOURCE: String =
+    |record Point { x: Float, y: Int }
+    |record Node { children: List[(Node, Float)] }
+    |pure func numbers() -> (Int, Int):
+    |    (1, 2)
+    |pure func labelled() -> (Int, String):
+    |    (1, "one")
+    |pure func located() -> (Point, Int):
+    |    ({ x = 1.5, y = 2 }, 3)
+    |pure func descendants(node: Node) -> (Node, Float):
+    |    (node, 0.5)
+    |func main() -> Int:
+    |    first = numbers()
+    |    second = labelled()
+    |    third = located()
+    |    fourth = descendants({ children = [] })
+    |    0
+    |
+
+
+private pure func specialized_records() -> List[specialized.ConcreteRecord]:
+    match parse_modules([{ source = SOURCE, targets = [] }]):
+        Err(_):
+            []
+        Ok(parsed):
+            match check(parsed):
+                Err(_):
+                    []
+                Ok(accepted):
+                    match specialized.specialize(accepted):
+                        Err(_): []
+                        Ok(program): specialized.specialized_contents(program).records
+
+
+-- Whether the one layout whose fields have this shape is inline; None when no
+-- layout, or more than one, has the shape.
+private pure func inline_with_shape(
+    shape: pure (List[specialized.TypeRef]) -> Bool,
+) -> Option[Bool]:
+    var found: Option[Bool] = None
+    var matches = 0
+    for layout in specialized_records():
+        if shape(specialized.record_fields(layout)):
+            matches = matches + 1
+            found = match layout:
+                specialized.InlineFields(_): Some(True)
+                specialized.ValueFields(_) | specialized.CountedFields(_): Some(False)
+    if matches == 1:
+        found
+    else:
+        None
+
+
+pure func test_number_tuple_is_inline() -> Bool:
+    (
+        inline_with_shape(pure func(fields: List[specialized.TypeRef]) -> Bool:
+            match fields:
+                [specialized.IntegerType(Int64Format), specialized.IntegerType(Int64Format)]: True
+                _: False
+        )
+        == Some(True)
+    )
+
+
+pure func test_tuple_with_a_string_is_counted() -> Bool:
+    (
+        inline_with_shape(pure func(fields: List[specialized.TypeRef]) -> Bool:
+            match fields:
+                [specialized.IntegerType(Int64Format), specialized.StringType]: True
+                _: False
+        )
+        == Some(False)
+    )
+
+
+pure func test_tuple_holding_an_inline_record_is_inline() -> Bool:
+    (
+        inline_with_shape(pure func(fields: List[specialized.TypeRef]) -> Bool:
+            match fields:
+                [specialized.RecordType(_), specialized.IntegerType(Int64Format)]: True
+                _: False
+        )
+        == Some(True)
+    )
+
+
+-- While (Node, Float) is prepared, Node's layout is still in progress, so the
+-- tuple cannot know Node is inline and stays counted.
+pure func test_tuple_closing_a_recursive_cycle_is_counted() -> Bool:
+    (
+        inline_with_shape(pure func(fields: List[specialized.TypeRef]) -> Bool:
+            match fields:
+                [specialized.RecordType(_), specialized.FloatType]: True
+                _: False
+        )
+        == Some(False)
+    )
+
+
+TESTS: TestSuite = {
+    description = "Structural tuple storage",
+    tests = [
+        ("a tuple of numbers is inline", test_number_tuple_is_inline),
+        ("a tuple with a String is counted", test_tuple_with_a_string_is_counted),
+        (
+            "a tuple holding an inline record is inline",
+            test_tuple_holding_an_inline_record_is_inline,
+        ),
+        (
+            "a tuple closing a recursive cycle is counted",
+            test_tuple_closing_a_recursive_cycle_is_counted,
+        ),
+    ],
+}

@@ -1,0 +1,537 @@
+import:
+    bool: and
+    int: Int methods
+    io/environment: get_current_directory
+    list: List methods
+    option: Option methods
+    path as path_ops
+    result: Result methods
+    string: String methods
+    test: TestSuite
+    ../../../../../build/generated/embedded_library: embedded_library_file
+    ../../../../../src/common/analysis/assemble: parsed_contents
+    ../../../../../src/common/analysis/check/check: check
+    ../../../../../src/common/analysis/load/load:
+        LibrarySource(EmbeddedLibrary, LibraryDirectory),
+        SourceFile,
+        SourceLoadFailure(DuplicateSourcePath, SourcePathContainsNul, LoadingFailed),
+        LoadFailure,
+        load_program,
+        load_program_with_sources,
+    ../../../../../src/common/syntax/source:
+        ModuleKind(UserModule),
+        compiler_source,
+        module_id,
+        module_source,
+        root_module_id,
+
+
+private MISSING_ROOT: String = "build/lsp-source-snapshots/not_on_disk.brp"
+private DEPENDENCY: String = "build/lsp-source-snapshots/dependency.brp"
+private ROOT_CONTENTS: String = "func main() -> Int:\n    42\n"
+
+
+private IMPORTING_ROOT: String = "import:\n    ./dependency: value\n\nfunc main() -> Int:\n    value()\n"
+
+
+private VALUE_CONTENTS: String = "pure func value() -> Int:\n    42\n"
+private DISK_ROOT: String = "blorp/test/e2e/fixtures/return/zero.brp"
+private LIBRARY_ROOT: String = "blorp/standard_library"
+
+
+private CHARACTER_HELP: String = "use ASCII function declarations and numeric literals, parameter names, or calls; keep -> adjacent"
+
+
+private func absolute(path: String) -> String:
+    match get_current_directory():
+        Ok(directory): path_ops.normalize(path_ops.join(directory, path))
+        Err(error): error
+
+
+private pure func row_is(
+    rows: List[SourceFile],
+    position: Int,
+    path: String,
+    contents: String,
+) -> Bool:
+    match rows.get(position):
+        Some(row): and(row.path == path, row.contents == contents)
+        None: False
+
+
+private pure func character_failure(failure: LoadFailure, position: Int, contents: String) -> Bool:
+    error = failure.diagnostic
+    match (module_id(position), failure.sources.modules.get(position)):
+        (Some(id), Some(row)):
+            and(
+                and(row.contents == contents, error.span.source == id.module_source()),
+                and(
+                    and(error.message == "unsupported character", error.help == CHARACTER_HELP),
+                    and(and(error.span.start == 0, error.span.end == 1), error.note.is_none()),
+                ),
+            )
+        _:
+            False
+
+
+func test_unsaved_root_supplies_exact_source_bytes_without_a_disk_file() -> Bool:
+    match load_program_with_sources(MISSING_ROOT, EmbeddedLibrary, [
+        { path = MISSING_ROOT, contents = ROOT_CONTENTS },
+    ]):
+        Err(_):
+            False
+        Ok(loaded):
+            and(
+                row_is(loaded.sources.modules, 0, MISSING_ROOT, ROOT_CONTENTS),
+                check(loaded.program).is_ok(),
+            )
+
+
+func test_existing_root_is_overridden() -> Bool:
+    match load_program_with_sources(DISK_ROOT, EmbeddedLibrary, [
+        { path = DISK_ROOT, contents = ROOT_CONTENTS },
+    ]):
+        Err(_): False
+        Ok(loaded): row_is(loaded.sources.modules, 0, DISK_ROOT, ROOT_CONTENTS)
+
+
+func test_unsaved_dependency_and_root_form_one_checked_program() -> Bool:
+    dependency_path = absolute(DEPENDENCY)
+    match load_program_with_sources(MISSING_ROOT, EmbeddedLibrary, [
+        { path = MISSING_ROOT, contents = IMPORTING_ROOT },
+        { path = DEPENDENCY, contents = VALUE_CONTENTS },
+        { path = "build/lsp-source-snapshots/unused.brp", contents = "$" },
+    ]):
+        Err(_):
+            False
+        Ok(loaded):
+            and(
+                and(
+                    row_is(loaded.sources.modules, 0, MISSING_ROOT, IMPORTING_ROOT),
+                    loaded.sources.modules.any(
+                        pure func(row): and(
+                            row.path == dependency_path,
+                            row.contents == VALUE_CONTENTS,
+                        ),
+                    ),
+                ),
+                and(
+                    check(loaded.program).is_ok(),
+                    loaded.sources.modules.all(pure func(row): row.contents != "$"),
+                ),
+            )
+
+
+func test_normalized_absolute_override_preserves_root_display_path() -> Bool:
+    written = "./build/lsp-source-snapshots/extra/../not_on_disk.brp"
+    match load_program_with_sources(written, EmbeddedLibrary, [
+        { path = absolute(MISSING_ROOT), contents = ROOT_CONTENTS },
+    ]):
+        Err(_): False
+        Ok(loaded): row_is(loaded.sources.modules, 0, written, ROOT_CONTENTS)
+
+
+private func duplicate_is_rejected(first: String, second: String, second_contents: String) -> Bool:
+    match load_program_with_sources(MISSING_ROOT, EmbeddedLibrary, [
+        { path = first, contents = "" },
+        { path = second, contents = second_contents },
+    ]):
+        Err(DuplicateSourcePath(path)): path == absolute(first)
+        _: False
+
+
+func test_duplicate_unused_equal_sources_reject_before_disk_reads() -> Bool:
+    duplicate_is_rejected("unused/../same.brp", "./same.brp", "")
+
+
+func test_duplicate_relative_and_absolute_sources_reject() -> Bool:
+    duplicate_is_rejected(MISSING_ROOT, absolute(MISSING_ROOT), ROOT_CONTENTS)
+
+
+func test_invalid_override_is_authoritative_and_retained_before_parse() -> Bool:
+    match load_program_with_sources(DISK_ROOT, EmbeddedLibrary, [
+        { path = DISK_ROOT, contents = "$" },
+    ]):
+        Err(LoadingFailed(failure)):
+            and(
+                character_failure(failure, 0, "$"),
+                row_is(failure.sources.modules, 0, DISK_ROOT, "$"),
+            )
+        _:
+            False
+
+
+func test_invalid_dependency_retains_exact_unsaved_bytes() -> Bool:
+    match load_program_with_sources(MISSING_ROOT, EmbeddedLibrary, [
+        { path = MISSING_ROOT, contents = IMPORTING_ROOT },
+        { path = DEPENDENCY, contents = "$" },
+    ]):
+        Err(LoadingFailed(failure)):
+            and(
+                character_failure(failure, 3, "$"),
+                row_is(failure.sources.modules, 3, absolute(DEPENDENCY), "$"),
+            )
+        _:
+            False
+
+
+func test_empty_override_is_authoritative() -> Bool:
+    match load_program_with_sources(DISK_ROOT, EmbeddedLibrary, [
+        { path = DISK_ROOT, contents = "" },
+    ]):
+        Ok(loaded): row_is(loaded.sources.modules, 0, DISK_ROOT, "")
+        Err(_): False
+
+
+func test_unoverridden_disk_failure_keeps_ordinary_diagnostic() -> Bool:
+    match (
+        load_program(MISSING_ROOT, EmbeddedLibrary),
+        load_program_with_sources(MISSING_ROOT, EmbeddedLibrary, []),
+    ):
+        (Err(expected), Err(LoadingFailed(actual))):
+            and(
+                and(
+                    expected.diagnostic.message == actual.diagnostic.message,
+                    expected.diagnostic.help == actual.diagnostic.help,
+                ),
+                and(
+                    expected.diagnostic.span == actual.diagnostic.span,
+                    actual.sources.modules.is_empty(),
+                ),
+            )
+        _:
+            False
+
+
+private func nul_path_is_rejected(
+    root: String,
+    sources: List[SourceFile],
+    expected: String,
+) -> Bool:
+    match load_program_with_sources(root, EmbeddedLibrary, sources):
+        Err(SourcePathContainsNul(path)): path == expected
+        _: False
+
+
+func test_nul_root_rejects_even_with_a_valid_override() -> Bool:
+    root = "bad\0/../${MISSING_ROOT}"
+    nul_path_is_rejected(root, [{ path = MISSING_ROOT, contents = ROOT_CONTENTS }], root)
+
+
+func test_unused_nul_override_rejects_raw_path_before_normalization() -> Bool:
+    path = "bad\0/../unused.brp"
+    nul_path_is_rejected(MISSING_ROOT, [{ path = path, contents = "" }], path)
+
+
+func test_nul_in_contents_remains_a_lexer_failure() -> Bool:
+    match load_program_with_sources(MISSING_ROOT, EmbeddedLibrary, [
+        { path = MISSING_ROOT, contents = "\0" },
+    ]):
+        Err(LoadingFailed(failure)): character_failure(failure, 0, "\0")
+        _: False
+
+
+func test_embedded_library_ignores_caller_files() -> Bool:
+    match load_program_with_sources(MISSING_ROOT, EmbeddedLibrary, [
+        { path = MISSING_ROOT, contents = ROOT_CONTENTS },
+        { path = "<standard library>/_base.brp", contents = "$" },
+    ]):
+        Err(_):
+            False
+        Ok(loaded):
+            match embedded_library_file("_base.brp"):
+                Some(contents):
+                    row_is(loaded.sources.modules, 1, "<standard library>/_base.brp", contents)
+                None:
+                    False
+
+
+func test_directory_foundation_uses_authoritative_override() -> Bool:
+    path = "${LIBRARY_ROOT}/_base.brp"
+    match load_program_with_sources(MISSING_ROOT, LibraryDirectory(LIBRARY_ROOT), [
+        { path = MISSING_ROOT, contents = ROOT_CONTENTS },
+        { path = path, contents = "$" },
+    ]):
+        Err(LoadingFailed(failure)):
+            and(
+                character_failure(failure, 1, "$"),
+                row_is(failure.sources.modules, 1, absolute(path), "$"),
+            )
+        _:
+            False
+
+
+func test_directory_library_module_uses_authoritative_override() -> Bool:
+    path = "${LIBRARY_ROOT}/bool.brp"
+    expected = absolute(path)
+    root = "import:\n    bool: and\n\nfunc main() -> Int:\n    42\n"
+    match load_program_with_sources(MISSING_ROOT, LibraryDirectory(LIBRARY_ROOT), [
+        { path = MISSING_ROOT, contents = root },
+        { path = path, contents = "$" },
+    ]):
+        Err(LoadingFailed(failure)):
+            failure.sources.modules.any(
+                pure func(row): and(row.path == expected, row.contents == "$"),
+            )
+        _:
+            False
+
+
+func test_override_outside_the_root_directory_is_accepted_and_unused() -> Bool:
+    match (
+        load_program(DISK_ROOT, EmbeddedLibrary),
+        load_program_with_sources(DISK_ROOT, EmbeddedLibrary, [
+            { path = "../outside_the_root_directory.brp", contents = "$" },
+            { path = "/outside_the_root_directory.brp", contents = "$" },
+        ]),
+    ):
+        (Ok(expected), Ok(actual)): expected.sources == actual.sources
+        _: False
+
+
+func test_paths_differing_only_in_case_are_distinct_keys() -> Bool:
+    upper = "build/lsp-source-snapshots/NOT_ON_DISK.brp"
+    match load_program_with_sources(MISSING_ROOT, EmbeddedLibrary, [
+        { path = MISSING_ROOT, contents = ROOT_CONTENTS },
+        { path = upper, contents = "$" },
+    ]):
+        Ok(loaded):
+            and(
+                row_is(loaded.sources.modules, 0, MISSING_ROOT, ROOT_CONTENTS),
+                loaded.sources.modules.all(pure func(row): row.contents != "$"),
+            )
+        Err(_):
+            False
+
+
+func test_duplicate_reports_the_normalized_path_of_the_later_row() -> Bool:
+    match load_program_with_sources(MISSING_ROOT, EmbeddedLibrary, [
+        { path = "same.brp", contents = "" },
+        { path = "unused/../././same.brp", contents = "" },
+    ]):
+        Err(DuplicateSourcePath(path)): path == absolute("same.brp")
+        _: False
+
+
+func test_root_inside_library_keeps_user_role() -> Bool:
+    root = "${LIBRARY_ROOT}/unsaved_application.brp"
+    match load_program_with_sources(root, LibraryDirectory(LIBRARY_ROOT), [
+        { path = root, contents = ROOT_CONTENTS },
+    ]):
+        Err(_):
+            False
+        Ok(loaded):
+            match parsed_contents(loaded.program).modules.get(0):
+                Some(module): module.role == UserModule
+                None: False
+
+
+func test_cycles_keep_normal_paths_and_import_diagnostic() -> Bool:
+    dependency = "import:\n    ./not_on_disk: main\n\npure func value() -> Int:\n    42\n"
+    match load_program_with_sources(MISSING_ROOT, EmbeddedLibrary, [
+        { path = MISSING_ROOT, contents = IMPORTING_ROOT },
+        { path = DEPENDENCY, contents = dependency },
+    ]):
+        Err(LoadingFailed(failure)):
+            error = failure.diagnostic
+            match module_id(3):
+                Some(id):
+                    and(
+                        and(
+                            (
+                                error.message
+                                == "import cycle: ${MISSING_ROOT} -> ${absolute(DEPENDENCY)} -> ${MISSING_ROOT}"
+                            ),
+                            (
+                                error.help
+                                == "move the declarations both modules need into a third module that both import"
+                            ),
+                        ),
+                        and(
+                            and(
+                                error.span.source == id.module_source(),
+                                and(error.span.start == 12, error.span.end == 31),
+                            ),
+                            row_is(failure.sources.modules, 3, absolute(DEPENDENCY), dependency),
+                        ),
+                    )
+                None:
+                    False
+        _:
+            False
+
+
+func test_two_imports_share_one_overridden_module() -> Bool:
+    dependency_path = absolute(DEPENDENCY)
+    root = "import:\n    ./dependency: value\n    ./other: other\n\nfunc main() -> Int:\n    value()\n"
+    other = "import:\n    ./dependency: value\n\npure func other() -> Int:\n    value()\n"
+    match load_program_with_sources(MISSING_ROOT, EmbeddedLibrary, [
+        { path = MISSING_ROOT, contents = root },
+        { path = DEPENDENCY, contents = VALUE_CONTENTS },
+        { path = "build/lsp-source-snapshots/other.brp", contents = other },
+    ]):
+        Err(_):
+            False
+        Ok(loaded):
+            and(
+                (
+                    loaded.sources.modules
+                        .filter(pure func(row): row.path == dependency_path)
+                        .length()
+                    == 1
+                ),
+                check(loaded.program).is_ok(),
+            )
+
+
+func test_existing_import_is_overridden_during_normal_checking() -> Bool:
+    root = "blorp/test/e2e/fixtures/test_entry/shared_left.brp"
+    dependency = "blorp/test/e2e/fixtures/test_entry/shared_case.brp"
+    contents = "import:\n    ./shared_case: shared_case\n\nfunc main() -> Int:\n    shared_case()\n"
+    replacement = "pure func shared_case() -> Int:\n    42\n"
+    match load_program_with_sources(root, EmbeddedLibrary, [
+        { path = root, contents = contents },
+        { path = dependency, contents = replacement },
+    ]):
+        Err(_):
+            False
+        Ok(loaded):
+            and(
+                row_is(loaded.sources.modules, 3, absolute(dependency), replacement),
+                check(loaded.program).is_ok(),
+            )
+
+
+func test_explicit_prelude_import_keeps_role_rejection() -> Bool:
+    contents = "import:\n    prelude: unused\n"
+    match load_program_with_sources(MISSING_ROOT, EmbeddedLibrary, [
+        { path = MISSING_ROOT, contents = contents },
+    ]):
+        Err(LoadingFailed(failure)):
+            error = failure.diagnostic
+            and(
+                and(
+                    error.message == "the prelude cannot be imported explicitly",
+                    (
+                        error.help
+                        == "remove this import; user modules receive the prelude automatically"
+                    ),
+                ),
+                and(
+                    (
+                        error.span
+                        == { source = root_module_id().module_source(), start = 12, end = 27 }
+                    ),
+                    row_is(failure.sources.modules, 0, MISSING_ROOT, contents),
+                ),
+            )
+        _:
+            False
+
+
+func test_sixteen_unused_overrides_preserve_ordinary_source_inventory() -> Bool:
+    var sources: List[SourceFile] = []
+    var position = 0
+    while position < 16:
+        sources = sources.append({
+            path = "build/lsp-source-snapshots/unused_${position}.brp",
+            contents = "$",
+        })
+        position = position + 1
+    match (
+        load_program(DISK_ROOT, EmbeddedLibrary),
+        load_program_with_sources(DISK_ROOT, EmbeddedLibrary, sources),
+    ):
+        (Ok(expected), Ok(actual)):
+            and(expected.sources == actual.sources, check(actual.program).is_ok())
+        _:
+            False
+
+
+TESTS: TestSuite = {
+    description = "Frozen source snapshots in the ordinary loader",
+    tests = [
+        (
+            "unsaved root supplies exact source bytes without a disk file",
+            test_unsaved_root_supplies_exact_source_bytes_without_a_disk_file,
+        ),
+        ("existing root is overridden", test_existing_root_is_overridden),
+        (
+            "unsaved dependency and root form one checked program",
+            test_unsaved_dependency_and_root_form_one_checked_program,
+        ),
+        (
+            "normalized absolute override preserves root display path",
+            test_normalized_absolute_override_preserves_root_display_path,
+        ),
+        (
+            "duplicate unused equal sources reject before disk reads",
+            test_duplicate_unused_equal_sources_reject_before_disk_reads,
+        ),
+        (
+            "duplicate relative and absolute sources reject",
+            test_duplicate_relative_and_absolute_sources_reject,
+        ),
+        (
+            "invalid override is authoritative and retained before parse",
+            test_invalid_override_is_authoritative_and_retained_before_parse,
+        ),
+        (
+            "invalid dependency retains exact unsaved bytes",
+            test_invalid_dependency_retains_exact_unsaved_bytes,
+        ),
+        ("empty override is authoritative", test_empty_override_is_authoritative),
+        (
+            "unoverridden disk failure keeps ordinary diagnostic",
+            test_unoverridden_disk_failure_keeps_ordinary_diagnostic,
+        ),
+        (
+            "NUL root rejects even with a valid override",
+            test_nul_root_rejects_even_with_a_valid_override,
+        ),
+        (
+            "unused NUL override rejects raw path before normalization",
+            test_unused_nul_override_rejects_raw_path_before_normalization,
+        ),
+        ("NUL in contents remains a lexer failure", test_nul_in_contents_remains_a_lexer_failure),
+        ("embedded library ignores caller files", test_embedded_library_ignores_caller_files),
+        (
+            "directory foundation uses authoritative override",
+            test_directory_foundation_uses_authoritative_override,
+        ),
+        (
+            "directory library module uses authoritative override",
+            test_directory_library_module_uses_authoritative_override,
+        ),
+        (
+            "override outside the root directory is accepted and unused",
+            test_override_outside_the_root_directory_is_accepted_and_unused,
+        ),
+        (
+            "paths differing only in case are distinct keys",
+            test_paths_differing_only_in_case_are_distinct_keys,
+        ),
+        (
+            "duplicate reports the normalized path of the later row",
+            test_duplicate_reports_the_normalized_path_of_the_later_row,
+        ),
+        ("root inside library keeps user role", test_root_inside_library_keeps_user_role),
+        (
+            "cycles keep normal paths and import diagnostic",
+            test_cycles_keep_normal_paths_and_import_diagnostic,
+        ),
+        (
+            "existing import is overridden during normal checking",
+            test_existing_import_is_overridden_during_normal_checking,
+        ),
+        (
+            "explicit prelude import keeps role rejection",
+            test_explicit_prelude_import_keeps_role_rejection,
+        ),
+        (
+            "sixteen unused overrides preserve ordinary source inventory",
+            test_sixteen_unused_overrides_preserve_ordinary_source_inventory,
+        ),
+        ("two imports share one overridden module", test_two_imports_share_one_overridden_module),
+    ],
+}

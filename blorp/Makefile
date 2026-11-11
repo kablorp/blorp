@@ -28,7 +28,7 @@ TEST_DRIVER_DIRECTORY := blorp/build/self-hosted-tests/driver
 TEST_DRIVER := $(TEST_DRIVER_DIRECTORY)/driver
 
 # The standard library embedded in the compiler: a generator the pinned seed
-# builds, and the module it writes, which src/compile/load/load.brp imports.
+# builds, and the module it writes, which src/common/analysis/load/load.brp imports.
 # Both are file targets, so they are rebuilt only when the library or the
 # generator changes. These are targets, so relative to blorp/ where make runs;
 # the recipes run in the repository root and prefix them with blorp/.
@@ -43,7 +43,7 @@ compiler: generate-compiler
 # A pinned-seed change (bootstrap.env) or a change to the shared text helper it
 # imports rebuilds the generator too. -O1: the generator loops over every
 # library byte, which -O0 makes needlessly slow.
-$(EMBED_LIBRARY): scripts/embed_library.brp src/utils/text.brp bootstrap.env
+$(EMBED_LIBRARY): scripts/embed_library.brp src/common/utils/text.brp bootstrap.env
 	@echo 'Build blorp/$(EMBED_LIBRARY)'
 	@cd .. && mkdir -p "$$(dirname "blorp/$(EMBED_LIBRARY)")" \
 		&& scripts/blorp-compiler-bootstrap compile blorp/scripts/embed_library.brp \

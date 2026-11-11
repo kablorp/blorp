@@ -13,10 +13,10 @@ Blorp has no formatter, and the repository's hand layout has drifted:
 - 50 files under `blorp/src` indent with tabs; most tests and every example in
   `README.md` indent with four spaces.
 - 2,608 lines under `blorp/src` are wider than 100 columns. The longest,
-  `compile/check/traits.brp:8`, is one 900-character import selection.
+  `common/analysis/check/traits.brp:8`, is one 900-character import selection.
 - The same construct wraps differently from file to file:
-  `compile/check/render.brp:241-243` breaks a chain before two of its links, while
-  `compile/check/declarations.brp:994-996` breaks before every link.
+  `common/analysis/check/render.brp:241-243` breaks a chain before two of its links, while
+  `common/analysis/check/declarations.brp:994-996` breaks before every link.
 
 A reviewer cannot tell layout changes from real ones, an exact-text edit tool
 fails on a tab it did not expect, and code an agent writes has no canonical
@@ -35,32 +35,32 @@ grep -l "$(printf '^\t')" $files | wc -l          # 50
 What the formatter reuses (surveyed 2026-11-06):
 
 - **The lexer drops comments, `---` documentation blocks and blank lines** as
-  trivia (`syntax/lex.brp:948-1100`, `grammar.ebnf:90-99`). A documentation
+  trivia (`common/syntax/lex.brp:948-1100`, `grammar.ebnf:90-99`). A documentation
   block opens and closes with a `---` line at column 1, and its body admits
   any byte except CR. `LexedProgram` keeps the whole `source_text` and every
-  token's byte-offset `Span` (`syntax/syntax.brp:8-12`, `:216-226`), so every
+  token's byte-offset `Span` (`common/syntax/syntax.brp:8-12`, `:216-226`), so every
   piece of trivia is recoverable from the gaps between tokens.
 - **The parser builds an abstract tree.** Every `ValueExpression` has a
-  `base_span` and a `span` (`syntax/syntax.brp:367`), and so do names, import
+  `base_span` and a `span` (`common/syntax/syntax.brp:367`), and so do names, import
   selections, type syntax, patterns, match arms and Dict entries. `x.f(y)`
   (`ReceiverInvocation`) stays distinct from `f(x, y)` (`DirectApplication`).
   It drops:
-  - parentheses: a group is transparent (`syntax/parse.brp:2029`);
+  - parentheses: a group is transparent (`common/syntax/parse.brp:2029`);
   - trailing commas and line breaks inside brackets;
   - the order between declaration kinds, which go into separate lists
-    (`syntax/parse.brp:4330-4360`);
+    (`common/syntax/parse.brp:4330-4360`);
   - a whole-declaration span: `ParsedFunction`, `ParsedRecord` and
     `ParsedUnion` locate only their names, and `pure` and `fixed` carry no
     span (only `Visibility.Private(Span)` does);
   - literal spellings: literals hold decoded values;
   - the difference between `else if` (`ElseIf(ParsedIf)`) and an `else:`
     block holding only an `if`, which are different trees
-    (`syntax/parse.brp:1880-1887`, `syntax/syntax.brp:586, 649-651`).
+    (`common/syntax/parse.brp:1880-1887`, `common/syntax/syntax.brp:586, 649-651`).
 - **Lexing and parsing run on one file alone.** `lex` then `parse_module`,
-  then the public `module_contents` (`syntax/parse.brp:189`), with a
+  then the public `module_contents` (`common/syntax/parse.brp:189`), with a
   `SourceId`, a `ModuleId` and the base `program_names().names`, as
   `test/unit/module_input.brp:75-78` already does. No imports are loaded.
-- **Name ids depend on lexing order** (`syntax/names.brp:240`).
+- **Name ids depend on lexing order** (`common/syntax/names.brp:240`).
 - **No source printer exists** anywhere in `blorp/`.
 
 ### Decisions already taken (Keith, 2026-11-06)
@@ -227,8 +227,8 @@ constructs containing it and of nothing beside them.
 
 Grouping and declaration starts are syntax, so the change belongs to Parse
 (`AGENTS.md` rule 8). Check must see exactly the tree it sees today. The
-formatter is a new module, `src/format/`, that depends only on `syntax/`
-and `utils/`, so it formats files that do not type-check.
+formatter is a new module, `src/format/`, that depends only on `common/syntax/`
+and `common/utils/`, so it formats files that do not type-check.
 
 1. **F1: keep parentheses and declaration starts in the parse tree.**
 2. **F2: the formatter**, `blorp format` and its `--check` mode, and its tests.
@@ -239,7 +239,7 @@ and `utils/`, so it formats files that do not type-check.
 
 ### F1: parentheses the formatter can see and Check cannot
 
-Today the group disappears at `syntax/parse.brp:2027-2029`:
+Today the group disappears at `common/syntax/parse.brp:2027-2029`:
 
 ```blorp
 private pure func finish_enclosed_value(enclosed: ParsedEnclosed) -> Result[ParsedValue, Diagnostic]:
@@ -248,7 +248,7 @@ private pure func finish_enclosed_value(enclosed: ParsedEnclosed) -> Result[Pars
 ```
 
 Check must see exactly today's tree. It reads written expressions at about
-twenty sites in `compile/check/expressions.brp` and `compile/check/bodies.brp` (for example
+twenty sites in `common/analysis/check/expressions.brp` and `common/analysis/check/bodies.brp` (for example
 `expressions.brp:577, 602, 701, 845, 894, 945` and `bodies.brp:259, 277,
 797`), several through `_` arms that would silently accept a new shape, and
 several depend on today's shape: `for i in (0..3)` must stay a range,
@@ -259,7 +259,7 @@ cost far more than the ceiling. So the parentheses are recorded beside the
 tree, where Check never reads them. The expected design:
 
 ```blorp
--- syntax/syntax.brp
+-- common/syntax/syntax.brp
 record ValueExpression {
 	base: ExpressionBase,
 	base_span: Span,
@@ -273,7 +273,7 @@ record ValueExpression {
 
 `finish_enclosed_value` adds the group's span to its value's `parentheses`
 instead of discarding it. Check never reads the field. The cost is the 34
-places in `syntax/`, `compile/assemble.brp` and `check/` that build a
+places in `common/syntax/`, `common/analysis/assemble.brp` and `check/` that build a
 `ValueExpression` literal today, each of which gains `parentheses = []` (or
 becomes a record update), which the line ceiling must absorb. The one case this cannot
 express is a group whose value is then flattened into an outer chain,
@@ -305,7 +305,7 @@ exit 1.
 
 ## Scope and non-goals
 
-In scope: `syntax/syntax.brp` and `syntax/parse.brp` (F1), Check's reading of groups,
+In scope: `common/syntax/syntax.brp` and `common/syntax/parse.brp` (F1), Check's reading of groups,
 `src/format/`, `src/main.brp`, their tests, a Formatting section in
 `README.md`, and `grammar.ebnf` only where a comment describes grouping.
 
@@ -321,7 +321,7 @@ rules; any rewrite beyond layout; lexer changes.
   instructions each within +0.5% of the matched baseline, production lines
   within +60, and the self-compiled C byte-identical. If neither option fits,
   stop and report with the token-tree fallback.
-- **Parse tests.** `test/unit/test_syntax/test_parse/test_grouping.brp:64-99` asserts
+- **Parse tests.** `test/unit/test_common/test_syntax/test_parse/test_grouping.brp:64-99` asserts
   that `(7)` is an `IntegerExpression` with `base_span` 23..24. With the
   expected design that stays true and the test gains the recorded
   parentheses; if the spike chooses otherwise, the parse suites that match
@@ -348,7 +348,7 @@ Suites live under `test/unit/test_format/` and are listed in
   header, a documentation block with blank and arbitrary lines, imports with
   attached and trailing comments, parentheses added to break a chain at the
   start of a statement (which Parse reads through
-  `consume_parenthesized_line`, `syntax/parse.brp:2610`), and an unparsable
+  `consume_parenthesized_line`, `common/syntax/parse.brp:2610`), and an unparsable
   input.
 - **Idempotence:** formatting every expected output returns it unchanged.
 - **Meaning preserved:** for every `.brp` file in the repository that parses,

@@ -1,0 +1,103 @@
+---
+Emit defines C records and unions in the order Verify published, after
+every record's forward declaration. The markers are the C names Emit gives
+each definition: `struct blorp_r_N{` for a record, and `enum blorp_tag_N{`
+or, for a union of bare variants, `enum blorp_u_N{`.
+---
+import:
+    bool: Bool methods
+    int: Int methods
+    list: List methods
+    option: Option methods
+    result: Result methods
+    test: TestSuite
+    ../../../../../src/common/codegen/emit/emit: emit
+    ../../../../../src/common/codegen/verify/verify:
+        AggregateDefinition(RecordDefinition, UnionDefinition),
+        VerifiedProgram,
+        aggregate_order,
+        verified_contents,
+        verify,
+    ../../../aggregate_order_inputs: DIAMOND, MIXED, owned
+    ../../../text_search: find_text
+
+
+-- Where `definition`'s C definition begins in `code`.
+private pure func definition_position(code: String, definition: AggregateDefinition) -> Option[Int]:
+    match definition:
+        RecordDefinition(index):
+            find_text(code, "struct blorp_r_${index}{", 0)
+        UnionDefinition(index):
+            match find_text(code, "enum blorp_tag_${index}{", 0):
+                Some(position): Some(position)
+                None: find_text(code, "enum blorp_u_${index}{", 0)
+
+
+-- Where record `index`'s typedef begins: `typedef struct blorp_r_N ` for an
+-- inline record, `typedef struct blorp_r_N*` for a managed one.
+private pure func record_declaration_position(code: String, index: Int) -> Option[Int]:
+    match find_text(code, "typedef struct blorp_r_${index} ", 0):
+        Some(position): Some(position)
+        None: find_text(code, "typedef struct blorp_r_${index}*", 0)
+
+
+-- Every definition is present, each after the one before it in the
+-- verified order, and every record's typedef precedes the first of them.
+private pure func defined_in_verified_order(program: VerifiedProgram, code: String) -> Bool:
+    var ordered: Bool = True
+    var first: Option[Int] = None
+    var previous: Option[Int] = None
+    for definition in aggregate_order(program):
+        match (definition_position(code, definition), previous):
+            (Some(position), Some(earlier)):
+                ordered = ordered.and(position > earlier)
+                previous = Some(position)
+            (Some(position), None):
+                first = Some(position)
+                previous = Some(position)
+            (None, _):
+                ordered = False
+    var index = 0
+    while index < verified_contents(program).records.length():
+        match (record_declaration_position(code, index), first):
+            (Some(declaration), Some(definition)): ordered = ordered.and(declaration < definition)
+            _: ordered = False
+        index = index + 1
+    ordered
+
+
+private pure func emitted_in_order(source: String) -> Bool:
+    match owned(source).and_then(verify):
+        Err(_):
+            False
+        Ok(program):
+            match emit(program):
+                Err(_):
+                    False
+                Ok(code):
+                    (aggregate_order(program).length() > 2).and(
+                        defined_in_verified_order(program, code),
+                    )
+
+
+pure func test_diamond_definitions_follow_the_verified_order() -> Bool:
+    emitted_in_order(DIAMOND)
+
+
+pure func test_mixed_definitions_follow_the_verified_order() -> Bool:
+    emitted_in_order(MIXED)
+
+
+TESTS: TestSuite = {
+    description = "Emitted aggregate order",
+    tests = [
+        (
+            "diamond definitions follow the verified order",
+            test_diamond_definitions_follow_the_verified_order,
+        ),
+        (
+            "mixed definitions follow the verified order",
+            test_mixed_definitions_follow_the_verified_order,
+        ),
+    ],
+}

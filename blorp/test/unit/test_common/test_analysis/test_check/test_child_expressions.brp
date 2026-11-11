@@ -1,0 +1,182 @@
+---
+`child_expressions` lists the expressions a form evaluates directly, in
+evaluation order, and `statement_expressions` those of a statement list. The
+call, creation and self-call walks share them. A lambda's creation evaluates
+its capture reads, so they are children; each is a variable read, which is why
+a walk that visits them finds no call.
+---
+import:
+    bool: and
+    test: TestSuite
+    ../../../../../src/common/analysis/check/check: check, checked_functions
+    ../../../../../src/common/analysis/check/model as checked
+    ../../../module_input: parse_modules, INTEGER_OPERATIONS
+
+
+private SOURCE: String =
+    |import:
+    |    int as int_ops
+    |union Choice:
+    |    Left
+    |    Right
+    |pure func apply[T, U](callback: pure (T) -> U, value: T) -> U:
+    |    callback(value)
+    |pure func other(value: Int) -> Int:
+    |    value
+    |pure func offset(value: Int, amount: Int) -> Int:
+    |    apply(pure func(item: Int) -> Int: int_ops.add(item, amount), value)
+    |pure func stored(amount: Int) -> Int:
+    |    callback = pure func(item: Int) -> Int: int_ops.add(item, amount)
+    |    callback(1)
+    |pure func pair() -> (Int, Int):
+    |    (other(1), other(2))
+    |pure func inspect(flag: Choice) -> Int:
+    |    total = match flag:
+    |        Left:
+    |            kept = other(1)
+    |            other(kept)
+    |        Right: other(2)
+    |    total
+    |func main() -> Int:
+    |    0
+    |
+
+
+private pure func checked_source() -> List[checked.CheckedFunction]:
+    match parse_modules([
+        { source = SOURCE, targets = [1] },
+        { source = INTEGER_OPERATIONS, targets = [] },
+    ]):
+        Err(_):
+            []
+        Ok(program):
+            match check(program):
+                Err(_): []
+                Ok(accepted): checked_functions(accepted).functions
+
+
+-- The returned value of the function declared at this position in SOURCE,
+-- which is a value body in every case here.
+private pure func returned_value(
+    position: Int,
+    functions: List[checked.CheckedFunction],
+) -> Option[checked.CheckedExpr]:
+    match functions.get(position):
+        Some(function):
+            match function.body:
+                checked.CheckedValueBody(checked.ReturnExpression(value)): Some(value)
+                _: None
+        None:
+            None
+
+
+private pure func describe(value: checked.CheckedExpr) -> String:
+    match value.form:
+        checked.ReadBinding(_): "read"
+        checked.ReadCapture(_): "capture"
+        checked.InvokeFunction(_): "call"
+        checked.MakeCallable(_): "callable"
+        checked.ConstructTuple(_): "tuple"
+        checked.Match(_): "match"
+        _: "other"
+
+
+private pure func describe_all(values: List[checked.CheckedExpr]) -> List[String]:
+    values.map(describe)
+
+
+pure func test_a_lambda_operand_contributes_its_capture_reads_before_later_operands() -> Bool:
+    match returned_value(2, checked_source()):
+        Some(value): describe_all(checked.child_expressions(value.form)) == ["read", "read"]
+        None: False
+
+
+-- The outcome the walks rely on: visiting a capture finds no call, so the call
+-- and self-call walks give the same result with or without them.
+pure func test_capture_reads_hold_no_call_so_visiting_them_adds_none() -> Bool:
+    match returned_value(2, checked_source()):
+        Some(value): checked.expression_calls(value).length() == 1
+        None: False
+
+
+pure func test_a_stored_lambda_creation_has_its_captures_as_children() -> Bool:
+    match checked_source().get(3):
+        Some(function):
+            match checked.statement_expressions(function.statements):
+                [created]:
+                    and(
+                        describe(created) == "callable",
+                        describe_all(checked.child_expressions(created.form)) == ["read"],
+                    )
+                _:
+                    False
+        None:
+            False
+
+
+private pure func in_source_order(values: List[checked.CheckedExpr]) -> Bool:
+    var ordered: Bool = True
+    var previous = 0
+    for value in values:
+        if value.span.start < previous:
+            ordered = False
+        previous = value.span.start
+    ordered
+
+
+pure func test_tuple_elements_are_children_in_written_order() -> Bool:
+    match returned_value(4, checked_source()):
+        Some(value):
+            children = checked.child_expressions(value.form)
+            and(
+                describe(value) == "tuple",
+                and(describe_all(children) == ["call", "call"], in_source_order(children)),
+            )
+        None:
+            False
+
+
+pure func test_match_children_are_scrutinee_then_each_arm_statements_and_value() -> Bool:
+    match checked_source().get(5):
+        Some(function):
+            match checked.statement_expressions(function.statements):
+                [matched]:
+                    children = checked.child_expressions(matched.form)
+                    and(
+                        describe(matched) == "match",
+                        and(
+                            describe_all(children) == ["read", "call", "call", "call"],
+                            in_source_order(children),
+                        ),
+                    )
+                _:
+                    False
+        None:
+            False
+
+
+TESTS: TestSuite = {
+    description = "Child expressions",
+    tests = [
+        (
+            "a lambda operand contributes its capture reads before later operands",
+            test_a_lambda_operand_contributes_its_capture_reads_before_later_operands,
+        ),
+        (
+            "capture reads hold no call, so visiting them adds none",
+            test_capture_reads_hold_no_call_so_visiting_them_adds_none,
+        ),
+        (
+            "a stored lambda creation has its captures as children",
+            test_a_stored_lambda_creation_has_its_captures_as_children,
+        ),
+        (
+            "tuple elements are children in written order",
+            test_tuple_elements_are_children_in_written_order,
+        ),
+        (
+            "match children are the scrutinee then each arm's statements and value",
+            test_match_children_are_scrutinee_then_each_arm_statements_and_value,
+        ),
+    ],
+}

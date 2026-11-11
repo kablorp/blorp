@@ -403,7 +403,7 @@ the fixed union `EntryKind`, the record `Entry`, the pure
 is `IOError`, imported from `io/error` along with `IOErrorKind`.
 Natives return Int codes (or a list or String); the shared `io/_codes`
 decoder produces `io/error` kinds, while the entry decoder stays private to `fs`.
-The native codes are named in `src/compile/runtime/fs.brp`. The
+The native codes are named in `src/common/codegen/runtime/fs.brp`. The
 language README's [I/O overview](../README.md#effects-and-io) shows where it
 fits beside `print` and the other effects, and
 [FILESYSTEM_DECISIONS.md](../FILESYSTEM_DECISIONS.md) records why the library
@@ -605,7 +605,7 @@ run in registration order, including entries after a False result. Empty suites
 pass. `run_suite_result` prints results and returns `TestCounts { passed, failed }`;
 `suites_exit_status` returns 0 when no suite failed and 1 otherwise, and
 `run_suite` does the same for one suite. See the
-[text suite](../test/unit/test_utils/test_text.brp).
+[text suite](../test/unit/test_common/test_utils/test_text.brp).
 
 ## Process execution
 

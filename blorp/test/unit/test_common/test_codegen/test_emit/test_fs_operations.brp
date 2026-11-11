@@ -1,0 +1,450 @@
+import:
+    bool: Bool methods
+    int: Int methods
+    list: List methods
+    option: Option methods
+    result: Result methods
+    string: String methods
+    test: TestSuite
+    ../../../../../src/common/analysis/check/check: check
+    ../../../../../src/common/codegen/emit/emit: emit
+    ../../../../../src/common/codegen/lower/lower: lower
+    ../../../../../src/common/codegen/own/own: own
+    ../../../../../src/common/codegen/runtime/fs:
+        FS_HELPERS_RUNTIME,
+        FS_READ_TEXT_RUNTIME,
+        FS_WRITE_TEXT_RUNTIME,
+        FS_ENTRY_KIND_RUNTIME,
+        FS_CREATE_DIRECTORY_RUNTIME,
+        FS_CREATE_DIRECTORIES_RUNTIME,
+        FS_REMOVE_FILE_RUNTIME,
+        FS_REMOVE_DIRECTORY_RUNTIME,
+        FS_RENAME_RUNTIME,
+        fs_list_directory_runtime,
+        FS_REMOVE_DIRECTORY_TREE_RUNTIME,
+        FS_CREATE_TEMPORARY_DIRECTORY_RUNTIME,
+        FS_OPEN_READ_RUNTIME,
+        fs_next_lines_runtime,
+        FS_CLOSE_RUNTIME,
+    ../../../../../src/common/codegen/runtime/list: list_c_type, list_element_key
+    ../../../../../src/common/codegen/runtime/process: PROCESS_POSIX_PRELUDE
+    ../../../../../src/common/codegen/specialize/specialize: specialize, TypeRef(StringType)
+    ../../../../../src/common/codegen/verify/verify: verify
+    ../../../module_input: parse_modules
+    ../../../text_search: occurrences
+
+
+private READ_TEXT_DECLARATION: String = "func read(path: String) -> Result[String, Int]:\n    builtin(\"fs.read_text\")\n"
+
+
+private ENTRY_KIND_DECLARATION: String = "func kind(path: String) -> Result[Int, Int]:\n    builtin(\"fs.entry_kind\")\n"
+
+
+private WRITE_TEXT_DECLARATION: String = "func store(path: String, text: String) -> Result[Void, Int]:\n    builtin(\"fs.write_text\")\n"
+
+
+private LIST_DIRECTORY_DECLARATION: String = "func listing(path: String) -> Result[List[String], Int]:\n    builtin(\"fs.list_directory\")\n"
+
+
+private OPEN_READ_DECLARATION: String = "func open(path: String) -> Result[Int, Int]:\n    builtin(\"fs.open_read\")\n"
+
+
+private NEXT_LINES_DECLARATION: String = "func next(descriptor: Int, carried: String) -> Result[List[String], Int]:\n    builtin(\"fs.next_lines\")\n"
+
+
+private CLOSE_DECLARATION: String = "func close(descriptor: Int) -> Result[Void, Int]:\n    builtin(\"fs.close\")\n"
+
+
+private pure func emitted(source: String) -> Result[String, Int]:
+    match parse_modules([{ source = source, targets = [] }]):
+        Err(_):
+            Err(1)
+        Ok(parsed):
+            match check(parsed):
+                Err(_):
+                    Err(2)
+                Ok(checked):
+                    match (
+                        specialize(checked)
+                            .and_then(lower)
+                            .and_then(own)
+                            .and_then(verify)
+                            .and_then(emit)
+                    ):
+                        Err(_): Err(3)
+                        Ok(code): Ok(code)
+
+
+private pure func both_called() -> String:
+    "${READ_TEXT_DECLARATION}${ENTRY_KIND_DECLARATION}func main() -> Int:\n    first = read(\"x\")\n    second = kind(\"x\")\n    0\n"
+
+
+pure func test_helpers_are_emitted_once_for_two_operations() -> Bool:
+    match emitted(both_called()):
+        Err(_):
+            False
+        Ok(code):
+            occurrences(code, FS_HELPERS_RUNTIME)
+                .equals(1)
+                .and(occurrences(code, FS_READ_TEXT_RUNTIME).equals(1))
+                .and(occurrences(code, FS_ENTRY_KIND_RUNTIME).equals(1))
+                .and(code.starts_with(PROCESS_POSIX_PRELUDE))
+
+
+private pure func all_three_called() -> String:
+    "${READ_TEXT_DECLARATION}${WRITE_TEXT_DECLARATION}${ENTRY_KIND_DECLARATION}func main() -> Int:\n    first = read(\"x\")\n    second = store(\"x\", \"text\")\n    third = kind(\"x\")\n    0\n"
+
+
+pure func test_helpers_are_emitted_once_for_three_operations() -> Bool:
+    match emitted(all_three_called()):
+        Err(_):
+            False
+        Ok(code):
+            occurrences(code, FS_HELPERS_RUNTIME)
+                .equals(1)
+                .and(occurrences(code, FS_READ_TEXT_RUNTIME).equals(1))
+                .and(occurrences(code, FS_WRITE_TEXT_RUNTIME).equals(1))
+                .and(occurrences(code, FS_ENTRY_KIND_RUNTIME).equals(1))
+                .and(code.starts_with(PROCESS_POSIX_PRELUDE))
+
+
+-- A Void success has no out-parameter, so the call passes the two borrowed
+-- Strings and the address of the Int code only.
+pure func test_void_success_passes_only_the_error_code() -> Bool:
+    match emitted(all_three_called()):
+        Err(_):
+            False
+        Ok(code):
+            occurrences(code, "blorp_fs_write_text(blorp_vl_0,blorp_vl_1,&blorp_runtime_2_error)").equals(
+                1,
+            )
+
+
+pure func test_helpers_are_emitted_once_for_one_operation() -> Bool:
+    read_only = "${READ_TEXT_DECLARATION}func main() -> Int:\n    first = read(\"x\")\n    0\n"
+    kind_only = "${ENTRY_KIND_DECLARATION}func main() -> Int:\n    first = kind(\"x\")\n    0\n"
+    match (emitted(read_only), emitted(kind_only)):
+        (Ok(read_code), Ok(kind_code)):
+            occurrences(read_code, FS_HELPERS_RUNTIME)
+                .equals(1)
+                .and(occurrences(read_code, FS_READ_TEXT_RUNTIME).equals(1))
+                .and(occurrences(read_code, FS_ENTRY_KIND_RUNTIME).equals(0))
+                .and(occurrences(kind_code, FS_HELPERS_RUNTIME).equals(1))
+                .and(occurrences(kind_code, FS_ENTRY_KIND_RUNTIME).equals(1))
+                .and(occurrences(kind_code, FS_READ_TEXT_RUNTIME).equals(0))
+        _:
+            False
+
+
+pure func test_unused_declarations_select_no_fs_fragments() -> Bool:
+    source = "${READ_TEXT_DECLARATION}${ENTRY_KIND_DECLARATION}func main() -> Int:\n    0\n"
+    match emitted(source):
+        Err(_):
+            False
+        Ok(code):
+            occurrences(code, "blorp_fs_")
+                .equals(0)
+                .and(occurrences(code, "_POSIX_C_SOURCE").equals(0))
+
+
+-- Each result is the ordinary Result: the String or Int success and the Int
+-- code are fresh out-parameters, and neither is released by the call.
+pure func test_result_takes_primitive_payloads() -> Bool:
+    match emitted(both_called()):
+        Err(_):
+            False
+        Ok(code):
+            occurrences(
+                code,
+                "struct blorp_string *blorp_runtime_1_value=NULL;int64_t blorp_runtime_1_error=0;",
+            )
+                .equals(1)
+                .and(
+                    occurrences(
+                        code,
+                        "int64_t blorp_runtime_1_value=0;int64_t blorp_runtime_1_error=0;",
+                    ).equals(1),
+                )
+                .and(
+                    occurrences(
+                        code,
+                        "blorp_fs_read_text(blorp_vl_0,&blorp_runtime_1_value,&blorp_runtime_1_error)",
+                    ).equals(1),
+                )
+                .and(
+                    occurrences(
+                        code,
+                        "blorp_fs_entry_kind(blorp_vl_0,&blorp_runtime_1_value,&blorp_runtime_1_error)",
+                    ).equals(1),
+                )
+
+
+private pure func listing_called() -> String:
+    "${LIST_DIRECTORY_DECLARATION}func main() -> Int:\n    first = listing(\"x\")\n    0\n"
+
+
+private pure func string_list_type() -> String:
+    list_c_type(list_element_key(StringType))
+
+
+-- The success is a fresh List[String] in its own out-parameter, which the Ok
+-- constructor takes; main then drops the whole Result.
+pure func test_listing_takes_a_fresh_string_list_and_drops_it() -> Bool:
+    match emitted(listing_called()):
+        Err(_):
+            False
+        Ok(code):
+            occurrences(
+                code,
+                "${string_list_type()} blorp_runtime_1_value=NULL;int64_t blorp_runtime_1_error=0;",
+            )
+                .equals(1)
+                .and(
+                    occurrences(
+                        code,
+                        "blorp_fs_list_directory(blorp_vl_0,&blorp_runtime_1_value,&blorp_runtime_1_error)",
+                    ).equals(1),
+                )
+                .and(
+                    occurrences(code, ".payload.blorp_up_0={.blorp_uf_0=blorp_runtime_1_value}").equals(
+                        1,
+                    ),
+                )
+                .and(occurrences(code, "blorp_union_drop_0(blorp_owner_1);").equals(1))
+
+
+-- The listing's fragment is built for the program's own List[String] type.
+pure func test_listing_alone_emits_its_fragment_for_the_string_list_type() -> Bool:
+    match emitted(listing_called()):
+        Err(_):
+            False
+        Ok(code):
+            occurrences(code, FS_HELPERS_RUNTIME)
+                .equals(1)
+                .and(occurrences(code, fs_list_directory_runtime(string_list_type())).equals(1))
+                .and(occurrences(code, FS_CREATE_DIRECTORY_RUNTIME).equals(0))
+                .and(occurrences(code, FS_ENTRY_KIND_RUNTIME).equals(0))
+                .and(code.starts_with(PROCESS_POSIX_PRELUDE))
+
+
+private pure func directories_called() -> String:
+    declarations = [
+        LIST_DIRECTORY_DECLARATION,
+        "func create(path: String) -> Result[Void, Int]:\n    builtin(\"fs.create_directory\")\n",
+        "func create_all(path: String) -> Result[Void, Int]:\n    builtin(\"fs.create_directories\")\n",
+        "func remove_file(path: String) -> Result[Void, Int]:\n    builtin(\"fs.remove_file\")\n",
+        "func remove_directory(path: String) -> Result[Void, Int]:\n    builtin(\"fs.remove_directory\")\n",
+        "func move(source: String, destination: String) -> Result[Void, Int]:\n    builtin(\"fs.rename\")\n",
+    ]
+    calls = "    a = listing(\"x\")\n    b = create(\"x\")\n    c = create_all(\"x\")\n    d = remove_file(\"x\")\n    e = remove_directory(\"x\")\n    f = move(\"x\", \"y\")\n"
+    "${declarations.join("")}func main() -> Int:\n${calls}    0\n"
+
+
+pure func test_six_directory_operations_share_one_helper_fragment() -> Bool:
+    match emitted(directories_called()):
+        Err(_):
+            False
+        Ok(code):
+            occurrences(code, FS_HELPERS_RUNTIME)
+                .equals(1)
+                .and(occurrences(code, fs_list_directory_runtime(string_list_type())).equals(1))
+                .and(occurrences(code, FS_CREATE_DIRECTORY_RUNTIME).equals(1))
+                .and(occurrences(code, FS_CREATE_DIRECTORIES_RUNTIME).equals(1))
+                .and(occurrences(code, FS_REMOVE_FILE_RUNTIME).equals(1))
+                .and(occurrences(code, FS_REMOVE_DIRECTORY_RUNTIME).equals(1))
+                .and(occurrences(code, FS_RENAME_RUNTIME).equals(1))
+                .and(
+                    occurrences(
+                        code,
+                        "blorp_fs_rename(blorp_vl_0,blorp_vl_1,&blorp_runtime_2_error)",
+                    ).equals(1),
+                )
+
+
+private pure func tree_and_temporary_called() -> String:
+    declarations = [
+        WRITE_TEXT_DECLARATION,
+        "func remove_tree(path: String) -> Result[Void, Int]:\n    builtin(\"fs.remove_directory_tree\")\n",
+        "func temporary(parent: String, prefix: String) -> Result[String, Int]:\n    builtin(\"fs.create_temporary_directory\")\n",
+    ]
+    calls = "    a = store(\"x\", \"text\")\n    b = remove_tree(\"x\")\n    c = temporary(\"x\", \"y\")\n    0\n"
+    "${declarations.join("")}func main() -> Int:\n${calls}"
+
+
+-- The path helpers that write_text and both new operations call live in the
+-- shared fragment, so a program calling all three defines each once.
+pure func test_tree_and_temporary_directory_share_the_path_helpers_with_write_text() -> Bool:
+    match emitted(tree_and_temporary_called()):
+        Err(_):
+            False
+        Ok(code):
+            occurrences(code, FS_HELPERS_RUNTIME)
+                .equals(1)
+                .and(occurrences(code, FS_WRITE_TEXT_RUNTIME).equals(1))
+                .and(occurrences(code, FS_REMOVE_DIRECTORY_TREE_RUNTIME).equals(1))
+                .and(occurrences(code, FS_CREATE_TEMPORARY_DIRECTORY_RUNTIME).equals(1))
+                .and(code.starts_with(PROCESS_POSIX_PRELUDE))
+
+
+-- The tree removal passes its path and the code's address; the temporary
+-- directory passes both Strings, then its fresh String and the code.
+pure func test_tree_and_temporary_directory_calls_pass_their_payloads() -> Bool:
+    match emitted(tree_and_temporary_called()):
+        Err(_):
+            False
+        Ok(code):
+            occurrences(code, "blorp_fs_remove_directory_tree(blorp_vl_0,&blorp_runtime_1_error)")
+                .equals(1)
+                .and(
+                    occurrences(
+                        code,
+                        "struct blorp_string *blorp_runtime_2_value=NULL;int64_t blorp_runtime_2_error=0;",
+                    ).equals(1),
+                )
+                .and(
+                    occurrences(
+                        code,
+                        "blorp_fs_create_temporary_directory(blorp_vl_0,blorp_vl_1,&blorp_runtime_2_value,&blorp_runtime_2_error)",
+                    ).equals(1),
+                )
+
+
+private pure func lines_called() -> String:
+    calls = "    a = open(\"x\")\n    b = next(3, \"\")\n    c = close(3)\n    d = read(\"x\")\n    0\n"
+    "${OPEN_READ_DECLARATION}${NEXT_LINES_DECLARATION}${CLOSE_DECLARATION}${READ_TEXT_DECLARATION}func main() -> Int:\n${calls}"
+
+
+-- The buffer growth that read_text and next_lines share lives in the helper
+-- fragment, so a program calling both defines it once.
+pure func test_line_natives_share_the_helpers_with_read_text() -> Bool:
+    match emitted(lines_called()):
+        Err(_):
+            False
+        Ok(code):
+            occurrences(code, FS_HELPERS_RUNTIME)
+                .equals(1)
+                .and(occurrences(code, FS_READ_TEXT_RUNTIME).equals(1))
+                .and(occurrences(code, FS_OPEN_READ_RUNTIME).equals(1))
+                .and(occurrences(code, fs_next_lines_runtime(string_list_type())).equals(1))
+                .and(occurrences(code, FS_CLOSE_RUNTIME).equals(1))
+                .and(
+                    occurrences(
+                        code,
+                        "size_t blorp_fs_grown_capacity(size_t capacity,size_t maximum){",
+                    ).equals(1),
+                )
+                .and(code.starts_with(PROCESS_POSIX_PRELUDE))
+
+
+-- open_read's descriptor and close's Void success use the existing Int and
+-- Void shapes; next_lines passes the descriptor by value, then the borrowed
+-- carried line, then its fresh List[String] and the code.
+pure func test_line_natives_pass_their_payloads() -> Bool:
+    match emitted(lines_called()):
+        Err(_):
+            False
+        Ok(code):
+            occurrences(code, "int64_t blorp_runtime_1_value=0;int64_t blorp_runtime_1_error=0;")
+                .equals(1)
+                .and(
+                    occurrences(
+                        code,
+                        "blorp_fs_open_read(blorp_vl_0,&blorp_runtime_1_value,&blorp_runtime_1_error)",
+                    ).equals(1),
+                )
+                .and(
+                    occurrences(
+                        code,
+                        "${string_list_type()} blorp_runtime_2_value=NULL;int64_t blorp_runtime_2_error=0;",
+                    ).equals(1),
+                )
+                .and(
+                    occurrences(
+                        code,
+                        "blorp_fs_next_lines(blorp_vl_0,blorp_vl_1,&blorp_runtime_2_value,&blorp_runtime_2_error)",
+                    ).equals(1),
+                )
+                .and(
+                    occurrences(code, "blorp_fs_close(blorp_vl_0,&blorp_runtime_1_error)").equals(
+                        1,
+                    ),
+                )
+
+
+-- The batch is a fresh List[String] that the Ok constructor takes; main then
+-- drops the whole Result, and with it every line.
+pure func test_next_lines_alone_takes_and_drops_its_batch() -> Bool:
+    source = "${NEXT_LINES_DECLARATION}func main() -> Int:\n    first = next(3, \"\")\n    0\n"
+    match emitted(source):
+        Err(_):
+            False
+        Ok(code):
+            occurrences(code, ".payload.blorp_up_0={.blorp_uf_0=blorp_runtime_2_value}")
+                .equals(1)
+                .and(occurrences(code, "blorp_union_drop_0(blorp_owner_1);").equals(1))
+                .and(occurrences(code, fs_next_lines_runtime(string_list_type())).equals(1))
+                .and(occurrences(code, FS_OPEN_READ_RUNTIME).equals(0))
+                .and(occurrences(code, FS_CLOSE_RUNTIME).equals(0))
+
+
+TESTS: TestSuite = {
+    description = "fs builtin C emission",
+    tests = [
+        (
+            "two fs operations share one helper fragment",
+            test_helpers_are_emitted_once_for_two_operations,
+        ),
+        (
+            "three fs operations share one helper fragment",
+            test_helpers_are_emitted_once_for_three_operations,
+        ),
+        (
+            "a Void success passes only the Int code's address",
+            test_void_success_passes_only_the_error_code,
+        ),
+        (
+            "one fs operation emits the helpers once and not the other operation",
+            test_helpers_are_emitted_once_for_one_operation,
+        ),
+        (
+            "unused fs declarations select no fragments or POSIX prelude",
+            test_unused_declarations_select_no_fs_fragments,
+        ),
+        (
+            "results carry primitive payloads through out-parameters",
+            test_result_takes_primitive_payloads,
+        ),
+        (
+            "a listing's Ok takes a fresh List[String] out-parameter and the Result is dropped",
+            test_listing_takes_a_fresh_string_list_and_drops_it,
+        ),
+        (
+            "a listing alone emits the helpers and its fragment for the program's List[String]",
+            test_listing_alone_emits_its_fragment_for_the_string_list_type,
+        ),
+        (
+            "six directory operations share one helper fragment and emit each fragment once",
+            test_six_directory_operations_share_one_helper_fragment,
+        ),
+        (
+            "tree removal, a temporary directory and write_text define the shared path helpers once",
+            test_tree_and_temporary_directory_share_the_path_helpers_with_write_text,
+        ),
+        (
+            "tree removal and a temporary directory pass their payloads through out-parameters",
+            test_tree_and_temporary_directory_calls_pass_their_payloads,
+        ),
+        (
+            "the line natives and read_text define the shared buffer growth once",
+            test_line_natives_share_the_helpers_with_read_text,
+        ),
+        (
+            "open_read, next_lines and close pass their payloads through out-parameters",
+            test_line_natives_pass_their_payloads,
+        ),
+        (
+            "next_lines alone emits its fragment, and its batch is taken by Ok and dropped with the Result",
+            test_next_lines_alone_takes_and_drops_its_batch,
+        ),
+    ],
+}

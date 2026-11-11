@@ -101,9 +101,9 @@ Probed on 2026-11-09 against `390945503`, with scratch programs only.
    - **The directory layout works today.** With `--library-root`, the imports
      `io/error: code` and `io/error as E` both compile and run, and so does a
      relative `./error` import between two modules in `io/`. The parser reads
-     `a/b` as a library path (`consume_path_parts`, `syntax/parse.brp`), and
+     `a/b` as a library path (`consume_path_parts`, `common/syntax/parse.brp`), and
      the loader joins every part under the root (`import_path`,
-     `compile/load/load.brp`).
+     `common/analysis/load/load.brp`).
    - **The pinned seed accepts the same programs.** Nesting library modules,
      including ones the compiler imports, needs no seed rotation.
    - **The embedded layout does not work.** The generator

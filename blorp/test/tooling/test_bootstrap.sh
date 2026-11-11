@@ -7,13 +7,13 @@ scratch=$(mktemp -d "${TMPDIR:-/tmp}/blorp bootstrap.XXXXXX")
 trap 'chmod -R u+w "$scratch"; rm -rf "$scratch"' EXIT
 fixture="$scratch/repo with spaces"
 tools="$scratch/fake tools"
-mkdir -p "$fixture/scripts" "$fixture/blorp/src/utils" "$fixture/blorp/scripts" "$fixture/blorp/standard_library" "$tools"
+mkdir -p "$fixture/scripts" "$fixture/blorp/src/common/utils" "$fixture/blorp/scripts" "$fixture/blorp/standard_library" "$tools"
 fixture=$(cd "$fixture" && pwd -P)
 cp "$repo_root/blorp/Makefile" "$fixture/blorp/Makefile"
 # The embedded library's generator source and one library file: the fake seed
 # "compiles" the first and the file target's prerequisites name the second.
 printf '%s\n' '# stub generator' >"$fixture/blorp/scripts/embed_library.brp"
-printf '%s\n' '-- stub text helper the generator imports' >"$fixture/blorp/src/utils/text.brp"
+printf '%s\n' '-- stub text helper the generator imports' >"$fixture/blorp/src/common/utils/text.brp"
 printf '%s\n' '-- stub library file' >"$fixture/blorp/standard_library/stub.brp"
 if [ -f "$repo_root/scripts/blorp-compiler-bootstrap" ]; then
 	cp "$repo_root/scripts/blorp-compiler-bootstrap" "$fixture/scripts/"
@@ -333,7 +333,7 @@ make -s -C "$fixture/blorp" BLORP_CC="$tools/fake cc" >"$scratch/make.stdout" 2>
 : >"$TEST_CC_LOG"
 # Every input is older than the generator, which is older than the module, so only
 # the directory's modification time, made by the removal, can rebuild it.
-touch -t "$long_ago" "$fixture/blorp/standard_library/stub.brp" "$fixture/blorp/scripts/embed_library.brp" "$fixture/blorp/src/utils/text.brp" "$fixture/blorp/bootstrap.env"
+touch -t "$long_ago" "$fixture/blorp/standard_library/stub.brp" "$fixture/blorp/scripts/embed_library.brp" "$fixture/blorp/src/common/utils/text.brp" "$fixture/blorp/bootstrap.env"
 touch -t 200006010000 "$generated/embed_library"
 touch -t 200101010000 "$generated/embedded_library.brp"
 rm "$fixture/blorp/standard_library/second.brp"

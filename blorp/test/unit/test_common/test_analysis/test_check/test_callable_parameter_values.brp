@@ -1,0 +1,138 @@
+---
+`body_callable_parameter_values` lists the callable parameters a body uses as
+values: returned or stored, captured by a nested lambda, or passed as a value
+to a callable it calls (a forwarded creation). A parameter only forwarded to
+a callee as a callable operand is not a value use, and a data local never is.
+---
+import:
+    test: TestSuite
+    ../../../../../src/common/analysis/check/check: check, checked_functions
+    ../../../../../src/common/analysis/check/model as model
+    ../../../module_input: parse_modules
+
+
+-- Functions are numbered in declaration order.
+private SOURCE: String =
+    |pure func apply(callback: pure (Int) -> Int, value: Int) -> Int:
+    |    callback(value)
+    |pure func keep(callback: pure (Int) -> Int) -> pure (Int) -> Int:
+    |    callback
+    |pure func wrapped(callback: pure (Int) -> Int, value: Int) -> Int:
+    |    inner = pure func(item: Int) -> Int: callback(item)
+    |    inner(value)
+    |pure func forward(callback: pure (Int) -> Int, value: Int) -> Int:
+    |    apply(callback, value)
+    |pure func copy(value: Int) -> Int:
+    |    kept = value
+    |    kept
+    |pure func run(callback: pure (Int) -> Int, runner: pure (pure (Int) -> Int) -> Int) -> Int:
+    |    runner(callback)
+    |func main() -> Int:
+    |    0
+    |
+
+
+-- The query's answer for one function's body, and that body's own callable
+-- parameters in binding order.
+private record ParameterValues {
+    used: List[model.CallableParameterId],
+    declared: List[model.CallableParameterId],
+}
+
+
+private pure func parameter_values(position: Int) -> Option[ParameterValues]:
+    match parse_modules([{ source = SOURCE, targets = [] }]):
+        Err(_):
+            None
+        Ok(parsed):
+            match check(parsed):
+                Err(_):
+                    None
+                Ok(accepted):
+                    match checked_functions(accepted).functions.get(position):
+                        None:
+                            None
+                        Some(function):
+                            var declared: List[model.CallableParameterId] = []
+                            for binding in function.bindings:
+                                match binding.origin:
+                                    model.CallableParameterBinding(parameter):
+                                        declared = declared.append(parameter)
+                                    _:
+                                        void
+                            Some({
+                                used = model.body_callable_parameter_values(
+                                    function.bindings,
+                                    function.statements,
+                                    function.body,
+                                ),
+                                declared = declared,
+                            })
+
+
+-- The body uses its one callable parameter as a value, exactly once.
+private pure func uses_its_only_parameter(position: Int) -> Bool:
+    match parameter_values(position):
+        Some(values):
+            match (values.used, values.declared):
+                ([used], [declared]): used == declared
+                _: False
+        None:
+            False
+
+
+private pure func uses_no_parameter(position: Int) -> Bool:
+    match parameter_values(position):
+        Some(values): values.used.is_empty()
+        None: False
+
+
+pure func test_returned_parameter_is_a_value_use() -> Bool:
+    uses_its_only_parameter(1)
+
+
+pure func test_parameter_captured_by_a_nested_lambda_is_a_value_use() -> Bool:
+    uses_its_only_parameter(2)
+
+
+pure func test_parameter_forwarded_as_a_callable_operand_is_not_a_value_use() -> Bool:
+    uses_no_parameter(3)
+
+
+pure func test_data_local_read_is_not_a_callable_parameter_use() -> Bool:
+    uses_no_parameter(4)
+
+
+-- `runner` is only called; `callback`, its argument, is a forwarded creation.
+pure func test_parameter_passed_to_a_called_callable_is_a_value_use() -> Bool:
+    match parameter_values(5):
+        Some(values):
+            match (values.used, values.declared):
+                ([used], [callback, _]): used == callback
+                _: False
+        None:
+            False
+
+
+TESTS: TestSuite = {
+    description = "Callable parameters a checked body uses as values",
+    tests = [
+        ("a returned parameter is a value use", test_returned_parameter_is_a_value_use),
+        (
+            "a parameter captured by a nested lambda is a value use",
+            test_parameter_captured_by_a_nested_lambda_is_a_value_use,
+        ),
+        (
+            "a parameter forwarded as a callable operand is not a value use",
+            test_parameter_forwarded_as_a_callable_operand_is_not_a_value_use,
+        ),
+        (
+            "a data local read is not a callable parameter use",
+            test_data_local_read_is_not_a_callable_parameter_use,
+        ),
+        (
+            "a parameter passed to a called callable is a value use",
+            test_parameter_passed_to_a_called_callable_is_a_value_use,
+        ),
+    ],
+}

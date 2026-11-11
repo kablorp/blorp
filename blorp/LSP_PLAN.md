@@ -38,22 +38,22 @@ are highlighting, then go-to-definition, then find-references.
 
 - the `json` codec;
 - loader source snapshots: `load_program_with_sources`
-  (`src/compile/load/load.brp:722`, see `SOURCE_SNAPSHOTS_DECISIONS.md`);
+  (`src/common/analysis/load/load.brp:722`, see `SOURCE_SNAPSHOTS_DECISIONS.md`);
 - the embedded library (`1a68dbd3b`);
 - byte-range spans on every token and definition name
-  (`src/syntax/syntax.brp:8`);
+  (`src/common/syntax/syntax.brp:8`);
 - process `capture`, which writes and then closes `stdin: Option[String]`.
 
 **What is missing:**
 
 - **`check` requires `main`.** Without it, checking fails with `MissingMain`
-  (`src/compile/check/signatures.brp:188`).
+  (`src/common/analysis/check/signatures.brp:188`).
 - **Name uses go unrecorded.** Nothing keeps which definition a name
   resolved to.
 - **The lexer skips comments** in four places, and the formatter finds them
   again (`src/format/trivia.brp:185`).
 - **A failed lex keeps no tokens.** Names are interned only after a
-  successful scan (`src/syntax/lex.brp:1890`).
+  successful scan (`src/common/syntax/lex.brp:1890`).
 - **The console cannot read.** `print` always adds a newline and never
   flushes.
 - **Each phase reports only its first error.**
@@ -85,7 +85,7 @@ are highlighting, then go-to-definition, then find-references.
 
 ### Shape
 
-- **Compiler** (`src/syntax/`, `src/compile/`): pure analysis, with no
+- **Compiler** (`src/common/`): pure analysis, with no
   editor state.
 - **Language server** (`src/lsp/`): four pure modules.
   - `protocol`: framing, and JSON-RPC to and from `Json`.
@@ -113,7 +113,7 @@ holds `Entrypoint[FunctionId]`, so the types keep the cases apart.
 
 The lexer records each comment where it consumes one:
 
-- `code_comment_end` (`src/syntax/lex.brp:1119`), reached from 1012 and
+- `code_comment_end` (`src/common/syntax/lex.brp:1119`), reached from 1012 and
   1846;
 - `next_code_line` (1249);
 - `doc_block_end` (1196).
@@ -153,10 +153,10 @@ equality, the test wrapper) get no row.
 **Where rows are recorded.**
 
 - `namespace` records import entries (`import_row`,
-  `src/compile/namespace/namespace.brp:1058`).
+  `src/common/analysis/namespace/namespace.brp:1058`).
 - `check` records the rest.
 
-So `Occurrence` lives in a new `src/compile/occurrences.brp`. It is a
+So `Occurrence` lives in a new `src/common/analysis/occurrences.brp`. It is a
 `fixed record` with a payload-free `fixed union` kind, so rows are stored
 inline with no allocation each.
 
@@ -276,8 +276,8 @@ declaration only on request.
 
 **What doesn't.**
 - References from modules that import the file are missed. Asked in
-  `src/syntax/lex.brp`, references to `lex` miss
-  `src/compile/load/load.brp:526` and `src/format/format.brp:1030`.
+  `src/common/syntax/lex.brp`, references to `lex` miss
+  `src/common/analysis/load/load.brp:526` and `src/format/format.brp:1030`.
 - Rows that touch an edit stay missing until the file analyses again, and an
   edit's errors appear with the next request.
 
@@ -297,7 +297,7 @@ limitation.
 ## Code
 
 **Analysis without `main`.** Today the missing entry is an error inside
-signature checking (`src/compile/check/signatures.brp:176`):
+signature checking (`src/common/analysis/check/signatures.brp:176`):
 
 ```blorp
     entrypoint: Option[FunctionId] = match namespace.named_value(
@@ -313,7 +313,7 @@ signature checking (`src/compile/check/signatures.brp:176`):
         None: Err(signature_error(parsed.end, MissingMain))
 ```
 
-and `check` is the only entry point (`src/compile/check/check.brp:189`):
+and `check` is the only entry point (`src/common/analysis/check/check.brp:189`):
 
 ```blorp
 pure func check(program: ParsedProgram) -> Result[CheckedProgram, CheckFailure]:
@@ -337,8 +337,8 @@ pure func check(program: ParsedProgram) -> Result[CheckedProgram, CheckFailure]:
         None: Err(program.missing_main(analysis))
 ```
 
-**Comments.** Today `LexedProgram` (`src/syntax/syntax.brp:246`) has no
-comments, and `lex` (`src/syntax/lex.brp:1717`) fails with a bare
+**Comments.** Today `LexedProgram` (`src/common/syntax/syntax.brp:246`) has no
+comments, and `lex` (`src/common/syntax/lex.brp:1717`) fails with a bare
 `Diagnostic`:
 
 ```blorp
@@ -403,7 +403,7 @@ pure func lex(
 `DocumentationBlock`, `TrailingComment` or `OwnLineComment` by today's rules,
 and `fence_at` and `documentation_end` move out of `trivia.brp`.
 
-**The occurrence table** (`src/compile/occurrences.brp`):
+**The occurrence table** (`src/common/analysis/occurrences.brp`):
 
 ```blorp
 -- A name written in source, and the definition it resolved to.
@@ -517,10 +517,10 @@ union Command:
 ## Scope and non-goals
 
 **May touch:**
-- `src/syntax/` and `src/format/`;
-- `src/compile/{check,namespace,load}/`, for the analysis product and its
+- `src/common/syntax/` and `src/format/`;
+- `src/common/analysis/{check,namespace,load}/`, for the analysis product and its
   rows;
-- new code: `src/compile/occurrences.brp` and `src/lsp/`;
+- new code: `src/common/analysis/occurrences.brp` and `src/lsp/`;
 - `src/cli.brp` and `src/main.brp`;
 - `io/console`, the runtime and the builtin tables;
 - `editor/`, the README and the tests.
@@ -546,7 +546,7 @@ threads, incremental analysis, `Bytes` input, or grammar changes.
   - If nothing colours, stop and ask: VS Code first, or a plugin lexer,
     which would reopen the TextMate decision.
 - **Bootstrap.** A library call to a `builtin` label the seed lacks stops
-  the seed parsing the library (`src/syntax/parse.brp:4439`). That breaks
+  the seed parsing the library (`src/common/syntax/parse.brp:4439`). That breaks
   every seed-built target. So the console labels land alone, a rotation
   follows, and only then come the library functions.
 - **Latency.** Analysing `blorp/src/main.brp` (72,000 lines) may be slow;
@@ -608,8 +608,8 @@ Each landing starts with a failing test.
 
 | Landing | Tests |
 | --- | --- |
-| 1 | `test/unit/test_compile/test_check/`. A module without `main` analyses, and `check` of it reports `MissingMain` with the exact message, help and span. A malformed `main` fails both. |
-| 2 | `test/unit/test_syntax/test_lex/`: one case per comment site. Formatter suites are unchanged, and formatting the repository changes nothing. |
+| 1 | `test/unit/test_common/test_analysis/test_check/`. A module without `main` analyses, and `check` of it reports `MissingMain` with the exact message, help and span. A malformed `main` fails both. |
+| 2 | `test/unit/test_common/test_syntax/test_lex/`: one case per comment site. Formatter suites are unchanged, and formatting the repository changes nothing. |
 | 3 | An unclosed string keeps the tokens before it and drops its own. The loader's diagnostic is unchanged. |
 | 4 | One case per name kind, checking both spans. Mutation proof: stop recording one kind, and only its case fails. |
 | 5 | Direct C tests of the natives, under `test/runtime/`. |

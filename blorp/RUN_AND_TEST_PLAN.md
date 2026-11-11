@@ -27,7 +27,7 @@ linking with the C compiler and running.
   path, output written to two files, stdin from `/dev/null`, a required
   positive timeout, and no environment control (callers wrap with
   `/usr/bin/env NAME=value`, as `self_hosted_harness.brp:22` does). The child
-  runs in its own process group (`src/compile/runtime/process.brp:191-194`) so
+  runs in its own process group (`src/common/codegen/runtime/process.brp:191-194`) so
   a timeout can kill everything it started.
 - **The approved process API** (`PROCESS_DECISIONS.md`) replaces it with
   `Command`, `capture`, `output` and `find_program`, deletes `run_to_files` in
@@ -35,7 +35,7 @@ linking with the C compiler and running.
   it. Nothing is implemented.
 - **New natives need a seed rotation before the compiler can use them.** An
   unknown builtin label is a parse error ("unknown builtin operation",
-  `src/syntax/parse.brp:4323-4329`; labels in `src/syntax/syntax.brp:441-465`).
+  `src/common/syntax/parse.brp:4323-4329`; labels in `src/common/syntax/syntax.brp:441-465`).
   The pinned seed knows `process.run_to_files`; it does not know the new
   process natives.
 - **Flags in use**: the harness links with `-std=c11 -O0`, the diagnostics

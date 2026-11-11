@@ -1,0 +1,289 @@
+---
+Verification publishes every record and union of a verified program exactly
+once, each after every layout it stores by value. Emit defines C aggregates
+in this order, so a by-value field's type is always complete before its
+parent's definition.
+---
+import:
+    bool: Bool methods
+    int: Int methods
+    list: List methods
+    option: Option methods
+    result: Result methods
+    test: TestSuite
+    ../../../../../src/common/codegen/own/own as own
+    ../../../../../src/common/codegen/specialize/specialize as specialized
+    ../../../../../src/common/codegen/verify/verify:
+        AggregateDefinition(RecordDefinition, UnionDefinition),
+        VerifiedProgram,
+        aggregate_order,
+        verified_contents,
+        verify,
+    ../../../aggregate_order_inputs: DIAMOND, EMPTY_CATALOGUES, MIXED, ROOTS, owned
+
+
+private pure func verified(source: String) -> Option[VerifiedProgram]:
+    match owned(source).and_then(verify):
+        Ok(program): Some(program)
+        Err(_): None
+
+
+private pure func same_definition(left: AggregateDefinition, right: AggregateDefinition) -> Bool:
+    match (left, right):
+        (RecordDefinition(first), RecordDefinition(second)): first == second
+        (UnionDefinition(first), UnionDefinition(second)): first == second
+        _: False
+
+
+-- Where `wanted` first sits in `order`.
+private pure func position_in(
+    order: List[AggregateDefinition],
+    wanted: AggregateDefinition,
+) -> Option[Int]:
+    var position = 0
+    var found: Option[Int] = None
+    for definition in order:
+        if same_definition(definition, wanted):
+            found = Some(position)
+            break
+        position = position + 1
+    found
+
+
+private pure func appearances(order: List[AggregateDefinition], wanted: AggregateDefinition) -> Int:
+    var count = 0
+    for definition in order:
+        if same_definition(definition, wanted):
+            count = count + 1
+    count
+
+
+-- Every field of every variant, in order.
+private pure func payload_fields(layout: specialized.ConcreteUnion) -> List[specialized.TypeRef]:
+    var fields: List[specialized.TypeRef] = []
+    for variant in specialized.union_variants(layout):
+        fields = fields.concat(variant)
+    fields
+
+
+-- The layouts `definition` stores by value: inline and by-value records and
+-- unboxed unions. A managed record, a boxed union, a List and a callable are
+-- references, which need only a forward declaration.
+private pure func stored_by_value(
+    contents: own.OwnershipProgram,
+    definition: AggregateDefinition,
+) -> List[AggregateDefinition]:
+    fields: List[specialized.TypeRef] = match definition:
+        RecordDefinition(index):
+            match contents.records.get(index):
+                Some(layout): specialized.record_fields(layout)
+                None: []
+        UnionDefinition(index):
+            match contents.unions.get(index):
+                Some(layout): payload_fields(layout)
+                None: []
+    var children: List[AggregateDefinition] = []
+    for field in fields:
+        match field:
+            specialized.RecordType(id):
+                child = specialized.record_number(id)
+                match contents.records.get(child):
+                    Some(specialized.InlineFields(_) | specialized.ValueFields(_)):
+                        children = children.append(RecordDefinition(child))
+                    _:
+                        void
+            specialized.UnionType(id):
+                child = specialized.union_number(id)
+                match contents.unions.get(child):
+                    Some(specialized.PlainCases(_) | specialized.OwningCases(_)):
+                        children = children.append(UnionDefinition(child))
+                    _:
+                        void
+            _:
+                void
+    children
+
+
+-- Every catalogue row appears exactly once, and nothing else does.
+private pure func lists_each_layout_once(program: VerifiedProgram) -> Bool:
+    contents = verified_contents(program)
+    order = aggregate_order(program)
+    var once = order.length() == (contents.records.length() + contents.unions.length())
+    var index = 0
+    while index < contents.records.length():
+        once = once.and(appearances(order, RecordDefinition(index)) == 1)
+        index = index + 1
+    index = 0
+    while index < contents.unions.length():
+        once = once.and(appearances(order, UnionDefinition(index)) == 1)
+        index = index + 1
+    once
+
+
+-- Each layout stored by value appears earlier than the layout storing it.
+private pure func children_come_first(program: VerifiedProgram) -> Bool:
+    contents = verified_contents(program)
+    order = aggregate_order(program)
+    var ordered: Bool = True
+    var position = 0
+    for definition in order:
+        for child in stored_by_value(contents, definition):
+            match position_in(order, child):
+                Some(child_position): ordered = ordered.and(child_position < position)
+                None: ordered = False
+        position = position + 1
+    ordered
+
+
+private pure func by_value_edges(program: VerifiedProgram) -> Int:
+    contents = verified_contents(program)
+    var count = 0
+    for definition in aggregate_order(program):
+        count = count + stored_by_value(contents, definition).length()
+    count
+
+
+-- Whether some record stores a union by value and some union stores a
+-- record by value. Then neither all records first nor all unions first can
+-- define every child before its parent, so the order must interleave kinds.
+private pure func stores_across_kinds_both_ways(program: VerifiedProgram) -> Bool:
+    contents = verified_contents(program)
+    var record_stores_union: Bool = False
+    var union_stores_record: Bool = False
+    for definition in aggregate_order(program):
+        for child in stored_by_value(contents, definition):
+            match (definition, child):
+                (RecordDefinition(_), UnionDefinition(_)): record_stores_union = True
+                (UnionDefinition(_), RecordDefinition(_)): union_stores_record = True
+                _: void
+    record_stores_union.and(union_stores_record)
+
+
+private pure func well_ordered(program: VerifiedProgram) -> Bool:
+    lists_each_layout_once(program).and(children_come_first(program))
+
+
+pure func test_empty_catalogues_publish_an_empty_order() -> Bool:
+    match verified(EMPTY_CATALOGUES):
+        None:
+            False
+        Some(program):
+            contents = verified_contents(program)
+            contents.records
+                .is_empty()
+                .and(contents.unions.is_empty())
+                .and(aggregate_order(program).is_empty())
+
+
+pure func test_shared_leaf_of_a_diamond_comes_once_before_both_parents() -> Bool:
+    match verified(DIAMOND):
+        None:
+            False
+        Some(program):
+            contents = verified_contents(program)
+            all_inline = contents.records.all(pure func(layout: specialized.ConcreteRecord) -> Bool:
+                match layout:
+                    specialized.InlineFields(_): True
+                    _: False
+            )
+            -- Top stores Left and Right, and each of them stores Leaf.
+            (contents.records.length() == 4)
+                .and(all_inline)
+                .and(by_value_edges(program) == 4)
+                .and(well_ordered(program))
+
+
+pure func test_mixed_records_and_unions_follow_their_stored_layouts() -> Bool:
+    match verified(MIXED):
+        None:
+            False
+        Some(program):
+            contents = verified_contents(program)
+            (contents.records.length() == 3)
+                .and(contents.unions.length() == 2)
+                .and(stores_across_kinds_both_ways(program))
+                .and(well_ordered(program))
+
+
+pure func test_boxed_and_managed_layouts_are_still_listed() -> Bool:
+    match verified(ROOTS):
+        None:
+            False
+        Some(program):
+            contents = verified_contents(program)
+            boxed = contents.unions.any(pure func(layout: specialized.ConcreteUnion) -> Bool:
+                match layout:
+                    specialized.BoxedCases(_): True
+                    _: False
+            )
+            managed = contents.records.any(pure func(layout: specialized.ConcreteRecord) -> Bool:
+                match layout:
+                    specialized.CountedFields(_): True
+                    _: False
+            )
+            boxed
+                .and(managed)
+                .and(well_ordered(program))
+
+
+-- Leaf is the diamond's only record of one Int, and Top its only record of
+-- two records, whose first field is Left.
+private pure func with_leaf_storing_left(
+    program: own.OwnershipProgram,
+) -> Option[own.OwnershipProgram]:
+    var left: Option[specialized.TypeRef] = None
+    for layout in program.records:
+        match specialized.record_fields(layout):
+            [specialized.RecordType(first), specialized.RecordType(_)]:
+                left = Some(specialized.RecordType(first))
+            _:
+                void
+    left.map(pure func(stored: specialized.TypeRef) -> own.OwnershipProgram:
+        records = program.records.map(
+            pure func(layout: specialized.ConcreteRecord) -> specialized.ConcreteRecord:
+                match specialized.record_fields(layout):
+                    [specialized.IntegerType(_)]: specialized.InlineFields([stored])
+                    _: layout
+        )
+        { program | records = records }
+    )
+
+
+-- Leaf storing Left closes Leaf -> Left -> Leaf by value, which no C layout
+-- can hold, so no order exists to publish.
+pure func test_by_value_cycle_is_rejected() -> Bool:
+    rewritten: Option[own.OwnershipProgram] = match owned(DIAMOND):
+        Ok(program): with_leaf_storing_left(program)
+        Err(_): None
+    match rewritten:
+        None:
+            False
+        Some(program):
+            match verify(program):
+                Ok(_):
+                    False
+                Err(error):
+                    (error.message == "ownership verification failed: aggregate layouts form a by-value cycle").and(
+                        error.help == "report this compiler error with the input program",
+                    )
+
+
+TESTS: TestSuite = {
+    description = "Verified aggregate order",
+    tests = [
+        ("empty catalogues publish an empty order", test_empty_catalogues_publish_an_empty_order),
+        (
+            "the shared leaf of a diamond comes once before both parents",
+            test_shared_leaf_of_a_diamond_comes_once_before_both_parents,
+        ),
+        (
+            "mixed records and unions follow their stored layouts",
+            test_mixed_records_and_unions_follow_their_stored_layouts,
+        ),
+        (
+            "boxed and managed layouts are still listed",
+            test_boxed_and_managed_layouts_are_still_listed,
+        ),
+        ("a by-value cycle is rejected", test_by_value_cycle_is_rejected),
+    ],
+}

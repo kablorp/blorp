@@ -1,0 +1,246 @@
+import:
+    bool: not, or
+    int: Int methods
+    list: List methods
+    option: Option methods
+    path: dirname
+    result: Result methods
+    string: String methods
+    test: TestSuite
+    ../../../src/common/syntax/names: name_spelling
+    ../../../src/common/syntax/parse:
+        ImportOrigin(RelativeImport, LibraryImport),
+        ParsedModuleContents,
+    ../test_format/repository_sources: SourceFile, parsed_source, repository_sources
+
+
+-- A layer's directory and the only directories and files its modules may import
+-- from, as allow-lists so that an import of `main`, a command directory or a new
+-- sibling is rejected too. Library imports name no file.
+--
+-- Inside `common/`, layers import only downward: `utils/`; `syntax/` and
+-- `utils/`; `analysis/`, `syntax/` and `utils/` (and the generated embedded
+-- library); `codegen/` and all of those. Because every `common/` layer lists
+-- only `common/` directories, no `common/` module imports `main.brp`,
+-- `cli.brp` or a command directory.
+private record Layer {
+    directory: String,
+    allowed: List[String],
+}
+
+
+private UTILS_LAYER: Layer = {
+    directory = "blorp/src/common/utils",
+    allowed = ["blorp/src/common/utils"],
+}
+
+
+private SYNTAX_LAYER: Layer = {
+    directory = "blorp/src/common/syntax",
+    allowed = ["blorp/src/common/syntax", "blorp/src/common/utils"],
+}
+
+
+-- `blorp/build/generated` is the embedded library `load.brp` imports.
+private ANALYSIS_LAYER: Layer = {
+    directory = "blorp/src/common/analysis",
+    allowed = [
+        "blorp/src/common/analysis",
+        "blorp/src/common/syntax",
+        "blorp/src/common/utils",
+        "blorp/build/generated",
+    ],
+}
+
+
+private CODEGEN_LAYER: Layer = {
+    directory = "blorp/src/common/codegen",
+    allowed = [
+        "blorp/src/common/codegen",
+        "blorp/src/common/analysis",
+        "blorp/src/common/syntax",
+        "blorp/src/common/utils",
+    ],
+}
+
+
+-- TEMPORARY: `blorp/src/cli.brp` is allowed only until step 2 of
+-- SOURCE_LAYOUT_PLAN.md moves `source_walk.brp`'s imports into `common/cli/`;
+-- remove it then. `format/` never imports `analysis/` or `codegen/`.
+private FORMAT_LAYER: Layer = {
+    directory = "blorp/src/format",
+    allowed = [
+        "blorp/src/format",
+        "blorp/src/common/syntax",
+        "blorp/src/common/utils",
+        "blorp/src/cli",
+    ],
+}
+
+
+-- A function, because a constant cannot name other constants.
+private pure func all_layers() -> List[Layer]:
+    [UTILS_LAYER, SYNTAX_LAYER, ANALYSIS_LAYER, CODEGEN_LAYER, FORMAT_LAYER]
+
+
+private pure func is_inside(path: String, directory: String) -> Bool:
+    or(path == directory, path.starts_with(directory + "/"))
+
+
+-- Each relative import of `contents`, resolved against `file_path`'s directory
+-- into the repository-relative path it names. A part with no spelling resolves
+-- to a path inside no layer, so it is reported like any other bad import.
+private pure func relative_import_targets(
+    file_path: String,
+    contents: ParsedModuleContents,
+) -> List[String]:
+    var targets: List[String] = []
+    for row in contents.imports:
+        match row.path.origin:
+            LibraryImport:
+                void
+            RelativeImport(parents):
+                var target = dirname(file_path)
+                for _ in 0..parents:
+                    target = dirname(target)
+                for part in row.path.parts:
+                    spelling = name_spelling(contents.names, part).get_or("<unspelled>")
+                    target = target + "/" + spelling
+                targets = targets.append(target)
+    targets
+
+
+-- One line per import of `file` outside what `layer` allows, naming the file
+-- and the resolved path; a file that does not parse is one line too.
+private pure func layer_violations(layer: Layer, file: SourceFile) -> List[String]:
+    match parsed_source(file.text):
+        Err(_):
+            ["${file.path}: does not parse"]
+        Ok(parsed):
+            relative_import_targets(file.path, parsed.contents)
+                .filter(
+                    pure func(target: String): layer.allowed
+                        .any(pure func(directory: String): target.is_inside(directory))
+                        .not(),
+                )
+                .map(
+                    pure func(target: String): "${file.path} imports ${target}, outside what ${layer.directory} may import",
+                )
+
+
+private pure func files_in(layer: Layer, files: List[SourceFile]) -> List[SourceFile]:
+    files.filter(pure func(file: SourceFile): file.path.is_inside(layer.directory))
+
+
+pure func all_violations(files: List[SourceFile]) -> List[String]:
+    var violations: List[String] = []
+    for layer in all_layers():
+        for file in files_in(layer, files):
+            violations = violations.concat(layer_violations(layer, file))
+    violations
+
+
+func test_every_layer_imports_only_what_it_may() -> Bool:
+    match repository_sources():
+        Err(error):
+            print_error(error)
+            False
+        Ok(files):
+            violations = all_violations(files)
+            for violation in violations:
+                print_error(violation)
+            violations.is_empty()
+
+
+-- The rules are checked on text, so they are proved by imports they must reject.
+pure func test_a_format_module_importing_analysis_is_reported() -> Bool:
+    file: SourceFile = {
+        path = "blorp/src/format/example.brp",
+        text = "import:\n    ../common/analysis/check/check: check\n    ../common/syntax/lex: lex\n\n\nVALUE: Int = 1\n",
+    }
+    expected = [
+        "blorp/src/format/example.brp imports blorp/src/common/analysis/check/check, outside what blorp/src/format may import",
+    ]
+    layer_violations(FORMAT_LAYER, file) == expected
+
+
+pure func test_a_syntax_module_importing_the_formatter_or_main_is_reported() -> Bool:
+    file: SourceFile = {
+        path = "blorp/src/common/syntax/example.brp",
+        text = "import:\n    ./lex: lex\n    ../../format/format: format_source\n    ../../main: main\n    ../utils/text: concat\n\n\nVALUE: Int = 1\n",
+    }
+    expected = [
+        "blorp/src/common/syntax/example.brp imports blorp/src/format/format, outside what blorp/src/common/syntax may import",
+        "blorp/src/common/syntax/example.brp imports blorp/src/main, outside what blorp/src/common/syntax may import",
+    ]
+    layer_violations(SYNTAX_LAYER, file) == expected
+
+
+pure func test_a_common_module_importing_the_old_compile_directory_is_reported() -> Bool:
+    file: SourceFile = {
+        path = "blorp/src/common/utils/example.brp",
+        text = "import:\n    ../../compile/x: x\n\n\nVALUE: Int = 1\n",
+    }
+    expected = [
+        "blorp/src/common/utils/example.brp imports blorp/src/compile/x, outside what blorp/src/common/utils may import",
+    ]
+    layer_violations(UTILS_LAYER, file) == expected
+
+
+pure func test_syntax_importing_analysis_is_reported() -> Bool:
+    file: SourceFile = {
+        path = "blorp/src/common/syntax/example.brp",
+        text = "import:\n    ../analysis/check/check: check\n\n\nVALUE: Int = 1\n",
+    }
+    expected = [
+        "blorp/src/common/syntax/example.brp imports blorp/src/common/analysis/check/check, outside what blorp/src/common/syntax may import",
+    ]
+    layer_violations(SYNTAX_LAYER, file) == expected
+
+
+pure func test_analysis_importing_codegen_is_reported() -> Bool:
+    file: SourceFile = {
+        path = "blorp/src/common/analysis/check/example.brp",
+        text = "import:\n    ../../codegen/emit/emit: emit\n    ../../syntax/syntax: Span\n    ../../../../build/generated/embedded_library: EMBEDDED_LIBRARY\n\n\nVALUE: Int = 1\n",
+    }
+    expected = [
+        "blorp/src/common/analysis/check/example.brp imports blorp/src/common/codegen/emit/emit, outside what blorp/src/common/analysis may import",
+    ]
+    layer_violations(ANALYSIS_LAYER, file) == expected
+
+
+pure func test_a_common_module_importing_the_cli_is_reported() -> Bool:
+    file: SourceFile = {
+        path = "blorp/src/common/syntax/example.brp",
+        text = "import:\n    ../../cli: parse_command\n\n\nVALUE: Int = 1\n",
+    }
+    expected = [
+        "blorp/src/common/syntax/example.brp imports blorp/src/cli, outside what blorp/src/common/syntax may import",
+    ]
+    layer_violations(SYNTAX_LAYER, file) == expected
+
+
+TESTS: TestSuite = {
+    description = "Source layer dependencies",
+    tests = [
+        ("every layer imports only what it may", test_every_layer_imports_only_what_it_may),
+        (
+            "a format module importing analysis is reported",
+            test_a_format_module_importing_analysis_is_reported,
+        ),
+        (
+            "a syntax module importing the formatter or main is reported, every one",
+            test_a_syntax_module_importing_the_formatter_or_main_is_reported,
+        ),
+        (
+            "a common module importing the old compile directory is reported",
+            test_a_common_module_importing_the_old_compile_directory_is_reported,
+        ),
+        ("syntax importing analysis is reported", test_syntax_importing_analysis_is_reported),
+        ("analysis importing codegen is reported", test_analysis_importing_codegen_is_reported),
+        (
+            "a common module importing the cli is reported",
+            test_a_common_module_importing_the_cli_is_reported,
+        ),
+    ],
+}

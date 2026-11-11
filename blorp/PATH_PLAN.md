@@ -20,8 +20,8 @@ for errors.
   `rename(source, destination)`). Callers join paths by hand: about 120 `+ "/" +`
   or `"${dir}/…"` sites in `test/`. The separator is declared three times, the
   last component is parsed twice, and "under this directory" is written three
-  ways (`src/cli.brp`, `src/syntax/source.brp`, `src/source_walk.brp`,
-  `src/compile/load/load.brp`).
+  ways (`src/cli.brp`, `src/common/syntax/source.brp`, `src/format/source_walk.brp`,
+  `src/common/analysis/load/load.brp`).
 - **Errors are broader than the operation.** Every `io/fs` operation returns
   `IOError`, whose kind has 15 variants. `read_text` cannot return
   `AlreadyExists`, `DirectoryNotEmpty`, `ReadOnlyFilesystem`, `NoSpace`,
@@ -30,7 +30,7 @@ for errors.
   later. `find_program` can produce 2 of `ProcessErrorKind`'s 9 variants.
   `get_current_directory` returns `Result[String, String]`.
 - **Naming case is not enforced.** Only type parameters must start with a
-  capital (`syntax/parse.brp`, `valid_type_parameter_name`). This compiles
+  capital (`common/syntax/parse.brp`, `valid_type_parameter_name`). This compiles
   at 9f29a0ebc:
 
   ```blorp
@@ -180,7 +180,7 @@ Made to fill gaps in the decisions above, and confirmed by Keith on
 **Classified once, at the lexer.** The lexer already scans each identifier's
 bytes; it records the result on the token as a closed type, so no later phase
 reads a spelling to decide anything (`valid_type_parameter_name`'s comment in
-`syntax/parse.brp` anticipates this). A single capital word fits two forms,
+`common/syntax/parse.brp` anticipates this). A single capital word fits two forms,
 so the type has one case for it:
 
 ```blorp
@@ -329,7 +329,7 @@ U8 `InvalidUtf8`, CDR `ChangedDuringRemoval`, OS `OtherOs(Int)`.
 | `temporary_directory` | `with_temporary_directory` | `TemporaryDirectoryError` | see below |
 
 The sets come from an audit of the runtime at 70f8b7479
-(`src/compile/runtime/fs.brp`, `process.brp`, `system.brp`) and the system
+(`src/common/codegen/runtime/fs.brp`, `process.brp`, `system.brp`) and the system
 calls each native makes, on the three supported 64-bit targets; a kind
 reachable only on 32-bit systems is left out.
 
@@ -354,7 +354,7 @@ reachable only on 32-bit systems is left out.
 working directory outside the process's root, today's "native path must be
 nonempty and absolute" message; the "exceeds the String capacity" case
 becomes `OtherOs`. Today's builtin returns English text
-(`src/compile/runtime/system.brp`), and the compiler calls it (`load.brp`),
+(`src/common/codegen/runtime/system.brp`), and the compiler calls it (`load.brp`),
 so a new builtin that returns a code lands first, and the seed learns it
 before the library uses it.
 
@@ -455,7 +455,7 @@ unchanged; messages that print a process error add the program the same way.
        `dict_ops`;
      - the two `count` parameters in `parse.brp` become `_` after landing 5,
        because the pinned seed cannot parse `_` parameters.
-2. **Qualified variants.** The parser's new syntax (`syntax/syntax.brp`,
+2. **Qualified variants.** The parser's new syntax (`common/syntax/syntax.brp`,
    `parse.brp`), the checker's resolution (`check/constructors.brp`,
    `patterns.brp`, `expressions.brp`, `bodies.brp`), diagnostics
    (`errors.brp`, `render.brp`), a namespace query from a union and variant

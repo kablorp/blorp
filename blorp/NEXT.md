@@ -129,7 +129,7 @@ None of these is planned yet. Each wants its own short design or brief.
   give the call every type. A never-returning builtin result, or a bottom type,
   would replace the pair; do not copy it as a pattern.
 - **Native tables repeat `process_helpers = False`** in 14 entries of
-  `src/compile/runtime/system.brp`. A default, or one grouped constructor,
+  `src/common/codegen/runtime/system.brp`. A default, or one grouped constructor,
   could remove them.
 - **Constants cannot call functions,** so a `Bytes` constant such as a file
   signature must be written as a function.

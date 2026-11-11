@@ -1,0 +1,596 @@
+import:
+    int: Int methods
+    ../../analysis/namespace/builtins:
+        IntegerFormat(Int64Format),
+        RuntimeOperation(StringConcat, StringAppendInt, ListAppend, ListSet, ListConcat),
+    ../../utils/text: concat
+    ../specialize/specialize:
+        RecordInstanceId,
+        TypeRef(
+            VoidType,
+            IntegerType,
+            FloatType,
+            StringType,
+            ListType,
+            CallableType,
+            RecordType,
+            UnionType,
+        ),
+        UnionInstanceId,
+        VariantInstanceId,
+
+
+private union ElementTerminal:
+    VoidElement
+    IntElement
+    FloatElement
+    StringElement
+    RecordElement(RecordInstanceId)
+    UnionElement(UnionInstanceId)
+    CallableElement(List[TypeRef], TypeRef)
+
+
+private record ElementKey {
+    depth: Int,
+    terminal: ElementTerminal,
+}
+
+
+-- A disposable emission key, never a type or layout authority. Its factory
+-- retains full nominal instance identity and counts only outer List layers.
+opaque type ListElementKey = ElementKey
+
+
+implements Equatable for ListElementKey:
+    pure func equals(left: Self, right: Self) -> Bool:
+        from_opaque ListElementKey(left) == from_opaque ListElementKey(right)
+
+
+private pure func terminal_key(terminal: ElementTerminal, depth: Int) -> ListElementKey:
+    into_opaque ListElementKey({ depth = depth, terminal = terminal })
+
+
+private pure func integer_terminal(format: IntegerFormat) -> ElementTerminal:
+    match format:
+        Int64Format: IntElement
+
+
+private pure func integer_suffix(format: IntegerFormat) -> String:
+    match format:
+        Int64Format: "i"
+
+
+private pure func element_key_at_depth(element: TypeRef, depth: Int) -> ListElementKey:
+    match element:
+        ListType(child): child.element_key_at_depth(depth + 1)
+        VoidType: terminal_key(VoidElement, depth)
+        IntegerType(format): terminal_key(integer_terminal(format), depth)
+        FloatType: terminal_key(FloatElement, depth)
+        StringType: terminal_key(StringElement, depth)
+        RecordType(id): terminal_key(RecordElement(id), depth)
+        UnionType(id): terminal_key(UnionElement(id), depth)
+        CallableType(parameters, result): terminal_key(CallableElement(parameters, result), depth)
+
+
+pure func list_element_key(element: TypeRef) -> ListElementKey:
+    element.element_key_at_depth(0)
+
+
+pure func list_key_depth(key: ListElementKey) -> Int:
+    from_opaque ListElementKey(key).depth
+
+
+-- Consumers peel exactly the depth produced by the factory. A terminal key
+-- is unchanged; this total projection does not invent an element or layout.
+pure func list_child_key(key: ListElementKey) -> ListElementKey:
+    contents = from_opaque ListElementKey(key)
+    if contents.depth > 0:
+        into_opaque ListElementKey({ contents | depth = contents.depth - 1 })
+    else:
+        key
+
+
+private VOID_RANK: Int = 0
+private INT_RANK: Int = 1
+private FLOAT_RANK: Int = 2
+private STRING_RANK: Int = 3
+private RECORD_RANK: Int = 4
+private UNION_RANK: Int = 5
+private CALLABLE_RANK: Int = 6
+private NO_NOMINAL_ORDINAL: Int = 0
+
+
+pure func list_key_rank(key: ListElementKey) -> Int:
+    match from_opaque ListElementKey(key).terminal:
+        VoidElement: VOID_RANK
+        IntElement: INT_RANK
+        FloatElement: FLOAT_RANK
+        StringElement: STRING_RANK
+        RecordElement(_): RECORD_RANK
+        UnionElement(_): UNION_RANK
+        CallableElement(_, _): CALLABLE_RANK
+
+
+pure func list_key_is_callable(key: ListElementKey) -> Bool:
+    match from_opaque ListElementKey(key).terminal:
+        CallableElement(_, _): True
+        _: False
+
+
+pure func list_key_ordinal(key: ListElementKey) -> Int:
+    match from_opaque ListElementKey(key).terminal:
+        RecordElement(id):
+            id.record_number()
+        UnionElement(id):
+            id.union_number()
+        VoidElement | IntElement | FloatElement | StringElement | CallableElement(_, _):
+            NO_NOMINAL_ORDINAL
+
+
+-- The `append_*` name writers add a C identifier to `output` in place;
+-- the String-returning wrappers serve the runtime-text templates and tests.
+pure func append_list_suffix(output: String, key: ListElementKey) -> String:
+    prefix = output
+        .append_int(key.list_key_depth())
+        .concat("_")
+    match from_opaque ListElementKey(key).terminal:
+        VoidElement:
+            prefix.concat("v")
+        IntElement:
+            prefix.concat("i")
+        FloatElement:
+            prefix.concat("f")
+        StringElement:
+            prefix.concat("s")
+        RecordElement(id):
+            prefix
+                .concat("r")
+                .append_int(id.record_number())
+        UnionElement(id):
+            prefix
+                .concat("u")
+                .append_int(id.union_number())
+        CallableElement(parameters, result):
+            prefix
+                .concat("c")
+                .append_callable_suffix(parameters, result)
+
+
+pure func list_suffix(key: ListElementKey) -> String:
+    "".append_list_suffix(key)
+
+
+-- Serialization happens after typed equality; delimiters retain every kind,
+-- arity, nesting boundary and nominal instance ordinal without a hash identity.
+private pure func append_type_suffix(output: String, value: TypeRef) -> String:
+    match value:
+        VoidType:
+            output.concat("v")
+        IntegerType(format):
+            output.concat(integer_suffix(format))
+        FloatType:
+            output.concat("f")
+        StringType:
+            output.concat("s")
+        ListType(element):
+            output
+                .concat("l")
+                .append_type_suffix(element)
+                .concat("e")
+        RecordType(id):
+            output
+                .concat("r")
+                .append_int(id.record_number())
+                .concat("e")
+        UnionType(id):
+            output
+                .concat("u")
+                .append_int(id.union_number())
+                .concat("e")
+        CallableType(parameters, result):
+            output
+                .concat("c")
+                .append_callable_suffix(parameters, result)
+
+
+pure func append_callable_suffix(
+    output: String,
+    parameters: List[TypeRef],
+    result: TypeRef,
+) -> String:
+    var suffix = output
+        .concat("p")
+        .append_int(parameters.length())
+        .concat("_")
+    for parameter in parameters:
+        suffix = suffix
+            .append_type_suffix(parameter)
+            .concat("_")
+    suffix
+        .concat("r_")
+        .append_type_suffix(result)
+        .concat("_e")
+
+
+pure func callable_suffix(parameters: List[TypeRef], result: TypeRef) -> String:
+    "".append_callable_suffix(parameters, result)
+
+
+pure func append_list_c_type(output: String, key: ListElementKey) -> String:
+    output
+        .concat("struct blorp_l_")
+        .append_list_suffix(key)
+        .concat("*")
+
+
+pure func list_c_type(key: ListElementKey) -> String:
+    "".append_list_c_type(key)
+
+
+-- Emitted once for all List layouts. One shared slot policy; callers supply
+-- the concrete root/element byte limit. Use the same ordinary linkage as other
+-- emitted List runtime utilities: a program may need only exact-sized
+-- constructors, leaving growth unused. Diagnostic builds also count the live
+-- owners of every layout's immortal empty root, which dup and drop otherwise
+-- skip, so a missing or extra dup or drop of `[]` still fails strict leak
+-- checking at exit; normal builds keep only the address test. The count is one
+-- total across all layouts, so an extra drop on one layout can cancel a missing
+-- drop on another: a limit on precision, never a false failure.
+--
+-- `blorp_list_copy_capacity` is the capacity of a copying append or concat,
+-- whose result is about to be appended to again. Sized exactly, it would resize
+-- at once, and `[]` is immortal, so every List built up from `[]` starts as
+-- such a copy. A copy floors at the first growth's capacity, clamped to
+-- `maximum` for elements too large for four slots. An empty join
+-- stays empty: it implies no later append. `required` is at most `maximum`;
+-- callers check it first.
+LIST_SHARED_RUNTIME: String =
+    raw
+        |enum {BLORP_LIST_DEFAULT_CAPACITY=4};
+        |size_t blorp_list_capacity(size_t current,size_t required,size_t maximum){
+        |if((uintmax_t)maximum>(uintmax_t)INT64_MAX)maximum=(size_t)INT64_MAX;
+        |if(current>maximum||required>maximum)abort();
+        |size_t capacity=current;
+        |if(capacity<BLORP_LIST_DEFAULT_CAPACITY)capacity=maximum<BLORP_LIST_DEFAULT_CAPACITY?maximum:BLORP_LIST_DEFAULT_CAPACITY;
+        |while(capacity<required)capacity=capacity>maximum/2?maximum:capacity*2;
+        |return capacity;
+        |}
+        |size_t blorp_list_copy_capacity(size_t required,size_t maximum){
+        |const size_t first_growth=maximum<BLORP_LIST_DEFAULT_CAPACITY?maximum:BLORP_LIST_DEFAULT_CAPACITY;
+        |return required==0||required>=first_growth?required:first_growth;
+        |}
+        |#if BLORP_MEMORY_DIAGNOSTICS
+        |static atomic_llong blorp_list_empty_owners;
+        |void *blorp_list_empty_acquire(const void *root){atomic_fetch_add_explicit(&blorp_list_empty_owners,1,memory_order_relaxed);return (void *)root;}
+        |void blorp_list_empty_release(void){atomic_fetch_sub_explicit(&blorp_list_empty_owners,1,memory_order_relaxed);}
+        |int blorp_list_empty_finish(int requested_exit_status){
+        |const long long owners=atomic_load_explicit(&blorp_list_empty_owners,memory_order_relaxed);
+        |if(!blorp_memory_strict||owners==0)return requested_exit_status;
+        |fprintf(stderr,"blorp: leak check: unbalanced empty list owners: %lld\n",owners);
+        |return BLORP_STRICT_LEAK_EXIT_STATUS;
+        |}
+        |#else
+        |#define blorp_list_empty_acquire(root) ((void *)(root))
+        |#define blorp_list_empty_release() ((void)0)
+        |#define blorp_list_empty_finish(requested_exit_status) (requested_exit_status)
+        |#endif
+        |
+
+
+-- A fresh root named `name` with `count` slots, published empty; callers
+-- initialize each slot through list_slot_store so length never exceeds
+-- initialized storage. Helpers and inline literal construction share it.
+pure func list_root_allocation(declaration: String, name: String, count: String) -> String:
+    "${declaration} ${name}=blorp_memory_allocate(sizeof *${name}+(size_t)${count}*sizeof *${name}->values);".concat(
+        "if(!${name})abort();atomic_init(&${name}->references,1);${name}->length=0;${name}->capacity=(size_t)${count};",
+    )
+
+
+private pure func empty_root_name(suffix: String) -> String:
+    "blorp_list_empty_${suffix}"
+
+
+-- `[]` names its layout's one immortal root instead of allocating. The root's
+-- address is its marker: dup and drop, the only code that changes a List count
+-- after allocation, skip it. Its count therefore keeps its static zero
+-- initialization, never the 1 a consumed update needs to write in place, so
+-- every update copies the root and none writes, frees or resizes it. Every
+-- thread shares it; `const` storage turns a stray write into a fault. A large
+-- starting count would also never reach 0 or 1, but every dup and drop would
+-- then write one location shared by all threads, the root could not be
+-- read-only, and the argument that the count stays far from 1 weakens where
+-- size_t is 32 bits.
+pure func list_empty_root(key: ListElementKey) -> String:
+    "(${key.list_c_type()})blorp_list_empty_acquire(&${key.list_suffix().empty_root_name()})"
+
+
+private pure func allocate_root(type_name: String, count: String) -> String:
+    list_root_allocation(type_name, "result", count)
+
+
+-- A copying append or concat's root, sized by `blorp_list_copy_capacity`.
+private pure func allocate_growing_root(
+    type_name: String,
+    required: String,
+    maximum: String,
+) -> String:
+    "const size_t capacity=blorp_list_copy_capacity(${required},${maximum});${list_root_allocation(type_name, "result", "capacity")}"
+
+
+-- Stores one occurrence the caller already owns into `name`'s next slot.
+pure func list_slot_store(name: String, slot: String, value: String) -> String:
+    "${name}->values[${slot}]=${value};${name}->length++;"
+
+
+-- `acquire` refers to the C local `element`; the slot owns that occurrence.
+private pure func store_occurrence(acquire: String, slot: String) -> String:
+    acquire.concat(list_slot_store("result", slot, "element"))
+
+
+-- The caller has checked required length and concrete byte bounds before any
+-- addition. Resizing `values` moves its existing slot obligations unchanged.
+private pure func reserve_unique(type_name: String, required: String, maximum: String) -> String:
+    "if(${required}>values->capacity){const size_t capacity=blorp_list_capacity(values->capacity,${required},${maximum});"
+        .concat(
+            "${type_name} grown=blorp_memory_resize(values,sizeof *values+capacity*sizeof *values->values);if(!grown)abort();",
+        )
+        .concat("values=grown;values->capacity=capacity;}")
+
+
+-- The supplied element ABI and dup/drop fragments come from accepted concrete
+-- layouts. A root owns every initialized slot, including equal occurrences.
+pure func list_runtime(
+    key: ListElementKey,
+    element_type: String,
+    acquire: String,
+    destroy: String,
+) -> String:
+    suffix = key.list_suffix()
+    type_name = key.list_c_type()
+    empty = suffix.empty_root_name()
+    "struct blorp_l_${suffix}{atomic_size_t references;int64_t length;size_t capacity;${element_type} values[];};"
+        .concat("static const struct blorp_l_${suffix} ${empty}={.length=0,.capacity=0};")
+        .concat(
+            "void blorp_list_dup_${suffix}(${type_name} value){if(value==&${empty})(void)blorp_list_empty_acquire(value);",
+        )
+        .concat("else atomic_fetch_add_explicit(&value->references,1,memory_order_relaxed);}")
+        .concat(
+            "void blorp_list_drop_${suffix}(${type_name} value){if(value==&${empty}){blorp_list_empty_release();return;}",
+        )
+        .concat(
+            "if(atomic_fetch_sub_explicit(&value->references,1,memory_order_acq_rel)!=1)return;",
+        )
+        .concat(
+            "for(int64_t index=0;index<value->length;index++){${element_type} element=value->values[index];(void)element;${destroy}}",
+        )
+        .concat(
+            "blorp_memory_release(value);}${type_name} blorp_list_repeat_${suffix}(${element_type} element,int64_t count){",
+        )
+        .concat("const uint64_t requested=count<=0?UINT64_C(0):(uint64_t)count;")
+        .concat(
+            "if(requested>(SIZE_MAX-sizeof(struct blorp_l_${suffix}))/sizeof(${element_type}))abort();",
+        )
+        .concat(
+            "${allocate_root(type_name, "requested")}for(uint64_t index=0;index<requested;index++){",
+        )
+        .concat("${store_occurrence(acquire, "index")}}return result;}")
+        .concat(
+            "int64_t blorp_list_length_${suffix}(const struct blorp_l_${suffix} *value){return value->length;}",
+        )
+        .concat(
+            "int blorp_list_get_${suffix}(const struct blorp_l_${suffix} *value,int64_t index,${element_type} *result){",
+        )
+        .concat(
+            "if(index<0||index>=value->length)return 0;${element_type} element=value->values[index];${acquire}*result=element;",
+        )
+        .concat("return 1;}")
+
+
+union ListUpdate:
+    AppendUpdate
+    SetUpdate
+    ConcatUpdate
+    SuffixUpdate
+
+
+pure func append_list_update_name(
+    output: String,
+    update: ListUpdate,
+    key: ListElementKey,
+) -> String:
+    prefix = match update:
+        AppendUpdate: "blorp_list_append_"
+        SetUpdate: "blorp_list_set_"
+        ConcatUpdate: "blorp_list_concat_"
+        SuffixUpdate: "blorp_list_suffix_"
+    output
+        .concat(prefix)
+        .append_list_suffix(key)
+
+
+pure func list_update_name(update: ListUpdate, key: ListElementKey) -> String:
+    "".append_list_update_name(update, key)
+
+
+-- The symbol of the in-place helper a runtime operation calls when it
+-- receives operand 0's obligation. Only an operation that reuses its first
+-- operand has one, and a user call never does. The List and String runtime
+-- definitions and emission all name the helper through this function, so a
+-- definition and its call cannot disagree.
+pure func consuming_helper_name(
+    operation: RuntimeOperation[VariantInstanceId, TypeRef],
+) -> Option[String]:
+    if operation.reuses_first_operand():
+        match operation:
+            StringConcat:
+                Some("blorp_string_concat_take_left")
+            StringAppendInt:
+                Some("blorp_string_append_int_take_left")
+            ListAppend(element):
+                Some("blorp_list_append_take_left_${element.list_element_key().list_suffix()}")
+            ListSet(element):
+                Some("blorp_list_set_take_left_${element.list_element_key().list_suffix()}")
+            ListConcat(element):
+                Some("blorp_list_concat_take_left_${element.list_element_key().list_suffix()}")
+            -- An operation newly marked reusing has no helper yet; emission
+            -- rejects a consumed operand of it rather than calling a copy.
+            _:
+                None
+    else:
+        None
+
+
+-- Borrowed updates copy live slots, acquiring every stored occurrence.
+-- Consumed updates check uniqueness before mutation, which the immortal empty
+-- root never passes. The test must stay `!=1` rather than, say, `>1`: the
+-- root's count is 0. Relocation preserves the old slots' obligations. Invalid
+-- set preserves the original value. Growing outputs check int64_t length and
+-- size_t storage before arithmetic.
+pure func list_update_runtime(
+    update: ListUpdate,
+    element: TypeRef,
+    element_type: String,
+    acquire: String,
+    destroy: String,
+) -> String:
+    key = element.list_element_key()
+    suffix = key.list_suffix()
+    type_name = key.list_c_type()
+    name = update.list_update_name(key)
+    borrowed = "const struct blorp_l_${suffix} *"
+    capacity = "(SIZE_MAX-sizeof(struct blorp_l_${suffix}))/sizeof(${element_type})"
+    match update:
+        AppendUpdate:
+            in_place: String = match consuming_helper_name(ListAppend(element)):
+                None:
+                    ""
+                Some(helper):
+                    "${type_name} ${helper}(${type_name} values,${element_type} value){"
+                        .concat(
+                            "if(atomic_load_explicit(&values->references,memory_order_acquire)!=1){",
+                        )
+                        .concat(
+                            "${type_name} result=${name}(values,value);blorp_list_drop_${suffix}(values);return result;}",
+                        )
+                        .concat(
+                            "const size_t count=(size_t)values->length;if(count>=(uintmax_t)INT64_MAX||count>=${capacity})abort();",
+                        )
+                        .concat(reserve_unique(type_name, "count+1", capacity))
+                        .concat("${element_type} element=value;${acquire}")
+                        .concat(list_slot_store("values", "count", "element"))
+                        .concat("return values;}")
+            "${type_name} ${name}(${borrowed}values,${element_type} value){const uint64_t count=(uint64_t)values->length;"
+                .concat("if(count>=(uint64_t)INT64_MAX||count>=${capacity})abort();")
+                .concat(
+                    "${allocate_growing_root(type_name, "(size_t)(count+1)", capacity)}for(uint64_t index=0;index<count;index++){",
+                )
+                .concat(
+                    "${element_type} element=values->values[index];${store_occurrence(acquire, "index")}}${element_type} element=value;",
+                )
+                .concat("${store_occurrence(acquire, "count")}return result;}")
+                .concat(in_place)
+        SetUpdate:
+            in_place: String = match consuming_helper_name(ListSet(element)):
+                None:
+                    ""
+                Some(helper):
+                    "${type_name} ${helper}(${type_name} values,int64_t index,${element_type} value){"
+                        .concat(
+                            "if(atomic_load_explicit(&values->references,memory_order_acquire)!=1){",
+                        )
+                        .concat(
+                            "${type_name} result=${name}(values,index,value);blorp_list_drop_${suffix}(values);return result;}",
+                        )
+                        .concat("if(index<0||index>=values->length)return values;")
+                        .concat("{${element_type} element=value;(void)element;${acquire}}")
+                        .concat(
+                            "{${element_type} element=values->values[index];(void)element;${destroy}}",
+                        )
+                        .concat("values->values[index]=value;return values;}")
+            -- Acquiring first protects a replacement equal to the old occurrence.
+            "${type_name} ${name}(${borrowed}values,int64_t index,${element_type} value){"
+                .concat("const uint64_t count=(uint64_t)values->length;")
+                .concat(
+                    "${allocate_root(type_name, "count")}for(uint64_t slot=0;slot<count;slot++){",
+                )
+                .concat(
+                    "${element_type} element=(index>=0&&(uint64_t)index==slot)?value:values->values[slot];",
+                )
+                .concat("${store_occurrence(acquire, "slot")}}return result;}")
+                .concat(in_place)
+        SuffixUpdate:
+            -- Selection verification proves 0 <= start <= length. The new
+            -- root is no larger than its source, whose allocation succeeded.
+            "${type_name} ${name}(${borrowed}values,int64_t start){const uint64_t count=(uint64_t)(values->length-start);"
+                .concat(
+                    "${allocate_root(type_name, "count")}for(uint64_t index=0;index<count;index++){",
+                )
+                .concat(
+                    "${element_type} element=values->values[(uint64_t)start+index];${store_occurrence(acquire, "index")}}return result;}",
+                )
+        ConcatUpdate:
+            in_place: String = match consuming_helper_name(ListConcat(element)):
+                None:
+                    ""
+                Some(helper):
+                    "${type_name} ${helper}(${type_name} values,${borrowed}right){"
+                        .concat(
+                            "if(atomic_load_explicit(&values->references,memory_order_acquire)!=1){",
+                        )
+                        .concat(
+                            "${type_name} result=${name}(values,right);blorp_list_drop_${suffix}(values);return result;}",
+                        )
+                        .concat(
+                            "const uint64_t first=(uint64_t)values->length;const uint64_t second=(uint64_t)right->length;",
+                        )
+                        .concat(
+                            "if(second>(uint64_t)INT64_MAX-first||second>${capacity}-first)abort();",
+                        )
+                        .concat(reserve_unique(type_name, "first+second", capacity))
+                        .concat(
+                            "for(uint64_t index=0;index<second;index++){${element_type} element=right->values[index];${acquire}",
+                        )
+                        .concat(list_slot_store("values", "first+index", "element"))
+                        .concat("}return values;}")
+            "${type_name} ${name}(${borrowed}left,${borrowed}right){const uint64_t first=(uint64_t)left->length;"
+                .concat(
+                    "const uint64_t second=(uint64_t)right->length;if(second>(uint64_t)INT64_MAX-first||first+second>${capacity})abort();",
+                )
+                .concat(
+                    "${allocate_growing_root(type_name, "(size_t)(first+second)", capacity)}for(uint64_t index=0;index<first;index++){",
+                )
+                .concat(
+                    "${element_type} element=left->values[index];${store_occurrence(acquire, "index")}}",
+                )
+                .concat(
+                    "for(uint64_t index=0;index<second;index++){${element_type} element=right->values[index];",
+                )
+                .concat("${store_occurrence(acquire, "first+index")}}return result;}")
+                .concat(in_place)
+
+
+-- argv uses the same concrete String list root and destruction as source Lists.
+pure func arguments_runtime(arguments_key: ListElementKey) -> String:
+    suffix = arguments_key.list_suffix()
+    runtime: String =
+        |struct blorp_l_${suffix} *blorp_list_from_argv(int argc,char **argv){
+        |if(argc<0){abort();}
+        |const size_t count=(size_t)argc;
+        |if(count>(SIZE_MAX-sizeof(struct blorp_l_${suffix}))/sizeof(struct blorp_string *)){abort();}
+        |struct blorp_l_${suffix} *result=blorp_memory_allocate(sizeof *result+count*sizeof *result->values);
+        |if(result==NULL){abort();}
+        |atomic_init(&result->references,1);result->length=0;result->capacity=count;
+        |for(size_t index=0;index<count;index++){
+        |const size_t length=strlen(argv[index]);
+        |if(length>(size_t)INT64_MAX||length>SIZE_MAX-sizeof(struct blorp_string)-1){abort();}
+        |if(!blorp_utf8_is_valid(argv[index],length)){
+        |blorp_list_drop_${suffix}(result);
+        |return NULL;
+        |}
+        |result->values[index]=blorp_string_from_bytes(argv[index],(int64_t)length);
+        |result->length++;
+        |}
+        |return result;
+        |}
+        |
+    runtime

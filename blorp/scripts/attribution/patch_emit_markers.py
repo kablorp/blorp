@@ -310,7 +310,7 @@ def apply_edit(text, anchor, replacement):
 def main():
     if len(sys.argv) != 2:
         sys.exit(__doc__)
-    path = sys.argv[1].rstrip("/") + "/compile/emit/emit.brp"
+    path = sys.argv[1].rstrip("/") + "/common/codegen/emit/emit.brp"
     with open(path) as handle:
         text = handle.read()
     for anchor, replacement in EDITS:

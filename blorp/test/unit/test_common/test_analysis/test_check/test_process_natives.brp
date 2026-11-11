@@ -1,0 +1,123 @@
+import:
+    bool: Bool methods
+    int: Int methods
+    list: List methods
+    option: Option methods
+    string: String methods
+    test: TestSuite
+    ../../../../../src/common/analysis/check/check: check
+    ../../../../../src/common/analysis/check/render: render_failure
+    ../../../../../src/common/syntax/source: module_source, root_module_id
+    ../../../module_input: parse_modules
+
+
+private HELP_CAPTURE: String = "declare an impure nongeneric function with String, List[String], List[String], List[String], List[String], Int parameters returning Result[List[String], Int]"
+
+
+private HELP_FIND_PROGRAM: String = "declare an impure nongeneric function with one String parameter returning Result[String, Int]"
+
+
+private HELP_FAULT: String = "declare an impure nongeneric function with one String parameter returning Result[Void, Int]"
+
+
+private CAPTURE_HEADER: String = "func run(program: String, arguments: List[String], directory: List[String], environment: List[String], stdin: List[String], timeout_ms: Int) -> Result[List[String], Int]:"
+
+
+private pure func body_for(label: String) -> String:
+    "\n    builtin(\"${label}\")\nfunc main() -> Int:\n    0\n"
+
+
+private pure func accepts(header: String, label: String) -> Bool:
+    match parse_modules([{ source = "${header}${body_for(label)}", targets = [] }]):
+        Err(_):
+            False
+        Ok(parsed):
+            match check(parsed):
+                Ok(_): True
+                Err(_): False
+
+
+-- The declaration must be refused where the label is written, with the help
+-- rendered from the operation's contract row.
+private pure func rejects(header: String, label: String, help: String) -> Bool:
+    match parse_modules([{ source = "${header}${body_for(label)}", targets = [] }]):
+        Err(_):
+            False
+        Ok(parsed):
+            match check(parsed):
+                Ok(_):
+                    False
+                Err(failure):
+                    errors = render_failure(failure)
+                    actual = errors.first
+                    start = header.length() + ("\n    builtin(".length())
+                    actual.message
+                        .equals("builtin declaration does not match its runtime contract")
+                        .and(actual.help.equals(help))
+                        .and(actual.span.start.equals(start))
+                        .and(actual.span.end.equals(start + ("\"${label}\"".length())))
+                        .and(actual.span.source == module_source(root_module_id()))
+                        .and(errors.remaining.is_empty())
+                        .and(actual.note.is_none())
+
+
+pure func test_exact_contracts_are_accepted() -> Bool:
+    accepts(CAPTURE_HEADER, "process.capture")
+        .and(accepts("func find(name: String) -> Result[String, Int]:", "process.find_program"))
+        .and(accepts("func abort(message: String) -> Result[Void, Int]:", "process.fault"))
+
+
+-- The reply is a List[String] and the error an Int; the timeout comes last and
+-- the call is impure.
+pure func test_capture_contract_is_closed() -> Bool:
+    [
+        "func run(program: String, arguments: List[String], directory: List[String], environment: List[String], stdin: List[String], timeout_ms: Int) -> Result[String, Int]:",
+        "func run(program: String, arguments: List[String], directory: List[String], environment: List[String], stdin: List[String], timeout_ms: Int) -> Result[List[String], String]:",
+        "func run(program: String, arguments: List[String], directory: List[String], environment: List[String], stdin: String, timeout_ms: Int) -> Result[List[String], Int]:",
+        "func run(program: String, arguments: List[String], directory: List[String], environment: List[String], stdin: List[String]) -> Result[List[String], Int]:",
+        "pure func run(program: String, arguments: List[String], directory: List[String], environment: List[String], stdin: List[String], timeout_ms: Int) -> Result[List[String], Int]:",
+    ].all(pure func(header: String) -> Bool: rejects(header, "process.capture", HELP_CAPTURE))
+
+
+pure func test_find_program_contract_is_closed() -> Bool:
+    [
+        "func find(name: String) -> Result[Int, Int]:",
+        "func find(name: String) -> Result[String, String]:",
+        "func find(name: Int) -> Result[String, Int]:",
+        "pure func find(name: String) -> Result[String, Int]:",
+    ].all(
+        pure func(header: String) -> Bool: rejects(
+            header,
+            "process.find_program",
+            HELP_FIND_PROGRAM,
+        ),
+    )
+
+
+pure func test_fault_contract_is_closed() -> Bool:
+    [
+        "func fault(message: String) -> Result[String, Int]:",
+        "func fault(message: Int) -> Result[Void, Int]:",
+        "func fault() -> Result[Void, Int]:",
+        "pure func fault(message: String) -> Result[Void, Int]:",
+    ].all(pure func(header: String) -> Bool: rejects(header, "process.fault", HELP_FAULT))
+
+
+TESTS: TestSuite = {
+    description = "process builtin contracts",
+    tests = [
+        ("each exact contract is accepted", test_exact_contracts_are_accepted),
+        (
+            "process.capture takes a String, four List[String] and an Int, is impure, and succeeds with a List[String]",
+            test_capture_contract_is_closed,
+        ),
+        (
+            "process.find_program takes one String, is impure, and succeeds with a String",
+            test_find_program_contract_is_closed,
+        ),
+        (
+            "process.fault takes one String, is impure, and returns Result[Void, Int]",
+            test_fault_contract_is_closed,
+        ),
+    ],
+}

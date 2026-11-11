@@ -260,7 +260,7 @@ will make it import `process`, and that needs a rotation first.
 2. **L1, the natives and the library.**
    - The natives `process.capture` and `process.find_program`, at about 10
      compiler lines.
-   - The C core in `blorp/src/compile/runtime/process.brp`, at about 300
+   - The C core in `blorp/src/common/codegen/runtime/process.brp`, at about 300
      lines.
    - `process.brp`, growing from 13 lines to about 230, and its suites.
    - The old `run_to_files` stays for now.

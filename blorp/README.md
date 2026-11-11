@@ -5,7 +5,7 @@ pattern matching, traits and value semantics. Its compiler is written in
 Blorp, compiles itself and emits C. Memory is managed by reference counting:
 there is no garbage collector and no shared mutable state.
 
-The compiler is in [`src/`](src/): `syntax/` is the front end shared with the formatter, `compile/` holds one folder per phase, `format/` is the formatter. Programs compile
+The compiler is in [`src/`](src/): `common/` holds the code the commands share (the front end, the analysis phases and the code-generation phases), `format/` is the formatter. Programs compile
 against [`standard_library/`](standard_library/), whose
 [README](standard_library/README.md) owns its API contracts. Tests are in
 [`test/`](test/), and [`grammar.ebnf`](grammar.ebnf) is the formal grammar.
@@ -49,7 +49,7 @@ C and leaves an existing output file as it was. Programs that use Float need
 ```sh
 make -C blorp test             # build the diagnostic compiler, run components and e2e
 make -C blorp test-e2e         # e2e only, with the compiler already built
-make -C blorp test-target-components TARGET_COMPONENT_SOURCES=blorp/test/unit/test_utils/test_text.brp
+make -C blorp test-target-components TARGET_COMPONENT_SOURCES=blorp/test/unit/test_common/test_utils/test_text.brp
 make -C blorp test INSTRUCTION_CHECK=on   # macOS: also hold retired-instruction ceilings
 ```
 
@@ -1047,7 +1047,7 @@ lambdas are rejected. A lowercase `tests` constant is a naming error that
 says to write `TESTS`. Compile one or more suite files into one program:
 
 ```sh
-bin/blorp compile --test-suite blorp/test/unit/test_utils/test_text.brp \
+bin/blorp compile --test-suite blorp/test/unit/test_common/test_utils/test_text.brp \
   [MORE_SUITES.brp ...] --library-root blorp/standard_library -o blorp/build/test_text.c
 ```
 
@@ -1095,14 +1095,19 @@ lex -> parse -> load -> namespace -> check -> specialize -> lower -> own -> veri
 Load drives lexing and parsing of each module, and checking begins by
 building the namespace.
 
-`src/` has four folders. `syntax/` is the front end both tools share: the
-lexer, the parser, and the token, source and name tables they build.
-`compile/` has one folder per phase after parsing, plus `runtime` for the C
-fragments `emit` embeds. `format/` is the formatter. `utils/` holds helpers
-with no Blorp knowledge. `syntax/` imports only `utils/`; `compile/` and
-`format/` import `syntax/` and `utils/`, and `format/` never imports
-`compile/`. Inside `compile/`, a folder imports only earlier
-folders; compiler imports are relative paths, and bare paths name library
+`src/` has `common/`, `format/`, and the entry point (`main.brp`, `cli.brp`).
+`common/` holds what the commands share, one folder per layer. `utils/` holds
+helpers with no Blorp knowledge. `syntax/` is the front end both tools share:
+the lexer, the parser, and the token, source and name tables they build.
+`analysis/` holds load, namespace and check (plus `assemble.brp` and
+`ids.brp`). `codegen/` holds the phases after checking, specialize through
+emit, plus `runtime` for the C fragments `emit` embeds. `format/` is the
+formatter. Layers import only downward: `utils/` imports itself; `syntax/`
+imports `utils/`; `analysis/` imports `syntax/` and `utils/`; `codegen/`
+imports `analysis/`, `syntax/` and `utils/`; `format/` imports `syntax/` and
+`utils/` and never `analysis/` or `codegen/`. Inside `analysis/` and
+`codegen/`, a folder imports only earlier folders; compiler imports are
+relative paths, and bare paths name library
 modules. Only the shell is impure: it reads modules with `fs.read_text`,
 prints diagnostics and writes the output with `fs.write_text`. Everything in
 between, diagnostic rendering included, is pure and reads no filesystem,
@@ -1112,7 +1117,7 @@ returns a new one or its first error.
 [`src/format`](src/format/format.brp) is not a phase: the
 [formatter](#formatting) lexes and parses one file with the front end and
 prints its tree, taking comments, blank lines and literal spellings from the
-source between tokens. It imports only `syntax/` and `utils/`.
+source between tokens. It imports only `common/syntax/` and `common/utils/`.
 
 The output is replaced atomically, as by
 [`write_text`](standard_library/README.md#the-fs-module): a symlinked output
@@ -1123,19 +1128,19 @@ the output may already be new.
 
 ### Phases
 
-1. **Lex** ([`lex`](src/syntax/lex.brp)) turns one module's bytes into tokens with
+1. **Lex** ([`lex`](src/common/syntax/lex.brp)) turns one module's bytes into tokens with
    byte spans. It extends the shared name table, minting one `NameId` per
    identifier spelling; identifier tokens carry only that id, and reserved
    words and punctuation become keyword and symbol tokens, so later phases
    never compare spellings. Layout becomes NEWLINE, INDENT and DEDENT tokens.
-2. **Parse** ([`parse`](src/syntax/parse.brp)) builds each module's syntax, each
+2. **Parse** ([`parse`](src/common/syntax/parse.brp)) builds each module's syntax, each
    node with its span; direct and UFCS calls stay distinct. It recognises
    contextual words such as `fixed` by the ids the name seed gives them.
-   [`assemble.brp`](src/compile/assemble.brp) seals the modules and name table
+   [`assemble.brp`](src/common/analysis/assemble.brp) seals the modules and name table
    into an opaque `ParsedProgram`, issues declaration ids once (functions,
    records, unions and owner-qualified variants) and fixes the module
    dependency order, rejecting import cycles.
-3. **Load** ([`load`](src/compile/load/load.brp)) reads the root, `_base.brp`, the
+3. **Load** ([`load`](src/common/analysis/load/load.brp)) reads the root, `_base.brp`, the
    prelude and every imported module once per logically normalized path
    (symlinks are not resolved), lexes and parses each, and publishes the
    `ParsedProgram` with the source inventory diagnostics render from.
@@ -1151,14 +1156,14 @@ the output may already be new.
    case-sensitive, so `A.brp` and `a.brp` are distinct keys even on a
    case-insensitive filesystem. A row for a path outside the root's directory,
    or for a module nothing imports, is accepted and unused.
-4. **Namespace** ([`namespace`](src/compile/namespace/namespace.brp)), the first step
+4. **Namespace** ([`namespace`](src/common/analysis/namespace/namespace.brp)), the first step
    of checking, gives each module one frozen scope in dependency order: its
    declarations, its imports and, for a user module, the prelude. A spelling
    denotes at most one entity per space: functions and constructors share the
    value space, types have their own, and an alias claims both.
-   [`builtins.brp`](src/compile/namespace/builtins.brp) validates the foundation and
+   [`builtins.brp`](src/common/analysis/namespace/builtins.brp) validates the foundation and
    designates `Bool`, `Option` and `Result` by name and exact constructors.
-5. **Check** ([`check`](src/compile/check/check.brp)) validates every declaration,
+5. **Check** ([`check`](src/common/analysis/check/check.brp)) validates every declaration,
    reachable or not, and publishes a `CheckedProgram` or a `CheckFailure`. It
    accepts declarations, constant annotations, signatures, traits and
    implementations, then constants and bodies, with expression-local
@@ -1166,9 +1171,9 @@ the output may already be new.
    substitution, every local read a function-owned `BindingId`, and every
    constructor its union and variant ids; matches are proved exhaustive.
    Operators become trait calls, Dict literals calls, and interpolation String
-   concatenation. [`render.brp`](src/compile/check/render.brp) turns a failure into
+   concatenation. [`render.brp`](src/common/analysis/check/render.brp) turns a failure into
    diagnostics.
-6. **Specialize** ([`specialize`](src/compile/specialize/specialize.brp)) expands the
+6. **Specialize** ([`specialize`](src/common/codegen/specialize/specialize.brp)) expands the
    call graph reachable from `main` into concrete instances, one per
    declaration and complete list of type arguments, phantom ones included. Its
    `SpecializedProgram` holds those functions and the record, union and List
@@ -1176,12 +1181,12 @@ the output may already be new.
    reaches later phases. It also decides representation: unmanaged, a managed
    String, List or record root, a boxed union, or an inline union with owned
    children.
-7. **Lower** ([`lower`](src/compile/lower/lower.brp)) publishes ordered value
+7. **Lower** ([`lower`](src/common/codegen/lower/lower.brp)) publishes ordered value
    definitions with function-owned `ValueId`s, separate from the bindings that
    name them. Matches become selection graphs over typed places that enter one
    shared body per arm; bound matches and `if` become joins with typed carried
    values, and loops carry values through their headers.
-8. **Own** ([`own`](src/compile/own/own.brp)) inserts reference counting: acquisitions,
+8. **Own** ([`own`](src/common/codegen/own/own.brp)) inserts reference counting: acquisitions,
    drops, borrows and transfers, each obligation named by an `OwnerId`. Every
    stored managed occurrence gets its own obligation, and an argument stays
    alive until the call's result owner exists. A managed parameter is owned
@@ -1189,7 +1194,7 @@ the output may already be new.
    String `+`, `append_int`) or another owned parameter, and a call moves the
    caller's owner there at its last use. These labels change where a program
    copies, never what it computes.
-9. **Verify** ([`verify`](src/compile/verify/verify.brp)) checks the ownership IR
+9. **Verify** ([`verify`](src/common/codegen/verify/verify.brp)) checks the ownership IR
    independently and alone produces a `VerifiedProgram`. It rejects dead or
    wrong owners, invalid borrows, undischarged obligations, calls that disagree
    with their callee's labels and malformed selection graphs, and checks the
@@ -1197,7 +1202,7 @@ the output may already be new.
    form a by-value cycle also yields the aggregate order, every record and
    union after the layouts it stores by value, which the `VerifiedProgram`
    carries.
-10. **Emit** ([`emit`](src/compile/emit/emit.brp)) projects the verified program to C
+10. **Emit** ([`emit`](src/common/codegen/emit/emit.brp)) projects the verified program to C
    without repeating any check; retains and releases are exactly the explicit
    operations, and record and union definitions follow the verified aggregate
    order.
@@ -1310,7 +1315,7 @@ it on `blorp/src/main.brp` to produce `blorp/build/blorp.c`, which `make`
 links. The compiler's own source can use only what the seed supports.
 
 The embedded standard library is a generated module,
-`blorp/build/generated/embedded_library.brp`, which `src/compile/load/load.brp`
+`blorp/build/generated/embedded_library.brp`, which `src/common/analysis/load/load.brp`
 imports. The seed builds [`scripts/embed_library.brp`](scripts/embed_library.brp),
 and `make -C blorp compiler` runs it whenever a library file, a library folder
 or the generator changes. It embeds every `.brp` file under the library at any
