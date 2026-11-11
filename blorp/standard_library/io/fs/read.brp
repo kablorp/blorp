@@ -1,0 +1,199 @@
+-- Reading a file. A native reports a failure as an Int code, which the decoder
+-- below turns into the one error union this module's operations can produce.
+import:
+    _base: Int, String, Void, List, Bool(True, False), Option, Result(Ok, Err), Stringable
+    bool: Bool methods
+    int: Int methods
+    io/_codes:
+        NOT_FOUND_CODE,
+        PERMISSION_DENIED_CODE,
+        NOT_A_DIRECTORY_CODE,
+        IS_A_DIRECTORY_CODE,
+        FILE_TOO_LARGE_CODE,
+        INVALID_UTF8_CODE,
+    list: List methods
+    option: Option methods
+    path: Path
+    result: Result methods
+    string: String methods
+
+
+-- Why a file could not be read. OtherOs keeps the operating system's own
+-- number, which differs between macOS and Linux.
+fixed union ReadError:
+    NotFound
+    PermissionDenied
+    NotADirectory
+    IsADirectory
+    -- EFBIG and EOVERFLOW, or contents beyond the String capacity.
+    FileTooLarge
+    -- Found after reading bytes.
+    InvalidUtf8
+    -- Any other errno, such as ELOOP, ENAMETOOLONG or EMFILE.
+    OtherOs(Int)
+
+
+-- Public so that its test binds it to literal native codes; it is not API for
+-- programs. A code this union does not name is OtherOs with the code negated,
+-- as io/_codes does: an unnamed errno arrives negated, so OtherOs keeps the
+-- platform's number, and a positive code that no variant names is a
+-- disagreement between the two tables that stays visible as a negative.
+pure func decode_read_error(code: Int) -> ReadError:
+    if code == NOT_FOUND_CODE:
+        NotFound
+    else if code == PERMISSION_DENIED_CODE:
+        PermissionDenied
+    else if code == NOT_A_DIRECTORY_CODE:
+        NotADirectory
+    else if code == IS_A_DIRECTORY_CODE:
+        IsADirectory
+    else if code == FILE_TOO_LARGE_CODE:
+        FileTooLarge
+    else if code == INVALID_UTF8_CODE:
+        InvalidUtf8
+    else:
+        OtherOs(0 - code)
+
+
+-- The fixed phrase for a variant: "no such file". Never the operating
+-- system's own wording.
+implements Stringable for ReadError:
+    pure func to_string(value: Self) -> String:
+        match value:
+            NotFound: "no such file"
+            PermissionDenied: "permission denied"
+            NotADirectory: "not a directory"
+            IsADirectory: "is a directory"
+            FileTooLarge: "file too large"
+            InvalidUtf8: "contents are not valid UTF-8"
+            OtherOs(number): "operating system error ${number}"
+
+
+private func native_read_text(path: String) -> Result[String, Int]:
+    builtin("fs.read_text")
+
+
+-- Private: no code outside this file can name or hold one, so no caller can
+-- close one twice, read one after it is closed, or share its file offset.
+private opaque type Descriptor = Int
+
+
+private func native_open_read(path: String) -> Result[Int, Int]:
+    builtin("fs.open_read")
+
+
+private func native_next_lines(descriptor: Int, carried: String) -> Result[List[String], Int]:
+    builtin("fs.next_lines")
+
+
+private func native_close(descriptor: Int) -> Result[Void, Int]:
+    builtin("fs.close")
+
+
+-- Reads to end of file, so a file that changes size is read as it is, then
+-- validates UTF-8. A directory is IsADirectory. A FIFO blocks until its writer
+-- closes. There is no size limit: a file or device that never ends, such as
+-- /dev/zero, exhausts memory and the allocation aborts.
+func read_text(path: Path) -> Result[String, ReadError]:
+    path
+        .to_string()
+        .native_read_text()
+        .map_err(decode_read_error)
+
+
+-- The only place a descriptor is opened and closed. Once the open succeeds,
+-- nothing can leave before the close: Blorp has no return or exception, and
+-- `use` cannot run this function's `?=`. A failed close is ignored (D38): the
+-- descriptor was only read, so nothing is lost.
+private func with_descriptor[T, E](
+    path: Path,
+    use: (Descriptor) -> Result[T, E],
+    on_error: pure (ReadError) -> E,
+) -> Result[T, E]:
+    opened ?= path
+        .to_string()
+        .native_open_read()
+        .map_err(decode_read_error)
+        .map_err(on_error)
+    outcome = use(into_opaque Descriptor(opened))
+    -- Bound because only a Void call can stand alone as a statement.
+    closed = native_close(opened)
+    outcome
+
+
+-- How many of a batch's elements are complete lines (D37): with two or more,
+-- every element but the last, which is the line still unfinished; with fewer,
+-- the file has ended, and the one element, if any, is its last line.
+private pure func complete_lines(batch_length: Int) -> Int:
+    if batch_length > 1:
+        batch_length - 1
+    else:
+        batch_length
+
+
+private func fold_descriptor[T, E](
+    descriptor: Descriptor,
+    initial: T,
+    step: (T, String) -> Result[T, E],
+    on_error: pure (ReadError) -> E,
+) -> Result[T, E]:
+    var folded: Result[T, E] = Ok(initial)
+    var carried = ""
+    var reading: Bool = True
+    while reading:
+        match native_next_lines(from_opaque Descriptor(descriptor), carried):
+            Ok(batch):
+                batch_length = batch.length()
+                -- At end of file the last element is the last line, and the
+                -- loop ends before `carried` is read again.
+                carried = batch
+                    .last()
+                    .get_or("")
+                for line in batch.take(batch_length.complete_lines()):
+                    match folded:
+                        Ok(state): folded = step(state, line)
+                        Err(_): break
+                -- A step's Err stops the reading here; the break only skips the
+                -- rest of this batch, and another read could replace that Err.
+                -- Two or more elements mean the file has not ended (D37).
+                reading = folded
+                    .is_ok()
+                    .and(batch_length > 1)
+            Err(code):
+                folded = Err(on_error(code.decode_read_error()))
+                reading = False
+    folded
+
+
+-- Folds `step` over the file's lines in order, a block at a time, so memory
+-- follows the longest line, never the file. A line ends at LF, and a CR just
+-- before the LF is removed; a last line without LF counts, and an empty file
+-- has no lines. The file is opened as read_text opens it, and is closed before
+-- fold_lines returns on every path the program controls.
+--
+-- The first Err from `step` stops reading and is the result, so a fold that
+-- needs only the start of a file reads only that much. A failure to open or
+-- read is the result, converted by `on_error` to the fold's error type E; a
+-- program that keeps ReadError passes `pure func(error: ReadError) -> ReadError: error`.
+-- A line that is not UTF-8 is InvalidUtf8, and a directory is IsADirectory. A
+-- failed read returns none of its block's lines, but the steps already taken
+-- stay taken: an impure `step` that printed has printed. A FIFO blocks until a
+-- line arrives or its writer closes.
+--
+-- `step` borrows its accumulator, so appending to a List in `step` copies that
+-- List on every line, which is quadratic overall. To collect every line, read
+-- the file with read_text.
+func fold_lines[T, E](
+    path: Path,
+    initial: T,
+    step: (T, String) -> Result[T, E],
+    on_error: pure (ReadError) -> E,
+) -> Result[T, E]:
+    path.with_descriptor(
+        func(descriptor: Descriptor) -> Result[T, E]: descriptor.fold_descriptor(
+            initial,
+            step,
+            on_error,
+        ),
+        on_error,
+    )

@@ -2,8 +2,6 @@ import:
     bool: and
     dict: Dict
     int: Int methods
-    io/error: to_string
-    io/fs: create_directory, read_text, write_text
     io/process:
         Captured,
         Command,
@@ -50,6 +48,7 @@ import:
         process_runtime,
     ../../src/common/codegen/runtime/string: string_runtime
     ../../src/common/codegen/specialize/specialize: TypeRef(StringType)
+    ../e2e/file_access: make_directories, path_of, read_file, write_file
     ../e2e/self_hosted_reports: verify_accounting
 
 
@@ -95,8 +94,8 @@ private func expect_status(actual: Int, expected: Int) -> Result[Void, String]:
 
 
 private func empty_output(prefix: String) -> Result[Void, String]:
-    out: String ?= read_text(prefix + ".out").map_err(to_string)
-    err: String ?= read_text(prefix + ".err").map_err(to_string)
+    out: String ?= read_file(prefix + ".out")
+    err: String ?= read_file(prefix + ".err")
     match and(out.equals(""), err.equals("")):
         True: Ok(void)
         False: Err("process unit expected empty output: " + prefix)
@@ -123,9 +122,9 @@ private func child_ready(c_compiler: String, directory: String) -> Result[String
         + PROCESS_FIND_PROGRAM_RUNTIME
         + PROCESS_FAULT_RUNTIME
     )
-    written: Void ?= write_text(directory + "/process_runtime.c", fragments).map_err(to_string)
-    source: String ?= read_text("blorp/test/runtime/fixtures/process_child.c").map_err(to_string)
-    copied: Void ?= write_text(directory + "/process_child.c", source).map_err(to_string)
+    written: Void ?= write_file(directory + "/process_runtime.c", fragments)
+    source: String ?= read_file("blorp/test/runtime/fixtures/process_child.c")
+    copied: Void ?= write_file(directory + "/process_child.c", source)
     executable = directory + "/process_child"
     prefix = directory + "/runtime-build"
     status: Int ?= isolated(
@@ -180,8 +179,8 @@ private func stream_case(child: String, directory: String) -> Result[Void, Strin
     prefix = directory + "/streams"
     status: Int ?= isolated(child, ["streams"], prefix)
     matched: Void ?= expect_status(status, 0)
-    out: String ?= read_text(prefix + ".out").map_err(to_string)
-    err: String ?= read_text(prefix + ".err").map_err(to_string)
+    out: String ?= read_file(prefix + ".out")
+    err: String ?= read_file(prefix + ".err")
     match and(out.equals("stdout text\n"), err.equals("stderr text\n")):
         True: Ok(void)
         False: Err("stdout/stderr captures were not distinct")
@@ -231,7 +230,7 @@ private func timeout_case(child: String, directory: String) -> Result[Void, Stri
         invocation(child, ["wait", ready_path], directory + "/timeout", TIMEOUT_PROBE_MS),
         "process.run_to_files: timed out",
     )
-    ready: String ?= read_text(ready_path).map_err(to_string)
+    ready: String ?= read_file(ready_path)
     match ready.equals("ready\n"):
         True: Ok(void)
         False: Err("timeout child never acknowledged readiness")
@@ -276,7 +275,7 @@ private func existing_case(child: String, directory: String, second: Bool) -> Re
     path = match second:
         True: prefix + ".err"
         False: prefix + ".out"
-    written: Void ?= write_text(path, "preserve capture").map_err(to_string)
+    written: Void ?= write_file(path, "preserve capture")
     expected = match second:
         True: "process.run_to_files: create stderr capture; errno="
         False: "process.run_to_files: create stdout capture; errno="
@@ -284,7 +283,7 @@ private func existing_case(child: String, directory: String, second: Bool) -> Re
         invocation(child, ["exit", "0"], prefix, CHILD_TIMEOUT_MS),
         expected,
     )
-    unchanged: String ?= read_text(path).map_err(to_string)
+    unchanged: String ?= read_file(path)
     match unchanged.equals("preserve capture"):
         True: Ok(void)
         False: Err("existing capture was overwritten")
@@ -368,11 +367,11 @@ private func native_probe(child: String, directory: String, mode: String) -> Res
         CHILD_TIMEOUT_MS,
     )
     matched: Void ?= expect_status(actual, 0)
-    out: String ?= read_text(prefix + ".out").map_err(to_string)
+    out: String ?= read_file(prefix + ".out")
     quiet: Void ?= match out.equals(""):
         True: Ok(void)
         False: Err("runtime probe wrote stdout")
-    report: String ?= read_text(prefix + ".err").map_err(to_string)
+    report: String ?= read_file(prefix + ".err")
     verify_accounting(report, True)
 
 
@@ -464,7 +463,7 @@ private func timed_out_case(child: String, directory: String) -> Result[Void, St
     ready_path = directory + "/capture-timeout.ready"
     timed = { child_command(child, ["partial", ready_path]) | timeout_ms = Some(TIMEOUT_PROBE_MS) }
     _ ?= timed.captured_as("TimedOut [ok] [er]")
-    ready: String ?= read_text(ready_path).map_err(to_string)
+    ready: String ?= read_file(ready_path)
     expect_text(ready, "ready\n")
 
 
@@ -473,7 +472,7 @@ private func timed_out_case(child: String, directory: String) -> Result[Void, St
 private func grandchild_case(child: String, directory: String) -> Result[Void, String]:
     pid_path = directory + "/capture-grandchild.pid"
     _ ?= child_command(child, ["grandchild", pid_path]).captured_as("Exited(0) [parent done\n] []")
-    pid: String ?= read_text(pid_path).map_err(to_string)
+    pid: String ?= read_file(pid_path)
     child_command(child, ["gone", pid]).captured_as("Exited(0) [] []")
 
 
@@ -593,16 +592,10 @@ private func rejection_case(directory: String) -> Result[Void, String]:
     { command(missing, []) | environment = { "NA\0ME" => None } }.captured_as("ContainsNul")
 
 
--- A fixture path is built here, so one the constructor refuses is a defect in
--- the test.
-private pure func path_of(text: String) -> Result[Path, String]:
-    to_path(text).map_err(pure func(error: PathError) -> String: "${text}: ${error}")
-
-
 private func directory_case(child: String, directory: String) -> Result[Void, String]:
     place = directory + "/capture-place"
-    _ ?= create_directory(place).map_err(to_string)
-    _ ?= write_text(place + "/marker.txt", "marked\n").map_err(to_string)
+    _ ?= make_directories(place)
+    _ ?= write_file(place + "/marker.txt", "marked\n")
     place_path ?= path_of(place)
     _ ?= { child_command(child, ["cat-file", "marker.txt"]) | directory = Some(place_path) }.captured_as(
         "Exited(0) [marked\n] []",
@@ -621,7 +614,7 @@ private func launch_case(child: String, directory: String) -> Result[Void, Strin
     missing = directory + "/capture-missing-program"
     _ ?= command(missing, []).captured_as("LaunchFailed(NotFound)")
     plain = directory + "/capture-plain-file"
-    _ ?= write_text(plain, "not a program\n").map_err(to_string)
+    _ ?= write_file(plain, "not a program\n")
     _ ?= command(plain, []).captured_as("LaunchFailed(PermissionDenied)")
     script = directory + "/capture-invalid-executable"
     _ ?= child_command(child, ["invalid-executable", script]).captured_as("Exited(0) [] []")

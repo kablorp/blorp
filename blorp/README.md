@@ -78,8 +78,9 @@ entries whose names start with `.` and walked symbolic links are skipped, but a
 `blorp format --check .` prints `src/a.brp`, and a file reached from two paths is
 processed once. `--exclude PATH`, which may repeat, removes a file, or a
 directory and everything below it on component boundaries; an excluded path
-that does not exist or lies outside every `PATH` is a usage error. Formatting
-rewrites only the files whose layout changes. `--check` prints
+that does not exist or lies outside every `PATH` is a usage error, and
+"outside" is lexical: `../../x` is not under `..`. An empty path is a usage
+error. Formatting rewrites only the files whose layout changes. `--check` prints
 `path:line: would reformat` for each file that would change, at its first
 changed line, and exits 1 if any would. A file that does not parse gets the
 parser's diagnostic and is left as it was, and the command exits 1; the other
@@ -152,11 +153,11 @@ The case of a declared name says what it is, and the compiler enforces it:
 
 | Names | Form | Examples |
 | --- | --- | --- |
-| Types, variants, traits, type parameters | `CapitalizedCamelCase` | `ReadError`, `IOError`, `UInt8`, `T` |
+| Types, variants, traits, type parameters | `CapitalizedCamelCase` | `ReadError`, `URLError`, `UInt8`, `T` |
 | Module constants | `UPPER_SNAKE_CASE` | `MAX_DEPTH`, `TESTS`, `MAX` |
 | Functions, methods, parameters, locals, captures, fields, import aliases | `lower_snake_case` | `read_text`, `utf8_valid`, `x1` |
 
-Consecutive capitals are allowed, so `IOError` and `UInt8` stay valid. A single
+Consecutive capitals are allowed, so `URLError` and `UInt8` stay valid. A single
 capital word such as `MAX` or `T` fits both the first two forms. `_` is the
 discard; no other name starts with an underscore, and underscores are never
 doubled or trailing. Module paths such as `_base` are paths, not names. A
@@ -169,8 +170,8 @@ help: write `kind`
 ```
 
 Conversion splits before a capital that follows a lowercase letter or digit and
-before the last capital of a run followed by a lowercase letter, so `IOError`
-becomes `io_error` and `UInt8` becomes `u_int8`. A name that is used is not
+before the last capital of a run followed by a lowercase letter, so `URLError`
+becomes `url_error` and `UInt8` becomes `u_int8`. A name that is used is not
 checked again, except that a field or method after a dot is lower_snake_case: `x.Foo`
 is rejected ("fields and methods are lower_snake_case"). A bare name in a
 pattern that starts with a capital is a variant, and one that no visible variant
@@ -920,11 +921,11 @@ row names one module:
 
 - `./name` and `../name` are relative to the importing file, without `.brp`;
   a bare path such as `int` is a module under the library root. A path may
-  pass through folders, as in `io/error` or `./shared/names`, which name
-  `io/error.brp` under the library root or `shared/names.brp` beside the
+  pass through folders, as in `io/environment` or `./shared/names`, which name
+  `io/environment.brp` under the library root or `shared/names.brp` beside the
   importing file. A module file beside a folder of the same name (`io.brp` and
   `io/`) is rejected at an import that passes through that name, such as `io`,
-  `io/error` or `./io/error`, because the path would read as both a module and
+  `io/process` or `./io/process`, because the path would read as both a module and
   a folder. Other imports are unaffected.
 - `module: answer, Shape(Circle, Square)` selects functions and types. A union
   selection lists the constructors it imports, and `Shape()` imports the type
@@ -1014,32 +1015,52 @@ outside the process's root) or `OtherOs(errno)`; match on the variant, and
 `"${error}"` reads as text. It prints nothing. See the
 [complete program](test/e2e/fixtures/current_directory/basic.brp).
 
-#### The fs library
+#### Paths and the fs library
 
-`io/fs` is the typed filesystem library; import it explicitly. Its operations
-are impure except for `default_if_not_found`. Their `Result` error is the
-shared `io/error.IOError`, which holds the caller's path and an `IOErrorKind`
-such as `NotFound` or `OtherOs(errno)`:
+A `Path` is a nonempty UTF-8 spelling with no NUL byte. `"a/b".to_path()` is the
+only way to make one and returns `Result[Path, PathError]`, so an empty or NUL
+string is refused at the one place a path is made. Operations take a `Path`, so
+swapped arguments no longer type-check. Notes:
+
+- `join(base, child)` puts the child under the base, even when it is absolute
+  (`/a` and `/b` give `/a/b`), and cleans nothing. It is not the join of Rust or
+  Python, where an absolute child replaces the base; ask `is_absolute` first for
+  that.
+- `+` concatenates the two spellings as String `+` does, `a + b` is `ab`, never
+  `a/b`.
+- Equality is byte-wise on the spelling, so `a//b` differs from `a/b`, and the
+  NFC and NFD spellings of one name are different paths.
+
+Each file operation lives in its own module under `io/fs/` (`read`, `write`,
+`entry`, `list`, `create_directory`, `remove_file`, `remove_directory`,
+`remove_tree`, `rename`, `temporary_directory`), which also declares the error
+union of its operations. A union holds only the failures its operations can
+cause, carries no path, and is the error itself. `Union.Variant` names a
+variant, so a caller matches exactly:
 
 ```blorp
 import:
-    io/fs: read_text, default_if_not_found
-    io/error: IOError
-func load_settings(path: String) -> Result[String, IOError]:
-    default_if_not_found(read_text(path), "defaults")
+    io/fs/read: ReadError, read_text
+    path: Path
+
+func settings(path: Path) -> Result[String, ReadError]:
+    result = path.read_text()
+    match result:
+        Err(ReadError.NotFound): Ok("")
+        _: result
 ```
 
-`IOError` implements `Stringable`: `"${error}"` reads `settings.conf: no such
-file`. `json.ParseError` and the `io/process` errors do the same; match on
-the variant, never on the text.
+An error implements `Stringable` with fixed text: write `"${path}: ${error}"`
+to read `settings.conf: no such file`. `json.ParseError` and the `io/process`
+errors do the same; match on the variant, never on the text.
 
-It reads and atomically writes UTF-8 text files (`read_text`, `write_text`),
-inspects and lists directories (`entry_kind`, `list_directory`), creates,
-removes and renames entries (`create_directory`, `create_directories`,
+The library reads and atomically writes UTF-8 text files (`read_text`,
+`write_text`), inspects and lists directories (`entry_kind`, `list_directory`),
+creates, removes and renames entries (`create_directory`, `create_directories`,
 `remove_file`, `remove_directory`, `remove_directory_tree`, `rename`), folds
 over a file's lines a block at a time (`fold_lines`), and scopes a temporary
 directory to a callback (`with_temporary_directory`). The
-[library README](standard_library/README.md#the-fs-module) owns every
+[library README](standard_library/README.md#the-file-modules) owns every
 operation's contract, edge cases and limits.
 
 `io/process` runs a program and captures its output (`command`, `capture`,
@@ -1148,7 +1169,7 @@ prints its tree, taking comments, blank lines and literal spellings from the
 source between tokens. It imports only `common/syntax/`, `common/cli/` and `common/utils/`.
 
 The output is replaced atomically, as by
-[`write_text`](standard_library/README.md#the-fs-module): a symlinked output
+[`write_text`](standard_library/README.md#the-file-modules): a symlinked output
 keeps the link, the mode is preserved, a hard link keeps the old contents, and
 a device or FIFO is refused. The output's directory must be writable. If the
 final directory flush fails the compiler reports "could not write", although
@@ -1347,7 +1368,7 @@ The embedded standard library is a generated module,
 imports. The seed builds [`scripts/embed_library.brp`](scripts/embed_library.brp),
 and `make -C blorp compiler` runs it whenever a library file, a library folder
 or the generator changes. It embeds every `.brp` file under the library at any
-depth, named by its path below the root, such as `io/error.brp`. Anything that
+depth, named by its path below the root, such as `io/fs/read.brp`. Anything that
 compiles `src/main.brp` directly (a benchmark recipe, a seed workflow) must run
 `make -C blorp build/generated/embedded_library.brp`
 first. The generated file is not formatted, and the repository formatting

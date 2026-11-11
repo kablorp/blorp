@@ -22,24 +22,20 @@ done.
     - L3, the library: `_base`, `uint8.brp`, `bytes.brp`, and
       `fs.read_bytes`/`write_bytes`;
     - L4, `String.byte_at` returns `Option[UInt8]`.
-- **Nested modules, `Stringable`, `io/` and the prelude:**
-  [`MODULES_AND_STRINGABLE_PLAN.md`](MODULES_AND_STRINGABLE_PLAN.md).
-  - **Status:** landings 1 to 6 are done: nested library modules,
-    `Stringable` interpolation, library errors as `Stringable` (`describe`
-    deleted), `print` and `print_error` in the prelude (run before the move),
-    and the `io/` layout (`io/console`, `io/error`, `io/fs`, `io/process`,
-    `io/environment`, `io/_codes`).
-  - **Landing 6:** the seed rotation is done: pin `blorp-seed-10c8053d2399`,
-    family `blorp`, and the `compile` command line. Seed-built code now
-    interpolates values directly (`68df72215`).
-  - **Next:** `Path` (landing 7), planned in [`PATH_PLAN.md`](PATH_PLAN.md):
-    enforced naming rules, qualified union variants, the `Path` type and a
-    current-directory native, a seed rotation, exact I/O errors in
-    type-oriented modules, then `Path` in the prelude. Landings 1 (naming
-    rules), 2 (qualified variants), 3 (the `Path` type), 4 (the
-    current-directory native), 5 (the seed rotation, pinning
-    `blorp-seed-4acd2377961d`) and 6 (exact process and environment errors)
-    have landed. Landing 7, files, is next.
+- **`Path` and exact I/O errors:** [`PATH_PLAN.md`](PATH_PLAN.md), which
+  completes [`MODULES_AND_STRINGABLE_PLAN.md`](MODULES_AND_STRINGABLE_PLAN.md).
+  - **Status:** done. The naming rules, `Union.Variant`, `Path`, exact
+    process, environment and file errors, and the `io/fs/` modules have
+    landed. Keith dropped `Path` from the prelude on 2026-11-11 because of
+    its compile cost.
+  - **Follow-ups, in the plan:**
+    - the process natives should send the errno for codes their union
+      lacks;
+    - a test-visible form of `private` for the error decoders;
+    - the `count` parameters in `parse.brp` become `_`;
+    - an opaque `DeclaredName`;
+    - shared ASCII helpers;
+    - embedded-library size, which affects every compile.
 - **Process API:** [`PROCESS_DECISIONS.md`](PROCESS_DECISIONS.md).
   - **Status:** L0 is implemented and independently reviewed; final combined
     landing gates and four-platform CI pass; L0 is published. Shared

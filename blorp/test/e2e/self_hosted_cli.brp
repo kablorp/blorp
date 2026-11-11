@@ -3,13 +3,12 @@
 import:
     bool: and, not
     int: Int methods
-    io/error: to_string
-    io/fs: create_directories, read_text, write_text
     list: List methods
     result: Result methods
     string: String methods
     test: TestSuite
     ../../src/common/cli/usage: EXIT_PATH, EXIT_REJECTED, EXIT_USAGE
+    ./file_access: read_file, write_file, make_directories
     ./self_hosted_harness:
         COMPILATION_TIMEOUT_MS,
         LIBRARY_ROOT,
@@ -123,8 +122,8 @@ private func run(
         status,
         COMPILATION_TIMEOUT_MS,
     )
-    stdout ?= read_text(prefix + ".stdout").map_err(to_string)
-    stderr ?= read_text(prefix + ".stderr").map_err(to_string)
+    stdout ?= read_file(prefix + ".stdout")
+    stderr ?= read_file(prefix + ".stderr")
     Ok({ stdout = stdout, stderr = stderr })
 
 
@@ -138,11 +137,11 @@ private pure func expect_output(
 
 
 private func written(path: String, contents: String) -> Result[Void, String]:
-    write_text(path, contents).map_err(to_string)
+    write_file(path, contents)
 
 
 private func contents_are(path: String, contents: String) -> Result[Void, String]:
-    now ?= read_text(path).map_err(to_string)
+    now ?= read_file(path)
     expect(now, contents, "${path} afterwards")
 
 
@@ -167,10 +166,10 @@ private func linked(target: String, link: String, prefix: String) -> Result[Void
 -- and the rest are never visited: .hidden/c.brp is hidden, link.brp and linkdir
 -- are symbolic links, and sub/note.txt is not a source file.
 private func build_tree(root: String) -> Result[Void, String]:
-    _ ?= create_directories("${root}/dir.brp").map_err(to_string)
-    _ ?= create_directories("${root}/sub").map_err(to_string)
-    _ ?= create_directories("${root}/subway").map_err(to_string)
-    _ ?= create_directories("${root}/.hidden").map_err(to_string)
+    _ ?= make_directories("${root}/dir.brp")
+    _ ?= make_directories("${root}/sub")
+    _ ?= make_directories("${root}/subway")
+    _ ?= make_directories("${root}/.hidden")
     _ ?= written("${root}/a.brp", UNFORMATTED)
     _ ?= written("${root}/dir.brp/e.brp", UNFORMATTED)
     _ ?= written("${root}/sub/b.brp", UNFORMATTED)
@@ -197,7 +196,7 @@ private func compile_writes_the_c_named_by_o(
         0,
     )
     _ ?= expect_output(output, "", "")
-    generated ?= read_text(prefix + ".c").map_err(to_string)
+    generated ?= read_file(prefix + ".c")
     if generated.length() > 0:
         Ok(void)
     else:
@@ -247,8 +246,8 @@ private func compile_test_suite_takes_one_suite_and_then_two(
         0,
     )
     _ ?= expect_output(two, "", "")
-    one_text ?= read_text(one_c).map_err(to_string)
-    two_text ?= read_text(two_c).map_err(to_string)
+    one_text ?= read_file(one_c)
+    two_text ?= read_file(two_c)
     -- The generated C labels each function with its module and name.
     if (
         one_text
@@ -318,8 +317,8 @@ private func compile_without_a_library_root_uses_the_embedded_library(
         0,
     )
     _ ?= expect_output(on_disk, "", "")
-    embedded_c ?= read_text(prefix + "_embedded.c").map_err(to_string)
-    disk_c ?= read_text(prefix + "_disk.c").map_err(to_string)
+    embedded_c ?= read_file(prefix + "_embedded.c")
+    disk_c ?= read_file(prefix + "_disk.c")
     if embedded_c.length() > 0:
         expect(embedded_c, disk_c, "C without --library-root")
     else:
@@ -335,7 +334,7 @@ private func a_library_root_wins_over_the_embedded_library(
     prefix = "${work_directory}/cli_override"
     copy = prefix + "_library"
     _ ?= command(["cp", "-R", LIBRARY_ROOT, copy], prefix + "_copy", 0, COMPILATION_TIMEOUT_MS)
-    original ?= read_text("${copy}/list.brp").map_err(to_string)
+    original ?= read_file("${copy}/list.brp")
     _ ?= written("${copy}/list.brp", original + "\nfunc broken( -> Int:\n")
     source = prefix + ".brp"
     _ ?= written(source, FORMATTED)
@@ -419,7 +418,7 @@ private func format_reports_the_same_file_given_twice_once(
     work_directory: String,
 ) -> Result[Void, String]:
     path = "${work_directory}/cli_twice/a.brp"
-    _ ?= create_directories("${work_directory}/cli_twice").map_err(to_string)
+    _ ?= make_directories("${work_directory}/cli_twice")
     _ ?= written(path, UNFORMATTED)
     output ?= run(
         compiler,
@@ -549,7 +548,7 @@ private func an_unparsable_file_in_a_walk_fails_and_the_others_are_still_formatt
     work_directory: String,
 ) -> Result[Void, String]:
     root = "${work_directory}/cli_walk_unparsable"
-    _ ?= create_directories(root).map_err(to_string)
+    _ ?= make_directories(root)
     _ ?= written("${root}/a.brp", UNPARSABLE)
     _ ?= written("${root}/b.brp", UNFORMATTED)
     output ?= run(compiler, ["format", root], root, EXIT_REJECTED)
@@ -653,6 +652,25 @@ private func exclude_outside_the_default_root_is_a_usage_error(
     )
 
 
+-- Containment is lexical: `../../x` is not under `..`, although the directory it
+-- names may be, so the exclusion is refused. No file is visited first.
+private func exclude_beyond_a_parent_root_is_a_usage_error(
+    compiler: String,
+    work_directory: String,
+) -> Result[Void, String]:
+    output ?= run(
+        compiler,
+        ["format", "--check", "--exclude", "../../x", ".."],
+        "${work_directory}/cli_exclude_parent",
+        EXIT_USAGE,
+    )
+    expect_output(
+        output,
+        "",
+        "blorp: error: the excluded path `../../x` is not inside any path being formatted\nhelp: exclude a file or directory below one of the paths to format, or add a path that contains it\n",
+    )
+
+
 -- help and usage
 
 private func help_prints_the_overview_to_stdout(
@@ -711,6 +729,35 @@ private func an_unknown_option_is_named(
         "",
         "blorp: error: unknown option `--bogus` for blorp format\nhelp: run blorp help format to list its options\n",
     )
+
+
+private func an_empty_format_path_is_a_usage_error(
+    compiler: String,
+    work_directory: String,
+) -> Result[Void, String]:
+    output ?= run(compiler, ["format", ""], "${work_directory}/cli_empty_format", EXIT_USAGE)
+    expect_output(output, "", "blorp: error: a path cannot be empty\nhelp: write a nonempty path\n")
+
+
+private func an_empty_compile_output_is_a_usage_error(
+    compiler: String,
+    work_directory: String,
+) -> Result[Void, String]:
+    output ?= run(
+        compiler,
+        ["compile", "blorp/test/e2e/fixtures/return/zero.brp", "-o", ""],
+        "${work_directory}/cli_empty_output",
+        EXIT_USAGE,
+    )
+    expect_output(output, "", "blorp: error: a path cannot be empty\nhelp: write a nonempty path\n")
+
+
+private func an_empty_compile_input_is_a_usage_error(
+    compiler: String,
+    work_directory: String,
+) -> Result[Void, String]:
+    output ?= run(compiler, ["compile", ""], "${work_directory}/cli_empty_input", EXIT_USAGE)
+    expect_output(output, "", "blorp: error: a path cannot be empty\nhelp: write a nonempty path\n")
 
 
 func suite(compiler: String, work_directory: String) -> TestSuite:
@@ -862,6 +909,12 @@ func suite(compiler: String, work_directory: String) -> TestSuite:
                 ),
             ),
             (
+                "format --exclude ../../x under the root .. is refused",
+                func(): reported(
+                    exclude_beyond_a_parent_root_is_a_usage_error(compiler, work_directory),
+                ),
+            ),
+            (
                 "help and -h print the overview to stdout",
                 func(): reported(help_prints_the_overview_to_stdout(compiler, work_directory)),
             ),
@@ -884,6 +937,20 @@ func suite(compiler: String, work_directory: String) -> TestSuite:
             (
                 "an unknown option is named",
                 func(): reported(an_unknown_option_is_named(compiler, work_directory)),
+            ),
+            (
+                "format refuses an empty path",
+                func(): reported(an_empty_format_path_is_a_usage_error(compiler, work_directory)),
+            ),
+            (
+                "compile refuses an empty -o",
+                func(): reported(
+                    an_empty_compile_output_is_a_usage_error(compiler, work_directory),
+                ),
+            ),
+            (
+                "compile refuses an empty input",
+                func(): reported(an_empty_compile_input_is_a_usage_error(compiler, work_directory)),
             ),
         ],
     }

@@ -81,7 +81,10 @@ decisions left open.
 8. **`Path` reopens D13, ahead of `Bytes`.** A String-backed opaque `Path`
    carries the filesystem operations as its methods, as in
    `config.read_text()`. `Path` and `IOError` join the prelude when it lands,
-   so file I/O needs no import. A `File` handle type is ruled out, because
+   so file I/O needs no import. Amended by `PATH_PLAN.md` (2026-11-11):
+   `IOError` is deleted in favour of one exact error per operation, and
+   `Path` stays an explicit import, by Keith's decision on its prelude
+   cost. A `File` handle type is ruled out, because
    Blorp deliberately has no open or close. `Path`'s details get their own
    decisions when its brief is written, and amend D13 in
    `FILESYSTEM_DECISIONS.md`.

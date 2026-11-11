@@ -269,9 +269,9 @@ static void write_file(const char *path, const char *bytes, size_t length) {
 
 /* "<directory>/lines-<name>", holding `length` bytes. */
 static void case_file(char *path, const char *directory, const char *name, const char *bytes, size_t length) {
-    char file_name[PATH_BYTES];
-    assert(snprintf(file_name, sizeof file_name, "lines-%s", name) > 0);
-    join(path, directory, file_name);
+    char leaf_name[PATH_BYTES];
+    assert(snprintf(leaf_name, sizeof leaf_name, "lines-%s", name) > 0);
+    join(path, directory, leaf_name);
     write_file(path, bytes, length);
 }
 

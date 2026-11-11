@@ -1,31 +1,28 @@
 import:
     bool: and
     int: Int methods
-    io/error: IOError, IOErrorKind(PermissionDenied, OtherOs), to_string
-    io/fs:
-        Entry,
-        EntryKind(File, Directory, Symlink, Other),
-        list_directory,
-        create_directory,
-        create_directories,
-        remove_file,
-        remove_directory,
-        remove_directory_tree,
-        rename,
-        with_temporary_directory,
-        entry_kind,
-        read_text,
-        write_text,
+    io/fs/create_directory: create_directory, create_directories
+    io/fs/entry: EntryKind(File, Directory, Symlink, Other), entry_kind
+    io/fs/list: list_directory
+    io/fs/read: read_text
+    io/fs/remove_directory: remove_directory
+    io/fs/remove_file: remove_file
+    io/fs/remove_tree: remove_directory_tree
+    io/fs/rename: RenameError, rename
+    io/fs/temporary_directory: TemporaryDirectoryError, with_temporary_directory
+    io/fs/write: write_text
     list: get, List methods
-    path: join
+    path: Path, join, to_path
+    result: Result methods
+    string: String methods
 
 
 -- Every operation runs against the directory that prepare_directories.sh has
 -- just rebuilt, given as the first argument, and changes it. Each error is
--- printed with the directory replaced by the entry's name, so the output is
--- the same wherever the directory is, and the number of an OtherOs error is
--- never printed, because it differs between macOS and Linux. A temporary
--- directory's random name is never printed either.
+-- printed as "name: reason" with the entry's name in place of its path, so the
+-- output is the same wherever the directory is, and the number of an OtherOs
+-- error is never printed, because it differs between macOS and Linux. A
+-- temporary directory's random name is never printed either.
 --
 -- Not here, each because it cannot be provoked without root or a second
 -- device, or differs by platform; the C tests in test/runtime/fs_suite.brp
@@ -39,33 +36,44 @@ import:
 --     AlreadyExists on Linux.
 
 
--- The error's own path must be the path the caller passed.
-private pure func described(path: String, name: String, error: IOError) -> String:
-    match error.kind:
-        OtherOs(_):
-            "OtherOs"
-        _:
-            if error.path == path:
-                renamed: IOError = { error | path = name }
-                renamed.to_string()
-            else:
-                "wrong path: ${error.path}"
+private OTHER_OS_PHRASE: String = "operating system error"
 
 
-private pure func outcome(path: String, name: String, result: Result[Void, IOError]) -> String:
+-- The failure as "name: reason". An OtherOs phrase carries a platform number,
+-- so it is shown as the variant alone; every error type words OtherOs the same.
+private pure func described[E: Stringable](name: String, error: E) -> String:
+    reason = "${error}"
+    if reason.starts_with(OTHER_OS_PHRASE):
+        "OtherOs"
+    else:
+        "${name}: ${reason}"
+
+
+private pure func outcome[E: Stringable](name: String, result: Result[Void, E]) -> String:
     match result:
         Ok(_): "ok"
-        Err(error): described(path, name, error)
+        Err(error): described(name, error)
 
 
-private func show(
+-- Runs `use` on a name in the directory; a name that is no path component is
+-- reported in the place of its case.
+private func in_directory(directory: Path, name: String, use: (Path) -> Void) -> Void:
+    match name.to_path():
+        Ok(child): use(join(directory, child))
+        Err(error): print("${name}: ${error}")
+
+
+private func show[E: Stringable](
     label: String,
-    directory: String,
+    directory: Path,
     name: String,
-    operation: (String) -> Result[Void, IOError],
+    operation: (Path) -> Result[Void, E],
 ) -> Void:
-    path = join(directory, name)
-    print("${label} ${name}: ${outcome(path, name, operation(path))}")
+    in_directory(
+        directory,
+        name,
+        func(path: Path) -> Void: print("${label} ${name}: ${outcome(name, operation(path))}"),
+    )
 
 
 private pure func kind_name(kind: Option[EntryKind]) -> String:
@@ -74,18 +82,24 @@ private pure func kind_name(kind: Option[EntryKind]) -> String:
         Some(found): found.kind_word()
 
 
-private func show_kind(directory: String, name: String) -> Void:
-    path = join(directory, name)
+private func show_kind(directory: Path, name: String) -> Void:
+    in_directory(directory, name, func(path: Path) -> Void: print_kind(path, name))
+
+
+private func print_kind(path: Path, name: String) -> Void:
     match entry_kind(path):
         Ok(kind): print("  ${name} is ${kind_name(kind)}")
-        Err(error): print("  ${name}: ${described(path, name, error)}")
+        Err(error): print("  ${name}: ${described(name, error)}")
 
 
-private func show_contents(directory: String, name: String) -> Void:
-    path = join(directory, name)
+private func show_contents(directory: Path, name: String) -> Void:
+    in_directory(directory, name, func(path: Path) -> Void: print_contents(path, name))
+
+
+private func print_contents(path: Path, name: String) -> Void:
     match read_text(path):
         Ok(text): print("  ${name} holds \"${text}\"")
-        Err(error): print("  ${name}: ${described(path, name, error)}")
+        Err(error): print("  ${name}: ${described(name, error)}")
 
 
 -- The expected output is ASCII. The precomposed e with an acute accent, which
@@ -106,8 +120,11 @@ private pure func kind_word(kind: EntryKind) -> String:
         Other: "other"
 
 
-private func show_listing(directory: String, name: String) -> Void:
-    path = join(directory, name)
+private func show_listing(directory: Path, name: String) -> Void:
+    in_directory(directory, name, func(path: Path) -> Void: print_listing(path, name))
+
+
+private func print_listing(path: Path, name: String) -> Void:
     match list_directory(path):
         Ok(entries):
             print("list_directory ${name}: ${entries.length()} entries")
@@ -115,162 +132,134 @@ private func show_listing(directory: String, name: String) -> Void:
                 print("  ${entry.name.shown()} ${entry.kind.kind_word()}")
             void
         Err(error):
-            print("list_directory ${name}: ${described(path, name, error)}")
+            print("list_directory ${name}: ${described(name, error)}")
 
 
--- A rename error names both paths the caller passed.
-private pure func names_both(error: IOError, source: String, destination: String) -> Bool:
-    match error.destination:
-        Some(second): and(error.path == source, second == destination)
-        None: False
+-- A rename error names neither path, so the caller words both, as the
+-- two-path error used to.
+private func show_rename(directory: Path, source_name: String, destination_name: String) -> Void:
+    in_directory(
+        directory,
+        source_name,
+        func(source: Path) -> Void: in_directory(
+            directory,
+            destination_name,
+            func(destination: Path) -> Void: print_rename(
+                source_name,
+                destination_name,
+                rename(source, destination),
+            ),
+        ),
+    )
 
 
-private func show_rename(directory: String, source_name: String, destination_name: String) -> Void:
-    source = join(directory, source_name)
-    destination = join(directory, destination_name)
-    label = "rename ${source_name} -> ${destination_name}"
-    match rename(source, destination):
-        Ok(_):
-            print("${label}: ok")
-        Err(error):
-            if error.kind.is_other_os():
-                print("${label}: OtherOs")
-            else if error.names_both(source, destination):
-                named: IOError = { error |
-                    path = source_name,
-                    destination = Some(destination_name),
-                }
-                print("${label}: ${named}")
-            else:
-                print("${label}: wrong paths: ${error}")
-
-
-private pure func is_other_os(kind: IOErrorKind) -> Bool:
-    match kind:
-        OtherOs(_): True
-        _: False
+private func print_rename(
+    source_name: String,
+    destination_name: String,
+    result: Result[Void, RenameError],
+) -> Void:
+    names = "${source_name} -> ${destination_name}"
+    match result:
+        Ok(_): print("rename ${names}: ok")
+        Err(error): print("rename ${names}: ${described(names, error)}")
 
 
 -- The tree, with a link out of it to a file and to a directory, must be gone
 -- while what the links name survives.
-private func show_survivors(directory: String) -> Void:
+private func show_survivors(directory: Path) -> Void:
     show_kind(directory, "tree")
     show_kind(directory, "outside")
     show_contents(directory, "outside/precious.txt")
 
 
+private pure func text_of[E: Stringable](error: E) -> String:
+    "${error}"
+
+
+private pure func temporary_text(error: TemporaryDirectoryError) -> String:
+    "${error}"
+
+
 -- A body that works in the directory it is given.
-private func work_in(directory: String) -> Result[Int, IOError]:
-    inside = join(directory, "inside.txt")
-    _ ?= write_text(inside, "scratch")
-    text ?= read_text(inside)
+private func work_in(directory: Path) -> Result[Int, String]:
+    child ?= "inside.txt"
+        .to_path()
+        .map_err(text_of)
+    inside = join(directory, child)
+    _ ?= write_text(inside, "scratch").map_err(text_of)
+    text ?= read_text(inside).map_err(text_of)
     Ok(text.length())
 
 
 -- A body that removes its own directory, so the cleanup that follows has
--- nothing to remove. It records the directory it was given in `seen`.
-private func remove_itself(seen: String, directory: String) -> Result[Int, IOError]:
-    _ ?= write_text(seen, directory)
-    _ ?= remove_directory_tree(directory)
+-- nothing to remove.
+private func remove_itself(directory: Path) -> Result[Int, String]:
+    _ ?= remove_directory_tree(directory).map_err(text_of)
     Ok(0)
 
 
-private func remove_then_fail(directory: String) -> Result[Int, IOError]:
-    _ ?= remove_directory_tree(directory)
-    Err({ path = "body", destination = None, kind = PermissionDenied })
+private func remove_then_fail(directory: Path) -> Result[Int, String]:
+    _ ?= remove_directory_tree(directory).map_err(text_of)
+    Err("body: permission denied")
 
 
-private func fail_with_text(directory: String) -> Result[Int, String]:
+private func fail_with_text(directory: Path) -> Result[Int, String]:
     Err("body failed")
 
 
-private func unreachable(directory: String) -> Result[Int, String]:
+private func unreachable(directory: Path) -> Result[Int, String]:
     print("body ran")
     Ok(0)
 
 
-private func show_scratch_entries(scratch: String) -> Void:
+private func show_scratch_entries(scratch: Path) -> Void:
     match list_directory(scratch):
         Ok(entries): print("  scratch holds ${entries.length()} entries")
-        Err(error): print("  scratch: ${described(scratch, "scratch", error)}")
+        Err(error): print("  scratch: ${described("scratch", error)}")
 
 
-private func show_with_directory(scratch: String) -> Void:
-    match with_temporary_directory(
-        scratch,
-        "run-",
-        work_in,
-        pure func(error: IOError) -> IOError: error,
-    ):
+private func show_with_directory(scratch: Path) -> Void:
+    match with_temporary_directory(scratch, "run-", work_in, temporary_text):
         Ok(size): print("with_temporary_directory ok: ${size}")
-        Err(error): print("with_temporary_directory ok: ${described(scratch, "scratch", error)}")
+        Err(text): print("with_temporary_directory ok: scratch: ${text}")
     show_scratch_entries(scratch)
 
 
-private func show_body_text_error(scratch: String) -> Void:
-    match with_temporary_directory(scratch, "run-", fail_with_text, to_string):
+private func show_body_text_error(scratch: Path) -> Void:
+    match with_temporary_directory(scratch, "run-", fail_with_text, temporary_text):
         Ok(size): print("with_temporary_directory text error: ok ${size}")
         Err(text): print("with_temporary_directory text error: ${text}")
     show_scratch_entries(scratch)
 
 
--- The cleanup's NotFound names the directory the body was given (D34), not
--- the parent, and the body could not have named it: it reads the record the
--- body left.
-private func show_removed_by_body(scratch: String, seen: String) -> Void:
-    match with_temporary_directory(
-        scratch,
-        "run-",
-        func(directory: String) -> Result[Int, IOError]: remove_itself(seen, directory),
-        pure func(error: IOError) -> IOError: error,
-    ):
-        Ok(size):
-            print("with_temporary_directory removed by body: ok ${size}")
-        Err(error):
-            match read_text(seen):
-                Ok(directory):
-                    named: IOError = { error | path = "directory" }
-                    print("with_temporary_directory removed by body: ${named}")
-                    if error.path == directory:
-                        print("  path is the directory the body was given")
-                    else if error.path == scratch:
-                        print("  path is the parent")
-                    else:
-                        print("  path is neither")
-                Err(read_error):
-                    print("with_temporary_directory removed by body: no record: ${read_error}")
+-- The cleanup's NotFound no longer names the directory the body was given
+-- (D34's exception is gone): the body had its path and the caller needs no
+-- other.
+private func show_removed_by_body(scratch: Path) -> Void:
+    match with_temporary_directory(scratch, "run-", remove_itself, temporary_text):
+        Ok(size): print("with_temporary_directory removed by body: ok ${size}")
+        Err(text): print("with_temporary_directory removed by body: directory: ${text}")
     show_scratch_entries(scratch)
 
 
-private func show_body_error_wins(scratch: String) -> Void:
-    match with_temporary_directory(
-        scratch,
-        "run-",
-        remove_then_fail,
-        pure func(error: IOError) -> IOError: error,
-    ):
-        Ok(size):
-            print("with_temporary_directory body error: ok ${size}")
-        Err(error):
-            print("with_temporary_directory body error: ${described("body", "body", error)}")
+private func show_body_error_wins(scratch: Path) -> Void:
+    match with_temporary_directory(scratch, "run-", remove_then_fail, temporary_text):
+        Ok(size): print("with_temporary_directory body error: ok ${size}")
+        Err(text): print("with_temporary_directory body error: ${text}")
     show_scratch_entries(scratch)
 
 
--- to_string is the converter, so the text carries the whole path; it is
--- compared with the text that path must give and printed under a name.
-private func show_missing_parent(directory: String) -> Void:
-    missing = join(directory, "missing")
-    match with_temporary_directory(missing, "run-", unreachable, to_string):
-        Ok(size):
-            print("with_temporary_directory missing parent: ok ${size}")
-        Err(text):
-            if text == "${missing}: no such file":
-                print("with_temporary_directory missing parent: missing: no such file")
-            else:
-                print("with_temporary_directory missing parent: wrong text: ${text}")
+private func show_missing_parent(directory: Path) -> Void:
+    in_directory(directory, "missing", func(missing: Path) -> Void: print_missing_parent(missing))
 
 
-private func show_listings(directory: String) -> Void:
+private func print_missing_parent(missing: Path) -> Void:
+    match with_temporary_directory(missing, "run-", unreachable, temporary_text):
+        Ok(size): print("with_temporary_directory missing parent: ok ${size}")
+        Err(text): print("with_temporary_directory missing parent: missing: ${text}")
+
+
+private func show_listings(directory: Path) -> Void:
     show_listing(directory, "listing")
     show_listing(directory, "listing_link")
     show_listing(directory, "empty")
@@ -283,7 +272,7 @@ private func show_listings(directory: String) -> Void:
     show("remove_directory", directory, "locked", remove_directory)
 
 
-private func show_creates(directory: String) -> Void:
+private func show_creates(directory: Path) -> Void:
     show("create_directory", directory, "fresh", create_directory)
     show("create_directory", directory, "fresh", create_directory)
     show("create_directory", directory, "absent/child", create_directory)
@@ -297,7 +286,7 @@ private func show_creates(directory: String) -> Void:
     show("create_directories", directory, "dangling", create_directories)
 
 
-private func show_removals(directory: String) -> Void:
+private func show_removals(directory: Path) -> Void:
     show("remove_file", directory, "to_remove.txt", remove_file)
     show("remove_file", directory, "to_remove.txt", remove_file)
     show("remove_file", directory, "listing/dir", remove_file)
@@ -307,7 +296,7 @@ private func show_removals(directory: String) -> Void:
     show("remove_directory", directory, "file.txt", remove_directory)
 
 
-private func show_renames(directory: String) -> Void:
+private func show_renames(directory: Path) -> Void:
     show_rename(directory, "old.txt", "new.txt")
     show_kind(directory, "old.txt")
     show_contents(directory, "new.txt")
@@ -315,7 +304,7 @@ private func show_renames(directory: String) -> Void:
     show_rename(directory, "source_dir", "nonempty")
 
 
-private func show_trees(directory: String) -> Void:
+private func show_trees(directory: Path) -> Void:
     show("remove_directory_tree", directory, "tree", remove_directory_tree)
     show_survivors(directory)
     show("remove_directory_tree", directory, "tree", remove_directory_tree)
@@ -326,13 +315,26 @@ private func show_trees(directory: String) -> Void:
     show_listing(directory, "listing")
 
 
-private func show_temporary_directories(directory: String) -> Void:
-    scratch = join(directory, "scratch")
+-- A prefix with a `/` or a NUL is refused before anything is made, so the body
+-- never runs and the parent is left alone.
+private func show_invalid_prefix(parent: Path, label: String, prefix: String) -> Void:
+    match with_temporary_directory(parent, prefix, unreachable, temporary_text):
+        Ok(size): print("with_temporary_directory ${label} prefix: ok ${size}")
+        Err(text): print("with_temporary_directory ${label} prefix: ${text}")
+
+
+private func show_temporary_directories(directory: Path) -> Void:
+    in_directory(directory, "scratch", func(scratch: Path) -> Void: run_temporary_cases(scratch))
+    show_missing_parent(directory)
+    show_invalid_prefix(directory, "slash", "a/b")
+    show_invalid_prefix(directory, "NUL", "a\0b")
+
+
+private func run_temporary_cases(scratch: Path) -> Void:
     show_with_directory(scratch)
     show_body_text_error(scratch)
-    show_removed_by_body(scratch, join(directory, "seen.txt"))
+    show_removed_by_body(scratch)
     show_body_error_wins(scratch)
-    show_missing_parent(directory)
 
 
 func main(arguments: List[String]) -> Int:
@@ -340,11 +342,16 @@ func main(arguments: List[String]) -> Int:
         None:
             print("missing directory")
             2
-        Some(directory):
-            show_listings(directory)
-            show_creates(directory)
-            show_removals(directory)
-            show_renames(directory)
-            show_trees(directory)
-            show_temporary_directories(directory)
-            0
+        Some(text):
+            match text.to_path():
+                Err(error):
+                    print("${text}: ${error}")
+                    2
+                Ok(directory):
+                    show_listings(directory)
+                    show_creates(directory)
+                    show_removals(directory)
+                    show_renames(directory)
+                    show_trees(directory)
+                    show_temporary_directories(directory)
+                    0

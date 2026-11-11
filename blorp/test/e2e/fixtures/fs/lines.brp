@@ -1,11 +1,12 @@
 import:
     bool: Bool methods
     int: Int methods
-    io/error: IOError, IOErrorKind(InvalidUtf8, OtherOs), to_string
-    io/fs: fold_lines, write_text, with_temporary_directory
+    io/fs/read: ReadError, fold_lines
+    io/fs/temporary_directory: TemporaryDirectoryError, with_temporary_directory
+    io/fs/write: WriteError, write_text
     list: List methods, repeat, get
     option: Option methods
-    path: join
+    path: Path, join, to_path
     string: String methods, from_codepoint
 
 
@@ -35,14 +36,14 @@ private INVALID_UTF8_FOLDS: Int = 300
 private CRLF_LINES: Int = 20000
 
 
--- What a step can return besides an IOError: a stop of the example's own.
+-- What a step can return besides a ReadError: a stop of the example's own.
 union Stopped:
-    ReadFailed(IOError)
+    ReadFailed(ReadError)
     StoppedAt(Int)
 
 
 union ScoreError:
-    Unreadable(IOError)
+    Unreadable(ReadError)
     NotANumber(String)
 
 
@@ -52,8 +53,8 @@ pure func add_score(total: Int, line: String) -> Result[Int, ScoreError]:
         None: Err(NotANumber(line))
 
 
-func total_score(path: String) -> Result[Int, ScoreError]:
-    fold_lines(path, 0, add_score, pure func(error: IOError) -> ScoreError: Unreadable(error))
+func total_score(path: Path) -> Result[Int, ScoreError]:
+    fold_lines(path, 0, add_score, pure func(error: ReadError) -> ScoreError: Unreadable(error))
 
 
 -- Prints each line it adds, so the output shows which lines were stepped.
@@ -62,34 +63,39 @@ private func traced_add_score(total: Int, line: String) -> Result[Int, ScoreErro
     add_score(total, line)
 
 
-func traced_total_score(path: String) -> Result[Int, ScoreError]:
+func traced_total_score(path: Path) -> Result[Int, ScoreError]:
     fold_lines(
         path,
         0,
         traced_add_score,
-        pure func(error: IOError) -> ScoreError: Unreadable(error),
+        pure func(error: ReadError) -> ScoreError: Unreadable(error),
     )
 
 
-private pure func keep(error: IOError) -> IOError:
+private pure func keep(error: ReadError) -> ReadError:
     error
 
 
-private pure func is_other_os(error: IOError) -> Bool:
-    match error.kind:
-        OtherOs(_): True
-        _: False
+-- Runs `use` on a name in the directory; a name that is no path component is
+-- reported in the place of its case.
+private func in_directory(directory: Path, name: String, use: (Path) -> Void) -> Void:
+    match name.to_path():
+        Ok(child): use(join(directory, child))
+        Err(error): print("${name}: ${error}")
 
 
--- The error's own path must be the path the caller passed.
-private pure func described(path: String, name: String, error: IOError) -> String:
-    if is_other_os(error):
-        "OtherOs"
-    else if error.path == path:
-        renamed: IOError = { error | path = name }
-        renamed.to_string()
-    else:
-        "wrong path: ${error.path}"
+-- The failure as "name: reason" with the entry's name in place of its path.
+-- ELOOP's number differs by platform, so only the variant is shown.
+private pure func described(name: String, error: ReadError) -> String:
+    match error:
+        ReadError.OtherOs(_): "OtherOs"
+        _: "${name}: ${error}"
+
+
+private pure func write_described(name: String, error: WriteError) -> String:
+    match error:
+        WriteError.OtherOs(_): "OtherOs"
+        _: "${name}: ${error}"
 
 
 private pure func repeated(piece: String, count: Int) -> String:
@@ -136,11 +142,11 @@ private pure func shown(line: String) -> String:
         text
 
 
-private pure func collect(lines: List[String], line: String) -> Result[List[String], IOError]:
+private pure func collect(lines: List[String], line: String) -> Result[List[String], ReadError]:
     Ok(lines.append(line))
 
 
-private func read_lines(path: String) -> Result[List[String], IOError]:
+private func read_lines(path: Path) -> Result[List[String], ReadError]:
     start: List[String] = []
     fold_lines(path, start, collect, keep)
 
@@ -160,16 +166,18 @@ private pure func shown_lines(lines: List[String]) -> String:
 
 -- Writes `text` as `name` in the directory, folds its lines and prints them
 -- with whether they are the expected ones.
-private func show_text(
-    directory: String,
-    name: String,
-    text: String,
-    expected: List[String],
-) -> Void:
-    path = join(directory, name)
+private func show_text(directory: Path, name: String, text: String, expected: List[String]) -> Void:
+    in_directory(
+        directory,
+        name,
+        func(path: Path) -> Void: show_text_at(path, name, text, expected),
+    )
+
+
+private func show_text_at(path: Path, name: String, text: String, expected: List[String]) -> Void:
     match write_text(path, text):
         Err(error):
-            print("${name}: write failed: ${described(path, name, error)}")
+            print("${name}: write failed: ${write_described(name, error)}")
         Ok(_):
             match read_lines(path):
                 Ok(lines):
@@ -177,7 +185,7 @@ private func show_text(
                         "${name}: ${lines.length()} lines: ${shown_lines(lines)}; as expected ${yes_no(lines == expected)}",
                     )
                 Err(error):
-                    print("${name}: ${described(path, name, error)}")
+                    print("${name}: ${described(name, error)}")
 
 
 -- The totals of a fold over many lines, so the check needs no copy of them.
@@ -195,7 +203,7 @@ private pure func carriage_return_ending(line: String) -> Int:
         0
 
 
-private pure func add_totals(totals: Totals, line: String) -> Result[Totals, IOError]:
+private pure func add_totals(totals: Totals, line: String) -> Result[Totals, ReadError]:
     Ok({
         lines = totals.lines + 1,
         bytes = totals.bytes + line.length(),
@@ -219,8 +227,11 @@ private pure func crlf_line(number: Int) -> String:
 
 
 -- Twenty thousand lines of varied length, far more than one read holds.
-private func show_crlf(directory: String) -> Void:
-    path = join(directory, "crlf.txt")
+private func show_crlf(directory: Path) -> Void:
+    in_directory(directory, "crlf.txt", show_crlf_at)
+
+
+private func show_crlf_at(path: Path) -> Void:
     var lines: List[String] = []
     for number in 0..CRLF_LINES:
         lines = lines.append(crlf_line(number))
@@ -232,7 +243,7 @@ private func show_crlf(directory: String) -> Void:
             .join(""),
     ):
         Err(error):
-            print("crlf.txt: write failed: ${described(path, "crlf.txt", error)}")
+            print("crlf.txt: write failed: ${write_described("crlf.txt", error)}")
         Ok(_):
             start: Totals = { lines = 0, bytes = 0, ending_in_carriage_return = 0 }
             match fold_lines(path, start, add_totals, keep):
@@ -241,44 +252,44 @@ private func show_crlf(directory: String) -> Void:
                         "crlf.txt: ${shown_totals(totals)}; as expected ${yes_no((totals.lines == expected.lines).and(totals.bytes == expected.bytes))}",
                     )
                 Err(error):
-                    print("crlf.txt: ${described(path, "crlf.txt", error)}")
+                    print("crlf.txt: ${described("crlf.txt", error)}")
 
 
-private pure func count_line(count: Int, line: String) -> Result[Int, IOError]:
+private pure func count_line(count: Int, line: String) -> Result[Int, ReadError]:
     Ok(count + 1)
 
 
 -- One fold over a file of the tree, or over a path that is not valid.
-private func show_fold(path: String, name: String) -> Void:
+private func show_fold(path: Path, name: String) -> Void:
     match fold_lines(path, 0, count_line, keep):
         Ok(count): print("fold_lines ${name}: ok ${count} lines")
-        Err(error): print("fold_lines ${name}: ${described(path, name, error)}")
+        Err(error): print("fold_lines ${name}: ${described(name, error)}")
 
 
-private func show_tree_fold(tree: String, name: String) -> Void:
-    show_fold(join(tree, name), name)
+private func show_tree_fold(tree: Path, name: String) -> Void:
+    in_directory(tree, name, func(path: Path) -> Void: show_fold(path, name))
 
 
-private func scored(path: String, trace: Bool) -> Result[Int, ScoreError]:
+private func scored(path: Path, trace: Bool) -> Result[Int, ScoreError]:
     if trace:
         traced_total_score(path)
     else:
         total_score(path)
 
 
-private func show_score(directory: String, name: String, text: String, trace: Bool) -> Void:
-    path = join(directory, name)
+private func show_score(directory: Path, name: String, text: String, trace: Bool) -> Void:
+    in_directory(directory, name, func(path: Path) -> Void: show_score_at(path, name, text, trace))
+
+
+private func show_score_at(path: Path, name: String, text: String, trace: Bool) -> Void:
     match write_text(path, text):
         Err(error):
-            print("${name}: write failed: ${described(path, name, error)}")
+            print("${name}: write failed: ${write_described(name, error)}")
         Ok(_):
             match scored(path, trace):
-                Ok(total):
-                    print("total_score ${name}: ok ${total}")
-                Err(NotANumber(line)):
-                    print("total_score ${name}: not a number ${line}")
-                Err(Unreadable(error)):
-                    print("total_score ${name}: ${described(path, name, error)}")
+                Ok(total): print("total_score ${name}: ok ${total}")
+                Err(NotANumber(line)): print("total_score ${name}: not a number ${line}")
+                Err(Unreadable(error)): print("total_score ${name}: ${described(name, error)}")
 
 
 private func announce_if(condition: Bool, message: String) -> Void:
@@ -303,7 +314,7 @@ private func announcing_step(count: Int, line: String) -> Result[Int, Stopped]:
     Ok(count + 1)
 
 
-private pure func unreadable(error: IOError) -> Stopped:
+private pure func unreadable(error: ReadError) -> Stopped:
     ReadFailed(error)
 
 
@@ -314,19 +325,21 @@ private pure func stop_at(count: Int, limit: Int) -> Result[Int, Stopped]:
         Ok(count + 1)
 
 
-private func show_stopped(path: String, name: String, outcome: Result[Int, Stopped]) -> Void:
+private func show_stopped(name: String, outcome: Result[Int, Stopped]) -> Void:
     match outcome:
         Ok(count): print("fold_lines ${name}: ok ${count} lines")
         Err(StoppedAt(line)): print("fold_lines ${name}: step stopped at line ${line}")
-        Err(ReadFailed(error)): print("fold_lines ${name}: ${described(path, name, error)}")
+        Err(ReadFailed(error)): print("fold_lines ${name}: ${described(name, error)}")
 
 
-private func show_long_not_utf8(tree: String) -> Void:
+private func show_long_not_utf8(tree: Path) -> Void:
+    in_directory(tree, "long_not_utf8.txt", show_long_not_utf8_at)
+
+
+private func show_long_not_utf8_at(path: Path) -> Void:
     name = "long_not_utf8.txt"
-    path = join(tree, name)
-    show_stopped(path, name, fold_lines(path, 0, announcing_step, unreadable))
+    show_stopped(name, fold_lines(path, 0, announcing_step, unreadable))
     show_stopped(
-        path,
         name + " with a step stopping at line 5",
         fold_lines(
             path,
@@ -342,11 +355,14 @@ private func show_long_not_utf8(tree: String) -> Void:
 -- LEAK_FOLDS. Counting the open descriptors in /dev/fd would need no limit, but
 -- the listing's size, and so the example's allocation count, differs between
 -- machines.
-private func show_early_stops(directory: String) -> Void:
-    path = join(directory, "small.txt")
+private func show_early_stops(directory: Path) -> Void:
+    in_directory(directory, "small.txt", show_early_stops_at)
+
+
+private func show_early_stops_at(path: Path) -> Void:
     match write_text(path, "one\ntwo\nthree\n"):
         Err(error):
-            print("small.txt: write failed: ${described(path, "small.txt", error)}")
+            print("small.txt: write failed: ${write_described("small.txt", error)}")
         Ok(_):
             var stopped = 0
             var failed = 0
@@ -364,15 +380,18 @@ private func show_early_stops(directory: String) -> Void:
             )
 
 
-private func show_invalid_utf8_folds(tree: String) -> Void:
-    path = join(tree, "long_not_utf8.txt")
+private func show_invalid_utf8_folds(tree: Path) -> Void:
+    in_directory(tree, "long_not_utf8.txt", show_invalid_utf8_folds_at)
+
+
+private func show_invalid_utf8_folds_at(path: Path) -> Void:
     var invalid = 0
     var otherwise = 0
     for attempt in 0..INVALID_UTF8_FOLDS:
         match fold_lines(path, 0, count_line, keep):
             Err(error):
-                match error.kind:
-                    InvalidUtf8: invalid = invalid + 1
+                match error:
+                    ReadError.InvalidUtf8: invalid = invalid + 1
                     _: otherwise = otherwise + 1
             Ok(_):
                 otherwise = otherwise + 1
@@ -381,12 +400,12 @@ private func show_invalid_utf8_folds(tree: String) -> Void:
     )
 
 
-private func run_leak_folds(tree: String, directory: String) -> Void:
+private func run_leak_folds(tree: Path, directory: Path) -> Void:
     show_early_stops(directory)
     show_invalid_utf8_folds(tree)
 
 
-private func run_cases(tree: String, directory: String) -> Result[Void, IOError]:
+private func run_cases(tree: Path, directory: Path) -> Result[Void, TemporaryDirectoryError]:
     show_text(directory, "empty.txt", "", [])
     show_text(directory, "newline.txt", "\n", [""])
     show_text(directory, "mixed.txt", "a\r\nb\rc\n\nlast", ["a", "b\rc", "", "last"])
@@ -408,7 +427,6 @@ private func run_cases(tree: String, directory: String) -> Result[Void, IOError]
     show_tree_fold(tree, "locked.txt")
     show_tree_fold(tree, "loop")
     show_tree_fold(tree, "not_utf8.bin")
-    show_fold("a\0b", "nul")
     show_long_not_utf8(tree)
     run_leak_folds(tree, directory)
     Ok(void)
@@ -419,15 +437,23 @@ func main(arguments: List[String]) -> Int:
         None:
             print("missing directory")
             2
-        Some(tree):
-            match with_temporary_directory(
-                tree,
-                "lines",
-                func(directory: String) -> Result[Void, IOError]: run_cases(tree, directory),
-                keep,
-            ):
-                Ok(_):
-                    0
+        Some(text):
+            match text.to_path():
                 Err(error):
-                    print("temporary directory: ${error}")
-                    1
+                    print("${text}: ${error}")
+                    2
+                Ok(tree):
+                    match with_temporary_directory(
+                        tree,
+                        "lines",
+                        func(directory: Path) -> Result[Void, TemporaryDirectoryError]: run_cases(
+                            tree,
+                            directory,
+                        ),
+                        pure func(error: TemporaryDirectoryError) -> TemporaryDirectoryError: error,
+                    ):
+                        Ok(_):
+                            0
+                        Err(error):
+                            print("temporary directory: ${error}")
+                            1

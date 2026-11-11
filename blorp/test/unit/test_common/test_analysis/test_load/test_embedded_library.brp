@@ -9,11 +9,10 @@ run against the library as it was at the last build.
 import:
     bool: Bool methods, and, not
     int: Int methods
-    io/error: to_string
-    io/fs: Entry, EntryKind(File, Directory), list_directory, read_text
+    io/fs/entry: Entry, EntryKind(File, Directory)
     list: List methods
     option: Option methods
-    path as path_ops
+    path: Path, to_path
     result: Result methods
     string: String methods
     test: TestSuite
@@ -29,7 +28,7 @@ import:
         load_program,
         load_test_program,
         module_role,
-    ../../../../../src/common/cli/usage: has_source_suffix
+    ../../../../../src/common/cli/usage: source_stem
     ../../../../../src/common/syntax/names: intern_names, program_names
     ../../../../../src/common/syntax/parse: ImportOrigin(LibraryImport), ParsedImport
     ../../../../../src/common/syntax/source:
@@ -37,6 +36,7 @@ import:
         compiler_source,
     ../../../../../src/common/syntax/syntax: Span
     ../../../../../src/common/utils/text: byte_order_before
+    ../../../../e2e/file_access: list_entries, read_file
 
 
 private LIBRARY_ROOT: String = "blorp/standard_library"
@@ -63,7 +63,7 @@ private func files_among(
                         Ok(nested): files_among(folder, later, found.concat(nested))
                         Err(message): Err(message)
                 File:
-                    if entry.name.has_source_suffix():
+                    if entry.name.is_library_file():
                         files_among(folder, later, found.append(relative))
                     else:
                         files_among(folder, later, found)
@@ -71,8 +71,15 @@ private func files_among(
                     files_among(folder, later, found)
 
 
+-- A name that is no path names no library file.
+private pure func is_library_file(name: String) -> Bool:
+    match name.to_path():
+        Ok(path): source_stem(path).is_some()
+        Err(_): False
+
+
 private func library_file_names(folder: String) -> Result[List[String], String]:
-    entries ?= list_directory("${LIBRARY_ROOT}/${folder}").map_err(to_string)
+    entries ?= list_entries("${LIBRARY_ROOT}/${folder}")
     files_among(folder, entries, [])
 
 
@@ -82,9 +89,9 @@ private func stale_file(names: List[String]) -> Result[Option[String], String]:
         []:
             Ok(None)
         [name, ...later]:
-            match read_text(path_ops.join(LIBRARY_ROOT, name)):
-                Err(error):
-                    Err(error.to_string())
+            match read_file("${LIBRARY_ROOT}/${name}"):
+                Err(message):
+                    Err(message)
                 Ok(disk):
                     if embedded_library_file(name) == Some(disk):
                         stale_file(later)
@@ -144,39 +151,81 @@ pure func test_a_file_that_is_not_embedded_is_absent() -> Bool:
     )
 
 
-private pure func embedded_layout() -> LibraryLayout:
-    library_layout(EmbeddedLibrary, "/project")
+private PROJECT: String = "/project"
+
+
+-- The layout of `source` under the working directory /project. Both texts are
+-- paths, so a failure is a defect of the test and makes its case fail.
+private pure func layout_of(source: LibrarySource) -> Option[LibraryLayout]:
+    match PROJECT.to_path():
+        Ok(working_directory):
+            match library_layout(source, working_directory):
+                Ok(layout): Some(layout)
+                Err(_): None
+        Err(_):
+            None
+
+
+private pure func role_of(layout: LibraryLayout, text: String) -> Option[ModuleKind]:
+    match text.to_path():
+        Ok(path): Some(module_role(layout, path))
+        Err(_): None
 
 
 pure func test_embedded_roles_use_the_embedded_root() -> Bool:
-    layout = embedded_layout()
-    and(
-        and(
-            module_role(layout, "<standard library>/_base.brp") == FoundationTypesModule,
-            module_role(layout, "<standard library>/prelude.brp") == FoundationPreludeModule,
-        ),
-        and(
+    match layout_of(EmbeddedLibrary):
+        None:
+            False
+        Some(layout):
             and(
-                module_role(layout, "<standard library>/int.brp") == LibraryModule,
-                module_role(layout, "<standard library>_copy/int.brp") == UserModule,
-            ),
-            and(
-                module_role(layout, "/project/<standard library>/int.brp") == UserModule,
-                module_role(layout, "/project/main.brp") == UserModule,
-            ),
-        ),
-    )
+                and(
+                    role_of(layout, "<standard library>/_base.brp") == Some(FoundationTypesModule),
+                    (
+                        role_of(layout, "<standard library>/prelude.brp")
+                        == Some(FoundationPreludeModule)
+                    ),
+                ),
+                and(
+                    and(
+                        role_of(layout, "<standard library>/int.brp") == Some(LibraryModule),
+                        role_of(layout, "<standard library>_copy/int.brp") == Some(UserModule),
+                    ),
+                    and(
+                        role_of(layout, "/project/<standard library>/int.brp") == Some(UserModule),
+                        role_of(layout, "/project/main.brp") == Some(UserModule),
+                    ),
+                ),
+            )
 
 
 pure func test_a_directory_layout_joins_a_relative_root_to_the_working_directory() -> Bool:
-    layout = library_layout(LibraryDirectory("lib/../std"), "/project")
-    and(
-        and(
-            module_role(layout, "/project/std/int.brp") == LibraryModule,
-            module_role(layout, "/project/std/_base.brp") == FoundationTypesModule,
-        ),
-        module_role(layout, "/project/lib/int.brp") == UserModule,
-    )
+    match layout_of(LibraryDirectory("lib/../std")):
+        None:
+            False
+        Some(layout):
+            and(
+                and(
+                    role_of(layout, "/project/std/int.brp") == Some(LibraryModule),
+                    role_of(layout, "/project/std/_base.brp") == Some(FoundationTypesModule),
+                ),
+                role_of(layout, "/project/lib/int.brp") == Some(UserModule),
+            )
+
+
+pure func test_an_absolute_directory_root_is_not_joined_to_the_working_directory() -> Bool:
+    match layout_of(LibraryDirectory("/elsewhere/std")):
+        None:
+            False
+        Some(layout):
+            and(
+                role_of(layout, "/elsewhere/std/int.brp") == Some(LibraryModule),
+                role_of(layout, "/project/elsewhere/std/int.brp") == Some(UserModule),
+            )
+
+
+-- A root that is no path is the layout's failure, whichever way it is wrong.
+pure func test_a_library_root_that_is_not_a_path_has_no_layout() -> Bool:
+    layout_of(LibraryDirectory("")).is_none()
 
 
 func test_an_embedded_library_import_has_the_embedded_path() -> Bool:
@@ -187,9 +236,13 @@ func test_an_embedded_library_import_has_the_embedded_path() -> Bool:
         symbols = [],
         span = { source = compiler_source(), start = 0, end = 0 },
     }
-    match import_path("/project/main.brp", request, part.names, embedded_layout()):
-        Ok(actual): actual == "<standard library>/int.brp"
-        Err(_): False
+    match (layout_of(EmbeddedLibrary), "/project/main.brp".to_path()):
+        (Some(layout), Ok(importer)):
+            match import_path(importer, request, part.names, layout):
+                Ok(actual): "${actual}" == "<standard library>/int.brp"
+                Err(_): False
+        _:
+            False
 
 
 private EMBEDDED_PREFIX: String = "<standard library>/"
@@ -253,7 +306,7 @@ func test_the_test_entry_is_read_from_the_embedded_library() -> Bool:
             paths.contains("<standard library>/test.brp")
 
 
-private NESTED_PATHS: List[String] = ["a.brp", "io.brp", "io/error.brp", "shadow/inner.brp"]
+private NESTED_PATHS: List[String] = ["a.brp", "io.brp", "io/status.brp", "shadow/inner.brp"]
 
 
 -- A stem is ambiguous when the paths hold its module file and a path below it.
@@ -261,45 +314,52 @@ pure func test_an_embedded_module_beside_its_folder_is_ambiguous() -> Bool:
     embedded_stem_is_ambiguous(NESTED_PATHS, "io")
         .and(not(embedded_stem_is_ambiguous(NESTED_PATHS, "a")))
         .and(not(embedded_stem_is_ambiguous(NESTED_PATHS, "shadow")))
-        .and(not(embedded_stem_is_ambiguous(NESTED_PATHS, "io/error")))
+        .and(not(embedded_stem_is_ambiguous(NESTED_PATHS, "io/status")))
 
 
 -- The embedded layout turns an absolute stem into one relative to the library
 -- root before looking it up; a user path and a directory layout have no answer.
 pure func test_an_embedded_stem_is_looked_up_relative_to_the_library_root() -> Bool:
-    directory = library_layout(LibraryDirectory("std"), "/project")
-    (embedded_stem_ambiguity(embedded_layout(), NESTED_PATHS, "<standard library>/io") == Some(True))
-        .and(
-            (
-                embedded_stem_ambiguity(embedded_layout(), NESTED_PATHS, "<standard library>/a")
-                == Some(False)
-            ),
-        )
-        .and(
-            (
-                embedded_stem_ambiguity(
-                    embedded_layout(),
-                    NESTED_PATHS,
-                    "<standard library>/io/error",
+    match (layout_of(EmbeddedLibrary), layout_of(LibraryDirectory("std"))):
+        (Some(embedded), Some(directory)):
+            (embedded_stem_ambiguity(embedded, NESTED_PATHS, "<standard library>/io") == Some(True))
+                .and(
+                    (
+                        embedded_stem_ambiguity(embedded, NESTED_PATHS, "<standard library>/a")
+                        == Some(False)
+                    ),
                 )
-                == Some(False)
-            ),
-        )
-        .and(embedded_stem_ambiguity(embedded_layout(), NESTED_PATHS, "/project/io").is_none())
-        .and(embedded_stem_ambiguity(directory, NESTED_PATHS, "/project/std/io").is_none())
+                .and(
+                    (
+                        embedded_stem_ambiguity(
+                            embedded,
+                            NESTED_PATHS,
+                            "<standard library>/io/status",
+                        )
+                        == Some(False)
+                    ),
+                )
+                .and(embedded_stem_ambiguity(embedded, NESTED_PATHS, "/project/io").is_none())
+                .and(embedded_stem_ambiguity(directory, NESTED_PATHS, "/project/std/io").is_none())
+        _:
+            False
 
 
 pure func test_an_embedded_collision_names_the_embedded_files() -> Bool:
     site: Span = { source = compiler_source(), start = 3, end = 9 }
-    error = ambiguous_stem_diagnostic("<standard library>/io", site)
-    (error.message == "<standard library>/io.brp sits beside the folder <standard library>/io/, so the import path names both a module and a folder")
-        .and(
-            (
-                error.help
-                == "rename one of them; a module that belongs with the folder can move into it"
-            ),
-        )
-        .and(error.span == site)
+    match "<standard library>/io".to_path():
+        Err(_):
+            False
+        Ok(stem):
+            error = ambiguous_stem_diagnostic(stem, site)
+            (error.message == "<standard library>/io.brp sits beside the folder <standard library>/io/, so the import path names both a module and a folder")
+                .and(
+                    (
+                        error.help
+                        == "rename one of them; a module that belongs with the folder can move into it"
+                    ),
+                )
+                .and(error.span == site)
 
 
 TESTS: TestSuite = {
@@ -326,6 +386,14 @@ TESTS: TestSuite = {
         (
             "a directory layout joins a relative root to the working directory",
             test_a_directory_layout_joins_a_relative_root_to_the_working_directory,
+        ),
+        (
+            "an absolute directory root is not joined to the working directory",
+            test_an_absolute_directory_root_is_not_joined_to_the_working_directory,
+        ),
+        (
+            "a library root that is not a path has no layout",
+            test_a_library_root_that_is_not_a_path_has_no_layout,
         ),
         (
             "an embedded library import has the embedded path",

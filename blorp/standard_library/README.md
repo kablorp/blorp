@@ -22,8 +22,8 @@ The library root contains two designated foundation modules:
   is the only implicit import: application roots and ordinary user helper
   modules receive its selections, and it cannot be imported explicitly.
 
-A library module may live in a folder, as `io/error.brp` imported
-as `io/error`. A module file may not sit beside a folder of the same name; the
+A library module may live in a folder, as `io/environment.brp` imported
+as `io/environment`. A module file may not sit beside a folder of the same name; the
 loader rejects an import that passes through such a name. On disk any folder
 counts, but the embedded library records only `.brp` files, so a folder with none
 (a README alone) does not count there.
@@ -314,17 +314,16 @@ It borrows its input, writes counted bytes to stderr once, and attempts LF only
 following a full transfer; short writes (including EINTR) stop without retry.
 The host attempts LF after short writes as well. Neither API reports delivery.
 
-`io/error` owns the shared fixed union `IOErrorKind`, the record `IOError`, and
-the `Stringable` text of both. Select `io/error: IOError` to name the error, then
-write `"${error}"` or `error.to_string()`; select `to_string` to pass it as a
-function value. The filesystem library uses these identities;
-the planned process API will use them too. `io/_codes.brp` is the library's
-native-code decoder; programs use the public `io/error` kinds instead of depending
-on numeric codes. `io/_codes` is internal by convention only: Blorp has
-neither re-exports nor module-private imports, so its functions are public
-by necessity, but they are not part of the library's API. Programs should not
-import it, and it may change without notice. (`_base`, the foundation module,
-is the other underscore module, and any module may import it.)
+There is no shared file error type. Each `io/fs/` module owns the error union of
+its operations, and the error carries no path: the caller knows the path and
+words it as `"${path}: ${error}"`. `io/_codes.brp` holds the native error codes
+that each module's decoder names. `io/_codes` is internal by convention only:
+Blorp has neither re-exports nor module-private imports, so its constants are
+public by necessity, but they are not part of the library's API. Programs should
+not import it, and it may change without notice. (`_base`, the foundation
+module, is the other underscore module, and any module may import it.) The
+decoders in the `io/fs/`, `io/environment` and `io/process` modules are public
+for the same reason: tests bind them to literal codes, and they are not API.
 
 ### JSON
 
@@ -397,27 +396,61 @@ and exact numeric lexemes. Source whitespace and escape spelling normalize.
 There is no library size or digit-count limit. Memory follows the input and
 result, and parsing and rendering cost time linear in them.
 
-### The fs module
+### The file modules
 
-`io/fs.brp` is the typed filesystem library; import it explicitly. It declares
-the fixed union `EntryKind`, the record `Entry`, the pure
-`default_if_not_found`, and the impure operations below. Their `Result` error
-is `IOError`, imported from `io/error` along with `IOErrorKind`.
-Natives return Int codes (or a list or String); the shared `io/_codes`
-decoder produces `io/error` kinds, while the entry decoder stays private to `fs`.
-The native codes are named in `src/common/codegen/runtime/fs.brp`. The
-language README's [I/O overview](../README.md#effects-and-io) shows where it
+The filesystem library is one module per operation under `io/fs/`; import each
+explicitly. Every operation takes a `Path` and returns a union that holds only
+the failures that operation can cause (races count: another process can swap a
+directory in during the call). A union is the error: there is no separate kind
+type, no error record and no helper over errors. `OtherOs(Int)` keeps the
+platform's errno, which differs between macOS and Linux, and every decoder
+turns a code its union does not name into `OtherOs` of the code negated, so a
+disagreement between the runtime and the library is visible and never a crash.
+The native codes are named in `src/common/codegen/runtime/fs.brp`. The language
+README's [I/O overview](../README.md#effects-and-io) shows where the library
 fits beside `print` and the other effects, and
-[FILESYSTEM_DECISIONS.md](../FILESYSTEM_DECISIONS.md) records why the library
-is shaped this way and what is still open.
+[FILESYSTEM_DECISIONS.md](../FILESYSTEM_DECISIONS.md) records why it is shaped
+this way. The text of a variant is fixed (`"no such file"`, `"permission
+denied"`), never `strerror` text.
 
-- `read_text(path) -> Result[String, IOError]` reads to end of file, so a file
-  that changes size is read as it is, and validates UTF-8. A directory is
-  `IsADirectory`; a NUL in the path is `PathContainsNul` before any system
-  call; interrupted `open` and `read` calls are retried. A FIFO blocks until
-  its writer closes. There is no size limit: reading `/dev/zero` exhausts
-  memory and the allocation aborts, an infrastructure exception.
-- `write_text(path, text) -> Result[Void, IOError]` replaces the file
+| Module (`io/fs/…`) | Operations | Error | Variants |
+| --- | --- | --- | --- |
+| `read` | `read_text`, `fold_lines` | `ReadError` | `NotFound` `PermissionDenied` `NotADirectory` `IsADirectory` `FileTooLarge` `InvalidUtf8` `OtherOs` |
+| `write` | `write_text` | `WriteError` | `NotFound` `PermissionDenied` `AlreadyExists` `NotADirectory` `IsADirectory` `DirectoryNotEmpty` `NotARegularFile` `ReadOnlyFilesystem` `NoSpace` `FileTooLarge` `OtherOs` |
+| `entry` | `entry_kind`, `Entry`, `EntryKind` | `EntryError` | `PermissionDenied` `OtherOs` |
+| `list` | `list_directory` | `ListError` | `NotFound` `PermissionDenied` `NotADirectory` `InvalidUtf8` `OtherOs` |
+| `create_directory` | `create_directory`, `create_directories` | `CreateDirectoryError` | `NotFound` `PermissionDenied` `AlreadyExists` `NotADirectory` `ReadOnlyFilesystem` `NoSpace` `OtherOs` |
+| `remove_file` | `remove_file` | `RemoveFileError` | `NotFound` `PermissionDenied` `NotADirectory` `IsADirectory` `ReadOnlyFilesystem` `OtherOs` |
+| `remove_directory` | `remove_directory` | `RemoveDirectoryError` | `NotFound` `PermissionDenied` `NotADirectory` `DirectoryNotEmpty` `ReadOnlyFilesystem` `OtherOs` |
+| `remove_tree` | `remove_directory_tree` | `RemoveTreeError` | `NotFound` `PermissionDenied` `NotADirectory` `IsADirectory` `DirectoryNotEmpty` `ReadOnlyFilesystem` `CrossesDevices` `ChangedDuringRemoval` `OtherOs` |
+| `rename` | `rename` | `RenameError` | `NotFound` `PermissionDenied` `NotADirectory` `IsADirectory` `DirectoryNotEmpty` `ReadOnlyFilesystem` `NoSpace` `CrossesDevices` `OtherOs` |
+| `temporary_directory` | `with_temporary_directory` | `TemporaryDirectoryError` | `NotFound` `PermissionDenied` `NotADirectory` `IsADirectory` `DirectoryNotEmpty` `ReadOnlyFilesystem` `NoSpace` `CrossesDevices` `ChangedDuringRemoval` `InvalidPrefix` `OtherOs` |
+
+`Union.Variant` names a variant through its union, so two unions that both have
+a `NotFound` can be imported together:
+
+```blorp
+import:
+    io/fs/read: ReadError, read_text
+    path: Path
+
+-- A missing file is no failure here; any other result stays.
+func settings(path: Path) -> Result[String, ReadError]:
+    result = path.read_text()
+    match result:
+        Err(ReadError.NotFound): Ok("")
+        _: result
+```
+
+A caller that mixes operations writes its own error union and wraps with a
+`match` or a lambda (a constructor is not a function value).
+
+- `read_text(path) -> Result[String, ReadError]` reads to end of file, so a
+  file that changes size is read as it is, and validates UTF-8. A directory is
+  `IsADirectory`; interrupted `open` and `read` calls are retried. A FIFO
+  blocks until its writer closes. There is no size limit: reading `/dev/zero`
+  exhausts memory and the allocation aborts, an infrastructure exception.
+- `write_text(path, text) -> Result[Void, WriteError]` replaces the file
   atomically: the text goes into a new file beside the target, named
   `.blorp-tmp-<pid>-<counter>`, which is flushed and then renamed over the
   target, so readers see the old contents or the new, never a mix, even after
@@ -450,28 +483,32 @@ is shaped this way and what is still open.
   - writing past `RLIMIT_FSIZE` raises SIGXFSZ, which ends the process unless
     the program ignores that signal; a library does not change signal
     dispositions.
-- `entry_kind(path) -> Result[Option[EntryKind], IOError]` uses `lstat`, so a
-  link is never followed. A missing path, or a file used as a directory, is
-  `Ok(None)`; there is no `exists` that returns a Bool.
-- `list_directory(path) -> Result[List[Entry], IOError]` lists a directory,
-  sorted by name bytes, with `.` and `..` omitted. An `Entry` is a `name` and
-  its own `EntryKind`, so a link in the listing is `Symlink`; a link given as
-  the path is followed. A name that is not UTF-8 makes the whole listing
-  `InvalidUtf8`, and an entry removed while the directory is read is left out.
+- `entry_kind(path) -> Result[Option[EntryKind], EntryError]` uses `lstat`, so
+  a link is never followed. A missing path, or a file used as a directory, is
+  `Ok(None)`; there is no `exists` that returns a Bool. `EntryKind` is `File`,
+  `Directory`, `Symlink` or `Other`.
+- `list_directory(path) -> Result[List[Entry], ListError]` lists a directory,
+  sorted by name bytes, with `.` and `..` omitted. An `Entry` is a `name`, a
+  String, and its own `EntryKind`, so a link in the listing is `Symlink`; a
+  link given as the path is followed. A name that is not UTF-8 makes the whole
+  listing `InvalidUtf8`, and an entry removed while the directory is read is
+  left out.
 - `create_directory(path)` makes one directory whose parent exists. An existing
   path of any kind is `AlreadyExists` and a missing parent `NotFound`;
   `missing/` creates `missing`, while `file/` for an existing file is
   `NotADirectory` on macOS and `AlreadyExists` on Linux.
   `create_directories(path)` makes each missing component. It succeeds on an
   existing directory, a link to one, or `/`, and when another process creates
-  a component first. It fails with `NotFound` for the empty path,
-  `NotADirectory` for a file in the middle and `AlreadyExists` for a file or
-  dangling link at the end. Every failure names the caller's path.
+  a component first. It fails with `NotADirectory` for a file in the middle
+  and `AlreadyExists` for a file or dangling link at the end.
 - `remove_file(path)` removes a file or link, never what a link names; a
   directory is `IsADirectory` on both platforms. `remove_directory(path)`
   removes an empty directory; one with entries is `DirectoryNotEmpty`.
   `rename(source, destination)` replaces a file, or an empty directory, at the
-  destination, and its error carries both paths in `path` and `destination`.
+  destination. A file renamed onto a directory is `IsADirectory` (`EISDIR`), a
+  destination directory with entries is `DirectoryNotEmpty`, and a different
+  device is `CrossesDevices`. The error does not say which path is at fault:
+  the caller has both.
 - `remove_directory_tree(path)` removes a directory and everything in it,
   never through a link and never past the device it starts on. Only a real
   directory is a root: a file or a link, even to a directory, is
@@ -484,22 +521,24 @@ is shaped this way and what is still open.
   removed stays removed. An empty root that cannot be searched (mode 0400) is
   `PermissionDenied`, and so is a child that cannot be opened (mode 000)
   unless it is empty.
-- `with_temporary_directory(parent, prefix, body, io_error)` makes a fresh
-  directory (mode 0700) directly in `parent`, runs `body(directory)` and
-  removes the directory and its contents before returning. It is generic in
-  the body's error type: `io_error` turns its own `IOError` into that type
-  (`to_string` for a `String` error,
-  `pure func(error: IOError) -> IOError: error` for `IOError`). The converter
-  must be pure, so a plain `func` lambda is rejected. The result is the body's
-  `Err`, else the removal's `Err`, else the body's `Ok`, so a body error hides a
-  failed removal. A failure to create the directory names `parent`; a failed
-  removal names the directory itself, the one exception to the rule below. A
-  signal, `abort()` or a stack overflow can still leave the directory behind.
-- `fold_lines(path, initial, step, io_error)` folds `step` over a file's lines
+- `with_temporary_directory(parent, prefix, body, on_error)` makes a fresh
+  directory (mode 0700) directly in `parent`, runs `body(directory)` with its
+  `Path` and removes the directory and its contents before returning. `prefix`
+  is a String; one that contains a NUL or a `/` is `InvalidPrefix`, and macOS
+  replaces every trailing `X`. It is generic in the body's error type:
+  `on_error` turns its own `TemporaryDirectoryError`, for creating and removing
+  alike, into that type (`pure func(error: TemporaryDirectoryError) -> String:
+  "${error}"` for a `String` error). The converter must be pure, so a plain
+  `func` lambda is rejected. The result is the body's `Err`, else the
+  removal's `Err`, else the body's `Ok`, so a body error hides a failed
+  removal. A failed removal does not name the directory; the body was given
+  its path. A signal, `abort()` or a stack overflow can still leave the
+  directory behind.
+- `fold_lines(path, initial, step, on_error)` folds `step` over a file's lines
   in order, reading a block at a time, so memory follows the longest line and
   never the file. It is generic in the fold's accumulator `T` and error `E`:
   `step: (T, String) -> Result[T, E]` takes the accumulator and the next line,
-  and `io_error` converts this library's own `IOError`, as in
+  and `on_error` converts this library's own `ReadError`, as in
   `with_temporary_directory`. A line ends at LF and one CR just before it is
   removed; a last line without LF counts and an empty file has no lines. The
   first `Err` from `step` stops reading and is the result. A failure to open or
@@ -514,12 +553,12 @@ is shaped this way and what is still open.
 
   ```blorp
   import:
-      io/fs: fold_lines
-      io/error: IOError
+      io/fs/read: ReadError, fold_lines
+      path: Path
       string: String methods
 
   union ScoreError:
-      Unreadable(IOError)
+      Unreadable(ReadError)
       NotANumber(String)
 
   pure func add_score(total: Int, line: String) -> Result[Int, ScoreError]:
@@ -528,22 +567,10 @@ is shaped this way and what is still open.
           None: Err(NotANumber(line))
 
   -- "3\r\n4\n5" gives Ok(12). "3\nx\n5" gives Err(NotANumber("x")), and the
-  -- fold stops reading at "x". A missing file gives Err(Unreadable(...NotFound)).
-  func total_score(path: String) -> Result[Int, ScoreError]:
-      fold_lines(path, 0, add_score, pure func(error: IOError) -> ScoreError: Unreadable(error))
+  -- fold stops reading at "x". A missing file gives Err(Unreadable(NotFound)).
+  func total_score(path: Path) -> Result[Int, ScoreError]:
+      fold_lines(path, 0, add_score, pure func(error: ReadError) -> ScoreError: Unreadable(error))
   ```
-- `io/error.IOError` holds the caller's `path`, an optional `destination` for
-  two-path operations, and an `IOErrorKind`: `NotFound`, `PermissionDenied`,
-  `AlreadyExists`, `NotADirectory`, `IsADirectory`, `DirectoryNotEmpty`,
-  `NotARegularFile`, `ReadOnlyFilesystem`, `NoSpace`, `FileTooLarge`,
-  `CrossesDevices`, `PathContainsNul`, `InvalidUtf8`, `ChangedDuringRemoval`
-  and `OtherOs(Int)`, which keeps the platform's errno. The path is the one
-  the caller passed, so `x: permission denied` does not say whether `x` or a
-  parent refused, except for the cleanup failure above.
-- `IOError` is `Stringable`: `"${error}"` gives `"<path>: <phrase>"` with
-  fixed text per kind, never `strerror` text.
-  `default_if_not_found(result, fallback)` turns `NotFound` into
-  `Ok(fallback)` and leaves every other result alone.
 
 The runtime C is tested by `test/runtime/fs_suite.brp`, and the examples
 `test/e2e/fixtures/fs/read.brp`, `lines.brp`, `write.brp` and `directories.brp`
@@ -551,44 +578,40 @@ run the library through ordinary mains. The harness runs `lines.brp` with at
 most 256 open descriptors, so a fold that left its file open would fail its
 1,000 early stops and 300 failed reads on every machine.
 
-### Logical paths
+### Paths
 
-`path` supplies pure String functions `join`, `dirname` and `normalize`.
-Only ASCII `/` separates components; these functions do no filesystem access,
-symlink resolution, Unicode normalization or case folding.
+`Path` is an opaque type over a String spelling: never empty and never holding
+NUL. `to_path(text)` is the only way to make one and returns `Err(Empty)` or
+`Err(ContainsNul)` (`PathError`, with fixed text) otherwise; nothing else is
+checked and nothing is normalized. Only ASCII `/` separates components, and
+these functions do no filesystem access, symlink resolution, case folding or
+Unicode normalization. A string literal never becomes a `Path`.
 
-`join(base, child)` returns an absolute child unchanged, or the child when the
-base is empty. Otherwise it retains or adds `/`, including for an empty child,
-without normalizing either input.
+Equality is byte-wise on the spelling, so `a//b` and `a/b` are different paths,
+and so are the NFC and NFD spellings of one name. `Path` is `Stringable` (its
+spelling), `Equatable` and `Hashable` (byte equality of the spelling), and
+`Addable`, where `+` concatenates the spellings exactly as String `+` does (`a`
++ `b` is `ab`, never `a/b`). It is not `Orderable`. Its functions are lexical:
 
-`dirname(path)` ignores trailing separators, removes the last component and its
-separator run, and preserves interior spelling. Root remains `/`; an empty path
-or a basename without a parent yields `.`.
-
-`normalize(path)` removes empty and `.` components and resolves `..` against a
-preceding ordinary component. Leading relative parents survive; absolute paths
-cannot move above root. Empty relative output becomes `.`, root becomes `/`, and
-trailing separators disappear. Other component bytes, including UTF-8 and NUL,
-are preserved. OS operations independently reject NUL paths.
-
-The byte scan/materialization is linear, and List take and String joining build
-their results in one pass.
-
-`Path` is an opaque type over a String spelling. `to_path(text)` is the only way
-to make one and returns `Err(Empty)` or `Err(ContainsNul)` (`PathError`, with
-fixed text) otherwise; nothing else is checked and nothing is normalized, so
-`a//b` and `a/b` are different paths. `Path` is `Stringable` (its spelling),
-`Equatable` and `Hashable` (byte equality of the spelling), and `Addable`, where
-`+` concatenates the spellings exactly as String `+` does (`a` + `b` is `ab`,
-never `a/b`). It is not `Orderable`. Its methods are lexical like the String
-functions:
-
-- `parent(path)` is total: `a` is `.` and `/` is `/`, as `dirname`.
+- `join(base, child)` puts `child` under `base`, even when `child` is absolute:
+  `/a` and `/b` give `/a/b`. This is not Rust's or Python's join, where an
+  absolute child replaces the base, and it does not clean: exactly one `/`
+  joins the parts, the base's trailing separators (root stays `/`) and the
+  child's leading ones are dropped, and `..`, `.` and repeated separators
+  inside either part stay as written. A child of only separators gives the
+  base. A caller that wants the other behaviour asks `is_absolute` first.
+- `normalize(path)` removes empty and `.` components and resolves `..` against
+  a preceding ordinary component. Leading relative parents survive; absolute
+  paths cannot move above root. It never gives an empty spelling: a relative
+  path that cancels completely is `.`, and root is `/`.
+- `parent(path)` is total: `a` is `.` and `/` is `/`. It ignores trailing
+  separators and keeps interior spelling.
 - `name(path)` is the last component ignoring trailing separators (`a/b/` is
   `b`); `None` for `/`, `.` and `..`.
 - `stem(path)` and `extension(path)` split the name at its last dot that does
   not begin it: `x.test.brp` is `x.test` and `brp`, `.hidden` has no extension,
   `a.` has the empty extension, and `...` has stem `..` and the empty extension. Both are `None` where `name` is.
+- `is_absolute(path)` is true when the spelling starts with a separator.
 - `is_within(path, root)` compares components, never bytes; both must be
   absolute or both relative, `.` components and repeated separators are
   ignored, and a `..` after the root's components makes the answer `False`
@@ -683,7 +706,7 @@ value, so the wrapping is a `match` or a lambda.
 - `exit.succeeded()` is `Exited(0)`. Every error union is `Stringable`
   with fixed text and no program or directory: `Unsuccessful` is "exited 2"
   followed by the child's stderr, and `DirectoryFailed(cause)` is "cannot
-  enter the directory: <cause>". A `SystemCallError` is worded as `io/error`
+  enter the directory: <cause>". A `SystemCallError` is worded like the `io/fs/` errors
   words the errno.
 
 ### run_to_files

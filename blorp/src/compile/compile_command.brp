@@ -4,10 +4,10 @@ load the program, generate its C and publish the file.
 ---
 import:
     int: Int methods
-    io/fs: write_text
+    io/fs/write: write_text
     list: List methods
     option: Option methods
-    path: normalize
+    path: Path, normalize
     result: Result methods
     string: String methods
     ../common/analysis/load/load:
@@ -17,21 +17,20 @@ import:
     ../common/cli/report: report_failure
     ../common/cli/usage:
         EXIT_PATH,
-        SOURCE_SUFFIX,
         error_message,
-        file_name,
         given_twice,
-        has_source_suffix,
         option_value,
+        path_argument,
+        source_stem,
         unknown_option,
     ../common/codegen/generate_c: generate_c
     ../common/syntax/syntax: singleton_diagnostic
-    ../common/utils/results: first_error
+    ../common/utils/results: first_error, translated_list
 
 
 record CompileRequest {
     inputs: CompileInputs,
-    output: String,
+    output: Path,
     library: LibrarySource,
 }
 
@@ -105,20 +104,8 @@ private pure func read_compile_options(
                 following.read_compile_options({ options | paths = options.paths.append(word) })
 
 
--- The C goes beside the working directory's other files unless -o says
--- otherwise: `src/main.brp` becomes `main.c`.
-private pure func default_output(input: String) -> String:
-    name = input.file_name()
-    (
-        name
-            .slice(0, name.length() - SOURCE_SUFFIX.length())
-            .get_or(name)
-        + OBJECT_SUFFIX
-    )
-
-
-private pure func output_is_input(output: String, inputs: List[String]) -> Result[Void, String]:
-    if inputs.any(pure func(input: String): input.normalize() == output.normalize()):
+private pure func output_is_input(output: Path, inputs: List[Path]) -> Result[Void, String]:
+    if inputs.any(pure func(input: Path): input.normalize() == output.normalize()):
         Err(
             error_message(
                 "the output `${output}` is also an input",
@@ -153,10 +140,12 @@ private pure func suite_request(
             "pass -o OUTPUT.c, the C file for the suite program",
         ),
     )
-    _ ?= suites.first_error(source_file)
-    _ ?= written.output_is_input(suites)
+    output_path ?= written.path_argument()
+    sources ?= suites.translated_list(path_argument)
+    _ ?= sources.translated_list(source_name)
+    _ ?= output_path.output_is_input(sources)
     inputs ?= suite_inputs(suites)
-    Ok({ inputs = inputs, output = written, library = library })
+    Ok({ inputs = inputs, output = output_path, library = library })
 
 
 private pure func single_input(inputs: List[String]) -> Result[String, String]:
@@ -185,22 +174,39 @@ private pure func program_request(
     library: LibrarySource,
 ) -> Result[CompileRequest, String]:
     input ?= single_input(paths)
-    _ ?= input.source_file()
-    written = output.get_or(input.default_output())
-    _ ?= written.output_is_input([input])
+    source ?= input.path_argument()
+    stem ?= source.source_name()
+    written ?= output
+        .get_or(stem + OBJECT_SUFFIX)
+        .path_argument()
+    _ ?= written.output_is_input([source])
     Ok({ inputs = ProgramInput(input), output = written, library = library })
 
 
-private pure func source_file(path: String) -> Result[Void, String]:
-    if path.has_source_suffix():
-        Ok(void)
-    else:
+private SEPARATOR_BYTE: Int = 47
+
+
+-- The name before `.brp`: the C goes beside the working directory's other
+-- files unless -o says otherwise, so `src/main.brp` becomes `main.c`. A source
+-- argument that ends in a separator names a directory, whatever precedes it.
+private pure func source_name(path: Path) -> Result[String, String]:
+    text = "${path}"
+    if text.byte_at(text.length() - 1) == Some(SEPARATOR_BYTE):
         Err(
             error_message(
-                "`${path}` is not a .brp source file",
-                "name a file that ends in .brp and has a name before it, such as main.brp",
+                "`${path}` ends in a separator, so it names a directory",
+                "name the file itself, such as main.brp",
             ),
         )
+    else:
+        path
+            .source_stem()
+            .to_result(
+                error_message(
+                    "`${path}` is not a .brp source file",
+                    "name a file that ends in .brp and has a name before it, such as main.brp",
+                ),
+            )
 
 
 pure func parse_compile(words: List[String]) -> Result[CompileRequest, String]:
@@ -224,10 +230,15 @@ private OBJECT_SUFFIX: String = ".c"
 
 -- write_text replaces the output atomically, so a failed or interrupted
 -- compile never leaves a truncated C file behind.
-private func publish(path: String, generated_c: String) -> Int:
+private func publish(path: Path, generated_c: String) -> Int:
     match path.write_text(generated_c):
         Err(error):
-            print_error(error_message("could not write ${error}", "provide a writable output path"))
+            print_error(
+                error_message(
+                    "could not write ${path}: ${error}",
+                    "provide a writable output path",
+                ),
+            )
             EXIT_PATH
         Ok(_):
             0

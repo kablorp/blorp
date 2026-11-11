@@ -1,0 +1,102 @@
+-- Removing a directory and everything in it. A native reports a failure as an
+-- Int code, which the decoder below turns into the error union of
+-- remove_directory_tree.
+import:
+    _base: Int, String, Void, Result(Ok, Err), Stringable
+    int: Int methods
+    io/_codes:
+        NOT_FOUND_CODE,
+        PERMISSION_DENIED_CODE,
+        NOT_A_DIRECTORY_CODE,
+        IS_A_DIRECTORY_CODE,
+        DIRECTORY_NOT_EMPTY_CODE,
+        READ_ONLY_FILESYSTEM_CODE,
+        CROSSES_DEVICES_CODE,
+        CHANGED_DURING_REMOVAL_CODE,
+    path: Path
+    result: Result methods
+    string: String methods
+
+
+-- Why a tree could not be removed. IsADirectory and DirectoryNotEmpty can only
+-- come from another process changing the tree during the call.
+fixed union RemoveTreeError:
+    NotFound
+    PermissionDenied
+    NotADirectory
+    IsADirectory
+    DirectoryNotEmpty
+    ReadOnlyFilesystem
+    -- A mount point or another device met by the walk.
+    CrossesDevices
+    -- Another process moved a directory while the walk was inside it.
+    ChangedDuringRemoval
+    -- Any other errno, such as a final `.` or `..`.
+    OtherOs(Int)
+
+
+-- Public so that its test binds it to literal native codes; it is not API for
+-- programs. A code this union does not name is OtherOs with the code negated,
+-- as io/_codes does.
+pure func decode_remove_tree_error(code: Int) -> RemoveTreeError:
+    if code == NOT_FOUND_CODE:
+        NotFound
+    else if code == PERMISSION_DENIED_CODE:
+        PermissionDenied
+    else if code == NOT_A_DIRECTORY_CODE:
+        NotADirectory
+    else if code == IS_A_DIRECTORY_CODE:
+        IsADirectory
+    else if code == DIRECTORY_NOT_EMPTY_CODE:
+        DirectoryNotEmpty
+    else if code == READ_ONLY_FILESYSTEM_CODE:
+        ReadOnlyFilesystem
+    else if code == CROSSES_DEVICES_CODE:
+        CrossesDevices
+    else if code == CHANGED_DURING_REMOVAL_CODE:
+        ChangedDuringRemoval
+    else:
+        OtherOs(0 - code)
+
+
+implements Stringable for RemoveTreeError:
+    pure func to_string(value: Self) -> String:
+        match value:
+            NotFound: "no such file"
+            PermissionDenied: "permission denied"
+            NotADirectory: "not a directory"
+            IsADirectory: "is a directory"
+            DirectoryNotEmpty: "directory not empty"
+            ReadOnlyFilesystem: "read-only file system"
+            CrossesDevices: "crosses devices"
+            ChangedDuringRemoval: "changed during removal"
+            OtherOs(number): "operating system error ${number}"
+
+
+private func native_remove_directory_tree(path: String) -> Result[Void, Int]:
+    builtin("fs.remove_directory_tree")
+
+
+-- Removes a directory and everything in it, never through a link and never
+-- past the device it starts on.
+--
+-- * Only a real directory is a root: a file or a link, even to a directory, is
+--   NotADirectory, and trailing slashes are stripped first (D20).
+-- * A final `.` or `..` is OtherOs, refused before any system call (D21).
+-- * A missing path is NotFound, although Go returns success (D9).
+-- * A mount point inside the tree, a root that is a mount point, and `/` are
+--   all CrossesDevices (D22). A bind mount of the same file system has the
+--   same device, so it is entered and emptied, as `rm -rf` does.
+-- * ChangedDuringRemoval means another process moved a directory while the walk
+--   was inside it.
+-- * The first failure stops the walk, and what it removed stays removed.
+-- * An empty root that cannot be searched (mode 0400) is PermissionDenied,
+--   because the mount-point check opens the root's `..`, where `rm -rf`
+--   succeeds. A child that cannot be opened (mode 000) is removed only when it
+--   is empty, and is otherwise PermissionDenied, since the walk cannot see
+--   inside it.
+func remove_directory_tree(path: Path) -> Result[Void, RemoveTreeError]:
+    path
+        .to_string()
+        .native_remove_directory_tree()
+        .map_err(decode_remove_tree_error)

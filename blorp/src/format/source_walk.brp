@@ -5,70 +5,63 @@ Paths are the normalized paths `format_command.brp` produced, and the walk keeps
 normalized, so one file reached from two roots is visited once.
 ---
 import:
+    _base: Stringable
     bool: and, not
-    io/error: IOError, IOErrorKind(NotADirectory, NotFound)
-    io/fs: EntryKind(File, Directory, Symlink, Other), entry_kind, list_directory
+    io/fs/entry: EntryError, EntryKind(File, Directory, Symlink, Other), entry_kind
+    io/fs/list: ListError, list_directory
     list: List methods
     option: Option methods
-    path: join, normalize
+    path: Path, join, normalize, is_within, to_path
     result: Result methods
     string: String methods
-    ../common/cli/usage: has_source_suffix, error_message
+    ../common/cli/usage: source_stem, error_message
     ../common/utils/results: first_error
+
+
+-- Why a path could not be read.
+union Unreadable:
+    -- Named on the command line, and nothing is there.
+    Missing
+    EntryFailed(EntryError)
+    ListFailed(ListError)
+
+
+implements Stringable for Unreadable:
+    pure func to_string(value: Self) -> String:
+        match value:
+            Missing: "no such file"
+            EntryFailed(error): error.to_string()
+            ListFailed(error): error.to_string()
+
+
+-- A path beside why it could not be read.
+record UnreadablePath {
+    path: Path,
+    reason: Unreadable,
+}
 
 
 -- The source files in visiting order, each once, and the paths that could not
 -- be read.
 record SourceWalk {
-    files: List[String],
-    unreadable: List[IOError],
+    files: List[Path],
+    unreadable: List[UnreadablePath],
 }
 
 
 -- Names that begin with a dot are hidden from a walk.
 private HIDDEN_PREFIX: String = "."
 
-private CURRENT_DIRECTORY: String = "."
 
-private PARENT_PREFIX: String = "../"
-
-private PARENT_DIRECTORY: String = ".."
-
-private ROOT_DIRECTORY: String = "/"
+private pure func is_excluded(path: Path, excluded: List[Path]) -> Bool:
+    excluded.any(pure func(prefix: Path): path.is_within(prefix))
 
 
--- Whether the normalized `path` is `root` or lies below it, on component
--- boundaries: a/b/c.brp is below a/b, a/bc.brp is not. The test is lexical.
-pure func is_at_or_below(path: String, root: String) -> Bool:
-    if path == root:
-        True
-    else if root == CURRENT_DIRECTORY:
-        and(
-            path
-                .starts_with(ROOT_DIRECTORY)
-                .not(),
-            and(
-                path != PARENT_DIRECTORY,
-                path
-                    .starts_with(PARENT_PREFIX)
-                    .not(),
-            ),
-        )
-    else if root == ROOT_DIRECTORY:
-        path.starts_with(ROOT_DIRECTORY)
-    else:
-        path.starts_with(root + ROOT_DIRECTORY)
+private pure func with_unreadable(walk: SourceWalk, path: Path, reason: Unreadable) -> SourceWalk:
+    { walk | unreadable = walk.unreadable.append({ path = path, reason = reason }) }
 
 
-private pure func is_excluded(path: String, excluded: List[String]) -> Bool:
-    excluded.any(pure func(prefix: String): path.is_at_or_below(prefix))
-
-
-private pure func with_unreadable(walk: SourceWalk, error: IOError) -> SourceWalk:
-    { walk | unreadable = walk.unreadable.append(error) }
-
-
-private pure func with_file(walk: SourceWalk, path: String) -> SourceWalk:
+private pure func with_file(walk: SourceWalk, path: Path) -> SourceWalk:
     if walk.files.contains(path):
         walk
     else:
@@ -76,8 +69,8 @@ private pure func with_file(walk: SourceWalk, path: String) -> SourceWalk:
 
 
 -- An excluded path must lie below a root, or it would exclude nothing.
-private pure func below_a_root(excluded_path: String, roots: List[String]) -> Result[Void, String]:
-    if roots.any(pure func(root: String): excluded_path.is_at_or_below(root)):
+private pure func below_a_root(excluded_path: Path, roots: List[Path]) -> Result[Void, String]:
+    if roots.any(pure func(root: Path): excluded_path.is_within(root)):
         Ok(void)
     else:
         Err(
@@ -90,7 +83,7 @@ private pure func below_a_root(excluded_path: String, roots: List[String]) -> Re
 
 -- An excluded path that does not exist is a misspelling.
 private func existing_exclusions(
-    excluded: List[String],
+    excluded: List[Path],
     walk: SourceWalk,
 ) -> Result[SourceWalk, String]:
     match excluded:
@@ -108,51 +101,64 @@ private func existing_exclusions(
                 Ok(Some(_)):
                     rest.existing_exclusions(walk)
                 Err(error):
-                    rest.existing_exclusions(walk.with_unreadable(error))
+                    rest.existing_exclusions(
+                        walk.with_unreadable(excluded_path, EntryFailed(error)),
+                    )
 
 
 -- Entries are visited in byte order of their names. Hidden entries, symbolic
 -- links and other special files are skipped, and so is anything excluded.
-private func visit_directory(
-    directory: String,
-    excluded: List[String],
-    walk: SourceWalk,
-) -> SourceWalk:
+private func visit_directory(directory: Path, excluded: List[Path], walk: SourceWalk) -> SourceWalk:
     match list_directory(directory):
         Err(error):
-            walk.with_unreadable(error)
+            walk.with_unreadable(directory, ListFailed(error))
         Ok(entries):
             var found = walk
             for entry in entries:
-                path = normalize(join(directory, entry.name))
-                visible = entry.name
-                    .starts_with(HIDDEN_PREFIX)
-                    .not()
-                if visible.and(
-                    path
-                        .is_excluded(excluded)
-                        .not(),
-                ):
-                    match entry.kind:
-                        File:
-                            if entry.name.has_source_suffix():
-                                found = found.with_file(path)
-                        Directory:
-                            found = path.visit_directory(excluded, found)
-                        Symlink | Other:
-                            void
+                -- A listed name is never empty and holds no NUL, so `to_path` keeps every entry.
+                match entry.name.to_path():
+                    Ok(name):
+                        path = directory
+                            .join(name)
+                            .normalize()
+                        visible = entry.name
+                            .starts_with(HIDDEN_PREFIX)
+                            .not()
+                        if visible.and(
+                            path
+                                .is_excluded(excluded)
+                                .not(),
+                        ):
+                            match entry.kind:
+                                File:
+                                    if (
+                                        path
+                                            .source_stem()
+                                            .is_some()
+                                    ):
+                                        found = found.with_file(path)
+                                Directory:
+                                    found = path.visit_directory(excluded, found)
+                                Symlink | Other:
+                                    void
+                    Err(_):
+                        void
             found
 
 
-private pure func not_a_source(path: String) -> String:
+private pure func not_a_source(path: Path) -> String:
     error_message(
         "`${path}` is not a .brp source file or a directory",
         "pass .brp files and directories to blorp format",
     )
 
 
-private pure func file_root(root: String, walk: SourceWalk) -> Result[SourceWalk, String]:
-    if root.has_source_suffix():
+private pure func file_root(root: Path, walk: SourceWalk) -> Result[SourceWalk, String]:
+    if (
+        root
+            .source_stem()
+            .is_some()
+    ):
         Ok(walk.with_file(root))
     else:
         Err(not_a_source(root))
@@ -163,8 +169,8 @@ private pure func file_root(root: String, walk: SourceWalk) -> Result[SourceWalk
 -- probed with `list_directory`, which does: if that lists, the link names a
 -- directory, and if it fails with NotADirectory the link names a file.
 private func visit_root(
-    root: String,
-    excluded: List[String],
+    root: Path,
+    excluded: List[Path],
     walk: SourceWalk,
 ) -> Result[SourceWalk, String]:
     if root.is_excluded(excluded):
@@ -172,9 +178,9 @@ private func visit_root(
     else:
         match entry_kind(root):
             Err(error):
-                Ok(walk.with_unreadable(error))
+                Ok(walk.with_unreadable(root, EntryFailed(error)))
             Ok(None):
-                Ok(walk.with_unreadable({ path = root, destination = None, kind = NotFound }))
+                Ok(walk.with_unreadable(root, Missing))
             Ok(Some(File)):
                 root.file_root(walk)
             Ok(Some(Directory)):
@@ -183,17 +189,14 @@ private func visit_root(
                 Err(not_a_source(root))
             Ok(Some(Symlink)):
                 match list_directory(root):
-                    Ok(_):
-                        Ok(root.visit_directory(excluded, walk))
-                    Err(error):
-                        match error.kind:
-                            NotADirectory: root.file_root(walk)
-                            _: Ok(walk.with_unreadable(error))
+                    Ok(_): Ok(root.visit_directory(excluded, walk))
+                    Err(ListError.NotADirectory): root.file_root(walk)
+                    Err(error): Ok(walk.with_unreadable(root, ListFailed(error)))
 
 
 private func visit_roots(
-    roots: List[String],
-    excluded: List[String],
+    roots: List[Path],
+    excluded: List[Path],
     walk: SourceWalk,
 ) -> Result[SourceWalk, String]:
     match roots:
@@ -207,8 +210,8 @@ private func visit_roots(
 
 -- Every exclusion is checked before any file is visited, so a misspelt
 -- --exclude rewrites nothing. The error is the usage message to print.
-func walk_sources(roots: List[String], excluded: List[String]) -> Result[SourceWalk, String]:
-    _ ?= excluded.first_error(pure func(path: String): path.below_a_root(roots))
+func walk_sources(roots: List[Path], excluded: List[Path]) -> Result[SourceWalk, String]:
+    _ ?= excluded.first_error(pure func(path: Path): path.below_a_root(roots))
     start: SourceWalk = { files = [], unreadable = [] }
     checked ?= excluded.existing_exclusions(start)
     roots.visit_roots(excluded, checked)

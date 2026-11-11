@@ -1,8 +1,9 @@
 import:
-    io/error: IOError, IOErrorKind(OtherOs), to_string
-    io/fs: EntryKind(File, Directory, Symlink, Other), write_text, read_text, entry_kind
+    io/fs/entry: EntryError, EntryKind(File, Directory, Symlink, Other), entry_kind
+    io/fs/read: ReadError, read_text
+    io/fs/write: WriteError, write_text
     list: get
-    path: join
+    path: Path, join, to_path
 
 
 -- Every write the example makes goes into the directory that prepare_write.sh
@@ -13,31 +14,34 @@ import:
 -- printed, because it differs between macOS and Linux.
 
 
--- The error's own path must be the path the caller passed.
-private pure func described(path: String, name: String, error: IOError) -> String:
-    match error.kind:
-        OtherOs(_):
-            "OtherOs"
-        _:
-            if error.path == path:
-                renamed: IOError = { error | path = name }
-                renamed.to_string()
-            else:
-                "wrong path: ${error.path}"
+-- Runs `use` on a name in the directory; a name that is no path component is
+-- reported in the place of its case.
+private func in_directory(directory: Path, name: String, use: (Path) -> Void) -> Void:
+    match name.to_path():
+        Ok(child): use(join(directory, child))
+        Err(error): print("${name}: ${error}")
 
 
-private func show_write(directory: String, name: String, text: String) -> Void:
-    path = join(directory, name)
+private func show_write(directory: Path, name: String, text: String) -> Void:
+    in_directory(directory, name, func(path: Path) -> Void: write_and_show(path, name, text))
+
+
+private func write_and_show(path: Path, name: String, text: String) -> Void:
     match write_text(path, text):
         Ok(_): print("write_text ${name}: ok")
-        Err(error): print("write_text ${name}: ${described(path, name, error)}")
+        Err(WriteError.OtherOs(_)): print("write_text ${name}: OtherOs")
+        Err(error): print("write_text ${name}: ${name}: ${error}")
 
 
-private func show_contents(directory: String, name: String) -> Void:
-    path = join(directory, name)
+private func show_contents(directory: Path, name: String) -> Void:
+    in_directory(directory, name, func(path: Path) -> Void: read_and_show(path, name))
+
+
+private func read_and_show(path: Path, name: String) -> Void:
     match read_text(path):
         Ok(text): print("  ${name} holds \"${text}\"")
-        Err(error): print("  ${name}: ${described(path, name, error)}")
+        Err(ReadError.OtherOs(_)): print("  ${name}: OtherOs")
+        Err(error): print("  ${name}: ${name}: ${error}")
 
 
 private pure func kind_name(kind: Option[EntryKind]) -> String:
@@ -49,19 +53,15 @@ private pure func kind_name(kind: Option[EntryKind]) -> String:
         Some(Other): "other"
 
 
-private func show_kind(directory: String, name: String) -> Void:
-    path = join(directory, name)
+private func show_kind(directory: Path, name: String) -> Void:
+    in_directory(directory, name, func(path: Path) -> Void: kind_and_show(path, name))
+
+
+private func kind_and_show(path: Path, name: String) -> Void:
     match entry_kind(path):
         Ok(kind): print("  ${name} is ${kind_name(kind)}")
-        Err(error): print("  ${name}: ${described(path, name, error)}")
-
-
--- A path with an embedded NUL is refused before any operating system call, and
--- is printed under a name because the NUL cannot be shown.
-private func show_nul_write() -> Void:
-    match write_text("a\0b", "text"):
-        Ok(_): print("write_text nul: ok")
-        Err(error): print("write_text nul: ${described("a\0b", "nul", error)}")
+        Err(EntryError.OtherOs(_)): print("  ${name}: OtherOs")
+        Err(error): print("  ${name}: ${name}: ${error}")
 
 
 func main(arguments: List[String]) -> Int:
@@ -69,31 +69,39 @@ func main(arguments: List[String]) -> Int:
         None:
             print("missing directory")
             2
-        Some(directory):
-            show_write(directory, "new.txt", "created")
-            show_contents(directory, "new.txt")
-            show_write(directory, "existing.txt", "replaced")
-            show_contents(directory, "existing.txt")
-            show_write(directory, "link", "through the link")
-            show_contents(directory, "real/target.txt")
-            show_kind(directory, "link")
-            show_write(directory, "dangling", "nowhere")
-            show_kind(directory, "missing_target")
-            show_write(directory, "read_only.txt", "denied")
-            show_contents(directory, "read_only.txt")
-            show_write(directory, "pipe", "blocked")
-            show_write(directory, "folder", "text")
-            show_write(directory, "folder/", "text")
-            show_kind(directory, "folder")
-            show_write(directory, "folder_link/", "text")
-            show_write(directory, "existing.txt/", "text")
-            show_contents(directory, "existing.txt")
-            show_write(directory, "link/", "text")
-            show_write(directory, "absent/", "text")
-            show_kind(directory, "absent")
-            show_write(directory, "dangling/", "text")
-            show_write(directory, "existing.txt/child", "text")
-            show_write(directory, "missing/child.txt", "text")
-            show_write(directory, "loop", "text")
-            show_nul_write()
-            0
+        Some(text):
+            match text.to_path():
+                Err(error):
+                    print("${text}: ${error}")
+                    2
+                Ok(directory):
+                    show_all(directory)
+                    0
+
+
+private func show_all(directory: Path) -> Void:
+    show_write(directory, "new.txt", "created")
+    show_contents(directory, "new.txt")
+    show_write(directory, "existing.txt", "replaced")
+    show_contents(directory, "existing.txt")
+    show_write(directory, "link", "through the link")
+    show_contents(directory, "real/target.txt")
+    show_kind(directory, "link")
+    show_write(directory, "dangling", "nowhere")
+    show_kind(directory, "missing_target")
+    show_write(directory, "read_only.txt", "denied")
+    show_contents(directory, "read_only.txt")
+    show_write(directory, "pipe", "blocked")
+    show_write(directory, "folder", "text")
+    show_write(directory, "folder/", "text")
+    show_kind(directory, "folder")
+    show_write(directory, "folder_link/", "text")
+    show_write(directory, "existing.txt/", "text")
+    show_contents(directory, "existing.txt")
+    show_write(directory, "link/", "text")
+    show_write(directory, "absent/", "text")
+    show_kind(directory, "absent")
+    show_write(directory, "dangling/", "text")
+    show_write(directory, "existing.txt/child", "text")
+    show_write(directory, "missing/child.txt", "text")
+    show_write(directory, "loop", "text")

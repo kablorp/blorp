@@ -1,0 +1,93 @@
+-- Creating directories. A native reports a failure as an Int code, which the
+-- decoder below turns into the error union both operations share.
+import:
+    _base: Int, String, Void, Result(Ok, Err), Stringable
+    int: Int methods
+    io/_codes:
+        NOT_FOUND_CODE,
+        PERMISSION_DENIED_CODE,
+        ALREADY_EXISTS_CODE,
+        NOT_A_DIRECTORY_CODE,
+        READ_ONLY_FILESYSTEM_CODE,
+        NO_SPACE_CODE,
+    path: Path
+    result: Result methods
+    string: String methods
+
+
+-- Why a directory could not be created.
+fixed union CreateDirectoryError:
+    NotFound
+    PermissionDenied
+    AlreadyExists
+    NotADirectory
+    ReadOnlyFilesystem
+    -- ENOSPC and EDQUOT.
+    NoSpace
+    -- Any other errno, such as ELOOP or ENAMETOOLONG.
+    OtherOs(Int)
+
+
+-- Public so that its test binds it to literal native codes; it is not API for
+-- programs. A code this union does not name is OtherOs with the code negated,
+-- as io/_codes does.
+pure func decode_create_directory_error(code: Int) -> CreateDirectoryError:
+    if code == NOT_FOUND_CODE:
+        NotFound
+    else if code == PERMISSION_DENIED_CODE:
+        PermissionDenied
+    else if code == ALREADY_EXISTS_CODE:
+        AlreadyExists
+    else if code == NOT_A_DIRECTORY_CODE:
+        NotADirectory
+    else if code == READ_ONLY_FILESYSTEM_CODE:
+        ReadOnlyFilesystem
+    else if code == NO_SPACE_CODE:
+        NoSpace
+    else:
+        OtherOs(0 - code)
+
+
+implements Stringable for CreateDirectoryError:
+    pure func to_string(value: Self) -> String:
+        match value:
+            NotFound: "no such file"
+            PermissionDenied: "permission denied"
+            AlreadyExists: "already exists"
+            NotADirectory: "not a directory"
+            ReadOnlyFilesystem: "read-only file system"
+            NoSpace: "no space left on device"
+            OtherOs(number): "operating system error ${number}"
+
+
+private func native_create_directory(path: String) -> Result[Void, Int]:
+    builtin("fs.create_directory")
+
+
+private func native_create_directories(path: String) -> Result[Void, Int]:
+    builtin("fs.create_directories")
+
+
+-- Creates one directory whose parent exists. A path that already exists, of any
+-- kind, is AlreadyExists; a missing parent is NotFound. A trailing slash is
+-- accepted: `missing/` creates `missing`. `file/` for an existing file is
+-- NotADirectory on macOS and AlreadyExists on Linux. ELOOP and ENAMETOOLONG are
+-- OtherOs.
+func create_directory(path: Path) -> Result[Void, CreateDirectoryError]:
+    path
+        .to_string()
+        .native_create_directory()
+        .map_err(decode_create_directory_error)
+
+
+-- Creates each missing directory along the path. It succeeds when the path is
+-- already a directory, or a link to one, and `/` succeeds. A file where a
+-- directory is needed is NotADirectory; a file, or a dangling link, at the end
+-- is AlreadyExists. Another process creating a component first is no failure.
+-- Every failure is reported for the whole path the caller passed, not the
+-- component that failed (D14).
+func create_directories(path: Path) -> Result[Void, CreateDirectoryError]:
+    path
+        .to_string()
+        .native_create_directories()
+        .map_err(decode_create_directory_error)

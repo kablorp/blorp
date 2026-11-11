@@ -3,10 +3,11 @@
 every source file the walk finds.
 ---
 import:
-    io/fs: read_text, write_text
+    io/fs/read: read_text
+    io/fs/write: write_text
     list: List methods
     option: Option methods
-    path: normalize
+    path: Path, normalize
     result: Result methods
     string: String methods
     ../common/cli/report: report_failure
@@ -17,17 +18,19 @@ import:
         error_message,
         given_twice,
         option_value,
+        path_argument,
         unknown_option,
     ../common/syntax/source: SourceInputs
     ../common/syntax/syntax: singleton_diagnostic
+    ../common/utils/results: translated_list
     ./format: first_changed_line, format_source
     ./source_walk: walk_sources
 
 
 -- `roots` and `excluded` are normalized; `roots` is never empty.
 record FormatRequest {
-    roots: List[String],
-    excluded: List[String],
+    roots: List[Path],
+    excluded: List[Path],
     check_only: Bool,
 }
 
@@ -81,17 +84,21 @@ private pure func read_format_options(
                 following.read_format_options({ options | paths = options.paths.append(word) })
 
 
+private pure func normalized_argument(text: String) -> Result[Path, String]:
+    text
+        .path_argument()
+        .map(normalize)
+
+
 pure func parse_format(words: List[String]) -> Result[FormatRequest, String]:
     options ?= words.read_format_options({ paths = [], excluded = [], check_only = False })
-    roots = if options.paths.is_empty():
+    written = if options.paths.is_empty():
         [CURRENT_DIRECTORY]
     else:
-        options.paths.map(normalize)
-    Ok({
-        roots = roots,
-        excluded = options.excluded.map(normalize),
-        check_only = options.check_only,
-    })
+        options.paths
+    roots ?= written.translated_list(normalized_argument)
+    excluded ?= options.excluded.translated_list(normalized_argument)
+    Ok({ roots = roots, excluded = excluded, check_only = options.check_only })
 
 
 private CURRENT_DIRECTORY: String = "."
@@ -102,12 +109,12 @@ private CURRENT_DIRECTORY: String = "."
 -- unformatted, 3 when it could not be read or written, 4 when blorp broke one of
 -- its own invariants. A file that fails prints its diagnostic and is left
 -- untouched.
-private func format_file(path: String, check_only: Bool) -> Int:
+private func format_file(path: Path, check_only: Bool) -> Int:
     match path.read_text():
         Err(error):
             print_error(
                 error_message(
-                    "could not read ${error}",
+                    "could not read ${path}: ${error}",
                     "check that the file exists and can be read",
                 ),
             )
@@ -115,7 +122,9 @@ private func format_file(path: String, check_only: Bool) -> Int:
         Ok(original):
             match original.format_source():
                 Err(diagnostic):
-                    sources: SourceInputs = { modules = [{ path = path, contents = original }] }
+                    sources: SourceInputs = {
+                        modules = [{ path = path.to_string(), contents = original }],
+                    }
                     sources.report_failure(diagnostic.singleton_diagnostic())
                 Ok(formatted):
                     if formatted == original:
@@ -129,7 +138,7 @@ private func format_file(path: String, check_only: Bool) -> Int:
                             Err(error):
                                 print_error(
                                     error_message(
-                                        "could not write ${error}",
+                                        "could not write ${path}: ${error}",
                                         "make the source file writable, then format it again",
                                     ),
                                 )
@@ -147,10 +156,10 @@ func format_request(request: FormatRequest) -> Int:
             EXIT_USAGE
         Ok(walk):
             var status: Int = 0
-            for error in walk.unreadable:
+            for unreadable in walk.unreadable:
                 print_error(
                     error_message(
-                        "could not read ${error}",
+                        "could not read ${unreadable.path}: ${unreadable.reason}",
                         "check that the path exists and can be read",
                     ),
                 )

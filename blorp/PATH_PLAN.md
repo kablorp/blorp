@@ -1,8 +1,9 @@
 # `Path`, exact I/O errors, naming rules and qualified variants
 
-**Status: plan, 2026-11-11, revision 4. Landings 4 (`7d8a92f25`), 3
-(`4024ef09d`), 1 (`be98099e6`), 2 (`4acd23779`), 5 (`c0512c385`) and 6
-(process and environment errors) have landed. Landing 7, files, is next.**
+**Status: done, 2026-11-11, revision 4. Landings 4 (`7d8a92f25`), 3
+(`4024ef09d`), 1 (`be98099e6`), 2 (`4acd23779`), 5 (`c0512c385`), 6
+(`e795acd05`) and 7 (files) have landed. Keith dropped landing 8 on
+2026-11-11: `Path` stays an explicit import.**
 Revision 4 folds in landing 2's parser and ergonomics review. Revision 3
 adds the naming rules
 Keith adopted, which make qualified variants a parser rule. Keith approved P1
@@ -119,8 +120,11 @@ numbers; each is approved as drafted there unless amended here.
   | `prefix + ".c"` | `prefix + extension`, `extension ?= ".c".to_path()` first |
   | three containment checks | `is_within(Path, Path) -> Bool`, by component |
 
-- **P11:** migrate only at the filesystem boundary. The compiler's
-  `SourceFile.path`, `SourceOverrides` and `LibraryContents` stay String.
+- **P11 (amended):** migrate only at the filesystem boundary. The
+  compiler's `SourceFile.path` and `SourceOverrides` stay String. Keith,
+  2026-11-11: `LibraryContents`' paths and the loader's private module
+  request hold `Path`s. As Strings, they would need an `Err` arm that cannot
+  happen at every `join`, `parent` and `entry_kind`.
 - **P12 (amended):** file utilities may stay out of the prelude ("if that
   means we keep a lot of file utilities out of the prelude, that's ok").
 - **Exact errors:** every fallible I/O operation returns a union whose
@@ -164,7 +168,8 @@ Made to fill gaps in the decisions above, and confirmed by Keith on
 - **No program in process errors,** extending "leave the path out": the
   caller has its `Command`.
 - **The prelude takes `Path` and `to_path` only;** every file operation is
-  an explicit import.
+  an explicit import. Superseded by Keith on 2026-11-11: `Path` stays an
+  explicit import too (landing 8).
 - **One module per error union under `io/fs/`,** with the names below.
   Operations with the same set share one union. `rename` gets a plain
   `RenameError` like every other operation.
@@ -566,8 +571,14 @@ unchanged; messages that print a process error add the program the same way.
        protocol. So a named code that `SystemCallError` lacks would decode as
        `OtherOs` of the negated protocol code, not the errno. The only
        reachable case is Linux `execve`'s `EISDIR`, when an ELF interpreter
-       is a directory. Fix it by having the process natives send
-       `other_os_code(errno)` for errnos the union does not name.
+       is a directory. The file natives have the same gap: btrfs and ZFS can
+       return `ENOSPC` from `unlink` and `rmdir`, and the three remove unions
+       have no `NoSpace`. Fix both by having each native send
+       `other_os_code(errno)` for errnos its operation's union does not name.
+     - `path.brp`, `compile_command.brp` and `io/fs/temporary_directory`
+       each declare the separator byte. One exported "ends in a separator"
+       predicate on `Path` would serve the compile input check and the
+       prefix check.
      - The decoders in `io/environment` and `io/process` are public, with a
        "not API" comment, so that tests can pass them literal codes. Blorp
        has no test-visible form of `private`; `io/_codes`'s `decode_error`
@@ -577,12 +588,50 @@ unchanged; messages that print a process error add the program the same way.
    `IOErrorKind`, `default_if_not_found`, the String functions in `path.brp`,
    `cli.file_name` and `module_stem` are deleted. Every caller, both READMEs'
    file sections and `FILESYSTEM_DECISIONS.md` are updated.
-   - Ceilings, estimates: compiler production lines at most +30 net;
-     standard library at most +220 net, mostly the unions, their decoders and
-     their text. Self-compile allocations and instructions each at most
-     +0.3%. Test growth reported separately. With landing 6, these keep the
-     single landing's budget (+40, +300, +0.5%).
-8. **The prelude.** `Path` and `to_path`. The prelude loads all of
+   - Ceilings: compiler production lines at most +110 net (was +30, then
+     +85);
+     standard library at most +545 net (was +220). Self-compile allocations
+     and instructions each at most +0.3%. Test growth reported separately.
+   - Keith's ruling, 2026-11-11: production measures +85 in the compiler and
+     +543 in the library. In the library, the ten modules hold 80 variants,
+     and each module repeats its imports, decoder and text, because there
+     are no shared helpers by decision. The compiler figure is mostly
+     `load.brp` holding `Path`s (P11, amended). Self-compile cost is +0.018%
+     allocations and +0.029% instructions, the median of 11 interleaved
+     `-O2` rounds, with byte-identical C for the same input.
+   - Measured, not acted on: a trivial compile costs about 9% more
+     instructions (`return/23`: 320.6 M to 350.0 M). The cost follows the
+     size of the library text the compiler embeds, not the program, so it
+     belongs to the embedded-library work.
+   - Coordinator gap-fills:
+     - `is_absolute(Path) -> Bool`, which follows from P4, because `join`
+       no longer lets an absolute child replace the base.
+     - An empty path argument (`blorp format ""`, `-o ""`) is a usage
+       error, since no `Path` is empty.
+     - `with_temporary_directory` checks the prefix for `/` in the library,
+       because the native reports it as `EINVAL`, which cannot be told
+       apart from `mkdtemp`'s own.
+   - Coordinator correction, 2026-11-11: the compiler figure rose from +85 to
+     +110 in the code review's fixes, which keep the old behaviour in two
+     places:
+     - a compile input that ends in `/` is refused again, as `file_name`'s
+       empty result made it before;
+     - the root path is checked before the working directory is asked for.
+
+     A review round that named each empty argument in its own message
+     grew the compiler further (to +160), so it was reverted to the one
+     message. The other changes from the old code:
+     - `--exclude ../../x` under the root `..` is refused, because
+       `is_within` is lexical and `../../x` is not under `..`;
+     - the `fs_directories` e2e compile ceiling rose about 40%, from
+       292,110 to 407,508 allocations, measured with its margin, because
+       the fixture imports nine `io/fs/` modules and `path.brp`, each
+       checked in full.
+8. **The prelude (dropped).** Keith, 2026-11-11: `Path` stays an explicit
+   import. The measured cost was about +31,000 allocations and +26%
+   instructions to compile an empty program, against the ceiling below.
+   Revisit once the checker checks only the declarations a program uses.
+   The original landing: `Path` and `to_path`. The prelude loads all of
    `path.brp`, and every loaded module is checked in full; today's
    `path.brp`, with similar functions, cost +13,222 allocations and +10.7%
    instructions to compile an empty program (measured at about `ce8753b6f`,

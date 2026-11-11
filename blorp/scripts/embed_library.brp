@@ -11,11 +11,13 @@ file or this program changes; see EMBEDDED_LIBRARY_PLAN.md.
 import:
     bool: Bool methods, and, or
     int: Int methods
-    io/error: to_string
-    io/fs: Entry, EntryKind(File, Directory, Symlink, Other), list_directory, read_text, write_text
+    io/fs/entry: Entry, EntryKind(File, Directory, Symlink, Other)
+    io/fs/list: ListError, list_directory
+    io/fs/read: ReadError, read_text
+    io/fs/write: WriteError, write_text
     list: List methods
     option: Option methods
-    path: join
+    path: Path, PathError, join, to_path
     result: Result methods
     string: String methods
     ../src/common/utils/text: byte_order_before
@@ -184,18 +186,23 @@ private pure func has_library_suffix(name: String) -> Bool:
     and(start >= 0, name.slice(start, name.length()) == Some(LIBRARY_SUFFIX))
 
 
--- The rows of the folder at `relative` below `root` ("" for the root), in
--- discovery order.
-private func folder_rows(root: String, relative: String) -> Result[List[(String, String)], String]:
-    entries ?= list_directory(join(root, relative)).map_err(to_string)
-    read_entries(root, relative, entries, [])
+-- The rows of the folder `directory`, which is `relative` below the library
+-- root ("" for the root), in discovery order.
+private func folder_rows(
+    directory: Path,
+    relative: String,
+) -> Result[List[(String, String)], String]:
+    entries ?= list_directory(directory).map_err(
+        pure func(error: ListError) -> String: "${directory}: ${error}",
+    )
+    read_entries(directory, relative, entries, [])
 
 
--- The (relative path, text) rows of `entries`, the entries of the folder at
--- `relative`, and of every folder beneath it, in discovery order. Recursion
+-- The (relative path, text) rows of `entries`, the entries of the folder
+-- `directory`, and of every folder beneath it, in discovery order. Recursion
 -- depth is the depth of the folders plus the file count of the library.
 private func read_entries(
-    root: String,
+    directory: Path,
     relative: String,
     entries: List[Entry],
     files: List[(String, String)],
@@ -204,26 +211,46 @@ private func read_entries(
         []:
             Ok(files)
         [entry, ...later]:
-            match entry.kind:
-                Directory:
-                    match folder_rows(root, "${relative}${entry.name}/"):
-                        Err(message): Err(message)
-                        Ok(nested): read_entries(root, relative, later, files.concat(nested))
-                File:
-                    if has_library_suffix(entry.name):
-                        name = "${relative}${entry.name}"
-                        match read_text(join(root, name)).map_err(to_string):
-                            Err(message):
-                                Err(message)
-                            Ok(contents):
-                                read_entries(root, relative, later, files.append((name, contents)))
-                    else:
-                        read_entries(root, relative, later, files)
-                Symlink | Other:
-                    if has_library_suffix(entry.name):
-                        Err("${join(root, relative)}${entry.name} is not a regular file")
-                    else:
-                        read_entries(root, relative, later, files)
+            match entry.name.to_path():
+                Ok(name): directory.read_entry(relative, entry, name, later, files)
+                Err(error): Err("${error}")
+
+
+private func read_entry(
+    directory: Path,
+    relative: String,
+    entry: Entry,
+    name: Path,
+    later: List[Entry],
+    files: List[(String, String)],
+) -> Result[List[(String, String)], String]:
+    path = directory.join(name)
+    match entry.kind:
+        Directory:
+            match folder_rows(path, "${relative}${entry.name}/"):
+                Err(message): Err(message)
+                Ok(nested): read_entries(directory, relative, later, files.concat(nested))
+        File:
+            if has_library_suffix(entry.name):
+                match read_text(path).map_err(
+                    pure func(error: ReadError) -> String: "${path}: ${error}",
+                ):
+                    Err(message):
+                        Err(message)
+                    Ok(contents):
+                        read_entries(
+                            directory,
+                            relative,
+                            later,
+                            files.append(("${relative}${entry.name}", contents)),
+                        )
+            else:
+                read_entries(directory, relative, later, files)
+        Symlink | Other:
+            if has_library_suffix(entry.name):
+                Err("${path} is not a regular file")
+            else:
+                read_entries(directory, relative, later, files)
 
 
 private pure func path_before(left: (String, String), right: (String, String)) -> Bool:
@@ -257,14 +284,22 @@ private pure func sorted_by_path(rows: List[(String, String)]) -> List[(String, 
 -- The (relative path, text) rows of every library file under `root`, at any
 -- depth, in path byte order.
 func library_rows(root: String) -> Result[List[(String, String)], String]:
-    files ?= folder_rows(root, "")
+    directory ?= root
+        .to_path()
+        .map_err(pure func(error: PathError) -> String: "${error}")
+    files ?= folder_rows(directory, "")
     Ok(sorted_by_path(files))
 
 
 private func write_module(root: String, output: String) -> Result[Void, String]:
     files ?= library_rows(root)
     text ?= render_embedded_library(files)
-    write_text(output, text).map_err(to_string)
+    destination ?= output
+        .to_path()
+        .map_err(pure func(error: PathError) -> String: "${error}")
+    write_text(destination, text).map_err(
+        pure func(error: WriteError) -> String: "${destination}: ${error}",
+    )
 
 
 func main(args: List[String]) -> Int:

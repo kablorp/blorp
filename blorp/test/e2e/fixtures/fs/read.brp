@@ -1,65 +1,40 @@
 import:
     io/console: print
-    io/error:
-        IOError,
-        IOErrorKind(
-            NotFound,
-            PermissionDenied,
-            AlreadyExists,
-            NotADirectory,
-            IsADirectory,
-            DirectoryNotEmpty,
-            NotARegularFile,
-            ReadOnlyFilesystem,
-            NoSpace,
-            FileTooLarge,
-            CrossesDevices,
-            PathContainsNul,
-            InvalidUtf8,
-            ChangedDuringRemoval,
-            OtherOs,
-        ),
-        to_string,
-    io/fs: EntryKind(File, Directory, Symlink, Other), read_text, entry_kind, default_if_not_found
+    io/fs/entry: EntryError, EntryKind(File, Directory, Symlink, Other), entry_kind
+    io/fs/read: ReadError, read_text
     list: get
-    path: join
+    path: Path, join, to_path
+    string: String methods
 
 
 -- Every read and entry kind the example prints is checked against the tree
 -- that prepare.sh builds in the directory given as the first argument. Each
--- error is printed with the directory replaced by the entry's name, so the
--- output is the same wherever the directory is, and the number of an OtherOs
--- error is never printed, because it differs between macOS and Linux.
+-- failure is printed as "name: reason" with the entry's name in place of its
+-- path, so the output is the same wherever the directory is, and the number of
+-- an OtherOs error is never printed, because it differs between macOS and Linux.
 
 
--- The error's own path must be the path the caller passed.
-private pure func described(path: String, name: String, error: IOError) -> String:
-    if error.path == path:
-        renamed: IOError = { error | path = name }
-        renamed.to_string()
-    else:
-        "wrong path: ${error.path}"
+-- ELOOP's number differs by platform, so only the variant is shown.
+private pure func read_failure(name: String, error: ReadError) -> String:
+    match error:
+        ReadError.OtherOs(_): "OtherOs"
+        _: "${name}: ${error}"
 
 
-private pure func is_other_os(error: IOError) -> Bool:
-    match error.kind:
-        OtherOs(_): True
-        _: False
+private pure func entry_failure(name: String, error: EntryError) -> String:
+    match error:
+        EntryError.OtherOs(_): "OtherOs"
+        _: "${name}: ${error}"
 
 
--- ELOOP's number differs by platform, so only the kind is shown.
-private pure func described_or_other(path: String, name: String, error: IOError) -> String:
-    if is_other_os(error):
-        "OtherOs"
-    else:
-        described(path, name, error)
-
-
-private func show_read(directory: String, name: String) -> Void:
-    path = join(directory, name)
-    match read_text(path):
-        Ok(text): print("read_text ${name}: ok ${text.length()} bytes")
-        Err(error): print("read_text ${name}: ${described_or_other(path, name, error)}")
+private func show_read(directory: Path, name: String) -> Void:
+    match name.to_path():
+        Ok(child):
+            match read_text(join(directory, child)):
+                Ok(text): print("read_text ${name}: ok ${text.length()} bytes")
+                Err(error): print("read_text ${name}: ${read_failure(name, error)}")
+        Err(error):
+            print("read_text ${name}: ${error}")
 
 
 private pure func kind_name(kind: Option[EntryKind]) -> String:
@@ -71,38 +46,34 @@ private pure func kind_name(kind: Option[EntryKind]) -> String:
         Some(Other): "other"
 
 
-private func show_kind(directory: String, name: String) -> Void:
-    path = join(directory, name)
-    match entry_kind(path):
-        Ok(kind): print("entry_kind ${name}: ${kind_name(kind)}")
-        Err(error): print("entry_kind ${name}: ${described_or_other(path, name, error)}")
+private func show_kind(directory: Path, name: String) -> Void:
+    match name.to_path():
+        Ok(child):
+            match entry_kind(join(directory, child)):
+                Ok(kind): print("entry_kind ${name}: ${kind_name(kind)}")
+                Err(error): print("entry_kind ${name}: ${entry_failure(name, error)}")
+        Err(error):
+            print("entry_kind ${name}: ${error}")
 
 
-private func show_default(directory: String, name: String) -> Void:
-    path = join(directory, name)
-    match default_if_not_found(read_text(path), "fallback"):
-        Ok(text): print("default_if_not_found ${name}: ok ${text.length()} bytes")
-        Err(error): print("default_if_not_found ${name}: ${described_or_other(path, name, error)}")
+-- What a caller that wants a default for a missing file writes: it matches
+-- NotFound itself, and any other failure stays.
+private func show_fallback(directory: Path, name: String) -> Void:
+    match name.to_path():
+        Ok(child):
+            path = join(directory, child)
+            result = read_text(path)
+            match result:
+                Err(ReadError.NotFound): print("fallback ${name}: ok 8 bytes")
+                Ok(text): print("fallback ${name}: ok ${text.length()} bytes")
+                Err(error): print("fallback ${name}: ${read_failure(name, error)}")
+        Err(error):
+            print("fallback ${name}: ${error}")
 
 
--- A path with an embedded NUL is refused before any operating system call, and
--- is printed under a name because the NUL cannot be shown.
-private func show_nul_read() -> Void:
-    match read_text("a\0b"):
-        Ok(text): print("read_text nul: ok ${text.length()} bytes")
-        Err(error): print("read_text nul: ${described("a\0b", "nul", error)}")
-
-
-private func show_nul_kind() -> Void:
-    match entry_kind("a\0b"):
-        Ok(kind): print("entry_kind nul: ${kind_name(kind)}")
-        Err(error): print("entry_kind nul: ${described("a\0b", "nul", error)}")
-
-
--- Every kind has one row, whatever an operation can produce today.
-private func show_row(kind: IOErrorKind) -> Void:
-    row: IOError = { path = "settings.conf", destination = None, kind = kind }
-    print("${row}")
+-- Every variant of ReadError has one row, whatever read_text can produce today.
+private func show_row(error: ReadError) -> Void:
+    print("settings.conf: ${error}")
 
 
 func main(arguments: List[String]) -> Int:
@@ -110,48 +81,41 @@ func main(arguments: List[String]) -> Int:
         None:
             print("missing directory")
             2
-        Some(directory):
-            show_read(directory, "settings.conf")
-            show_read(directory, "empty.txt")
-            show_read(directory, "link_to_file")
-            show_read(directory, "missing.txt")
-            show_read(directory, "locked.txt")
-            show_read(directory, "settings.conf/child")
-            show_read(directory, "folder")
-            show_read(directory, "not_utf8.bin")
-            show_read(directory, "loop")
-            show_read(directory, "dangling_link")
-            show_nul_read()
-            show_kind(directory, "settings.conf")
-            show_kind(directory, "locked.txt")
-            show_kind(directory, "folder")
-            show_kind(directory, "link_to_file")
-            show_kind(directory, "dangling_link")
-            show_kind(directory, "loop")
-            show_kind(directory, "pipe")
-            show_kind(directory, "missing.txt")
-            show_kind(directory, "settings.conf/child")
-            show_kind(directory, "loop/inside")
-            show_nul_kind()
-            show_default(directory, "missing.txt")
-            show_default(directory, "settings.conf")
-            show_default(directory, "locked.txt")
-            show_default(directory, "folder")
-            show_row(NotFound)
-            show_row(PermissionDenied)
-            show_row(AlreadyExists)
-            show_row(NotADirectory)
-            show_row(IsADirectory)
-            show_row(DirectoryNotEmpty)
-            show_row(NotARegularFile)
-            show_row(ReadOnlyFilesystem)
-            show_row(NoSpace)
-            show_row(FileTooLarge)
-            show_row(CrossesDevices)
-            show_row(PathContainsNul)
-            show_row(InvalidUtf8)
-            show_row(ChangedDuringRemoval)
-            show_row(OtherOs(40))
-            moved: IOError = { path = "a", destination = Some("b"), kind = CrossesDevices }
-            print("${moved}")
-            0
+        Some(text):
+            match text.to_path():
+                Err(error):
+                    print("${text}: ${error}")
+                    2
+                Ok(directory):
+                    show_read(directory, "settings.conf")
+                    show_read(directory, "empty.txt")
+                    show_read(directory, "link_to_file")
+                    show_read(directory, "missing.txt")
+                    show_read(directory, "locked.txt")
+                    show_read(directory, "settings.conf/child")
+                    show_read(directory, "folder")
+                    show_read(directory, "not_utf8.bin")
+                    show_read(directory, "loop")
+                    show_read(directory, "dangling_link")
+                    show_kind(directory, "settings.conf")
+                    show_kind(directory, "locked.txt")
+                    show_kind(directory, "folder")
+                    show_kind(directory, "link_to_file")
+                    show_kind(directory, "dangling_link")
+                    show_kind(directory, "loop")
+                    show_kind(directory, "pipe")
+                    show_kind(directory, "missing.txt")
+                    show_kind(directory, "settings.conf/child")
+                    show_kind(directory, "loop/inside")
+                    show_fallback(directory, "missing.txt")
+                    show_fallback(directory, "settings.conf")
+                    show_fallback(directory, "locked.txt")
+                    show_fallback(directory, "folder")
+                    show_row(ReadError.NotFound)
+                    show_row(ReadError.PermissionDenied)
+                    show_row(ReadError.NotADirectory)
+                    show_row(ReadError.IsADirectory)
+                    show_row(ReadError.FileTooLarge)
+                    show_row(ReadError.InvalidUtf8)
+                    show_row(ReadError.OtherOs(40))
+                    0

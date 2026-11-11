@@ -1,0 +1,86 @@
+-- What a path names. A native reports a failure as an Int code, which the
+-- decoder below turns into the error union of entry_kind.
+import:
+    _base: Int, String, Option(Some, None), Result(Ok, Err), Stringable
+    int: Int methods
+    io/_codes: PERMISSION_DENIED_CODE
+    path: Path
+    result: Result methods
+    string: String methods
+
+
+-- What a path names without following a link.
+fixed union EntryKind:
+    File
+    Directory
+    Symlink
+    Other
+
+
+-- One entry of a directory: its name, and its own kind, so a link is Symlink
+-- whatever it points at.
+record Entry {
+    name: String,
+    kind: EntryKind,
+}
+
+
+-- Why a path could not be examined. A missing path is not an error: it is None.
+fixed union EntryError:
+    PermissionDenied
+    -- Any other errno, such as ELOOP or ENAMETOOLONG.
+    OtherOs(Int)
+
+
+-- Public so that its test binds it to literal native codes; it is not API for
+-- programs. A code this union does not name is OtherOs with the code negated,
+-- as io/_codes does.
+pure func decode_entry_error(code: Int) -> EntryError:
+    if code == PERMISSION_DENIED_CODE:
+        PermissionDenied
+    else:
+        OtherOs(0 - code)
+
+
+implements Stringable for EntryError:
+    pure func to_string(value: Self) -> String:
+        match value:
+            PermissionDenied: "permission denied"
+            OtherOs(number): "operating system error ${number}"
+
+
+-- The entry codes of FS_HELPERS_RUNTIME's second enum.
+private ABSENT_ENTRY_CODE: Int = 0
+private FILE_ENTRY_CODE: Int = 1
+private DIRECTORY_ENTRY_CODE: Int = 2
+private SYMLINK_ENTRY_CODE: Int = 3
+
+
+-- Every code that is not a named kind is Other, because the C side sends
+-- Other for each remaining st_mode type. Public for io/fs/list, which reads a
+-- listing's kind bytes with it; it is not API for programs.
+pure func decode_entry_kind(code: Int) -> Option[EntryKind]:
+    if code == ABSENT_ENTRY_CODE:
+        None
+    else if code == FILE_ENTRY_CODE:
+        Some(File)
+    else if code == DIRECTORY_ENTRY_CODE:
+        Some(Directory)
+    else if code == SYMLINK_ENTRY_CODE:
+        Some(Symlink)
+    else:
+        Some(Other)
+
+
+private func native_entry_kind(path: String) -> Result[Int, Int]:
+    builtin("fs.entry_kind")
+
+
+-- lstat: a link is not followed, so a symlink is Symlink even when dangling.
+-- ENOENT, and ENOTDIR from a file used as a directory, give Ok(None).
+func entry_kind(path: Path) -> Result[Option[EntryKind], EntryError]:
+    code ?= path
+        .to_string()
+        .native_entry_kind()
+        .map_err(decode_entry_error)
+    Ok(code.decode_entry_kind())

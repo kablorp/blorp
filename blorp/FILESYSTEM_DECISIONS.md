@@ -1,12 +1,16 @@
 # Filesystem decisions
 
-`fs`, `io` and `system` are now `io/fs`, `io/error` and `io/environment`
-(MODULES_AND_STRINGABLE_PLAN.md, landing 4); names below are as written then.
+`fs`, `io` and `system` became `io/fs`, `io/error` and `io/environment`
+(MODULES_AND_STRINGABLE_PLAN.md, landing 4). PATH_PLAN.md landing 7 then
+replaced `io/fs` and `io/error` with one module per operation under `io/fs/`,
+each owning an exact error union, and made every operation take a `Path`. Names
+below are as written when each decision was made; the amendments say what
+changed. `IOError`, `IOErrorKind` and `default_if_not_found` no longer exist.
 
 This file records the decisions behind the `fs` library and the lent-resource
 design that would follow it, so they outlive the plan they were made in. The
 contract of each operation lives in the
-[standard library README](standard_library/README.md#the-fs-module); this
+[standard library README](standard_library/README.md#the-file-modules); this
 file says why it is that way and what is still open. Every decision below was
 approved by Keith on the date given, except those marked open or deferred.
 `io.describe` below is history: `IOError` and `IOErrorKind` implement
@@ -47,9 +51,16 @@ has risen by about 0.18%.
 - **R3.** Console output (`print`, `print_error`) is in the prelude; all other
   IO stays an explicit import. Amended 2026-11-10 from "IO stays an explicit
   import, and the prelude does not change" (MODULES_AND_STRINGABLE_PLAN.md
-  decision 7).
+  decision 7). Amended 2026-11-11: each file operation is an explicit import
+  of its own `io/fs/` module, and `Path` stays an explicit import too, because
+  landing 8, which would have put `Path` and `to_path` in the prelude, was
+  dropped.
 - **R4, from the roadmap.** Paths stay `String`. Errors carry fixed text, never `strerror` text.
   A NUL in a path is rejected before the system call.
+  Amended 2026-11-11 (PATH_PLAN.md P1, P2, P6 and P7): operations take a
+  `Path`, which cannot be empty or hold NUL, so no operation reports a NUL
+  path; an error carries no path (`"${path}: ${error}"` is the caller's to
+  write). Errors still carry fixed text.
 
 ## Part 1 decisions
 
@@ -93,18 +104,23 @@ has risen by about 0.18%.
   survives only in `OtherOs`.
 - **D14, 2026-11-03.** An `IOError`'s `path` is always the path the caller
   passed. Naming the failing component would need an error payload carrying
-  a String beside the code; revisit when a consumer needs it.
+  a String beside the code; revisit when a consumer needs it. Superseded
+  2026-11-11 by PATH_PLAN.md P7: errors carry no path at all, so a failure
+  never says whether the path or one of its parents refused.
 - **D34, 2026-11-04, the exception to D14.** When `with_temporary_directory`
   cannot remove its directory, the error names that directory, not
   `parent`: the body was given that path, and it is the only one that says
   what was left behind. A failure to create the directory still names
-  `parent`.
+  `parent`. Superseded 2026-11-11 with D14: `TemporaryDirectoryError` names
+  no directory, and the body's `Path` is the only name of it. Exceptions to
+  "an error carries no path" no longer exist.
 - **D15, 2026-11-03, testing codes.** An e2e example receives a directory
   that `prepare.sh` builds and provokes every reachable kind; a C test
   checks errno to code against numeric literals.
 - **D8, 2026-11-03.** A file name that is not UTF-8 fails the whole listing
   with `InvalidUtf8` until a `Path` type exists, rather than silently
-  skipping the entry.
+  skipping the entry. A `Path` is still UTF-8 (PATH_PLAN.md P9), so the
+  rule stands until `Path` is byte-backed.
 
 **Reading and writing**
 
@@ -146,10 +162,12 @@ has risen by about 0.18%.
 **Callback operations**
 
 - **D11, 2026-11-04.** Callback operations are generic in the callback's
-  error type and take a pure converter from `IOError`, as in
-  `with_temporary_directory[T, E](parent, prefix, body, io_error)`; without
-  it, an application with its own error union nests Results. A `FromIOError`
-  trait would serve here and in Part 2 (D29), but a trait method's first
+  error type and take a pure converter from the operation's own error union
+  (`IOError` when this was written; now `ReadError` for `fold_lines`,
+  `TemporaryDirectoryError` for `with_temporary_directory`), as in
+  `with_temporary_directory[T, E](parent, prefix, body, on_error)`; without
+  it, an application with its own error union nests Results. A trait that converts
+  an error union (named `FromIOError` then) would serve here and in Part 2 (D29), but a trait method's first
   parameter must be `Self` today. If that language change lands, the
   converter parameter goes, in a breaking change.
 - **D39, 2026-11-05, `fold_lines`.** `fold_lines[T, E](path, initial, step:
@@ -162,7 +180,15 @@ has risen by about 0.18%.
   yet. A List accumulator in `fold_lines` copies the list on every line, so
   collecting lines goes through `read_text` for now.
 - **D13, 2026-11-05, a `Path` type.** Deferred. Reopen with `Bytes`, or if D8's error
-  turns out to be common.
+  turns out to be common. Amended 2026-11-11: a `Path` type exists (PATH_PLAN.md
+  landings 3 and 7), a UTF-8 spelling that is never empty and never holds NUL.
+  The byte-backed form stays deferred.
+
+- **`rename` and `IsADirectory`, 2026-11-11.** Renaming a file onto a
+  directory fails with `EISDIR`, which is `IsADirectory` in `RenameError`.
+  This case was missing from the decisions above; `RenameError` also has
+  `NotFound`, `PermissionDenied`, `NotADirectory`, `DirectoryNotEmpty`,
+  `ReadOnlyFilesystem`, `NoSpace`, `CrossesDevices` and `OtherOs`.
 
 ## Part 2: lent resources (not started)
 
@@ -203,7 +229,7 @@ The approved shape, all 2026-11-04 unless noted:
 - **D25.** `shareable` resources are deferred. **D26** was withdrawn, and
   **D28** (`?=` inside a `with` body) is moot.
 - **D29, error conversion.** Decided together with D11, which chose a
-  converter argument for now. Whether Part 2 uses a `FromIOError` trait stays
+  converter argument for now. Whether Part 2 uses such a conversion trait stays
   open until a trait method can take a first parameter that is not `Self`.
 - **D7, open.** A test-only resource type and scope, so tests can count
   releases.

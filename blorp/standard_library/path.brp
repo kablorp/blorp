@@ -31,54 +31,16 @@ private pure func is_separator(path: String, position: Int) -> Bool:
         None: False
 
 
--- Empty children add or preserve the separator used by library-prefix checks.
--- Components and separator runs are preserved without normalization.
-pure func join(base: String, child: String) -> String:
-    match child.is_separator(0):
-        True:
-            child
-        False:
-            base_length = base.length()
-            match base_length.equals(0):
-                True:
-                    child
-                False:
-                    match base.is_separator(base_length - 1):
-                        True: base + child
-                        False: base + "/" + child
-
-
--- Ignore trailing separators, remove the final component and its separator run.
--- Interior components remain lexical; root stays '/', empty/basename becomes '.'.
-pure func dirname(path: String) -> String:
-    var end = path.length()
-
+-- The length of `text` without its trailing separators; 0 for an empty text or
+-- one that is only separators.
+private pure func length_without_trailing_separators(text: String) -> Int:
+    var end = text.length()
     while end > 0:
-        match path.is_separator(end - 1):
-            True: end = end - 1
-            False: break
-
-    while end > 0:
-        match path.is_separator(end - 1):
-            True: break
-            False: end = end - 1
-
-    while end > 0:
-        match path.is_separator(end - 1):
-            True: end = end - 1
-            False: break
-
-    match end.equals(0):
-        True:
-            match path.is_separator(0):
-                True: "/"
-                False: "."
-        False:
-            -- 0 < end <= byte length, and byte[end] is ASCII '/'.
-            -- Both endpoints are scalar boundaries; checked Slice cannot fail.
-            match path.slice(0, end):
-                Some(prefix): prefix
-                None: "."
+        if text.is_separator(end - 1):
+            end = end - 1
+        else:
+            break
+    end
 
 
 -- Callers supply one nonempty component cut at proved scalar boundaries.
@@ -110,7 +72,7 @@ private pure func normalized_component(
 -- Pure logical normalization: no filesystem, symlink or Unicode normalization.
 -- The byte scan/materialization is linear, and List.join builds its String in
 -- one pass; List append copies only when its List is shared.
-pure func normalize(path: String) -> String:
+private pure func normalized_spelling(path: String) -> String:
     absolute = path.is_separator(0)
     size = path.length()
     var components: List[String] = []
@@ -207,8 +169,50 @@ pure func to_path(text: String) -> Result[Path, PathError]:
         Ok(into_opaque Path(text))
 
 
+-- `child` under `base`, even when `child` is absolute: `/a` and `/b` give
+-- `/a/b`. Exactly one separator joins them; nothing else is cleaned, so `..`,
+-- `.` and repeated separators inside either part are kept as written. Unlike
+-- Rust's and Python's join, an absolute child does not replace the base. At
+-- the junction the base's trailing separators (root stays `/`) and the child's
+-- leading ones are dropped; a child that is only separators gives the base.
+-- The `get_or` fallbacks below are unreachable: both slices lie inside the spelling.
+pure func join(base: Path, child: Path) -> Path:
+    base_text = from_opaque Path(base)
+    child_text = from_opaque Path(child)
+    var child_start = 0
+    while child_start < child_text.length():
+        if child_text.is_separator(child_start):
+            child_start = child_start + 1
+        else:
+            break
+    if child_start == child_text.length():
+        base
+    else:
+        base_end = base_text.length_without_trailing_separators()
+        below = child_text
+            .slice(child_start, child_text.length())
+            .get_or(child_text)
+        if base_end == 0:
+            -- Only separators: root.
+            into_opaque Path("/" + below)
+        else:
+            into_opaque Path(
+                base_text
+                    .slice(0, base_end)
+                    .get_or(base_text) + "/" + below
+            )
+
+
+-- Lexical only: `.` components and cancelled `a/..` pairs are removed, and no
+-- filesystem, symlink or Unicode normalization is consulted. It never gives an
+-- empty spelling: an absolute path keeps its leading `/`, and a relative one
+-- with no components left is `.`.
+pure func normalize(path: Path) -> Path:
+    into_opaque Path(from_opaque Path(path).normalized_spelling())
+
+
 -- The last component, ignoring trailing separators, split at its last dot that
--- does not begin it, like the compiler's `module_stem`: `x.test.brp` is
+-- does not begin it, `x.test.brp` is
 -- `x.test` and `brp`, `.hidden` has no extension, `a.` has the empty one, `...`
 -- is `..` and the empty one. `/`, `.` and `..` name no entry, so no parts.
 private record NameParts {
@@ -219,12 +223,7 @@ private record NameParts {
 
 
 private pure func name_parts(spelling: String) -> Option[NameParts]:
-    var end = spelling.length()
-    while end > 0:
-        if spelling.is_separator(end - 1):
-            end = end - 1
-        else:
-            break
+    end = spelling.length_without_trailing_separators()
     var start = end
     while start > 0:
         if spelling.is_separator(start - 1):
@@ -251,10 +250,39 @@ private pure func name_parts(spelling: String) -> Option[NameParts]:
                 Some({ name = text, stem = text, extension = None })
 
 
--- Total: a path with no parent component is `.`, and root is its own parent,
--- as `dirname` has it. `.` and `..` are components like any other.
+-- Total: a path with no parent component is `.`, and root is its own parent.
+-- `.` and `..` are components like any other. Trailing separators are ignored,
+-- and the final component and its separator run are removed; interior
+-- components remain lexical.
 pure func parent(path: Path) -> Path:
-    into_opaque Path(from_opaque Path(path).dirname())
+    spelling = from_opaque Path(path)
+    var end = spelling.length_without_trailing_separators()
+
+    while end > 0:
+        if spelling.is_separator(end - 1):
+            break
+        else:
+            end = end - 1
+
+    while end > 0:
+        if spelling.is_separator(end - 1):
+            end = end - 1
+        else:
+            break
+
+    if end == 0:
+        if spelling.is_separator(0):
+            into_opaque Path("/")
+        else:
+            into_opaque Path(".")
+    else:
+        -- 0 < end <= byte length, and byte[end] is ASCII '/'.
+        -- Both endpoints are scalar boundaries; checked Slice cannot fail.
+        into_opaque Path(
+            spelling
+                .slice(0, end)
+                .get_or(".")
+        )
 
 
 -- The last component, ignoring trailing separators: `a/b/` is `b`.
@@ -293,6 +321,13 @@ private pure func path_components(spelling: String) -> List[String]:
                 result = result.append(component)
             start = position + 1
     result
+
+
+-- Whether the spelling starts with a separator, so it names the same place
+-- from any working directory. `join` puts an absolute child under its base, so
+-- a caller that wants Python's behaviour asks this first.
+pure func is_absolute(path: Path) -> Bool:
+    from_opaque Path(path).is_separator(0)
 
 
 -- Whether `path` is `root` or lies below it, comparing components, never

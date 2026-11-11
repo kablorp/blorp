@@ -61,7 +61,7 @@ block under `src/`:
 No analysis module imports code generation.
 
 **Generated C keeps its bytes across a directory move.** Function labels come
-from the file name alone (`module_stem`, `src/syntax/source.brp:86`), and
+from the file name alone (`file_stem`, `src/common/syntax/source.brp`), and
 they appear only in C comments. The 2026-11-07 move produced byte-identical
 C the same way.
 

@@ -1,0 +1,92 @@
+-- Listing a directory. A native reports a failure as an Int code, which the
+-- decoder below turns into the error union of list_directory.
+import:
+    _base: Int, String, List, Option(Some, None), Result(Ok, Err), Stringable
+    int: Int methods
+    io/_codes: NOT_FOUND_CODE, PERMISSION_DENIED_CODE, NOT_A_DIRECTORY_CODE, INVALID_UTF8_CODE
+    list: List methods
+    option: Option methods
+    path: Path
+    result: Result methods
+    string: String methods
+    ./entry: Entry, EntryKind(Other), decode_entry_kind
+
+
+-- Why a directory could not be listed.
+fixed union ListError:
+    NotFound
+    PermissionDenied
+    NotADirectory
+    -- An entry's name is not valid UTF-8, which a String cannot hold (D8).
+    InvalidUtf8
+    -- Any other errno, such as ELOOP, ENAMETOOLONG or EMFILE.
+    OtherOs(Int)
+
+
+-- Public so that its test binds it to literal native codes; it is not API for
+-- programs. A code this union does not name is OtherOs with the code negated,
+-- as io/_codes does.
+pure func decode_list_error(code: Int) -> ListError:
+    if code == NOT_FOUND_CODE:
+        NotFound
+    else if code == PERMISSION_DENIED_CODE:
+        PermissionDenied
+    else if code == NOT_A_DIRECTORY_CODE:
+        NotADirectory
+    else if code == INVALID_UTF8_CODE:
+        InvalidUtf8
+    else:
+        OtherOs(0 - code)
+
+
+implements Stringable for ListError:
+    pure func to_string(value: Self) -> String:
+        match value:
+            NotFound: "no such file"
+            PermissionDenied: "permission denied"
+            NotADirectory: "not a directory"
+            InvalidUtf8: "contents are not valid UTF-8"
+            OtherOs(number): "operating system error ${number}"
+
+
+-- Each listing element is one entry code byte followed by the name (D17). A
+-- mismatch between the two sides stays visible: an unknown code is Other, and
+-- an element with no byte at all becomes an entry named by the whole element,
+-- of kind Other. The absent code is never sent for an entry, so it too reads
+-- as Other. Every code is below 0x80, so the name starts on a character
+-- boundary; the slice fallback only keeps a malformed element visible.
+private ENTRY_CODE_BYTES: Int = 1
+
+
+private pure func decoded_entry(element: String) -> Entry:
+    match element.byte_at(0):
+        Some(code):
+            {
+                name = element
+                    .slice(ENTRY_CODE_BYTES, element.length())
+                    .get_or(element),
+                kind = code
+                    .decode_entry_kind()
+                    .get_or(Other),
+            }
+        None:
+            { name = element, kind = Other }
+
+
+private func native_list_directory(path: String) -> Result[List[String], Int]:
+    builtin("fs.list_directory")
+
+
+-- Lists a directory, sorted by name bytes, so the order does not depend on the
+-- file system. `.` and `..` are omitted. A link given as the path is followed
+-- and its target is listed, while each entry's kind is its own: a link in the
+-- listing is Symlink, not followed. A name that is not valid UTF-8 fails the
+-- whole listing with InvalidUtf8, since a String cannot hold it (D8). An entry
+-- removed while the directory is read is left out. ELOOP, ENAMETOOLONG and
+-- EMFILE are OtherOs.
+func list_directory(path: Path) -> Result[List[Entry], ListError]:
+    elements ?= path
+        .to_string()
+        .native_list_directory()
+        .map_err(decode_list_error)
+    Ok(elements.map(decoded_entry))

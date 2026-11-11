@@ -160,7 +160,7 @@ constructs Blorp `TestSuite`s and calls `test.run_suite`. Make builds it once pe
 invocation with the compiler under test and passes a mode (`components`,
 `deferred` or `e2e`), the exact compiler and C compiler paths and, for the
 component modes, the link libraries as argv; the driver makes its own e2e work
-directory with `fs.with_temporary_directory`. This narrow entry exception
+directory with `io/fs/temporary_directory`'s `with_temporary_directory`. This narrow entry exception
 does not authorize alternate fixture mains or assertion frameworks.
 Port bounded suites incrementally through ordinary target TestSuites and real
 fixture mains. Existing fixture parity checks compare compiler outputs only;

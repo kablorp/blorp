@@ -1,0 +1,167 @@
+-- A directory that exists only while a body runs. A native reports a failure
+-- as an Int code, which the decoder below turns into the one error union for
+-- both creating and removing the directory.
+import:
+    _base: Int, String, Void, Bool(True, False), Option(Some, None), Result(Ok, Err), Stringable
+    int: Int methods
+    io/_codes:
+        NOT_FOUND_CODE,
+        PERMISSION_DENIED_CODE,
+        NOT_A_DIRECTORY_CODE,
+        IS_A_DIRECTORY_CODE,
+        DIRECTORY_NOT_EMPTY_CODE,
+        READ_ONLY_FILESYSTEM_CODE,
+        NO_SPACE_CODE,
+        CROSSES_DEVICES_CODE,
+        PATH_CONTAINS_NUL_CODE,
+        CHANGED_DURING_REMOVAL_CODE,
+    path: Path, to_path
+    result: Result methods
+    string: String methods
+
+
+-- Why the directory could not be made or removed. The error does not say
+-- which step failed, or name the directory.
+fixed union TemporaryDirectoryError:
+    NotFound
+    PermissionDenied
+    NotADirectory
+    IsADirectory
+    DirectoryNotEmpty
+    ReadOnlyFilesystem
+    -- ENOSPC and EDQUOT.
+    NoSpace
+    CrossesDevices
+    ChangedDuringRemoval
+    -- The prefix contains a NUL byte or a `/`.
+    InvalidPrefix
+    -- Any other errno, as the platform numbers it.
+    OtherOs(Int)
+
+
+-- Public so that its test binds it to literal native codes; it is not API for
+-- programs. A code this union does not name is OtherOs with the code negated,
+-- as io/_codes does.
+pure func decode_temporary_directory_error(code: Int) -> TemporaryDirectoryError:
+    if code == NOT_FOUND_CODE:
+        NotFound
+    else if code == PERMISSION_DENIED_CODE:
+        PermissionDenied
+    else if code == NOT_A_DIRECTORY_CODE:
+        NotADirectory
+    else if code == IS_A_DIRECTORY_CODE:
+        IsADirectory
+    else if code == DIRECTORY_NOT_EMPTY_CODE:
+        DirectoryNotEmpty
+    else if code == READ_ONLY_FILESYSTEM_CODE:
+        ReadOnlyFilesystem
+    else if code == NO_SPACE_CODE:
+        NoSpace
+    else if code == CROSSES_DEVICES_CODE:
+        CrossesDevices
+    else if code == CHANGED_DURING_REMOVAL_CODE:
+        ChangedDuringRemoval
+    else if code == PATH_CONTAINS_NUL_CODE:
+        InvalidPrefix
+    else:
+        OtherOs(0 - code)
+
+
+implements Stringable for TemporaryDirectoryError:
+    pure func to_string(value: Self) -> String:
+        match value:
+            NotFound: "no such file"
+            PermissionDenied: "permission denied"
+            NotADirectory: "not a directory"
+            IsADirectory: "is a directory"
+            DirectoryNotEmpty: "directory not empty"
+            ReadOnlyFilesystem: "read-only file system"
+            NoSpace: "no space left on device"
+            CrossesDevices: "crosses devices"
+            ChangedDuringRemoval: "changed during removal"
+            InvalidPrefix: "the prefix contains a NUL byte or a /"
+            OtherOs(number): "operating system error ${number}"
+
+
+private SEPARATOR_BYTE: Int = 47
+
+
+-- The native refuses a `/` too, but as an errno that cannot be told from
+-- mkdtemp's own EINVAL, so the library names it first.
+private pure func has_separator(text: String) -> Bool:
+    var found: Bool = False
+    for position in 0..text.length():
+        if text.byte_at(position) == Some(SEPARATOR_BYTE):
+            found = True
+            break
+    found
+
+
+private func native_create_temporary_directory(
+    parent: String,
+    prefix: String,
+) -> Result[String, Int]:
+    builtin("fs.create_temporary_directory")
+
+
+private func native_remove_directory_tree(path: String) -> Result[Void, Int]:
+    builtin("fs.remove_directory_tree")
+
+
+-- The directory's whole life: made, handed to the body, removed. `prefix` has
+-- passed with_temporary_directory's separator check.
+private func run_in_new_directory[T, E](
+    parent: Path,
+    prefix: String,
+    body: (Path) -> Result[T, E],
+    on_error: pure (TemporaryDirectoryError) -> E,
+) -> Result[T, E]:
+    created ?= parent
+        .to_string()
+        .native_create_temporary_directory(prefix)
+        .map_err(decode_temporary_directory_error)
+        .map_err(on_error)
+    -- The native joins a non-empty parent, the prefix and six letters, and
+    -- a C path holds no NUL, so `to_path` cannot fail on its reply. If it
+    -- did, the negated NUL code is the disagreement made visible, and the
+    -- directory just made is left behind, since the body has no path to use.
+    directory: Path ?= match created.to_path():
+        Ok(path): Ok(path)
+        Err(_): Err(on_error(OtherOs(0 - PATH_CONTAINS_NUL_CODE)))
+    outcome = body(directory)
+    removed = created
+        .native_remove_directory_tree()
+        .map_err(decode_temporary_directory_error)
+    value ?= outcome
+    _ ?= removed.map_err(on_error)
+    Ok(value)
+
+
+-- Makes a fresh, empty directory directly in `parent` (mode 0700, a name no
+-- other process can predict), runs `body` with its path, and removes the
+-- directory and everything in it before returning. `prefix` starts the name; one
+-- with a NUL or a `/` is InvalidPrefix, and macOS replaces every trailing `X`
+-- of a prefix. `on_error` turns this library's own failures into the body's
+-- error type E; a program that keeps TemporaryDirectoryError passes
+-- `pure func(error: TemporaryDirectoryError) -> TemporaryDirectoryError: error`.
+--
+-- The result, in order of priority: the body's Err; otherwise the removal's
+-- Err; otherwise the body's Ok. So a body Err hides a failed removal: the
+-- directory may be left behind with nothing said. A failed removal does not
+-- name the directory (D34): the body was given its path, and the error does
+-- not repeat it. A body that removes its own directory makes the removal
+-- NotFound.
+--
+-- Removal runs on every path the program controls, since Blorp has no return or
+-- exception that could skip it. A signal, `abort()` or a stack overflow can
+-- still leave the directory.
+func with_temporary_directory[T, E](
+    parent: Path,
+    prefix: String,
+    body: (Path) -> Result[T, E],
+    on_error: pure (TemporaryDirectoryError) -> E,
+) -> Result[T, E]:
+    if prefix.has_separator():
+        Err(on_error(InvalidPrefix))
+    else:
+        parent.run_in_new_directory(prefix, body, on_error)

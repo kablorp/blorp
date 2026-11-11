@@ -1,14 +1,14 @@
 import:
     bool: not, and
     int: Int methods
-    io/error: to_string
-    io/fs: EntryKind, entry_kind, read_text, write_text
+    io/fs/entry: EntryKind
     io/process: run_to_files
     list: List methods, repeat
     result: Result methods
     string: String methods
     test: TestSuite
     ../../src/common/cli/usage: EXIT_PATH, EXIT_REJECTED
+    ./file_access: read_file, write_file, kind_of
     ./self_hosted_reports: parse_instructions, positive_allocations, within_ceiling
 
 
@@ -46,7 +46,6 @@ private FS_READ_OUTPUT: String =
     |read_text not_utf8.bin: not_utf8.bin: contents are not valid UTF-8
     |read_text loop: OtherOs
     |read_text dangling_link: dangling_link: no such file
-    |read_text nul: nul: path contains a NUL byte
     |entry_kind settings.conf: file
     |entry_kind locked.txt: file
     |entry_kind folder: directory
@@ -57,27 +56,17 @@ private FS_READ_OUTPUT: String =
     |entry_kind missing.txt: absent
     |entry_kind settings.conf/child: absent
     |entry_kind loop/inside: OtherOs
-    |entry_kind nul: nul: path contains a NUL byte
-    |default_if_not_found missing.txt: ok 8 bytes
-    |default_if_not_found settings.conf: ok 6 bytes
-    |default_if_not_found locked.txt: locked.txt: permission denied
-    |default_if_not_found folder: folder: is a directory
+    |fallback missing.txt: ok 8 bytes
+    |fallback settings.conf: ok 6 bytes
+    |fallback locked.txt: locked.txt: permission denied
+    |fallback folder: folder: is a directory
     |settings.conf: no such file
     |settings.conf: permission denied
-    |settings.conf: already exists
     |settings.conf: not a directory
     |settings.conf: is a directory
-    |settings.conf: directory not empty
-    |settings.conf: not a regular file
-    |settings.conf: read-only file system
-    |settings.conf: no space left on device
     |settings.conf: file too large
-    |settings.conf: crosses devices
-    |settings.conf: path contains a NUL byte
     |settings.conf: contents are not valid UTF-8
-    |settings.conf: changed during removal
     |settings.conf: operating system error 40
-    |a -> b: crosses devices
     |
 
 
@@ -101,7 +90,6 @@ private FS_LINES_OUTPUT: String =
     |fold_lines locked.txt: locked.txt: permission denied
     |fold_lines loop: OtherOs
     |fold_lines not_utf8.bin: not_utf8.bin: contents are not valid UTF-8
-    |fold_lines nul: nul: path contains a NUL byte
     |  stepped the first line
     |fold_lines long_not_utf8.txt: long_not_utf8.txt: contents are not valid UTF-8
     |fold_lines long_not_utf8.txt with a step stopping at line 5: step stopped at line 5
@@ -143,7 +131,6 @@ private FS_WRITE_OUTPUT: String =
     |write_text existing.txt/child: existing.txt/child: not a directory
     |write_text missing/child.txt: missing/child.txt: no such file
     |write_text loop: OtherOs
-    |write_text nul: nul: path contains a NUL byte
     |
 
 
@@ -215,11 +202,12 @@ private FS_DIRECTORIES_OUTPUT: String =
     |with_temporary_directory text error: body failed
     |  scratch holds 0 entries
     |with_temporary_directory removed by body: directory: no such file
-    |  path is the directory the body was given
     |  scratch holds 0 entries
     |with_temporary_directory body error: body: permission denied
     |  scratch holds 0 entries
     |with_temporary_directory missing parent: missing: no such file
+    |with_temporary_directory slash prefix: the prefix contains a NUL byte or a /
+    |with_temporary_directory NUL prefix: the prefix contains a NUL byte or a /
     |
 
 
@@ -348,7 +336,7 @@ func command(
     if actual.equals(expected_status):
         Ok(void)
     else:
-        match read_text(prefix + ".stderr").map_err(to_string):
+        match read_file(prefix + ".stderr"):
             Ok(captured):
                 Err(
                     (
@@ -390,11 +378,11 @@ private func compile_timed(
         0,
         COMPILATION_TIMEOUT_MS,
     )
-    output: String ?= read_text(prefix + ".compile.stdout").map_err(to_string)
+    output: String ?= read_file(prefix + ".compile.stdout")
     _ ?= expect(output, "", "compiler stdout")
-    report: String ?= read_text(prefix + ".compile.stderr").map_err(to_string)
+    report: String ?= read_file(prefix + ".compile.stderr")
     allocations: Int ?= positive_allocations(report)
-    generated: String ?= read_text(prefix + ".c").map_err(to_string)
+    generated: String ?= read_file(prefix + ".c")
     if (
         generated
             .length()
@@ -436,9 +424,9 @@ private func link_fixture(
         0,
         COMPILATION_TIMEOUT_MS,
     )
-    stdout: String ?= read_text(binary + ".link.stdout").map_err(to_string)
+    stdout: String ?= read_file(binary + ".link.stdout")
     _ ?= expect(stdout, "", "C compiler stdout")
-    stderr: String ?= read_text(binary + ".link.stderr").map_err(to_string)
+    stderr: String ?= read_file(binary + ".link.stderr")
     expect(stderr, "", "C compiler stderr")
 
 
@@ -490,9 +478,9 @@ private func run_normal(prefix: String, run: NativeRun) -> Result[Void, String]:
         run.status,
         NATIVE_TIMEOUT_MS,
     )
-    output: String ?= read_text(capture + ".normal.run.stdout").map_err(to_string)
+    output: String ?= read_file(capture + ".normal.run.stdout")
     _ ?= expect(output, run.stdout, "native stdout" + label_suffix(run))
-    errors: String ?= read_text(capture + ".normal.run.stderr").map_err(to_string)
+    errors: String ?= read_file(capture + ".normal.run.stderr")
     expect(errors, run.stderr, "native stderr" + label_suffix(run))
 
 
@@ -506,9 +494,9 @@ private func run_strict(prefix: String, run: NativeRun) -> Result[Void, String]:
         run.status,
         NATIVE_TIMEOUT_MS,
     )
-    strict_output: String ?= read_text(capture + ".strict.run.stdout").map_err(to_string)
+    strict_output: String ?= read_file(capture + ".strict.run.stdout")
     _ ?= expect(strict_output, run.stdout, "strict native stdout" + label_suffix(run))
-    accounting: String ?= read_text(capture + ".strict.run.stderr").map_err(to_string)
+    accounting: String ?= read_file(capture + ".strict.run.stderr")
     -- The runtime writes its report as the program's last act, after everything
     -- the program wrote to the same stream.
     report = (
@@ -580,7 +568,7 @@ private pure func compiler_inputs(input: CompileInput) -> List[String]:
 
 
 private func instructions_within(prefix: String, ceiling: CompileCeiling) -> Result[Void, String]:
-    timing: String ?= read_text(prefix + ".instructions").map_err(to_string)
+    timing: String ?= read_file(prefix + ".instructions")
     instructions: Int ?= parse_instructions(timing)
     within_ceiling("compile retired instructions", instructions, ceiling.instructions)
 
@@ -801,18 +789,18 @@ func verify_unpublished_expecting(
     prefix = work_directory + "/" + name
     output = prefix + ".c"
     _ ?= expect_failure(compiler, compile_arguments(library_root, source, output), prefix, expected)
-    created: Option[EntryKind] ?= entry_kind(output).map_err(to_string)
+    created: Option[EntryKind] ?= kind_of(output)
     unpublished: Void ?= match created:
         None: Ok(void)
         Some(_): Err("a rejected compilation created " + output)
-    _ ?= write_text(output, PRESERVED_OUTPUT).map_err(to_string)
+    _ ?= write_file(output, PRESERVED_OUTPUT)
     _ ?= expect_failure(
         compiler,
         compile_arguments(library_root, source, output),
         prefix + ".existing",
         expected,
     )
-    unchanged: String ?= read_text(output).map_err(to_string)
+    unchanged: String ?= read_file(output)
     expect(unchanged, PRESERVED_OUTPUT, "rejected output sentinel")
 
 
@@ -825,7 +813,7 @@ func verify_unpublished_rejection(
     diagnostic: String,
 ) -> Result[Void, String]:
     source = work_directory + "/" + name + ".brp"
-    _ ?= write_text(source, text).map_err(to_string)
+    _ ?= write_file(source, text)
     verify_unpublished_against(compiler, LIBRARY_ROOT, work_directory, {
         name = name,
         source = source,
@@ -860,9 +848,9 @@ func expect_status(
         status,
         COMPILATION_TIMEOUT_MS,
     )
-    stdout: String ?= read_text(prefix + ".compile.stdout").map_err(to_string)
+    stdout: String ?= read_file(prefix + ".compile.stdout")
     _ ?= expect(stdout, "", "failed compiler stdout")
-    stderr: String ?= read_text(prefix + ".compile.stderr").map_err(to_string)
+    stderr: String ?= read_file(prefix + ".compile.stderr")
     expect(stderr, expected_stderr, "failed compiler diagnostic")
 
 
@@ -891,7 +879,7 @@ private func directory_output_fixture(
     work_directory: String,
 ) -> Result[Void, String]:
     source = work_directory + "/directory_output.brp"
-    _ ?= write_text(source, "func main() -> Int:\n    0\n").map_err(to_string)
+    _ ?= write_file(source, "func main() -> Int:\n    0\n")
     expect_status(
         compiler,
         compile_arguments(LIBRARY_ROOT, source, work_directory),
@@ -911,9 +899,7 @@ private func missing_module_fixture(
     work_directory: String,
 ) -> Result[Void, String]:
     source = work_directory + "/missing_module.brp"
-    _ ?= write_text(source, "import:\n    ./missing: thing\nfunc main() -> Int:\n    0\n").map_err(
-        to_string,
-    )
+    _ ?= write_file(source, "import:\n    ./missing: thing\nfunc main() -> Int:\n    0\n")
     expect_failure(
         compiler,
         compile_arguments(LIBRARY_ROOT, source, work_directory + "/missing_module.c"),
@@ -984,7 +970,7 @@ private func fs_tree_tests(
         "fs_read",
         "fs/read",
         { allocations = 209287, instructions = 726587374 },
-        once_given([tree], 0, FS_READ_OUTPUT, 260),
+        once_given([tree], 0, FS_READ_OUTPUT, 194),
     )
     lines_run: NativeRun = {
         label = None,
@@ -994,25 +980,25 @@ private func fs_tree_tests(
         status = 0,
         stdout = FS_LINES_OUTPUT,
         stderr = "",
-        allocations = 6156046,
+        allocations = 6155744,
     }
     lines = fixture_program(
         "fs_lines",
         "fs/lines",
-        { allocations = 337645, instructions = 1035693790 },
+        { allocations = 367500, instructions = 1101335507 },
         [lines_run],
     )
     write = fixture_program(
         "fs_write",
         "fs/write",
-        { allocations = 201397, instructions = 705888463 },
-        once_given([write_tree], 0, FS_WRITE_OUTPUT, 223),
+        { allocations = 210082, instructions = 725251308 },
+        once_given([write_tree], 0, FS_WRITE_OUTPUT, 213),
     )
     directories = fixture_program(
         "fs_directories",
         "fs/directories",
-        { allocations = 292110, instructions = 939641936 },
-        once_given([directories_tree], 0, FS_DIRECTORIES_OUTPUT, 574),
+        { allocations = 407508, instructions = 1266349840 },
+        once_given([directories_tree], 0, FS_DIRECTORIES_OUTPUT, 591),
     )
     match run_to_files(
         SHELL,
@@ -1242,7 +1228,7 @@ func suite(
     step_without_result: Rejection = {
         name = "fs_step_without_result",
         source = "blorp/test/e2e/fixtures/fs/step_without_result.brp",
-        diagnostic = ":14:42: error: argument type does not match the parameter type\nhelp: use an expression of type (Int, String) -> Result[Int, Int] here\n",
+        diagnostic = ":16:39: error: argument type does not match the parameter type\nhelp: use an expression of type (Int, String) -> Result[Int, Int] here\n",
     }
     non_dict_key: Rejection = {
         name = "dict_non_dict_key",
@@ -2070,7 +2056,7 @@ func suite(
                         "lookup_errors/append_modules",
                         { allocations = 2093946, instructions = 6132631441 },
                         "64 modules\n",
-                        1417,
+                        1613,
                     ),
                 ),
             ),

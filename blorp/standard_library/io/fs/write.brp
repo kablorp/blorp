@@ -1,0 +1,115 @@
+-- Writing a file. A native reports a failure as an Int code, which the decoder
+-- below turns into the error union of write_text.
+import:
+    _base: Int, String, Void, Result(Ok, Err), Stringable
+    int: Int methods
+    io/_codes:
+        NOT_FOUND_CODE,
+        PERMISSION_DENIED_CODE,
+        ALREADY_EXISTS_CODE,
+        NOT_A_DIRECTORY_CODE,
+        IS_A_DIRECTORY_CODE,
+        DIRECTORY_NOT_EMPTY_CODE,
+        NOT_A_REGULAR_FILE_CODE,
+        READ_ONLY_FILESYSTEM_CODE,
+        NO_SPACE_CODE,
+        FILE_TOO_LARGE_CODE,
+    path: Path
+    result: Result methods
+    string: String methods
+
+
+-- Why a file could not be written. AlreadyExists and DirectoryNotEmpty can
+-- only come from another process swapping a directory in during the call.
+fixed union WriteError:
+    NotFound
+    PermissionDenied
+    AlreadyExists
+    NotADirectory
+    IsADirectory
+    DirectoryNotEmpty
+    NotARegularFile
+    ReadOnlyFilesystem
+    -- ENOSPC and EDQUOT.
+    NoSpace
+    -- EFBIG and EOVERFLOW.
+    FileTooLarge
+    -- Any other errno, such as ELOOP, ENAMETOOLONG, EBUSY or ETXTBSY.
+    OtherOs(Int)
+
+
+-- Public so that its test binds it to literal native codes; it is not API for
+-- programs. A code this union does not name is OtherOs with the code negated,
+-- as io/_codes does.
+pure func decode_write_error(code: Int) -> WriteError:
+    if code == NOT_FOUND_CODE:
+        NotFound
+    else if code == PERMISSION_DENIED_CODE:
+        PermissionDenied
+    else if code == ALREADY_EXISTS_CODE:
+        AlreadyExists
+    else if code == NOT_A_DIRECTORY_CODE:
+        NotADirectory
+    else if code == IS_A_DIRECTORY_CODE:
+        IsADirectory
+    else if code == DIRECTORY_NOT_EMPTY_CODE:
+        DirectoryNotEmpty
+    else if code == NOT_A_REGULAR_FILE_CODE:
+        NotARegularFile
+    else if code == READ_ONLY_FILESYSTEM_CODE:
+        ReadOnlyFilesystem
+    else if code == NO_SPACE_CODE:
+        NoSpace
+    else if code == FILE_TOO_LARGE_CODE:
+        FileTooLarge
+    else:
+        OtherOs(0 - code)
+
+
+implements Stringable for WriteError:
+    pure func to_string(value: Self) -> String:
+        match value:
+            NotFound: "no such file"
+            PermissionDenied: "permission denied"
+            AlreadyExists: "already exists"
+            NotADirectory: "not a directory"
+            IsADirectory: "is a directory"
+            DirectoryNotEmpty: "directory not empty"
+            NotARegularFile: "not a regular file"
+            ReadOnlyFilesystem: "read-only file system"
+            NoSpace: "no space left on device"
+            FileTooLarge: "file too large"
+            OtherOs(number): "operating system error ${number}"
+
+
+private func native_write_text(path: String, text: String) -> Result[Void, Int]:
+    builtin("fs.write_text")
+
+
+-- Replaces the file atomically: readers see the old contents or the new, never
+-- a mix, even after a crash. A symlink is written through and stays a link; a
+-- dangling link is NotFound and creates nothing. A new file gets mode 0666
+-- narrowed by the umask, and a replaced file keeps its mode and, where the
+-- operating system permits, its owner and group, or its group alone. An Err
+-- before the rename leaves the target unchanged; an Err after it (only the
+-- directory flush can fail there) means the target holds the old contents or
+-- the new. A path ending in `/` names a directory, which is never written: it
+-- is IsADirectory when it names one or a link to one, NotADirectory when it
+-- names anything else, and NotFound when nothing is there; any other failure to look
+-- it up is reported as for any path.
+--
+-- Limits: a hard link to the old file keeps the old contents; extended
+-- attributes and ACLs are not copied; a link re-pointed between resolving it
+-- and the rename is not detected. The new file is created beside the target,
+-- so a writable file in a directory this process cannot write is
+-- PermissionDenied, and a crash can leave a hidden `.blorp-tmp-*` file there.
+-- A busy executable (ETXTBSY) or a bind-mounted target (EBUSY) is OtherOs. A
+-- directory without read permission gives an Err after a rename that
+-- succeeded. Writing past the file-size limit (RLIMIT_FSIZE) raises SIGXFSZ,
+-- which ends the process unless the program ignores that signal; a library
+-- does not change signal dispositions.
+func write_text(path: Path, text: String) -> Result[Void, WriteError]:
+    path
+        .to_string()
+        .native_write_text(text)
+        .map_err(decode_write_error)

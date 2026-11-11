@@ -3,11 +3,12 @@ import:
     dict: empty, Dict methods
     int: Int methods
     io/environment: get_current_directory, CurrentDirectoryError
-    io/error: to_string
-    io/fs: EntryKind(File, Directory), entry_kind, read_text
+    io/fs/entry: EntryKind(File, Directory), entry_kind
+    io/fs/read: ReadError, read_text
     list: List methods
     option: Option methods
-    path as path_ops: Path
+    path as path_ops: Path, PathError(Empty, ContainsNul), is_absolute, to_path
+    result: Result methods
     string: String methods
     -- The one import that leaves src/: the module is generated into the build
     -- directory (see EMBEDDED_LIBRARY_PLAN.md), so build it first with
@@ -37,6 +38,7 @@ import:
         internal_error,
         or_internal_error,
         path_error,
+    ../../utils/results: translated_list
     ../assemble:
         ParsedAssembly,
         ParsedProgram,
@@ -50,6 +52,10 @@ private LIBRARY_SUFFIX: String = ".brp"
 private FOUNDATION_TYPES_PATH: String = "_base.brp"
 
 private FOUNDATION_PRELUDE_PATH: String = "prelude.brp"
+
+private LIBRARY_TEST_PATH: String = "test.brp"
+
+private LIBRARY_ROOT_NAME: String = "the library root"
 
 
 record LoadedProgram {
@@ -68,6 +74,7 @@ record LoadFailure {
 union SourceLoadFailure:
     DuplicateSourcePath(String)
     SourcePathContainsNul(String)
+    SourcePathEmpty
     LoadingFailed(LoadFailure)
 
 
@@ -99,21 +106,23 @@ private EMBEDDED_LIBRARY_ROOT: String = "<standard library>"
 
 
 private record LibraryContents {
-    root: String,
+    root: Path,
+    -- The root and a separator, so a path under the root starts with it.
     prefix: String,
-    types_path: String,
-    prelude_path: String,
+    types_path: Path,
+    prelude_path: Path,
+    test_path: Path,
 }
 
 
--- The variants differ in where the text is read from. The embedded one holds
--- nothing: its paths always derive from EMBEDDED_LIBRARY_ROOT, so they cannot
--- disagree with it.
+-- The variants differ in where the text is read from. Both hold their paths:
+-- the embedded one is rooted at EMBEDDED_LIBRARY_ROOT, so its modules get paths
+-- under it.
 private union LibraryChoice:
     -- Library and foundation modules under a directory.
     ReadFromDirectory(LibraryContents)
-    -- The embedded copy; its modules get paths under EMBEDDED_LIBRARY_ROOT.
-    ReadFromEmbedded
+    -- The embedded copy.
+    ReadFromEmbedded(LibraryContents)
 
 
 -- The configured library is the only authority for module roles: the
@@ -122,59 +131,89 @@ private union LibraryChoice:
 opaque type LibraryLayout = LibraryChoice
 
 
-private pure func root_contents(root: String) -> LibraryContents:
-    {
+private ROOT_DIRECTORY: String = "/"
+
+
+-- A written path lies under the working directory unless it is absolute. Path
+-- `join` puts an absolute child under its base, so the loader decides here.
+private pure func resolved_path(working_directory: Path, written: Path) -> Path:
+    if written.is_absolute():
+        path_ops.normalize(written)
+    else:
+        path_ops.normalize(path_ops.join(working_directory, written))
+
+
+private pure func root_contents(root: Path) -> Result[LibraryContents, PathError]:
+    types_file ?= FOUNDATION_TYPES_PATH.to_path()
+    prelude_file ?= FOUNDATION_PRELUDE_PATH.to_path()
+    test_file ?= LIBRARY_TEST_PATH.to_path()
+    root_text = root.to_string()
+    prefix = if root_text == ROOT_DIRECTORY:
+        root_text
+    else:
+        root_text + ROOT_DIRECTORY
+    Ok({
         root = root,
-        prefix = path_ops.join(root, ""),
-        types_path = path_ops.join(root, FOUNDATION_TYPES_PATH),
-        prelude_path = path_ops.join(root, FOUNDATION_PRELUDE_PATH),
-    }
-
-
-private pure func embedded_contents() -> LibraryContents:
-    root_contents(EMBEDDED_LIBRARY_ROOT)
+        prefix = prefix,
+        types_path = path_ops.join(root, types_file),
+        prelude_path = path_ops.join(root, prelude_file),
+        test_path = path_ops.join(root, test_file),
+    })
 
 
 private pure func layout_contents(layout: LibraryLayout) -> LibraryContents:
     match from_opaque LibraryLayout(layout):
-        ReadFromDirectory(contents): contents
-        ReadFromEmbedded: embedded_contents()
+        ReadFromDirectory(contents) | ReadFromEmbedded(contents): contents
 
 
 -- A directory root is joined to the working directory and normalized here,
--- like every path passed to module_role.
-pure func library_layout(source: LibrarySource, working_directory: String) -> LibraryLayout:
-    match source:
+-- like every path passed to module_role. The root a caller wrote may not be a
+-- Path.
+pure func library_layout(
+    source: LibrarySource,
+    working_directory: Path,
+) -> Result[LibraryLayout, PathError]:
+    root ?= match source:
         EmbeddedLibrary:
-            into_opaque LibraryLayout(ReadFromEmbedded)
-        LibraryDirectory(root):
-            directory = path_ops.normalize(path_ops.join(working_directory, root))
-            into_opaque LibraryLayout(ReadFromDirectory(root_contents(directory)))
+            EMBEDDED_LIBRARY_ROOT.to_path()
+        LibraryDirectory(written):
+            written
+                .to_path()
+                .map(pure func(path: Path) -> Path: working_directory.resolved_path(path))
+    contents ?= root_contents(root)
+    choice: LibraryChoice = match source:
+        EmbeddedLibrary: ReadFromEmbedded(contents)
+        LibraryDirectory(_): ReadFromDirectory(contents)
+    Ok(into_opaque LibraryLayout(choice))
 
 
 -- Decides the role of a normalized path, whether it was queued by an import or
 -- named on the command line. The application root is the caller's concern: it
 -- is a user module wherever it lives, and only foundation roles are rejected.
-pure func module_role(layout: LibraryLayout, path: String) -> ModuleKind:
+pure func module_role(layout: LibraryLayout, path: Path) -> ModuleKind:
     contents = layout_contents(layout)
     if path == contents.types_path:
         FoundationTypesModule
     else if path == contents.prelude_path:
         FoundationPreludeModule
-    else if path.starts_with(contents.prefix):
+    else if (
+        path
+            .to_string()
+            .starts_with(contents.prefix)
+    ):
         LibraryModule
     else:
         UserModule
 
 
 private func join_parts(
-    directory: String,
+    directory: Path,
     parts: List[NameId],
     position: Int,
     names: NameTable,
     layout: LibraryLayout,
     site: Span,
-) -> Result[String, Diagnostic]:
+) -> Result[Path, Diagnostic]:
     match parts.get(position):
         None:
             Ok(directory)
@@ -188,18 +227,28 @@ private func join_parts(
                     )
             ):
                 Ok(spelling):
-                    stem = path_ops.join(directory, spelling)
-                    if layout.stem_is_ambiguous(stem):
-                        Err(ambiguous_stem_diagnostic(stem, site))
-                    else:
-                        stem.join_parts(parts, position + 1, names, layout, site)
+                    -- A spelling is an identifier, so it is a nonempty component.
+                    match spelling.to_path():
+                        Ok(component):
+                            stem = path_ops.join(directory, component)
+                            if layout.stem_is_ambiguous(stem):
+                                Err(ambiguous_stem_diagnostic(stem, site))
+                            else:
+                                stem.join_parts(parts, position + 1, names, layout, site)
+                        Err(error):
+                            Err(
+                                internal_error(
+                                    compiler_span(),
+                                    "import path has a spelling that is not a path: ${error}",
+                                ),
+                            )
                 Err(error):
                     Err(error)
 
 
 -- `a.brp` beside the folder `a/` would make the import `a` or `a/b` read two
 -- ways, so an import path that passes through such a name is refused.
-pure func ambiguous_stem_diagnostic(stem: String, site: Span) -> Diagnostic:
+pure func ambiguous_stem_diagnostic(stem: Path, site: Span) -> Diagnostic:
     diagnostic(
         site,
         "${stem}${LIBRARY_SUFFIX} sits beside the folder ${stem}/, so the import path names both a module and a folder",
@@ -227,8 +276,8 @@ pure func embedded_stem_ambiguity(
     match from_opaque LibraryLayout(layout):
         ReadFromDirectory(_):
             None
-        ReadFromEmbedded:
-            prefix = embedded_contents().prefix
+        ReadFromEmbedded(contents):
+            prefix = contents.prefix
             if stem.starts_with(prefix):
                 stem
                     .slice(prefix.length(), stem.length())
@@ -242,64 +291,75 @@ pure func embedded_stem_ambiguity(
 -- even if it holds no module; the embedded library records only library files,
 -- so there a folder counts only when it holds one. A stem whose kind cannot be
 -- read counts as absent: reading the module reports that failure.
-private func stem_is_ambiguous(layout: LibraryLayout, stem: String) -> Bool:
-    match embedded_stem_ambiguity(layout, EMBEDDED_LIBRARY_PATHS, stem):
+private func stem_is_ambiguous(layout: LibraryLayout, stem: Path) -> Bool:
+    match embedded_stem_ambiguity(layout, EMBEDDED_LIBRARY_PATHS, stem.to_string()):
         Some(ambiguous):
             ambiguous
         None:
-            match "${stem}${LIBRARY_SUFFIX}".entry_kind():
-                Ok(Some(File)):
-                    match stem.entry_kind():
-                        Ok(Some(Directory)): True
-                        _: False
-                _:
+            match module_file(stem):
+                Ok(file):
+                    match file.entry_kind():
+                        Ok(Some(File)):
+                            match stem.entry_kind():
+                                Ok(Some(Directory)): True
+                                _: False
+                        _:
+                            False
+                Err(_):
                     False
+
+
+-- The module file beside the folder `stem`.
+private pure func module_file(stem: Path) -> Result[Path, PathError]:
+    "${stem}${LIBRARY_SUFFIX}".to_path()
 
 
 -- This projection belongs to source loading, where filesystem paths are needed.
 -- Semantic import resolution receives ModuleId targets instead of these strings.
 func import_path(
-    importer: String,
+    importer: Path,
     request: ParsedImport,
     names: NameTable,
     layout: LibraryLayout,
-) -> Result[String, Diagnostic]:
+) -> Result[Path, Diagnostic]:
     base = match request.path.origin:
         LibraryImport:
             layout_contents(layout).root
         RelativeImport(parents):
-            var directory = path_ops.dirname(importer)
+            var directory = path_ops.parent(importer)
             var remaining = parents
             while remaining > 0:
-                directory = path_ops.dirname(directory)
+                directory = path_ops.parent(directory)
                 remaining = remaining - 1
             directory
     directory ?= base.join_parts(request.path.parts, 0, names, layout, request.span)
     -- Already normal: the importer and library root are normalized, relative parents
-    -- are resolved with dirname on that normal path, and the parser admits only
+    -- are resolved with parent on that normal path, and the parser admits only
     -- identifier parts ("interior dot segments are rejected" in
     -- test_grammar/test_imports.brp), so normalizing again would only reallocate.
-    Ok("${directory}${LIBRARY_SUFFIX}")
+    match module_file(directory):
+        Ok(file): Ok(file)
+        Err(error): Err(internal_error(compiler_span(), "import path is not a path: ${error}"))
 
 
 -- The site is the import that discovered the file; designated inputs have none.
 -- The role is fixed when the module is queued and is its only role authority.
 private record RequestedModule {
     id: ModuleId,
-    path: String,
+    path: Path,
     role: ModuleKind,
     site: Option[Span],
 }
 
 
-private pure func designated(id: ModuleId, path: String, role: ModuleKind) -> RequestedModule:
+private pure func designated(id: ModuleId, path: Path, role: ModuleKind) -> RequestedModule:
     { id = id, path = path, role = role, site = None }
 
 
 -- Return the first queued module with this path.
 private pure func known_module(
     requests: List[RequestedModule],
-    path: String,
+    path: Path,
 ) -> Option[RequestedModule]:
     var known: Option[RequestedModule] = None
     for request in requests:
@@ -320,19 +380,20 @@ private union ModuleStore:
 private pure func module_store(
     layout: LibraryLayout,
     role: ModuleKind,
-    path: String,
+    path: Path,
 ) -> Result[ModuleStore, Diagnostic]:
     match from_opaque LibraryLayout(layout):
         ReadFromDirectory(_):
             Ok(DiskFile)
-        ReadFromEmbedded:
+        ReadFromEmbedded(contents):
             match role:
                 UserModule:
                     Ok(DiskFile)
                 FoundationTypesModule | FoundationPreludeModule | LibraryModule:
-                    prefix = embedded_contents().prefix
-                    relative = if path.starts_with(prefix):
-                        path.slice(prefix.length(), path.length())
+                    prefix = contents.prefix
+                    text = path.to_string()
+                    relative = if text.starts_with(prefix):
+                        text.slice(prefix.length(), text.length())
                     else:
                         None
                     match relative:
@@ -374,16 +435,13 @@ private func read_override_or_disk(
     current: RequestedModule,
     overrides: SourceOverrides,
 ) -> Result[String, Diagnostic]:
-    match from_opaque SourceOverrides(overrides).get(current.path):
+    match from_opaque SourceOverrides(overrides).get(current.path.to_string()):
         Some(contents):
             Ok(contents)
         None:
             match current.path.read_text():
-                Ok(contents):
-                    Ok(contents)
-                Err(error):
-                    -- to_string names the path: "missing.brp: no such file".
-                    Err(unreadable(error.to_string(), current.site, current.role))
+                Ok(contents): Ok(contents)
+                Err(error): Err(unreadable("${current.path}: ${error}", current.site, current.role))
 
 
 private func read_module(
@@ -397,8 +455,16 @@ private func read_module(
             current.read_override_or_disk(overrides)
         EmbeddedFile(relative):
             match embedded_library_file(relative):
-                Some(contents): Ok(contents)
-                None: Err(unreadable("${current.path}: no such file", current.site, current.role))
+                Some(contents):
+                    Ok(contents)
+                None:
+                    Err(
+                        unreadable(
+                            "${current.path}: ${ReadError.NotFound}",
+                            current.site,
+                            current.role,
+                        ),
+                    )
 
 
 -- Everything loading threads through the queue. Each queued file yields exactly
@@ -463,7 +529,7 @@ private pure func import_diagnostic(
 private pure func import_allowed(
     cursor: ImportCursor,
     known: Option[RequestedModule],
-    path: String,
+    path: Path,
     span: Span,
 ) -> Result[RequestedModule, Diagnostic]:
     role = match known:
@@ -523,7 +589,12 @@ private func link_module(
         requests = state.requests,
         targets = [],
     })
-    assembly ?= state.assembly.append_module(parsed, resolved.targets, current.role, current.path)
+    assembly ?= state.assembly.append_module(
+        parsed,
+        resolved.targets,
+        current.role,
+        current.path.to_string(),
+    )
     Ok({ state | requests = resolved.requests, assembly = assembly })
 
 
@@ -540,7 +611,7 @@ private func load_module(
             display_path = if current.id == root_module_id():
                 state.root_path
             else:
-                current.path
+                current.path.to_string()
             with_source = { state |
                 modules = state.modules.append({ path = display_path, contents = contents }),
             }
@@ -573,7 +644,7 @@ private func load_test_entry(
     state: LoadState,
     grouped: List[RequestedModule],
 ) -> Result[LoadState, LoadFailure]:
-    path = path_ops.join(layout_contents(state.layout).root, "test.brp")
+    path = layout_contents(state.layout).test_path
     known = state.requests.known_module(path)
     id: ModuleId ?= match known:
         Some(request):
@@ -633,10 +704,10 @@ private pure func display_paths(
 -- The shell queries once; this projection owns failure before any source is read.
 pure func working_directory_result(
     result: Result[Path, CurrentDirectoryError],
-) -> Result[String, LoadFailure]:
+) -> Result[Path, LoadFailure]:
     match result:
         Ok(directory):
-            Ok(directory.to_string())
+            Ok(directory)
         Err(error):
             Err(
                 failure(
@@ -652,8 +723,9 @@ pure func working_directory_result(
 
 -- Every queued path has one identity, role, read, and parse in this invocation.
 func load_program(root_path: String, library: LibrarySource) -> Result[LoadedProgram, LoadFailure]:
+    root ?= usable_root(root_path)
     directory ?= get_current_directory().working_directory_result()
-    root_path.load_input(library, ApplicationInput, directory, no_source_overrides())
+    root_path.load_input(root, library, ApplicationInput, directory, no_source_overrides())
 
 
 func load_test_program(
@@ -661,25 +733,59 @@ func load_test_program(
     grouped_paths: List[String],
     library: LibrarySource,
 ) -> Result[LoadedProgram, LoadFailure]:
+    root ?= usable_root(root_path)
     directory ?= get_current_directory().working_directory_result()
-    root_path.load_input(library, TestSuiteInput(grouped_paths), directory, no_source_overrides())
+    root_path.load_input(
+        root,
+        library,
+        TestSuiteInput(grouped_paths),
+        directory,
+        no_source_overrides(),
+    )
 
 
--- Raw paths are checked before normalization can erase an invalid component.
-private pure func contains_nul(path: String, position: Int) -> Bool:
-    match path.byte_at(position):
-        Some(byte):
-            if byte == 0:
-                True
-            else:
-                path.contains_nul(position + 1)
-        None:
-            False
+-- A path the caller wrote is checked before normalization can erase an invalid
+-- component.
+private pure func written_path(written: String) -> Result[Path, SourceLoadFailure]:
+    match written.to_path():
+        Ok(path): Ok(path)
+        Err(ContainsNul): Err(SourcePathContainsNul(written))
+        Err(Empty): Err(SourcePathEmpty)
+
+
+-- The root a caller wrote, checked before the working directory is asked for.
+private pure func usable_root(root_path: String) -> Result[Path, LoadFailure]:
+    root_path
+        .to_path()
+        .map_err(pure func(error: PathError) -> LoadFailure: unusable_path("`${root_path}`", error))
+
+
+-- The failure for a path the caller wrote that is not a Path.
+private pure func unusable_path(what: String, error: PathError) -> LoadFailure:
+    failure(
+        [],
+        path_error(
+            compiler_span(),
+            "${what} is not a usable path: ${error}",
+            "write a nonempty path without NUL bytes",
+        ),
+    )
+
+
+private pure func test_suite_root(written: String) -> Result[Path, LoadFailure]:
+    written
+        .to_path()
+        .map_err(
+            pure func(error: PathError) -> LoadFailure: unusable_path(
+                "test suite input `${written}`",
+                error,
+            ),
+        )
 
 
 -- Rows are admitted in order, so the first bad row is the one reported.
 private pure func admit_sources(
-    working_directory: String,
+    working_directory: Path,
     sources: List[SourceFile],
     admitted: Dict[String, String],
     position: Int,
@@ -688,23 +794,26 @@ private pure func admit_sources(
         None:
             Ok(admitted)
         Some(source):
-            if source.path.contains_nul(0):
-                Err(SourcePathContainsNul(source.path))
-            else:
-                path = path_ops.normalize(path_ops.join(working_directory, source.path))
-                if admitted.contains(path):
-                    Err(DuplicateSourcePath(path))
-                else:
-                    working_directory.admit_sources(
-                        sources,
-                        admitted.set(path, source.contents),
-                        position + 1,
-                    )
+            match written_path(source.path):
+                Ok(written):
+                    key = working_directory
+                        .resolved_path(written)
+                        .to_string()
+                    if admitted.contains(key):
+                        Err(DuplicateSourcePath(key))
+                    else:
+                        working_directory.admit_sources(
+                            sources,
+                            admitted.set(key, source.contents),
+                            position + 1,
+                        )
+                Err(error):
+                    Err(error)
 
 
 -- The one constructor of a non-empty SourceOverrides.
 private pure func source_overrides(
-    working_directory: String,
+    working_directory: Path,
     sources: List[SourceFile],
 ) -> Result[SourceOverrides, SourceLoadFailure]:
     admitted ?= working_directory.admit_sources(sources, empty(), 0)
@@ -716,15 +825,12 @@ func load_program_with_sources(
     library: LibrarySource,
     sources: List[SourceFile],
 ) -> Result[LoadedProgram, SourceLoadFailure]:
-    _: Void ?= if root_path.contains_nul(0):
-        Err(SourcePathContainsNul(root_path))
-    else:
-        Ok(void)
-    directory: String ?= match get_current_directory().working_directory_result():
+    root ?= written_path(root_path)
+    directory: Path ?= match get_current_directory().working_directory_result():
         Ok(present): Ok(present)
         Err(error): Err(LoadingFailed(error))
     overrides ?= directory.source_overrides(sources)
-    match root_path.load_input(library, ApplicationInput, directory, overrides):
+    match root_path.load_input(root, library, ApplicationInput, directory, overrides):
         Ok(loaded): Ok(loaded)
         Err(error): Err(LoadingFailed(error))
 
@@ -733,16 +839,16 @@ func load_program_with_sources(
 -- command-line order. They are user modules wherever they live, like the first;
 -- a path already queued, a foundation input included, would be one module twice.
 private pure func queue_roots(
-    working_directory: String,
-    paths: List[String],
+    working_directory: Path,
+    roots: List[Path],
     queued: List[RequestedModule],
     later: List[RequestedModule],
 ) -> Result[List[RequestedModule], LoadFailure]:
-    match paths.get(later.length()):
+    match roots.get(later.length()):
         None:
             Ok(later)
         Some(written):
-            path = path_ops.normalize(path_ops.join(working_directory, written))
+            path = working_directory.resolved_path(written)
             requests = queued.concat(later)
             match (requests.known_module(path), module_id(requests.length())):
                 (Some(_), _):
@@ -758,7 +864,7 @@ private pure func queue_roots(
                     )
                 (None, Some(id)):
                     working_directory.queue_roots(
-                        paths,
+                        roots,
                         queued,
                         later.append(designated(id, path, UserModule)),
                     )
@@ -773,14 +879,17 @@ private pure func queue_roots(
 
 private func load_input(
     root_path: String,
+    root: Path,
     library: LibrarySource,
     mode: LoadMode,
-    working_directory: String,
+    working_directory: Path,
     overrides: SourceOverrides,
 ) -> Result[LoadedProgram, LoadFailure]:
-    layout = library_layout(library, working_directory)
+    layout ?= library_layout(library, working_directory).map_err(
+        pure func(error: PathError) -> LoadFailure: unusable_path(LIBRARY_ROOT_NAME, error),
+    )
     foundation = layout_contents(layout)
-    root_file = path_ops.normalize(path_ops.join(working_directory, root_path))
+    root_file = working_directory.resolved_path(root)
     -- Only the foundation inputs are barred from being the application root.
     _: Void ?= match layout.module_role(root_file):
         FoundationTypesModule | FoundationPreludeModule:
@@ -806,8 +915,12 @@ private func load_input(
         ),
     ]
     later: List[RequestedModule] ?= match mode:
-        ApplicationInput: Ok([])
-        TestSuiteInput(paths): working_directory.queue_roots(paths, designated_inputs, [])
+        ApplicationInput:
+            Ok([])
+        TestSuiteInput(paths):
+            match paths.translated_list(test_suite_root):
+                Ok(roots): working_directory.queue_roots(roots, designated_inputs, [])
+                Err(error): Err(error)
     initial ?= load_queue({
         layout = layout,
         overrides = overrides,
