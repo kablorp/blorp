@@ -1,6 +1,8 @@
 # Language server: `blorp lsp`
 
-**Status: plan, 2026-11-10, awaiting Keith's review of four open decisions.**
+**Status: plan, 2026-11-10, revised the same day. Name uses are now keyed by
+the compiler's identities, each analysis records the files it read, and the
+paths follow `SOURCE_LAYOUT_PLAN.md`. Four decisions await Keith.**
 
 ## Problem
 
@@ -23,88 +25,71 @@ are highlighting, then go-to-definition, then find-references.
 
 ## Background
 
-**Keith decided on 2026-11-10:**
+**Keith decided on 2026-11-10:** a `blorp lsp` subcommand; one loop and
+whole-program analysis to start; semantic tokens only, with no TextMate
+grammar; comments as lexer output; a limited v1 root, documented; library
+go-to through a temporary folder; the cleanest rotation path; and an
+ergonomic way to write without a newline (not `put`).
 
-- a `blorp lsp` subcommand;
-- start simple, with one loop and whole-program analysis;
-- semantic tokens only, with no TextMate grammar;
-- comments as lexer output if that is cleaner (it is);
-- a limited v1 root, with its limits documented;
-- library go-to through a temporary folder;
-- the cleanest rotation path;
-- an ergonomic way to write output without a newline (`put` was rejected).
-
-**What exists:**
-
-- the `json` codec;
-- loader source snapshots: `load_program_with_sources`
-  (`src/common/analysis/load/load.brp:722`, see `SOURCE_SNAPSHOTS_DECISIONS.md`);
-- the embedded library (`1a68dbd3b`);
-- byte-range spans on every token and definition name
-  (`src/common/syntax/syntax.brp:8`);
-- process `capture`, which writes and then closes `stdin: Option[String]`.
+**What exists:** the `json` codec; loader source snapshots
+(`load_program_with_sources`, `analysis/load/load.brp:722`); the embedded
+library; byte-range spans on every token (`syntax/syntax.brp:8`); and
+process `capture`, which can feed standard input.
 
 **What is missing:**
 
-- **`check` requires `main`.** Without it, checking fails with `MissingMain`
-  (`src/common/analysis/check/signatures.brp:188`).
-- **Name uses go unrecorded.** Nothing keeps which definition a name
-  resolved to.
-- **The lexer skips comments** in four places, and the formatter finds them
-  again (`src/format/trivia.brp:185`).
-- **A failed lex keeps no tokens.** Names are interned only after a
-  successful scan (`src/common/syntax/lex.brp:1890`).
-- **The console cannot read.** `print` always adds a newline and never
-  flushes.
+- **`check` requires `main`**, failing with `MissingMain`
+  (`common/analysis/check/signatures.brp:188`).
+- **Name uses go unrecorded.**
+- **The lexer skips comments**, and the formatter finds them again
+  (`format/trivia.brp:185`).
+- **A failed lex keeps no tokens**, because names are interned only after a
+  successful scan (`common/syntax/lex.brp:1890`).
+- **The console cannot read**, and `print` always adds a newline.
 - **Each phase reports only its first error.**
 
-**Related plans:**
-
-- `STRING_PLAN.md` moves byte work to `byte_*` functions.
-- `PATH_PLAN.md`: its naming rules, rotation (landing 5) and exact-error
-  rules all apply here.
+**Related plans:** `STRING_PLAN.md` moves byte work to `byte_*` functions,
+and `PATH_PLAN.md`'s naming and exact-error rules apply here.
 
 ## Open decisions
 
-1. **First editor.** I recommend **CLion**, Keith's editor. JetBrains
+1. **First editor.** I recommend **CLion**, Keith's editor: JetBrains
    supports `semanticTokens/full` from 2024.2.2, and the old plugin
-   (`ee9e001c6de8:editor/intellij/`) supplies a launcher. VS Code needs about
-   30 lines and documents semantic tokens better.
-2. **The console API.** The names below, plus the rule that every read
-   flushes standard output first. That rule is implicit behaviour, so it
-   needs Keith's approval (`blorp/AGENTS.md`).
-3. **Recording occurrences.** If recording them on every compile fits the
+   (`ee9e001c6de8:editor/intellij/`) has a launcher. VS Code documents them
+   better.
+2. **The console API:** the names below, and every read flushing standard
+   output first, an implicit behaviour that needs approval.
+3. **Recording name uses.** If recording them on every compile fits the
    ceilings, the checker always records them. Otherwise only analysis does,
    behind an explicit argument. A spike decides.
 4. **Serving broken files.** I recommend keeping each document's last
-   successful analysis and mapping its spans onto the current text. Without
-   it, every transient error while typing drops all identifier colour and
-   every go-to. As a per-document cache, it needs approval.
+   successful analysis and mapping positions through the edit. Without it,
+   every transient error while typing drops identifier colour and go-to. As
+   a per-document cache, it needs approval.
 
 ## Proposed solution
 
 ### Shape
 
-- **Compiler** (`src/common/`): pure analysis, with no
-  editor state.
-- **Language server** (`src/lsp/`): four pure modules.
-  - `protocol`: framing, and JSON-RPC to and from `Json`.
-  - `positions`: byte offsets to and from LSP positions.
-  - `tokens`: semantic-token encoding.
-  - `server`: open documents, one step per message.
-- **Transport** (`src/lsp/lsp_command.brp`, the command shell), the only impure
-  code: read, step, analyse on request, write.
+- **Compiler** (`src/common/`): pure analysis, with no editor state.
+- **The `lsp` command** (`src/lsp/`), a command directory like `compile/`:
+  - `protocol`: framing, and JSON-RPC to and from `Json`;
+  - `positions`: byte offsets to and from LSP positions;
+  - `tokens`: semantic-token encoding;
+  - `server`: open documents, one step per message;
+  - `lsp_command.brp`: the help text and the transport, the only impure code
+    (read, step, analyse on request, write).
+
+  The layer suite (`test/unit/test_layout/test_dependencies.brp`) gains an
+  `lsp/` layer that imports itself and `common/`. `main.brp` dispatches
+  `lsp` there.
 - **Editor plugin** (`editor/intellij/`): it launches `blorp lsp`.
 
 ### Analysis without an entry point
 
-`check` splits in two.
-
-- **`analyze`** checks declarations and bodies, and records a missing entry
-  function as a fact.
-- **`check`** runs `analyze`, then requires the entry function. A present
-  `main` is still validated in full.
-
+`check` splits in two. **`analyze`** checks declarations and bodies, and
+records a missing entry function as a fact. **`check`** runs `analyze`, then
+requires the entry function; a present `main` is still validated in full.
 The analysis holds `Option[Entrypoint[FunctionId]]`, and `CheckedProgram`
 holds `Entrypoint[FunctionId]`, so the types keep the cases apart.
 `MissingMain` is unchanged.
@@ -118,55 +103,66 @@ The lexer records each comment where it consumes one:
 - `next_code_line` (1249);
 - `doc_block_end` (1196).
 
-The list is threaded through the scanners' results and returned beside the
-tokens. Each entry is a span and a `documentation` flag. The parser never
-sees it.
+The list is returned beside the tokens, and the parser never sees it.
+`source_trivia` takes it instead of scanning gaps for comments; it still
+finds blank lines there. `Trivia` and the formatting rules are unchanged, so
+formatter output is byte-identical.
 
-`source_trivia` takes the list instead of scanning gaps for comments; it
-still finds blank lines in the gaps. Its "text outside every token" check
-now admits only blanks and listed comments. `Trivia` and the formatting
-rules are unchanged, so formatter output is byte-identical.
-
-A failed lex returns its prefix as a `LexedProgram`. The failure path runs
-the single `intern_names` pass over the tokens finished before the error.
+A failed lex returns its prefix as a `LexedProgram`: the failure path runs
+the one `intern_names` pass over the tokens finished before the error.
 Tokens inside a half-scanned string, interpolation or pipe string are
 dropped. The loader and the formatter use only the diagnostic.
 
-### The occurrence table
+### Name uses, keyed by identity
 
-Analysis records one row per name written in source: the name's span, the
-definition's name span, and the kind.
+The compiler establishes each declaration once, under an identity its
+tables join to the written name:
+- the ordinals in `analysis/ids.brp`, such as `FunctionId`;
+- `TraitMethodId`, `VariantId`, `FieldId`, `TypeParameterId`, `ModuleId`;
+- `TypeHead` (`namespace/namespace.brp:62`) for a type, built-in or declared;
+- `ScopedBindingId` for parameters and locals (`check/model.brp:633`), whose
+  `BindingDefinition` (`:703`) holds the span and mutability.
 
-**Coverage.** Rows cover:
+What is missing is the use. Analysis records one new fact per name used: a
+`NameUse`, its span and its `Referent`, the identity the checker resolved it
+to. The rest are joins:
+- **go-to:** `declaration_span(analysis, referent)`;
+- **references:** every use with an equal referent;
+- **token type:** the referent's case;
+- **modifiers:** `declaration` for the declarations themselves, read from
+  the declaration tables; `readonly` for an immutable binding or a constant;
+  `defaultLibrary` for anything the library declares.
 
-- functions, trait methods, UFCS calls;
-- constants, locals and parameters;
-- types and type parameters;
-- fields, in access, update, construction and patterns;
-- variants and traits;
-- import-list entries;
-- names inside `${…}`.
+**Coverage:** functions, trait methods and UFCS calls; constants, locals
+and parameters; types and type parameters; fields, in access, update,
+construction and patterns; variants, traits and module aliases; import-list
+entries; and names inside `${…}`. Synthesised names (derived equality, the
+test wrapper) get none.
 
-A definition records a row with both spans equal. Synthesised names (derived
-equality, the test wrapper) get no row.
+**Declarations without a written name.** A built-in type such as `Int` has
+none, so go-to returns `null`. A module's declaration is the start of its
+file. A trait's `Self` resolves to the trait's name.
 
-**Where rows are recorded.**
+**Where.** `check`'s body walk records uses (always, or only for
+`analyze`: decision 3), in a new `check/name_uses.brp`, because fields, type
+parameters and bindings are Check's identities. Import selections name only
+declarations, which `namespace` resolves (`import_row`,
+`namespace/namespace.brp:1058`) but keeps no spans for. It gains a table of
+each selection's span and entity, which `check` turns into uses.
 
-- `namespace` records import entries (`import_row`,
-  `src/common/analysis/namespace/namespace.brp:1058`).
-- `check` records the rest.
+**Inline rows.** `NameUse` is a `fixed record` over a `fixed union`, so rows
+take no allocation each. Seven plain types become `fixed`, which they
+already qualify for: `TypeHead` and `PrimitiveType` in `namespace/`, and
+`TypeParameterIdentity`, `TypeParameterOwner`, `ScopedBindingId`,
+`BodyOwner` and `AggregateId` in `check/model.brp`. `FieldId` gains the
+`Equatable` that `Referent`'s `==` needs.
 
-So `Occurrence` lives in a new `src/common/analysis/occurrences.brp`. It is a
-`fixed record` with a payload-free `fixed union` kind, so rows are stored
-inline with no allocation each.
+**Across analyses**, the server compares a declaration's path and byte
+range, never ids or `SourceId`s.
 
-**Identity.** The definition's name span is the identity: every definition
-has one, locals have nothing else, and it is what go-to-definition returns.
-The server compares paths and byte ranges, never `SourceId`s, which differ
-between loads.
-
-**Rejected:** re-resolving names in the server (it duplicates the checker),
-and `FunctionId`-keyed rows (locals have no id).
+**Rejected:** copying the declaration's span into each row (the first
+draft), a kind tag, and re-resolving names in the server. Each duplicates a
+fact the compiler owns, and copies can disagree.
 
 ### The console
 
@@ -178,121 +174,94 @@ and `FunctionId`-keyed rows (locals have no id).
 - `read_exact(byte_count)`.
 
 **Flushing.** Every read flushes standard output first, as Python's `input`
-does. So a prompt shows before the program
-waits, and the server's write-then-read loop needs no extra call. `flush`
-covers output that no read follows.
+does, so a prompt shows before the program waits. `flush` covers output that
+no read follows.
 
 **`read_line`** drops LF or CRLF, as `fold_lines` does. A last line without
 LF is returned as is.
 
-**`read_exact`** returns:
+**`read_exact`** returns `None` only when input has already ended,
+`Some("")` for a count of zero or less, and an error when input ends
+part-way. Both reads share one buffer. Input that is not UTF-8 is an error.
+Each read has its own exact error union, per `PATH_PLAN.md`.
 
-- `None` only when input has already ended;
-- `Some("")` for a count of zero or less;
-- an error when input ends part-way.
-
-Both reads share one buffer. Input that is not UTF-8 is an error. Each read
-has its own exact error union (`PATH_PLAN.md`), designed with the Bytes
-session and implementing `Stringable`.
-
-**Rejected:**
-
-- `print(text, ending = "")`, which needs named optional arguments;
-- dropping `print`'s newline, which breaks every call site;
-- `read_text(n)`, which reads as characters and clashes with
-  `fs.read_text(path)`.
+**Rejected:** `print(text, ending = "")` (named optional arguments),
+dropping `print`'s newline (breaks every call), and `read_text(n)` (clashes
+with `fs.read_text`).
 
 ### The server
 
-**Initialization.**
-- **Positions.** The server picks UTF-8 if the client offers it in
-  `general.positionEncodings`, and UTF-16 otherwise. It echoes the choice.
-- **Capabilities.** It announces full sync, definition, references, and
-  full semantic tokens with a legend.
-- **Line breaks.** `positions` accepts `\n`, `\r\n` and a lone `\r`, as the
-  protocol requires.
+**Initialization.** The server picks UTF-8 positions if the client offers
+them, and UTF-16 otherwise, and echoes the choice. It announces full sync,
+definition, references, and full semantic tokens with a legend. `positions`
+accepts `\n`, `\r\n` and a lone `\r`, as the protocol requires.
 
 **Analysis on demand.**
-- `didOpen` and `didChange` store the text and mark every open document
-  stale, since any may import the changed one; `didOpen` analyses at once.
-- A request on a stale document first analyses the program rooted there,
-  with every open document as a snapshot.
-- So a burst of edits followed by one request costs one analysis.
+- The server keeps, per root, the files its analysis read (the loader's
+  `SourceInputs`).
+- `didOpen`, `didChange`, `didClose` (reverting to disk) and watched
+  `**/*.brp` changes stale every root that read the file, and every root
+  whose load failed, since a missing file may now exist.
+- `didOpen` analyses at once. A request on a stale document first analyses
+  its program, with open documents as snapshots, so a burst of edits costs
+  one analysis.
 
-**Diagnostics.** Each analysis publishes diagnostics:
-- to every file it reports in, open or not;
-- as `[]` to every file it reported in last time but not now.
+**Diagnostics** refresh when an analysis runs, so an edit's errors appear
+with the next request. Each analysis publishes to every file it reports in,
+and `[]` to every file it reported in last time but not now. A shared file
+shows the latest analysis's. Library files are never published; URIs are
+percent-encoded.
 
-The latest analysis wins when two roots share a file. Library files are
-never published. URIs are percent-encoded.
+**The library on disk.** The server runs inside
+`fs.with_temporary_directory("/tmp", "blorp-lsp-", …)`, writes each module
+in the generated `EMBEDDED_LIBRARY_PATHS` there, and analyses with
+`LibraryDirectory(folder)`, so library spans carry real paths. `/tmp` is a
+named constant; every supported platform is POSIX.
 
-**The library on disk.**
-- The server runs inside
-  `fs.with_temporary_directory("/tmp", "blorp-lsp-", …)`.
-- At startup it writes each module named in the generated
-  `EMBEDDED_LIBRARY_PATHS` there.
-- It analyses with `LibraryDirectory(folder)`, so library spans carry real
-  paths.
-- A killed server leaves the folder behind. `/tmp` is a named constant: all
-  supported platforms are POSIX.
-
-**Semantic tokens.**
-- **From the lexer:** keywords, comments, strings, numbers and operators.
-- **From occurrences:** functions, methods, types, variants, fields,
-  parameters, locals, type parameters, traits and module aliases, only at
-  the lexer's identifier tokens. Equal spans add `declaration`.
-- **Standard names:** only the protocol's token types and modifiers.
-- **No overlap:** string pieces are already separate lexer tokens that stop
-  at `${`, so no token overlaps another.
-- **Multiline tokens** are always split per line.
+**Semantic tokens.** Keywords, comments, strings, numbers and operators
+come from the lexer. Identifier tokens take their type and modifiers from
+name uses and the declaration tables. Only the protocol's standard types and
+modifiers are used. String pieces are separate lexer tokens that stop at
+`${`, so no token overlaps another, and multiline tokens are split per line.
 
 **Broken files** (open decision 4). When analysis fails, the server keeps
-the last successful analysis and its text, and maps rows onto the new text:
-- A row inside the common prefix of the old and new text keeps its spans.
-- A row inside the common suffix shifts by the change in length.
-- A row that touches the change is dropped.
-- A `definition` in the edited file maps the same way.
+the last successful analysis sealed, with each file's text then. A file's
+edits since form one window, between the longest common prefix and the
+longest non-overlapping common suffix. Positions before it are unchanged,
+positions after shift by the change in length, and positions inside find
+nothing; two distant edits make one wide window. A request's position maps
+back through its file's window, and each answer span forward through its
+own file's.
 
-**Definition** returns the definition of the row at the position, or `null`
-if there is none. A position at an identifier's end counts as inside it.
+**Definition** returns the declaration of the use at the position, or
+`null`. A position at an identifier's end counts as inside it.
 
-**References** returns every row with that definition. It includes the
+**References** returns every use with that referent. It includes the
 declaration only on request.
 
-**Lifecycle.**
-- `shutdown` returns `null`.
-- `exit` ends with status 0 after `shutdown`, and 1 otherwise. End of input
-  without `exit` also ends with 1.
-- Requests before `initialize` get -32002, unknown requests -32601, and
-  invalid JSON -32700.
-- Unknown notifications and cancellations are ignored.
+**Lifecycle.** `shutdown` returns `null`. `exit` ends with status 0 after
+`shutdown` and 1 otherwise, as does end of input without `exit`. Requests
+before `initialize` get -32002, unknown requests -32601, invalid JSON
+-32700. Unknown notifications and cancellations are ignored.
 
 ### v1 limitation: the open file is the root
 
-**What works.**
-- Go-to-definition reaches any definition in the open file's program: the
-  file itself, its imports, and the library.
-- References cover that same program.
-
-**What doesn't.**
-- References from modules that import the file are missed. Asked in
-  `src/common/syntax/lex.brp`, references to `lex` miss
-  `src/common/analysis/load/load.brp:526` and `src/format/format.brp:1030`.
-- Rows that touch an edit stay missing until the file analyses again, and an
-  edit's errors appear with the next request.
-
-**How it lifts.** A landing after v1 has the plugin pass the workspace's
-roots (such as `blorp/src/main.brp`) in `initializationOptions.roots`.
-References then cover every root's program. Once packages exist (`pkg/`), a
-manifest supplies the roots instead. Until then the README documents the
-limitation.
+Go-to and references cover the open file's program: the file, its imports
+and the library. References from importers are missed: asked in
+`common/syntax/lex.brp`, references to `lex` miss
+`common/analysis/load/load.brp:526`. The README documents this. A later
+landing has the plugin pass the workspace's roots in
+`initializationOptions.roots`, and once packages exist a manifest does.
 
 ### Later
 
 - Lexing resumes after an error, if colour below an unclosed string is
   missed.
 - Incremental sync and cancellation, if latency exceeds its ceilings.
-- More errors per phase, hover, and `TMPDIR`.
+- More errors per phase, and `TMPDIR`.
+- More facts as features need them: declaration extents, attached
+  documentation, binding scopes, a reverse import graph, a position index.
+- One line-start table for `positions` and `common/cli/report.brp`.
 
 ## Code
 
@@ -403,40 +372,48 @@ pure func lex(
 `DocumentationBlock`, `TrailingComment` or `OwnLineComment` by today's rules,
 and `fence_at` and `documentation_end` move out of `trivia.brp`.
 
-**The occurrence table** (`src/common/analysis/occurrences.brp`):
+**Name uses** (`src/common/analysis/check/name_uses.brp`):
 
 ```blorp
--- A name written in source, and the definition it resolved to.
-fixed record Occurrence {
+-- What a name used in source resolved to: an identity the compiler already
+-- owns. `declaration_span` joins it to where it is declared.
+fixed union Referent:
+    FunctionReferent(FunctionId)
+    TraitMethodReferent(TraitMethodId)
+    ConstantReferent(ConstantId)
+    -- A record, union or opaque type, or a built-in one such as `Int`.
+    TypeReferent(TypeHead)
+    TraitReferent(TraitId)
+    FieldReferent(FieldId)
+    VariantReferent(VariantId)
+    TypeParameterReferent(TypeParameterId)
+    BindingReferent(ScopedBindingId)
+    ModuleReferent(ModuleId)
+
+
+-- One name used in source. Declarations are not uses: the declaration tables
+-- already hold them.
+fixed record NameUse {
     span: Span,
-    -- The definition's name span: the entity's identity, and where go-to
-    -- lands. Equal to `span` at the definition itself.
-    definition: Span,
-    kind: NameKind,
+    referent: Referent,
 }
 
-fixed union NameKind:
-    FunctionName
-    TraitMethodName
-    ConstantName
-    LocalName
-    ParameterName
-    TypeName
-    TypeParameterName
-    TraitName
-    FieldName
-    VariantName
-    ModuleAliasName
+
+-- Where go-to lands: the referent's written name, a module's first byte, or
+-- None for a built-in type.
+pure func declaration_span(analysis: Analysis, referent: Referent) -> Option[Span]
+
+
+-- Every referent the analysis declares, for colouring declarations.
+pure func declarations(analysis: Analysis) -> List[Referent]
 ```
 
-For `check` above, the rows are:
-
-- `check`: a definition (`FunctionName`);
-- `program`: a definition (`ParameterName`);
-- `ParsedProgram`, `Result`, `CheckedProgram`, `CheckFailure`: uses
-  (`TypeName`);
-- `program`: a use of the parameter;
-- `check_program`: a use (`FunctionName`).
+Today's `check` (`check.brp:189`, above) records six uses:
+`ParsedProgram`, `CheckedProgram` and `CheckFailure` (`TypeReferent` of an
+`OpaqueHead`), `Result` (of a `UnionHead`), `program` in the body
+(`BindingReferent`, binding 0 of `check`'s `DeclaredBody`) and
+`check_program` (`FunctionReferent`). The declarations of `check` and
+`program` come from the function table and `check`'s `bindings`.
 
 **The console.** Today all of `standard_library/io/console.brp` is:
 
@@ -516,87 +493,73 @@ union Command:
 
 ## Scope and non-goals
 
-**May touch:**
-- `src/common/syntax/` and `src/format/`;
-- `src/common/analysis/{check,namespace,load}/`, for the analysis product and its
-  rows;
-- new code: `src/common/analysis/occurrences.brp` and `src/lsp/`;
-- `src/main.brp`, for the `Command` case and the overview text;
-- `io/console`, the runtime and the builtin tables;
-- `editor/`, the README and the tests.
+**May touch:** `src/common/syntax/`, `src/format/`,
+`src/common/analysis/{check,namespace,load}/`, the new `src/lsp/`,
+`src/main.brp` (the `Command` case and overview), `io/console`, the runtime,
+the builtin tables, `editor/`, the README and the tests.
 
 **Not:** completion, hover, rename, formatting through the server, TextMate,
 threads, incremental analysis, `Bytes` input, or grammar changes.
 
-**Concurrent work:**
-- **The Bytes session's `PATH_PLAN.md` landings** edit the same builtin
-  tables and `io/`. Coordinate before landings 5 and 7.
-- **The String plan's breaking switch:** whichever lands second migrates the
-  other's `length` and `slice` uses.
+**Concurrent work:** the Bytes session's `PATH_PLAN.md` landings 6 to 8
+edit the same builtin tables and `io/`, so coordinate before our landings 6
+and 8. Of the String plan's breaking switch and this work, whichever lands
+second migrates the other's `length` and `slice` uses.
 
 ## Risks and unknowns
 
-- **Can occurrences always be recorded?** The landing 4 spike answers this.
-  A one-day spike on a scratch branch records rows for the whole compiler.
-  It measures a stage-2 self-compile as `STRING_PLAN.md` describes, and
-  reports rows per line and lines per file. The ceilings decide.
-- **Do semantic tokens alone colour a file in CLion?** JetBrains doesn't say.
-  - The plugin landing probes this first, with a stub server.
-  - It also probes how the client treats `null` and error replies.
-  - If nothing colours, stop and ask: VS Code first, or a plugin lexer,
-    which would reopen the TextMate decision.
+- **Can name uses always be recorded?** A one-day spike on a scratch
+  branch records uses for the whole compiler over the fixed identities and
+  measures a stage-2 self-compile. The ceilings decide.
+- **Do semantic tokens alone colour a file in CLion?** The plugin landing
+  probes it first with a stub server, with `null` and error replies too. If
+  nothing colours, stop and ask.
 - **Bootstrap.** A library call to a `builtin` label the seed lacks stops
-  the seed parsing the library (`src/common/syntax/parse.brp:4439`). That breaks
-  every seed-built target. So the console labels land alone, a rotation
-  follows, and only then come the library functions.
-- **Latency.** Analysing `blorp/src/main.brp` (72,000 lines) may be slow;
-  the ceilings bound it.
+  the seed parsing the library (`common/syntax/parse.brp:4439`). So the
+  console labels land alone, a rotation follows, and then the library.
+- **Latency.** Analysing `blorp/src/main.brp` may be slow.
 
 ## Dependencies
 
-- Landing 4 follows landing 1.
-- Landings 5, 6 and 7 go strictly in order.
-- Landing 7 needs Keith's console answer and Bytes timing; landing 8, his
-  answer on decision 4.
-- Landing 8's pure modules follow landings 1, 3 and 4. Its transport follows
-  landing 7.
-- Landing 9 needs the editor choice.
+- Landing 5 follows 1 and 4; landings 6, 7 and 8 go strictly in order.
+- Landing 8 needs Keith's console answer; landing 9, decision 4; landing
+  10, the editor choice.
+- Landing 9's pure modules follow landings 1, 3 and 5; its transport, 8.
 
 ## Release strategy
 
 Each landing is one squashed commit, gated and reviewed on its own. A revert
-backs it out; for landing 6, re-pinning the previous seed does.
+backs it out; for landing 7, re-pinning the previous seed does.
 
 1. **Analysis without an entry point.**
 2. **Comments as lexer output.** Formatter output stays byte-identical.
 3. **The lexer keeps its prefix on failure.**
-4. **The occurrence table.** The spike comes first.
-5. **Console labels.** Builtin labels, runtime and emission, with no library
-   change.
-6. **Seed rotation.** This is `PATH_PLAN.md`'s landing 5 if that comes after
-   ours; otherwise a plain rotation.
-7. **The `io/console` functions.** After ergonomics review and Keith's
+4. **Fixed identities:** the seven types become `fixed`, with matched
+   before/after measurements, as a data-model refactor requires.
+5. **Name uses**, after the spike.
+6. **Console labels:** builtin labels, runtime and emission, no library.
+7. **Seed rotation**, a plain one (`PATH_PLAN.md`'s landed as `c0512c385`).
+8. **The `io/console` functions**, after ergonomics review and Keith's
    approval.
-8. **`blorp lsp`.** The `src/lsp/` modules, which can be built during
-   landings 5 to 7; the transport; and the README section with the v1
-   limitation.
-9. **The editor plugin.**
+9. **`blorp lsp`:** the `src/lsp/` modules (buildable during landings 6
+   to 8), the transport, and the README's v1 limitation.
+10. **The editor plugin.**
 
-**Ceilings** are measured against the parent commit, as a stage-2
-self-compile unless stated, with production and test lines counted
-separately. Compile-cost changes must also fit the 15% margin of the e2e
-instruction ceilings (`72d65fd7a`).
+**Ceilings** are against the parent commit, as a stage-2 self-compile
+unless stated, with test lines counted apart. Compile cost must also fit the
+e2e instruction ceilings' 15% margin.
 
 | Landing | Instructions | Allocations | Peak heap | Production lines |
 | --- | --- | --- | --- | --- |
 | 1 analysis | ≤ +0.2% | ≤ +0.05% | ≤ +0.1% | ≤ +80 net |
 | 2 comments | ≤ +0.5%, and formatting the repository ≤ +0.5% | ≤ +0.3% | ≤ +0.3% | ≤ +60 net |
 | 3 prefix | ≤ +0.1% | ≤ +0.01% | ≤ +0.1% | ≤ +60 net |
-| 4 occurrences, always recorded | ≤ +1% | ≤ +0.5% | ≤ +0.5% | ≤ +600 net |
-| 4 occurrences, on request | compile path ≤ +0.2% | ≤ +0.01% | ≤ +0.1% | ≤ +650 net |
-| 5 console labels | ≤ +0.1% | ≤ +0.01% | ≤ +0.1% | ≤ +150 net |
-| 7 console functions | ≤ +0.1% | ≤ +0.01% | ≤ +0.1% | ≤ +60 net |
-| 8 server | ≤ +3% (more source to compile) | ≤ +3% | ≤ +3% | ≤ +2,000 |
+| 4 fixed identities | ≤ +0.1% | no increase | ≤ +0.1% | ≤ +20 net |
+| 5 name uses, always recorded | ≤ +1% | ≤ +0.5% | ≤ +0.5% | ≤ +650 net |
+| 5 name uses, on request | compile path ≤ +0.2% | ≤ +0.01% | ≤ +0.1% | ≤ +700 net |
+| 6 console labels | ≤ +0.1% | ≤ +0.01% | ≤ +0.1% | ≤ +150 net |
+| 8 console functions | ≤ +0.1% | ≤ +0.01% | ≤ +0.1% | ≤ +60 net |
+| 9 server | ≤ +3% (more source to compile) | ≤ +3% | ≤ +3% | ≤ +2,000 |
 
 **Latency.** Per request after one change, on this host: ≤ 1.0 s for
 `blorp/src/main.brp`, and ≤ 50 ms for a one-module program. Landing 1
@@ -608,22 +571,20 @@ Each landing starts with a failing test.
 
 | Landing | Tests |
 | --- | --- |
-| 1 | `test/unit/test_common/test_analysis/test_check/`. A module without `main` analyses, and `check` of it reports `MissingMain` with the exact message, help and span. A malformed `main` fails both. |
-| 2 | `test/unit/test_common/test_syntax/test_lex/`: one case per comment site. Formatter suites are unchanged, and formatting the repository changes nothing. |
+| 1 | `test_common/test_analysis/test_check/`: a module without `main` analyses, and `check` reports `MissingMain` with exact message, help and span. A malformed `main` fails both. |
+| 2 | `test_common/test_syntax/test_lex/`: one case per comment site. Formatter suites and the formatted repository are unchanged. |
 | 3 | An unclosed string keeps the tokens before it and drops its own. The loader's diagnostic is unchanged. |
-| 4 | One case per name kind, checking both spans. Mutation proof: stop recording one kind, and only its case fails. |
-| 5 | Direct C tests of the natives, under `test/runtime/`. |
-| 7 | e2e programs driven through `capture`: LF and CRLF, a final line without LF, header and body in one chunk, a short `read_exact`, a count of zero, invalid UTF-8, and `write` output appearing before a read. |
-| 8 | `test/unit/test_lsp/`: framing; positions for `é`, an astral emoji and `\r`; token splitting; lifecycle errors; broken-file mapping; each request through `receive`. An e2e session in `self_hosted_cli.brp` (new `process` import and overview text) runs `initialize` through `exit` and checks the replies, the diagnostic and status 0. Input that ends without `exit` gives status 1. |
-| 9 | A manual checklist in the plugin's README. |
+| 4 | Existing suites, unchanged. |
+| 5 | One case per `Referent` case, checking the use's span and, through `declaration_span`, its declaration's. Mutation proof: stop recording one case, and only its test fails. |
+| 6 | Direct C tests of the natives, under `test/runtime/`. |
+| 8 | e2e programs through `capture`: LF and CRLF, a last line without LF, header and body in one chunk, a short `read_exact`, a zero count, invalid UTF-8, and `write` output before a read. |
+| 9 | `test/unit/test_lsp/`: framing; positions for `é`, an astral emoji and `\r`; token splitting; lifecycle errors; broken-file windows; staleness after a new import, a late open, a shared file's edit and a close; each request through `receive`. An e2e session in `self_hosted_cli.brp` runs `initialize` through `exit` and checks replies, a diagnostic and the status. |
+| 10 | A manual checklist in the plugin's README. |
 
-**Commands:**
-1. `make -C blorp test-target-components TARGET_COMPONENT_SOURCES=<suite>`, to
-   iterate;
-2. `make -C blorp test`;
-3. `scripts/blorp-fixpoint --prove`, for compiler landings;
-4. `make -C blorp test-e2e INSTRUCTION_CHECK=on`, for changes in compile
-   cost.
+**Commands:** `make -C blorp test-target-components
+TARGET_COMPONENT_SOURCES=<suite>` to iterate; then `make -C blorp test`;
+`scripts/blorp-fixpoint --prove` for compiler landings; and `make -C blorp
+test-e2e INSTRUCTION_CHECK=on` when compile cost changes.
 
 ## Acceptance criteria
 
@@ -631,30 +592,28 @@ Each landing starts with a failing test.
   prints the unchanged `MissingMain`.
 - [ ] **2.** `make -C blorp format-check` passes, formatter expectations are
   unchanged, and only the lexer recognises comments.
-- [ ] **4.** Every name kind passes. The spike's numbers and the chosen form
-  are in `benchmarks/results/`.
-- [ ] **6.** `scripts/blorp-fixpoint --prove` passes with the new seed.
-- [ ] **7.** The console e2e programs pass on all four CI platforms.
-- [ ] **8.** The e2e replies match exactly. Definition on `print` returns a
-  file in the temporary folder, and the folder is gone after `exit`.
-  Latency is within ceiling.
-- [ ] **9.** The chosen editor colours a file even while it has an error, and
-  definition and references work, including into the library.
+- [ ] **4.** Output identity holds on the e2e fixtures, and the
+  measurements are recorded.
+- [ ] **5.** Every `Referent` case passes. The spike's numbers and the
+  chosen form are in `benchmarks/results/`.
+- [ ] **7.** `scripts/blorp-fixpoint --prove` passes with the new seed.
+- [ ] **8.** The console e2e programs pass on all four CI platforms.
+- [ ] **9.** The e2e replies match exactly. Definition on `print` lands in
+  the temporary folder, which is gone after `exit`. Latency is in ceiling.
+- [ ] **10.** The editor colours a file while it has an error, and definition
+  and references work, into the library too.
 - [ ] **Every landing** meets its ceilings, passes `make -C blorp test`, and
   is reviewed and test-run.
 
 ## Handback
 
-Each landing returns:
-- its branch and commit;
-- evidence per criterion;
-- measurements with raw-sample paths;
-- anything it found but did not fix.
+Each landing returns its commit, evidence per criterion, measurements with
+raw-sample paths, and anything found but not fixed.
 
-Stop and ask the coordinating session if:
+Stop and ask if:
 - a ceiling is exceeded;
 - CLion shows no colour;
-- an occurrence needs information the checker has already discarded;
+- a name use needs information the checker has discarded;
 - the console errors conflict with the Bytes session's design.
 
-Changes to the console API go to Keith.
+Console API changes go to Keith.

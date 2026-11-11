@@ -54,18 +54,17 @@ done.
     after `PATH_PLAN.md`'s landing 6 changes the process errors.
   - **Later:** binary capture after `Bytes`, and `run` with streaming.
 - **Language server (`blorp lsp`):** [`LSP_PLAN.md`](LSP_PLAN.md).
-  - **Status:** the plan was written on 2026-11-10 and awaits Keith's review.
-    Four choices are open: the first editor, the console API, when
-    occurrences are recorded, and serving broken files. Its foundations have
+  - **Status:** the plan was written and revised on 2026-11-10 (name uses
+    keyed by the compiler's identities; each analysis records the files it
+    read) and awaits Keith's review. Four choices are open: the first editor,
+    the console API, when name uses are recorded, and serving broken files.
+    Its foundations have
     landed: the `json` codec
     ([results](../benchmarks/results/blorp-json-foundation-2026-11-08.md))
     and loader source snapshots
     ([results](../benchmarks/results/blorp-source-snapshots-2026-11-09.md),
     [`SOURCE_SNAPSHOTS_DECISIONS.md`](SOURCE_SNAPSHOTS_DECISIONS.md)).
-  - **Revision still to make:** key name uses by the compiler's existing
-    identities rather than by copied definition spans, and record which
-    files each analysis read.
-  - **Next:** that revision, then the plan's landing 1, analysis without an
+  - **Next:** Keith's review, then the plan's landing 1, analysis without an
     entry point. The source layout it waited for has landed
     ([`SOURCE_LAYOUT_PLAN.md`](SOURCE_LAYOUT_PLAN.md)).
 - **String code points:** [`STRING_PLAN.md`](STRING_PLAN.md).
