@@ -47,8 +47,14 @@ static int probe_pipe(int ends[2]) {
     return made;
 }
 
+static int fork_failure = 0;
+
 static pid_t probe_fork(void) {
     fork_count++;
+    if (fork_failure != 0) {
+        errno = fork_failure;
+        return -1;
+    }
     return fork();
 }
 
@@ -166,8 +172,23 @@ static int capture_sigchld(const char *program) {
     const int forks = fork_count;
     const uint8_t succeeded = run_capture(program, 2, arguments, NULL, 0, INT64_C(10000), &exit, &error);
     if (sigaction(SIGCHLD, &original, NULL) != 0) return 1;
-    const int64_t expected = blorp_process_error(blorp_fs_errno_code(ECHILD), BLORP_PROCESS_LAUNCH_FAILED);
+    const int64_t expected = blorp_process_error(-(int64_t)ECHILD, BLORP_PROCESS_LAUNCH_FAILED);
     return !succeeded && error == expected && fork_count == forks ? 0 : 1;
+}
+
+/* A failed fork is LaunchFailed. SystemCallError names PermissionDenied (code 2) but not NoSpace,
+ * so ENOSPC arrives as the OS's own number and EACCES as the named kind. */
+static int capture_fork_failure(const char *program) {
+    const char *const arguments[] = {"exit", "0"};
+    int64_t exit = -1, error = 0;
+    fork_failure = ENOSPC;
+    const uint8_t unnamed = run_capture(program, 2, arguments, NULL, 0, INT64_C(10000), &exit, &error);
+    const int unnamed_ok = !unnamed && error == blorp_process_error(-(int64_t)ENOSPC, BLORP_PROCESS_LAUNCH_FAILED);
+    fork_failure = EACCES;
+    const uint8_t named = run_capture(program, 2, arguments, NULL, 0, INT64_C(10000), &exit, &error);
+    const int named_ok = !named && error == blorp_process_error(2, BLORP_PROCESS_LAUNCH_FAILED);
+    fork_failure = 0;
+    return unnamed_ok && named_ok ? 0 : 1;
 }
 
 /* Whether no child of this process remains, reaped or not. */
@@ -441,6 +462,7 @@ static int child_case(int argc, char **argv) {
         if (strcmp(argv[1], "capture-signals") == 0) return capture_signals(argv[2]);
         if (strcmp(argv[1], "capture-sigchld") == 0) return capture_sigchld(argv[2]);
         if (strcmp(argv[1], "capture-reap") == 0) return capture_reap(argv[2]);
+        if (strcmp(argv[1], "capture-fork-failure") == 0) return capture_fork_failure(argv[2]);
         if (strcmp(argv[1], "capture-startup") == 0) return capture_startup(argv[2]);
         if (strcmp(argv[1], "capture-closed-stdio") == 0) return capture_closed_stdio(argv[2]);
         if (strcmp(argv[1], "capture-group-race") == 0) return capture_group_race(argv[2]);

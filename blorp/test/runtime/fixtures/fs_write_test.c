@@ -712,9 +712,10 @@ static int case_rename_failure(const char *root) {
     make_file(target, "old", 0644);
     const int free_before = lowest_free_descriptor();
     begin();
+    /* WriteError lacks CrossesDevices, so EXDEV arrives as the OS's own number. */
     inject(RENAME_CALL, 0, 0, 1, EXDEV);
     const int64_t error = write_text_to(target, "never published");
-    expect_unchanged(error, 11, 1, target, "old");
+    expect_unchanged(error, -(int64_t)EXDEV, 1, target, "old");
     expect_clean(free_before, directory);
     return 0;
 }

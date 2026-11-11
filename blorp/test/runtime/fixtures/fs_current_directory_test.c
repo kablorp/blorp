@@ -133,6 +133,8 @@ int main(int argc, char **argv) {
     if (strcmp(name, "permission_denied") == 0) status = case_failure(EACCES, 2);
     /* EIO and EINTR are 5 and 4 on every supported platform. */
     if (strcmp(name, "other_errno") == 0) status = case_failure(EIO, -5);
+    /* NoSpace is a named kind that CurrentDirectoryError lacks, so its number arrives. */
+    if (strcmp(name, "other_errno") == 0) status += case_failure(ENOSPC, -(int64_t)ENOSPC);
     if (strcmp(name, "interrupted_is_not_retried") == 0) {
         /* Not retrying is deliberate: it matches the old fragment, and POSIX lists no
          * EINTR for getcwd. */

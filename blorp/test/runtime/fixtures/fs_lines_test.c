@@ -778,6 +778,9 @@ static int case_read_error(const char *directory) {
     assert(count_events(READ_CALL) == 4);
     assert(count_events(CLOSE_CALL) == 0);
     assert(is_open((int)descriptor));
+    /* ReadError lacks NoSpace, so the OS's own number arrives. */
+    inject(READ_CALL, 0, 1, ENOSPC);
+    assert(next(descriptor, "", &lines) == -(int64_t)ENOSPC);
     assert(close_descriptor(descriptor) == 0);
     expect_clean(free_before);
     return 0;

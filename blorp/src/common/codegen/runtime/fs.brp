@@ -1,8 +1,10 @@
 -- The C half of the fs library (the standard_library/io/fs/ modules). A native
 -- reports a failure as an Int code that each module's decoder decodes: a named kind has the positive
 -- code below, and any other errno is sent negated, so OtherOs keeps the
--- platform's own number. The two tables agree only by the tests that name
--- each code as a literal, in test/runtime/fs_suite.brp and the fs e2e example.
+-- platform's own number, as does a named kind that the operation's union lacks
+-- (the BLORP_FS_*_KINDS masks). The tables and masks agree with the library only
+-- by the tests that name each code as a literal, in test/runtime/fs_suite.brp
+-- and the fs e2e example.
 -- Paths are never reported; the library pairs each code with the caller's path.
 
 
@@ -34,6 +36,40 @@ FS_HELPERS_RUNTIME: String =
         |BLORP_FS_INVALID_UTF8=13,BLORP_FS_CHANGED_DURING_REMOVAL=14,
         |BLORP_FS_UNREACHABLE=15 /* current_directory: the OS names no usable absolute path */
         |};
+        |/* Bit BLORP_FS_<name> is set when an operation's error union names that kind. Each mask mirrors its
+        | * module's union; bits for codes no errno produces exist only to keep each mask equal to its union. */
+        |#define BLORP_FS_KIND(name) (UINT32_C(1)<<BLORP_FS_##name)
+        |enum {
+        |BLORP_FS_READ_KINDS=BLORP_FS_KIND(NOT_FOUND)|BLORP_FS_KIND(PERMISSION_DENIED)|BLORP_FS_KIND(NOT_A_DIRECTORY)
+        |    |BLORP_FS_KIND(IS_A_DIRECTORY)|BLORP_FS_KIND(FILE_TOO_LARGE)|BLORP_FS_KIND(INVALID_UTF8),
+        |BLORP_FS_WRITE_KINDS=BLORP_FS_KIND(NOT_FOUND)|BLORP_FS_KIND(PERMISSION_DENIED)|BLORP_FS_KIND(ALREADY_EXISTS)
+        |    |BLORP_FS_KIND(NOT_A_DIRECTORY)|BLORP_FS_KIND(IS_A_DIRECTORY)|BLORP_FS_KIND(DIRECTORY_NOT_EMPTY)
+        |    |BLORP_FS_KIND(NOT_A_REGULAR_FILE)|BLORP_FS_KIND(READ_ONLY_FILESYSTEM)|BLORP_FS_KIND(NO_SPACE)
+        |    |BLORP_FS_KIND(FILE_TOO_LARGE),
+        |BLORP_FS_ENTRY_KINDS=BLORP_FS_KIND(PERMISSION_DENIED),
+        |BLORP_FS_LIST_KINDS=BLORP_FS_KIND(NOT_FOUND)|BLORP_FS_KIND(PERMISSION_DENIED)|BLORP_FS_KIND(NOT_A_DIRECTORY)
+        |    |BLORP_FS_KIND(INVALID_UTF8),
+        |BLORP_FS_CREATE_DIRECTORY_KINDS=BLORP_FS_KIND(NOT_FOUND)|BLORP_FS_KIND(PERMISSION_DENIED)|BLORP_FS_KIND(ALREADY_EXISTS)
+        |    |BLORP_FS_KIND(NOT_A_DIRECTORY)|BLORP_FS_KIND(READ_ONLY_FILESYSTEM)|BLORP_FS_KIND(NO_SPACE),
+        |BLORP_FS_REMOVE_FILE_KINDS=BLORP_FS_KIND(NOT_FOUND)|BLORP_FS_KIND(PERMISSION_DENIED)|BLORP_FS_KIND(NOT_A_DIRECTORY)
+        |    |BLORP_FS_KIND(IS_A_DIRECTORY)|BLORP_FS_KIND(READ_ONLY_FILESYSTEM),
+        |BLORP_FS_REMOVE_DIRECTORY_KINDS=BLORP_FS_KIND(NOT_FOUND)|BLORP_FS_KIND(PERMISSION_DENIED)|BLORP_FS_KIND(NOT_A_DIRECTORY)
+        |    |BLORP_FS_KIND(DIRECTORY_NOT_EMPTY)|BLORP_FS_KIND(READ_ONLY_FILESYSTEM),
+        |BLORP_FS_RENAME_KINDS=BLORP_FS_KIND(NOT_FOUND)|BLORP_FS_KIND(PERMISSION_DENIED)|BLORP_FS_KIND(NOT_A_DIRECTORY)
+        |    |BLORP_FS_KIND(IS_A_DIRECTORY)|BLORP_FS_KIND(DIRECTORY_NOT_EMPTY)|BLORP_FS_KIND(READ_ONLY_FILESYSTEM)
+        |    |BLORP_FS_KIND(NO_SPACE)|BLORP_FS_KIND(CROSSES_DEVICES),
+        |/* One native serves RemoveTreeError and TemporaryDirectoryError, so it takes the kinds both name:
+        | * ENOSPC while a temporary directory is cleaned up arrives as OtherOs. */
+        |BLORP_FS_REMOVE_TREE_KINDS=BLORP_FS_KIND(NOT_FOUND)|BLORP_FS_KIND(PERMISSION_DENIED)|BLORP_FS_KIND(NOT_A_DIRECTORY)
+        |    |BLORP_FS_KIND(IS_A_DIRECTORY)|BLORP_FS_KIND(DIRECTORY_NOT_EMPTY)|BLORP_FS_KIND(READ_ONLY_FILESYSTEM)
+        |    |BLORP_FS_KIND(CROSSES_DEVICES)|BLORP_FS_KIND(CHANGED_DURING_REMOVAL),
+        |BLORP_FS_TEMPORARY_DIRECTORY_KINDS=BLORP_FS_KIND(NOT_FOUND)|BLORP_FS_KIND(PERMISSION_DENIED)|BLORP_FS_KIND(NOT_A_DIRECTORY)
+        |    |BLORP_FS_KIND(IS_A_DIRECTORY)|BLORP_FS_KIND(DIRECTORY_NOT_EMPTY)|BLORP_FS_KIND(READ_ONLY_FILESYSTEM)
+        |    |BLORP_FS_KIND(NO_SPACE)|BLORP_FS_KIND(CROSSES_DEVICES)|BLORP_FS_KIND(CHANGED_DURING_REMOVAL)
+        |    |BLORP_FS_KIND(PATH_CONTAINS_NUL),
+        |BLORP_FS_CURRENT_DIRECTORY_KINDS=BLORP_FS_KIND(NOT_FOUND)|BLORP_FS_KIND(PERMISSION_DENIED)|BLORP_FS_KIND(INVALID_UTF8)
+        |    |BLORP_FS_KIND(UNREACHABLE)
+        |};
         |enum {
         |BLORP_FS_ENTRY_ABSENT=0,BLORP_FS_ENTRY_FILE=1,BLORP_FS_ENTRY_DIRECTORY=2,
         |BLORP_FS_ENTRY_SYMLINK=3,BLORP_FS_ENTRY_OTHER=4
@@ -52,8 +88,8 @@ FS_HELPERS_RUNTIME: String =
         |static inline int64_t blorp_fs_other_os_code(int number){
         |return -(int64_t)number;
         |}
-        |/* The code of a named kind, or any other errno negated. An operation whose errno
-        | * means something else (EEXIST from rmdir) maps that errno itself first. */
+        |/* The code of a named kind, or any other errno negated. Only blorp_fs_errno_code_within
+        | * calls it in production code, so an operation never sends a kind its union lacks. */
         |static inline int64_t blorp_fs_errno_code(int number){
         |switch(number){
         |case ENOENT:return BLORP_FS_NOT_FOUND;
@@ -68,6 +104,11 @@ FS_HELPERS_RUNTIME: String =
         |case EXDEV:return BLORP_FS_CROSSES_DEVICES;
         |default:return blorp_fs_other_os_code(number);
         |}
+        |}
+        |/* The errno's kind if the mask `named` includes it, else the errno negated, as OtherOs keeps it. */
+        |static inline int64_t blorp_fs_errno_code_within(int number,uint32_t named){
+        |const int64_t code=blorp_fs_errno_code(number);
+        |return code>0&&(named&(UINT32_C(1)<<code))!=0?code:blorp_fs_other_os_code(number);
         |}
         |/* The entry code of a mode from lstat or fstatat, which do not follow a link. Only
         | * entry_kind and list_directory call it, so it has external linkage. */
@@ -110,7 +151,7 @@ FS_HELPERS_RUNTIME: String =
         |struct stat status;
         |int examined;
         |BLORP_FS_RETRY(examined,fstat(descriptor,&status));
-        |if(examined<0){return blorp_fs_errno_code(errno);}
+        |if(examined<0){return blorp_fs_errno_code_within(errno,BLORP_FS_READ_KINDS);}
         |return S_ISDIR(status.st_mode)?BLORP_FS_IS_A_DIRECTORY:0;
         |}
         |/* A descriptor arrives as an Int. One outside int's range names no open file, so
@@ -150,7 +191,7 @@ FS_READ_TEXT_RUNTIME: String =
         |ssize_t received;
         |BLORP_FS_RETRY(received,read(descriptor,buffer+used,request));
         |if(received<0){
-        |const int64_t failure=blorp_fs_errno_code(errno);
+        |const int64_t failure=blorp_fs_errno_code_within(errno,BLORP_FS_READ_KINDS);
         |blorp_memory_release(buffer);
         |return failure;
         |}
@@ -165,7 +206,7 @@ FS_READ_TEXT_RUNTIME: String =
         |if(blorp_fs_has_nul(path)){*error=BLORP_FS_PATH_CONTAINS_NUL;return BLORP_FS_FAILED;}
         |int descriptor;
         |BLORP_FS_RETRY(descriptor,open(path->bytes,O_RDONLY|O_CLOEXEC));
-        |if(descriptor<0){*error=blorp_fs_errno_code(errno);return BLORP_FS_FAILED;}
+        |if(descriptor<0){*error=blorp_fs_errno_code_within(errno,BLORP_FS_READ_KINDS);return BLORP_FS_FAILED;}
         |char *contents=NULL;
         |size_t length=0;
         |const int64_t failure=blorp_fs_read_descriptor(descriptor,&contents,&length);
@@ -225,7 +266,7 @@ FS_WRITE_TEXT_RUNTIME: String =
         |/* realpath's answer, copied so that every path here is released the same way. */
         |static int64_t blorp_fs_real_path(const char *path,char **resolved){
         |char *answer=realpath(path,NULL);
-        |if(answer==NULL){return blorp_fs_errno_code(errno);}
+        |if(answer==NULL){return blorp_fs_errno_code_within(errno,BLORP_FS_WRITE_KINDS);}
         |*resolved=blorp_fs_copy_path(answer,strlen(answer));
         |free(answer);
         |return 0;
@@ -250,10 +291,10 @@ FS_WRITE_TEXT_RUNTIME: String =
         |if(!S_ISREG(status->st_mode)){return BLORP_FS_NOT_A_REGULAR_FILE;}
         |int descriptor;
         |BLORP_FS_RETRY(descriptor,open(path,O_WRONLY|O_NONBLOCK|O_CLOEXEC));
-        |if(descriptor<0){return blorp_fs_errno_code(errno);}
+        |if(descriptor<0){return blorp_fs_errno_code_within(errno,BLORP_FS_WRITE_KINDS);}
         |int examined;
         |BLORP_FS_RETRY(examined,fstat(descriptor,status));
-        |const int64_t failure=examined<0?blorp_fs_errno_code(errno):0;
+        |const int64_t failure=examined<0?blorp_fs_errno_code_within(errno,BLORP_FS_WRITE_KINDS):0;
         |(void)close(descriptor);
         |return failure;
         |}
@@ -266,7 +307,7 @@ FS_WRITE_TEXT_RUNTIME: String =
         |struct stat status;
         |int examined;
         |BLORP_FS_RETRY(examined,stat(path,&status));
-        |if(examined<0){return blorp_fs_errno_code(errno);}
+        |if(examined<0){return blorp_fs_errno_code_within(errno,BLORP_FS_WRITE_KINDS);}
         |return S_ISDIR(status.st_mode)?BLORP_FS_IS_A_DIRECTORY:BLORP_FS_NOT_A_DIRECTORY;
         |}
         |/* Which file the write replaces or creates. A link is followed with realpath, so a
@@ -276,13 +317,13 @@ FS_WRITE_TEXT_RUNTIME: String =
         |if(path[length-1]=='/'){return blorp_fs_slashed_target_failure(path);}
         |int examined;
         |BLORP_FS_RETRY(examined,lstat(path,&target->status));
-        |if(examined<0){return errno==ENOENT?blorp_fs_new_target(path,length,target):blorp_fs_errno_code(errno);}
+        |if(examined<0){return errno==ENOENT?blorp_fs_new_target(path,length,target):blorp_fs_errno_code_within(errno,BLORP_FS_WRITE_KINDS);}
         |int64_t failure=0;
         |if(S_ISLNK(target->status.st_mode)){
         |failure=blorp_fs_real_path(path,&target->path);
         |if(failure!=0){return failure;}
         |BLORP_FS_RETRY(examined,lstat(target->path,&target->status));
-        |if(examined<0){failure=blorp_fs_errno_code(errno);}
+        |if(examined<0){failure=blorp_fs_errno_code_within(errno,BLORP_FS_WRITE_KINDS);}
         |}else{
         |target->path=blorp_fs_copy_path(path,length);
         |}
@@ -307,7 +348,7 @@ FS_WRITE_TEXT_RUNTIME: String =
         |if(opened>=0){*temporary=path;*descriptor=opened;return 0;}
         |const int saved=errno;
         |blorp_memory_release(path);
-        |if(saved!=EEXIST){return blorp_fs_errno_code(saved);}
+        |if(saved!=EEXIST){return blorp_fs_errno_code_within(saved,BLORP_FS_WRITE_KINDS);}
         |}
         |return blorp_fs_other_os_code(EEXIST);
         |}
@@ -321,9 +362,9 @@ FS_WRITE_TEXT_RUNTIME: String =
         |int changed;
         |BLORP_FS_RETRY(changed,fchown(descriptor,status->st_uid,status->st_gid));
         |if(changed<0&&errno==EPERM){BLORP_FS_RETRY(changed,fchown(descriptor,(uid_t)-1,status->st_gid));}
-        |if(changed<0&&errno!=EPERM){return blorp_fs_errno_code(errno);}
+        |if(changed<0&&errno!=EPERM){return blorp_fs_errno_code_within(errno,BLORP_FS_WRITE_KINDS);}
         |BLORP_FS_RETRY(changed,fchmod(descriptor,(mode_t)(status->st_mode&07777)));
-        |return changed<0?blorp_fs_errno_code(errno):0;
+        |return changed<0?blorp_fs_errno_code_within(errno,BLORP_FS_WRITE_KINDS):0;
         |}
         |/* POSIX lets a write of a regular file return 0 only for an empty request, so a
         | * write that makes no progress is reported as EIO rather than repeated forever. */
@@ -334,7 +375,7 @@ FS_WRITE_TEXT_RUNTIME: String =
         |if(request>BLORP_FS_REQUEST_MAXIMUM){request=BLORP_FS_REQUEST_MAXIMUM;}
         |ssize_t written;
         |BLORP_FS_RETRY(written,write(descriptor,bytes+done,request));
-        |if(written<0){return blorp_fs_errno_code(errno);}
+        |if(written<0){return blorp_fs_errno_code_within(errno,BLORP_FS_WRITE_KINDS);}
         |if(written==0){return blorp_fs_other_os_code(EIO);}
         |done+=(size_t)written;
         |}
@@ -358,8 +399,8 @@ FS_WRITE_TEXT_RUNTIME: String =
         |static int64_t blorp_fs_fill_temporary(int descriptor,const struct blorp_fs_write_target *target,const struct blorp_string *text){
         |int64_t failure=target->replaces?blorp_fs_copy_owner_and_mode(descriptor,&target->status):0;
         |if(failure==0){failure=blorp_fs_write_all(descriptor,text->bytes,(size_t)text->length);}
-        |if(failure==0&&blorp_fs_flush_file(descriptor)<0){failure=blorp_fs_errno_code(errno);}
-        |if(close(descriptor)<0&&failure==0){failure=blorp_fs_errno_code(errno);}
+        |if(failure==0&&blorp_fs_flush_file(descriptor)<0){failure=blorp_fs_errno_code_within(errno,BLORP_FS_WRITE_KINDS);}
+        |if(close(descriptor)<0&&failure==0){failure=blorp_fs_errno_code_within(errno,BLORP_FS_WRITE_KINDS);}
         |return failure;
         |}
         |/* Orders the rename before later writes. A file system that cannot flush a directory
@@ -368,10 +409,10 @@ FS_WRITE_TEXT_RUNTIME: String =
         |static int64_t blorp_fs_flush_directory(const char *directory){
         |int descriptor;
         |BLORP_FS_RETRY(descriptor,open(directory,O_RDONLY|O_DIRECTORY|O_CLOEXEC));
-        |if(descriptor<0){return blorp_fs_errno_code(errno);}
+        |if(descriptor<0){return blorp_fs_errno_code_within(errno,BLORP_FS_WRITE_KINDS);}
         |int flushed;
         |BLORP_FS_RETRY(flushed,fsync(descriptor));
-        |const int64_t failure=flushed<0&&errno!=EINVAL&&errno!=ENOTSUP?blorp_fs_errno_code(errno):0;
+        |const int64_t failure=flushed<0&&errno!=EINVAL&&errno!=ENOTSUP?blorp_fs_errno_code_within(errno,BLORP_FS_WRITE_KINDS):0;
         |(void)close(descriptor);
         |return failure;
         |}
@@ -386,7 +427,7 @@ FS_WRITE_TEXT_RUNTIME: String =
         |if(failure==0){
         |int renamed;
         |BLORP_FS_RETRY(renamed,rename(temporary,target->path));
-        |if(renamed<0){failure=blorp_fs_errno_code(errno);}
+        |if(renamed<0){failure=blorp_fs_errno_code_within(errno,BLORP_FS_WRITE_KINDS);}
         |}
         |if(failure!=0){(void)unlink(temporary);}
         |blorp_memory_release(temporary);
@@ -419,7 +460,7 @@ FS_ENTRY_KIND_RUNTIME: String =
         |if(examined<0){
         |const int saved=errno;
         |if(saved==ENOENT||saved==ENOTDIR){*kind=BLORP_FS_ENTRY_ABSENT;return BLORP_FS_SUCCEEDED;}
-        |*error=blorp_fs_errno_code(saved);
+        |*error=blorp_fs_errno_code_within(saved,BLORP_FS_ENTRY_KINDS);
         |return BLORP_FS_FAILED;
         |}
         |*kind=blorp_fs_kind_of_mode(status.st_mode);
@@ -490,7 +531,7 @@ private FS_LIST_DIRECTORY_SUPPORT: String =
         |BLORP_FS_RETRY(examined,fstatat(dirfd(directory),entry->d_name,&status,AT_SYMLINK_NOFOLLOW));
         |if(examined<0){
         |if(errno==ENOENT){*kind=BLORP_FS_ENTRY_ABSENT;return 0;}
-        |return blorp_fs_errno_code(errno);
+        |return blorp_fs_errno_code_within(errno,BLORP_FS_LIST_KINDS);
         |}
         |*kind=blorp_fs_kind_of_mode(status.st_mode);
         |return 0;
@@ -502,7 +543,7 @@ private FS_LIST_DIRECTORY_SUPPORT: String =
         |for(;;){
         |struct dirent *entry;
         |do{errno=0;entry=readdir(directory);}while(entry==NULL&&errno==EINTR);
-        |if(entry==NULL){return errno==0?0:blorp_fs_errno_code(errno);}
+        |if(entry==NULL){return errno==0?0:blorp_fs_errno_code_within(errno,BLORP_FS_LIST_KINDS);}
         |const char *name=entry->d_name;
         |if(strcmp(name,".")==0||strcmp(name,"..")==0){continue;}
         |int64_t kind=BLORP_FS_ENTRY_ABSENT;
@@ -519,12 +560,12 @@ private FS_LIST_DIRECTORY_SUPPORT: String =
         |static int64_t blorp_fs_list_entries(const char *path,struct blorp_fs_listed *listed){
         |int descriptor;
         |BLORP_FS_RETRY(descriptor,open(path,O_RDONLY|O_DIRECTORY|O_CLOEXEC));
-        |if(descriptor<0){return blorp_fs_errno_code(errno);}
+        |if(descriptor<0){return blorp_fs_errno_code_within(errno,BLORP_FS_LIST_KINDS);}
         |DIR *directory=fdopendir(descriptor);
         |if(directory==NULL){
         |const int saved=errno;
         |(void)close(descriptor);
-        |return blorp_fs_errno_code(saved);
+        |return blorp_fs_errno_code_within(saved,BLORP_FS_LIST_KINDS);
         |}
         |const int64_t failure=blorp_fs_read_listed(directory,listed);
         |(void)closedir(directory);
@@ -566,7 +607,7 @@ FS_CREATE_DIRECTORY_RUNTIME: String =
         |if(blorp_fs_has_nul(path)){*error=BLORP_FS_PATH_CONTAINS_NUL;return BLORP_FS_FAILED;}
         |int made;
         |BLORP_FS_RETRY(made,mkdir(path->bytes,0777));
-        |if(made<0){*error=blorp_fs_errno_code(errno);return BLORP_FS_FAILED;}
+        |if(made<0){*error=blorp_fs_errno_code_within(errno,BLORP_FS_CREATE_DIRECTORY_KINDS);return BLORP_FS_FAILED;}
         |return BLORP_FS_SUCCEEDED;
         |}
         |
@@ -586,7 +627,7 @@ FS_CREATE_DIRECTORIES_RUNTIME: String =
         |int made;
         |BLORP_FS_RETRY(made,mkdir(prefix,0777));
         |if(made==0){return 0;}
-        |if(errno!=EEXIST){return blorp_fs_errno_code(errno);}
+        |if(errno!=EEXIST){return blorp_fs_errno_code_within(errno,BLORP_FS_CREATE_DIRECTORY_KINDS);}
         |struct stat status;
         |int examined;
         |BLORP_FS_RETRY(examined,stat(prefix,&status));
@@ -639,7 +680,7 @@ FS_REMOVE_FILE_RUNTIME: String =
         |BLORP_FS_RETRY(examined,lstat(path->bytes,&status));
         |if(examined==0&&S_ISDIR(status.st_mode)){*error=BLORP_FS_IS_A_DIRECTORY;return BLORP_FS_FAILED;}
         |}
-        |*error=blorp_fs_errno_code(saved);
+        |*error=blorp_fs_errno_code_within(saved,BLORP_FS_REMOVE_FILE_KINDS);
         |return BLORP_FS_FAILED;
         |}
         |
@@ -654,7 +695,7 @@ FS_REMOVE_DIRECTORY_RUNTIME: String =
         |int removed;
         |BLORP_FS_RETRY(removed,rmdir(path->bytes));
         |if(removed==0){return BLORP_FS_SUCCEEDED;}
-        |*error=errno==EEXIST?BLORP_FS_DIRECTORY_NOT_EMPTY:blorp_fs_errno_code(errno);
+        |*error=errno==EEXIST?BLORP_FS_DIRECTORY_NOT_EMPTY:blorp_fs_errno_code_within(errno,BLORP_FS_REMOVE_DIRECTORY_KINDS);
         |return BLORP_FS_FAILED;
         |}
         |
@@ -669,7 +710,7 @@ FS_RENAME_RUNTIME: String =
         |int renamed;
         |BLORP_FS_RETRY(renamed,rename(source->bytes,destination->bytes));
         |if(renamed==0){return BLORP_FS_SUCCEEDED;}
-        |*error=errno==EEXIST?BLORP_FS_DIRECTORY_NOT_EMPTY:blorp_fs_errno_code(errno);
+        |*error=errno==EEXIST?BLORP_FS_DIRECTORY_NOT_EMPTY:blorp_fs_errno_code_within(errno,BLORP_FS_RENAME_KINDS);
         |return BLORP_FS_FAILED;
         |}
         |
@@ -715,12 +756,12 @@ FS_REMOVE_DIRECTORY_TREE_RUNTIME: String =
         |static int64_t blorp_fs_read_tree_level(int descriptor,struct blorp_fs_tree_level *level){
         |int copy;
         |BLORP_FS_RETRY(copy,fcntl(descriptor,F_DUPFD_CLOEXEC,0));
-        |if(copy<0){return blorp_fs_errno_code(errno);}
+        |if(copy<0){return blorp_fs_errno_code_within(errno,BLORP_FS_REMOVE_TREE_KINDS);}
         |DIR *stream=fdopendir(copy);
         |if(stream==NULL){
         |const int saved=errno;
         |(void)close(copy);
-        |return blorp_fs_errno_code(saved);
+        |return blorp_fs_errno_code_within(saved,BLORP_FS_REMOVE_TREE_KINDS);
         |}
         |int64_t failure=0;
         |size_t capacity=0;
@@ -728,7 +769,7 @@ FS_REMOVE_DIRECTORY_TREE_RUNTIME: String =
         |struct dirent *entry;
         |do{errno=0;entry=readdir(stream);}while(entry==NULL&&errno==EINTR);
         |if(entry==NULL){
-        |if(errno!=0){failure=blorp_fs_errno_code(errno);}
+        |if(errno!=0){failure=blorp_fs_errno_code_within(errno,BLORP_FS_REMOVE_TREE_KINDS);}
         |break;
         |}
         |const char *name=entry->d_name;
@@ -750,7 +791,7 @@ FS_REMOVE_DIRECTORY_TREE_RUNTIME: String =
         |int removed;
         |BLORP_FS_RETRY(removed,unlinkat(parent,name,AT_REMOVEDIR));
         |if(removed==0||errno==ENOENT){return 0;}
-        |return errno==EEXIST?BLORP_FS_DIRECTORY_NOT_EMPTY:blorp_fs_errno_code(errno);
+        |return errno==EEXIST?BLORP_FS_DIRECTORY_NOT_EMPTY:blorp_fs_errno_code_within(errno,BLORP_FS_REMOVE_TREE_KINDS);
         |}
         |/* The current directory's entry `name`, which unlinkat refused with `refused`, as it
         | * refuses a directory. O_NOFOLLOW with O_DIRECTORY refuses a link, so the walk
@@ -769,7 +810,7 @@ FS_REMOVE_DIRECTORY_TREE_RUNTIME: String =
         |int64_t failure=0;
         |if(child<0){
         |const int failed=errno;
-        |if(failed!=ENOENT&&failed!=EACCES){return blorp_fs_errno_code(failed==ENOTDIR?refused:failed);}
+        |if(failed!=ENOENT&&failed!=EACCES){return blorp_fs_errno_code_within(failed==ENOTDIR?refused:failed,BLORP_FS_REMOVE_TREE_KINDS);}
         |if(failed==EACCES){
         |failure=blorp_fs_remove_emptied(*current,name);
         |if(failure==BLORP_FS_DIRECTORY_NOT_EMPTY){failure=BLORP_FS_PERMISSION_DENIED;}
@@ -778,7 +819,7 @@ FS_REMOVE_DIRECTORY_TREE_RUNTIME: String =
         |struct stat status;
         |int examined;
         |BLORP_FS_RETRY(examined,fstat(child,&status));
-        |failure=examined<0?blorp_fs_errno_code(errno):0;
+        |failure=examined<0?blorp_fs_errno_code_within(errno,BLORP_FS_REMOVE_TREE_KINDS):0;
         |if(failure==0&&status.st_dev!=tree->levels[tree->depth-1].device){failure=BLORP_FS_CROSSES_DEVICES;}
         |if(failure==0){
         |blorp_fs_push_tree_level(tree,&status);
@@ -803,12 +844,12 @@ FS_REMOVE_DIRECTORY_TREE_RUNTIME: String =
         |static int64_t blorp_fs_leave_tree_level(struct blorp_fs_tree *tree,int *current){
         |int parent;
         |BLORP_FS_RETRY(parent,openat(*current,"..",O_RDONLY|O_DIRECTORY|O_CLOEXEC));
-        |if(parent<0){return blorp_fs_errno_code(errno);}
+        |if(parent<0){return blorp_fs_errno_code_within(errno,BLORP_FS_REMOVE_TREE_KINDS);}
         |struct blorp_fs_tree_level *above=&tree->levels[tree->depth-2];
         |struct stat status;
         |int examined;
         |BLORP_FS_RETRY(examined,fstat(parent,&status));
-        |int64_t failure=examined<0?blorp_fs_errno_code(errno):0;
+        |int64_t failure=examined<0?blorp_fs_errno_code_within(errno,BLORP_FS_REMOVE_TREE_KINDS):0;
         |if(failure==0&&(status.st_dev!=above->device||status.st_ino!=above->inode)){failure=BLORP_FS_CHANGED_DURING_REMOVAL;}
         |if(failure!=0){(void)close(parent);return failure;}
         |(void)close(*current);
@@ -837,7 +878,7 @@ FS_REMOVE_DIRECTORY_TREE_RUNTIME: String =
         |BLORP_FS_RETRY(removed,unlinkat(*current,name,0));
         |if(removed==0||errno==ENOENT){level->next++;continue;}
         |const int refused=errno;
-        |if(refused!=EISDIR&&refused!=EPERM&&refused!=EBUSY){return blorp_fs_errno_code(refused);}
+        |if(refused!=EISDIR&&refused!=EPERM&&refused!=EBUSY){return blorp_fs_errno_code_within(refused,BLORP_FS_REMOVE_TREE_KINDS);}
         |failure=blorp_fs_enter_tree_child(tree,current,name,refused);
         |}
         |if(failure!=0){return failure;}
@@ -852,12 +893,12 @@ FS_REMOVE_DIRECTORY_TREE_RUNTIME: String =
         |struct stat status,parent_status;
         |int examined;
         |BLORP_FS_RETRY(examined,fstat(root,&status));
-        |if(examined<0){return blorp_fs_errno_code(errno);}
+        |if(examined<0){return blorp_fs_errno_code_within(errno,BLORP_FS_REMOVE_TREE_KINDS);}
         |int parent;
         |BLORP_FS_RETRY(parent,openat(root,"..",O_RDONLY|O_DIRECTORY|O_CLOEXEC));
-        |if(parent<0){return blorp_fs_errno_code(errno);}
+        |if(parent<0){return blorp_fs_errno_code_within(errno,BLORP_FS_REMOVE_TREE_KINDS);}
         |BLORP_FS_RETRY(examined,fstat(parent,&parent_status));
-        |const int64_t failure=examined<0?blorp_fs_errno_code(errno):0;
+        |const int64_t failure=examined<0?blorp_fs_errno_code_within(errno,BLORP_FS_REMOVE_TREE_KINDS):0;
         |(void)close(parent);
         |if(failure!=0){return failure;}
         |if(parent_status.st_dev!=status.st_dev||parent_status.st_ino==status.st_ino){return BLORP_FS_CROSSES_DEVICES;}
@@ -876,7 +917,7 @@ FS_REMOVE_DIRECTORY_TREE_RUNTIME: String =
         |if(blorp_fs_names_dot_entry(root,length)){return blorp_fs_other_os_code(EINVAL);}
         |int current;
         |BLORP_FS_RETRY(current,open(root,O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC));
-        |if(current<0){return blorp_fs_errno_code(errno);}
+        |if(current<0){return blorp_fs_errno_code_within(errno,BLORP_FS_REMOVE_TREE_KINDS);}
         |struct blorp_fs_tree tree={.levels=NULL,.depth=0,.capacity=0};
         |int64_t failure=blorp_fs_enter_tree_root(current,&tree);
         |if(failure==0){failure=blorp_fs_empty_tree(&tree,&current);}
@@ -888,7 +929,7 @@ FS_REMOVE_DIRECTORY_TREE_RUNTIME: String =
         |int removed;
         |BLORP_FS_RETRY(removed,rmdir(root));
         |if(removed==0){return 0;}
-        |return errno==EEXIST?BLORP_FS_DIRECTORY_NOT_EMPTY:blorp_fs_errno_code(errno);
+        |return errno==EEXIST?BLORP_FS_DIRECTORY_NOT_EMPTY:blorp_fs_errno_code_within(errno,BLORP_FS_REMOVE_TREE_KINDS);
         |}
         |/* Trailing slashes are stripped, keeping one that is the whole path, because POSIX
         | * resolves `link/` to the link's target, which the walk would then empty. */
@@ -931,7 +972,7 @@ FS_CREATE_TEMPORARY_DIRECTORY_RUNTIME: String =
         |memcpy(template+length,blorp_fs_temporary_suffix,sizeof blorp_fs_temporary_suffix);
         |if(mkdtemp(template)!=NULL){break;}
         |if(errno==EINTR){continue;}
-        |*error=errno==EEXIST?blorp_fs_other_os_code(EEXIST):blorp_fs_errno_code(errno);
+        |*error=errno==EEXIST?blorp_fs_other_os_code(EEXIST):blorp_fs_errno_code_within(errno,BLORP_FS_TEMPORARY_DIRECTORY_KINDS);
         |blorp_memory_release(template);
         |return BLORP_FS_FAILED;
         |}
@@ -952,7 +993,7 @@ FS_OPEN_READ_RUNTIME: String =
         |if(blorp_fs_has_nul(path)){*error=BLORP_FS_PATH_CONTAINS_NUL;return BLORP_FS_FAILED;}
         |int opened;
         |BLORP_FS_RETRY(opened,open(path->bytes,O_RDONLY|O_CLOEXEC));
-        |if(opened<0){*error=blorp_fs_errno_code(errno);return BLORP_FS_FAILED;}
+        |if(opened<0){*error=blorp_fs_errno_code_within(errno,BLORP_FS_READ_KINDS);return BLORP_FS_FAILED;}
         |const int64_t refused=blorp_fs_refuse_directory(opened);
         |if(refused!=0){(void)close(opened);*error=refused;return BLORP_FS_FAILED;}
         |*descriptor=opened;
@@ -998,7 +1039,7 @@ private FS_NEXT_LINES_SUPPORT: String =
         |if(request>BLORP_FS_REQUEST_MAXIMUM){request=BLORP_FS_REQUEST_MAXIMUM;}
         |ssize_t received;
         |BLORP_FS_RETRY(received,read(descriptor,buffer->bytes+buffer->used,request));
-        |if(received<0){return blorp_fs_errno_code(errno);}
+        |if(received<0){return blorp_fs_errno_code_within(errno,BLORP_FS_READ_KINDS);}
         |if(received==0){buffer->ended=1;return 0;}
         |const int newline=memchr(buffer->bytes+buffer->used,'\n',(size_t)received)!=NULL;
         |buffer->used+=(size_t)received;
@@ -1029,7 +1070,7 @@ private FS_NEXT_LINES_SUPPORT: String =
         |while(missing>0){
         |ssize_t received;
         |BLORP_FS_RETRY(received,read(descriptor,buffer->bytes+buffer->used,missing));
-        |if(received<0){return blorp_fs_errno_code(errno);}
+        |if(received<0){return blorp_fs_errno_code_within(errno,BLORP_FS_READ_KINDS);}
         |if(received==0){return BLORP_FS_INVALID_UTF8;}
         |for(size_t index=0;index<(size_t)received;index++){
         |if(((unsigned char)buffer->bytes[buffer->used+index]&0xC0)!=0x80){return BLORP_FS_INVALID_UTF8;}
@@ -1108,7 +1149,7 @@ pure func fs_next_lines_runtime(string_list_type: String) -> String:
             "uint8_t blorp_fs_next_lines(int64_t descriptor,const struct blorp_string *carried,${string_list_type} *lines,int64_t *error){\n",
         )
         .concat(
-            "if(!blorp_fs_is_descriptor(descriptor)){*error=blorp_fs_errno_code(EBADF);return BLORP_FS_FAILED;}\n",
+            "if(!blorp_fs_is_descriptor(descriptor)){*error=blorp_fs_errno_code_within(EBADF,BLORP_FS_READ_KINDS);return BLORP_FS_FAILED;}\n",
         )
         .concat("struct blorp_fs_line_buffer buffer;\nsize_t count=0;\n")
         .concat(
@@ -1134,8 +1175,8 @@ pure func fs_next_lines_runtime(string_list_type: String) -> String:
 FS_CLOSE_RUNTIME: String =
     raw
         |uint8_t blorp_fs_close(int64_t descriptor,int64_t *error){
-        |if(!blorp_fs_is_descriptor(descriptor)){*error=blorp_fs_errno_code(EBADF);return BLORP_FS_FAILED;}
-        |if(close((int)descriptor)<0){*error=blorp_fs_errno_code(errno);return BLORP_FS_FAILED;}
+        |if(!blorp_fs_is_descriptor(descriptor)){*error=blorp_fs_errno_code_within(EBADF,BLORP_FS_READ_KINDS);return BLORP_FS_FAILED;}
+        |if(close((int)descriptor)<0){*error=blorp_fs_errno_code_within(errno,BLORP_FS_READ_KINDS);return BLORP_FS_FAILED;}
         |return BLORP_FS_SUCCEEDED;
         |}
         |

@@ -765,6 +765,12 @@ static int case_list_read_failure(const char *root) {
     assert(count_events(READDIR_CALL) == 5);
     expect_one_stream();
     expect_clean(free_before);
+    /* ListError lacks NoSpace, so the OS's own number arrives. */
+    begin();
+    inject(READDIR_CALL, 4, 1, ENOSPC);
+    assert(list_failure(directory) == -(int64_t)ENOSPC);
+    expect_one_stream();
+    expect_clean(free_before);
     return 0;
 }
 
@@ -892,6 +898,10 @@ static int case_create_kinds(const char *root) {
     begin();
     inject(MKDIR_CALL, 0, 1, ENOSPC);
     assert(create_directory(made) == 9);
+    /* CreateDirectoryError lacks IsADirectory, so the OS's own number arrives. */
+    begin();
+    inject(MKDIR_CALL, 0, 1, EISDIR);
+    assert(create_directory(made) == -(int64_t)EISDIR);
     begin();
     assert(on_string(blorp_fs_create_directory, nul_path(made)) == 12);
     assert(event_count == 0);
@@ -1054,6 +1064,10 @@ static int case_remove_file_kinds(const char *root) {
     inject(UNLINK_CALL, 0, 1, EROFS);
     assert(remove_file(target) == 8);
     assert(count_events(LSTAT_CALL) == 0);
+    /* ENOSPC is a named kind that RemoveFileError lacks, so the OS's own number arrives. */
+    begin();
+    inject(UNLINK_CALL, 0, 1, ENOSPC);
+    assert(remove_file(target) == -(int64_t)ENOSPC);
     begin();
     assert(on_string(blorp_fs_remove_file, nul_path(target)) == 12);
     assert(event_count == 0);
@@ -1094,6 +1108,10 @@ static int case_remove_directory_kinds(const char *root) {
     begin();
     inject(RMDIR_CALL, 0, 1, EROFS);
     assert(remove_directory(full) == 8);
+    /* RemoveDirectoryError lacks NoSpace, so the OS's own number arrives. */
+    begin();
+    inject(RMDIR_CALL, 0, 1, ENOSPC);
+    assert(remove_directory(full) == -(int64_t)ENOSPC);
     begin();
     assert(on_string(blorp_fs_remove_directory, nul_path(full)) == 12);
     assert(event_count == 0);
@@ -1155,6 +1173,13 @@ static int case_rename_kinds(const char *root) {
     begin();
     inject(RENAME_CALL, 0, 1, EXDEV);
     assert(rename_path(second, first) == 11);
+    /* RenameError names NoSpace but not FileTooLarge. */
+    begin();
+    inject(RENAME_CALL, 0, 1, ENOSPC);
+    assert(rename_path(second, first) == 9);
+    begin();
+    inject(RENAME_CALL, 0, 1, EFBIG);
+    assert(rename_path(second, first) == -(int64_t)EFBIG);
     begin();
     assert(rename_strings(nul_path(second), string_of(first)) == 12);
     assert(rename_strings(string_of(second), nul_path(first)) == 12);

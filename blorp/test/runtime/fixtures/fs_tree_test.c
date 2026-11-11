@@ -976,6 +976,10 @@ static int case_tree_read_failures(const char *directory) {
     begin();
     inject(FSTAT_CALL, 0, 1, EIO);
     assert(remove_tree("tree") == -(int64_t)EIO);
+    /* RemoveTreeError lacks NoSpace, so the OS's own number arrives. */
+    begin();
+    inject(FSTAT_CALL, 0, 1, ENOSPC);
+    assert(remove_tree("tree") == -(int64_t)ENOSPC);
     assert(is_directory("tree"));
     return 0;
 }
@@ -1151,6 +1155,10 @@ static int case_temporary_failures(const char *directory) {
     inject(MKDTEMP_CALL, 0, 1, EEXIST);
     assert(temporary_failure(".", "p") == -(int64_t)EEXIST);
     assert(calls[MKDTEMP_CALL] == 1);
+    /* TemporaryDirectoryError lacks FileTooLarge, so the OS's own number arrives. */
+    begin();
+    inject(MKDTEMP_CALL, 0, 1, EFBIG);
+    assert(temporary_failure(".", "p") == -(int64_t)EFBIG);
     return 0;
 }
 

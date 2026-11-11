@@ -140,6 +140,23 @@ static int case_codes(void) {
         }
         assert(blorp_fs_errno_code(number) == expected);
     }
+    /* A mask keeps the kinds it names and sends every other errno negated, named or not. The
+     * masks here are synthetic: the operations' own are proved through their natives. */
+    static const uint32_t masks[] = {
+        BLORP_FS_KIND(NOT_FOUND) | BLORP_FS_KIND(NOT_A_DIRECTORY),
+        BLORP_FS_KIND(NO_SPACE),
+    };
+    for (size_t which = 0; which < sizeof masks / sizeof masks[0]; which++) {
+        for (int number = 1; number < 256; number++) {
+            int64_t expected = -(int64_t)number;
+            for (size_t index = 0; index < sizeof named / sizeof named[0]; index++) {
+                if (named[index].number == number && (masks[which] & (UINT32_C(1) << named[index].code)) != 0) {
+                    expected = named[index].code;
+                }
+            }
+            assert(blorp_fs_errno_code_within(number, masks[which]) == expected);
+        }
+    }
     /* The codes that no errno produces. */
     assert(BLORP_FS_NOT_A_REGULAR_FILE == 7);
     assert(BLORP_FS_PATH_CONTAINS_NUL == 12);
