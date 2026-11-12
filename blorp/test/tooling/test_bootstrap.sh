@@ -276,6 +276,19 @@ expect_failure 'manifest is missing' "$resolver" --print-path
 mv "$scratch/manifest" "$manifest"
 pass 'help works before publication and missing manifest has useful error'
 
+# Running the seed names it on stderr: downloaded the first time, cached after.
+rm -rf "$BLORP_COMPILER_BOOTSTRAP_CACHE_DIR"
+"$resolver" version >"$scratch/stdout" 2>"$scratch/stderr"
+[ "$(cat "$scratch/stderr")" = "Blorp bootstrap: seed $tag (downloaded)" ] || fail 'downloaded seed line'
+"$resolver" version >"$scratch/stdout" 2>"$scratch/stderr"
+[ "$(cat "$scratch/stderr")" = "Blorp bootstrap: seed $tag (cached)" ] || fail 'cached seed line'
+[ ! -s "$scratch/stdout" ] || fail 'seed line leaked to stdout'
+"$resolver" --print-path 2>&1 >/dev/null | cmp -s - /dev/null || fail 'print-path is not silent on stderr'
+pass 'running the seed prints its tag and source to stderr only'
+# The fake seed logged these runs' arguments; the Makefile checks below compare
+# that log from empty.
+: >"$TEST_SEED_LOG"
+
 # Only fake seed/CC execute in these Makefile behavior checks.
 : >"$TEST_CC_LOG"
 : >"$TEST_CC_ARGS"

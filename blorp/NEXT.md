@@ -117,9 +117,6 @@ None of these is planned yet. Each wants its own short design or brief.
   `dict_ops`.
 - **`alias.Union.Variant` is deliberately unsupported** (Keith, 2026-11-10): a
   pattern head has two parts, and importing the union serves.
-- **Tooling found broken or quiet while landing work:**
-  - `scripts/blorp-compiler-bootstrap` prints nothing when it downloads or
-    reuses a cached seed, so a build log cannot show which seed it used.
 - **Compiler costs found while landing work:**
   - **A named lambda costs one allocation per call.** Binding a lambda to a
     local before passing it costs an allocation that an inline lambda does
