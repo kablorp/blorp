@@ -1,0 +1,625 @@
+-- Native cases for the io/fs operations: programs that call only some natives
+-- and so must emit valid C under -Werror with exactly their helpers, and
+-- programs that read, write and change trees the prepare scripts build. Each
+-- program compiles once within its ceiling, then runs with exact stdout,
+-- status and strict allocation counts. One rejection checks the exact
+-- diagnostic.
+import:
+    bool: not
+    io/process: CaptureError, Exit(Exited), capture
+    result: Result methods
+    test: TestSuite
+    ../driver/harness:
+        NativeRun,
+        Program,
+        Rejection,
+        ending,
+        fixture_program,
+        once,
+        once_given,
+        preparation,
+        prints,
+        reported,
+        verify_on_rebuilt_tree,
+        verify_program,
+        verify_rejection,
+
+
+private FS_PREPARE_SCRIPT: String = "blorp/test/test_compile/fixtures/fs/prepare.sh"
+
+
+private FS_WRITE_PREPARE_SCRIPT: String = "blorp/test/test_compile/fixtures/fs/prepare_write.sh"
+
+
+private FS_DIRECTORIES_PREPARE_SCRIPT: String = "blorp/test/test_compile/fixtures/fs/prepare_directories.sh"
+
+
+-- prepare.sh's exit status when it runs as root, which file permissions do
+-- not refuse, so no fs example could provoke PermissionDenied.
+private FS_NOT_RUN_STATUS: Int = 77
+
+
+private FS_READ_OUTPUT: String =
+    |read_text settings.conf: ok 6 bytes
+    |read_text empty.txt: ok 0 bytes
+    |read_text link_to_file: ok 6 bytes
+    |read_text missing.txt: missing.txt: no such file
+    |read_text locked.txt: locked.txt: permission denied
+    |read_text settings.conf/child: settings.conf/child: not a directory
+    |read_text folder: folder: is a directory
+    |read_text not_utf8.bin: not_utf8.bin: contents are not valid UTF-8
+    |read_text loop: OtherOs
+    |read_text dangling_link: dangling_link: no such file
+    |entry_kind settings.conf: file
+    |entry_kind locked.txt: file
+    |entry_kind folder: directory
+    |entry_kind link_to_file: symlink
+    |entry_kind dangling_link: symlink
+    |entry_kind loop: symlink
+    |entry_kind pipe: other
+    |entry_kind missing.txt: absent
+    |entry_kind settings.conf/child: absent
+    |entry_kind loop/inside: OtherOs
+    |fallback missing.txt: ok 8 bytes
+    |fallback settings.conf: ok 6 bytes
+    |fallback locked.txt: locked.txt: permission denied
+    |fallback folder: folder: is a directory
+    |settings.conf: no such file
+    |settings.conf: permission denied
+    |settings.conf: not a directory
+    |settings.conf: is a directory
+    |settings.conf: file too large
+    |settings.conf: contents are not valid UTF-8
+    |settings.conf: operating system error 40
+    |
+
+
+-- The cases of fixtures/fs/lines.brp. A step that stops a fold prints which
+-- lines it saw; the failing long_not_utf8.txt prints its first line and, as the
+-- block that fails returns none of its lines, never its last valid one.
+private FS_LINES_OUTPUT: String =
+    |empty.txt: 0 lines: ; as expected yes; text.lines() agrees yes
+    |newline.txt: 1 lines: ; as expected yes; text.lines() agrees yes
+    |terminated.txt: 1 lines: a; as expected yes; text.lines() agrees yes
+    |unterminated.txt: 1 lines: a; as expected yes; text.lines() agrees yes
+    |crlf_pair.txt: 2 lines: a | b; as expected yes; text.lines() agrees yes
+    |blank_lines.txt: 2 lines:  | ; as expected yes; text.lines() agrees yes
+    |lone_cr.txt: 1 lines: <CR>; as expected yes; text.lines() agrees yes
+    |mixed.txt: 4 lines: a | b<CR>c |  | last; as expected yes; text.lines() agrees yes
+    |total_score scores_ok.txt: ok 12
+    |  step 3
+    |  step x
+    |total_score scores_bad.txt: not a number x
+    |crlf.txt: 20000 lines 568720 bytes 0 ending in CR; as expected yes
+    |growth.txt: 2 lines: 200001 bytes 100001 characters | end; as expected yes; text.lines() agrees yes
+    |tail.txt: 3 lines: ab | 80000 bytes 40000 characters | end; as expected yes; text.lines() agrees yes
+    |carried.txt: 3 lines: a | 65533 bytes 65533 characters | end; as expected yes; text.lines() agrees yes
+    |fold_lines missing.txt: missing.txt: no such file
+    |fold_lines folder: folder: is a directory
+    |fold_lines locked.txt: locked.txt: permission denied
+    |fold_lines loop: OtherOs
+    |fold_lines not_utf8.bin: not_utf8.bin: contents are not valid UTF-8
+    |  stepped the first line
+    |fold_lines long_not_utf8.txt: long_not_utf8.txt: contents are not valid UTF-8
+    |fold_lines long_not_utf8.txt with a step stopping at line 5: step stopped at line 5
+    |1000 folds stopped at line 2: 1000 stopped by the step, 0 otherwise
+    |300 folds of long_not_utf8.txt: 300 InvalidUtf8, 0 otherwise
+    |
+
+
+-- fs/lines.brp opens a file 1,300 times, one fold at a time. Under this limit,
+-- macOS's default, a fold that left its file open would run out of descriptors
+-- (OtherOs) long before the last fold, on every machine; the runners' own
+-- limits are far higher than 1,300.
+private FS_LINES_DESCRIPTOR_LIMIT: Int = 256
+
+
+private FS_WRITE_OUTPUT: String =
+    |write_text new.txt: ok
+    |  new.txt holds "created"
+    |write_text existing.txt: ok
+    |  existing.txt holds "replaced"
+    |write_text link: ok
+    |  real/target.txt holds "through the link"
+    |  link is symlink
+    |write_text dangling: dangling: no such file
+    |  missing_target is absent
+    |write_text read_only.txt: read_only.txt: permission denied
+    |  read_only.txt holds "kept"
+    |write_text pipe: pipe: not a regular file
+    |write_text folder: folder: is a directory
+    |write_text folder/: folder/: is a directory
+    |  folder is directory
+    |write_text folder_link/: folder_link/: is a directory
+    |write_text existing.txt/: existing.txt/: not a directory
+    |  existing.txt holds "replaced"
+    |write_text link/: link/: not a directory
+    |write_text absent/: absent/: no such file
+    |  absent is absent
+    |write_text dangling/: dangling/: no such file
+    |write_text existing.txt/child: existing.txt/child: not a directory
+    |write_text missing/child.txt: missing/child.txt: no such file
+    |write_text loop: OtherOs
+    |
+
+
+-- The directory operations' kinds, in the order directories.brp provokes them.
+private FS_DIRECTORIES_OUTPUT: String =
+    |list_directory listing: 7 entries
+    |  B file
+    |  _ file
+    |  a file
+    |  ab file
+    |  dir directory
+    |  link symlink
+    |  e-acute file
+    |list_directory listing_link: 7 entries
+    |  B file
+    |  _ file
+    |  a file
+    |  ab file
+    |  dir directory
+    |  link symlink
+    |  e-acute file
+    |list_directory empty: 0 entries
+    |list_directory missing: missing: no such file
+    |list_directory file.txt: file.txt: not a directory
+    |list_directory locked: locked: permission denied
+    |remove_directory locked: ok
+    |create_directory fresh: ok
+    |create_directory fresh: fresh: already exists
+    |create_directory absent/child: absent/child: no such file
+    |create_directory slashed/: ok
+    |  slashed is directory
+    |create_directories deep/a/b/c: ok
+    |create_directories deep/a/b/c: ok
+    |  deep/a/b/c is directory
+    |create_directories file.txt/x/y: file.txt/x/y: not a directory
+    |create_directories file.txt: file.txt: already exists
+    |create_directories dangling: dangling: already exists
+    |remove_file to_remove.txt: ok
+    |remove_file to_remove.txt: to_remove.txt: no such file
+    |remove_file listing/dir: listing/dir: is a directory
+    |remove_directory removable: ok
+    |remove_directory nonempty: nonempty: directory not empty
+    |remove_directory removable: removable: no such file
+    |remove_directory file.txt: file.txt: not a directory
+    |rename old.txt -> new.txt: ok
+    |  old.txt is absent
+    |  new.txt holds "moved"
+    |rename old.txt -> again.txt: old.txt -> again.txt: no such file
+    |rename source_dir -> nonempty: source_dir -> nonempty: directory not empty
+    |remove_directory_tree tree: ok
+    |  tree is absent
+    |  outside is directory
+    |  outside/precious.txt holds "precious"
+    |remove_directory_tree tree: tree: no such file
+    |remove_directory_tree file.txt: file.txt: not a directory
+    |remove_directory_tree listing_link: listing_link: not a directory
+    |remove_directory_tree listing_link/: listing_link/: not a directory
+    |remove_directory_tree listing/.: OtherOs
+    |list_directory listing: 7 entries
+    |  B file
+    |  _ file
+    |  a file
+    |  ab file
+    |  dir directory
+    |  link symlink
+    |  e-acute file
+    |with_temporary_directory ok: 7
+    |  scratch holds 0 entries
+    |with_temporary_directory text error: body failed
+    |  scratch holds 0 entries
+    |with_temporary_directory removed by body: directory: no such file
+    |  scratch holds 0 entries
+    |with_temporary_directory body error: body: permission denied
+    |  scratch holds 0 entries
+    |with_temporary_directory missing parent: missing: no such file
+    |with_temporary_directory slash prefix: the prefix contains a NUL byte or a /
+    |with_temporary_directory NUL prefix: the prefix contains a NUL byte or a /
+    |
+
+
+-- Each native's code, the same on macOS and Linux: macOS refuses unlink of a
+-- directory with EPERM and Linux with EISDIR, and both are IsADirectory (5).
+private FS_NATIVE_DIRECTORIES_OUTPUT: String =
+    |create_directories: ok
+    |create_directory: 3
+    |rename: ok
+    |entry 2 renamed
+    |remove_file: 5
+    |remove_directory: 6
+    |remove_directory: ok
+    |remove_directory: ok
+    |create_temporary_directory: ok
+    |create_directories: ok
+    |write_text: ok
+    |remove_directory_tree: ok
+    |remove_directory_tree: 1
+    |remove_directory: ok
+    |
+
+
+-- The CRLF loses its CR, the empty line and the two-byte character survive,
+-- and the last line, which has no LF, is carried and then returned alone. A
+-- second close of the same descriptor is EBADF, -9 on macOS and Linux alike,
+-- and the file is removed, so the next run creates it again.
+private FS_NATIVE_LINES_OUTPUT: String =
+    |write_text: ok
+    |batch 5
+    |  [first]
+    |  [second]
+    |  []
+    |  [café]
+    |  [last]
+    |batch 1
+    |  [last]
+    |close: ok
+    |close: -9
+    |remove_file: ok
+    |
+
+
+-- The fs examples read, write and change trees that the prepare scripts build,
+-- because no fs operation can create a file that is not UTF-8, a symlink, a
+-- read-only file, a mode 000 directory or a FIFO. Where prepare.sh cannot build
+-- its tree, as root, all four examples are reported as not run and left out,
+-- so that they earn no PASS credit: each needs a user that file permissions
+-- refuse.
+private func fs_tree_tests(
+    compiler: String,
+    c_compiler: String,
+    work_directory: String,
+    check_instructions: Bool,
+) -> List[(String, () -> Bool)]:
+    tree = work_directory + "/fs_tree"
+    write_tree = work_directory + "/fs_write_tree"
+    directories_tree = work_directory + "/fs_directories_tree"
+    read = fixture_program(
+        "fs_read",
+        "fs/read",
+        { allocations = 226851, instructions = 805322717 },
+        once_given([tree], 0, FS_READ_OUTPUT, 194),
+    )
+    lines_run: NativeRun = {
+        label = None,
+        arguments = [tree],
+        directory = None,
+        descriptor_limit = Some(FS_LINES_DESCRIPTOR_LIMIT),
+        status = 0,
+        stdout = FS_LINES_OUTPUT,
+        stderr = "",
+        allocations = 6155907,
+    }
+    lines = fixture_program(
+        "fs_lines",
+        "fs/lines",
+        { allocations = 387374, instructions = 1388425179 },
+        [lines_run],
+    )
+    write = fixture_program(
+        "fs_write",
+        "fs/write",
+        { allocations = 238950, instructions = 844075447 },
+        once_given([write_tree], 0, FS_WRITE_OUTPUT, 213),
+    )
+    directories = fixture_program(
+        "fs_directories",
+        "fs/directories",
+        { allocations = 424653, instructions = 1557742393 },
+        once_given([directories_tree], 0, FS_DIRECTORIES_OUTPUT, 591),
+    )
+    match tree_built(tree):
+        Err(error):
+            [("the fs example tree is prepared", func(): reported(Err(error)))]
+        Ok(built):
+            if built.not():
+                print_error(
+                    "fs examples not run: their trees need a user that file permissions refuse",
+                )
+                []
+            else:
+                [
+                    (
+                        "fs read_text and entry_kind return each kind, and to_string words each one",
+                        func(): reported(
+                            verify_program(
+                                compiler,
+                                c_compiler,
+                                work_directory,
+                                check_instructions,
+                                read,
+                            ),
+                        ),
+                    ),
+                    (
+                        "fs fold_lines reads every line ending, block boundary and failure, and closes its file on every path",
+                        func(): reported(
+                            verify_program(
+                                compiler,
+                                c_compiler,
+                                work_directory,
+                                check_instructions,
+                                lines,
+                            ),
+                        ),
+                    ),
+                    (
+                        "fs write_text replaces, creates and writes through a link, and returns each kind it can",
+                        func(): reported(
+                            verify_on_rebuilt_tree(
+                                compiler,
+                                c_compiler,
+                                work_directory,
+                                check_instructions,
+                                write,
+                                write_tree,
+                                FS_WRITE_PREPARE_SCRIPT,
+                            ),
+                        ),
+                    ),
+                    (
+                        "fs directory operations list, create, remove and rename, and return each kind they can",
+                        func(): reported(
+                            verify_on_rebuilt_tree(
+                                compiler,
+                                c_compiler,
+                                work_directory,
+                                check_instructions,
+                                directories,
+                                directories_tree,
+                                FS_DIRECTORIES_PREPARE_SCRIPT,
+                            ),
+                        ),
+                    ),
+                ]
+
+
+-- Whether prepare.sh built the fs example tree: False when it exits
+-- FS_NOT_RUN_STATUS, as root, and an error, with its stderr, for any other
+-- ending but Exited(0).
+private func tree_built(tree: String) -> Result[Bool, String]:
+    invocation ?= preparation(FS_PREPARE_SCRIPT, tree)
+    prepared ?= capture(invocation).map_err(
+        pure func(error: CaptureError) -> String: "${FS_PREPARE_SCRIPT}: ${error}",
+    )
+    if prepared.exit == Exited(0):
+        Ok(True)
+    else if prepared.exit == Exited(FS_NOT_RUN_STATUS):
+        Ok(False)
+    else:
+        ended = prepared.exit.ending(invocation.timeout_ms)
+        Err("${FS_PREPARE_SCRIPT} ${ended}: ${prepared.stderr}")
+
+
+func suite(
+    compiler: String,
+    c_compiler: String,
+    work_directory: String,
+    check_instructions: Bool,
+) -> TestSuite:
+    run_program = func(program: Program) -> Bool: reported(
+        verify_program(compiler, c_compiler, work_directory, check_instructions, program),
+    )
+    step_without_result: Rejection = {
+        name = "fs_step_without_result",
+        source = "blorp/test/test_compile/fixtures/fs/step_without_result.brp",
+        diagnostic = ":16:39: error: argument type does not match the parameter type\nhelp: use an expression of type (Int, String) -> Result[Int, Int] here\n",
+    }
+    {
+        description = "Blorp fs",
+        tests = [
+            (
+                "fs.fold_lines rejects a step that returns its accumulator without a Result",
+                func(): reported(verify_rejection(compiler, work_directory, step_without_result)),
+            ),
+            (
+                "a program that calls only fs.read_text is valid C under -Werror",
+                func(): run_program(
+                    prints(
+                        "fs_native_read_text",
+                        "fs/natives_read_text",
+                        { allocations = 122794, instructions = 497293417 },
+                        "1\n",
+                        2,
+                    ),
+                ),
+            ),
+            (
+                "a program that calls only fs.entry_kind is valid C under -Werror",
+                func(): run_program(
+                    prints(
+                        "fs_native_entry_kind",
+                        "fs/natives_entry_kind",
+                        { allocations = 122778, instructions = 497610679 },
+                        "2\n",
+                        2,
+                    ),
+                ),
+            ),
+            (
+                "a program that calls both fs natives emits their shared helpers once",
+                func(): run_program(
+                    prints(
+                        "fs_native_both",
+                        "fs/natives_both",
+                        { allocations = 124822, instructions = 502738889 },
+                        "1\n2\n",
+                        4,
+                    ),
+                ),
+            ),
+            (
+                "a program that calls only fs.write_text is valid C under -Werror",
+                func(): run_program(
+                    prints(
+                        "fs_native_write_text",
+                        "fs/natives_write_text",
+                        { allocations = 122747, instructions = 497183270 },
+                        "1\n",
+                        3,
+                    ),
+                ),
+            ),
+            (
+                "a program that calls only fs.list_directory is valid C under -Werror and brings its List[String] layout",
+                func(): run_program(
+                    prints(
+                        "fs_native_list_directory",
+                        "fs/natives_list_directory",
+                        { allocations = 122995, instructions = 497018317 },
+                        "4\n",
+                        2,
+                    ),
+                ),
+            ),
+            (
+                "a program that calls only fs.create_directory is valid C under -Werror",
+                func(): run_program(
+                    prints(
+                        "fs_native_create_directory",
+                        "fs/natives_create_directory",
+                        { allocations = 122616, instructions = 496825145 },
+                        "1\n",
+                        2,
+                    ),
+                ),
+            ),
+            (
+                "a program that calls only fs.create_directories is valid C under -Werror",
+                func(): run_program(
+                    prints(
+                        "fs_native_create_directories",
+                        "fs/natives_create_directories",
+                        { allocations = 122616, instructions = 496607407 },
+                        "created\n",
+                        3,
+                    ),
+                ),
+            ),
+            (
+                "a program that calls only fs.remove_file is valid C under -Werror",
+                func(): run_program(
+                    prints(
+                        "fs_native_remove_file",
+                        "fs/natives_remove_file",
+                        { allocations = 122617, instructions = 496743065 },
+                        "1\n",
+                        2,
+                    ),
+                ),
+            ),
+            (
+                "a program that calls only fs.remove_directory is valid C under -Werror",
+                func(): run_program(
+                    prints(
+                        "fs_native_remove_directory",
+                        "fs/natives_remove_directory",
+                        { allocations = 122618, instructions = 497106080 },
+                        "1\n",
+                        2,
+                    ),
+                ),
+            ),
+            (
+                "a program that calls only fs.rename is valid C under -Werror",
+                func(): run_program(
+                    prints(
+                        "fs_native_rename",
+                        "fs/natives_rename",
+                        { allocations = 122754, instructions = 500001823 },
+                        "1\n",
+                        3,
+                    ),
+                ),
+            ),
+            (
+                "a program that calls only fs.remove_directory_tree is valid C under -Werror",
+                func(): run_program(
+                    prints(
+                        "fs_native_remove_directory_tree",
+                        "fs/natives_remove_directory_tree",
+                        { allocations = 122622, instructions = 499045078 },
+                        "1\n",
+                        3,
+                    ),
+                ),
+            ),
+            (
+                "a program that calls only fs.create_temporary_directory is valid C under -Werror",
+                func(): run_program(
+                    prints(
+                        "fs_native_create_temporary_directory",
+                        "fs/natives_create_temporary_directory",
+                        { allocations = 122859, instructions = 497520858 },
+                        "1\n",
+                        4,
+                    ),
+                ),
+            ),
+            -- The program removes the directory it creates, so its second run starts
+            -- as its first did.
+            (
+                "a program that calls the eight directory natives and write_text emits their shared helpers once and returns each code",
+                func(): run_program(
+                    fixture_program(
+                        "fs_native_directories",
+                        "fs/natives_directories",
+                        { allocations = 143558, instructions = 553573522 },
+                        once_given(
+                            [work_directory + "/fs_directories"],
+                            0,
+                            FS_NATIVE_DIRECTORIES_OUTPUT,
+                            89,
+                        ),
+                    ),
+                ),
+            ),
+            (
+                "a program that calls only fs.open_read is valid C under -Werror",
+                func(): run_program(
+                    fixture_program(
+                        "fs_native_open_read",
+                        "fs/natives_open_read",
+                        { allocations = 124513, instructions = 502176859 },
+                        once_given([work_directory], 0, "1\n", 6),
+                    ),
+                ),
+            ),
+            (
+                "a program that calls only fs.next_lines is valid C under -Werror and brings its List[String] layout",
+                func(): run_program(
+                    prints(
+                        "fs_native_next_lines",
+                        "fs/natives_next_lines",
+                        { allocations = 123124, instructions = 498159647 },
+                        "-9\n",
+                        2,
+                    ),
+                ),
+            ),
+            (
+                "a program that calls only fs.close is valid C under -Werror",
+                func(): run_program(
+                    prints(
+                        "fs_native_close",
+                        "fs/natives_close",
+                        { allocations = 122605, instructions = 497301761 },
+                        "-9\n",
+                        1,
+                    ),
+                ),
+            ),
+            (
+                "a program that calls the three line natives, write_text and remove_file emits their shared helpers once and reads every batch",
+                func(): run_program(
+                    fixture_program(
+                        "fs_native_lines",
+                        "fs/natives_lines",
+                        { allocations = 137979, instructions = 535214545 },
+                        once_given([work_directory], 0, FS_NATIVE_LINES_OUTPUT, 53),
+                    ),
+                ),
+            ),
+        ].concat(fs_tree_tests(compiler, c_compiler, work_directory, check_instructions)),
+    }

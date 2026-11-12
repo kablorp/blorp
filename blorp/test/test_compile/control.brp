@@ -1,21 +1,30 @@
 -- Native cases for matches, patterns, conditionals, loops, Result propagation,
--- process input, effects, calculators, main signatures and suite entries: each
--- program compiles once within its ceiling, then runs once per case with exact
--- status, stdout and stderr and strict allocation counts. Rejections check the
--- exact diagnostic and that no C is created or overwritten.
+-- process input, effects, calculators, main signatures, suite entries, compile
+-- failures (a rejected program, an output path that is a directory and a
+-- missing module) and a compile's cost, which must not depend on how deep its
+-- source sits: each program compiles once within its ceiling, then runs once
+-- per case with exact status, stdout and stderr and strict allocation counts.
+-- Rejections check the exact diagnostic and that no C is created or
+-- overwritten.
 import:
     int: Int methods
     list: List methods, repeat
     result: Result methods
     string: String methods
     test: TestSuite
-    ../driver/file_access: write_file
+    ../../src/common/cli/usage: EXIT_PATH
+    ../driver/file_access: make_directories, read_file, write_file
     ../driver/harness:
         CompileCeiling,
         CompileInput(SingleSource),
+        FIXTURES,
         LIBRARY_ROOT,
         Program,
+        compile_arguments,
+        compile_timed,
         exits_with,
+        expect_failure,
+        expect_status,
         fixture_program,
         once,
         prints,
@@ -128,6 +137,99 @@ private PASSING_SUITE_OUTPUT: String = "\n>> registration Tests\n  [PASS] pure\n
 
 
 private FAILING_SUITE_OUTPUT: String = "\n>> continued registration Tests\nfirst\n  [FAIL] first case\nsecond\n  [PASS] second case\nthird\n  [FAIL] third case\n\n2 of 3 tests failed\n"
+
+
+private func rejected_fixture(compiler: String, work_directory: String) -> Result[Void, String]:
+    verify_unpublished_rejection(
+        compiler,
+        work_directory,
+        "rejected",
+        "func start() -> Int:\n    0\n",
+        ":3:1: error: expected a main function\nhelp: declare func main() -> Int: as the entrypoint\n",
+    )
+
+
+-- fs words the failure, naming the output path the compiler was given.
+private func directory_output_fixture(
+    compiler: String,
+    work_directory: String,
+) -> Result[Void, String]:
+    source = work_directory + "/directory_output.brp"
+    _ ?= write_file(source, "func main() -> Int:\n    0\n")
+    expect_status(
+        compiler,
+        compile_arguments(LIBRARY_ROOT, source, work_directory),
+        work_directory + "/directory_output",
+        EXIT_PATH,
+        (
+            "blorp: error: could not write "
+            + work_directory
+            + ": is a directory\nhelp: provide a writable output path\n"
+        ),
+    )
+
+
+-- fs words the failure, naming the module path the loader resolved.
+private func missing_module_fixture(
+    compiler: String,
+    work_directory: String,
+) -> Result[Void, String]:
+    source = work_directory + "/missing_module.brp"
+    _ ?= write_file(source, "import:\n    ./missing: thing\nfunc main() -> Int:\n    0\n")
+    expect_failure(
+        compiler,
+        compile_arguments(LIBRARY_ROOT, source, work_directory + "/missing_module.c"),
+        work_directory + "/missing_module",
+        (
+            source
+            + ":2:5: error: could not read module "
+            + work_directory
+            + "/missing.brp: no such file\nhelp: check the import path and provide a readable .brp file under its source root\n"
+        ),
+    )
+
+
+-- Directories between the shallow and the deep copy of a fixture. Each extra
+-- level used to cost about four allocations, so eight is unmistakable.
+private DEPTH_LEVELS: String = "d1/d2/d3/d4/d5/d6/d7/d8"
+
+
+-- A compile's allocations are the same for a copy of a fixture however deep its
+-- directory sits, with absolute input and output paths and the same library
+-- root: the loader normalizes every path it is given, and a path that is
+-- already normal must cost nothing.
+private func verify_compile_depth_independence(
+    compiler: String,
+    work_directory: String,
+    check_instructions: Bool,
+) -> Result[Void, String]:
+    fixture: String ?= read_file(FIXTURES + "return/zero.brp")
+    shallow = work_directory + "/depth_shallow"
+    deep = shallow + "/" + DEPTH_LEVELS
+    _ ?= make_directories(shallow)
+    _ ?= make_directories(deep)
+    _ ?= write_file(shallow + "/zero.brp", fixture)
+    _ ?= write_file(deep + "/zero.brp", fixture)
+    shallow_allocations: Int ?= compile_timed(
+        check_instructions,
+        compiler,
+        LIBRARY_ROOT,
+        [shallow + "/zero.brp"],
+        shallow + "/zero",
+    )
+    deep_allocations: Int ?= compile_timed(
+        check_instructions,
+        compiler,
+        LIBRARY_ROOT,
+        [deep + "/zero.brp"],
+        deep + "/zero",
+    )
+    if shallow_allocations == deep_allocations:
+        Ok(void)
+    else:
+        Err(
+            "compile allocations depend on directory depth: ${shallow_allocations} in ${shallow}, ${deep_allocations} in ${deep}",
+        )
 
 
 func suite(
@@ -1727,6 +1829,84 @@ func suite(
                         ),
                     ),
                 ),
+            ),
+            (
+                "compile allocations do not depend on the checkout's depth",
+                func(): reported(
+                    verify_compile_depth_independence(compiler, work_directory, check_instructions),
+                ),
+            ),
+            (
+                "nonzero native exit is preserved",
+                func(): run_program(
+                    exits_with(
+                        "nonzero",
+                        "return/23",
+                        { allocations = 119475, instructions = 471319645 },
+                        23,
+                        0,
+                    ),
+                ),
+            ),
+            (
+                "managed text stdout and strict accounting",
+                func(): run_program(
+                    prints(
+                        "text",
+                        "effects/hello",
+                        { allocations = 120605, instructions = 494783096 },
+                        "Hello, World!\n",
+                        1,
+                    ),
+                ),
+            ),
+            (
+                "discard propagation preserves effects aliases and failures",
+                func(): run_program(
+                    prints(
+                        "discard",
+                        "result_propagation/discard",
+                        { allocations = 131853, instructions = 519292120 },
+                        "once\nshared-value\n7\nerror-once\nkept-error\n",
+                        12,
+                    ),
+                ),
+            ),
+            (
+                "grouped suites run in order and a failed suite fails the program",
+                func(): run_program(
+                    suite_program(
+                        "grouped_suites",
+                        "test_entry/passing",
+                        ["test_entry/failing"],
+                        { allocations = 138875, instructions = 542702761 },
+                        once(1, PASSING_SUITE_OUTPUT + FAILING_SUITE_OUTPUT, 42),
+                    ),
+                ),
+            ),
+            (
+                "the first suite alone passes",
+                func(): run_program(
+                    suite_program(
+                        "single_suite",
+                        "test_entry/passing",
+                        [],
+                        { allocations = 135531, instructions = 530974163 },
+                        once(0, PASSING_SUITE_OUTPUT, 21),
+                    ),
+                ),
+            ),
+            (
+                "rejected compilation creates no output and preserves an existing one",
+                func(): reported(rejected_fixture(compiler, work_directory)),
+            ),
+            (
+                "a compile whose output path is a directory fails with 'is a directory'",
+                func(): reported(directory_output_fixture(compiler, work_directory)),
+            ),
+            (
+                "an import of a missing module fails with its resolved path and 'no such file'",
+                func(): reported(missing_module_fixture(compiler, work_directory)),
             ),
         ],
     }

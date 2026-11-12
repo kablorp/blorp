@@ -161,7 +161,9 @@ literals in tests does not add them to the pilot's input grammar.
 
 **End-to-end.** The cases are in [test/test_compile/](test/test_compile/), with
 programs in [test/test_compile/fixtures/](test/test_compile/fixtures/), and the
-driver that runs them is [test/driver/driver.brp](test/driver/driver.brp).
+driver that runs them is [test/driver/driver.brp](test/driver/driver.brp); the
+runner API the cases share (`Program`, `verify_program` and the rest) is
+[test/driver/harness.brp](test/driver/harness.brp), which holds no case.
 `make -C blorp test-e2e` runs the native cases and process-runtime checks. Its approved orchestration entry is an ordinary `main(args)` that
 constructs Blorp `TestSuite`s and calls `test.run_suite`. Make builds it once per
 invocation with the compiler under test and passes a mode (`components`
