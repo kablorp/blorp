@@ -35,7 +35,7 @@ TEST_DRIVER := $(TEST_DRIVER_DIRECTORY)/driver
 EMBED_LIBRARY := build/generated/embed_library
 EMBEDDED_LIBRARY := build/generated/embedded_library.brp
 
-.PHONY: compiler generate-compiler link-compiler example test format-check test-components test-target-components test-compiler link-test-compiler test-e2e build-test-driver
+.PHONY: compiler generate-compiler link-compiler example test format-check test-target-components test-compiler link-test-compiler test-e2e build-test-driver
 
 compiler: generate-compiler
 	@$(MAKE) --no-print-directory link-compiler
@@ -90,11 +90,11 @@ cd ..; \
 	if [ ! -x "$$cc_path" ]; then printf '%s\n' 'C compiler must resolve to an executable file' >&2; exit 1; fi
 endef
 
-# One make invocation builds the driver once: test-components and test-e2e name
+# One make invocation builds the driver once: test-target-components and test-e2e name
 # it as a prerequisite, so they share one build when given together.
 test:
 	@$(MAKE) --no-print-directory test-compiler
-	@$(MAKE) --no-print-directory format-check test-components test-e2e
+	@$(MAKE) --no-print-directory format-check test-target-components test-e2e
 
 # The formatting gate. The roots are named so the walk never reaches build
 # output. FORMAT_EXCLUDED holds the sources that are unformatted on purpose:
@@ -115,12 +115,6 @@ format-check:
 	@$(RESOLVE_TEST_TOOLS); \
 	"$$compiler_path" format --check \
 		$(addprefix --exclude ,$(FORMAT_EXCLUDED)) $(FORMAT_ROOTS)
-
-# Other suites remain in source for incremental self-hosted migration; the
-# driver prints how many it leaves out, per top directory. That report is its own
-# invocation so test-target-components, the narrow loop, prints only its suites.
-test-components: test-target-components
-	@set -eu; cd ..; BLORP_LEAK_CHECK=strict "$(TEST_DRIVER)" deferred $(TARGET_COMPONENT_SOURCES)
 
 # The driver is an ordinary Blorp main(args) running TestSuites; fixtures retain
 # their own real mains. It receives all configuration explicitly from Make, and
@@ -143,7 +137,9 @@ build-test-driver:
 			-DBLORP_MEMORY_DIAGNOSTICS=1 "$(TEST_DRIVER).c" -o "$(TEST_DRIVER)" $(TEST_COMPILER_LIBRARIES)
 
 # One program per phase directory, built and run under strict leak checking in
-# blorp/build/self-hosted-tests/, where a failure can be inspected.
+# blorp/build/self-hosted-tests/, where a failure can be inspected. With no
+# TARGET_COMPONENT_SOURCES the driver runs its whole selection, and first fails
+# on any test_*.brp that selection leaves out.
 test-target-components: build-test-driver
 	@set -eu; $(RESOLVE_TEST_TOOLS); \
 		BLORP_LEAK_CHECK=strict "$(TEST_DRIVER)" components "$$compiler_path" "$$cc_path" \

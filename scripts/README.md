@@ -34,9 +34,8 @@ The Blorp test driver that `make` builds runs it and the e2e selection.
 The native e2e selection runs the real-main cases and process-runtime
 lifecycle checks through ordinary Blorp TestSuites, with exact output, strict
 accounting and ASan/UBSan checks. `test-e2e` uses an already-built diagnostic Blorp
-compiler. Unported unit/runtime/grammar/tooling suites
-are DEFERRED (the e2e directory has none), with their sources preserved; they receive no PASS credit, and
-`test-components` prints how many each top directory holds.
+compiler. Every `test_*.brp` file is selected and run; the
+full component run fails on one that `COMPONENT_SOURCES` does not list.
 
 ## Blorp seed build
 
@@ -66,8 +65,8 @@ The cache was `$XDG_CACHE_HOME/blorp/blorp2-bootstrap` before the rename to Blor
 directory is no longer read and can be deleted.
 
 The `example` target uses the newly built Blorp compiler. `test` builds Blorp and
-runs its explicit self-hosted component and native e2e selections; `test-components` uses an
-already-built Blorp compiler. Unported suites are deferred.
+runs its explicit self-hosted component and native e2e selections; `test-target-components` uses an
+already-built Blorp compiler.
 Run the isolated behavioral shell tests with
 `bash blorp/test/tooling/test_bootstrap.sh`; they use fake transport,
 seed and C compiler tools, including quoted paths and parallel target requests.

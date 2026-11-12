@@ -1,5 +1,5 @@
 import:
-    bool: and
+    bool: and, not
     int: Int methods
     io/fs/temporary_directory: TemporaryDirectoryError, with_temporary_directory
     list: List methods
@@ -20,11 +20,12 @@ import:
     ./self_hosted_harness as native_tests
     ./self_hosted_selection:
         EndToEndRun,
-        Invocation(Components, Deferred, EndToEnd),
+        Invocation(Components, EndToEnd),
         group_sources,
         component_selection,
         scan_entries,
-        deferral_line,
+        unselected_message,
+        unselected_sources,
         parse_invocation,
     ./self_hosted_strings as strings_tests
     ./self_hosted_surface as surface_tests
@@ -214,9 +215,9 @@ private COMPONENT_SOURCES: List[String] = [
 ]
 
 
--- Where test sources live. The deferred report counts, per top directory, the
--- test_*.brp files below it that no component selection runs.
-private DEFERRAL_ROOTS: List[String] = [
+-- Where test sources live. Every test_*.brp below a root must be listed in
+-- COMPONENT_SOURCES, or the full run fails before it builds anything.
+private TEST_ROOTS: List[String] = [
     "blorp/test/unit",
     "blorp/test/runtime",
     "blorp/test/test_grammar",
@@ -243,12 +244,20 @@ private func test_sources_under(directory: String) -> Result[List[String], Strin
     found
 
 
-private func report_deferred(selected: List[String]) -> Int:
+-- 0 only when every test source below the roots is in COMPONENT_SOURCES.
+private func check_selection() -> Int:
     var status = 0
-    for directory in DEFERRAL_ROOTS:
+    for directory in TEST_ROOTS:
         match test_sources_under(directory):
             Ok(found):
-                print(deferral_line(directory, found, selected))
+                unselected = unselected_sources(found, COMPONENT_SOURCES)
+                if (
+                    unselected
+                        .is_empty()
+                        .not()
+                ):
+                    print_error(unselected_message(unselected))
+                    status = 1
             Err(error):
                 print_error(error)
                 status = 1
@@ -346,14 +355,16 @@ func main(arguments: List[String]) -> Int:
                 Components(run):
                     match component_selection(run.sources, COMPONENT_SOURCES):
                         Ok(selected):
-                            run_suite(component_tests.suite(run.tools, group_sources(selected)))
-                        Err(message):
-                            print_error(message)
-                            1
-                Deferred(requested):
-                    match component_selection(requested, COMPONENT_SOURCES):
-                        Ok(selected):
-                            report_deferred(selected)
+                            -- Only the full run checks the selection: a narrow
+                            -- run names its own sources.
+                            status = if run.sources.is_empty():
+                                check_selection()
+                            else:
+                                0
+                            if status.equals(0):
+                                run_suite(component_tests.suite(run.tools, group_sources(selected)))
+                            else:
+                                status
                         Err(message):
                             print_error(message)
                             1

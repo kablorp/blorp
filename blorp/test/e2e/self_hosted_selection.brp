@@ -1,5 +1,5 @@
--- Argument parsing, source grouping and the deferral scan of the Blorp test
--- driver. Everything here is pure: the driver reads its arguments, never its
+-- Argument parsing, source grouping and the unselected-source check of the Blorp
+-- test driver. Everything here is pure: the driver reads its arguments, never its
 -- environment, and its file system and process work live in the modules that
 -- import this one.
 import:
@@ -190,31 +190,23 @@ pure func scan_entries(directory: String, entries: List[Entry]) -> DirectoryScan
     }
 
 
--- One DEFERRED line for a top directory: how many of its test sources no
--- selection runs.
-pure func deferral_line(
-    directory: String,
-    test_sources: List[String],
-    selected: List[String],
-) -> String:
-    deferred = test_sources
-        .filter(
-            pure func(source: String): selected
-                .contains(source)
-                .not(),
-        )
-        .length()
-    (
-        "DEFERRED: "
-        + directory
-        + ": "
-        + deferred.to_string()
-        + " of "
-        + test_sources
-            .length()
-            .to_string()
-        + " test_*.brp files are not run"
+-- The test sources no component selection runs, in scan order.
+pure func unselected_sources(test_sources: List[String], selected: List[String]) -> List[String]:
+    test_sources.filter(
+        pure func(source: String): selected
+            .contains(source)
+            .not(),
     )
+
+
+-- One rejection per unselected test source, each with the way to fix it.
+-- The rejections are bound before joining: with `Path` imported, `join` also
+-- names path.brp's, and a chained call cannot choose before `map` is solved.
+pure func unselected_message(unselected: List[String]) -> String:
+    rejections = unselected.map(
+        pure func(source: String): "${source}: no suite runs this test file\nhelp: list it in COMPONENT_SOURCES in blorp/test/e2e/self_hosted.brp, or delete it",
+    )
+    rejections.join("\n")
 
 
 -- Captured output ends with the newline that print adds again.
@@ -238,23 +230,21 @@ pure func without_final_newline(text: String) -> String:
 -- searches PATH or guesses a working directory.
 --   components COMPILER C_COMPILER [LIBRARY...] [-- SOURCE...]
 --       builds and runs one program per directory of SOURCE..., or of the
---       built-in selection when none are given.
---   deferred [SOURCE...]
---       counts the test sources that selection does not run.
+--       built-in selection when none are given. The built-in selection first
+--       fails on any test_*.brp under the test roots that it does not list.
 --   e2e COMPILER C_COMPILER TEMPORARY_PARENT [--check-instructions]
 --       runs the native examples in a directory made inside TEMPORARY_PARENT.
 --       With the flag, each ported example's compile must also stay within its
 --       retired-instruction ceiling (macOS /usr/bin/time -l); without it only
 --       the allocation ceilings are held.
 private COMPONENTS_MODE: String = "components"
-private DEFERRED_MODE: String = "deferred"
 private E2E_MODE: String = "e2e"
 private SOURCES_SEPARATOR: String = "--"
 private CHECK_INSTRUCTIONS_FLAG: String = "--check-instructions"
 private PATH_ROOT: String = "/"
 
 
-USAGE: String = "usage: self-hosted components COMPILER C_COMPILER [LIBRARY...] [-- SOURCE...]\n       self-hosted deferred [SOURCE...]\n       self-hosted e2e COMPILER C_COMPILER TEMPORARY_PARENT [--check-instructions]"
+USAGE: String = "usage: self-hosted components COMPILER C_COMPILER [LIBRARY...] [-- SOURCE...]\n       self-hosted e2e COMPILER C_COMPILER TEMPORARY_PARENT [--check-instructions]"
 
 
 NOT_ABSOLUTE: String = "self-hosted driver requires absolute compiler, C compiler and temporary-parent paths"
@@ -277,7 +267,6 @@ record EndToEndRun {
 
 union Invocation:
     Components(ComponentRun)
-    Deferred(List[String])
     EndToEnd(EndToEndRun)
 
 
@@ -363,9 +352,6 @@ pure func parse_invocation(arguments: List[String]) -> Result[Invocation, String
     rest = words.drop(1)
     if mode.equals(COMPONENTS_MODE):
         parse_components(rest)
-    else if mode.equals(DEFERRED_MODE):
-        invocation: Invocation = Deferred(rest)
-        Ok(invocation)
     else if mode.equals(E2E_MODE):
         parse_end_to_end(rest)
     else:

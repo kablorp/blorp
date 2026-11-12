@@ -116,9 +116,6 @@ None of these is planned yet. Each wants its own short design or brief.
 - **Tooling found broken or quiet while landing work:**
   - `scripts/blorp-compiler-bootstrap` prints nothing when it downloads or
     reuses a cached seed, so a build log cannot show which seed it used.
-  - **Unit files outside `COMPONENT_SOURCES` rot unseen.** No gate compiles
-    them: `test_check/test_structural_patterns.brp` no longer compiles
-    (`is_ok` is unknown), and ten test imports name files that are gone.
 - **Compiler costs found while landing work:**
   - **A named lambda costs one allocation per call.** Binding a lambda to a
     local before passing it costs an allocation that an inline lambda does

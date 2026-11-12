@@ -428,24 +428,15 @@ printf 'components|%s|%s|-lm|-lpthread|--|a|b/test_one.brp|c.brp\n' "$expected_c
 cmp -s "$TEST_DRIVER_ARGS" "$scratch/expected" || fail 'the narrow selection is not passed to the components mode'
 pass 'test-target-components passes TARGET_COMPONENT_SOURCES to the driver, and only that'
 
-for target in test-target-components test-components; do
-	reset_driver_logs
-	if ! run_test_target "$target"; then cat "$scratch/make.stderr" >&2; fail "$target must run the driver"; fi
-	printf 'components|%s|%s|-lm|-lpthread|--\n' "$expected_compiler" "$expected_cc" >"$scratch/expected"
-	[ "$target" = test-target-components ] || printf 'deferred\n' >>"$scratch/expected"
-	cmp -s "$TEST_DRIVER_ARGS" "$scratch/expected" || fail "$target did not leave the selection to the driver or report deferrals only for test-components"
-	if grep -Fq 'driver:e2e' "$TEST_DRIVER_LOG"; then fail "$target ran e2e"; fi
-	grep -Fxq "driver:components:strict:$fixture" "$TEST_DRIVER_LOG" || fail "$target did not run the components mode strictly from the repository root"
-	pass "$target leaves an empty selection to the driver's built-in list"
-done
-
 reset_driver_logs
-if ! run_test_target test-components TARGET_COMPONENT_SOURCES='a.brp'; then cat "$scratch/make.stderr" >&2; fail 'test-components with a selection'; fi
-printf 'components|%s|%s|-lm|-lpthread|--|a.brp\ndeferred|a.brp\n' "$expected_compiler" "$expected_cc" >"$scratch/expected"
-cmp -s "$TEST_DRIVER_ARGS" "$scratch/expected" || fail 'the deferral report does not use the same selection'
-pass 'test-components reports deferrals against the selection it ran'
+if ! run_test_target test-target-components; then cat "$scratch/make.stderr" >&2; fail 'test-target-components must run the driver'; fi
+printf 'components|%s|%s|-lm|-lpthread|--\n' "$expected_compiler" "$expected_cc" >"$scratch/expected"
+cmp -s "$TEST_DRIVER_ARGS" "$scratch/expected" || fail 'test-target-components did not leave the selection to the driver'
+if grep -Fq 'driver:e2e' "$TEST_DRIVER_LOG"; then fail 'test-target-components ran e2e'; fi
+grep -Fxq "driver:components:strict:$fixture" "$TEST_DRIVER_LOG" || fail 'test-target-components did not run the components mode strictly from the repository root'
+pass "test-target-components leaves an empty selection to the driver's built-in list"
 
-# `test` builds the driver once, then runs components, the deferral report and e2e.
+# `test` builds the driver once, then runs components and e2e.
 reset_driver_logs
 if ! TMPDIR="$link_parent" make -s -C "$fixture/blorp" test BLORP_CC="$tools/fake cc" \
 	BLORP_COMPILER='blorp/build/output compiler' \
@@ -454,9 +445,9 @@ if ! TMPDIR="$link_parent" make -s -C "$fixture/blorp" test BLORP_CC="$tools/fak
 	fail 'test must run the self-hosted driver'
 fi
 [ "$(grep -c '^compiler:strict$' "$TEST_COMPILER_ARGS")" = 1 ] || fail 'test did not build the driver exactly once'
-printf 'driver:components:strict:%s\ndriver:deferred:strict:%s\ndriver:e2e:strict:%s\n' "$fixture" "$fixture" "$fixture" >"$scratch/expected"
-cmp -s "$TEST_DRIVER_LOG" "$scratch/expected" || fail 'test did not run components, deferrals and e2e in that order'
-pass 'test builds the driver once and runs components, deferrals and e2e in order'
+printf 'driver:components:strict:%s\ndriver:e2e:strict:%s\n' "$fixture" "$fixture" >"$scratch/expected"
+cmp -s "$TEST_DRIVER_LOG" "$scratch/expected" || fail 'test did not run components and e2e in that order'
+pass 'test builds the driver once and runs components and e2e in order'
 
 for failure_kind in driver-compile driver-link driver-run; do
 	reset_driver_logs
@@ -466,17 +457,16 @@ for failure_kind in driver-compile driver-link driver-run; do
 		driver-link) TEST_CC_STATUS=42 ;;
 		driver-run) TEST_DRIVER_STATUS=43 ;;
 	esac
-	for target in test-target-components test-components test-e2e; do
+	for target in test-target-components test-e2e; do
 		: >"$TEST_DRIVER_LOG"
 		if run_test_target "$target"; then fail "$target ignored a $failure_kind failure"; fi
 		if [ "$failure_kind" != driver-run ] && [ -s "$TEST_DRIVER_LOG" ]; then fail "$target ran a driver after a $failure_kind failure"; fi
-		if [ "$failure_kind" = driver-run ] && [ "$target" = test-components ] && [ "$(wc -l <"$TEST_DRIVER_LOG" | tr -d ' ')" != 1 ]; then fail 'a failed component run still reported deferrals'; fi
 	done
 	pass "a $failure_kind failure stops every test target and fails it"
 done
 unset TEST_DRIVER_COMPILE_STATUS TEST_CC_STATUS TEST_DRIVER_STATUS
 
-for target in test-target-components test-components test-e2e; do
+for target in test-target-components test-e2e; do
 	expect_failure 'missing Blorp test compiler' make -s -C "$fixture/blorp" "$target" BLORP_COMPILER=missing-compiler
 done
 pass 'every test target fails with actionable build help when the compiler is missing'

@@ -1098,8 +1098,8 @@ only once, and a `private tests` constant is accepted only in the first file.
 
 The component gate compiles each phase directory's suites into one program,
 `all_suites`, under `blorp/build/self-hosted-tests/`, and runs it with strict
-leak checking; `test-components` then prints a `DEFERRED:` line per top test
-directory, counting the `test_*.brp` files it does not run. Each native e2e
+leak checking. The full run first fails on any `test_*.brp` under the test
+roots that `COMPONENT_SOURCES` does not list. Each native e2e
 case is a `Program` built with the constructors in
 [`self_hosted_harness.brp`](test/e2e/self_hosted_harness.brp): one compile,
 against its `library_root` (the standard library unless the program names

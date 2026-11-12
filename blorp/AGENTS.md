@@ -7,18 +7,15 @@ owns runnable commands; [grammar.ebnf](grammar.ebnf) is its grammar.
 ## Scope
 
 The pinned Blorp seed builds the current compiler. All active Blorp tests
-are self-hosted. Unported suites remain in source and are explicitly
-deferred. Compiler source stays within the eventual bootstrap subset: no
-concurrency, parallelism, tensors
+are self-hosted, and every test file is selected and run. Compiler source
+stays within the eventual bootstrap subset: no concurrency, parallelism, tensors
 or dimension types, debug blocks, numeric widths other than Int64 and Float64,
 doctests, channels or FFI. Tuples and static traits are supported by the
 current seed; their use in compiler implementation remains bounded by each
 reviewed task. Compiler source writes arithmetic, ordering and equality with
 their operators; String `+` calls Addable. Other operations use concrete
 functions such as `concat`, and pattern matching. Boolean logic calls the
-`and`, `or` and `not` functions of the `bool` library module. Dependencies on
-the old TestSuite API mark deferred tests; port bounded suites
-incrementally without expanding the input language.
+`and`, `or` and `not` functions of the `bool` library module.
 
 Each increment starts from a small executable fixture and its expected
 behavior, including rejections. Define only the grammar and rules that
@@ -100,7 +97,7 @@ Commands, from the repository root:
 
 ```bash
 make -C blorp compiler                  # build the compiler from the pinned seed
-make -C blorp test                      # components, deferrals report and native e2e
+make -C blorp test                      # components and native e2e
 make -C blorp test-target-components TARGET_COMPONENT_SOURCES=<paths>   # one suite
 scripts/blorp-fixpoint --prove          # A builds B, B builds C, B == C
 bash blorp/test/tooling/test_bootstrap.sh   # bootstrap resolver and Makefile recipes
@@ -142,12 +139,12 @@ suite file itself.
 `make -C blorp test` builds Blorp, runs the explicit component selection
 (`COMPONENT_SOURCES` in [test/e2e/self_hosted.brp](test/e2e/self_hosted.brp))
 through its ordinary TestSuite entries, and runs the self-hosted native
-e2e selection. `test-components` and `test-target-components` run that selection
+e2e selection. `test-target-components` runs that selection
 with an already-built Blorp compiler; `TARGET_COMPONENT_SOURCES=<paths>` makes
-`test-target-components` run exactly those suites instead. Unported
-unit/runtime/grammar/tooling suites are DEFERRED, preserved for incremental
-migration, and receive no PASS credit; `test-components` prints how many
-`test_*.brp` files each top directory leaves out.
+it run exactly those suites instead. Every `test_*.brp` file under the
+test roots is selected: a full run fails before it builds anything, naming each
+file that `COMPONENT_SOURCES` does not list. Add a new suite to the list, or
+delete it.
 Rejections check exact message, help and span. Embedded programs use aligned
 multiline strings with exact contents; keep quoted escapes where they make
 the bytes clearer, such as CRLF or malformed indentation. Using multiline
@@ -157,8 +154,8 @@ literals in tests does not add them to the pilot's input grammar.
 [test/e2e/fixtures/](test/e2e/fixtures/). `make -C blorp test-e2e` runs the native cases and process-runtime
 checks. Its approved orchestration entry is an ordinary `main(args)` that
 constructs Blorp `TestSuite`s and calls `test.run_suite`. Make builds it once per
-invocation with the compiler under test and passes a mode (`components`,
-`deferred` or `e2e`), the exact compiler and C compiler paths and, for the
+invocation with the compiler under test and passes a mode (`components`
+or `e2e`), the exact compiler and C compiler paths and, for the
 component modes, the link libraries as argv; the driver makes its own e2e work
 directory with `io/fs/temporary_directory`'s `with_temporary_directory`. This narrow entry exception
 does not authorize alternate fixture mains or assertion frameworks.

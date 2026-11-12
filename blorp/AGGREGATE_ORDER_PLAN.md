@@ -345,7 +345,7 @@ already compiles. Keith decided K1–K4 on 2026-11-10.
 Both suites build programs from source through the real phases
 (`lowered(...)` from `test/unit/list_update_inputs.brp`, then `own`,
 `verify`, `emit`). Each case first asserts the catalogue shape it relies
-on, the way `test_tuples.brp`'s `complete_catalogue` does. A source that
+on: a pattern match on the specialized program's record and union rows. A source that
 stops producing the intended layouts then fails loudly instead of passing
 vacuously. Each source's `main` constructs every record, union and callable the case
 relies on, since Specialize only catalogues what the program builds.
