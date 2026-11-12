@@ -65,6 +65,14 @@ done.
   - **Built:** D40, a pure `String.lines()` with `fold_lines`'s line rules, so
     `read_text(path).lines()` collects lines.
   - **Later:** the plan's "Later" list.
+- **Library cost:** [`LIBRARY_COST_PLAN.md`](LIBRARY_COST_PLAN.md).
+  - **Status:** hello's compile is about 99% standard-library work. Keith
+    approved option (a) on 2026-11-12. Checking now closes instantiation
+    paths only within strongly connected components, so bounded `!=`
+    functions no longer cost time quadratic in their number.
+  - **Next:** option (a)'s second landing, deciding ordinary growth from the
+    same components. Option (b), elaborating a library body only when the
+    program reaches it, waits on four decisions for Keith in the plan.
 
 ## Smaller follow-ups
 
@@ -84,17 +92,8 @@ None of these is planned yet. Each wants its own short design or brief.
 - **Binary patterns.** Erlang-style matching and construction on `Bytes`, with
   sized, endian segments and storage-sharing slices. It waits for a
   binary-format consumer.
-- **Checking a bounded generic function costs time quadratic in their number.**
-  - Every compile checks every library module the prelude reaches, so
-    adding `List.starts_with` (23 M instructions) and `Orderable for List`
-    (20 M) raised a hello program's compile from 322 M to 395 M instructions
-    (+22%, `-O0`), 51 M of it from the List additions.
-  - Probe: N copies of `pure func ne_i[E: Equatable](a: E, b: E) -> Bool: a != b`
-    beside hello cost 416 M with none, 653 M for N=10, 2.43 G for N=40 and
-    7.12 G for N=80. `==` costs about a tenth as much as `!=` (642 M for 40).
-  - Lead: the allocations come from `instantiation_paths.insert` and
-    `recursion.dependency_graph`. Raw data is in the main checkout's ignored
-    `build/measurements/bounded-generic-checking-2026-11-12/`.
+- **Checking cost follows the library, not the program:** see
+  [`LIBRARY_COST_PLAN.md`](LIBRARY_COST_PLAN.md).
 - **Names and errors:**
   - **The clash message for a prelude String method's name.** A user function
     `lines(text: String)` reports "two functions named lines can accept the
@@ -114,7 +113,8 @@ None of these is planned yet. Each wants its own short design or brief.
     the size of the embedded library text. `Path` stays an explicit import
     for the same reason (about +31,000 allocations and +26% instructions to
     compile an empty program as a prelude name); revisit once the checker
-    checks only the declarations a program uses.
+    checks only the declarations a program uses (option (b) of
+    [`LIBRARY_COST_PLAN.md`](LIBRARY_COST_PLAN.md)).
   - **Temporary-directory cleanup and `ENOSPC`.** One native serves
     `RemoveTreeError`, which has no `NoSpace`, and a temporary directory's
     cleanup, so `ENOSPC` during cleanup arrives as `OtherOs(28)`.

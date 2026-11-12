@@ -7,6 +7,7 @@ import:
     bool: Bool methods
     int: INT_MAX, Int methods
     list: repeat
+    option: Option methods
 
 
 union PathOperation:
@@ -224,6 +225,116 @@ private pure func pump_transitions(
     marked
 
 
+-- One control on Tarjan's depth-first path and the next of its successors to
+-- visit, an offset into `successors`.
+private fixed record Visit {
+    control: Int,
+    edge: Int,
+}
+
+
+-- A stack whose live part is the first `height` entries, so a pop is a
+-- counter decrement and never copies the list.
+private pure func push_at[T](values: List[T], height: Int, value: T) -> List[T]:
+    if height < values.length():
+        values.set(height, value)
+    else:
+        values.append(value)
+
+
+-- Each control's strongly connected component over the transitions read as a
+-- plain graph, named by the component's first-visited control. Tarjan's
+-- algorithm, iterative so that a long chain of controls cannot exhaust the
+-- stack; successors are in compressed rows (row c is successors[starts[c]
+-- up to starts[c + 1]]). Callers pass transitions whose ends lie in
+-- 0..count, so every index below is in range and no `get_or` default is
+-- ever used: each stands in for a lookup that cannot miss.
+pure func strong_components(count: Int, transitions: List[InstantiationPath]) -> List[Int]:
+    var starts: List[Int] = repeat(0, count + 1)
+    for transition in transitions:
+        starts = starts.set(transition.source + 1, starts.get_or(transition.source + 1, 0) + 1)
+    for control in 0..count:
+        starts = starts.set(control + 1, starts.get_or(control + 1, 0) + starts.get_or(control, 0))
+    var filled = starts
+    var successors: List[Int] = repeat(0, transitions.length())
+    for transition in transitions:
+        slot = filled.get_or(transition.source, 0)
+        successors = successors.set(slot, transition.target)
+        filled = filled.set(transition.source, slot + 1)
+    var order: List[Int] = repeat(-1, count)
+    var low: List[Int] = repeat(-1, count)
+    var component: List[Int] = repeat(-1, count)
+    var frames: List[Visit] = []
+    var depth = 0
+    var waiting: List[Int] = []
+    var height = 0
+    var discovered = 0
+    for root in 0..count:
+        var entering: Option[Int] = None
+        if order.get_or(root, 0) < 0:
+            entering = Some(root)
+        while (
+            entering
+                .is_some()
+                .or(depth > 0)
+        ):
+            match entering:
+                Some(control):
+                    order = order.set(control, discovered)
+                    low = low.set(control, discovered)
+                    discovered = discovered + 1
+                    waiting = waiting.push_at(height, control)
+                    height = height + 1
+                    frames = frames.push_at(depth, {
+                        control = control,
+                        edge = starts.get_or(control, 0),
+                    })
+                    depth = depth + 1
+                    entering = None
+                None:
+                    -- depth > 0 here: the loop runs with no control to enter only then.
+                    top = frames.get_or(depth - 1, { control = 0, edge = 0 })
+                    if top.edge < starts.get_or(top.control + 1, 0):
+                        frames = frames.set(depth - 1, { top | edge = top.edge + 1 })
+                        successor = successors.get_or(top.edge, 0)
+                        if order.get_or(successor, 0) < 0:
+                            entering = Some(successor)
+                        else:
+                            -- A visited control without a component is still waiting.
+                            if component.get_or(successor, 0) < 0:
+                                low = low.set(
+                                    top.control,
+                                    low
+                                        .get_or(top.control, 0)
+                                        .min(order.get_or(successor, 0)),
+                                )
+                    else:
+                        depth = depth - 1
+                        finished = low.get_or(top.control, 0)
+                        if finished == order.get_or(top.control, 0):
+                            var member = -1
+                            while member != top.control:
+                                height = height - 1
+                                member = waiting.get_or(height, 0)
+                                component = component.set(member, top.control)
+                        if depth > 0:
+                            parent = frames.get_or(depth - 1, top).control
+                            low = low.set(
+                                parent,
+                                low
+                                    .get_or(parent, 0)
+                                    .min(finished),
+                            )
+    component
+
+
+-- A pump is a cycle, and every derivation of a pair whose ends share a
+-- strongly connected component stays inside that component, so only
+-- transitions within one component can be marked or make a path unbounded.
+-- Closing over just those keeps the dense tables sized by the controls on
+-- cycles, not by every control the producer issued. Controls are renumbered
+-- in their original order and marks map back to original positions, so the
+-- result, including the order of marks, is what the whole graph gives.
 pure func bound_instantiation_paths(
     count: Int,
     transitions: List[InstantiationPath],
@@ -247,22 +358,63 @@ pure func bound_instantiation_paths(
     if valid.not():
         None
     else:
-        var initial = no_pairs(count)
+        -- Validation above bounds every control, so no lookup below can miss.
+        components = strong_components(count, transitions)
+        var used: List[Bool] = repeat(False, count)
+        var cyclic: List[InstantiationPath] = []
+        var origins: List[Int] = []
+        var position = 0
+        for transition in transitions:
+            if components.get_or(transition.source, 0) == components.get_or(transition.target, 0):
+                used = used
+                    .set(transition.source, True)
+                    .set(transition.target, True)
+                cyclic = cyclic.append(transition)
+                origins = origins.append(position)
+            position = position + 1
+        var local: List[Int] = repeat(0, count)
+        var size = 0
         for control in 0..count:
-            initial = initial.insert(control, control)
-        for transition in transitions:
-            match transition.operation:
-                KeepPath: initial = initial.insert(transition.source, transition.target)
-                _: void
-        balanced = initial.close_paths(transitions)
-        var forward = balanced
-        for transition in transitions:
-            match transition.operation:
-                PushPath(_): forward = forward.insert(transition.source, transition.target)
-                _: void
-        reachable = forward.close_paths([])
-        anchors = reachable.pump_anchors(transitions)
-        if anchors.is_empty():
-            Some(BoundedPaths)
-        else:
-            Some(UnboundedPaths(balanced.pump_transitions(reachable, anchors, transitions)))
+            if used.get_or(control, False):
+                local = local.set(control, size)
+                size = size + 1
+        -- Lambdas cannot capture a `var`, so the closures below read these
+        -- immutable copies.
+        numbering = local
+        positions = origins
+        inner = cyclic.map(
+            pure func(transition) -> InstantiationPath: { transition |
+                source = numbering.get_or(transition.source, 0),
+                target = numbering.get_or(transition.target, 0),
+            },
+        )
+        match bound_cyclic_paths(size, inner):
+            UnboundedPaths(marked):
+                Some(UnboundedPaths(marked.map(pure func(found): positions.get_or(found, 0))))
+            BoundedPaths:
+                Some(BoundedPaths)
+
+
+private pure func bound_cyclic_paths(
+    count: Int,
+    transitions: List[InstantiationPath],
+) -> PathBoundedness:
+    var initial = no_pairs(count)
+    for control in 0..count:
+        initial = initial.insert(control, control)
+    for transition in transitions:
+        match transition.operation:
+            KeepPath: initial = initial.insert(transition.source, transition.target)
+            _: void
+    balanced = initial.close_paths(transitions)
+    var forward = balanced
+    for transition in transitions:
+        match transition.operation:
+            PushPath(_): forward = forward.insert(transition.source, transition.target)
+            _: void
+    reachable = forward.close_paths([])
+    anchors = reachable.pump_anchors(transitions)
+    if anchors.is_empty():
+        BoundedPaths
+    else:
+        UnboundedPaths(balanced.pump_transitions(reachable, anchors, transitions))

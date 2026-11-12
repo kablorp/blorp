@@ -8,6 +8,7 @@ import:
         PathOperation(KeepPath, PushPath, PopPath),
         PathBoundedness(BoundedPaths, UnboundedPaths),
         bound_instantiation_paths,
+        strong_components,
 
 
 -- These are analysis-local controls/symbols, not fabricated semantic IDs.
@@ -175,6 +176,138 @@ pure func test_unrelated_nonpump_transitions_are_not_marked() -> Bool:
         _: False
 
 
+-- Transitions on no cycle never enter the closure, yet marks still name the
+-- original positions, in the whole graph's order.
+pure func test_marks_keep_positions_around_acyclic_transitions() -> Bool:
+    paths: List[InstantiationPath] = [
+        { source = 3, target = 0, operation = PushPath(1) },
+        { source = 0, target = 1, operation = PushPath(0) },
+        { source = 2, target = 3, operation = KeepPath },
+        { source = 1, target = 0, operation = KeepPath },
+        { source = 1, target = 4, operation = PopPath(0) },
+    ]
+    match bound_instantiation_paths(5, paths):
+        Some(UnboundedPaths(marked)): marked == [1, 3]
+        _: False
+
+
+-- Two pumps in separate components joined by an edge on no cycle: both are
+-- marked in transition order and the joining edge is not.
+pure func test_pumps_in_separate_components_keep_transition_order() -> Bool:
+    paths: List[InstantiationPath] = [
+        { source = 1, target = 1, operation = PushPath(0) },
+        { source = 0, target = 1, operation = KeepPath },
+        { source = 0, target = 0, operation = PushPath(0) },
+    ]
+    match bound_instantiation_paths(2, paths):
+        Some(UnboundedPaths(marked)): marked == [0, 2]
+        _: False
+
+
+-- Controls on one cycle share a component; a chain into it and a self loop
+-- elsewhere do not join it.
+pure func test_components_group_cycles_and_separate_chains() -> Bool:
+    components = strong_components(5, [
+        { source = 0, target = 1, operation = KeepPath },
+        { source = 1, target = 2, operation = PushPath(0) },
+        { source = 2, target = 1, operation = KeepPath },
+        { source = 3, target = 3, operation = PopPath(0) },
+    ])
+    match components:
+        [entry, cycle_start, cycle_end, looped, alone]:
+            [
+                cycle_start == cycle_end,
+                entry != cycle_start,
+                looped != cycle_start,
+                alone != cycle_start,
+                alone != looped,
+                entry != alone,
+            ].all(pure func(holds): holds)
+        _:
+            False
+
+
+pure func test_a_three_control_cycle_is_one_component() -> Bool:
+    components = strong_components(4, [
+        { source = 0, target = 1, operation = KeepPath },
+        { source = 1, target = 2, operation = PushPath(0) },
+        { source = 2, target = 0, operation = PopPath(0) },
+        { source = 2, target = 3, operation = KeepPath },
+    ])
+    match components:
+        [cycle_a, cycle_b, cycle_c, outside]:
+            [cycle_a == cycle_b, cycle_b == cycle_c, outside != cycle_a].all(
+                pure func(holds): holds,
+            )
+        _:
+            False
+
+
+-- From 0 the search finishes {1, 2} first and then reaches 1 again from 3.
+-- That edge crosses into a finished component, so it must not pull 3 into
+-- 0's component.
+pure func test_a_cross_edge_into_a_finished_component_joins_nothing() -> Bool:
+    components = strong_components(4, [
+        { source = 0, target = 1, operation = KeepPath },
+        { source = 1, target = 2, operation = KeepPath },
+        { source = 2, target = 1, operation = KeepPath },
+        { source = 0, target = 3, operation = KeepPath },
+        { source = 3, target = 1, operation = KeepPath },
+    ])
+    match components:
+        [root, cycle_a, cycle_b, crossing]:
+            [cycle_a == cycle_b, root != cycle_a, crossing != cycle_a, crossing != root].all(
+                pure func(holds): holds,
+            )
+        _:
+            False
+
+
+-- Only 3's back edge reaches 1, so 2 learns its low link from 3, and 1
+-- closes all three; 0 above and 4 below stay alone.
+pure func test_a_nested_back_edge_propagates_its_low_link() -> Bool:
+    components = strong_components(5, [
+        { source = 0, target = 1, operation = KeepPath },
+        { source = 1, target = 2, operation = KeepPath },
+        { source = 2, target = 3, operation = KeepPath },
+        { source = 3, target = 1, operation = KeepPath },
+        { source = 3, target = 4, operation = KeepPath },
+    ])
+    match components:
+        [above, cycle_a, cycle_b, cycle_c, below]:
+            [
+                cycle_a == cycle_b,
+                cycle_b == cycle_c,
+                above != cycle_a,
+                below != cycle_a,
+                above != below,
+            ].all(pure func(holds): holds)
+        _:
+            False
+
+
+-- Longer than the 50,000 frames at which a recursive search overflows the
+-- host stack (see load.brp's load_queue), so this cycle proves the search is
+-- iterative.
+private LONG_CYCLE: Int = 100000
+
+
+pure func test_a_long_cycle_is_one_component_without_recursion() -> Bool:
+    var paths: List[InstantiationPath] = []
+    for control in 0..LONG_CYCLE:
+        paths = paths.append({
+            source = control,
+            target = (control + 1) % LONG_CYCLE,
+            operation = KeepPath,
+        })
+    components = strong_components(LONG_CYCLE, paths)
+    root = components.get_or(0, -1)
+    and(
+        int_ops.equals(components.length(), LONG_CYCLE),
+        components.all(pure func(component): component == root),
+    )
+
+
 pure func test_matching_cancellation_exposes_a_growing_cycle() -> Bool:
     marks_all(3, [
         { source = 0, target = 1, operation = PushPath(0) },
@@ -241,5 +374,30 @@ TESTS: TestSuite = {
             test_a_pair_found_only_through_closure_exposes_the_pump,
         ),
         ("marks follow discovery order", test_marks_follow_discovery_order_of_each_pump),
+        (
+            "marks keep positions around acyclic transitions",
+            test_marks_keep_positions_around_acyclic_transitions,
+        ),
+        (
+            "pumps in separate components keep transition order",
+            test_pumps_in_separate_components_keep_transition_order,
+        ),
+        (
+            "components group cycles and separate chains",
+            test_components_group_cycles_and_separate_chains,
+        ),
+        ("a three-control cycle is one component", test_a_three_control_cycle_is_one_component),
+        (
+            "a cross edge into a finished component joins nothing",
+            test_a_cross_edge_into_a_finished_component_joins_nothing,
+        ),
+        (
+            "a nested back edge propagates its low link",
+            test_a_nested_back_edge_propagates_its_low_link,
+        ),
+        (
+            "a long cycle is one component without recursion",
+            test_a_long_cycle_is_one_component_without_recursion,
+        ),
     ],
 }
