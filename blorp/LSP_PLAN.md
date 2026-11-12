@@ -1,7 +1,7 @@
 # Language server: `blorp lsp`
 
-**Status: plan, 2026-11-10, revised the same day; Keith settled its open
-decisions on 2026-11-11. Next: landing 1.**
+**Status: plan, 2026-11-10; Keith settled its decisions and asked for a byte
+console on 2026-11-11. Landing 1 is in progress.**
 
 ## Problem
 
@@ -30,10 +30,10 @@ grammar; comments as lexer output; a limited v1 root, documented; library
 go-to through a temporary folder; the cleanest rotation path; and an
 ergonomic way to write without a newline (not `put`).
 
-**On 2026-11-11:** CLion first; `read_exact` returns `Bytes`, since a byte
-count can end inside a character; name uses always recorded, with no spike;
-and broken files served from the last good analysis, after the plugin. The
-console names and flushing await approval at landing 8.
+**On 2026-11-11:** CLion first; name uses always recorded;
+broken files served from the last good analysis, after the plugin; and the
+console reworked "to work with bytes", for the LSP. Keith then approved
+the byte console as below, with read flushing and the closed-pipe rule.
 
 **What exists:** the `json` codec; loader source snapshots
 (`load_program_with_sources`, `analysis/load/load.brp:823`); the embedded
@@ -50,7 +50,6 @@ process `capture`, which can feed standard input.
 - **A failed lex keeps no tokens**, because names are interned only after a
   successful scan (`common/syntax/lex.brp:1954`).
 - **The console cannot read**, and `print` always adds a newline.
-- **Each phase reports only its first error.**
 
 **Related plans:** `STRING_PLAN.md` moves byte work to `byte_*` functions,
 and `PATH_PLAN.md`'s naming and exact-error rules apply here.
@@ -135,13 +134,14 @@ file. A trait's `Self` resolves to the trait's name.
 
 **Where.** `check`'s body walk always records uses, in a new
 `check/name_uses.brp`, because fields, type parameters and bindings are
-Check's identities. Import selections name only declarations, which `namespace` resolves (`import_row`,
-`namespace/namespace.brp:1058`) but keeps no spans for. It gains a table of
+Check's identities. Import selections name only declarations, which
+`namespace` resolves (`import_row`, `namespace/namespace.brp:1058`) but
+keeps no spans for. It gains a table of
 each selection's span and entity, which `check` turns into uses.
 
 **Inline rows.** `NameUse` is a `fixed record` over a `fixed union`, so rows
-take no allocation each. Seven plain types become `fixed`, which they
-already qualify for: `TypeHead` and `PrimitiveType` in `namespace/`, and
+take no allocation each. Seven plain types that already qualify become
+`fixed`: `TypeHead` and `PrimitiveType` in `namespace/`, and
 `TypeParameterIdentity`, `TypeParameterOwner`, `ScopedBindingId`,
 `BodyOwner` and `AggregateId` in `check/model.brp`. `FieldId` gains the
 `Equatable` that `Referent`'s `==` needs.
@@ -149,36 +149,36 @@ already qualify for: `TypeHead` and `PrimitiveType` in `namespace/`, and
 **Across analyses**, the server compares a declaration's path and byte
 range, never ids or `SourceId`s.
 
-**Rejected:** copying the declaration's span into each row (the first
-draft), a kind tag, and re-resolving names in the server. Each duplicates a
+**Rejected:** copying the declaration's span into each row, a
+kind tag, and re-resolving names in the server. Each duplicates a
 fact the compiler owns, and copies can disagree.
 
 ### The console
 
-`io/console` keeps `print` and `print_error`, and gains:
+Standard streams carry bytes and the protocol counts them, so the new
+console functions take and return `Bytes`, and `print` and `print_error` stay
+for text lines:
 
-- `write` and `write_error`, which write text as given;
+- `write` and `write_error`, with no newline added;
 - `flush`;
-- `read_line`;
-- `read_exact(byte_count)`.
+- `read_line`, without its LF or CRLF, as `fold_lines` drops them;
+- `read_exact(byte_count)`, which fails if input ends part-way.
 
-**Flushing.** Every read flushes standard output first, as Python's `input`
-does, so a prompt shows before the program waits. `flush` covers output that
-no read follows.
+**Text at the edge.** No console function decodes, so neither read's exact
+error union has a content case. The transport encodes each reply once,
+counting those bytes for its header, and decodes each body once, answering
+-32700 if it is not UTF-8.
 
-**`read_line`** drops LF or CRLF, as `fold_lines` does. A last line without
-LF is returned as is.
+**Buffers.** `print` and `write` share standard output's buffer, so their
+order holds; both reads share standard input's. Every read flushes standard
+output first, as Python's `input` does, so a prompt shows before the program
+waits. `flush` covers output that no read follows.
 
-**`read_exact`** returns `Bytes`: `None` only when input has already ended,
-empty for a count of zero or less, and an error when input ends part-way.
-The server decodes a body with `bytes.to_text`, answering -32700 for
-invalid UTF-8. A line that is not UTF-8 is a `read_line` error. Both reads
-share one buffer, and each has its own exact error union, per
-`PATH_PLAN.md`.
+**Text programs** convert at the edge too; text forms wait for a consumer.
 
 **Rejected:** `print(text, ending = "")` (named optional arguments),
-dropping `print`'s newline (breaks every call), and `read_bytes(n)` (clashes
-with `fs.read_bytes`).
+dropping `print`'s newline (breaks every call), and `read_bytes(n)` and
+`write_bytes(data)`, which clash with `io/fs`'s.
 
 ### The server
 
@@ -197,8 +197,8 @@ accepts `\n`, `\r\n` and a lone `\r`, as the protocol requires.
   its program, with open documents as snapshots, so a burst of edits costs
   one analysis.
 
-**Diagnostics** refresh when an analysis runs, so an edit's errors appear
-with the next request. Each analysis publishes to every file it reports in,
+**Diagnostics** refresh with each analysis, so an edit's errors wait for the
+next request. Each analysis publishes to every file it reports in,
 and `[]` to every file it reported in last time but not now. A shared file
 shows the latest analysis's. Library files are never published; URIs are
 percent-encoded.
@@ -218,13 +218,11 @@ modifiers are used. String pieces are separate lexer tokens that stop at
 **Broken files.** In landing 9, while a root fails to analyse, its files
 get only the lexer's tokens (the prefix, if lexing failed), definition
 returns `null` and references `[]`. Landing 11 then keeps the last
-successful analysis sealed, with each file's text then. A file's
-edits since form one window, between the longest common prefix and the
-longest non-overlapping common suffix. Positions before it are unchanged,
-positions after shift by the change in length, and positions inside find
-nothing; two distant edits make one wide window. A request's position maps
-back through its file's window, and each answer span forward through its
-own file's.
+successful analysis sealed, with each file's text then. Each file's edits
+since form one window, between the longest common prefix and the longest
+non-overlapping common suffix: positions before it hold, positions after
+shift by the length change, and positions inside find nothing. Requests map
+back through their file's window, and answers forward through theirs.
 
 **Definition** returns the declaration of the use at the position, or
 `null`. A position at an identifier's end counts as inside it.
@@ -233,16 +231,15 @@ own file's.
 declaration only on request.
 
 **Lifecycle.** `shutdown` returns `null`. `exit` ends with status 0 after
-`shutdown` and 1 otherwise, as does end of input without `exit`. Requests
-before `initialize` get -32002, unknown requests -32601, invalid JSON
--32700. Unknown notifications and cancellations are ignored.
+`shutdown` and 1 otherwise, as does end of input without `exit`, even
+mid-header. Requests before `initialize` get -32002, unknown requests
+-32601, invalid JSON -32700. Unknown notifications and cancellations are
+ignored.
 
 ### v1 limitation: the open file is the root
 
 Go-to and references cover the open file's program: the file, its imports
-and the library. References from importers are missed: asked in
-`common/syntax/lex.brp`, references to `lex` miss
-`common/analysis/load/load.brp:582`. The README documents this. A later
+and the library, not importers. The README documents this. A later
 landing has the plugin pass the workspace's roots in
 `initializationOptions.roots`, and once packages exist a manifest does.
 
@@ -404,8 +401,7 @@ pure func declarations(analysis: Analysis) -> List[Referent]
 Today's `check` (above) records six uses: `ParsedProgram`, `CheckedProgram`
 and `CheckFailure` (`TypeReferent` of an `OpaqueHead`), `Result` (of a
 `UnionHead`), `program` (`BindingReferent`) and `check_program`
-(`FunctionReferent`). The declarations of `check` and `program` come from
-the function table and `check`'s `bindings`.
+(`FunctionReferent`).
 
 **The console.** Today all of `standard_library/io/console.brp` is:
 
@@ -418,34 +414,73 @@ func print_error(message: String) -> Void:
     builtin("string.print_error")
 ```
 
-The additions, for ergonomics review:
+The additions, reviewed for ergonomics:
 
 ```blorp
--- The text exactly as given; no newline is added.
-func write(text: String) -> Void
-func write_error(text: String) -> Void
+-- The bytes exactly as given; no newline is added. Output a closed pipe
+-- refuses is dropped, under the SIGPIPE guard `capture` already uses, so a
+-- client that has gone does not end the program.
+func write(data: Bytes) -> Void
+func write_error(data: Bytes) -> Void
 -- Sends buffered standard output now. Every read does this first.
 func flush() -> Void
--- The next line without its LF or CRLF; a last line with no LF as it is;
--- None once input has ended.
-func read_line() -> Result[Option[String], ReadLineError]
--- Exactly `byte_count` bytes; None once input has ended; empty for a count
--- of zero or less; an error if input ends part-way.
+-- Bytes, unlike `io/fs`'s String line functions: those before the next LF,
+-- without it or a CR just before it (a lone CR stays). A last line with no
+-- LF comes as it is; None once input has ended.
+func read_line() -> Result[Option[Bytes], ReadLineError]
+-- Exactly `byte_count` bytes. A count of zero or less gives Some(empty)
+-- without reading; None means input ended before the first byte. Bytes are
+-- held only as they arrive, so a large count costs only the input received.
 func read_exact(byte_count: Int) -> Result[Option[Bytes], ReadExactError]
+
+
+-- Why standard input could not be read: one exact union per operation, as
+-- `PATH_PLAN.md` requires. Both implement Stringable.
+fixed union ReadLineError:
+    -- EISDIR: standard input is a directory.
+    IsADirectory
+    -- Any other errno, such as EIO or EBADF.
+    OtherOs(Int)
+
+
+fixed union ReadExactError:
+    -- Input ended after this many of the bytes asked for.
+    EndedEarly(Int)
+    IsADirectory
+    OtherOs(Int)
 ```
 
-A first-time user's prompt needs no flush:
+The transport counts and sends the same bytes:
 
 ```blorp
 import:
+    bytes: Bytes, String methods
+    io/console: write, flush
+    json: Json, render
+
+
+-- One message: a header counting the body's UTF-8 bytes, then the body.
+func send(message: Json) -> Void:
+    body: Bytes = message.render().to_bytes()
+    write("Content-Length: ${body.length()}\r\n\r\n".to_bytes() + body)
+    flush()
+```
+
+A text prompt converts once each way, and needs no flush:
+
+```blorp
+import:
+    bytes: Bytes, String methods
     io/console: write, read_line
 
 
 func main() -> Int:
-    write("Name: ")
+    write("Name: ".to_bytes())
     match read_line():
-        Ok(Some(name)):
-            print("Hello, ${name}")
+        Ok(Some(line)):
+            match line.to_text():
+                Some(name): print("Hello, ${name}")
+                None: print_error("the name is not UTF-8")
             0
         Ok(None):
             0
@@ -494,17 +529,15 @@ the builtin tables, `editor/`, the README and the tests.
 threads, incremental analysis, or grammar changes.
 
 **Concurrent work:** `UINT8_BYTES_PLAN.md` edits the same builtin tables,
-so coordinate before our landings 6 and 8; its L3 adds `Bytes`. Of the
+so coordinate before our landings 6 and 8. Of the
 String plan's breaking switch and this work, whichever lands second migrates
 the other's `length` and `slice` uses.
 
 ## Risks and unknowns
 
-- **Recording cost.** Every compile records name uses; landing 5 measures
-  the cost.
+- **Recording cost:** every compile pays it, measured in landing 5.
 - **Do semantic tokens alone colour a file in CLion?** The plugin landing
-  probes it first with a stub server, with `null` and error replies too. If
-  nothing colours, stop and ask.
+  probes it first with a stub server, with `null` and error replies too.
 - **Bootstrap.** A library call to a `builtin` label the seed lacks stops
   the seed parsing the library (`common/syntax/parse.brp:4708`). So the
   console labels land alone, a rotation follows, and then the library.
@@ -513,8 +546,10 @@ the other's `length` and `slice` uses.
 ## Dependencies
 
 - Landing 5 follows 1 and 4; landings 6, 7 and 8 go strictly in order.
-- Landing 8 needs `Bytes` (`UINT8_BYTES_PLAN.md`'s L3), and Keith's approval
-  of the names and of reads flushing.
+- Landing 6 needs `UINT8_BYTES_PLAN.md`'s L1, since its natives pass byte
+  lists. If it lands before that plan's L2, L2's rotation carries it and
+  landing 7 is dropped.
+- Landing 8 needs `Bytes` (L3).
 - Landing 9's pure modules follow landings 1, 3 and 5; its transport, 8.
 - Landing 11 follows 10.
 
@@ -526,15 +561,13 @@ backs it out; for landing 7, re-pinning the previous seed does.
 1. **Analysis without an entry point.**
 2. **Comments as lexer output.** Formatter output stays byte-identical.
 3. **The lexer keeps its prefix on failure.**
-4. **Fixed identities:** the seven types become `fixed`, with matched
-   before/after measurements, as a data-model refactor requires.
+4. **Fixed identities:** the seven types become `fixed`.
 5. **Name uses**, always recorded.
 6. **Console labels:** builtin labels, runtime and emission, no library.
 7. **Seed rotation**, a plain one (`PATH_PLAN.md`'s landed as `c0512c385`).
-8. **The `io/console` functions**, after ergonomics review and Keith's
-   approval.
-9. **`blorp lsp`:** the `src/lsp/` modules (buildable during landings 6
-   to 8), the transport, and the README's v1 limitation.
+8. **The `io/console` functions.**
+9. **`blorp lsp`:** the `src/lsp/` modules, the transport, and the README's
+   v1 limitation.
 10. **The CLion plugin.**
 11. **Broken files** served from the last good analysis.
 
@@ -570,15 +603,14 @@ Each landing starts with a failing test.
 | 4 | Existing suites, unchanged. |
 | 5 | One case per `Referent` case, checking the use's span and, through `declaration_span`, its declaration's. Mutation proof: stop recording one case, and only its test fails. |
 | 6 | Direct C tests of the natives, under `test/runtime/`. |
-| 8 | e2e programs through `capture`: LF and CRLF, a last line without LF, header and body in one chunk, a short `read_exact`, a zero count, input that is not UTF-8 to each read, and `write` output before a read. |
+| 8 | e2e programs through `capture`: LF and CRLF, a last line without LF, header and body in one chunk, a short `read_exact`, a zero count at end of input, bytes that are not UTF-8 through each read, `write` output before a read, `print` and `write` output in order, a write after the reader closes, and `write` imported beside `io/fs/write`'s `write_text`. |
 | 9 | `test/unit/test_lsp/`: framing; a body that is not UTF-8; positions for `é`, an astral emoji and `\r`; token splitting; a broken file's lexer tokens; lifecycle errors; staleness after a new import, a late open, a shared file's edit and a close; each request through `receive`. An e2e session in `self_hosted_cli.brp` runs `initialize` through `exit` and checks replies, a diagnostic and the status. |
 | 10 | A manual checklist in the plugin's README. |
 | 11 | `test/unit/test_lsp/`: edit windows, with positions before, inside and after one, and two distant edits. |
 
-**Commands:** `make -C blorp test-target-components
-TARGET_COMPONENT_SOURCES=<suite>` to iterate; then `make -C blorp test`;
-`scripts/blorp-fixpoint --prove` for compiler landings; and `make -C blorp
-test-e2e INSTRUCTION_CHECK=on` when compile cost changes.
+**Commands:** those in `blorp/AGENTS.md`, `scripts/blorp-fixpoint --prove`
+for compiler landings, and `make -C blorp test-e2e INSTRUCTION_CHECK=on`
+when compile cost changes.
 
 ## Acceptance criteria
 
@@ -592,7 +624,7 @@ test-e2e INSTRUCTION_CHECK=on` when compile cost changes.
   `benchmarks/results/`.
 - [ ] **7.** `scripts/blorp-fixpoint --prove` passes with the new seed.
 - [ ] **8.** The console e2e programs pass on all four CI platforms, and
-  `read_exact` returns bytes that are not UTF-8 unchanged.
+  both reads return bytes that are not UTF-8 unchanged.
 - [ ] **9.** The e2e replies match exactly, with -32700 for a body that is
   not UTF-8. A broken file gets only lexer tokens. Definition on `print`
   lands in the temporary folder, which is gone after `exit`. Latency is in
