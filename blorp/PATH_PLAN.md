@@ -476,12 +476,25 @@ unchanged; messages that print a process error add the program the same way.
      - `src/` had 25 capitalized aliases, not 3.
    - Follow-ups, not done here:
      - an opaque `DeclaredName`, so a declaring site cannot skip its check
-       even by calling the token reader directly;
-     - one shared set of ASCII class helpers for the lexer and `naming.brp`;
+       even by calling the token reader directly. Measured 2026-11-11 and
+       not done: the guarantee needs the syntax tree's declaration fields
+       (about 12 in `syntax.brp`) to hold the checked type, and their
+       readers span 22 files, an estimated +120 to +170 production lines
+       against the +60 its brief allowed. A wrapper inside the parser alone
+       would not give the guarantee. Revisit with `LSP_PLAN.md`'s name
+       identities;
+     - one shared set of ASCII class helpers for the lexer and `naming.brp`.
+       Done 2026-11-11 (`286e8a01b`): `naming.brp` imports the lexer's seven
+       ASCII constants, with byte-identical compiler C and unchanged
+       allocations. A separate module cost +30 lines, so the lexer hosts
+       them. Coordinator correction: production ceiling 0 to +2 net, because
+       the formatter puts one imported name per line and the brief asked
+       for a two-line comment;
      - `import: dict` alone gives no qualified access, so tests alias it as
        `dict_ops`;
      - the two `count` parameters in `parse.brp` become `_` after landing 5,
-       because the pinned seed cannot parse `_` parameters.
+       because the pinned seed cannot parse `_` parameters. Done 2026-11-11
+       (`0f5ddfd25`).
 2. **Qualified variants.** The parser's new syntax (`common/syntax/syntax.brp`,
    `parse.brp`), the checker's resolution (`check/constructors.brp`,
    `patterns.brp`, `expressions.brp`, `bodies.brp`), diagnostics
@@ -528,6 +541,9 @@ unchanged; messages that print a process error add the program the same way.
      read, which cost more lines than it saved on an error path. The
      code-reviewer also did the documenter review of `README.md` and
      `grammar.ebnf`.
+   - Fixed afterwards (`fad5f4327`, 2026-11-11): the help for a type
+     parameter named like a type suggested `T`, which could be the
+     conflicting name. It now names the conflict and suggests no name.
 3. **`Path` in `path.brp`, beside the String functions.** P2 to P5, `+`,
    P10's methods except two, `PathError` and unit tests. No compiler change.
    `join` and `normalize` already name String functions in `path.brp`, and a
@@ -575,10 +591,23 @@ unchanged; messages that print a process error add the program the same way.
        return `ENOSPC` from `unlink` and `rmdir`, and the three remove unions
        have no `NoSpace`. Fix both by having each native send
        `other_os_code(errno)` for errnos its operation's union does not name.
+       Done 2026-11-11 (`db2e75476`): every native maps an errno through a
+       mask of the kinds its operation's union names, at +45 production
+       lines (ceiling +45). Left as they are:
+       - one native serves `RemoveTreeError`, which has no `NoSpace`, and a
+         temporary directory's cleanup, so ENOSPC during cleanup arrives as
+         `OtherOs(28)`;
+       - `entry_kind` has no injected-errno test, because its C fixture has
+         no `lstat` hook;
+       - the natives' NUL guards send `PATH_CONTAINS_NUL`, which most unions
+         lack, but no `Path` holds NUL, so the guards are unreachable.
      - `path.brp`, `compile_command.brp` and `io/fs/temporary_directory`
        each declare the separator byte. One exported "ends in a separator"
        predicate on `Path` would serve the compile input check and the
-       prefix check.
+       prefix check. Done 2026-11-11 (`7bd2b7047`): `ends_in_separator`
+       serves the compile input check. `temporary_directory` keeps its
+       copy, because it asks whether a String prefix contains `/`, which is
+       not a `Path` question.
      - The decoders in `io/environment` and `io/process` are public, with a
        "not API" comment, so that tests can pass them literal codes. Blorp
        has no test-visible form of `private`; `io/_codes`'s `decode_error`

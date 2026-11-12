@@ -11,8 +11,8 @@ eventually anyway", and `opaque type Bytes = List[UInt8]`, with no separate
 
 **Status:** S0 and L0 implementation/local qualification are complete. Full
 instruction-enabled tests, fixpoint, fixture parity, independent code/test
-reviews and four-platform CI pass. L0 is published on origin/main. L1 has not
-started. The corrected L0 line allowance is recorded under Ceilings;
+reviews and four-platform CI pass. L0 is published on origin/main. L1
+started on 2026-11-11, when Keith asked for `Bytes` in the library. The corrected L0 line allowance is recorded under Ceilings;
 performance caps are unchanged. See the
 [L0 measurement report](../benchmarks/results/blorp-integer-model-l0-2026-11-08.md).
 
@@ -218,11 +218,39 @@ How Int and Float are built in today:
 
   Binary process capture and `Path` (D13) follow in their own plans.
 
+  **Since revision 3,** `PATH_PLAN.md` gave the library `Path` and exact
+  errors, and split `fs.brp` into `io/fs/` modules. So L3 adds
+  `read_bytes(path: Path) -> Result[Bytes, ReadError]` to `io/fs/read` and
+  `write_bytes(path: Path, data: Bytes) -> Result[Void, WriteError]` to
+  `io/fs/write`, beside `read_text` and `write_text`; L1's natives take the
+  path's text.
+
 Two limits remain and are stated rather than fixed:
 
 - A constant cannot call a function, so a `Bytes` constant such as a file
   signature is a function returning `from_list([137, 80, 78, 71, ...])`.
 - `for byte in data` needs `data.to_list()`.
+
+Follow-ups Keith raised on 2026-11-11, for after L3:
+- **A `to_text` that does not copy.** `struct blorp_string` and a
+  `List[UInt8]` share their header (references, length, capacity), and the
+  String adds a trailing NUL that its capacity excludes. A uniquely owned
+  list with a spare byte can become the String in place: validate, write the
+  NUL, lower the capacity by one. The decision is made at run time, as
+  copy-on-write appends are, so the native needs its operand consumed on its
+  last use rather than a new static analysis. `read_bytes` and `read_exact`
+  could allocate one spare byte so that the conversion never reallocates, and
+  `to_bytes` works the same way in reverse. Measure allocations and copies on
+  a read-then-decode workload before deciding.
+- **Streaming decode.** `to_text` returns `Option`, so it cannot tell an
+  invalid sequence from data that ends partway through a character, which a
+  chunked decoder must carry into the next chunk. The first streaming
+  consumer (live process output, chunked standard input) brings one
+  primitive that returns the longest whole-character prefix and the 0 to 3
+  carried bytes, and fails only on a sequence no later byte can fix. Today's
+  APIs do not need it: `fold_lines` completes a character cut at its buffer
+  end, `capture` validates once after the child is reaped, and the language
+  server decodes whole message bodies.
 
 ## S0 results
 

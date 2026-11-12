@@ -14,7 +14,10 @@ done.
     reviewed and published; combined local gates and four-platform CI pass. Matched costs
     pass unchanged performance ceilings; see
     [`L0 results`](../benchmarks/results/blorp-integer-model-l0-2026-11-08.md).
-  - **Next:** L1, adding UInt8 with deferred integer literals.
+  - **Next:** L1, adding UInt8 with deferred integer literals, started on
+    2026-11-11 (branch `blorp/uint8-l1`). `LSP_PLAN.md`'s landing 6 waits
+    for L1 and its landing 8 for L3; if landing 6 is nearly ready when L1
+    lands, L2's rotation waits briefly to carry its labels too.
   - **Afterwards:**
     - L1, the compiler learns `UInt8`, with deferred integer literals;
     - L2, a plain seed rotation onto L1 (the family and command-line switch landed
@@ -28,13 +31,12 @@ done.
     process, environment and file errors, and the `io/fs/` modules have
     landed. Keith dropped `Path` from the prelude on 2026-11-11 because of
     its compile cost.
-  - **Follow-ups, in the plan:**
-    - the process natives should send the errno for codes their union
-      lacks;
+  - **Follow-ups, in the plan:** the errno masks, the `_` parameters, the
+    shared ASCII constants and `ends_in_separator` landed on 2026-11-11.
+    Open:
     - a test-visible form of `private` for the error decoders;
-    - the `count` parameters in `parse.brp` become `_`;
-    - an opaque `DeclaredName`;
-    - shared ASCII helpers;
+    - an opaque `DeclaredName`, measured at +120 to +170 lines and not
+      done; revisit with the LSP plan's name identities;
     - embedded-library size, which affects every compile.
 - **Process API:** [`PROCESS_DECISIONS.md`](PROCESS_DECISIONS.md).
   - **Status:** L0 is implemented and independently reviewed; final combined
