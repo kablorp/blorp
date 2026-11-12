@@ -52,10 +52,9 @@ done.
     count stored in each String, and byte work uses `byte_*` functions. L1
     landed on 2026-11-12: every String keeps its count, the compiler knows the
     five byte and code point operations, and strict runs recount each String
-    on release.
-  - **Next:** a cheaper recount, because L2's seed would otherwise push the
-    e2e compiles over their 15% instruction margin; then L2, a seed rotation,
-    and the breaking switch (L3).
+    on release. The recount now counts eight bytes per step, and L2 pinned a
+    seed that carries it (2026-11-12).
+  - **Next:** L3, the breaking switch, starting with its census.
 - **Filesystem:** [`FILESYSTEM_DECISIONS.md`](FILESYSTEM_DECISIONS.md).
   - **Status:** Part 1 has landed through `fold_lines`. Part 2, lent
     resources, waits for a consumer.

@@ -19,8 +19,9 @@ results"). L1 landed on 2026-11-12 within its ceilings, with S9's recount
 limited to strict runs (see "L1 results"). That recount costs a strict -O0
 test compiler about 18%, which L2's e2e instruction ceilings cannot absorb as
 planned. Counting eight bytes per step (see "Recount") and resetting three
-path ceilings (see "Keith's ruling") let L2 proceed; its acceptance test is
-the stage-B e2e run with no ceiling raised at L2.
+path ceilings (see "Keith's ruling") let L2 proceed. L2 landed on 2026-11-12:
+the seed now carries the count, so the test compiler recounts under strict,
+and no e2e ceiling was raised. L3, the breaking switch, is next.
 
 ## Problem
 
@@ -615,6 +616,10 @@ reproduction: `path_normalize/edges` sits 1.47% under its ceiling, `fs/write`
 3. **L2, a seed rotation.** It can share PATH landing 5's rotation, and the
    language server's console natives, if they are on main first. Otherwise
    it is a plain rotation.
+   - **Done, 2026-11-12.** A plain rotation. The pin names
+     `blorp-seed-15d8d1263e10`, which main's CI built from the recount's
+     commit `15d8d1263`. `make -C blorp test-e2e INSTRUCTION_CHECK=on` passes
+     with the seed-built test compiler and no ceiling raised.
 4. **L3, the switch, one breaking landing** (principle 14, no shims).
    - **First, a census.** Grep every String `length()`, `byte_at` and
      `.slice(` under `blorp/src`, `blorp/scripts`, `blorp/standard_library`,
