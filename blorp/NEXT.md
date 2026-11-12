@@ -48,9 +48,10 @@ done.
     landed: the `json` codec
     and loader source snapshots (`load_program_with_sources`, in the README's
     Load phase).
-  - **Landed:** landing 1, analysis without an entry point, and landing 2,
-    comments as lexer output.
-  - **Next:** landing 3, the lexer's prefix on failure.
+  - **Landed:** landing 1, analysis without an entry point; landing 2,
+    comments as lexer output; and landing 3, the lexer's prefix on failure.
+  - **Next:** landing 4, fixed identities: seven plain types become `fixed`,
+    so the name-use rows of landing 5 take no allocation each.
 - **String code points:** [`STRING_PLAN.md`](STRING_PLAN.md).
   - **Status:** approved on 2026-11-10: `length` counts code points, from a
     count stored in each String, and byte work uses `byte_*` functions. S0
@@ -123,9 +124,9 @@ None of these is planned yet. Each wants its own short design or brief.
     local before passing it costs an allocation that an inline lambda does
     not.
   - **A plain record returned by value is heap-allocated** even when the
-    caller destructures it at once. The lexer's `CodeLine` costs one
-    allocation per code line, 37,160 in the self-compile (`LSP_PLAN.md`,
-    landing 2's measurement).
+    caller destructures it at once. The lexer's `SkippedLines` (`CodeLine`
+    before landing 3) costs one allocation per code line, 37,160 in the
+    self-compile (`LSP_PLAN.md`, landing 2's measurement).
   - **`max` and `min` are receiver-only.** `max(a, b)` reports "unknown
     function", so only `a.max(b)` works.
 - **No never-returning type.** `process.brp`'s `fault` calls the `process.fault`

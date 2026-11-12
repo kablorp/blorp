@@ -46,6 +46,7 @@ import:
             WhereKeyword,
         ),
         Comment,
+        LexFailure,
         LexedProgram,
         Spacing(Adjacent, Spaced),
         Symbol(
@@ -397,12 +398,20 @@ private fixed record LinePrefix {
 
 
 -- A code line's indentation and level. At the end of the source it is an empty
--- line at level 0, which closes every open level.
-private record CodeLine {
+-- line at level 0, which closes every open level. It is `fixed` so that
+-- `SkippedLines` carries it without an allocation of its own.
+private fixed record CodeLine {
     prefix: LinePrefix,
     level: Int,
-    -- The comments on the blank and comment-only lines skipped before it.
+}
+
+
+-- The comments on the blank and comment-only lines skipped before the next
+-- code line, and that line or the error that stopped the scan. The comments
+-- are kept on failure: the lexer consumed them, and an editor colours them.
+private record SkippedLines {
     comments: List[Comment],
+    line: Result[CodeLine, Diagnostic],
 }
 
 
@@ -1326,7 +1335,7 @@ private pure func line_prefix(text: SourceText, start: Int) -> LinePrefix:
 
 -- Skips blank, whitespace-only and comment-only lines from the line at `start`
 -- to the next code line, with its indentation level and the comments skipped.
-private pure func next_code_line(text: SourceText, start: Int) -> Result[CodeLine, Diagnostic]:
+private pure func next_code_line(text: SourceText, start: Int) -> SkippedLines:
     -- One Result carries the line past trivia lines, or the first error.
     var scan: Result[LinePrefix, Diagnostic] = Ok(text.line_prefix(start))
     var skipped: List[Comment] = []
@@ -1364,15 +1373,18 @@ private pure func next_code_line(text: SourceText, start: Int) -> Result[CodeLin
             Err(_):
                 break
 
-    prefix ?= scan
     end = text.bytes.length()
-
-    if prefix.end == end:
-        Ok({ prefix = { start = end, end = end }, level = 0, comments = skipped })
-    else:
-        match text.indentation_level(prefix):
-            Ok(level): Ok({ prefix = prefix, level = level, comments = skipped })
-            Err(error): Err(error)
+    line: Result[CodeLine, Diagnostic] = match scan:
+        Ok(prefix):
+            if prefix.end == end:
+                Ok({ prefix = { start = end, end = end }, level = 0 })
+            else:
+                match text.indentation_level(prefix):
+                    Ok(level): Ok({ prefix = prefix, level = level })
+                    Err(error): Err(error)
+        Err(error):
+            Err(error)
+    { comments = skipped, line = line }
 
 
 -- A pipe scan stops at an interpolation opener; a raw block keeps every byte. In both, a
@@ -1789,6 +1801,55 @@ private pure func word_spellings(tokens: List[ScannedToken]) -> List[String]:
     spellings
 
 
+-- The program the scanned tokens and comments make. Interning during the scan
+-- would extend a table the loop still holds, which the host copies for each
+-- new spelling, so one `intern_names` call mints the IDs of all the scanned
+-- spellings. Its `ids` hold one ID per WordToken in order, so the `None` arm,
+-- the only failure, never runs; it would leave a prefix holding the tokens
+-- converted before it, so it is reported ahead of any scan error.
+private pure func lexed_program(
+    text: SourceText,
+    tokens: List[ScannedToken],
+    comments: List[Comment],
+    names: NameTable,
+) -> Result[LexedProgram, LexFailure]:
+    interned = names.intern_names(tokens.word_spellings())
+    var lexed: List[Token] = []
+    var word_position: Int = 0
+    var missing: Option[Diagnostic] = None
+
+    for scanned in tokens:
+        match scanned:
+            ReadyToken(ready):
+                lexed = lexed.append(ready)
+            WordToken(_, start, end, form):
+                match interned.ids.get(word_position):
+                    Some(id):
+                        lexed = lexed.append(token(text, IdentifierToken(id, form), start, end))
+                    None:
+                        missing = Some(
+                            internal_error(
+                                compiler_span(),
+                                "a scanned identifier has no interned ID",
+                            ),
+                        )
+                        break
+
+                word_position = word_position + 1
+
+    program: LexedProgram = {
+        source_text = text.bytes,
+        tokens = lexed,
+        comments = comments,
+        end = { source = text.origin, start = text.bytes.length(), end = text.bytes.length() },
+        base_names = names,
+        names = interned.names,
+    }
+    match missing:
+        Some(error): Err({ error = error, prefix = program })
+        None: Ok(program)
+
+
 -- The host's layout algorithm (GRAMMAR 2.2-2.3) over levels counted in
 -- tabs or four-space groups. A code line deeper than the innermost open
 -- level starts with an Indent and opens its level, whatever the step; a
@@ -1806,7 +1867,7 @@ pure func lex(
     origin: SourceId,
     source: String,
     names: NameTable,
-) -> Result[LexedProgram, Diagnostic]:
+) -> Result[LexedProgram, LexFailure]:
     text: SourceText = { origin = origin, bytes = source }
     var tokens: List[ScannedToken] = []
     var comments: List[Comment] = []
@@ -1816,14 +1877,14 @@ pure func lex(
     var brackets: Int = 0
     var bodies: List[BracketedBlock] = []
     -- One Result carries each code line to lay out, or the first error.
-    var lines: Result[CodeLine, Diagnostic] = text.next_code_line(0)
+    first = text.next_code_line(0)
+    var lines: Result[CodeLine, Diagnostic] = first.line
+    for item in first.comments:
+        comments = comments.append(item)
 
     while True:
         match lines:
             Ok(line):
-                for item in line.comments:
-                    comments = comments.append(item)
-
                 if line.level > levels.top_level():
                     tokens = tokens.append(
                         ReadyToken(symbol(text, Indent, line.prefix.start, line.prefix.end)),
@@ -1973,49 +2034,22 @@ pure func lex(
                     Ok(line_end):
                         next = (line_end + 1).min(source.length())
                         tokens = tokens.append(ReadyToken(symbol(text, Newline, line_end, next)))
-                        text.next_code_line(next)
+                        following = text.next_code_line(next)
+                        for item in following.comments:
+                            comments = comments.append(item)
+                        following.line
                     Err(error):
                         Err(error)
             Err(_):
                 break
 
-    finished ?= lines
-    -- Interning during the scan would extend a table the loop still holds,
-    -- which the host copies for each new spelling, so one `intern_names` call
-    -- mints the IDs of all the scanned spellings. Its `ids` hold one ID per
-    -- WordToken in order, so the `None` arm never runs.
-    interned = names.intern_names(tokens.word_spellings())
-    var lexed: List[Token] = []
-    var word_position: Int = 0
-    var missing: Option[Diagnostic] = None
-
-    for scanned in tokens:
-        match scanned:
-            ReadyToken(ready):
-                lexed = lexed.append(ready)
-            WordToken(_, start, end, form):
-                match interned.ids.get(word_position):
-                    Some(id):
-                        lexed = lexed.append(token(text, IdentifierToken(id, form), start, end))
-                    None:
-                        missing = Some(
-                            internal_error(
-                                compiler_span(),
-                                "a scanned identifier has no interned ID",
-                            ),
-                        )
-                        break
-
-                word_position = word_position + 1
-
-    _: Void ?= match missing:
-        Some(error): Err(error)
-        None: Ok(void)
-    Ok({
-        source_text = source,
-        tokens = lexed,
-        comments = comments,
-        end = { source = origin, start = source.length(), end = source.length() },
-        base_names = names,
-        names = interned.names,
-    })
+    -- The scan ended at the end of the source or at its first error; either
+    -- way the tokens and comments so far become a program.
+    program = text.lexed_program(tokens, comments, names)
+    match lines:
+        Ok(_):
+            program
+        Err(error):
+            match program:
+                Ok(prefix): Err({ error = error, prefix = prefix })
+                Err(internal): Err(internal)
