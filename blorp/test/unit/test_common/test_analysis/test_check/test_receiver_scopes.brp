@@ -15,10 +15,10 @@ import:
     ../../../../../src/common/analysis/check/render: render_failure, render_check_error
     ../../../../../src/common/analysis/check/traits: accepted_traits
     ../../../../../src/common/analysis/ids: inventory_traits
-    ../../../../../src/common/analysis/namespace/builtins: IntegerFormat(Int64Format)
     ../../../../../src/common/analysis/namespace/namespace: Namespace, build_namespace
     ../../../../../src/common/syntax/source: module_id, module_source, root_module_id
     ../../../../../src/common/syntax/syntax:
+        IntegerFormat(Int64Format),
         Diagnostic,
         DiagnosticKind(ProgramProblem),
         DiagnosticNote(PreviousDeclaration, NoteLines, CompetingDeclarations),
@@ -107,37 +107,74 @@ private pure func rejects(parsed: Result[ParsedProgram, Diagnostic], expected: D
                         .and(render_failure(failure).remaining.is_empty())
 
 
+-- The checked functions and lambdas of a program that parses and checks.
+private pure func checked_rows(
+    parsed: Result[ParsedProgram, Diagnostic],
+) -> Option[model.CheckedFunctions]:
+    match parsed:
+        Err(_):
+            None
+        Ok(input):
+            match check(input):
+                Err(_): None
+                Ok(program): Some(checked_functions(program))
+
+
+-- Whether `calls` select, in order, the functions numbered `expected`.
+private pure func select_in_order(
+    calls: List[model.CheckedCall],
+    rows: model.CheckedFunctions,
+    expected: List[Int],
+) -> Bool:
+    var matches = calls.length() == expected.length()
+    var position: Int = 0
+    for call in calls:
+        selected = match (call.target, expected.get(position)):
+            (model.UserFunction(id, _), Some(ordinal)):
+                match rows.functions.get(ordinal):
+                    Some(declaration): id == declaration.id
+                    None: False
+            _:
+                False
+        matches = matches.and(selected)
+        position = position + 1
+    matches
+
+
 private pure func calls_are(
     parsed: Result[ParsedProgram, Diagnostic],
     caller: Int,
     expected: List[Int],
 ) -> Bool:
-    match parsed:
-        Err(_):
+    match checked_rows(parsed):
+        None:
             False
-        Ok(input):
-            match check(input):
-                Err(_):
+        Some(rows):
+            match rows.functions.get(caller):
+                None: False
+                Some(function): model.function_calls(function).select_in_order(rows, expected)
+
+
+-- The same for the calls inside the lambdas that the function numbered
+-- `caller` declares.
+private pure func lambda_calls_are(
+    parsed: Result[ParsedProgram, Diagnostic],
+    caller: Int,
+    expected: List[Int],
+) -> Bool:
+    match checked_rows(parsed):
+        None:
+            False
+        Some(rows):
+            match rows.functions.get(caller):
+                None:
                     False
-                Ok(program):
-                    match checked_functions(program).functions.get(caller):
-                        None:
-                            False
-                        Some(function):
-                            calls = model.function_calls(function)
-                            var matches = calls.length() == expected.length()
-                            var position: Int = 0
-                            for call in calls:
-                                selected = match (call.target, expected.get(position)):
-                                    (model.UserFunction(id, _), Some(ordinal)):
-                                        match checked_functions(program).functions.get(ordinal):
-                                            Some(declaration): id == declaration.id
-                                            None: False
-                                    _:
-                                        False
-                                matches = matches.and(selected)
-                                position = position + 1
-                            matches
+                Some(function):
+                    var calls: List[model.CheckedCall] = []
+                    for lambda in rows.lambdas:
+                        if lambda.root == function.id:
+                            calls = calls.concat(model.lambda_calls(lambda))
+                    calls.select_in_order(rows, expected)
 
 
 private pure func ordinary(source: String, targets: List[Int]) -> Result[ParsedProgram, Diagnostic]:
@@ -669,6 +706,46 @@ private pure func test_repeated_calls_retain_their_own_occurrence_spans() -> Boo
     })
 
 
+-- An integer literal receiver is Int, never a value any receiver admits: with
+-- String's `describe` imported first, `7`, a call whose only source of T is its
+-- literals, and a lambda parameter whose T only a literal gives all select Int's.
+-- Functions are numbered across modules: the root's five, then String's
+-- `describe`, then Int's. `piped` calls `describe` inside its second lambda.
+private pure func test_a_literal_receiver_selects_the_int_method_over_the_string_one() -> Bool:
+    root: String =
+        |import:
+        |    ./texts: String methods
+        |    ./numbers: Int methods
+        |pure func same[T](first: T, second: T) -> T:
+        |    first
+        |pure func pipe[T](make: pure () -> T, use: pure (T) -> Int) -> Int:
+        |    use(make())
+        |pure func paired() -> Int:
+        |    same(7, 8).describe()
+        |pure func piped() -> Int:
+        |    pipe(pure func(): 7, pure func(value): value.describe())
+        |func main() -> Int:
+        |    7.describe()
+        |
+    texts: String =
+        |pure func describe(value: String) -> Int:
+        |    0
+        |
+    numbers: String =
+        |pure func describe(value: Int) -> Int:
+        |    value
+        |
+    parsed = parse_modules([
+        { source = root, targets = [1, 2] },
+        { source = texts, targets = [] },
+        { source = numbers, targets = [] },
+    ])
+    calls_are(parsed, 4, [6])
+        .and(calls_are(parsed, 2, [0, 6]))
+        .and(calls_are(parsed, 3, [1]))
+        .and(lambda_calls_are(parsed, 3, [6]))
+
+
 private pure func test_unused_overlaps_keep_the_first_qualifying_duplicate_import_anchor() -> Bool:
     root =
         |import:
@@ -953,6 +1030,10 @@ TESTS: TestSuite = {
         (
             "repeated calls retain their own occurrence spans",
             test_repeated_calls_retain_their_own_occurrence_spans,
+        ),
+        (
+            "a literal receiver selects the Int method over the String one",
+            test_a_literal_receiver_selects_the_int_method_over_the_string_one,
         ),
         (
             "unused overlaps keep the first qualifying duplicate import anchor",

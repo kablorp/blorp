@@ -9,7 +9,6 @@ import:
         DecisionNodeId,
         ListLengthTest(ExactLength, MinimumLength),
     ../../analysis/namespace/builtins:
-        IntegerFormat(Int64Format),
         DesignatedBoolean,
         DesignatedOption,
         DesignatedResult,
@@ -23,6 +22,7 @@ import:
             IntegerDivide,
             IntegerRemainder,
             IntegerToString,
+            IntegerConvert,
             StringLength,
             StringConcat,
             StringAppendInt,
@@ -38,6 +38,8 @@ import:
             StringByteAt,
             StringFromCodepoint,
             StringSlice,
+            StringToBytes,
+            BytesToText,
             SystemCall,
             ListConcat,
             StringEquals,
@@ -50,10 +52,11 @@ import:
             FloatRemainder,
             FloatToString,
         ),
-        SystemPayload(IntPayload, StringPayload, StringListPayload, VoidPayload),
+        SystemPayload(IntPayload, StringPayload, StringListPayload, UInt8ListPayload, VoidPayload),
         system_signature,
     ../../syntax/source: label_text
     ../../syntax/syntax:
+        IntegerFormat(Int64Format, UInt8Format),
         Diagnostic,
         EntryResult(IntegerExitStatus, SuccessfulExit),
         Entrypoint(NoArguments, WithArguments),
@@ -96,7 +99,6 @@ import:
         StoredPayload(UnmanagedPayload, OwnedPayload),
         parameter_type,
     ../runtime/float: float_parse_runtime, float_runtime, float_string_runtime
-    ../runtime/fs: FS_HELPERS_RUNTIME
     ../runtime/list:
         ListElementKey,
         ListUpdate(AppendUpdate, SetUpdate, ConcatUpdate, SuffixUpdate),
@@ -111,7 +113,7 @@ import:
         list_slot_store,
         LIST_SHARED_RUNTIME,
     ../runtime/memory: MEMORY_RUNTIME
-    ../runtime/process: PROCESS_POSIX_PRELUDE, PROCESS_HELPERS_RUNTIME
+    ../runtime/process: PROCESS_POSIX_PRELUDE
     ../runtime/string:
         string_equals_runtime,
         STRING_SLICE_RUNTIME,
@@ -119,8 +121,16 @@ import:
         string_print_runtime,
         STRING_PRINT_ERROR_RUNTIME,
         string_runtime,
+        string_to_bytes_runtime,
+        bytes_to_text_runtime,
     ../runtime/string_concat: string_concat_runtime, string_append_int_runtime
-    ../runtime/system: SystemRuntime, system_runtime, system_symbol
+    ../runtime/system:
+        NativeListTypes,
+        SystemRuntime,
+        SHARED_FRAGMENTS,
+        shared_fragment_runtime,
+        system_runtime,
+        system_symbol,
     ../specialize/specialize as specialized:
         CallTarget(UserFunction, RuntimeFunction),
         ConcreteRecord(InlineFields, ValueFields, CountedFields),
@@ -246,7 +256,18 @@ private pure func c_callable(target: CallTarget) -> Option[String]:
                     Some("blorp_int_divide")
                 IntegerRemainder(Int64Format):
                     Some("blorp_int_remainder")
-                IntegerToString(Int64Format):
+                IntegerAdd(UInt8Format):
+                    Some("blorp_uint8_add")
+                IntegerSubtract(UInt8Format):
+                    Some("blorp_uint8_subtract")
+                IntegerMultiply(UInt8Format):
+                    Some("blorp_uint8_multiply")
+                IntegerDivide(UInt8Format):
+                    Some("blorp_uint8_divide")
+                IntegerRemainder(UInt8Format):
+                    Some("blorp_uint8_remainder")
+                -- C converts a narrower argument to int64_t exactly.
+                IntegerToString(Int64Format) | IntegerToString(UInt8Format):
                     Some("blorp_int_to_string")
                 FloatAdd:
                     Some("blorp_float_add")
@@ -278,6 +299,8 @@ private pure func c_callable(target: CallTarget) -> Option[String]:
                     Some("blorp_string_from_codepoint")
                 StringSlice(_):
                     Some("blorp_string_slice")
+                StringToBytes:
+                    Some("blorp_string_to_bytes")
                 ListRepeat(element):
                     Some("blorp_list_repeat_${element.list_element_key().list_suffix()}")
                 ListLength(element):
@@ -290,7 +313,8 @@ private pure func c_callable(target: CallTarget) -> Option[String]:
                     Some(SetUpdate.list_update_name(element.list_element_key()))
                 ListConcat(element):
                     Some(ConcatUpdate.list_update_name(element.list_element_key()))
-                StringEquals(_) | IntegerEquals(Int64Format, _) | IntegerLessThan(Int64Format, _) | FloatEquals(_) | FloatLessThan(_) | SystemCall(_, _):
+                -- append_operation writes a conversion as a C cast.
+                StringEquals(_) | IntegerEquals(_, _) | IntegerLessThan(_, _) | IntegerConvert(_, _) | FloatEquals(_) | FloatLessThan(_) | BytesToText(_) | SystemCall(_, _):
                     None
 
 
@@ -707,6 +731,7 @@ private pure func append_callable_entry(
 private pure func integer_c_type(format: IntegerFormat) -> String:
     match format:
         Int64Format: "int64_t"
+        UInt8Format: "uint8_t"
 
 
 private pure func append_type_name(
@@ -1107,8 +1132,11 @@ private pure func append_operation(
             Ok(output.append_parameter_name(index))
         VoidDefinition:
             Ok("${output}((uint8_t)0)")
-        IntegerDefinition(value):
+        IntegerDefinition(Int64Format, value):
             Ok(output.append_integer(value))
+        -- Verification proved that the value fits, so the cast never changes it.
+        IntegerDefinition(UInt8Format, value):
+            Ok("${output}((uint8_t)${value})")
         FloatDefinition(value):
             Ok(output.concat(value.c_float_literal()))
         StringDefinition(bytes):
@@ -1162,6 +1190,17 @@ private pure func append_operation(
                     .concat(",")
                     .append_local_name(argument.argument_value())
             Ok(invocation.concat(")"))
+        -- C defines the conversion into each format named here: into Int64, which
+        -- holds every source value, exactly, and into the unsigned UInt8, modulo 256.
+        -- A signed format narrower than Int64 would need a helper instead.
+        CallDefinition(RuntimeFunction(IntegerConvert(_, target)), [argument]):
+            match target:
+                Int64Format | UInt8Format:
+                    Ok(
+                        output
+                            .concat("(${integer_c_type(target)})")
+                            .append_local_name(argument.argument_value()),
+                    )
         CallDefinition(target, arguments):
             -- A runtime operand 0 that receives its obligation calls the
             -- operation's in-place helper; verification admits no other.
@@ -1376,7 +1415,9 @@ private pure func runtime_argument(
         None: Err(render(span, MissingRuntimeArgument(id, position)))
 
 
-private pure func append_parse_number(
+-- A one-argument runtime call that fills its scratch payload and returns whether
+-- the result is Some.
+private pure func append_unary_option(
     output: String,
     id: ValueId,
     option: DesignatedOption[VariantInstanceId],
@@ -1462,10 +1503,16 @@ private pure func append_string_slice(
 -- A Void payload has none; its constructor takes the unmanaged unit.
 private pure func system_payload_local(payload: SystemPayload, name: String) -> Option[String]:
     match payload:
-        IntPayload: Some("int64_t ${name}=0;")
-        StringPayload: Some("struct blorp_string *${name}=NULL;")
-        StringListPayload: Some("${StringType.list_element_key().list_c_type()} ${name}=NULL;")
-        VoidPayload: None
+        IntPayload:
+            Some("int64_t ${name}=0;")
+        StringPayload:
+            Some("struct blorp_string *${name}=NULL;")
+        StringListPayload:
+            Some("${StringType.list_element_key().list_c_type()} ${name}=NULL;")
+        UInt8ListPayload:
+            Some("${IntegerType(UInt8Format).list_element_key().list_c_type()} ${name}=NULL;")
+        VoidPayload:
+            None
 
 
 -- The call's argument and the constructor's payload for one Result branch.
@@ -1578,7 +1625,7 @@ private pure func append_value(
         CallDefinition(target, arguments):
             match target:
                 RuntimeFunction(StringParseInt(option)):
-                    output.append_parse_number(
+                    output.append_unary_option(
                         id,
                         option,
                         arguments,
@@ -1588,7 +1635,7 @@ private pure func append_value(
                         span,
                     )
                 RuntimeFunction(StringParseFloat(option)):
-                    output.append_parse_number(
+                    output.append_unary_option(
                         id,
                         option,
                         arguments,
@@ -1601,6 +1648,16 @@ private pure func append_value(
                     output.append_list_get(id, option, element, arguments, unions, span)
                 RuntimeFunction(StringByteAt(option)):
                     output.append_string_byte_at(id, option, arguments, unions, span)
+                RuntimeFunction(BytesToText(option)):
+                    output.append_unary_option(
+                        id,
+                        option,
+                        arguments,
+                        unions,
+                        "struct blorp_string *",
+                        "blorp_bytes_to_text",
+                        span,
+                    )
                 RuntimeFunction(StringFromCodepoint(option)):
                     output.append_string_from_codepoint(id, option, arguments, unions, span)
                 RuntimeFunction(StringSlice(option)):
@@ -1609,10 +1666,10 @@ private pure func append_value(
                     output.append_system_call(id, system, result, arguments, unions, span)
                 RuntimeFunction(StringEquals(boolean)):
                     output.append_comparison(id, boolean, arguments, unions, StringEquality, span)
-                -- Int64Format is explicit: c_callable matches every format, so a new one fails there first.
-                RuntimeFunction(IntegerEquals(Int64Format, boolean)):
+                -- C compares every integer format's values exactly after promotion.
+                RuntimeFunction(IntegerEquals(_, boolean)):
                     output.append_comparison(id, boolean, arguments, unions, ScalarEquality, span)
-                RuntimeFunction(IntegerLessThan(Int64Format, boolean)):
+                RuntimeFunction(IntegerLessThan(_, boolean)):
                     output.append_comparison(id, boolean, arguments, unions, ScalarLessThan, span)
                 RuntimeFunction(FloatEquals(boolean)):
                     output.append_comparison(id, boolean, arguments, unions, ScalarEquality, span)
@@ -2477,6 +2534,8 @@ private pure func append_selection_node(
                             data = "".append_byte_array(name, bytes)
                             test = "(${base})->length==INT64_C(${bytes.length()})&&memcmp((${base})->bytes,${name},(size_t)${bytes.length()})==0"
                             Ok(data.concat(scope.c_selection_branch(test, yes, no)))
+                        -- Verification proved that the value fits the place's format, and C
+                        -- compares promoted values exactly, so an Int64 constant serves every format.
                         ExactInt(value):
                             Ok(
                                 scope.c_selection_branch(
@@ -2979,6 +3038,18 @@ INTEGER_ARITHMETIC_RUNTIME: String =
     |
 
 
+-- Unsigned int holds every intermediate result, so nothing overflows, and the
+-- conversion back to uint8_t keeps it modulo 256. Division and remainder by
+-- zero give 0. A program may call only some, so they have external linkage.
+UINT8_ARITHMETIC_RUNTIME: String =
+    |uint8_t blorp_uint8_add(uint8_t first,uint8_t second){return (uint8_t)((unsigned)first+(unsigned)second);}
+    |uint8_t blorp_uint8_subtract(uint8_t first,uint8_t second){return (uint8_t)((unsigned)first-(unsigned)second);}
+    |uint8_t blorp_uint8_multiply(uint8_t first,uint8_t second){return (uint8_t)((unsigned)first*(unsigned)second);}
+    |uint8_t blorp_uint8_divide(uint8_t first,uint8_t second){return second==0?0:(uint8_t)(first/second);}
+    |uint8_t blorp_uint8_remainder(uint8_t first,uint8_t second){return second==0?0:(uint8_t)(first%second);}
+    |
+
+
 -- The type under any List layers. A String or Float there, anywhere in a record,
 -- union or function that specialization kept, selects its ABI prelude even when
 -- no value of it is ever built: a phantom type argument keeps its record
@@ -2998,6 +3069,7 @@ private fixed record RuntimeRequirements {
     float_types: Bool,
     integer_addition: Bool,
     integer_arithmetic: Bool,
+    uint8_arithmetic: Bool,
     string_output: Bool,
     string_error_output: Bool,
     integer_parsing: Bool,
@@ -3005,6 +3077,8 @@ private fixed record RuntimeRequirements {
     string_concatenation: Bool,
     string_integer_appending: Bool,
     string_slicing: Bool,
+    string_to_bytes: Bool,
+    bytes_to_text: Bool,
     float_formatting: Bool,
     float_parsing: Bool,
 }
@@ -3016,6 +3090,7 @@ private pure func runtime_requirements(inventory: ProgramInventory) -> RuntimeRe
         float_types = False,
         integer_addition = False,
         integer_arithmetic = False,
+        uint8_arithmetic = False,
         string_output = False,
         string_error_output = False,
         integer_parsing = False,
@@ -3023,6 +3098,8 @@ private pure func runtime_requirements(inventory: ProgramInventory) -> RuntimeRe
         string_concatenation = False,
         string_integer_appending = False,
         string_slicing = False,
+        string_to_bytes = False,
+        bytes_to_text = False,
         float_formatting = False,
         float_parsing = False,
     }
@@ -3039,6 +3116,8 @@ private pure func runtime_requirements(inventory: ProgramInventory) -> RuntimeRe
                 requirements = { requirements | integer_addition = True }
             IntegerSubtract(Int64Format) | IntegerMultiply(Int64Format) | IntegerDivide(Int64Format) | IntegerRemainder(Int64Format):
                 requirements = { requirements | integer_arithmetic = True }
+            IntegerAdd(UInt8Format) | IntegerSubtract(UInt8Format) | IntegerMultiply(UInt8Format) | IntegerDivide(UInt8Format) | IntegerRemainder(UInt8Format):
+                requirements = { requirements | uint8_arithmetic = True }
             StringPrint:
                 requirements = { requirements | string_output = True }
             StringPrintError:
@@ -3053,13 +3132,17 @@ private pure func runtime_requirements(inventory: ProgramInventory) -> RuntimeRe
                 requirements = { requirements | string_integer_appending = True }
             StringSlice(_):
                 requirements = { requirements | string_slicing = True }
+            StringToBytes:
+                requirements = { requirements | string_to_bytes = True }
+            BytesToText(_):
+                requirements = { requirements | bytes_to_text = True }
             FloatToString:
                 requirements = { requirements | float_formatting = True }
             StringParseFloat(_):
                 requirements = { requirements | float_parsing = True }
             ListRepeat(_) | ListLength(_) | ListGet(_, _) | ListAppend(_) | ListSet(_) | ListConcat(_):
                 void
-            IntegerToString(Int64Format) | IntegerEquals(Int64Format, _) | IntegerLessThan(Int64Format, _) | FloatAdd | FloatSubtract | FloatMultiply | FloatDivide | FloatRemainder | StringLength | StringByteAt(_) | StringFromCodepoint(_):
+            IntegerToString(_) | IntegerEquals(_, _) | IntegerLessThan(_, _) | IntegerConvert(_, _) | FloatAdd | FloatSubtract | FloatMultiply | FloatDivide | FloatRemainder | StringLength | StringByteAt(_) | StringFromCodepoint(_):
                 void
             FloatCopySign | FloatEquals(_) | FloatLessThan(_):
                 void
@@ -3649,14 +3732,19 @@ pure func emit(program: VerifiedProgram) -> Result[String, Diagnostic]:
         string_runtime()
     else:
         "#include <stdint.h>\n"
-    string_list_type = StringType
-        .list_element_key()
-        .list_c_type()
+    native_lists: NativeListTypes = {
+        strings = StringType
+            .list_element_key()
+            .list_c_type(),
+        bytes = IntegerType(UInt8Format)
+            .list_element_key()
+            .list_c_type(),
+    }
     system = inventory
         .system_calls()
         .map(
             pure func(operation: SystemOperation) -> SystemRuntime: operation.system_runtime(
-                string_list_type,
+                native_lists,
             ),
         )
     -- Every system operation's fragment needs POSIX.1-2008, with the XSI and
@@ -3699,6 +3787,9 @@ pure func emit(program: VerifiedProgram) -> Result[String, Diagnostic]:
     if requirements.integer_arithmetic:
         fragments = fragments.append(INTEGER_ARITHMETIC_RUNTIME)
 
+    if requirements.uint8_arithmetic:
+        fragments = fragments.append(UINT8_ARITHMETIC_RUNTIME)
+
     if requirements.string_output:
         fragments = fragments.append(string_print_runtime())
 
@@ -3721,11 +3812,14 @@ pure func emit(program: VerifiedProgram) -> Result[String, Diagnostic]:
         fragments = fragments.append(STRING_SLICE_RUNTIME)
 
     fragments = fragments.append(aggregates)
-    -- System fragments follow the aggregates, whose String-list type they use.
-    if system.any(pure func(runtime: SystemRuntime) -> Bool: runtime.fs_helpers):
-        fragments = fragments.append(FS_HELPERS_RUNTIME)
-    if system.any(pure func(runtime: SystemRuntime) -> Bool: runtime.process_helpers):
-        fragments = fragments.append(PROCESS_HELPERS_RUNTIME)
+    -- These fragments follow the aggregates, whose List types they use.
+    if requirements.string_to_bytes:
+        fragments = fragments.append(string_to_bytes_runtime(native_lists.bytes))
+    if requirements.bytes_to_text:
+        fragments = fragments.append(bytes_to_text_runtime(native_lists.bytes))
+    for shared in SHARED_FRAGMENTS:
+        if system.any(pure func(runtime: SystemRuntime) -> Bool: runtime.shared.contains(shared)):
+            fragments = fragments.append(shared.shared_fragment_runtime())
     for runtime in system:
         fragments = fragments.append(runtime.fragment)
     var index: Int = 0

@@ -10,6 +10,7 @@ import:
         ImportSelection(NamedSelection, ConstructorSelection, MethodsSelection),
         ModulePath,
     ../../syntax/syntax:
+        IntegerFormat(Int64Format, UInt8Format),
         Purity(Pure, Impure),
         Diagnostic,
         DiagnosticKind(ProgramProblem, CompilerFault),
@@ -49,10 +50,11 @@ import:
         UnionId,
     ../namespace/builtins:
         builtin_type_name,
+        integer_fits,
+        integer_limits,
         integer_spelling,
         render_builtin_type_error,
         runtime_declaration_help,
-        IntegerFormat(Int64Format),
     ../namespace/namespace:
         builtin_head,
         Conflict,
@@ -1086,12 +1088,24 @@ private pure func render_call_error(
                 context,
             )
         errors.GenericArgumentConflict(conflict):
-            type_diagnostic(
-                span,
-                "argument type does not match the parameter type",
-                conflict.mismatch.expected,
-                context,
-            )
+            match (conflict.mismatch.expected, conflict.current.value_type):
+                (check.IntegerType(expected), check.IntegerType(actual)):
+                    -- The local that took Int from a lone literal can take the other format.
+                    annotation: Option[(errors.LiteralBinding, IntegerFormat)] = match (
+                        conflict.current_literal,
+                        conflict.previous_literal,
+                    ):
+                        (Some(binding), _): Some((binding, expected))
+                        (None, Some(binding)): Some((binding, actual))
+                        (None, None): None
+                    integer_mixing(expected, actual, annotation, context, span)
+                _:
+                    type_diagnostic(
+                        span,
+                        "argument type does not match the parameter type",
+                        conflict.mismatch.expected,
+                        context,
+                    )
         errors.TextJoinConflict(_):
             rendered(
                 span,
@@ -1620,6 +1634,14 @@ private pure func render_value_error(
                 "cannot infer the element type of an empty list literal",
                 "give it a context with a List type, such as a List parameter, return type or append argument",
             )
+        errors.IntegerLiteralOutOfRange(value, format):
+            limits = format.integer_limits()
+            spelling = format.integer_spelling()
+            rendered(
+                span,
+                "${value} does not fit in ${spelling}",
+                "${spelling} holds ${limits.minimum} to ${limits.maximum}",
+            )
         errors.EmptyDictNeedsType:
             rendered(span, "an empty Dict needs its type", "write `name: Dict[K, V] = {}`")
         errors.DictLiteralRequiresDict:
@@ -1981,13 +2003,10 @@ private pure func builtin_spelling(
 
     for declaration in context.parsed.builtin_types:
         selected: Bool = match declaration.declaration:
-            IntegerBuiltin(_):
+            IntegerBuiltin(_, declared):
                 match value:
-                    check.IntegerType(format):
-                        match format:
-                            Int64Format: True
-                    _:
-                        False
+                    check.IntegerType(format): format == declared
+                    _: False
             FloatBuiltin(_):
                 value == check.FloatType
             StringBuiltin(_):
@@ -2316,6 +2335,49 @@ private pure func missing_coverage(
             )
 
 
+-- The library function that converts a value to `format`.
+private pure func integer_conversion(format: IntegerFormat) -> String:
+    match format:
+        Int64Format: "to_int()"
+        UInt8Format: "to_uint8()"
+
+
+-- Integer formats never mix implicitly: the help names each conversion, and the
+-- annotation that gives a literal-declared local the other format, when the
+-- literal fits it.
+private pure func integer_mixing(
+    expected: IntegerFormat,
+    actual: IntegerFormat,
+    annotation: Option[(errors.LiteralBinding, IntegerFormat)],
+    context: RenderContext,
+    span: Span,
+) -> Diagnostic:
+    message = "argument type does not match the parameter type"
+    left = expected.integer_spelling()
+    right = actual.integer_spelling()
+    conversions = "${left} and ${right} do not mix: convert the ${right} with ${integer_conversion(expected)}, or the ${left} with ${integer_conversion(actual)}"
+    match annotation:
+        Some((binding, format)):
+            if integer_fits(format, binding.literal):
+                match binding.name.parsed_spelling(context.parsed.names, span):
+                    Err(fault):
+                        fault
+                    Ok(name):
+                        keyword = if binding.mutable:
+                            "var "
+                        else:
+                            ""
+                        rendered(
+                            span,
+                            message,
+                            "${conversions}; or declare ${keyword}${name}: ${format.integer_spelling()} = ${binding.literal}",
+                        )
+            else:
+                rendered(span, message, conversions)
+        None:
+            rendered(span, message, conversions)
+
+
 private pure func type_diagnostic(
     span: Span,
     message: String,
@@ -2570,6 +2632,12 @@ private pure func render_trait_error(
                 span,
                 "canonical Stringable requires pure to_string(Self) -> String as its sole abstract method",
                 "keep to_string abstract; other pure methods require default bodies",
+            )
+        errors.IntegerWithoutNegation(format):
+            rendered(
+                span,
+                "${format.integer_spelling()} has no negation",
+                "write 0 - value for the wrapping result",
             )
         errors.MissingImplementation(method, _):
             match (

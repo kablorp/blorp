@@ -1,11 +1,18 @@
 import:
     bool: Bool methods
+    int: Int methods
+    result: Result methods
+    string: String methods
     test: TestSuite
     ../../../../../src/common/analysis/namespace/builtins as builtins:
-        IntegerFormat(Int64Format),
+        check_builtin_types,
         integer_fits,
+        integer_limits,
         integer_primitive,
+        render_builtin_type_error,
+        runtime_declaration_help,
     ../../../../../src/common/syntax/syntax:
+        IntegerFormat(Int64Format, UInt8Format),
         ParsedRuntimeOperation(
             IntegerAddBuiltin,
             IntegerSubtractBuiltin,
@@ -13,8 +20,20 @@ import:
             IntegerDivideBuiltin,
             IntegerRemainderBuiltin,
             IntegerToStringBuiltin,
+            IntegerConvertBuiltin,
+            StringToBytesBuiltin,
+            BytesToTextBuiltin,
+            SystemBuiltin,
         ),
+        SystemOperation(FsReadBytes, FsWriteBytes),
         Purity(Pure),
+    ../../../module_input: FOUNDATION_TYPES, parse_modules_with_base
+
+
+private ENTRY: String = "func main() -> Int:\n    0\n"
+
+
+private FORMATS: List[IntegerFormat] = [Int64Format, UInt8Format]
 
 
 pure func test_int64_format_accepts_the_complete_literal_carrier() -> Bool:
@@ -24,64 +43,200 @@ pure func test_int64_format_accepts_the_complete_literal_carrier() -> Bool:
         .and(integer_fits(Int64Format, 9223372036854775807))
 
 
-pure func test_int64_format_projects_to_the_existing_primitive() -> Bool:
-    integer_primitive(Int64Format) == builtins.BuiltinInt
+pure func test_uint8_format_holds_exactly_0_to_255() -> Bool:
+    limits = integer_limits(UInt8Format)
+    (limits.minimum == 0)
+        .and(limits.maximum == 255)
+        .and(integer_fits(UInt8Format, 0))
+        .and(integer_fits(UInt8Format, 255))
+        .and(integer_fits(UInt8Format, -1).not())
+        .and(integer_fits(UInt8Format, 256).not())
 
 
-pure func test_integer_builtin_labels_preserve_the_int64_format() -> Bool:
-    operations: List[Option[builtins.RuntimeOperation[Int, Int]]] = [
-        builtins.primitive_operation(IntegerAddBuiltin),
-        builtins.primitive_operation(IntegerSubtractBuiltin),
-        builtins.primitive_operation(IntegerMultiplyBuiltin),
-        builtins.primitive_operation(IntegerDivideBuiltin),
-        builtins.primitive_operation(IntegerRemainderBuiltin),
-        builtins.primitive_operation(IntegerToStringBuiltin),
-    ]
-    expected: List[Option[builtins.RuntimeOperation[Int, Int]]] = [
-        Some(builtins.IntegerAdd(Int64Format)),
-        Some(builtins.IntegerSubtract(Int64Format)),
-        Some(builtins.IntegerMultiply(Int64Format)),
-        Some(builtins.IntegerDivide(Int64Format)),
-        Some(builtins.IntegerRemainder(Int64Format)),
-        Some(builtins.IntegerToString(Int64Format)),
-    ]
-    operations == expected
+pure func test_each_format_projects_to_its_own_primitive() -> Bool:
+    (integer_primitive(Int64Format) == builtins.BuiltinInt).and(
+        integer_primitive(UInt8Format) == builtins.BuiltinUInt8,
+    )
+
+
+pure func test_integer_builtin_labels_keep_their_format() -> Bool:
+    var preserved: Bool = True
+    for format in FORMATS:
+        operations: List[Option[builtins.RuntimeOperation[Int, Int]]] = [
+            builtins.primitive_operation(IntegerAddBuiltin(format)),
+            builtins.primitive_operation(IntegerSubtractBuiltin(format)),
+            builtins.primitive_operation(IntegerMultiplyBuiltin(format)),
+            builtins.primitive_operation(IntegerDivideBuiltin(format)),
+            builtins.primitive_operation(IntegerRemainderBuiltin(format)),
+            builtins.primitive_operation(IntegerToStringBuiltin(format)),
+        ]
+        expected: List[Option[builtins.RuntimeOperation[Int, Int]]] = [
+            Some(builtins.IntegerAdd(format)),
+            Some(builtins.IntegerSubtract(format)),
+            Some(builtins.IntegerMultiply(format)),
+            Some(builtins.IntegerDivide(format)),
+            Some(builtins.IntegerRemainder(format)),
+            Some(builtins.IntegerToString(format)),
+        ]
+        preserved = preserved.and(operations == expected)
+    preserved
 
 
 pure func test_every_integer_arithmetic_contract_uses_its_format() -> Bool:
-    operations: List[builtins.RuntimeOperation[Int, Int]] = [
-        builtins.IntegerAdd(Int64Format),
-        builtins.IntegerSubtract(Int64Format),
-        builtins.IntegerMultiply(Int64Format),
-        builtins.IntegerDivide(Int64Format),
-        builtins.IntegerRemainder(Int64Format),
-    ]
     var accepted: Bool = True
-    for operation in operations:
-        contract = builtins.runtime_contract(operation)
-        match (contract.purity, contract.parameters, contract.return_type):
-            (Pure, [builtins.PrimitiveRuntimeType(builtins.BuiltinInt), builtins.PrimitiveRuntimeType(builtins.BuiltinInt)], builtins.ValueResult(builtins.PrimitiveRuntimeType(builtins.BuiltinInt))):
-                void
-            _:
-                accepted = False
+    for format in FORMATS:
+        primitive: builtins.RuntimeType[Int] = builtins.PrimitiveRuntimeType(
+            integer_primitive(format),
+        )
+        operations: List[builtins.RuntimeOperation[Int, Int]] = [
+            builtins.IntegerAdd(format),
+            builtins.IntegerSubtract(format),
+            builtins.IntegerMultiply(format),
+            builtins.IntegerDivide(format),
+            builtins.IntegerRemainder(format),
+        ]
+        for operation in operations:
+            contract = builtins.runtime_contract(operation)
+            accepted = accepted
+                .and(contract.purity == Pure)
+                .and(contract.parameters == [primitive, primitive])
+                .and(contract.return_type == builtins.ValueResult(primitive))
     accepted
 
 
 pure func test_integer_comparison_contracts_preserve_the_designated_boolean() -> Bool:
     boolean: builtins.DesignatedBoolean[Int] = { true_variant = 3, false_variant = 7 }
-    operations: List[builtins.RuntimeOperation[Int, Int]] = [
-        builtins.IntegerEquals(Int64Format, boolean),
-        builtins.IntegerLessThan(Int64Format, boolean),
-    ]
     var accepted: Bool = True
-    for operation in operations:
-        contract = builtins.runtime_contract(operation)
-        match (contract.purity, contract.parameters, contract.return_type):
-            (Pure, [builtins.PrimitiveRuntimeType(builtins.BuiltinInt), builtins.PrimitiveRuntimeType(builtins.BuiltinInt)], builtins.BooleanResult(designated)):
-                accepted = accepted.and(designated == boolean)
-            _:
-                accepted = False
+    for format in FORMATS:
+        primitive: builtins.RuntimeType[Int] = builtins.PrimitiveRuntimeType(
+            integer_primitive(format),
+        )
+        operations: List[builtins.RuntimeOperation[Int, Int]] = [
+            builtins.IntegerEquals(format, boolean),
+            builtins.IntegerLessThan(format, boolean),
+        ]
+        for operation in operations:
+            contract = builtins.runtime_contract(operation)
+            match (contract.purity, contract.parameters, contract.return_type):
+                (Pure, [first, second], builtins.BooleanResult(designated)):
+                    accepted = accepted
+                        .and(first == primitive)
+                        .and(second == primitive)
+                        .and(designated == boolean)
+                _:
+                    accepted = False
     accepted
+
+
+-- Widening to Int and narrowing to UInt8 each take the source format's primitive.
+pure func test_a_conversion_contract_maps_its_source_to_its_target() -> Bool:
+    operation: Option[builtins.RuntimeOperation[Int, Int]] = builtins.primitive_operation(
+        IntegerConvertBuiltin(UInt8Format, Int64Format),
+    )
+    widening_operation: builtins.RuntimeOperation[Int, Int] = builtins.IntegerConvert(
+        UInt8Format,
+        Int64Format,
+    )
+    narrowing_operation: builtins.RuntimeOperation[Int, Int] = builtins.IntegerConvert(
+        Int64Format,
+        UInt8Format,
+    )
+    int: builtins.RuntimeType[Int] = builtins.PrimitiveRuntimeType(builtins.BuiltinInt)
+    uint8: builtins.RuntimeType[Int] = builtins.PrimitiveRuntimeType(builtins.BuiltinUInt8)
+    widening = builtins.runtime_contract(widening_operation)
+    narrowing = builtins.runtime_contract(narrowing_operation)
+    (operation == Some(widening_operation))
+        .and(widening.parameters == [uint8])
+        .and(widening.return_type == builtins.ValueResult(int))
+        .and(narrowing.parameters == [int])
+        .and(narrowing.return_type == builtins.ValueResult(uint8))
+
+
+pure func test_a_uint8_label_declaration_help_names_uint8() -> Bool:
+    (runtime_declaration_help(IntegerAddBuiltin(UInt8Format)) == "declare a pure function with two UInt8 parameters returning UInt8")
+        .and(
+            (
+                runtime_declaration_help(IntegerConvertBuiltin(Int64Format, UInt8Format))
+                == "declare a pure nongeneric function with one Int parameter returning UInt8"
+            ),
+        )
+        .and(
+            (
+                runtime_declaration_help(IntegerAddBuiltin(Int64Format))
+                == "declare a pure function with two Int parameters returning Int"
+            ),
+        )
+
+
+pure func test_byte_natives_take_and_give_uint8_lists() -> Bool:
+    boolean_option: builtins.DesignatedOption[Int] = { some = 1, none = 2 }
+    to_bytes: builtins.RuntimeOperation[Int, Int] = builtins.StringToBytes
+    to_text: builtins.RuntimeOperation[Int, Int] = builtins.BytesToText(boolean_option)
+    bytes: builtins.RuntimeType[Int] = builtins.UInt8ListRuntimeType
+    string: builtins.RuntimeType[Int] = builtins.PrimitiveRuntimeType(builtins.BuiltinString)
+    giving = builtins.runtime_contract(to_bytes)
+    taking = builtins.runtime_contract(to_text)
+    (giving.parameters == [string])
+        .and(giving.return_type == builtins.ValueResult(bytes))
+        .and(taking.parameters == [bytes])
+        .and(taking.return_type == builtins.OptionalResult(string, boolean_option))
+
+
+-- The help is rendered from each signature row, so it names the List[UInt8] payloads.
+pure func test_byte_file_natives_declare_uint8_list_rows() -> Bool:
+    (runtime_declaration_help(SystemBuiltin(FsReadBytes)) == "declare an impure nongeneric function with one String parameter returning Result[List[UInt8], Int]")
+        .and(
+            (
+                runtime_declaration_help(SystemBuiltin(FsWriteBytes))
+                == "declare an impure nongeneric function with String and List[UInt8] parameters returning Result[Void, Int]"
+            ),
+        )
+        .and(
+            (
+                runtime_declaration_help(BytesToTextBuiltin)
+                == "declare a pure nongeneric function with one List[UInt8] parameter returning Option[String]"
+            ),
+        )
+
+
+-- UInt8 is optional until the standard library declares it.
+pure func test_a_base_without_uint8_is_accepted() -> Bool:
+    match parse_modules_with_base([{ source = ENTRY, targets = [] }], {
+        types = FOUNDATION_TYPES,
+        prelude_selections = "Int",
+    }):
+        Ok(program): check_builtin_types(program).is_ok()
+        Err(_): False
+
+
+pure func test_a_base_with_uint8_is_accepted() -> Bool:
+    match parse_modules_with_base([{ source = ENTRY, targets = [] }], {
+        types = FOUNDATION_TYPES + "type UInt8 = builtin\n",
+        prelude_selections = "Int, UInt8",
+    }):
+        Ok(program): check_builtin_types(program).is_ok()
+        Err(_): False
+
+
+pure func test_a_repeated_uint8_is_rejected_at_the_second() -> Bool:
+    repeated = "type UInt8 = builtin\ntype UInt8 = builtin\n"
+    match parse_modules_with_base([{ source = ENTRY, targets = [] }], {
+        types = FOUNDATION_TYPES + repeated,
+        prelude_selections = "Int",
+    }):
+        Err(_):
+            False
+        Ok(program):
+            match check_builtin_types(program):
+                Ok(_):
+                    False
+                Err(error):
+                    diagnostic = render_builtin_type_error(error)
+                    second = FOUNDATION_TYPES.length() + "type UInt8 = builtin\ntype ".length()
+                    (diagnostic.message == "duplicate builtin type declaration")
+                        .and(diagnostic.help == "declare type UInt8 = builtin exactly once")
+                        .and(diagnostic.span.start == second)
+                        .and(diagnostic.span.end == second + 5)
 
 
 TESTS: TestSuite = {
@@ -91,14 +246,12 @@ TESTS: TestSuite = {
             "Int64 format accepts the complete literal carrier",
             test_int64_format_accepts_the_complete_literal_carrier,
         ),
+        ("UInt8 format holds exactly 0 to 255", test_uint8_format_holds_exactly_0_to_255),
         (
-            "Int64 format projects to the existing primitive",
-            test_int64_format_projects_to_the_existing_primitive,
+            "each format projects to its own primitive",
+            test_each_format_projects_to_its_own_primitive,
         ),
-        (
-            "integer builtin labels preserve the Int64 format",
-            test_integer_builtin_labels_preserve_the_int64_format,
-        ),
+        ("integer builtin labels keep their format", test_integer_builtin_labels_keep_their_format),
         (
             "every integer arithmetic contract uses its format",
             test_every_integer_arithmetic_contract_uses_its_format,
@@ -106,6 +259,25 @@ TESTS: TestSuite = {
         (
             "integer comparison contracts preserve the designated Boolean",
             test_integer_comparison_contracts_preserve_the_designated_boolean,
+        ),
+        (
+            "a conversion contract maps its source to its target",
+            test_a_conversion_contract_maps_its_source_to_its_target,
+        ),
+        (
+            "a UInt8 label declaration help names UInt8",
+            test_a_uint8_label_declaration_help_names_uint8,
+        ),
+        ("byte natives take and give UInt8 Lists", test_byte_natives_take_and_give_uint8_lists),
+        (
+            "byte file natives declare UInt8 List rows",
+            test_byte_file_natives_declare_uint8_list_rows,
+        ),
+        ("a base without UInt8 is accepted", test_a_base_without_uint8_is_accepted),
+        ("a base with UInt8 is accepted", test_a_base_with_uint8_is_accepted),
+        (
+            "a repeated UInt8 is rejected at the second",
+            test_a_repeated_uint8_is_rejected_at_the_second,
         ),
     ],
 }

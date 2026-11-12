@@ -376,6 +376,53 @@ keeps what a later landing needs. What it found:
 
    Tests use fixtures with their own `_base`, so nothing the seed parses uses
    `UInt8` yet.
+   - **Execution, 2026-11-12.** `IntegerFormat` moved to `syntax.brp`, so the
+     parser reads the format from `type UInt8 = builtin` and the `uint8.*`
+     labels, and the parsed operations carry it. `UInt8Format` has an arm in
+     every projection L0 made. The conversions are one
+     `IntegerConvert(source, target)`, emitted as a C cast, behind
+     `uint8.to_int` and `int.wrap_to_uint8`. A literal whose expectation is
+     an unsolved variable gets an `IntegerLiteralSlot` with an integer-only
+     state; it defaults to Int when its call, variant, record or list
+     finishes, when lambda resolution stalls, and at publication. Its range
+     is checked once its format is fixed. A literal defaults before receiver
+     selection sees it, so `7.describe()` picks Int's `describe` over
+     String's. The byte natives share the read and atomic-replace helpers
+     with their text forms through `SystemRuntime.shared`, and use the read
+     and write errno masks.
+     - Lines: production +1,165 −315 (+850 net) for L1, after a
+       preparatory commit that drops `SystemRuntime.posix_declarations`
+       (−69 net). Tests +2,396 −168 (+2,228 net).
+     - Cost against `aa9d5feaf`, from `blorp/scripts/self-compile-cost`
+       with 11 rounds: fixed input instructions +0.100% and allocations
+       +0.015%; own source instructions +1.31% and allocations +1.24%. The
+       fixed-input C differs only in the file-system runtime: the read and
+       atomic-replace helpers are emitted once, ahead of the operations that
+       share them, and `read_text` and `write_text` call the new path
+       helpers. The program's own functions are unchanged.
+     - **Keith's ruling, 2026-11-11: production ceiling +700 → about +870.**
+       S0's table did not foresee the deferred literal's full size (about 300
+       lines against 225: slot origins, integer-only unification, four
+       defaulting points and the range check) or the plumbing that lets the
+       U4 help name an Int local declared from a lone literal (about 95
+       lines through `scope`, `bodies`, `InferenceUse` and the conflict).
+     - **Coordinator budget correction, 2026-11-12: e2e allocation ceilings
+       `fs_write` 210,082 → 210,212 and `accepted_generic_head` 4,684 →
+       4,693.** A deferred integer literal costs about 8 allocations, from
+       inference unification and defaulting, and the seeded `UInt8` word,
+       the shared-fragment selection and the List key's format suffix cost
+       13 to 20 more per compile. Main had already used most of the two
+       ceilings' headroom: it measured 209,917 and 4,681.
+     - `lookup_errors/append_modules` now pins 1684 strict allocations, up
+       from 1677. The fixture builds the compiler's own seeded name
+       table, and seeding `UInt8` by identity adds seven allocations there;
+       the 66-allocation eager-error regression it guards against would
+       still fail it.
+     - Gates: `make -C blorp test INSTRUCTION_CHECK=on`,
+       `scripts/blorp-fixpoint --prove` (714 fixture pairs identical),
+       `test_bootstrap.sh` and `git diff --check` pass. Five oracles were
+       proved by breaking them: the range check, the Int default, the
+       integer-only waiting literal, wrapping and literal emission.
 4. **L2, seed rotation** onto L1: a plain rotation (`scripts/README.md`,
    "Rotating the seed pin"). The seed family switch to `blorp` and the move to
    the `compile INPUT --library-root DIR -o OUTPUT` command line landed with

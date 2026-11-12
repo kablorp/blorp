@@ -10,6 +10,7 @@ import:
     option: Option methods
     result: Result methods
     ../../syntax/syntax:
+        IntegerFormat(Int64Format, UInt8Format),
         binder_span,
         ParsedLambda,
         ParsedBlock,
@@ -71,7 +72,7 @@ import:
     ../../utils/results: translated_list
     ../../utils/stack: push_at
     ../ids: TraitMethodId, FunctionId, VariantId, OpaqueRow, TraitId, OpaqueId, RecordId
-    ../namespace/builtins as builtins: RuntimeOperation, IntegerFormat(Int64Format)
+    ../namespace/builtins as builtins: RuntimeOperation, integer_fits
     ../namespace/namespace:
         NamedValue(NamedMethod, NamedFunction, NamedConstant, NamedConstructor, NamedAlias),
         OfferedValue(OfferedMethod, OfferedFunction, OfferedConstant, OfferedConstructor),
@@ -101,6 +102,7 @@ import:
             PlannedDict,
             PlannedStoredCall,
             PlannedLeaf,
+            PlannedIntegerLiteral,
             PlannedRecord,
             PlannedUpdate,
             PlannedVariant,
@@ -160,6 +162,7 @@ import:
             ForeignOpaqueProjection,
             EmptyDictNeedsType,
             DictLiteralRequiresDict,
+            IntegerLiteralOutOfRange,
         ),
         MethodError(MethodReceiverNeedsType),
         CheckerInvariant(
@@ -251,7 +254,12 @@ import:
         PendingStep,
         PendingValue,
         PendingVariantContract,
-        InferenceVariableState(UnboundVariable),
+        InferenceVariableState(UnboundVariable, UnboundIntegerVariable),
+        SlotOrigin(TypeParameterSlot, IntegerLiteralSlot),
+        default_call_literals,
+        default_every_integer_literal,
+        default_integer_literals,
+        next_inference_variable,
         inference_complete,
         inference_type,
         tuple_inference_type,
@@ -989,7 +997,7 @@ private pure func plan_base(
                 ConstantInitializer(_, _, _): Err(constant_error(body.span, NonClosedInitializer))
                 BodyExpression(_, _): Ok(PlannedInterpolation(parts))
         IntegerExpression(value):
-            Ok(PlannedLeaf(AcceptedInteger(value), IntegerType(Int64Format)))
+            value.plan_integer_literal(expectation, slots, body.base_span)
         FloatExpression(value):
             Ok(PlannedLeaf(AcceptedFloat(value), FloatType))
         TupleExpression(elements):
@@ -1002,6 +1010,30 @@ private pure func plan_base(
                     scope.plan_body_base(body, expectation, context, construction, slots)
                 ConstantInitializer(_, _, _):
                     body.plan_closed_base(expectation, construction, slots)
+
+
+-- An integer literal takes the integer type it is expected to have, waits
+-- for an unsolved variable to decide one, and is otherwise Int, so that a
+-- mismatch reads as it did before literals had more than one type.
+private pure func plan_integer_literal(
+    value: Int,
+    expectation: Option[InferenceType],
+    slots: List[InferenceSlot],
+    span: Span,
+) -> Result[PlannedBase, CheckError]:
+    match expectation:
+        Some(hint):
+            match hint.inference_head(slots, span):
+                Err(error):
+                    Err(error)
+                Ok(AcceptedType(IntegerType(format))):
+                    Ok(PlannedLeaf(AcceptedInteger(value), IntegerType(format)))
+                Ok(CallVariable(_)):
+                    Ok(PlannedIntegerLiteral(value))
+                Ok(_):
+                    Ok(PlannedLeaf(AcceptedInteger(value), IntegerType(Int64Format)))
+        None:
+            Ok(PlannedLeaf(AcceptedInteger(value), IntegerType(Int64Format)))
 
 
 private pure func plan_closed_base(
@@ -1277,7 +1309,10 @@ private pure func plan_body_base(
                     if binding.binding_site().binding.owner == context.caller.body:
                         Ok(
                             PlannedLeaf(
-                                AcceptedBinding(binding.local_binding_id()),
+                                AcceptedBinding(
+                                    binding.local_binding_id(),
+                                    binding.literal_binding(),
+                                ),
                                 binding.binding_definition().value_type,
                             ),
                         )
@@ -1302,7 +1337,7 @@ private pure func plan_body_base(
                         local.binding_site().binding.owner
                         == context.caller.body
                     ):
-                        AcceptedBinding(local.local_binding_id())
+                        AcceptedBinding(local.local_binding_id(), None)
                     else:
                         PendingCapture(local.binding_site().binding)
                     Ok(PlannedLeaf(base, local.binding_definition().value_type))
@@ -1660,7 +1695,11 @@ private pure func pending_receiver_contract(
     context ?= site.body_context(application.span)
     application.select_receiver_contract(
         candidates,
-        { value_type = current.pending_type(), span = current.base_span },
+        {
+            value_type = current.pending_type(),
+            span = current.base_span,
+            literal = current.read_literal(),
+        },
         slots,
         context,
     )
@@ -1771,7 +1810,11 @@ private pure func placed_arguments(
 
     match placement:
         ReceiverPlacement(receiver, _):
-            actual: InferenceUse = { value_type = receiver.pending_type(), span = span }
+            actual: InferenceUse = {
+                value_type = receiver.pending_type(),
+                span = span,
+                literal = receiver.read_literal(),
+            }
             [actual].concat(values)
         _:
             values
@@ -1898,6 +1941,8 @@ private pure func elaborate_value(
     var context_work: List[ContextWork] = []
     var inference_revision = 0
     var slots: List[InferenceSlot] = []
+    -- Whether any integer literal waits for its format; until one does, nothing defaults.
+    var integer_literals: Bool = False
     var work: List[Option[ExpressionWork]] = [
         Some(FinishRoot),
         Some(
@@ -1997,7 +2042,7 @@ private pure func elaborate_value(
                                             PendingNamedCallable(_, signature, _):
                                                 for parameter in signature.type_parameters:
                                                     slots = slots.append({
-                                                        parameter = parameter,
+                                                        origin = TypeParameterSlot(parameter),
                                                         call_span = written.span,
                                                         first_argument = None,
                                                         state = UnboundVariable(0),
@@ -2005,7 +2050,7 @@ private pure func elaborate_value(
                                             PendingMethodCallable(_, signature, _):
                                                 for parameter in signature.type_parameters:
                                                     slots = slots.append({
-                                                        parameter = parameter,
+                                                        origin = TypeParameterSlot(parameter),
                                                         call_span = written.span,
                                                         first_argument = None,
                                                         state = UnboundVariable(0),
@@ -2054,7 +2099,9 @@ private pure func elaborate_value(
                                                         Ok(call):
                                                             for parameter in contract.signature.type_parameters:
                                                                 slots = slots.append({
-                                                                    parameter = parameter,
+                                                                    origin = TypeParameterSlot(
+                                                                        parameter,
+                                                                    ),
                                                                     call_span = contract.span,
                                                                     first_argument = None,
                                                                     state = UnboundVariable(0),
@@ -2181,13 +2228,35 @@ private pure func elaborate_value(
                                                             Some(value),
                                                         )
                                                         operand_count = operand_count + 1
+                                            -- Closed like any literal: only its format waits.
+                                            PlannedIntegerLiteral(integer):
+                                                value: PendingValue = {
+                                                    span = written.span,
+                                                    readiness = ClosedInference,
+                                                    base = AcceptedInteger(integer),
+                                                    base_type = next_inference_variable(slots),
+                                                    base_span = written.base_span,
+                                                    operations = NoPendingOperations,
+                                                }
+                                                slots = slots.append({
+                                                    origin = IntegerLiteralSlot,
+                                                    call_span = written.base_span,
+                                                    first_argument = None,
+                                                    state = UnboundIntegerVariable(0),
+                                                })
+                                                integer_literals = True
+                                                operands = operands.push_at(
+                                                    operand_count,
+                                                    Some(value),
+                                                )
+                                                operand_count = operand_count + 1
                                             PlannedConstructOpaque(declaration, operand):
                                                 conversion = declaration.opaque_conversion(
                                                     slots.length(),
                                                 )
                                                 for parameter in declaration.type_parameters:
                                                     slots = slots.append({
-                                                        parameter = parameter,
+                                                        origin = TypeParameterSlot(parameter),
                                                         call_span = written.base_span,
                                                         first_argument = None,
                                                         state = UnboundVariable(0),
@@ -2218,7 +2287,7 @@ private pure func elaborate_value(
                                                 )
                                                 for parameter in declaration.type_parameters:
                                                     slots = slots.append({
-                                                        parameter = parameter,
+                                                        origin = TypeParameterSlot(parameter),
                                                         call_span = written.base_span,
                                                         first_argument = None,
                                                         state = UnboundVariable(0),
@@ -2664,12 +2733,20 @@ private pure func elaborate_value(
                                                 ),
                                             )
                     CheckRecord(literal, fields):
-                        match literal.finish_pending_record(fields, slots):
-                            Err(error):
-                                failure = Some(error)
-                            Ok(value):
-                                operands = operands.push_at(operand_count, Some(value))
-                                operand_count = operand_count + 1
+                        if integer_literals:
+                            match [literal.value_type].default_integer_literals(
+                                slots,
+                                literal.span,
+                            ):
+                                Ok(defaulted): slots = defaulted
+                                Err(error): failure = Some(error)
+                        if failure.is_none():
+                            match literal.finish_pending_record(fields, slots):
+                                Err(error):
+                                    failure = Some(error)
+                                Ok(value):
+                                    operands = operands.push_at(operand_count, Some(value))
+                                    operand_count = operand_count + 1
                     FinishVariant(contract, range, span):
                         match operands.call_operands(range, span):
                             Err(error):
@@ -2725,12 +2802,17 @@ private pure func elaborate_value(
                                                         )
                                                         work_count = work_count + 1
                     CheckVariant(contract, values, span):
-                        match contract.finish_pending_variant(values, span, slots):
-                            Err(error):
-                                failure = Some(error)
-                            Ok(value):
-                                operands = operands.push_at(operand_count, Some(value))
-                                operand_count = operand_count + 1
+                        if integer_literals:
+                            match [contract.result_type].default_integer_literals(slots, span):
+                                Ok(defaulted): slots = defaulted
+                                Err(error): failure = Some(error)
+                        if failure.is_none():
+                            match contract.finish_pending_variant(values, span, slots):
+                                Err(error):
+                                    failure = Some(error)
+                                Ok(value):
+                                    operands = operands.push_at(operand_count, Some(value))
+                                    operand_count = operand_count + 1
                     -- Elements enter one at a time so that, once E is known, every later
                     -- element is checked under E as its expected type: a nested `[]`
                     -- after a sibling receives its element type from E = List[T].
@@ -2898,12 +2980,21 @@ private pure func elaborate_value(
                                                         )
                                                         work_count = work_count + 1
                     CheckList(source, values, base_span, span):
-                        match source.finish_pending_list(values, span, base_span, slots):
-                            Err(error):
-                                failure = Some(error)
-                            Ok(value):
-                                operands = operands.push_at(operand_count, Some(value))
-                                operand_count = operand_count + 1
+                        if integer_literals:
+                            match source.list_element_type(values, base_span):
+                                Ok(element):
+                                    match [element].default_integer_literals(slots, base_span):
+                                        Ok(defaulted): slots = defaulted
+                                        Err(error): failure = Some(error)
+                                Err(error):
+                                    failure = Some(error)
+                        if failure.is_none():
+                            match source.finish_pending_list(values, span, base_span, slots):
+                                Err(error):
+                                    failure = Some(error)
+                                Ok(value):
+                                    operands = operands.push_at(operand_count, Some(value))
+                                    operand_count = operand_count + 1
                     ScheduleCall(contract, arguments, placement, hint):
                         match site.body_context(contract.span):
                             Err(error):
@@ -2980,7 +3071,7 @@ private pure func elaborate_value(
                                         }
                                         for parameter in contract.signature.type_parameters:
                                             slots = slots.append({
-                                                parameter = parameter,
+                                                origin = TypeParameterSlot(parameter),
                                                 call_span = contract.span,
                                                 first_argument = None,
                                                 state = UnboundVariable(0),
@@ -3074,12 +3165,17 @@ private pure func elaborate_value(
                                             )
                                             work_count = work_count + 1
                     CheckCall(call, arguments, placement):
-                        match call.finish_pending_call(arguments, placement, slots):
-                            Err(error):
-                                failure = Some(error)
-                            Ok(value):
-                                operands = operands.push_at(operand_count, Some(value))
-                                operand_count = operand_count + 1
+                        if integer_literals:
+                            match call.default_call_literals(slots):
+                                Ok(defaulted): slots = defaulted
+                                Err(error): failure = Some(error)
+                        if failure.is_none():
+                            match call.finish_pending_call(arguments, placement, slots):
+                                Err(error):
+                                    failure = Some(error)
+                                Ok(value):
+                                    operands = operands.push_at(operand_count, Some(value))
+                                    operand_count = operand_count + 1
                     ContinuePostfix(postfixes, hints, position, base_span, span, expected):
                         operand_count = operand_count - 1
                         current_result = operands.expression_operand(operand_count, span)
@@ -3351,6 +3447,15 @@ private pure func elaborate_value(
                             BodyExpression(context, resolve_block):
                                 match lambda_work.get(position):
                                     None:
+                                        -- Stuck: the integer literals nothing constrained become Int,
+                                        -- which may let resolution resume.
+                                        if (revision == inference_revision).and(integer_literals):
+                                            match slots.default_every_integer_literal():
+                                                Some(defaulted):
+                                                    slots = defaulted
+                                                    inference_revision = inference_revision + 1
+                                                None:
+                                                    void
                                         if revision != inference_revision:
                                             next_resolution: ExpressionWork = if context_work.is_empty():
                                                 ResolveLambdas(0, inference_revision)
@@ -3732,6 +3837,7 @@ private pure func freeze_pending_call(
             receiver_use: InferenceUse = {
                 value_type = AcceptedType(frozen_receiver.value_type),
                 span = call.span,
+                literal = None,
             }
             actual = [receiver_use].concat(actual)
             match call.target:
@@ -4300,7 +4406,7 @@ private pure func freeze_pending_form(
             Ok(LiteralString(text))
         AcceptedConstant(template):
             Ok(template.form)
-        AcceptedBinding(id):
+        AcceptedBinding(id, _):
             Ok(ReadBinding(id))
         AcceptedCapture(id):
             Ok(ReadCapture(id))
@@ -4406,8 +4512,20 @@ private pure func finish_pending_value(
     -- type, so it proves the opaque declaration's bounds here. A record literal
     -- or constructor takes its type from an expected type that is already proved.
     _: Void ?= match base:
-        ConstructOpaque(_, _): traits.prove_declared_bounds(base_type, assumptions, value.base_span)
-        _: Ok(void)
+        ConstructOpaque(_, _):
+            traits.prove_declared_bounds(base_type, assumptions, value.base_span)
+        -- A deferred literal's format is fixed only now.
+        LiteralInteger(integer):
+            match base_type:
+                IntegerType(format):
+                    if integer_fits(format, integer):
+                        Ok(void)
+                    else:
+                        Err(value_error(value.base_span, IntegerLiteralOutOfRange(integer, format)))
+                _:
+                    Err(checker_invariant(value.base_span, InvalidInferenceWorklist))
+        _:
+            Ok(void)
     var current: CheckedExpr = { form = base, value_type = base_type, span = value.base_span }
     var failure: Option[CheckError] = None
 

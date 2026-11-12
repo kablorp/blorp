@@ -6,7 +6,9 @@ import:
             ProcessFindProgram,
             ProcessFault,
             FsReadText,
+            FsReadBytes,
             FsWriteText,
+            FsWriteBytes,
             FsEntryKind,
             FsListDirectory,
             FsCreateDirectory,
@@ -22,8 +24,13 @@ import:
         ),
     ./fs:
         FS_ENTRY_KIND_RUNTIME,
+        FS_HELPERS_RUNTIME,
+        FS_READ_RUNTIME,
         FS_READ_TEXT_RUNTIME,
+        fs_read_bytes_runtime,
+        FS_WRITE_RUNTIME,
         FS_WRITE_TEXT_RUNTIME,
+        fs_write_bytes_runtime,
         fs_list_directory_runtime,
         FS_CREATE_DIRECTORY_RUNTIME,
         FS_CREATE_DIRECTORIES_RUNTIME,
@@ -35,7 +42,11 @@ import:
         FS_OPEN_READ_RUNTIME,
         fs_next_lines_runtime,
         FS_CLOSE_RUNTIME,
-    ./process: process_capture_runtime, PROCESS_FIND_PROGRAM_RUNTIME, PROCESS_FAULT_RUNTIME
+    ./process:
+        PROCESS_HELPERS_RUNTIME,
+        process_capture_runtime,
+        PROCESS_FIND_PROGRAM_RUNTIME,
+        PROCESS_FAULT_RUNTIME,
 
 
 -- The working directory, failing with an Int code of the shared fs protocol
@@ -91,7 +102,9 @@ pure func system_symbol(operation: SystemOperation) -> String:
         ProcessFindProgram: "blorp_process_find_program"
         ProcessFault: "blorp_process_fault"
         FsReadText: "blorp_fs_read_text"
+        FsReadBytes: "blorp_fs_read_bytes"
         FsWriteText: "blorp_fs_write_text"
+        FsWriteBytes: "blorp_fs_write_bytes"
         FsEntryKind: "blorp_fs_entry_kind"
         FsListDirectory: "blorp_fs_list_directory"
         FsCreateDirectory: "blorp_fs_create_directory"
@@ -106,75 +119,83 @@ pure func system_symbol(operation: SystemOperation) -> String:
         FsClose: "blorp_fs_close"
 
 
--- `fs_helpers` needs FS_HELPERS_RUNTIME, and `process_helpers` needs
--- PROCESS_HELPERS_RUNTIME after it.
+-- C that more than one system operation's fragment calls, emitted once, in
+-- this order, before the operations' own fragments: the fs helpers first, then
+-- what calls them.
+union SharedFragment:
+    FsHelpers
+    ProcessHelpers
+    FileReading
+    FileReplacing
+
+
+SHARED_FRAGMENTS: List[SharedFragment] = [FsHelpers, ProcessHelpers, FileReading, FileReplacing]
+
+
+pure func shared_fragment_runtime(fragment: SharedFragment) -> String:
+    match fragment:
+        FsHelpers: FS_HELPERS_RUNTIME
+        ProcessHelpers: PROCESS_HELPERS_RUNTIME
+        FileReading: FS_READ_RUNTIME
+        FileReplacing: FS_WRITE_RUNTIME
+
+
+-- `shared` are the shared fragments the operation's own fragment calls.
 record SystemRuntime {
     fragment: String,
-    fs_helpers: Bool,
-    process_helpers: Bool,
+    shared: List[SharedFragment],
 }
 
 
--- The emitter supplies the String-list C type from its existing typed key.
-pure func system_runtime(operation: SystemOperation, string_list_type: String) -> SystemRuntime:
+-- The List C types a native's fragment names, from the emitter's typed keys.
+record NativeListTypes {
+    strings: String,
+    bytes: String,
+}
+
+
+pure func system_runtime(operation: SystemOperation, lists: NativeListTypes) -> SystemRuntime:
     match operation:
         CurrentDirectory:
-            {
-                fragment = SYSTEM_CURRENT_DIRECTORY_RUNTIME,
-                fs_helpers = True,
-                process_helpers = False,
-            }
+            { fragment = SYSTEM_CURRENT_DIRECTORY_RUNTIME, shared = [FsHelpers] }
         ProcessCapture:
             {
-                fragment = process_capture_runtime(string_list_type),
-                fs_helpers = True,
-                process_helpers = True,
+                fragment = process_capture_runtime(lists.strings),
+                shared = [FsHelpers, ProcessHelpers],
             }
         ProcessFindProgram:
-            { fragment = PROCESS_FIND_PROGRAM_RUNTIME, fs_helpers = True, process_helpers = True }
+            { fragment = PROCESS_FIND_PROGRAM_RUNTIME, shared = [FsHelpers, ProcessHelpers] }
         ProcessFault:
-            { fragment = PROCESS_FAULT_RUNTIME, fs_helpers = False, process_helpers = True }
+            { fragment = PROCESS_FAULT_RUNTIME, shared = [ProcessHelpers] }
         FsReadText:
-            { fragment = FS_READ_TEXT_RUNTIME, fs_helpers = True, process_helpers = False }
+            { fragment = FS_READ_TEXT_RUNTIME, shared = [FsHelpers, FileReading] }
+        FsReadBytes:
+            { fragment = fs_read_bytes_runtime(lists.bytes), shared = [FsHelpers, FileReading] }
         FsWriteText:
-            { fragment = FS_WRITE_TEXT_RUNTIME, fs_helpers = True, process_helpers = False }
+            { fragment = FS_WRITE_TEXT_RUNTIME, shared = [FsHelpers, FileReplacing] }
+        FsWriteBytes:
+            { fragment = fs_write_bytes_runtime(lists.bytes), shared = [FsHelpers, FileReplacing] }
         FsEntryKind:
-            { fragment = FS_ENTRY_KIND_RUNTIME, fs_helpers = True, process_helpers = False }
+            { fragment = FS_ENTRY_KIND_RUNTIME, shared = [FsHelpers] }
         FsListDirectory:
-            {
-                fragment = fs_list_directory_runtime(string_list_type),
-                fs_helpers = True,
-                process_helpers = False,
-            }
+            { fragment = fs_list_directory_runtime(lists.strings), shared = [FsHelpers] }
         FsCreateDirectory:
-            { fragment = FS_CREATE_DIRECTORY_RUNTIME, fs_helpers = True, process_helpers = False }
+            { fragment = FS_CREATE_DIRECTORY_RUNTIME, shared = [FsHelpers] }
         FsCreateDirectories:
-            { fragment = FS_CREATE_DIRECTORIES_RUNTIME, fs_helpers = True, process_helpers = False }
+            { fragment = FS_CREATE_DIRECTORIES_RUNTIME, shared = [FsHelpers] }
         FsRemoveFile:
-            { fragment = FS_REMOVE_FILE_RUNTIME, fs_helpers = True, process_helpers = False }
+            { fragment = FS_REMOVE_FILE_RUNTIME, shared = [FsHelpers] }
         FsRemoveDirectory:
-            { fragment = FS_REMOVE_DIRECTORY_RUNTIME, fs_helpers = True, process_helpers = False }
+            { fragment = FS_REMOVE_DIRECTORY_RUNTIME, shared = [FsHelpers] }
         FsRename:
-            { fragment = FS_RENAME_RUNTIME, fs_helpers = True, process_helpers = False }
+            { fragment = FS_RENAME_RUNTIME, shared = [FsHelpers] }
         FsRemoveDirectoryTree:
-            {
-                fragment = FS_REMOVE_DIRECTORY_TREE_RUNTIME,
-                fs_helpers = True,
-                process_helpers = False,
-            }
+            { fragment = FS_REMOVE_DIRECTORY_TREE_RUNTIME, shared = [FsHelpers] }
         FsCreateTemporaryDirectory:
-            {
-                fragment = FS_CREATE_TEMPORARY_DIRECTORY_RUNTIME,
-                fs_helpers = True,
-                process_helpers = False,
-            }
+            { fragment = FS_CREATE_TEMPORARY_DIRECTORY_RUNTIME, shared = [FsHelpers] }
         FsOpenRead:
-            { fragment = FS_OPEN_READ_RUNTIME, fs_helpers = True, process_helpers = False }
+            { fragment = FS_OPEN_READ_RUNTIME, shared = [FsHelpers] }
         FsNextLines:
-            {
-                fragment = fs_next_lines_runtime(string_list_type),
-                fs_helpers = True,
-                process_helpers = False,
-            }
+            { fragment = fs_next_lines_runtime(lists.strings), shared = [FsHelpers] }
         FsClose:
-            { fragment = FS_CLOSE_RUNTIME, fs_helpers = True, process_helpers = False }
+            { fragment = FS_CLOSE_RUNTIME, shared = [FsHelpers] }

@@ -1,0 +1,185 @@
+---
+Programs over a base that declares UInt8, which the standard library cannot do
+until the pinned seed knows the type. Each program has four modules: the root
+at 0, a library at 1 that implements the operator traits for Int and UInt8, the
+base at 2 and its prelude at 3. The check, specialization, lowering, ownership,
+verification and emission suites share them.
+---
+import:
+    option: Option methods
+    result: Result methods
+    string: String methods
+    ../../src/common/analysis/assemble:
+        ParsedAssembly,
+        ParsedProgram,
+        append_module,
+        assembly_names,
+        begin_program,
+    ../../src/common/analysis/check/check: CheckedProgram, check
+    ../../src/common/analysis/check/render: render_failure
+    ../../src/common/codegen/lower/lower: LoweredProgram, lower
+    ../../src/common/codegen/own/own: OwnershipProgram, own
+    ../../src/common/codegen/specialize/specialize: specialize
+    ../../src/common/syntax/lex: lex
+    ../../src/common/syntax/parse: parse_module
+    ../../src/common/syntax/source:
+        ModuleId,
+        ModuleKind(UserModule, LibraryModule, FoundationTypesModule, FoundationPreludeModule),
+        module_id,
+        module_source,
+        root_module_id,
+    ../../src/common/syntax/syntax: Diagnostic, Diagnostics, diagnostic
+    ./input: setup_diagnostic
+    ./module_input: FOUNDATION_TYPES, sealed
+
+
+private BASE_POSITION: Int = 2
+
+
+-- The traits the operators call, after the base's types and unions. UInt8 has
+-- no Negatable, as an unsigned type has no negation.
+UINT8_TRAITS: String =
+    |type UInt8 = builtin
+    |trait Equatable:
+    |    pure func equals(left: Self, right: Self) -> Bool
+    |    pure func not_equals(left: Self, right: Self) -> Bool:
+    |        match left.equals(right):
+    |            True: False
+    |            False: True
+    |trait Orderable:
+    |    pure func less_than(left: Self, right: Self) -> Bool
+    |    pure func greater_than(left: Self, right: Self) -> Bool:
+    |        right.less_than(left)
+    |    pure func less_than_or_equal(left: Self, right: Self) -> Bool:
+    |        match right.less_than(left):
+    |            True: False
+    |            False: True
+    |    pure func greater_than_or_equal(left: Self, right: Self) -> Bool:
+    |        match left.less_than(right):
+    |            True: False
+    |            False: True
+    |trait Addable:
+    |    pure func add(left: Self, right: Self) -> Self
+    |trait Subtractable:
+    |    pure func subtract(left: Self, right: Self) -> Self
+    |trait Negatable:
+    |    pure func negate(value: Self) -> Self
+    |
+
+
+private UINT8_LIBRARY: String =
+    |import:
+    |    _base: Int, UInt8, Bool, Equatable, Orderable, Addable, Subtractable, Negatable
+    |implements Equatable for Int:
+    |    pure func equals(left: Self, right: Self) -> Bool:
+    |        builtin("int.equals")
+    |implements Addable for Int:
+    |    pure func add(left: Self, right: Self) -> Self:
+    |        builtin("int.add")
+    |implements Subtractable for Int:
+    |    pure func subtract(left: Self, right: Self) -> Self:
+    |        builtin("int.subtract")
+    |implements Negatable for Int:
+    |    pure func negate(value: Self) -> Self:
+    |        subtract(0, value)
+    |implements Equatable for UInt8:
+    |    pure func equals(left: Self, right: Self) -> Bool:
+    |        builtin("uint8.equals")
+    |implements Orderable for UInt8:
+    |    pure func less_than(left: Self, right: Self) -> Bool:
+    |        builtin("uint8.less_than")
+    |implements Addable for UInt8:
+    |    pure func add(left: Self, right: Self) -> Self:
+    |        builtin("uint8.add")
+    |implements Subtractable for UInt8:
+    |    pure func subtract(left: Self, right: Self) -> Self:
+    |        builtin("uint8.subtract")
+    |pure func to_int(value: UInt8) -> Int:
+    |    builtin("uint8.to_int")
+    |
+
+
+private UINT8_PRELUDE: String =
+    |import:
+    |    _base: Int, UInt8, Float, String, Void, List, Bool(True, False), Option(Some, None), Result(Ok, Err), Equatable, Orderable, Addable, Subtractable, Negatable
+    |
+
+
+-- `byte` returns a UInt8 literal, and main converts it to its exit status.
+UINT8_LITERAL: String =
+    |pure func to_int(value: UInt8) -> Int:
+    |    builtin("uint8.to_int")
+    |pure func byte() -> UInt8:
+    |    200
+    |func main() -> Int:
+    |    byte().to_int()
+    |
+
+
+private pure func append_source(
+    assembly: ParsedAssembly,
+    position: Int,
+    source: String,
+    targets: List[ModuleId],
+    role: ModuleKind,
+) -> Result[ParsedAssembly, Diagnostic]:
+    invalid = diagnostic(
+        { source = module_source(root_module_id()), start = 0, end = 0 },
+        "invalid UInt8 fixture module",
+        "use the four fixture module positions",
+    )
+    module ?= module_id(position).to_result(invalid)
+    tokens ?= lex(module_source(module), source, assembly_names(assembly)).map_err(
+        pure func(failure): failure.error,
+    )
+    parsed ?= parse_module(tokens, module)
+    append_module(assembly, parsed, targets, role, "module_" + position.to_string())
+
+
+-- `source` is the root module; it sees the base through the prelude.
+pure func uint8_program(source: String) -> Result[ParsedProgram, Diagnostic]:
+    invalid = diagnostic(
+        { source = module_source(root_module_id()), start = 0, end = 0 },
+        "invalid UInt8 fixture module",
+        "use the four fixture module positions",
+    )
+    base ?= module_id(BASE_POSITION).to_result(invalid)
+    root ?= append_source(begin_program(), 0, source, [], UserModule)
+    library ?= append_source(root, 1, UINT8_LIBRARY, [base], LibraryModule)
+    types ?= append_source(
+        library,
+        BASE_POSITION,
+        FOUNDATION_TYPES + UINT8_TRAITS,
+        [],
+        FoundationTypesModule,
+    )
+    prelude ?= append_source(types, 3, UINT8_PRELUDE, [base], FoundationPreludeModule)
+    sealed(prelude)
+
+
+pure func checked_uint8(source: String) -> Result[CheckedProgram, Diagnostic]:
+    parsed ?= uint8_program(source)
+    check(parsed).map_err(setup_diagnostic)
+
+
+pure func lowered_uint8(source: String) -> Result[LoweredProgram, Diagnostic]:
+    checked ?= checked_uint8(source)
+    concrete ?= specialize(checked)
+    lower(concrete)
+
+
+pure func owned_uint8(source: String) -> Result[OwnershipProgram, Diagnostic]:
+    lowered ?= lowered_uint8(source)
+    own(lowered)
+
+
+-- The diagnostics checking renders, or None when the program checks or its
+-- setup fails.
+pure func uint8_rejection(source: String) -> Option[Diagnostics]:
+    match uint8_program(source):
+        Err(_):
+            None
+        Ok(parsed):
+            match check(parsed):
+                Ok(_): None
+                Err(failure): Some(render_failure(failure))

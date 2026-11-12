@@ -8,7 +8,7 @@ import:
     int: Int methods
     option: Option methods
     result: Result methods
-    ../../syntax/syntax: Purity, Span, WrittenName, ReceiverApplication
+    ../../syntax/syntax: IntegerFormat(Int64Format), Purity, Span, WrittenName, ReceiverApplication
     ../../utils/results: translated_list
     ../../utils/stack: push_at
     ../ids: TraitMethodId, FunctionId, OpaqueId, RecordId, VariantId
@@ -23,6 +23,7 @@ import:
     ./errors:
         CheckError,
         GenericConflict,
+        LiteralBinding,
         MethodError(NoApplicableMethod, MethodReceiverNeedsType),
         method_error,
         ExpectedTypeSite(SourceAnnotation),
@@ -68,7 +69,15 @@ import:
         FieldId,
         CheckedCall,
         TypeParameterId,
-        TypeRef(StringType, TupleType, CallableType, ListType, NominalType, ParameterType),
+        TypeRef(
+            StringType,
+            TupleType,
+            CallableType,
+            ListType,
+            NominalType,
+            ParameterType,
+            IntegerType,
+        ),
         CanonicalOperation,
         NominalId,
         TypeUse,
@@ -158,7 +167,7 @@ union PendingBase:
     AcceptedFloat(Float)
     AcceptedString(String)
     AcceptedConstant(CheckedExpr)
-    AcceptedBinding(BindingId)
+    AcceptedBinding(BindingId, Option[LiteralBinding])
     AcceptedCapture(CaptureId)
     PendingCapture(ScopedBindingId)
     PendingNamedCallable(FunctionId, FunctionSignature, Int)
@@ -344,11 +353,26 @@ pure func call_inference_ready(
         None: Ok(complete)
 
 
+-- Nested matches, not a tuple: this runs for every argument, and a tuple allocates.
+pure func read_literal(value: PendingValue) -> Option[LiteralBinding]:
+    match value.operations:
+        NoPendingOperations:
+            match value.base:
+                AcceptedBinding(_, literal): literal
+                _: None
+        PendingOperationLink(_, _):
+            None
+
+
 pure func pending_arguments(values: List[PendingValue]) -> List[InferenceUse]:
     var arguments: List[InferenceUse] = []
 
     for value in values:
-        arguments = arguments.append({ value_type = value.pending_type(), span = value.span })
+        arguments = arguments.append({
+            value_type = value.pending_type(),
+            span = value.span,
+            literal = value.read_literal(),
+        })
 
     arguments
 
@@ -1046,10 +1070,11 @@ pure func record_argument_origin(
                                                         Some({
                                                             position = position,
                                                             slot = { slot |
-                                                                first_argument = Some({
-                                                                    value_type = equality.actual,
-                                                                    span = actual.span,
-                                                                }),
+                                                                first_argument = Some(
+                                                                    { actual |
+                                                                        value_type = equality.actual,
+                                                                    },
+                                                                ),
                                                             },
                                                         }),
                                                     )
@@ -1078,24 +1103,54 @@ union InferenceType:
     InferredNominal(NominalId, List[InferenceType])
 
 
+-- `literal` is the literal-initialized local the value reads, if it reads one
+-- directly, so that a format conflict can suggest annotating it.
 record InferenceUse {
     value_type: InferenceType,
     span: Span,
+    literal: Option[LiteralBinding],
 }
 
 
+-- An unbound variable's rank bounds union-find chains. An integer variable
+-- is an integer literal's type, or a variable linked to one: only an integer
+-- format may fill it, and it publishes as Int when nothing does.
 union InferenceVariableState:
     UnboundVariable(Int)
+    UnboundIntegerVariable(Int)
     BoundVariable(InferenceType)
     LinkedVariable(InferenceVariableId)
 
 
+-- What a variable stands for: a type parameter of the call or construction
+-- that created it, or an integer literal whose format its context decides.
+union SlotOrigin:
+    TypeParameterSlot(TypeParameterId)
+    IntegerLiteralSlot
+
+
 record InferenceSlot {
-    parameter: TypeParameterId,
+    origin: SlotOrigin,
     call_span: Span,
     first_argument: Option[InferenceUse],
     state: InferenceVariableState,
 }
+
+
+-- The variable of the slot that `slots` would append next.
+pure func next_inference_variable(slots: List[InferenceSlot]) -> InferenceType:
+    CallVariable(into_opaque InferenceVariableId(slots.length()))
+
+
+-- The parameter a variable names in a published type or a diagnostic. An
+-- integer literal's class publishes as its format before any reader asks.
+private pure func slot_parameter(
+    slot: InferenceSlot,
+    span: Span,
+) -> Result[TypeParameterId, CheckError]:
+    match slot.origin:
+        TypeParameterSlot(parameter): Ok(parameter)
+        IntegerLiteralSlot: Err(checker_invariant(span, InvalidInferenceWorklist))
 
 
 record CallResultContext {
@@ -1308,7 +1363,7 @@ pure func inference_head(
                 match slots.get(from_opaque InferenceVariableId(id)):
                     Some(slot):
                         match slot.state:
-                            UnboundVariable(_): complete = True
+                            UnboundVariable(_) | UnboundIntegerVariable(_): complete = True
                             BoundVariable(value): current = value
                             LinkedVariable(next): current = CallVariable(next)
                     None:
@@ -1392,33 +1447,40 @@ pure func publish_inference_type(
             requested = match value_type:
                 CallVariable(original): original
                 _: id
-            match (
-                slots
-                    .get(from_opaque InferenceVariableId(requested))
-                    .or_checker_invariant(
-                        span,
-                        InvalidInferenceVariable(from_opaque InferenceVariableId(requested)),
-                    )
-            ):
-                Ok(slot):
-
-                    match publication:
-                        CompleteInference:
-                            Err(
-                                call_error(
-                                    slot.call_span,
-                                    UninferableTypeParameter(slot.parameter),
+            if id.integer_variable(slots):
+                -- An integer literal that nothing constrained is Int.
+                Ok(IntegerType(Int64Format))
+            else:
+                match slots.get(from_opaque InferenceVariableId(requested)):
+                    Some(slot):
+                        match slot.origin:
+                            IntegerLiteralSlot:
+                                Err(checker_invariant(span, InvalidInferenceWorklist))
+                            TypeParameterSlot(parameter):
+                                match publication:
+                                    CompleteInference:
+                                        Err(
+                                            call_error(
+                                                slot.call_span,
+                                                UninferableTypeParameter(parameter),
+                                            ),
+                                        )
+                                    DiagnosticInference:
+                                        Ok(ParameterType(parameter))
+                                    OccursInference(root, occurring):
+                                        if root == id:
+                                            Ok(ParameterType(occurring))
+                                        else:
+                                            Ok(ParameterType(parameter))
+                    None:
+                        Err(
+                            checker_invariant(
+                                span,
+                                InvalidInferenceVariable(
+                                    from_opaque InferenceVariableId(requested),
                                 ),
-                            )
-                        DiagnosticInference:
-                            Ok(ParameterType(slot.parameter))
-                        OccursInference(root, parameter):
-                            if root == id:
-                                Ok(ParameterType(parameter))
-                            else:
-                                Ok(ParameterType(slot.parameter))
-                Err(error):
-                    Err(error)
+                            ),
+                        )
         InferredCallable(purity, parameters, result):
             var values: List[TypeRef] = []
             var failure: Option[CheckError] = None
@@ -1546,10 +1608,13 @@ private pure func generic_argument_conflict(
         DiagnosticInference,
         occurrence.span,
     )
+    conflicting ?= slot.slot_parameter(occurrence.span)
     conflict: GenericConflict = {
-        parameter = slot.parameter,
+        parameter = conflicting,
         previous = { value_type = first, span = previous.span },
         current = { value_type = current, span = occurrence.span },
+        previous_literal = previous.literal,
+        current_literal = occurrence.literal,
         mismatch = {
             expected = expected,
             actual = { value_type = actual_type, span = occurrence.span },
@@ -1662,8 +1727,38 @@ private pure func inference_rank(
     span: Span,
 ) -> Result[Int, CheckError]:
     match state:
-        UnboundVariable(rank): Ok(rank)
+        UnboundVariable(rank) | UnboundIntegerVariable(rank): Ok(rank)
         _: Err(checker_invariant(span, InvalidInferenceWorklist))
+
+
+-- Whether the root `id` reaches is an unbound integer variable. Callers
+-- pass a root, or accept that a bound one is not.
+private pure func integer_variable(id: InferenceVariableId, slots: List[InferenceSlot]) -> Bool:
+    match slots.get(from_opaque InferenceVariableId(id)):
+        Some(slot):
+            match slot.state:
+                UnboundIntegerVariable(_): True
+                _: False
+        None:
+            False
+
+
+-- An integer variable accepts only an integer type. Anything else is the
+-- mismatch an Int literal would have met, so its diagnostic is unchanged.
+private pure func integer_action(
+    action: InferenceAction,
+    slots: List[InferenceSlot],
+) -> InferenceAction:
+    match action:
+        BindInference(id, AcceptedType(IntegerType(_))):
+            action
+        BindInference(id, _):
+            if id.integer_variable(slots):
+                InferenceMismatch
+            else:
+                action
+        _:
+            action
 
 
 record InferenceSlotUpdate {
@@ -1704,7 +1799,11 @@ pure func inspect_inference_equality(
     right ?= equality.actual.inference_head(slots, span)
     current = { equality | parameter = origin, relation = relation }
 
-    match left.inference_action(right):
+    action = left
+        .inference_action(right)
+        .integer_action(slots)
+
+    match action:
         SameInference:
             Ok(CompleteEquality)
         MergeInference(left_id, right_id):
@@ -1797,28 +1896,131 @@ private pure func link_inference_variables(
     left_rank ?= left_slot.state.inference_rank(span)
     right_rank ?= right_slot.state.inference_rank(span)
 
-    -- Union by rank bounds chains without repeatedly rewriting old terms.
-    if left_rank < right_rank:
-        Ok(
-            UpdateInferenceSlots([
-                {
-                    position = left_position,
-                    slot = { left_slot | state = LinkedVariable(right_id) },
-                },
-            ]),
-        )
+    -- The root keeps an integer literal's constraint from either side.
+    integer: Bool = match left_slot.state:
+        UnboundIntegerVariable(_):
+            True
+        _:
+            match right_slot.state:
+                UnboundIntegerVariable(_): True
+                _: False
+
+    -- Union by rank bounds chains without repeatedly rewriting old terms. The
+    -- root is rewritten only when it gains a rank or an integer constraint.
+    left_roots = left_rank >= right_rank
+    linked: InferenceSlotUpdate = if left_roots:
+        { position = right_position, slot = { right_slot | state = LinkedVariable(left_id) } }
     else:
-        var updates: List[InferenceSlotUpdate] = [
-            { position = right_position, slot = { right_slot | state = LinkedVariable(left_id) } },
-        ]
+        { position = left_position, slot = { left_slot | state = LinkedVariable(right_id) } }
+    if integer.or(left_rank == right_rank):
+        root_rank = if left_rank == right_rank:
+            left_rank + 1
+        else if left_roots:
+            left_rank
+        else:
+            right_rank
+        root_state: InferenceVariableState = if integer:
+            UnboundIntegerVariable(root_rank)
+        else:
+            UnboundVariable(root_rank)
+        root: InferenceSlotUpdate = if left_roots:
+            { position = left_position, slot = { left_slot | state = root_state } }
+        else:
+            { position = right_position, slot = { right_slot | state = root_state } }
+        Ok(UpdateInferenceSlots([linked, root]))
+    else:
+        Ok(UpdateInferenceSlots([linked]))
 
-        if left_rank == right_rank:
-            updates = updates.append({
-                position = left_position,
-                slot = { left_slot | state = UnboundVariable(left_rank + 1) },
-            })
 
-        Ok(UpdateInferenceSlots(updates))
+-- The state of an integer literal that nothing constrained.
+private INTEGER_DEFAULT: InferenceVariableState = BoundVariable(
+    AcceptedType(IntegerType(Int64Format)),
+)
+
+
+-- Every unbound integer variable that `terms` reach becomes Int: the type of an
+-- integer literal that nothing constrained by the time the call, variant,
+-- record or list it fills finishes.
+pure func default_integer_literals(
+    terms: List[InferenceType],
+    slots: List[InferenceSlot],
+    span: Span,
+) -> Result[List[InferenceSlot], CheckError]:
+    var current = slots
+    var failure: Option[CheckError] = None
+    for term in terms:
+        step: Result[List[InferenceSlot], CheckError] = match term.inference_head(current, span):
+            Err(error):
+                Err(error)
+            Ok(CallVariable(id)):
+                position = from_opaque InferenceVariableId(id)
+                match current.get(position):
+                    Some(slot):
+                        match slot.state:
+                            UnboundIntegerVariable(_):
+                                Ok(current.set(position, { slot | state = INTEGER_DEFAULT }))
+                            _:
+                                Ok(current)
+                    None:
+                        Err(checker_invariant(span, InvalidInferenceVariable(position)))
+            Ok(AcceptedType(_)):
+                Ok(current)
+            Ok(InferredCallable(_, parameters, result)):
+                parameters
+                    .append(result)
+                    .default_integer_literals(current, span)
+            Ok(InferredList(element)):
+                [element].default_integer_literals(current, span)
+            Ok(InferredTuple(elements)):
+                elements.default_integer_literals(current, span)
+            Ok(InferredNominal(_, arguments)):
+                arguments.default_integer_literals(current, span)
+        match step:
+            Ok(updated):
+                current = updated
+            Err(error):
+                failure = Some(error)
+                break
+    match failure:
+        Some(error): Err(error)
+        None: Ok(current)
+
+
+-- The defaults for a finished call's own variables.
+pure func default_call_literals(
+    call: PendingCall,
+    slots: List[InferenceSlot],
+) -> Result[List[InferenceSlot], CheckError]:
+    var variables: List[InferenceType] = []
+    for parameter in call.signature.type_parameters:
+        variables = variables.append(
+            CallVariable(
+                into_opaque InferenceVariableId(
+                    call.variable_start + parameter.parameter_position()
+                ),
+            ),
+        )
+    variables.default_integer_literals(slots, call.span)
+
+
+-- Once inference stops making progress, every unbound integer variable is
+-- Int; None when there is none, so that the caller knows it is stuck.
+pure func default_every_integer_literal(slots: List[InferenceSlot]) -> Option[List[InferenceSlot]]:
+    var current = slots
+    var changed: Bool = False
+    var position = 0
+    for slot in slots:
+        match slot.state:
+            UnboundIntegerVariable(_):
+                current = current.set(position, { slot | state = INTEGER_DEFAULT })
+                changed = True
+            _:
+                void
+        position = position + 1
+    if changed:
+        Some(current)
+    else:
+        None
 
 
 private pure func inference_occurs_error(
@@ -1837,7 +2039,8 @@ private pure func inference_occurs_error(
             span,
             InvalidInferenceVariable(from_opaque InferenceVariableId(origin_id)),
         )
-    snapshot ?= value.publish_inference_type(slots, OccursInference(root, origin.parameter), span)
+    origin_parameter ?= origin.slot_parameter(span)
+    snapshot ?= value.publish_inference_type(slots, OccursInference(root, origin_parameter), span)
     site_result: Result[ExpectedTypeSite, CheckError] = match equality.origin:
         ArgumentConstraint(call, _, _, written):
             Ok(SourceAnnotation(written.span))
@@ -1866,7 +2069,7 @@ private pure func inference_occurs_error(
         call_error(
             span,
             InfiniteTypeArgument({
-                parameter = origin.parameter,
+                parameter = origin_parameter,
                 call_span = origin.call_span,
                 recursive_type = snapshot,
                 expected_site = site,
@@ -2035,7 +2238,7 @@ private pure func with_flexible_parameters(
     var flexible = slots
     for declared_parameter in parameters:
         flexible = flexible.append({
-            parameter = declared_parameter,
+            origin = TypeParameterSlot(declared_parameter),
             call_span = span,
             first_argument = None,
             state = UnboundVariable(0),

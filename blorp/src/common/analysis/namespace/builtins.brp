@@ -1,11 +1,12 @@
 import:
     bool: Bool methods
-    int: Int methods
+    int: INT_MAX, INT_MIN, Int methods
     option: Option methods
     ../../syntax/names: FoundationWords, InitialNames, NameId, NameTable
     ../../syntax/syntax:
         Diagnostic,
         DiagnosticKind(ProgramProblem),
+        IntegerFormat(Int64Format, UInt8Format),
         ParsedBuiltinType(IntegerBuiltin, FloatBuiltin, StringBuiltin, VoidBuiltin, ListBuiltin),
         ParsedRuntimeOperation(
             FloatCopySignBuiltin,
@@ -17,6 +18,7 @@ import:
             IntegerDivideBuiltin,
             IntegerRemainderBuiltin,
             IntegerToStringBuiltin,
+            IntegerConvertBuiltin,
             StringLengthBuiltin,
             StringConcatBuiltin,
             StringAppendIntBuiltin,
@@ -41,6 +43,8 @@ import:
             ListSetBuiltin,
             ListConcatBuiltin,
             StringEqualsBuiltin,
+            StringToBytesBuiltin,
+            BytesToTextBuiltin,
             IntegerEqualsBuiltin,
             IntegerLessThanBuiltin,
         ),
@@ -50,7 +54,9 @@ import:
             ProcessFindProgram,
             ProcessFault,
             FsReadText,
+            FsReadBytes,
             FsWriteText,
+            FsWriteBytes,
             FsEntryKind,
             FsListDirectory,
             FsCreateDirectory,
@@ -107,27 +113,41 @@ record DesignatedUnions {
 }
 
 
--- A storage format, carried by checked types and runtime operations. Each phase
--- owns exhaustive projections of the facts it needs.
-fixed union IntegerFormat:
-    Int64Format
-
-
 pure func integer_primitive(format: IntegerFormat) -> PrimitiveType:
     match format:
         Int64Format: BuiltinInt
+        UInt8Format: BuiltinUInt8
 
 
 -- Whether a format is plain data that a fixed record or union stores inline.
 pure func integer_fixed_storage(format: IntegerFormat) -> Bool:
     match format:
         Int64Format: True
+        UInt8Format: True
 
 
--- Int is the parser's literal carrier, so every representable value fits Int64.
-pure func integer_fits(format: IntegerFormat, value: Int) -> Bool:
+private UINT8_MAXIMUM: Int = 255
+
+
+-- The least and greatest value of a format. Int is the parser's literal
+-- carrier, so every literal fits Int64.
+fixed record IntegerLimits {
+    minimum: Int,
+    maximum: Int,
+}
+
+
+-- The one authority for which values a format holds: check and verify both
+-- ask it whether a literal fits.
+pure func integer_limits(format: IntegerFormat) -> IntegerLimits:
     match format:
-        Int64Format: True
+        Int64Format: { minimum = INT_MIN, maximum = INT_MAX }
+        UInt8Format: { minimum = 0, maximum = UINT8_MAXIMUM }
+
+
+pure func integer_fits(format: IntegerFormat, value: Int) -> Bool:
+    limits = format.integer_limits()
+    (value >= limits.minimum).and(value <= limits.maximum)
 
 
 -- An operation whose result is a designated union carries that union's
@@ -139,6 +159,9 @@ union RuntimeOperation[Variant, Element]:
     IntegerDivide(IntegerFormat)
     IntegerRemainder(IntegerFormat)
     IntegerToString(IntegerFormat)
+    -- From the first format to the second, modulo the second's range: exact
+    -- when the second holds every value of the first.
+    IntegerConvert(IntegerFormat, IntegerFormat)
     FloatAdd
     FloatSubtract
     FloatMultiply
@@ -166,12 +189,16 @@ union RuntimeOperation[Variant, Element]:
     ListSet(Element)
     ListConcat(Element)
     StringEquals(DesignatedBoolean[Variant])
+    -- A String's UTF-8 bytes, and the String that bytes spell when they are UTF-8.
+    StringToBytes
+    BytesToText(DesignatedOption[Variant])
     IntegerEquals(IntegerFormat, DesignatedBoolean[Variant])
     IntegerLessThan(IntegerFormat, DesignatedBoolean[Variant])
 
 
 union PrimitiveType:
     BuiltinInt
+    BuiltinUInt8
     BuiltinFloat
     BuiltinString
     BuiltinVoid
@@ -182,6 +209,7 @@ union RuntimeType[Element]:
     ElementRuntimeType(Element)
     ListRuntimeType(Element)
     StringListRuntimeType
+    UInt8ListRuntimeType
 
 
 -- Union results retain their designated constructors and exact payload types.
@@ -235,6 +263,12 @@ pure func runtime_contract[Variant, Element](
                 purity = Pure,
                 parameters = [PrimitiveRuntimeType(integer_primitive(format))],
                 return_type = ValueResult(PrimitiveRuntimeType(BuiltinString)),
+            }
+        IntegerConvert(source, target):
+            {
+                purity = Pure,
+                parameters = [PrimitiveRuntimeType(integer_primitive(source))],
+                return_type = ValueResult(PrimitiveRuntimeType(integer_primitive(target))),
             }
         StringLength:
             {
@@ -301,6 +335,18 @@ pure func runtime_contract[Variant, Element](
                     PrimitiveRuntimeType(BuiltinInt),
                     PrimitiveRuntimeType(BuiltinInt),
                 ],
+                return_type = OptionalResult(PrimitiveRuntimeType(BuiltinString), option),
+            }
+        StringToBytes:
+            {
+                purity = Pure,
+                parameters = [PrimitiveRuntimeType(BuiltinString)],
+                return_type = ValueResult(UInt8ListRuntimeType),
+            }
+        BytesToText(option):
+            {
+                purity = Pure,
+                parameters = [UInt8ListRuntimeType],
                 return_type = OptionalResult(PrimitiveRuntimeType(BuiltinString), option),
             }
         SystemCall(system, result):
@@ -409,6 +455,7 @@ union SystemParameter:
     IntParameter
     StringParameter
     StringListParameter
+    UInt8ListParameter
 
 
 -- One branch of a system call's Result, which takes one fresh payload.
@@ -416,6 +463,7 @@ union SystemPayload:
     IntPayload
     StringPayload
     StringListPayload
+    UInt8ListPayload
     VoidPayload
 
 
@@ -447,9 +495,17 @@ pure func system_signature(operation: SystemOperation) -> SystemSignature:
             }
         FsReadText | ProcessFindProgram:
             { parameters = [StringParameter], success = StringPayload, error = IntPayload }
+        FsReadBytes:
+            { parameters = [StringParameter], success = UInt8ListPayload, error = IntPayload }
         FsWriteText:
             {
                 parameters = [StringParameter, StringParameter],
+                success = VoidPayload,
+                error = IntPayload,
+            }
+        FsWriteBytes:
+            {
+                parameters = [StringParameter, UInt8ListParameter],
                 success = VoidPayload,
                 error = IntPayload,
             }
@@ -490,6 +546,7 @@ private pure func parameter_runtime_type[Element](
         IntParameter: PrimitiveRuntimeType(BuiltinInt)
         StringParameter: PrimitiveRuntimeType(BuiltinString)
         StringListParameter: StringListRuntimeType
+        UInt8ListParameter: UInt8ListRuntimeType
 
 
 private pure func payload_runtime_type[Element](payload: SystemPayload) -> RuntimeType[Element]:
@@ -497,6 +554,7 @@ private pure func payload_runtime_type[Element](payload: SystemPayload) -> Runti
         IntPayload: PrimitiveRuntimeType(BuiltinInt)
         StringPayload: PrimitiveRuntimeType(BuiltinString)
         StringListPayload: StringListRuntimeType
+        UInt8ListPayload: UInt8ListRuntimeType
         VoidPayload: PrimitiveRuntimeType(BuiltinVoid)
 
 
@@ -514,16 +572,18 @@ pure func primitive_operation[Variant, Element](
     parsed: ParsedRuntimeOperation,
 ) -> Option[RuntimeOperation[Variant, Element]]:
     match parsed:
-        IntegerAddBuiltin:
-            Some(IntegerAdd(Int64Format))
-        IntegerSubtractBuiltin:
-            Some(IntegerSubtract(Int64Format))
-        IntegerMultiplyBuiltin:
-            Some(IntegerMultiply(Int64Format))
-        IntegerDivideBuiltin:
-            Some(IntegerDivide(Int64Format))
-        IntegerRemainderBuiltin:
-            Some(IntegerRemainder(Int64Format))
+        IntegerAddBuiltin(format):
+            Some(IntegerAdd(format))
+        IntegerSubtractBuiltin(format):
+            Some(IntegerSubtract(format))
+        IntegerMultiplyBuiltin(format):
+            Some(IntegerMultiply(format))
+        IntegerDivideBuiltin(format):
+            Some(IntegerDivide(format))
+        IntegerRemainderBuiltin(format):
+            Some(IntegerRemainder(format))
+        IntegerConvertBuiltin(source, target):
+            Some(IntegerConvert(source, target))
         FloatAddBuiltin:
             Some(FloatAdd)
         FloatSubtractBuiltin:
@@ -540,8 +600,8 @@ pure func primitive_operation[Variant, Element](
             Some(FloatCopySign)
         FloatEqualsBuiltin | FloatLessThanBuiltin:
             None
-        IntegerToStringBuiltin:
-            Some(IntegerToString(Int64Format))
+        IntegerToStringBuiltin(format):
+            Some(IntegerToString(format))
         StringLengthBuiltin:
             Some(StringLength)
         StringConcatBuiltin:
@@ -552,7 +612,9 @@ pure func primitive_operation[Variant, Element](
             Some(StringPrint)
         StringPrintErrorBuiltin:
             Some(StringPrintError)
-        ListRepeatBuiltin | ListLengthBuiltin | ListAppendBuiltin | ListSetBuiltin | ListConcatBuiltin | StringParseIntBuiltin | StringParseFloatBuiltin | StringByteAtBuiltin | StringFromCodepointBuiltin | StringSliceBuiltin | SystemBuiltin(_) | ListGetBuiltin | StringEqualsBuiltin | IntegerEqualsBuiltin | IntegerLessThanBuiltin:
+        StringToBytesBuiltin:
+            Some(StringToBytes)
+        ListRepeatBuiltin | ListLengthBuiltin | ListAppendBuiltin | ListSetBuiltin | ListConcatBuiltin | StringParseIntBuiltin | StringParseFloatBuiltin | StringByteAtBuiltin | StringFromCodepointBuiltin | StringSliceBuiltin | SystemBuiltin(_) | ListGetBuiltin | StringEqualsBuiltin | BytesToTextBuiltin | IntegerEqualsBuiltin(_) | IntegerLessThanBuiltin(_):
             None
 
 
@@ -560,16 +622,18 @@ pure func runtime_declaration_help(operation: ParsedRuntimeOperation) -> String:
     match operation:
         StringPrintBuiltin | StringPrintErrorBuiltin:
             "declare an impure function with one String parameter returning Void"
-        IntegerAddBuiltin | IntegerSubtractBuiltin | IntegerMultiplyBuiltin | IntegerDivideBuiltin | IntegerRemainderBuiltin:
-            "declare a pure function with two Int parameters returning Int"
+        IntegerAddBuiltin(format) | IntegerSubtractBuiltin(format) | IntegerMultiplyBuiltin(format) | IntegerDivideBuiltin(format) | IntegerRemainderBuiltin(format):
+            "declare a pure function with two ${format.integer_spelling()} parameters returning ${format.integer_spelling()}"
+        IntegerConvertBuiltin(source, target):
+            "declare a pure nongeneric function with one ${source.integer_spelling()} parameter returning ${target.integer_spelling()}"
         FloatAddBuiltin | FloatSubtractBuiltin | FloatMultiplyBuiltin | FloatDivideBuiltin | FloatRemainderBuiltin:
             "declare a pure function with two Float parameters returning Float"
         FloatCopySignBuiltin:
             "declare a pure nongeneric function with two Float parameters returning Float"
         FloatToStringBuiltin:
             "declare a pure function with one Float parameter returning String"
-        IntegerToStringBuiltin:
-            "declare a pure function with one Int parameter returning String"
+        IntegerToStringBuiltin(format):
+            "declare a pure function with one ${format.integer_spelling()} parameter returning String"
         StringLengthBuiltin:
             "declare a pure function with one String parameter returning Int"
         StringConcatBuiltin:
@@ -600,12 +664,16 @@ pure func runtime_declaration_help(operation: ParsedRuntimeOperation) -> String:
             "declare a pure function with List[E], Int and E parameters returning List[E]"
         ListConcatBuiltin:
             "declare a pure function with two List[E] parameters returning List[E]"
-        IntegerEqualsBuiltin | IntegerLessThanBuiltin:
-            "declare a pure nongeneric function with two Int parameters returning Bool"
+        IntegerEqualsBuiltin(format) | IntegerLessThanBuiltin(format):
+            "declare a pure nongeneric function with two ${format.integer_spelling()} parameters returning Bool"
         FloatEqualsBuiltin | FloatLessThanBuiltin:
             "declare a pure nongeneric function with two Float parameters returning Bool"
         StringEqualsBuiltin:
             "declare a pure nongeneric function with two String parameters returning Bool"
+        StringToBytesBuiltin:
+            "declare a pure nongeneric function with one String parameter returning List[UInt8]"
+        BytesToTextBuiltin:
+            "declare a pure nongeneric function with one List[UInt8] parameter returning Option[String]"
 
 
 private pure func parameter_spelling(parameter: SystemParameter) -> String:
@@ -613,6 +681,7 @@ private pure func parameter_spelling(parameter: SystemParameter) -> String:
         IntParameter: "Int"
         StringParameter: "String"
         StringListParameter: "List[String]"
+        UInt8ListParameter: "List[UInt8]"
 
 
 private pure func payload_spelling(payload: SystemPayload) -> String:
@@ -620,6 +689,7 @@ private pure func payload_spelling(payload: SystemPayload) -> String:
         IntPayload: "Int"
         StringPayload: "String"
         StringListPayload: "List[String]"
+        UInt8ListPayload: "List[UInt8]"
         VoidPayload: "Void"
 
 
@@ -646,6 +716,7 @@ private pure func system_declaration_help(operation: SystemOperation) -> String:
 
 union BuiltinTypeRole:
     IntRole
+    UInt8Role
     FloatRole
     StringRole
     VoidRole
@@ -680,7 +751,7 @@ private pure func builtin_type_error(span: Span, kind: BuiltinTypeErrorKind) -> 
 
 pure func builtin_type_name(declaration: ParsedBuiltinType) -> WrittenName:
     match declaration:
-        IntegerBuiltin(name): name
+        IntegerBuiltin(name, _): name
         FloatBuiltin(name): name
         StringBuiltin(name): name
         VoidBuiltin(name): name
@@ -689,7 +760,7 @@ pure func builtin_type_name(declaration: ParsedBuiltinType) -> WrittenName:
 
 private pure func builtin_type_role(declaration: ParsedBuiltinType) -> BuiltinTypeRole:
     match declaration:
-        IntegerBuiltin(_): IntRole
+        IntegerBuiltin(_, format): format.integer_role()
         FloatBuiltin(_): FloatRole
         StringBuiltin(_): StringRole
         VoidBuiltin(_): VoidRole
@@ -938,6 +1009,8 @@ pure func check_builtin_types(
             end = row.end
     shaped ?= parsed.check_foundation_shape()
     accepted ?= parsed.accept_builtins([])
+    -- UInt8Role is not required: the library cannot declare UInt8 until the
+    -- pinned seed knows it. UINT8_BYTES_PLAN's L3 declares it and makes it required.
     integer_id ?= accepted.builtin_head(IntRole, end)
     string_id ?= accepted.builtin_head(StringRole, end)
     unit_id ?= accepted.builtin_head(VoidRole, end)
@@ -958,14 +1031,22 @@ pure func check_builtin_types(
     Ok({ initial = initial, designated = designated })
 
 
-pure func integer_spelling(format: IntegerFormat) -> String:
+private pure func integer_role(format: IntegerFormat) -> BuiltinTypeRole:
     match format:
-        Int64Format: IntRole.builtin_type_spelling()
+        Int64Format: IntRole
+        UInt8Format: UInt8Role
+
+
+pure func integer_spelling(format: IntegerFormat) -> String:
+    format
+        .integer_role()
+        .builtin_type_spelling()
 
 
 private pure func builtin_type_spelling(role: BuiltinTypeRole) -> String:
     match role:
         IntRole: "Int"
+        UInt8Role: "UInt8"
         FloatRole: "Float"
         StringRole: "String"
         VoidRole: "Void"

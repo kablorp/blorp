@@ -6,8 +6,12 @@ import:
     test: TestSuite
     ../../src/common/codegen/runtime/fs:
         FS_HELPERS_RUNTIME,
+        FS_READ_RUNTIME,
         FS_READ_TEXT_RUNTIME,
+        fs_read_bytes_runtime,
+        FS_WRITE_RUNTIME,
         FS_WRITE_TEXT_RUNTIME,
+        fs_write_bytes_runtime,
         FS_ENTRY_KIND_RUNTIME,
         FS_CREATE_DIRECTORY_RUNTIME,
         FS_CREATE_DIRECTORIES_RUNTIME,
@@ -27,9 +31,13 @@ import:
         LIST_SHARED_RUNTIME,
     ../../src/common/codegen/runtime/memory: MEMORY_RUNTIME
     ../../src/common/codegen/runtime/process: PROCESS_POSIX_PRELUDE
-    ../../src/common/codegen/runtime/string: string_runtime
+    ../../src/common/codegen/runtime/string:
+        bytes_to_text_runtime,
+        string_runtime,
+        string_to_bytes_runtime,
     ../../src/common/codegen/runtime/system: SYSTEM_CURRENT_DIRECTORY_RUNTIME
-    ../../src/common/codegen/specialize/specialize: TypeRef(StringType)
+    ../../src/common/codegen/specialize/specialize: TypeRef(StringType, IntegerType)
+    ../../src/common/syntax/syntax: IntegerFormat(UInt8Format)
     ../e2e/file_access: path_of, write_file
     ../e2e/self_hosted_harness: isolated, run_expecting, strict_leak_check
     ../e2e/self_hosted_reports: verify_accounting
@@ -629,6 +637,67 @@ private pure func string_list_layout() -> String:
     )
 
 
+-- The List[UInt8] layout and the byte natives, as a program calling them all emits them.
+private pure func bytes_layout() -> String:
+    (
+        LIST_SHARED_RUNTIME
+        + list_runtime(list_element_key(IntegerType(UInt8Format)), "uint8_t", "", "")
+    )
+
+
+private pure func bytes_operations() -> String:
+    byte_list_type = list_c_type(list_element_key(IntegerType(UInt8Format)))
+    (
+        FS_READ_RUNTIME
+        + FS_WRITE_RUNTIME
+        + string_to_bytes_runtime(byte_list_type)
+        + bytes_to_text_runtime(byte_list_type)
+        + fs_read_bytes_runtime(byte_list_type)
+        + fs_write_bytes_runtime(byte_list_type)
+    )
+
+
+private func bytes_tests(executable: String, directory: String) -> List[(String, () -> Bool)]:
+    [
+        (
+            "a byte file round trip keeps NUL and 0xFF",
+            func(): reported(native_case(executable, directory, "round_trip")),
+        ),
+        (
+            "reading a missing byte file is NotFound and publishes nothing",
+            func(): reported(native_case(executable, directory, "missing")),
+        ),
+        (
+            "to_bytes copies every UTF-8 byte and an embedded NUL",
+            func(): reported(native_case(executable, directory, "to_bytes")),
+        ),
+        (
+            "to_text refuses an overlong encoding",
+            func(): reported(native_case(executable, directory, "refuses_overlong")),
+        ),
+        (
+            "to_text refuses a UTF-16 surrogate",
+            func(): reported(native_case(executable, directory, "refuses_surrogate")),
+        ),
+        (
+            "to_text refuses a code point above U+10FFFF",
+            func(): reported(native_case(executable, directory, "refuses_above_unicode")),
+        ),
+        (
+            "to_text refuses a lone continuation byte",
+            func(): reported(native_case(executable, directory, "refuses_lone_continuation")),
+        ),
+        (
+            "to_text refuses a sequence cut off at the end",
+            func(): reported(native_case(executable, directory, "refuses_truncated")),
+        ),
+        (
+            "to_text accepts a four-byte character",
+            func(): reported(native_case(executable, directory, "accepts_four_bytes")),
+        ),
+    ]
+
+
 private pure func line_operations() -> String:
     (
         FS_OPEN_READ_RUNTIME
@@ -658,7 +727,7 @@ func suite(c_compiler: String, directory: String) -> TestSuite:
         directory,
         "fs",
         "",
-        FS_READ_TEXT_RUNTIME + FS_ENTRY_KIND_RUNTIME,
+        FS_READ_RUNTIME + FS_READ_TEXT_RUNTIME + FS_ENTRY_KIND_RUNTIME,
     ):
         Err(error): [("the fs read probe builds", func(): reported(Err(error)))]
         Ok(executable): read_tests(executable, directory)
@@ -667,7 +736,7 @@ func suite(c_compiler: String, directory: String) -> TestSuite:
         directory,
         "fs_write",
         "",
-        FS_WRITE_TEXT_RUNTIME,
+        FS_WRITE_RUNTIME + FS_WRITE_TEXT_RUNTIME,
     ):
         Err(error):
             [("the fs write probe builds", func(): reported(Err(error)))]
@@ -712,6 +781,15 @@ func suite(c_compiler: String, directory: String) -> TestSuite:
             line_tests(executable, directory).concat(
                 line_permission_tests(root, executable, directory),
             )
+    bytes: List[(String, () -> Bool)] = match ready(
+        c_compiler,
+        directory,
+        "fs_bytes",
+        bytes_layout(),
+        bytes_operations(),
+    ):
+        Err(error): [("the byte natives probe builds", func(): reported(Err(error)))]
+        Ok(executable): bytes_tests(executable, directory)
     current: List[(String, () -> Bool)] = match ready(
         c_compiler,
         directory,
@@ -728,5 +806,6 @@ func suite(c_compiler: String, directory: String) -> TestSuite:
             .concat(directories)
             .concat(tree)
             .concat(lines)
+            .concat(bytes)
             .concat(current),
     }

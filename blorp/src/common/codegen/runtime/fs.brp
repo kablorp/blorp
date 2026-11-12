@@ -164,8 +164,9 @@ FS_HELPERS_RUNTIME: String =
 
 
 -- Reads to end of file, so a file that changes size is read as it is, and a
--- FIFO or device is read as far as its writer goes.
-FS_READ_TEXT_RUNTIME: String =
+-- FIFO or device is read as far as its writer goes. read_text and read_bytes
+-- share it.
+FS_READ_RUNTIME: String =
     raw
         |enum {BLORP_FS_READ_INITIAL_CAPACITY=4096};
         |/* Reads the open descriptor to end of file into a fresh buffer. Returns 0, or the
@@ -202,15 +203,27 @@ FS_READ_TEXT_RUNTIME: String =
         |*length=used;
         |return 0;
         |}
-        |uint8_t blorp_fs_read_text(const struct blorp_string *path,struct blorp_string **text,int64_t *error){
-        |if(blorp_fs_has_nul(path)){*error=BLORP_FS_PATH_CONTAINS_NUL;return BLORP_FS_FAILED;}
+        |/* The bytes of the file at `path` in a fresh buffer: 0, or the failure code with
+        | * nothing allocated. */
+        |static int64_t blorp_fs_read_path(const struct blorp_string *path,char **contents,size_t *length){
+        |if(blorp_fs_has_nul(path)){return BLORP_FS_PATH_CONTAINS_NUL;}
         |int descriptor;
         |BLORP_FS_RETRY(descriptor,open(path->bytes,O_RDONLY|O_CLOEXEC));
-        |if(descriptor<0){*error=blorp_fs_errno_code_within(errno,BLORP_FS_READ_KINDS);return BLORP_FS_FAILED;}
+        |if(descriptor<0){return blorp_fs_errno_code_within(errno,BLORP_FS_READ_KINDS);}
+        |const int64_t failure=blorp_fs_read_descriptor(descriptor,contents,length);
+        |(void)close(descriptor);
+        |return failure;
+        |}
+        |
+
+
+-- The file's text, which must be UTF-8.
+FS_READ_TEXT_RUNTIME: String =
+    raw
+        |uint8_t blorp_fs_read_text(const struct blorp_string *path,struct blorp_string **text,int64_t *error){
         |char *contents=NULL;
         |size_t length=0;
-        |const int64_t failure=blorp_fs_read_descriptor(descriptor,&contents,&length);
-        |(void)close(descriptor);
+        |const int64_t failure=blorp_fs_read_path(path,&contents,&length);
         |if(failure!=0){*error=failure;return BLORP_FS_FAILED;}
         |if(!blorp_utf8_is_valid(contents,length)){
         |blorp_memory_release(contents);
@@ -224,19 +237,32 @@ FS_READ_TEXT_RUNTIME: String =
         |
 
 
+-- The file's bytes, whatever they are, for the emitter's List[UInt8] C type.
+-- The read stops at the largest String, so the List's size cannot overflow.
+pure func fs_read_bytes_runtime(byte_list_type: String) -> String:
+    "uint8_t blorp_fs_read_bytes(const struct blorp_string *path,${byte_list_type} *bytes,int64_t *error){\n"
+        .concat("char *contents=NULL;\nsize_t length=0;\n")
+        .concat("const int64_t failure=blorp_fs_read_path(path,&contents,&length);\n")
+        .concat("if(failure!=0){*error=failure;return BLORP_FS_FAILED;}\n")
+        .concat(list_root_allocation(byte_list_type, "result", "length"))
+        .concat("\nmemcpy(result->values,contents,length);\nresult->length=(int64_t)length;\n")
+        .concat("blorp_memory_release(contents);\n*bytes=result;\nreturn BLORP_FS_SUCCEEDED;\n}\n")
+
+
 -- Replaces the file atomically: the text goes into a new file beside the
 -- target, which is flushed and then renamed over it, so a reader sees the old
 -- contents or the new. A link is followed to its final target, which is
 -- replaced in its own directory, so the link survives (D4). The flush orders
 -- the contents before the rename without forcing them to stable storage (D5).
 -- Every failure before the rename removes the new file and leaves the target
--- as it was; only the directory flush can fail after it.
-FS_WRITE_TEXT_RUNTIME: String =
+-- as it was; only the directory flush can fail after it. write_text and
+-- write_bytes share it.
+FS_WRITE_RUNTIME: String =
     raw
         |/* The prelude's _DARWIN_C_SOURCE reveals F_BARRIERFSYNC. Without it the flush would
         | * have no barrier to call, so a hidden declaration stops the build here. */
         |#if defined(__APPLE__) && !defined(F_BARRIERFSYNC)
-        |#error fs.write_text needs F_BARRIERFSYNC: define _DARWIN_C_SOURCE before any header
+        |#error an fs write needs F_BARRIERFSYNC: define _DARWIN_C_SOURCE before any header
         |#endif
         |/* A temporary name is taken only by a file that an earlier process with the same pid
         | * left when it crashed, one for each write it had in flight, and every attempt takes
@@ -396,9 +422,9 @@ FS_WRITE_TEXT_RUNTIME: String =
         |}
         |/* Everything between creating the new file and renaming it. Its descriptor is closed
         | * exactly once, and a failed close fails the write. */
-        |static int64_t blorp_fs_fill_temporary(int descriptor,const struct blorp_fs_write_target *target,const struct blorp_string *text){
+        |static int64_t blorp_fs_fill_temporary(int descriptor,const struct blorp_fs_write_target *target,const char *bytes,size_t length){
         |int64_t failure=target->replaces?blorp_fs_copy_owner_and_mode(descriptor,&target->status):0;
-        |if(failure==0){failure=blorp_fs_write_all(descriptor,text->bytes,(size_t)text->length);}
+        |if(failure==0){failure=blorp_fs_write_all(descriptor,bytes,length);}
         |if(failure==0&&blorp_fs_flush_file(descriptor)<0){failure=blorp_fs_errno_code_within(errno,BLORP_FS_WRITE_KINDS);}
         |if(close(descriptor)<0&&failure==0){failure=blorp_fs_errno_code_within(errno,BLORP_FS_WRITE_KINDS);}
         |return failure;
@@ -418,12 +444,12 @@ FS_WRITE_TEXT_RUNTIME: String =
         |}
         |/* Creates, fills and renames the new file. Until the rename succeeds, a failure
         | * removes it, ignoring the unlink's own error, and the target is unchanged. */
-        |static int64_t blorp_fs_replace(const struct blorp_fs_write_target *target,const struct blorp_string *text){
+        |static int64_t blorp_fs_replace(const struct blorp_fs_write_target *target,const char *bytes,size_t length){
         |char *temporary=NULL;
         |int descriptor=-1;
         |int64_t failure=blorp_fs_create_temporary(target->directory,target->replaces?0600:0666,&temporary,&descriptor);
         |if(failure!=0){return failure;}
-        |failure=blorp_fs_fill_temporary(descriptor,target,text);
+        |failure=blorp_fs_fill_temporary(descriptor,target,bytes,length);
         |if(failure==0){
         |int renamed;
         |BLORP_FS_RETRY(renamed,rename(temporary,target->path));
@@ -433,19 +459,40 @@ FS_WRITE_TEXT_RUNTIME: String =
         |blorp_memory_release(temporary);
         |return failure!=0?failure:blorp_fs_flush_directory(target->directory);
         |}
-        |uint8_t blorp_fs_write_text(const struct blorp_string *path,const struct blorp_string *text,int64_t *error){
-        |if(blorp_fs_has_nul(path)){*error=BLORP_FS_PATH_CONTAINS_NUL;return BLORP_FS_FAILED;}
+        |/* Replaces the file at `path` with `length` bytes: 0, or the failure code. */
+        |static int64_t blorp_fs_write_path(const struct blorp_string *path,const char *bytes,size_t length){
+        |if(blorp_fs_has_nul(path)){return BLORP_FS_PATH_CONTAINS_NUL;}
         |struct blorp_fs_write_target target={.directory=NULL,.path=NULL};
         |int64_t failure=blorp_fs_resolve_target(path->bytes,(size_t)path->length,&target);
         |if(failure==0){
-        |failure=blorp_fs_replace(&target,text);
+        |failure=blorp_fs_replace(&target,bytes,length);
         |blorp_memory_release(target.directory);
         |blorp_memory_release(target.path);
         |}
+        |return failure;
+        |}
+        |
+
+
+FS_WRITE_TEXT_RUNTIME: String =
+    raw
+        |uint8_t blorp_fs_write_text(const struct blorp_string *path,const struct blorp_string *text,int64_t *error){
+        |const int64_t failure=blorp_fs_write_path(path,text->bytes,(size_t)text->length);
         |if(failure!=0){*error=failure;return BLORP_FS_FAILED;}
         |return BLORP_FS_SUCCEEDED;
         |}
         |
+
+
+-- For the emitter's List[UInt8] C type. Its uint8_t elements are the bytes.
+pure func fs_write_bytes_runtime(byte_list_type: String) -> String:
+    "uint8_t blorp_fs_write_bytes(const struct blorp_string *path,${byte_list_type} data,int64_t *error){\n"
+        .concat(
+            "const int64_t failure=blorp_fs_write_path(path,(const char *)data->values,(size_t)data->length);\n",
+        )
+        .concat(
+            "if(failure!=0){*error=failure;return BLORP_FS_FAILED;}\nreturn BLORP_FS_SUCCEEDED;\n}\n",
+        )
 
 
 -- lstat: a link is not followed. A missing path, or a file used as a
