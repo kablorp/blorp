@@ -999,12 +999,14 @@ declared type.
 The [prelude](standard_library/prelude.brp) is the only implicit import. User
 modules receive its selections: the base types, `Bool`, `Option` and `Result`
 with their constructors, the operator traits, `Equatable`, `Hashable`,
-`Stringable`, `Dict`, the console functions `print` and `print_error`, and
+`Stringable`, `Dict`, the console functions `print` and `print_error`, the
+generic `max` and `min` of any `Orderable`, and
 the methods of Int, Float, String and List, so `(42 + 1).to_string().length()`
 needs no import. Other direct calls need named imports: console output is in
 the prelude, while files, processes and the environment are explicit imports.
-A user module cannot declare `print` or `print_error` ("print is provided by
-the prelude"). Selecting them from `io/console` as well is redundant but
+A user module cannot declare `print`, `print_error`, `max` or `min` ("max is
+provided by the prelude", with the help "give this function another name").
+Selecting `print` or `print_error` from `io/console` as well is redundant but
 accepted: an import of a name already in scope enters once. A function whose
 first parameter is a String and whose name is a String method the prelude
 provides, such as `lines`, is rejected as well, with "two functions named lines

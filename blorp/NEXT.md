@@ -133,8 +133,8 @@ None of these is planned yet. Each wants its own short design or brief.
     caller destructures it at once. The lexer's `SkippedLines` (`CodeLine`
     before landing 3) costs one allocation per code line, 37,160 in the
     self-compile (`LSP_PLAN.md`, landing 2's measurement).
-  - **`max` and `min` are receiver-only.** `max(a, b)` reports "unknown
-    function", so only `a.max(b)` works.
+  - **`Orderable for String` is missing,** so `max` and `min`, which take any
+    `Orderable`, do not take Strings.
 - **No never-returning type.** `process.brp`'s `fault` calls the `process.fault`
   native, which aborts, and then a second function that is never reached, to
   give the call every type. A never-returning builtin result, or a bottom type,

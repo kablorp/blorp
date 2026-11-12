@@ -62,7 +62,7 @@ For example, `(42 + 1).to_string().length()` needs no imports. Direct calls
 still require named imports such as `int: add`; `add` selected from both `int`
 and `string` names the one Addable family. IO remains explicit.
 Int implements `Orderable` with one signed64 `less_than` builtin and the trait's
-defaults; `min` and `max` are ordinary pure functions. `not_equals` uses the canonical
+defaults. `not_equals` uses the canonical
 trait default. Imported `INT_MIN`
 and `INT_MAX` are closed scalar literals, with no runtime global storage.
 The [imports design](../README.md#modules-imports-and-the-prelude) defines the full rules.
@@ -232,6 +232,15 @@ Integrated correctness, self-compilation and resource acceptance remain separate
 A List of `Orderable` elements is `Orderable`: lexicographic, the first differing
 position decides, and a prefix sorts before the longer List. `[1, 2] < [1, 3]`,
 `[1] < [1, 2]`.
+
+### Largest and smallest
+
+`max[T: Orderable](first, second) -> T` and `min[T: Orderable](first, second) -> T`
+are declared once, in `order.brp`, and the prelude selects them. `_base` cannot
+hold them, because it declares no functions. Both `max(a, b)` and `a.max(b)`
+work for Int, Float, a List of Orderable and any user type that implements
+`Orderable`. When neither argument is less, both return `first`. String has no
+`Orderable` yet, so `max` and `min` do not accept Strings.
 
 ### List membership
 
