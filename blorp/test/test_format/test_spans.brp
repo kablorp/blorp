@@ -1,0 +1,213 @@
+import:
+    bool: and, not, or
+    int: Int methods
+    list: List methods
+    option: Option methods
+    string: String methods
+    test: TestSuite
+    ../../src/common/syntax/syntax:
+        Keyword(
+            PureKeyword,
+            FunctionKeyword,
+            PrivateKeyword,
+            TypeKeyword,
+            RecordKeyword,
+            UnionKeyword,
+            TraitKeyword,
+            ImplementsKeyword,
+            OpaqueKeyword,
+        ),
+        Symbol(LeftParen, Minus, AtSign, Dot, DotDot, Newline, Indent, Dedent),
+        Token,
+        TokenKind(
+            IdentifierToken,
+            KeywordToken,
+            SymbolToken,
+            IntegerLiteral,
+            FloatLiteral,
+            QuotedString,
+            PipeString,
+            StringStart,
+            StringSegment,
+            CharLiteral,
+        ),
+    ./repository_sources: ParsedSource, parsed_source, repository_sources
+    ./syntax_nodes:
+        FirstToken(
+            NameFirst,
+            KeywordFirst,
+            SymbolFirst,
+            NumberFirst,
+            StringFirst,
+            CharFirst,
+            CallableFirst,
+            DeclarationFirst,
+            PathFirst,
+            StartsWith,
+        ),
+        module_nodes,
+
+
+-- How many misplaced starts a failing run prints.
+private REPORTED_FAILURES: Int = 20
+
+
+-- The keywords a declaration may start with.
+private DECLARATION_KEYWORDS: List[Keyword] = [
+    PrivateKeyword,
+    PureKeyword,
+    FunctionKeyword,
+    TypeKeyword,
+    RecordKeyword,
+    UnionKeyword,
+    TraitKeyword,
+    ImplementsKeyword,
+    OpaqueKeyword,
+]
+
+
+private pure func is_layout(token: Token) -> Bool:
+    match token.kind:
+        SymbolToken(Newline) | SymbolToken(Indent) | SymbolToken(Dedent): True
+        _: False
+
+
+-- The code token starting at `offset`. Layout tokens can start there too: a
+-- Dedent before a line at column 1 is empty and shares the line's start.
+private pure func code_token_at(tokens: List[Token], offset: Int) -> Option[Token]:
+    var low = 0
+    var high = tokens.length()
+    while low < high:
+        middle = (low + high) / 2
+        match tokens.get(middle):
+            Some(token):
+                if token.span.start < offset:
+                    low = middle + 1
+                else:
+                    high = middle
+            None:
+                high = middle
+    var found: Option[Token] = None
+    var position = low
+    while position < tokens.length():
+        match tokens.get(position):
+            Some(token):
+                if token.span.start != offset:
+                    break
+                if (
+                    token
+                        .is_layout()
+                        .not()
+                ):
+                    found = Some(token)
+                    break
+            None:
+                break
+        position = position + 1
+    found
+
+
+private pure func keyword_is(token: Token, expected: Keyword) -> Bool:
+    match token.kind:
+        KeywordToken(keyword): keyword == expected
+        _: False
+
+
+private pure func symbol_is(token: Token, expected: Symbol) -> Bool:
+    match token.kind:
+        SymbolToken(symbol): symbol == expected
+        _: False
+
+
+private pure func is_name(token: Token) -> Bool:
+    match token.kind:
+        IdentifierToken(_, _): True
+        _: False
+
+
+private pure func starts_as(token: Token, first: FirstToken) -> Bool:
+    match first:
+        NameFirst:
+            token.is_name()
+        KeywordFirst(keyword):
+            token.keyword_is(keyword)
+        SymbolFirst(symbol):
+            token.symbol_is(symbol)
+        NumberFirst:
+            match token.kind:
+                IntegerLiteral(_) | FloatLiteral(_): True
+                _: token.symbol_is(Minus)
+        StringFirst:
+            match token.kind:
+                QuotedString(_) | PipeString(_) | StringStart(_) | StringSegment(_): True
+                _: False
+        CharFirst:
+            match token.kind:
+                CharLiteral: True
+                _: False
+        CallableFirst:
+            or(
+                token.keyword_is(PureKeyword),
+                or(token.keyword_is(FunctionKeyword), token.symbol_is(LeftParen)),
+            )
+        -- `fixed`, `@tail_recursive`'s `@`, and a constant's name are not keywords.
+        DeclarationFirst:
+            match token.kind:
+                IdentifierToken(_, _): True
+                KeywordToken(keyword): DECLARATION_KEYWORDS.contains(keyword)
+                _: token.symbol_is(AtSign)
+        PathFirst:
+            or(token.is_name(), or(token.symbol_is(Dot), token.symbol_is(DotDot)))
+        StartsWith(_):
+            True
+
+
+-- Where a node's span starts at a token other than its own first one.
+private pure func misplaced_starts(path: String, parsed: ParsedSource) -> List[String]:
+    var failures: List[String] = []
+    for syntax in module_nodes(parsed.contents):
+        match syntax.start:
+            None:
+                void
+            Some(start):
+                placed: Bool = match start.first:
+                    StartsWith(offset):
+                        start.offset == offset
+                    _:
+                        match parsed.tokens.code_token_at(start.offset):
+                            Some(token): token.starts_as(start.first)
+                            None: False
+                if placed.not():
+                    failures = failures.append("${path}: offset ${start.offset}: ${syntax.label}")
+    failures
+
+
+-- The comment cursor emits a node's comments before its span starts, so a span
+-- that starts after its first token would let a comment slip inside it.
+func test_every_span_starts_at_its_first_token() -> Bool:
+    match repository_sources():
+        Err(error):
+            print_error(error)
+            False
+        Ok(files):
+            var failures: List[String] = []
+            var parsed_count = 0
+            for file in files:
+                match parsed_source(file.text):
+                    Ok(parsed):
+                        parsed_count = parsed_count + 1
+                        failures = failures.concat(misplaced_starts(file.path, parsed))
+                    Err(_):
+                        void
+            print(
+                "  ${parsed_count} of ${files.length()} repository sources parse; ${failures.length()} misplaced starts",
+            )
+            for failure in failures.take(REPORTED_FAILURES):
+                print_error(failure)
+            and(failures.is_empty(), parsed_count > 0)
+
+
+TESTS: TestSuite = {
+    description = "Blorp formatter spans",
+    tests = [("every span starts at its first token", test_every_span_starts_at_its_first_token)],
+}

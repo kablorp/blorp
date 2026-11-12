@@ -154,8 +154,8 @@ None of these is planned yet. Each wants its own short design or brief.
 - **The e2e driver prints a ceiling failure mid-line,** interleaved with the
   next PASS line, so a gate log hides it; search the raw log for "exceed the
   ceiling".
-- **`test/runtime/fixtures/argv_test.c` is run by no suite,** like the two
-  String probes that L1 brought back under `string_suite.brp`.
+- **`test/test_common/test_codegen/test_runtime/fixtures/argv_test.c` is run by no
+  suite,** like the two String probes that L1 brought back under `string_suite.brp`.
 
 ## Working notes for agents
 

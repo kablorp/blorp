@@ -1,0 +1,102 @@
+import:
+    bool: Bool methods
+    option: Option methods
+    result: Result methods
+    string: String methods
+    test: TestSuite
+    ../../../../src/common/analysis/check/check: check
+    ../../../../src/common/codegen/emit/emit: emit
+    ../../../../src/common/codegen/lower/lower: lower
+    ../../../../src/common/codegen/own/own: own
+    ../../../../src/common/codegen/runtime/process: PROCESS_POSIX_PRELUDE
+    ../../../../src/common/codegen/specialize/specialize: specialize
+    ../../../../src/common/codegen/verify/verify: verify
+    ../../../../src/common/syntax/syntax: Diagnostic
+    ../../../support/module_input: test_base, parse_modules
+    ../../../support/process_capture_inputs: process_seed
+    ../../../support/text_search: find_text
+
+
+private pure func process_c() -> Result[String, Diagnostic]:
+    seed ?= process_seed(test_base())
+    owned ?= own(seed.lowered)
+    verified ?= verify(owned)
+    emit(verified)
+
+
+-- The POSIX feature prelude comes before every header, and the List[String]
+-- layout the native's parameters use comes before the native.
+pure func test_posix_prelude_and_list_layout_precede_the_native() -> Bool:
+    match process_c():
+        Err(_):
+            False
+        Ok(code):
+            match (
+                find_text(code, "struct blorp_l_0_s{", 0),
+                find_text(code, "uint8_t blorp_process_capture(", 0),
+            ):
+                (Some(layout), Some(native)):
+                    code
+                        .starts_with(PROCESS_POSIX_PRELUDE)
+                        .and(layout < native)
+                _:
+                    False
+
+
+-- The six operands in order, then the success and error out-parameters.
+pure func test_the_call_passes_six_operands_then_both_out_parameters() -> Bool:
+    match process_c():
+        Err(_):
+            False
+        Ok(code):
+            find_text(
+                code,
+                "blorp_process_capture(blorp_vl_0,blorp_vl_1,blorp_vl_2,blorp_vl_3,blorp_vl_4,blorp_vl_5,&blorp_runtime_6_value,&blorp_runtime_6_error)",
+                0,
+            ).is_some()
+
+
+-- A declared native that nothing calls selects no process fragment, so a
+-- program that never runs a process gets no POSIX feature prelude.
+pure func test_an_unused_declaration_selects_no_process_fragments() -> Bool:
+    source = "func query(program: String, arguments: List[String], directory: List[String], environment: List[String], stdin: List[String], timeout: Int) -> Result[List[String], Int]:\n    builtin(\"process.capture\")\nfunc main() -> Int:\n    0\n"
+    match parse_modules([{ source = source, targets = [] }]):
+        Err(_):
+            False
+        Ok(parsed):
+            match check(parsed):
+                Err(_):
+                    False
+                Ok(checked):
+                    match (
+                        specialize(checked)
+                            .and_then(lower)
+                            .and_then(own)
+                            .and_then(verify)
+                            .and_then(emit)
+                    ):
+                        Err(_):
+                            False
+                        Ok(code):
+                            find_text(code, "_POSIX_C_SOURCE", 0)
+                                .is_none()
+                                .and(find_text(code, "blorp_process_capture", 0).is_none())
+
+
+TESTS: TestSuite = {
+    description = "Process builtin C emission",
+    tests = [
+        (
+            "POSIX feature prelude first and the native after the String list layout",
+            test_posix_prelude_and_list_layout_precede_the_native,
+        ),
+        (
+            "the call passes six operands, then both out-parameters",
+            test_the_call_passes_six_operands_then_both_out_parameters,
+        ),
+        (
+            "an unused process declaration selects no process fragments",
+            test_an_unused_declaration_selects_no_process_fragments,
+        ),
+    ],
+}

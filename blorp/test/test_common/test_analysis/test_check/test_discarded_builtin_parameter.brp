@@ -1,0 +1,75 @@
+import:
+    bool: and
+    list: List methods
+    result: Result methods
+    test: TestSuite
+    ../../../../src/common/analysis/check/check: check
+    ../../../../src/common/analysis/namespace/builtins as builtins
+    ../../../../src/common/codegen/lower/lower as lower
+    ../../../../src/common/codegen/specialize/specialize as specialized
+    ../../../../src/common/syntax/syntax: Diagnostic
+    ../../../support/input: setup_diagnostic
+    ../../../support/module_input: parse_modules
+
+
+-- A builtin body hands the native every parameter, so a `_` parameter still
+-- counts as an argument: the call below keeps all three operands.
+SOURCE: String =
+    |pure func slice_text(value: String, _: Int, end: Int) -> Option[String]:
+    |    builtin("string.slice")
+    |func main() -> Int:
+    |    unused = slice_text("abc", 0, 2)
+    |    0
+    |
+
+
+-- The operand count of the first native call in `slice_text`, or None.
+private pure func native_operand_count() -> Option[Int]:
+    match parse_modules([{ source = SOURCE, targets = [] }]):
+        Err(_):
+            None
+        Ok(parsed):
+            match check(parsed).map_err(setup_diagnostic):
+                Err(_):
+                    None
+                Ok(checked):
+                    match specialized.specialize(checked):
+                        Err(_):
+                            None
+                        Ok(concrete):
+                            match lower.lower(concrete):
+                                Err(_):
+                                    None
+                                Ok(lowered):
+                                    native_call_operands(lower.lowered_functions(lowered).functions)
+
+
+private pure func native_call_operands(functions: List[lower.LoweredFunction]) -> Option[Int]:
+    var found: Option[Int] = None
+    for function in functions:
+        for step in function.steps:
+            match step:
+                lower.Define(result):
+                    match result.operation:
+                        lower.CallValue(specialized.RuntimeFunction(builtins.StringSlice(_)), operands):
+                            found = Some(operands.length())
+                        _:
+                            void
+                _:
+                    void
+    found
+
+
+pure func test_a_discard_parameter_is_still_an_operand_of_a_builtin_call() -> Bool:
+    native_operand_count() == Some(3)
+
+
+TESTS: TestSuite = {
+    description = "Builtin bodies with discarded parameters",
+    tests = [
+        (
+            "a discard parameter is still an operand of a builtin call",
+            test_a_discard_parameter_is_still_an_operand_of_a_builtin_call,
+        ),
+    ],
+}

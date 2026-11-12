@@ -1,0 +1,395 @@
+import:
+    bool: not, and
+    io/fs/entry: Entry, EntryKind(File, Directory, Symlink, Other)
+    list: List methods
+    path: to_path
+    result: Result methods
+    test: TestSuite
+    ../driver/harness: LIBRARY_ROOT
+    ../driver/selection:
+        ComponentGroup,
+        DirectoryScan,
+        Tools,
+        compile_arguments,
+        link_arguments,
+        run_command,
+        component_selection,
+        NO_SOURCES_SELECTED,
+        group_sources,
+        program_directory,
+        scan_entries,
+        unselected_message,
+        unselected_sources,
+        without_final_newline,
+        Invocation(Components, EndToEnd),
+        ComponentRun,
+        EndToEndRun,
+        parse_invocation,
+        USAGE,
+        NOT_ABSOLUTE,
+
+
+pure func test_groups_follow_first_appearance_and_keep_list_order() -> Bool:
+    groups = group_sources([
+        "blorp/test/test_common/test_utils/test_text.brp",
+        "blorp/test/test_common/test_syntax/test_lex/test_lex.brp",
+        "blorp/test/test_common/test_utils/test_stack.brp",
+        "blorp/test/test_grammar/test_conformance.brp",
+        "blorp/test/test_common/test_syntax/test_lex/test_float.brp",
+    ])
+    expected: List[ComponentGroup] = [
+        {
+            directory = "blorp/test/test_common/test_utils",
+            sources = [
+                "blorp/test/test_common/test_utils/test_text.brp",
+                "blorp/test/test_common/test_utils/test_stack.brp",
+            ],
+        },
+        {
+            directory = "blorp/test/test_common/test_syntax/test_lex",
+            sources = [
+                "blorp/test/test_common/test_syntax/test_lex/test_lex.brp",
+                "blorp/test/test_common/test_syntax/test_lex/test_float.brp",
+            ],
+        },
+        {
+            directory = "blorp/test/test_grammar",
+            sources = ["blorp/test/test_grammar/test_conformance.brp"],
+        },
+    ]
+    groups == expected
+
+
+pure func test_no_sources_make_no_groups() -> Bool:
+    group_sources([]).is_empty()
+
+
+pure func test_equally_named_directories_of_different_roots_stay_apart() -> Bool:
+    groups = group_sources([
+        "blorp/test/test_common/test_syntax/test_lex/test_a.brp",
+        "blorp/test/other/test_lex/test_b.brp",
+    ])
+    expected: List[ComponentGroup] = [
+        {
+            directory = "blorp/test/test_common/test_syntax/test_lex",
+            sources = ["blorp/test/test_common/test_syntax/test_lex/test_a.brp"],
+        },
+        {
+            directory = "blorp/test/other/test_lex",
+            sources = ["blorp/test/other/test_lex/test_b.brp"],
+        },
+    ]
+    groups == expected
+
+
+pure func test_program_directory_mirrors_the_group_under_the_build_root() -> Bool:
+    unit: ComponentGroup = {
+        directory = "blorp/test/test_common/test_syntax/test_lex",
+        sources = [],
+    }
+    grammar: ComponentGroup = { directory = "blorp/test/test_grammar", sources = [] }
+    unit_directory = (
+        program_directory(unit)
+        == Ok("blorp/build/self-hosted-tests/test_common/test_syntax/test_lex")
+    )
+    grammar_directory = (
+        program_directory(grammar)
+        == Ok("blorp/build/self-hosted-tests/test_grammar")
+    )
+    unit_directory.and(grammar_directory)
+
+
+pure func test_program_directory_rejects_a_group_outside_the_test_root() -> Bool:
+    outside: ComponentGroup = { directory = "blorp/src/test_lex", sources = [] }
+    bare: ComponentGroup = { directory = "blorp/test", sources = [] }
+    outside_error = (
+        program_directory(outside)
+        == Err("component source directory blorp/src/test_lex is not under blorp/test/")
+    )
+    outside_error.and(
+        program_directory(bare)
+            .is_ok()
+            .not(),
+    )
+
+
+pure func test_scan_keeps_test_files_and_directories_and_ignores_links_and_other_names() -> Bool:
+    entries: List[Entry] = [
+        { name = "test_a.brp", kind = File },
+        { name = "test_b.txt", kind = File },
+        { name = "helper.brp", kind = File },
+        { name = "test_.brp", kind = File },
+        { name = "brp", kind = File },
+        { name = "test_link.brp", kind = Symlink },
+        { name = "test_pipe.brp", kind = Other },
+        { name = "test_dir.brp", kind = Directory },
+        { name = "fixtures", kind = Directory },
+    ]
+    expected: DirectoryScan = {
+        test_sources = ["root/test_a.brp", "root/test_.brp"],
+        subdirectories = ["root/test_dir.brp", "root/fixtures"],
+    }
+    scan_entries("root", entries) == expected
+
+
+pure func test_unselected_sources_are_the_test_sources_no_selection_lists() -> Bool:
+    found = ["d/test_a.brp", "d/test_b.brp", "d/test_c.brp"]
+    (
+        unselected_sources(found, ["d/test_b.brp", "elsewhere/test_a.brp"])
+        == ["d/test_a.brp", "d/test_c.brp"]
+    )
+
+
+pure func test_nothing_is_unselected_when_everything_is_listed_or_nothing_exists() -> Bool:
+    all_listed = unselected_sources(["d/test_a.brp"], ["d/test_a.brp"]).is_empty()
+    none_found = unselected_sources([], ["d/test_a.brp"]).is_empty()
+    all_listed.and(none_found)
+
+
+pure func test_each_unselected_source_is_named_with_how_to_select_it() -> Bool:
+    (
+        unselected_message(["d/test_a.brp", "d/test_c.brp"])
+        == (
+            "d/test_a.brp: no suite runs this test file\n"
+            + "help: list it in COMPONENT_SOURCES in blorp/test/driver/driver.brp, or delete it\n"
+            + "d/test_c.brp: no suite runs this test file\n"
+            + "help: list it in COMPONENT_SOURCES in blorp/test/driver/driver.brp, or delete it"
+        )
+    )
+
+
+pure func test_only_one_final_newline_is_removed() -> Bool:
+    removed = without_final_newline("a\nb\n") == "a\nb"
+    kept_blank_line = without_final_newline("a\n\n") == "a\n"
+    unchanged = without_final_newline("a") == "a"
+    empty = without_final_newline("") == ""
+    newline_only = without_final_newline("\n") == ""
+    removed
+        .and(kept_blank_line)
+        .and(unchanged)
+        .and(empty)
+        .and(newline_only)
+
+
+pure func components(run: ComponentRun) -> Invocation:
+    Components(run)
+
+
+pure func test_components_split_libraries_from_sources_at_the_separator() -> Bool:
+    parsed = parse_invocation([
+        "driver",
+        "components",
+        "/cc/compiler",
+        "/usr/bin/cc",
+        "-lm",
+        "-lpthread",
+        "--",
+        "a.brp",
+        "b.brp",
+    ])
+    expected: ComponentRun = {
+        tools = {
+            compiler = "/cc/compiler",
+            c_compiler = "/usr/bin/cc",
+            libraries = ["-lm", "-lpthread"],
+        },
+        sources = ["a.brp", "b.brp"],
+    }
+    parsed == Ok(components(expected))
+
+
+pure func test_components_without_a_separator_take_every_extra_argument_as_a_library() -> Bool:
+    parsed = parse_invocation(["driver", "components", "/compiler", "/cc", "-lm"])
+    expected: ComponentRun = {
+        tools = { compiler = "/compiler", c_compiler = "/cc", libraries = ["-lm"] },
+        sources = [],
+    }
+    parsed == Ok(components(expected))
+
+
+pure func test_e2e_takes_the_tools_and_the_temporary_parent() -> Bool:
+    expected: EndToEndRun = {
+        compiler = "/compiler",
+        c_compiler = "/cc",
+        temporary_parent = "/tmp",
+        check_instructions = False,
+    }
+    invocation: Invocation = EndToEnd(expected)
+    parse_invocation(["driver", "e2e", "/compiler", "/cc", "/tmp"]) == Ok(invocation)
+
+
+pure func test_e2e_checks_instructions_only_when_asked() -> Bool:
+    expected: EndToEndRun = {
+        compiler = "/compiler",
+        c_compiler = "/cc",
+        temporary_parent = "/tmp",
+        check_instructions = True,
+    }
+    invocation: Invocation = EndToEnd(expected)
+    (
+        parse_invocation(["driver", "e2e", "/compiler", "/cc", "/tmp", "--check-instructions"])
+        == Ok(invocation)
+    )
+
+
+pure func test_unknown_modes_and_wrong_counts_print_the_usage() -> Bool:
+    rejected = [
+        ["driver"],
+        ["driver", "unknown"],
+        ["driver", "components"],
+        ["driver", "components", "/compiler"],
+        ["driver", "e2e", "/compiler", "/cc"],
+        ["driver", "e2e", "/compiler", "/cc", "/tmp", "extra"],
+        ["driver", "e2e", "/compiler", "/cc", "/tmp", "--check-instructions", "extra"],
+    ]
+    rejected.all(pure func(arguments: List[String]): parse_invocation(arguments) == Err(USAGE))
+
+
+pure func test_relative_tool_and_directory_paths_are_rejected() -> Bool:
+    rejected = [
+        ["driver", "components", "compiler", "/cc"],
+        ["driver", "components", "/compiler", "cc"],
+        ["driver", "e2e", "compiler", "/cc", "/tmp"],
+        ["driver", "e2e", "/compiler", "cc", "/tmp"],
+        ["driver", "e2e", "/compiler", "/cc", "tmp"],
+    ]
+    rejected.all(
+        pure func(arguments: List[String]): parse_invocation(arguments) == Err(NOT_ABSOLUTE),
+    )
+
+
+pure func configured_tools() -> Tools:
+    { compiler = "/work/compiler", c_compiler = "/usr/bin/cc", libraries = ["-lm", "-lpthread"] }
+
+
+pure func test_compile_arguments_list_the_group_sources_after_the_test_suite_flag() -> Bool:
+    group: ComponentGroup = { directory = "d", sources = ["d/a.brp", "d/b.brp"] }
+    expected: List[String] = [
+        "compile",
+        "--test-suite",
+        "d/a.brp",
+        "d/b.brp",
+        "--library-root",
+        LIBRARY_ROOT,
+        "-o",
+        "build/all_suites.c",
+    ]
+    compile_arguments(group, "build/all_suites") == expected
+
+
+pure func test_link_arguments_end_with_the_given_libraries_after_the_output() -> Bool:
+    actual = link_arguments(configured_tools(), "build/all_suites")
+    tail: List[String] = ["-o", "build/all_suites", "-lm", "-lpthread"]
+    actual.drop(actual.length() - 4) == tail
+
+
+pure func test_the_program_runs_without_arguments_under_strict_leak_checking() -> Bool:
+    match to_path("build/all_suites"):
+        Ok(program):
+            run = run_command(program)
+            strict = run.environment.get("BLORP_LEAK_CHECK") == Some(Some("strict"))
+            strict
+                .and("${run.program}" == "build/all_suites")
+                .and(run.arguments.is_empty())
+                .and(run.timeout_ms == Some(600000))
+        Err(_):
+            False
+
+
+pure func test_an_empty_request_selects_the_built_in_list() -> Bool:
+    component_selection([], ["a.brp", "b.brp"]) == Ok(["a.brp", "b.brp"])
+
+
+pure func test_a_request_replaces_the_built_in_list() -> Bool:
+    component_selection(["c.brp"], ["a.brp", "b.brp"]) == Ok(["c.brp"])
+
+
+pure func test_an_empty_selection_is_an_error_not_a_pass() -> Bool:
+    nothing: List[String] = []
+    component_selection(nothing, nothing) == Err(NO_SOURCES_SELECTED)
+
+
+TESTS: TestSuite = {
+    description = "Self-hosted driver selection",
+    tests = [
+        (
+            "groups follow first appearance and keep list order within a group",
+            test_groups_follow_first_appearance_and_keep_list_order,
+        ),
+        ("no sources make no groups", test_no_sources_make_no_groups),
+        (
+            "equally named directories of different roots stay apart",
+            test_equally_named_directories_of_different_roots_stay_apart,
+        ),
+        (
+            "a program directory mirrors its group under the build root",
+            test_program_directory_mirrors_the_group_under_the_build_root,
+        ),
+        (
+            "a group outside the test root has no program directory",
+            test_program_directory_rejects_a_group_outside_the_test_root,
+        ),
+        (
+            "a scan keeps test files and directories and ignores links and other names",
+            test_scan_keeps_test_files_and_directories_and_ignores_links_and_other_names,
+        ),
+        (
+            "unselected sources are the test sources no selection lists",
+            test_unselected_sources_are_the_test_sources_no_selection_lists,
+        ),
+        (
+            "nothing is unselected when everything is listed or nothing exists",
+            test_nothing_is_unselected_when_everything_is_listed_or_nothing_exists,
+        ),
+        (
+            "each unselected source is named with how to select it",
+            test_each_unselected_source_is_named_with_how_to_select_it,
+        ),
+        (
+            "only one final newline is removed from captured output",
+            test_only_one_final_newline_is_removed,
+        ),
+        (
+            "compile arguments list the group sources after the test-suite flag",
+            test_compile_arguments_list_the_group_sources_after_the_test_suite_flag,
+        ),
+        (
+            "link arguments end with the given libraries after the output",
+            test_link_arguments_end_with_the_given_libraries_after_the_output,
+        ),
+        (
+            "the program runs without arguments under strict leak checking",
+            test_the_program_runs_without_arguments_under_strict_leak_checking,
+        ),
+        (
+            "an empty request selects the built-in list",
+            test_an_empty_request_selects_the_built_in_list,
+        ),
+        ("a request replaces the built-in list", test_a_request_replaces_the_built_in_list),
+        (
+            "an empty selection is an error, not a pass",
+            test_an_empty_selection_is_an_error_not_a_pass,
+        ),
+        (
+            "components split libraries from sources at the separator",
+            test_components_split_libraries_from_sources_at_the_separator,
+        ),
+        (
+            "components without a separator take every extra argument as a library",
+            test_components_without_a_separator_take_every_extra_argument_as_a_library,
+        ),
+        (
+            "e2e takes the tools and the temporary parent",
+            test_e2e_takes_the_tools_and_the_temporary_parent,
+        ),
+        ("e2e checks instructions only when asked", test_e2e_checks_instructions_only_when_asked),
+        (
+            "unknown modes and wrong argument counts print the usage",
+            test_unknown_modes_and_wrong_counts_print_the_usage,
+        ),
+        (
+            "relative tool and directory paths are rejected",
+            test_relative_tool_and_directory_paths_are_rejected,
+        ),
+    ],
+}

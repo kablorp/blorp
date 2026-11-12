@@ -1,0 +1,453 @@
+---
+An integer literal takes its format from its context: an expected UInt8, or an
+unsolved variable that another operand or argument fixes later. One that nothing
+constrains is Int, as every literal was before UInt8. Its range is checked once
+its format is fixed. Rejections compare the rendered message, help and span.
+---
+import:
+    bool: Bool methods
+    int: Int methods
+    list: List methods
+    option: Option methods
+    string: String methods
+    test: TestSuite
+    ../../../../src/common/analysis/check/check: checked_functions
+    ../../../../src/common/analysis/check/model as model
+    ../../../../src/common/syntax/source: label_text, module_source, root_module_id
+    ../../../../src/common/syntax/syntax: IntegerFormat(Int64Format, UInt8Format)
+    ../../../support/text_search: find_text
+    ../../../support/uint8_inputs: checked_uint8, uint8_rejection
+
+
+private GENERICS: String =
+    |pure func larger[T: Orderable](first: T, second: T) -> T:
+    |    first
+    |pure func same[T](first: T, second: T) -> T:
+    |    first
+    |func main() -> Int:
+    |    0
+    |
+
+
+private RANGE_HELP: String = "UInt8 holds 0 to 255"
+
+
+private pure func uint8() -> model.TypeRef:
+    model.IntegerType(UInt8Format)
+
+
+private pure func int() -> model.TypeRef:
+    model.IntegerType(Int64Format)
+
+
+-- Every integer literal among `values`, with its type, in evaluation order.
+private pure func literals_in(values: List[model.CheckedExpr]) -> List[(Int, model.TypeRef)]:
+    var found: List[(Int, model.TypeRef)] = []
+    for value in values:
+        match value.form:
+            model.LiteralInteger(literal): found = found.append((literal, value.value_type))
+            _: void
+        found = found.concat(literals_in(model.child_expressions(value.form)))
+    found
+
+
+-- The literals of the root module's function `name`; a rejection prints why.
+private func literal_types(source: String, name: String) -> List[(Int, model.TypeRef)]:
+    match checked_uint8(GENERICS + source):
+        Err(diagnostic):
+            print_error("rejected: ${diagnostic.message} / ${diagnostic.help}")
+            []
+        Ok(checked):
+            var found: List[(Int, model.TypeRef)] = []
+            for function in checked_functions(checked).functions:
+                if label_text(function.label) == "module_0." + name:
+                    body: List[model.CheckedExpr] = match function.body:
+                        model.CheckedValueBody(model.ReturnExpression(value)): [value]
+                        _: []
+                    found = literals_in(
+                        model.statement_expressions(function.statements).concat(body),
+                    )
+            found
+
+
+private func expect_literals(
+    source: String,
+    name: String,
+    expected: List[(Int, model.TypeRef)],
+) -> Bool:
+    found = literal_types(source, name)
+    var same: Bool = found.length() == expected.length()
+    var position = 0
+    for (value, value_type) in found:
+        match expected.get(position):
+            Some((expected_value, expected_type)):
+                same = same
+                    .and(value == expected_value)
+                    .and(value_type == expected_type)
+            None:
+                same = False
+        position = position + 1
+    if same.not():
+        print_error("found ${found.length()} literals, expected ${expected.length()}")
+    same
+
+
+-- The single diagnostic, at the first occurrence of `fragment` after GENERICS.
+private func rejects_at(source: String, fragment: String, message: String, help: String) -> Bool:
+    rejects_after(source, fragment, fragment, message, help)
+
+
+-- The same, at the first `fragment` at or after the first `anchor`.
+private func rejects_after(
+    source: String,
+    anchor: String,
+    fragment: String,
+    message: String,
+    help: String,
+) -> Bool:
+    whole = GENERICS + source
+    anchored = find_text(whole, anchor, GENERICS.length()).get_or(whole.length())
+    match (uint8_rejection(whole), find_text(whole, fragment, anchored)):
+        (Some(diagnostics), Some(start)):
+            first = diagnostics.first
+            exact = (first.span.source == module_source(root_module_id()))
+                .and(first.span.start == start)
+                .and(first.span.end == start + fragment.length())
+                .and(first.message == message)
+                .and(first.help == help)
+                .and(diagnostics.remaining.is_empty())
+            if exact.not():
+                print_error(
+                    "reported ${first.span.start}..${first.span.end} ${first.message} / ${first.help}",
+                )
+            exact
+        (None, _):
+            print_error("checked without a diagnostic")
+            False
+        (_, None):
+            False
+
+
+func test_an_annotation_gives_a_literal_its_format() -> Bool:
+    source: String =
+        |pure func values() -> UInt8:
+        |    byte: UInt8 = 200
+        |    byte
+        |
+    expect_literals(source, "values", [(200, uint8())])
+
+
+func test_an_operand_gives_a_literal_its_format_on_either_side() -> Bool:
+    source: String =
+        |pure func values(byte: UInt8) -> List[Bool]:
+        |    next = byte + 1
+        |    wrapped = 0 - byte
+        |    [byte == 0, larger(byte, 3) == larger(3, byte)]
+        |
+    expect_literals(source, "values", [
+        (1, uint8()),
+        (0, uint8()),
+        (0, uint8()),
+        (3, uint8()),
+        (3, uint8()),
+    ])
+
+
+func test_an_expected_variant_or_list_gives_a_literal_its_format() -> Bool:
+    source: String =
+        |pure func values() -> List[UInt8]:
+        |    maybe: Option[UInt8] = Some(200)
+        |    [137, 80]
+        |
+    expect_literals(source, "values", [(200, uint8()), (137, uint8()), (80, uint8())])
+
+
+-- Nothing expects `paired`, so the call's literals wait and then default when
+-- the call finishes.
+func test_a_literal_nothing_constrains_is_int() -> Bool:
+    source: String =
+        |pure func values() -> Int:
+        |    count = 5
+        |    listed = [6, 7]
+        |    paired = same(1, 2)
+        |    paired
+        |
+    expect_literals(source, "values", [(5, int()), (6, int()), (7, int()), (1, int()), (2, int())])
+
+
+-- The first lambda's literal is the only source of T, nothing expects the
+-- call's result, and the second lambda waits for T: only the default once
+-- resolution stops lets it go on.
+func test_a_literal_that_stalls_lambda_resolution_becomes_int() -> Bool:
+    source: String =
+        |pure func pipe[T](make: pure () -> T, use: pure (T) -> T) -> T:
+        |    use(make())
+        |pure func values() -> Int:
+        |    piped = pipe(pure func(): 7, pure func(value): value)
+        |    piped
+        |
+    match checked_uint8(GENERICS + source):
+        Ok(_):
+            True
+        Err(diagnostic):
+            print_error("rejected: ${diagnostic.message} / ${diagnostic.help}")
+            False
+
+
+func test_an_annotated_literal_outside_uint8_is_rejected_at_the_literal() -> Bool:
+    source: String =
+        |pure func values() -> UInt8:
+        |    byte: UInt8 = 300
+        |    byte
+        |
+    rejects_at(source, "300", "300 does not fit in UInt8", RANGE_HELP)
+
+
+func test_a_negative_literal_is_outside_uint8() -> Bool:
+    source: String =
+        |pure func values() -> UInt8:
+        |    byte: UInt8 = -1
+        |    byte
+        |
+    rejects_at(source, "-1", "-1 does not fit in UInt8", RANGE_HELP)
+
+
+func test_a_deferred_literal_is_checked_once_its_format_is_fixed() -> Bool:
+    source: String =
+        |pure func values(byte: UInt8) -> UInt8:
+        |    larger(256, byte)
+        |
+    rejects_at(source, "256", "256 does not fit in UInt8", RANGE_HELP)
+
+
+func test_a_literal_pattern_takes_the_scrutinee_format() -> Bool:
+    source: String =
+        |pure func describe(byte: UInt8) -> Int:
+        |    match byte:
+        |        0: 1
+        |        255: 2
+        |        _: 3
+        |
+    match checked_uint8(GENERICS + source):
+        Ok(_):
+            True
+        Err(diagnostic):
+            print_error("rejected: ${diagnostic.message} / ${diagnostic.help}")
+            False
+
+
+func test_a_literal_pattern_outside_uint8_is_rejected() -> Bool:
+    source: String =
+        |pure func describe(byte: UInt8) -> Int:
+        |    match byte:
+        |        256: 1
+        |        _: 3
+        |
+    rejects_at(source, "256", "256 does not fit in UInt8", RANGE_HELP)
+
+
+func test_a_constant_outside_uint8_is_rejected_at_its_literal() -> Bool:
+    rejects_at("LIMIT: UInt8 = 300\n", "300", "300 does not fit in UInt8", RANGE_HELP)
+
+
+func test_a_list_element_outside_uint8_is_rejected() -> Bool:
+    source: String =
+        |pure func values() -> List[UInt8]:
+        |    [1, 300]
+        |
+    rejects_at(source, "300", "300 does not fit in UInt8", RANGE_HELP)
+
+
+func test_a_variant_payload_outside_uint8_is_rejected() -> Bool:
+    source: String =
+        |pure func values() -> Option[UInt8]:
+        |    Some(300)
+        |
+    rejects_at(source, "300", "300 does not fit in UInt8", RANGE_HELP)
+
+
+func test_a_negative_literal_pattern_is_outside_uint8() -> Bool:
+    source: String =
+        |pure func describe(byte: UInt8) -> Int:
+        |    match byte:
+        |        -1: 1
+        |        _: 3
+        |
+    rejects_at(source, "-1", "-1 does not fit in UInt8", RANGE_HELP)
+
+
+func test_a_record_update_outside_uint8_is_rejected() -> Bool:
+    source: String =
+        |record Pixel { red: UInt8, alpha: UInt8 }
+        |pure func values(pixel: Pixel) -> Pixel:
+        |    { pixel | red = 300 }
+        |
+    rejects_at(source, "300", "300 does not fit in UInt8", RANGE_HELP)
+
+
+-- A literal first argument waits for its format, yet the conflict still reads
+-- as an Int literal's did.
+-- Nothing expects `paired`, so `5` waits on T, and only an integer may fill
+-- a waiting literal's variable.
+func test_a_waiting_literal_reports_a_conflict_as_int() -> Bool:
+    source: String =
+        |pure func values() -> String:
+        |    paired = same(5, "five")
+        |    paired
+        |
+    rejects_at(
+        source,
+        "\"five\"",
+        "argument type does not match the parameter type",
+        "use an expression of type Int here",
+    )
+
+
+func test_a_literal_after_a_fixed_argument_reports_its_conflict_as_before() -> Bool:
+    source: String =
+        |pure func values() -> String:
+        |    same("five", 55)
+        |
+    rejects_at(
+        source,
+        "55",
+        "argument type does not match the parameter type",
+        "use an expression of type String here",
+    )
+
+
+func test_negating_a_uint8_points_to_wrapping_subtraction() -> Bool:
+    source: String =
+        |pure func values(byte: UInt8) -> UInt8:
+        |    -byte
+        |
+    rejects_after(
+        source,
+        "-byte",
+        "-",
+        "UInt8 has no negation",
+        "write 0 - value for the wrapping result",
+    )
+
+
+func test_mixing_formats_names_both_conversions() -> Bool:
+    source: String =
+        |pure func values(byte: UInt8, count: Int) -> UInt8:
+        |    byte + count
+        |
+    rejects_after(
+        source,
+        "+ count",
+        "count",
+        "argument type does not match the parameter type",
+        "UInt8 and Int do not mix: convert the Int with to_uint8(), or the UInt8 with to_int()",
+    )
+
+
+-- `total` took Int from its lone literal, so annotating it is the other fix.
+func test_mixing_with_a_literal_declared_local_suggests_its_annotation() -> Bool:
+    source: String =
+        |pure func values(byte: UInt8) -> Int:
+        |    var total = 0
+        |    total = total + byte
+        |    total
+        |
+    rejects_after(
+        source,
+        "+ byte",
+        "byte",
+        "argument type does not match the parameter type",
+        "Int and UInt8 do not mix: convert the UInt8 with to_int(), or the Int with to_uint8(); or declare var total: UInt8 = 0",
+    )
+
+
+-- A literal that UInt8 cannot hold gets no annotation suggestion.
+func test_a_local_whose_literal_does_not_fit_gets_no_annotation() -> Bool:
+    source: String =
+        |pure func values(byte: UInt8) -> Int:
+        |    total = 300
+        |    total + byte
+        |
+    rejects_after(
+        source,
+        "+ byte",
+        "byte",
+        "argument type does not match the parameter type",
+        "Int and UInt8 do not mix: convert the UInt8 with to_int(), or the Int with to_uint8()",
+    )
+
+
+TESTS: TestSuite = {
+    description = "Blorp integer literal formats",
+    tests = [
+        ("an annotation gives a literal its format", test_an_annotation_gives_a_literal_its_format),
+        (
+            "an operand gives a literal its format on either side",
+            test_an_operand_gives_a_literal_its_format_on_either_side,
+        ),
+        (
+            "an expected variant or list gives a literal its format",
+            test_an_expected_variant_or_list_gives_a_literal_its_format,
+        ),
+        ("a literal nothing constrains is Int", test_a_literal_nothing_constrains_is_int),
+        (
+            "a literal that stalls lambda resolution becomes Int",
+            test_a_literal_that_stalls_lambda_resolution_becomes_int,
+        ),
+        (
+            "an annotated literal outside UInt8 is rejected at the literal",
+            test_an_annotated_literal_outside_uint8_is_rejected_at_the_literal,
+        ),
+        ("a negative literal is outside UInt8", test_a_negative_literal_is_outside_uint8),
+        (
+            "a deferred literal is checked once its format is fixed",
+            test_a_deferred_literal_is_checked_once_its_format_is_fixed,
+        ),
+        (
+            "a literal pattern takes the scrutinee format",
+            test_a_literal_pattern_takes_the_scrutinee_format,
+        ),
+        (
+            "a literal pattern outside UInt8 is rejected",
+            test_a_literal_pattern_outside_uint8_is_rejected,
+        ),
+        (
+            "a constant outside UInt8 is rejected at its literal",
+            test_a_constant_outside_uint8_is_rejected_at_its_literal,
+        ),
+        ("a List element outside UInt8 is rejected", test_a_list_element_outside_uint8_is_rejected),
+        (
+            "a variant payload outside UInt8 is rejected",
+            test_a_variant_payload_outside_uint8_is_rejected,
+        ),
+        (
+            "a negative literal pattern is outside UInt8",
+            test_a_negative_literal_pattern_is_outside_uint8,
+        ),
+        (
+            "a record update outside UInt8 is rejected",
+            test_a_record_update_outside_uint8_is_rejected,
+        ),
+        (
+            "a waiting literal reports a conflict as Int",
+            test_a_waiting_literal_reports_a_conflict_as_int,
+        ),
+        (
+            "a literal after a fixed argument reports its conflict as before",
+            test_a_literal_after_a_fixed_argument_reports_its_conflict_as_before,
+        ),
+        (
+            "negating a UInt8 points to wrapping subtraction",
+            test_negating_a_uint8_points_to_wrapping_subtraction,
+        ),
+        ("mixing formats names both conversions", test_mixing_formats_names_both_conversions),
+        (
+            "mixing with a literal-declared local suggests its annotation",
+            test_mixing_with_a_literal_declared_local_suggests_its_annotation,
+        ),
+        (
+            "a local whose literal does not fit gets no annotation",
+            test_a_local_whose_literal_does_not_fit_gets_no_annotation,
+        ),
+    ],
+}

@@ -1,0 +1,1496 @@
+import:
+    bool: Bool methods
+    int: Int methods
+    list: List methods
+    option: Option methods
+    result: Result methods
+    string: String methods
+    test: TestSuite
+    ../../../../src/common/codegen/lower/lower as lower
+    ../../../../src/common/codegen/own/own as own
+    ../../../../src/common/codegen/verify/verify: verify
+    ../../../support/list_update_inputs: owned_source
+
+
+-- String declarations beside the List ones `owned_source` supplies; List and
+-- String updates share one consuming selector, so both exercise one transfer.
+STRING_DECLARATIONS: String =
+    |pure func append_int(text: String, value: Int) -> String:
+    |    builtin("string.append_int")
+    |pure func text_length(text: String) -> Int:
+    |    builtin("string.length")
+    |
+
+
+-- Every operation of a block and the blocks nested in it, outer first.
+private pure func flatten(operations: List[own.OwnershipOperation]) -> List[own.OwnershipOperation]:
+    var all: List[own.OwnershipOperation] = []
+    for operation in operations:
+        all = all.append(operation)
+        match operation:
+            own.ExecuteLoop(loop):
+                all = all.concat(flatten_loop_block(loop.body))
+            own.ExecuteJoin(join):
+                for arm in join.arms:
+                    all = all.concat(flatten(arm.operations))
+                    match arm.exit:
+                        own.TransferLoop(_, tail): all = all.concat(flatten_loop_tail(tail))
+                        own.Yield(_): void
+            _:
+                void
+    all
+
+
+private pure func flatten_loop_block(block: own.OwnedLoopBlock) -> List[own.OwnershipOperation]:
+    flatten(block.operations).concat(flatten_loop_tail(block.tail))
+
+
+private pure func flatten_loop_tail(tail: own.OwnedLoopTail) -> List[own.OwnershipOperation]:
+    var all: List[own.OwnershipOperation] = []
+    match tail:
+        own.ExitLoop(_):
+            void
+        own.MatchLoop(matched):
+            for arm in matched.arms:
+                all = all.concat(flatten_loop_block(arm.body))
+    all
+
+
+-- Owner numbers are function-wide, so facts are read from the one function
+-- that contains loops: `collect` in every source below.
+private pure func collect_operations(program: own.OwnershipProgram) -> List[own.OwnershipOperation]:
+    var found: List[own.OwnershipOperation] = []
+    for function in program.functions:
+        all = flatten(function.operations)
+        if (
+            loops(all)
+                .is_empty()
+                .not()
+        ):
+            found = all
+    found
+
+
+private pure func loops(operations: List[own.OwnershipOperation]) -> List[own.OwnedLoop]:
+    var found: List[own.OwnedLoop] = []
+    for operation in operations:
+        match operation:
+            own.ExecuteLoop(loop): found = found.append(loop)
+            _: void
+    found
+
+
+-- The owners a loop's headers take: managed initials that name an existing
+-- owner rather than one of the loop's entry acquisitions.
+private pure func taken(loop: own.OwnedLoop) -> List[Int]:
+    var owners: List[Int] = []
+    for header in loop.headers:
+        match header.initial:
+            own.UnmanagedReturn(_):
+                void
+            own.OwnedReturn(_, owner):
+                if loop.entry_acquisitions.all(
+                    pure func(acquisition): own.owner_number(acquisition.owner).not_equals(
+                        own.owner_number(owner),
+                    ),
+                ):
+                    owners = owners.append(own.owner_number(owner))
+    owners
+
+
+private pure func header_owners(loop: own.OwnedLoop) -> List[Int]:
+    var owners: List[Int] = []
+    for header in loop.headers:
+        match header.parameter:
+            own.ManagedJoinParameter(_, owner): owners = owners.append(own.owner_number(owner))
+            own.UnmanagedJoinParameter(_): void
+    owners
+
+
+-- Every managed initial is an entry acquisition of that same initial value.
+private pure func acquires_each_initial(loop: own.OwnedLoop) -> Bool:
+    loop.headers.all(pure func(header):
+        match header.initial:
+            own.UnmanagedReturn(_):
+                True
+            own.OwnedReturn(value, owner):
+                loop.entry_acquisitions.any(pure func(acquisition):
+                    own.owner_number(acquisition.owner)
+                        .equals(own.owner_number(owner))
+                        .and(
+                            lower.value_number(acquisition.borrow.value).equals(
+                                lower.value_number(value),
+                            ),
+                        )
+                )
+    )
+
+
+-- Owners consumed by a runtime update anywhere in these operations.
+private pure func consumed_owners(operations: List[own.OwnershipOperation]) -> List[Int]:
+    var owners: List[Int] = []
+    for operation in operations:
+        match operation:
+            own.DefineValue(definition):
+                match definition.operation:
+                    own.CallDefinition(_, [own.ConsumedArgument(_, owner), ..._]):
+                        owners = owners.append(own.owner_number(owner))
+                    _:
+                        void
+            _:
+                void
+    owners
+
+
+-- Owners of the List and String literals defined in these operations, in order.
+private pure func literal_owners(operations: List[own.OwnershipOperation]) -> List[Int]:
+    var owners: List[Int] = []
+    for operation in operations:
+        match operation:
+            own.DefineValue(definition):
+                match (definition.operation, definition.result):
+                    (own.ConstructListDefinition(_), own.OwnedResult(owner)):
+                        owners = owners.append(own.owner_number(owner))
+                    (own.StringDefinition(_), own.OwnedResult(owner)):
+                        owners = owners.append(own.owner_number(owner))
+                    _:
+                        void
+            _:
+                void
+    owners
+
+
+-- Owners acquired for record field projections, in order.
+private pure func projection_owners(operations: List[own.OwnershipOperation]) -> List[Int]:
+    var projected: List[Int] = []
+    var owners: List[Int] = []
+    for operation in operations:
+        match operation:
+            own.DefineValue(definition):
+                match definition.operation:
+                    own.ReadRecordFieldDefinition(_, _):
+                        projected = projected.append(lower.value_number(definition.id))
+                    _:
+                        void
+            own.AcquireOwner(owner, borrow, _):
+                if projected.contains(lower.value_number(borrow.value)):
+                    owners = owners.append(own.owner_number(owner))
+            _:
+                void
+    owners
+
+
+private pure func same_ints(left: List[Int], right: List[Int]) -> Bool:
+    var same: Bool = left
+        .length()
+        .equals(right.length())
+    var index = 0
+    for value in left:
+        match right.get(index):
+            Some(other): same = same.and(value.equals(other))
+            None: same = False
+        index = index + 1
+    same
+
+
+-- Whether a block drops an owner after a loop header or a join in it took
+-- that owner: the obligation would be retired twice, once there and once here.
+private pure func retires_taken(operations: List[own.OwnershipOperation]) -> Bool:
+    var taken_here: List[Int] = []
+    var retired: Bool = False
+    for operation in operations:
+        match operation:
+            own.ExecuteLoop(loop):
+                taken_here = taken_here.concat(taken(loop))
+                retired = retired.or(loop_block_retires(loop.body))
+            own.ExecuteJoin(join):
+                taken_here = taken_here.concat(entering(join))
+                for arm in join.arms:
+                    retired = retired.or(retires_taken(arm.operations))
+                    match arm.exit:
+                        own.TransferLoop(_, tail):
+                            retired = retired.or(
+                                loop_block_retires({ operations = [], tail = tail }),
+                            )
+                        own.Yield(_):
+                            void
+            own.DropOwner(owner, _):
+                retired = retired.or(taken_here.contains(own.owner_number(owner)))
+            _:
+                void
+    retired
+
+
+private pure func loop_block_retires(block: own.OwnedLoopBlock) -> Bool:
+    var retired = retires_taken(block.operations)
+    match block.tail:
+        own.ExitLoop(_):
+            void
+        own.MatchLoop(matched):
+            for arm in matched.arms:
+                retired = retired.or(loop_block_retires(arm.body))
+    retired
+
+
+-- No block retires a taken owner after its loop or join, and the independent
+-- verifier accepts every transfer.
+private pure func transfers_soundly(program: own.OwnershipProgram) -> Bool:
+    var retired: Bool = False
+    for function in program.functions:
+        retired = retired.or(retires_taken(function.operations))
+    retired
+        .not()
+        .and(verify(program).is_ok())
+
+
+private pure func transfer_facts(body: String) -> Option[own.OwnershipProgram]:
+    match owned_source(STRING_DECLARATIONS + body):
+        Ok(program): Some(program)
+        Err(_): None
+
+
+-- A literal moves into the outer header and the outer header into the inner
+-- one, whose update then consumes the inner header's own obligation.
+private pure func nested_transfers(body: String) -> Bool:
+    match transfer_facts(body):
+        None:
+            False
+        Some(program):
+            operations = collect_operations(program)
+            match loops(operations):
+                [outer, inner]:
+                    same_ints(taken(outer), literal_owners(operations).take(1))
+                        .and(same_ints(taken(inner), header_owners(outer)))
+                        .and(
+                            header_owners(inner).all(
+                                pure func(owner): consumed_owners(flatten_loop_block(inner.body)).contains(
+                                    owner,
+                                ),
+                            ),
+                        )
+                        .and(transfers_soundly(program))
+                _:
+                    False
+
+
+pure func test_nested_accumulator_headers_take_their_dying_owners() -> Bool:
+    body: String =
+        |pure func collect() -> List[Int]:
+        |    var values: List[Int] = []
+        |    while less_than(length(values), 12):
+        |        var again: Bool = True
+        |        while again:
+        |            values = append(values, 7)
+        |            again = False
+        |    values
+        |func main() -> Int:
+        |    unused = collect()
+        |    0
+        |
+    nested_transfers(body)
+
+
+pure func test_string_accumulator_takes_its_dying_owner() -> Bool:
+    body: String =
+        |pure func collect() -> String:
+        |    var text: String = "a"
+        |    while less_than(text_length(text), 12):
+        |        var again: Bool = True
+        |        while again:
+        |            text = append_int(text, 7)
+        |            again = False
+        |    text
+        |func main() -> Int:
+        |    unused = collect()
+        |    0
+        |
+    nested_transfers(body)
+
+
+private pure func only_loop_acquires(body: String) -> Bool:
+    match transfer_facts(body):
+        None:
+            False
+        Some(program):
+            match loops(collect_operations(program)):
+                [loop]:
+                    taken(loop)
+                        .is_empty()
+                        .and(acquires_each_initial(loop))
+                        .and(verify(program).is_ok())
+                _:
+                    False
+
+
+pure func test_body_read_keeps_entry_acquisition() -> Bool:
+    body: String =
+        |pure func collect() -> List[Int]:
+        |    original: List[Int] = [1]
+        |    var values = original
+        |    while less_than(length(values), 12):
+        |        values = append(values, length(original))
+        |    values
+        |func main() -> Int:
+        |    unused = collect()
+        |    0
+        |
+    only_loop_acquires(body)
+
+
+pure func test_two_headers_fed_by_one_owner_both_acquire() -> Bool:
+    body: String =
+        |pure func collect() -> List[Int]:
+        |    original: List[Int] = [1]
+        |    var left = original
+        |    var right = original
+        |    while less_than(length(left), 12):
+        |        left = append(left, 1)
+        |        right = append(right, 2)
+        |    concat(left, right)
+        |func main() -> Int:
+        |    unused = collect()
+        |    0
+        |
+    only_loop_acquires(body)
+
+
+-- Each header takes the owner acquired for its own projection.
+private pure func projections_transfer(body: String) -> Bool:
+    match transfer_facts(body):
+        None:
+            False
+        Some(program):
+            operations = collect_operations(program)
+            match loops(operations):
+                [loop]:
+                    projected = projection_owners(operations)
+                    projected
+                        .is_empty()
+                        .not()
+                        .and(same_ints(taken(loop), projected))
+                        .and(transfers_soundly(program))
+                _:
+                    False
+
+
+pure func test_projected_owner_transfers() -> Bool:
+    body: String =
+        |record State { items: List[Int], count: Int }
+        |pure func collect(state: State) -> List[Int]:
+        |    var items = state.items
+        |    while less_than(length(items), 12):
+        |        items = append(items, 7)
+        |    items
+        |func main() -> Int:
+        |    state: State = { items = [], count = 0 }
+        |    unused = collect(state)
+        |    0
+        |
+    projections_transfer(body)
+
+
+pure func test_projections_of_one_record_take_their_own_owners() -> Bool:
+    body: String =
+        |record State { left: List[Int], right: List[Int] }
+        |pure func collect(state: State) -> List[Int]:
+        |    var left = state.left
+        |    var right = state.right
+        |    while less_than(length(left), 12):
+        |        left = append(left, 1)
+        |        right = append(right, 2)
+        |    concat(left, right)
+        |func main() -> Int:
+        |    state: State = { left = [], right = [] }
+        |    unused = collect(state)
+        |    0
+        |
+    projections_transfer(body)
+
+
+-- `local` belongs to the outer loop body; the inner loop sits in a `continue`
+-- arm, so it can take that owner only through the arm's loop row.
+pure func test_loop_in_abrupt_arm_takes_body_owner_through_loop_row() -> Bool:
+    body: String =
+        |pure func collect() -> List[Int]:
+        |    var total: List[Int] = []
+        |    while less_than(length(total), 12):
+        |        var local: List[Int] = [1]
+        |        if less_than(length(local), 5):
+        |            var again: Bool = True
+        |            while again:
+        |                local = append(local, 2)
+        |                again = False
+        |            total = concat(total, local)
+        |            continue
+        |        total = append(total, 0)
+        |    total
+        |func main() -> Int:
+        |    unused = collect()
+        |    0
+        |
+    match transfer_facts(body):
+        None:
+            False
+        Some(program):
+            operations = collect_operations(program)
+            match (loops(operations), literal_owners(operations)):
+                ([_, inner], [_, local]):
+                    same_ints(taken(inner), [local]).and(transfers_soundly(program))
+                _:
+                    False
+
+
+-- An abrupt arm before the loop still retires the owner the loop takes later:
+-- the arm's snapshot precedes the transfer.
+pure func test_earlier_break_retires_an_owner_taken_later() -> Bool:
+    body: String =
+        |pure func collect() -> List[Int]:
+        |    var total: List[Int] = []
+        |    while less_than(length(total), 12):
+        |        var local: List[Int] = [1]
+        |        if less_than(length(total), 0):
+        |            break
+        |        var again: Bool = True
+        |        while again:
+        |            local = append(local, 2)
+        |            again = False
+        |        total = concat(total, local)
+        |    total
+        |func main() -> Int:
+        |    unused = collect()
+        |    0
+        |
+    match transfer_facts(body):
+        None:
+            False
+        Some(program):
+            operations = collect_operations(program)
+            var break_drops: List[Int] = []
+            for operation in operations:
+                match operation:
+                    own.ExecuteJoin(join):
+                        for arm in join.arms:
+                            match arm.exit:
+                                own.TransferLoop(_, own.ExitLoop(own.Break(_))):
+                                    for dropped in arm.operations:
+                                        match dropped:
+                                            own.DropOwner(owner, _):
+                                                break_drops = break_drops.append(
+                                                    own.owner_number(owner),
+                                                )
+                                            _:
+                                                void
+                                _:
+                                    void
+                    _:
+                        void
+            match (loops(operations), literal_owners(operations)):
+                ([_, inner], [_, local]):
+                    same_ints(taken(inner), [local])
+                        .and(break_drops.contains(local))
+                        .and(transfers_soundly(program))
+                _:
+                    False
+
+
+-- Joins: the owners a join takes, and how each of its arms discharges them.
+
+private pure func entering(join: own.OwnedJoin) -> List[Int]:
+    join.entering.map(pure func(owner): own.owner_number(owner))
+
+
+-- Every join in a function and the blocks nested in it, outer first.
+private pure func joins(operations: List[own.OwnershipOperation]) -> List[own.OwnedJoin]:
+    var found: List[own.OwnedJoin] = []
+    for operation in flatten(operations):
+        match operation:
+            own.ExecuteJoin(join): found = found.append(join)
+            _: void
+    found
+
+
+-- The operations of the one function that contains joins.
+private pure func join_operations(program: own.OwnershipProgram) -> List[own.OwnershipOperation]:
+    var found: List[own.OwnershipOperation] = []
+    for function in program.functions:
+        if (
+            joins(function.operations)
+                .is_empty()
+                .not()
+        ):
+            found = function.operations
+    found
+
+
+private pure func yields(arm: own.OwnedJoinArm) -> Bool:
+    match arm.exit:
+        own.Yield(_): True
+        own.TransferLoop(_, _): False
+
+
+private pure func yielding_arms(join: own.OwnedJoin) -> List[own.OwnedJoinArm]:
+    join.arms.filter(yields)
+
+
+private pure func abrupt_arms(join: own.OwnedJoin) -> List[own.OwnedJoinArm]:
+    join.arms.filter(pure func(arm): yields(arm).not())
+
+
+-- How often these operations, not their nested blocks, drop `owner`.
+private pure func drops_in(operations: List[own.OwnershipOperation], owner: Int) -> Int:
+    var count = 0
+    for operation in operations:
+        match operation:
+            own.DropOwner(dropped, _):
+                if own.owner_number(dropped).equals(owner):
+                    count = count + 1
+            _:
+                void
+    count
+
+
+-- The arm drops `owner` before anything else: it never reads it.
+private pure func drops_on_entry(arm: own.OwnedJoinArm, owner: Int) -> Bool:
+    match arm.operations.get(0):
+        Some(own.DropOwner(dropped, _)):
+            own.owner_number(dropped)
+                .equals(owner)
+                .and(drops_in(arm.operations, owner).equals(1))
+        _:
+            False
+
+
+-- The arm reads `owner` before dropping it once.
+private pure func drops_after_reading(arm: own.OwnedJoinArm, owner: Int) -> Bool:
+    drops_in(arm.operations, owner)
+        .equals(1)
+        .and(drops_on_entry(arm, owner).not())
+
+
+-- An update in the arm consumes `owner`, which the arm then never drops.
+private pure func consumes_in(arm: own.OwnedJoinArm, owner: Int) -> Bool:
+    consumed_owners(arm.operations)
+        .contains(owner)
+        .and(drops_in(arm.operations, owner).equals(0))
+
+
+-- A join among the arm's own operations takes `owner` from it.
+private pure func forwards_in(arm: own.OwnedJoinArm, owner: Int) -> Bool:
+    var forwarded: Bool = False
+    for operation in arm.operations:
+        match operation:
+            own.ExecuteJoin(join): forwarded = forwarded.or(entering(join).contains(owner))
+            _: void
+    forwarded.and(drops_in(arm.operations, owner).equals(0))
+
+
+-- The accumulator's header owner enters the `if`; the update consumes it in
+-- one arm and the other retires it after its yield acquires the value.
+pure func test_statement_if_takes_the_dying_accumulator() -> Bool:
+    body: String =
+        |pure func collect() -> List[Int]:
+        |    var values: List[Int] = []
+        |    while less_than(length(values), 12):
+        |        if less_than(length(values), 6):
+        |            values = append(values, 1)
+        |    values
+        |func main() -> Int:
+        |    unused = collect()
+        |    0
+        |
+    match transfer_facts(body):
+        None:
+            False
+        Some(program):
+            operations = join_operations(program)
+            match (loops(flatten(operations)), joins(operations)):
+                ([loop], [join]):
+                    match (header_owners(loop), yielding_arms(join)):
+                        ([header], [update, kept]):
+                            same_ints(entering(join), [header])
+                                .and(consumes_in(update, header))
+                                .and(drops_after_reading(kept, header))
+                                .and(transfers_soundly(program))
+                        _:
+                            False
+                _:
+                    False
+
+
+-- One owner, three arms: unread in the first, read in the second and
+-- consumed in the third, each discharging it exactly once.
+pure func test_value_match_arms_each_discharge_the_entering_owner() -> Bool:
+    body: String =
+        |union Choice:
+        |    Skip
+        |    Read
+        |    Grow
+        |pure func pick(choice: Choice) -> Int:
+        |    values: List[Int] = [1]
+        |    match choice:
+        |        Skip: 0
+        |        Read: length(values)
+        |        Grow: length(append(values, 2))
+        |func main() -> Int:
+        |    unused = pick(Grow)
+        |    0
+        |
+    match transfer_facts(body):
+        None:
+            False
+        Some(program):
+            operations = join_operations(program)
+            match (joins(operations), literal_owners(operations)):
+                ([join], [values]):
+                    match join.arms:
+                        [skip, read, grow]:
+                            same_ints(entering(join), [values])
+                                .and(drops_on_entry(skip, values))
+                                .and(drops_after_reading(read, values))
+                                .and(consumes_in(grow, values))
+                                .and(transfers_soundly(program))
+                        _:
+                            False
+                _:
+                    False
+
+
+-- `?=` nests its continuation in the Ok arm, so each prefix owner still
+-- needed enters every join on the way, and each Err arm drops it on entry.
+pure func test_propagation_chain_forwards_live_prefix_owners() -> Bool:
+    body: String =
+        |pure func checked(values: List[Int]) -> Result[Int, Int]:
+        |    Ok(length(values))
+        |pure func chain() -> Result[Int, Int]:
+        |    first: List[Int] = [1]
+        |    second: List[Int] = [2]
+        |    third: List[Int] = [3]
+        |    a ?= checked(first)
+        |    b ?= checked(second)
+        |    Ok(length(third))
+        |func main() -> Int:
+        |    unused = chain()
+        |    0
+        |
+    match transfer_facts(body):
+        None:
+            False
+        Some(program):
+            operations = join_operations(program)
+            match (joins(operations), literal_owners(operations)):
+                ([outer, inner], [first, second, third]):
+                    match (outer.arms, inner.arms):
+                        ([outer_ok, outer_err], [inner_ok, inner_err]):
+                            entering(outer)
+                                .contains(first)
+                                .not()
+                                .and(entering(outer).contains(second))
+                                .and(entering(outer).contains(third))
+                                .and(
+                                    entering(inner)
+                                        .contains(second)
+                                        .not(),
+                                )
+                                .and(entering(inner).contains(third))
+                                .and(forwards_in(outer_ok, third))
+                                .and(drops_in(outer_err.operations, second).equals(1))
+                                .and(drops_in(outer_err.operations, third).equals(1))
+                                .and(drops_after_reading(inner_ok, third))
+                                .and(drops_in(inner_err.operations, third).equals(1))
+                                .and(transfers_soundly(program))
+                        _:
+                            False
+                _:
+                    False
+
+
+-- An `else if` is a join in the outer `else` arm, which forwards the owner.
+pure func test_else_if_chain_forwards_the_entering_owner() -> Bool:
+    body: String =
+        |pure func grade(count: Int) -> Int:
+        |    values: List[Int] = [1]
+        |    if less_than(count, 1):
+        |        0
+        |    else if less_than(count, 2):
+        |        length(values)
+        |    else:
+        |        1
+        |func main() -> Int:
+        |    unused = grade(1)
+        |    0
+        |
+    match transfer_facts(body):
+        None:
+            False
+        Some(program):
+            operations = join_operations(program)
+            match (joins(operations), literal_owners(operations)):
+                ([outer, inner], [values]):
+                    match (outer.arms, inner.arms):
+                        ([first, rest], [second, last]):
+                            same_ints(entering(outer), [values])
+                                .and(same_ints(entering(inner), [values]))
+                                .and(drops_on_entry(first, values))
+                                .and(forwards_in(rest, values))
+                                .and(drops_after_reading(second, values))
+                                .and(drops_on_entry(last, values))
+                                .and(transfers_soundly(program))
+                        _:
+                            False
+                _:
+                    False
+
+
+-- An owner read after the join stays with its block.
+pure func test_owner_read_after_the_join_does_not_enter() -> Bool:
+    body: String =
+        |pure func kept(flag: Bool) -> Bool:
+        |    values: List[Int] = [1]
+        |    count = if flag:
+        |        length(values)
+        |    else:
+        |        0
+        |    less_than(count, length(values))
+        |func main() -> Int:
+        |    unused = kept(True)
+        |    0
+        |
+    match transfer_facts(body):
+        None:
+            False
+        Some(program):
+            match joins(join_operations(program)):
+                [join]:
+                    entering(join)
+                        .is_empty()
+                        .and(transfers_soundly(program))
+                _:
+                    False
+
+
+-- A snapshot keeps the old List live past the join, so the update borrows
+-- and copies rather than changing what the snapshot sees.
+pure func test_snapshot_keeps_its_owner_out_of_the_join() -> Bool:
+    body: String =
+        |pure func snapshot(flag: Bool) -> Bool:
+        |    var values: List[Int] = [1]
+        |    old = values
+        |    if flag:
+        |        values = append(values, 2)
+        |    less_than(length(old), length(values))
+        |func main() -> Int:
+        |    unused = snapshot(True)
+        |    0
+        |
+    match transfer_facts(body):
+        None:
+            False
+        Some(program):
+            operations = join_operations(program)
+            match joins(operations):
+                [join]:
+                    entering(join)
+                        .is_empty()
+                        .and(consumed_owners(flatten(operations)).is_empty())
+                        .and(transfers_soundly(program))
+                _:
+                    False
+
+
+-- The abrupt arm's `break` moves `owner` into one of the loop's outputs.
+private pure func breaks_with(arm: own.OwnedJoinArm, owner: Int) -> Bool:
+    match arm.exit:
+        own.TransferLoop(_, own.ExitLoop(own.Break(outputs))):
+            [outputs.value]
+                .concat(outputs.carried)
+                .any(pure func(transfer):
+                    match transfer:
+                        own.OwnedReturn(_, moved): own.owner_number(moved).equals(owner)
+                        own.UnmanagedReturn(_): False
+                )
+        _:
+            False
+
+
+-- The accumulator enters the outer `if` and is forwarded into the inner one,
+-- whose `break` arm moves it out at the edge instead of retiring it.
+pure func test_nested_join_with_a_break_arm_takes_the_forwarded_owner() -> Bool:
+    body: String =
+        |pure func collect() -> List[Int]:
+        |    var values: List[Int] = []
+        |    while less_than(length(values), 12):
+        |        if less_than(length(values), 6):
+        |            if less_than(length(values), 3):
+        |                values = append(values, 1)
+        |            else:
+        |                break
+        |        else:
+        |            values = append(values, 2)
+        |    values
+        |func main() -> Int:
+        |    unused = collect()
+        |    0
+        |
+    match transfer_facts(body):
+        None:
+            False
+        Some(program):
+            operations = join_operations(program)
+            match (loops(flatten(operations)), joins(operations)):
+                ([loop], [outer, inner]):
+                    match (
+                        header_owners(loop),
+                        outer.arms,
+                        yielding_arms(inner),
+                        abrupt_arms(inner),
+                    ):
+                        ([header], [forwarding, growing], [update], [exit]):
+                            entering(outer)
+                                .contains(header)
+                                .and(entering(inner).contains(header))
+                                .and(forwards_in(forwarding, header))
+                                .and(consumes_in(growing, header))
+                                .and(consumes_in(update, header))
+                                .and(drops_in(exit.operations, header).equals(0))
+                                .and(breaks_with(exit, header))
+                                .and(transfers_soundly(program))
+                        _:
+                            False
+                _:
+                    False
+
+
+-- The arm consumes the accumulator before a nested `break`, which must not
+-- retire it a second time.
+pure func test_break_after_an_in_arm_consumption_retires_nothing_again() -> Bool:
+    body: String =
+        |pure func collect() -> List[Int]:
+        |    var values: List[Int] = []
+        |    while less_than(length(values), 12):
+        |        if less_than(length(values), 6):
+        |            values = append(values, 1)
+        |            if less_than(length(values), 3):
+        |                break
+        |    values
+        |func main() -> Int:
+        |    unused = collect()
+        |    0
+        |
+    match transfer_facts(body):
+        None:
+            False
+        Some(program):
+            operations = join_operations(program)
+            match (loops(flatten(operations)), joins(operations)):
+                ([loop], [outer, inner]):
+                    match (header_owners(loop), yielding_arms(outer), abrupt_arms(inner)):
+                        ([header], [update, _], [exit]):
+                            entering(outer)
+                                .contains(header)
+                                .and(consumed_owners(update.operations).contains(header))
+                                .and(drops_in(exit.operations, header).equals(0))
+                                .and(transfers_soundly(program))
+                        _:
+                            False
+                _:
+                    False
+
+
+-- Matching the accumulator on itself: the Some arm drops the old Option on
+-- entry, after its edge acquired the payload, so the update can consume it.
+pure func test_option_accumulator_matched_on_itself_consumes_its_payload() -> Bool:
+    body: String =
+        |pure func collect() -> Option[List[Int]]:
+        |    var acc: Option[List[Int]] = Some([])
+        |    var count: List[Int] = []
+        |    while less_than(length(count), 3):
+        |        count = append(count, 0)
+        |        match acc:
+        |            Some(list):
+        |                acc = Some(append(list, 1))
+        |            None:
+        |                acc = None
+        |    acc
+        |func main() -> Int:
+        |    unused = collect()
+        |    0
+        |
+    match transfer_facts(body):
+        None:
+            False
+        Some(program):
+            operations = join_operations(program)
+            match (loops(flatten(operations)), joins(operations)):
+                ([loop], [join]):
+                    match (header_owners(loop), join.arms):
+                        ([acc, _], [some, none]):
+                            match some.inputs:
+                                [own.ManagedJoinParameter(_, payload)]:
+                                    entering(join)
+                                        .contains(acc)
+                                        .and(drops_on_entry(some, acc))
+                                        .and(consumes_in(some, own.owner_number(payload)))
+                                        .and(drops_on_entry(none, acc))
+                                        .and(transfers_soundly(program))
+                                _:
+                                    False
+                        _:
+                            False
+                _:
+                    False
+
+
+pure func test_string_accumulator_consumes_in_each_arm() -> Bool:
+    body: String =
+        |pure func collect() -> String:
+        |    var text: String = "a"
+        |    while less_than(text_length(text), 12):
+        |        if less_than(text_length(text), 6):
+        |            text = append_int(text, 7)
+        |        else:
+        |            text = append_int(text, 8)
+        |    text
+        |func main() -> Int:
+        |    unused = collect()
+        |    0
+        |
+    match transfer_facts(body):
+        None:
+            False
+        Some(program):
+            operations = join_operations(program)
+            match (loops(flatten(operations)), joins(operations)):
+                ([loop], [join]):
+                    match (header_owners(loop), join.arms):
+                        ([header], [first, second]):
+                            same_ints(entering(join), [header])
+                                .and(consumes_in(first, header))
+                                .and(consumes_in(second, header))
+                                .and(transfers_soundly(program))
+                        _:
+                            False
+                _:
+                    False
+
+
+-- A loop in a join arm takes the owner entering that join at its header.
+pure func test_loop_in_a_join_arm_takes_the_entering_owner() -> Bool:
+    body: String =
+        |pure func collect(flag: Bool) -> List[Int]:
+        |    var values: List[Int] = [1]
+        |    if flag:
+        |        var again: Bool = True
+        |        while again:
+        |            values = append(values, 2)
+        |            again = False
+        |    values
+        |func main() -> Int:
+        |    unused = collect(True)
+        |    0
+        |
+    match transfer_facts(body):
+        None:
+            False
+        Some(program):
+            operations = join_operations(program)
+            match (joins(operations), literal_owners(operations)):
+                ([join], [values]):
+                    match join.arms:
+                        [looping, kept]:
+                            match loops(looping.operations):
+                                [loop]:
+                                    same_ints(entering(join), [values])
+                                        .and(same_ints(taken(loop), [values]))
+                                        .and(drops_in(looping.operations, values).equals(0))
+                                        .and(drops_after_reading(kept, values))
+                                        .and(transfers_soundly(program))
+                                _:
+                                    False
+                        _:
+                            False
+                _:
+                    False
+
+
+-- The loop in the arm reads the entering owner in its body, not as an
+-- initial: its header acquires nothing from it, and the arm drops it once,
+-- after the loop step rather than inside the loop.
+pure func test_entering_owner_read_by_a_loop_body_drops_after_the_loop() -> Bool:
+    body: String =
+        |pure func measure(flag: Bool) -> List[Int]:
+        |    original: List[Int] = [1, 2]
+        |    var total: List[Int] = []
+        |    if flag:
+        |        var again: Bool = True
+        |        while again:
+        |            total = append(total, length(original))
+        |            again = False
+        |    total
+        |func main() -> Int:
+        |    unused = measure(True)
+        |    0
+        |
+    match transfer_facts(body):
+        None:
+            False
+        Some(program):
+            operations = join_operations(program)
+            match (joins(operations), literal_owners(operations)):
+                ([join], [original, _]):
+                    match join.arms:
+                        [looping, skipped]:
+                            var after_loop: Bool = False
+                            var seen_loop: Bool = False
+                            for operation in looping.operations:
+                                match operation:
+                                    own.ExecuteLoop(_):
+                                        seen_loop = True
+                                    own.DropOwner(owner, _):
+                                        after_loop = after_loop.or(
+                                            seen_loop.and(own.owner_number(owner).equals(original)),
+                                        )
+                                    _:
+                                        void
+                            match loops(looping.operations):
+                                [loop]:
+                                    entering(join)
+                                        .contains(original)
+                                        .and(
+                                            taken(loop)
+                                                .contains(original)
+                                                .not(),
+                                        )
+                                        .and(
+                                            drops_in(flatten_loop_block(loop.body), original).equals(
+                                                0,
+                                            ),
+                                        )
+                                        .and(drops_in(looping.operations, original).equals(1))
+                                        .and(after_loop)
+                                        .and(drops_on_entry(skipped, original))
+                                        .and(transfers_soundly(program))
+                                _:
+                                    False
+                        _:
+                            False
+                _:
+                    False
+
+
+-- Moves at last use: a store or an outgoing edge occurrence takes the owner
+-- whose last use it is instead of acquiring and dropping it.
+
+-- Owners defined by these operations' definitions.
+private pure func defined_owners(operations: List[own.OwnershipOperation]) -> List[Int]:
+    var owners: List[Int] = []
+    for operation in operations:
+        match operation:
+            own.DefineValue(definition):
+                match definition.result:
+                    own.OwnedResult(owner): owners = owners.append(own.owner_number(owner))
+                    _: void
+            _:
+                void
+    owners
+
+
+private pure func acquired_owners(operations: List[own.OwnershipOperation]) -> List[Int]:
+    var owners: List[Int] = []
+    for operation in operations:
+        match operation:
+            own.AcquireOwner(owner, _, _): owners = owners.append(own.owner_number(owner))
+            _: void
+    owners
+
+
+-- The owners stored by the constructions among these operations, in order.
+private pure func stored_owners(operations: List[own.OwnershipOperation]) -> List[Int]:
+    var payloads: List[own.StoredPayload] = []
+    for operation in operations:
+        match operation:
+            own.DefineValue(definition):
+                match definition.operation:
+                    own.ConstructListDefinition(stored):
+                        payloads = payloads.concat(stored)
+                    own.ConstructDefinition(_, stored):
+                        payloads = payloads.concat(stored)
+                    own.ConstructRecordDefinition(_, fields):
+                        payloads = payloads.concat(
+                            fields.map(pure func(field) -> own.StoredPayload: field.value),
+                        )
+                    _:
+                        void
+            _:
+                void
+    var owners: List[Int] = []
+    for payload in payloads:
+        match payload:
+            own.OwnedPayload(_, owner): owners = owners.append(own.owner_number(owner))
+            own.UnmanagedPayload(_): void
+    owners
+
+
+-- The operations of the one function, other than main, that stores an owned
+-- payload: the last one in instance order.
+private pure func storing_operations(program: own.OwnershipProgram) -> List[own.OwnershipOperation]:
+    var found: List[own.OwnershipOperation] = []
+    for function in program.functions:
+        all = flatten(function.operations)
+        if (
+            stored_owners(all)
+                .is_empty()
+                .not()
+        ):
+            found = all
+    found
+
+
+pure func test_a_dying_owner_moves_into_a_record_field() -> Bool:
+    body: String =
+        |record Box { items: List[Int] }
+        |pure func wrap(count: Int) -> Box:
+        |    items: List[Int] = [count]
+        |    { items = items }
+        |func main() -> Int:
+        |    box = wrap(3)
+        |    length(box.items)
+        |
+    match transfer_facts(body):
+        None:
+            False
+        Some(program):
+            operations = storing_operations(program)
+            match (stored_owners(operations), literal_owners(operations)):
+                ([stored], [items]):
+                    stored
+                        .equals(items)
+                        .and(acquired_owners(operations).is_empty())
+                        .and(drops_in(operations, items).equals(0))
+                        .and(verify(program).is_ok())
+                _:
+                    False
+
+
+-- One obligation fills one slot: the second occurrence acquires from the
+-- owner the first one moves.
+pure func test_a_repeated_payload_moves_once_and_acquires_once() -> Bool:
+    body: String =
+        |pure func pair(count: Int) -> List[List[Int]]:
+        |    items: List[Int] = [count]
+        |    [items, items]
+        |func main() -> Int:
+        |    length(pair(3))
+        |
+    match transfer_facts(body):
+        None:
+            False
+        Some(program):
+            operations = storing_operations(program)
+            match (
+                stored_owners(operations),
+                literal_owners(operations),
+                acquired_owners(operations),
+            ):
+                ([first, second], [items, _], [acquired]):
+                    first
+                        .equals(items)
+                        .and(second.equals(acquired))
+                        .and(drops_in(operations, items).equals(0))
+                        .and(verify(program).is_ok())
+                _:
+                    False
+
+
+pure func test_a_store_before_a_later_read_acquires() -> Bool:
+    body: String =
+        |record Box { items: List[Int] }
+        |pure func measure(count: Int) -> Bool:
+        |    items: List[Int] = [count]
+        |    box: Box = { items = items }
+        |    less_than(length(items), length(box.items))
+        |func main() -> Int:
+        |    unused = measure(3)
+        |    0
+        |
+    match transfer_facts(body):
+        None:
+            False
+        Some(program):
+            operations = storing_operations(program)
+            match (
+                stored_owners(operations),
+                literal_owners(operations),
+                acquired_owners(operations),
+            ):
+                ([stored], [items], [acquired, ..._]):
+                    stored
+                        .equals(acquired)
+                        .and(drops_in(operations, items).equals(1))
+                        .and(verify(program).is_ok())
+                _:
+                    False
+
+
+-- The back edge moves the update's result into the header rather than
+-- acquiring it and retiring the result's owner.
+private pure func loop_exits(block: own.OwnedLoopBlock) -> List[own.OwnedLoopExit]:
+    match block.tail:
+        own.ExitLoop(exit):
+            [exit]
+        own.MatchLoop(matched):
+            var exits: List[own.OwnedLoopExit] = []
+            for arm in matched.arms:
+                exits = exits.concat(loop_exits(arm.body))
+            exits
+
+
+pure func test_a_back_edge_moves_a_body_owner() -> Bool:
+    body: String =
+        |pure func collect() -> List[Int]:
+        |    var values: List[Int] = []
+        |    while less_than(length(values), 12):
+        |        values = append(values, 7)
+        |    values
+        |func main() -> Int:
+        |    unused = collect()
+        |    0
+        |
+    match transfer_facts(body):
+        None:
+            False
+        Some(program):
+            match loops(collect_operations(program)):
+                [loop]:
+                    body_operations = flatten_loop_block(loop.body)
+                    var moved: List[Int] = []
+                    var exits = 0
+                    for exit in loop_exits(loop.body):
+                        match exit:
+                            own.Recur(transfers, _):
+                                exits = exits + 1
+                                for transfer in transfers:
+                                    match transfer:
+                                        own.OwnedReturn(_, owner):
+                                            moved = moved.append(own.owner_number(owner))
+                                        own.UnmanagedReturn(_):
+                                            void
+                            own.Break(_):
+                                void
+                    exits
+                        .equals(1)
+                        .and(
+                            moved
+                                .is_empty()
+                                .not(),
+                        )
+                        .and(
+                            moved.all(
+                                pure func(owner): defined_owners(body_operations).contains(owner),
+                            ),
+                        )
+                        .and(transfers_soundly(program))
+                _:
+                    False
+
+
+-- A yielding arm moves the values it made into the join's carriers; an arm
+-- that yields enclosing values still acquires them.
+pure func test_a_yield_moves_arm_owners_into_carriers() -> Bool:
+    body: String =
+        |pure func choose(flag: Bool) -> Bool:
+        |    var left: List[Int] = []
+        |    var right: List[Int] = []
+        |    if flag:
+        |        left = [1]
+        |        right = [2]
+        |    less_than(length(left), length(right))
+        |func main() -> Int:
+        |    unused = choose(True)
+        |    0
+        |
+    match transfer_facts(body):
+        None:
+            False
+        Some(program):
+            operations = join_operations(program)
+            match joins(operations):
+                [join]:
+                    var moving_arms = 0
+                    var acquiring_arms = 0
+                    for arm in yielding_arms(join):
+                        match arm.exit:
+                            own.Yield(outputs):
+                                owners = outputs.carried.map(pure func(transfer) -> Int:
+                                    match transfer:
+                                        own.OwnedReturn(_, owner): own.owner_number(owner)
+                                        own.UnmanagedReturn(_): -1
+                                )
+                                if owners.all(
+                                    pure func(owner): defined_owners(arm.operations).contains(
+                                        owner,
+                                    ),
+                                ):
+                                    moving_arms = moving_arms + 1
+                                if owners.all(
+                                    pure func(owner): acquired_owners(arm.operations).contains(
+                                        owner,
+                                    ),
+                                ):
+                                    acquiring_arms = acquiring_arms + 1
+                            own.TransferLoop(_, _):
+                                void
+                    moving_arms
+                        .equals(1)
+                        .and(acquiring_arms.equals(1))
+                        .and(transfers_soundly(program))
+                _:
+                    False
+
+
+-- Edges ask the same rule as stores: an arm that yields one value in two
+-- carriers moves its owner into the first and acquires the second from it.
+pure func test_a_value_yielded_twice_moves_once_and_acquires_once() -> Bool:
+    body: String =
+        |pure func choose(flag: Bool) -> Bool:
+        |    var left: List[Int] = []
+        |    var right: List[Int] = []
+        |    if flag:
+        |        made: List[Int] = [1]
+        |        left = made
+        |        right = made
+        |    less_than(length(left), length(right))
+        |func main() -> Int:
+        |    unused = choose(True)
+        |    0
+        |
+    match transfer_facts(body):
+        None:
+            False
+        Some(program):
+            operations = join_operations(program)
+            match joins(operations):
+                [join]:
+                    var moved_once = 0
+                    for arm in yielding_arms(join):
+                        match arm.exit:
+                            own.Yield(outputs):
+                                owners = outputs.carried.map(pure func(transfer) -> Int:
+                                    match transfer:
+                                        own.OwnedReturn(_, owner): own.owner_number(owner)
+                                        own.UnmanagedReturn(_): -1
+                                )
+                                match (
+                                    owners,
+                                    literal_owners(arm.operations),
+                                    acquired_owners(arm.operations),
+                                ):
+                                    ([first, second], [made], [acquired]):
+                                        if (
+                                            first
+                                                .equals(made)
+                                                .and(second.equals(acquired))
+                                                .and(drops_in(arm.operations, made).equals(0))
+                                        ):
+                                            moved_once = moved_once + 1
+                                    _:
+                                        void
+                            own.TransferLoop(_, _):
+                                void
+                    moved_once
+                        .equals(1)
+                        .and(transfers_soundly(program))
+                _:
+                    False
+
+
+TESTS: TestSuite = {
+    description = "Loop entry and join ownership transfer insertion",
+    tests = [
+        (
+            "nested accumulator headers take their dying owners",
+            test_nested_accumulator_headers_take_their_dying_owners,
+        ),
+        (
+            "a String accumulator takes its dying owner",
+            test_string_accumulator_takes_its_dying_owner,
+        ),
+        (
+            "a body read of the initial keeps the entry acquisition",
+            test_body_read_keeps_entry_acquisition,
+        ),
+        (
+            "two headers fed by one owner both acquire",
+            test_two_headers_fed_by_one_owner_both_acquire,
+        ),
+        ("a projected owner transfers into its header", test_projected_owner_transfers),
+        (
+            "projections of one record each take their own owner",
+            test_projections_of_one_record_take_their_own_owners,
+        ),
+        (
+            "a loop in an abrupt arm takes a loop-body owner through its loop row",
+            test_loop_in_abrupt_arm_takes_body_owner_through_loop_row,
+        ),
+        (
+            "an earlier break still retires an owner a later loop takes",
+            test_earlier_break_retires_an_owner_taken_later,
+        ),
+        (
+            "a statement if takes the dying accumulator",
+            test_statement_if_takes_the_dying_accumulator,
+        ),
+        (
+            "each value match arm discharges the entering owner once",
+            test_value_match_arms_each_discharge_the_entering_owner,
+        ),
+        (
+            "a propagation chain forwards live prefix owners",
+            test_propagation_chain_forwards_live_prefix_owners,
+        ),
+        (
+            "an else-if chain forwards the entering owner",
+            test_else_if_chain_forwards_the_entering_owner,
+        ),
+        (
+            "an owner read after the join does not enter it",
+            test_owner_read_after_the_join_does_not_enter,
+        ),
+        (
+            "a snapshot keeps its owner out of the join",
+            test_snapshot_keeps_its_owner_out_of_the_join,
+        ),
+        (
+            "a nested join with a break arm takes the forwarded owner",
+            test_nested_join_with_a_break_arm_takes_the_forwarded_owner,
+        ),
+        (
+            "a break after an in-arm consumption retires nothing again",
+            test_break_after_an_in_arm_consumption_retires_nothing_again,
+        ),
+        (
+            "an Option accumulator matched on itself consumes its payload",
+            test_option_accumulator_matched_on_itself_consumes_its_payload,
+        ),
+        ("a String accumulator consumes in each arm", test_string_accumulator_consumes_in_each_arm),
+        (
+            "a loop in a join arm takes the entering owner",
+            test_loop_in_a_join_arm_takes_the_entering_owner,
+        ),
+        (
+            "an entering owner read by a loop body drops after the loop",
+            test_entering_owner_read_by_a_loop_body_drops_after_the_loop,
+        ),
+        ("a dying owner moves into a record field", test_a_dying_owner_moves_into_a_record_field),
+        (
+            "a repeated payload moves once and acquires once",
+            test_a_repeated_payload_moves_once_and_acquires_once,
+        ),
+        ("a store before a later read acquires", test_a_store_before_a_later_read_acquires),
+        ("a back edge moves a body owner", test_a_back_edge_moves_a_body_owner),
+        ("a yield moves arm owners into carriers", test_a_yield_moves_arm_owners_into_carriers),
+        (
+            "a value yielded twice moves once and acquires once",
+            test_a_value_yielded_twice_moves_once_and_acquires_once,
+        ),
+    ],
+}

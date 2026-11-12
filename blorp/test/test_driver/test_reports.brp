@@ -1,0 +1,160 @@
+import:
+    bool: not, and
+    list: List methods
+    result: Result methods
+    string: String methods
+    test: TestSuite
+    ../driver/reports:
+        positive_allocations,
+        report_allocations,
+        verify_accounting,
+        parse_instructions,
+        within_ceiling,
+
+
+pure func test_balanced_reports_respect_zero_and_positive_policies() -> Bool:
+    zero = "blorp: leak check: 0 allocs, 0 releases, 0 leaked, 0 bytes\n"
+    positive = "blorp: leak check: 7 allocs, 7 releases, 0 leaked, 0 bytes\n"
+    verify_accounting(zero, False)
+        .is_ok()
+        .and(
+            verify_accounting(zero, True)
+                .is_ok()
+                .not(),
+        )
+        .and(verify_accounting(positive, True).is_ok())
+
+
+pure func test_malformed_unbalanced_and_extra_reports_fail() -> Bool:
+    reports: List[String] = [
+        "",
+        "blorp: leak check: 7 allocs, 6 releases, 0 leaked, 0 bytes\n",
+        "blorp: leak check: 7 allocs, 7 releases, 1 leaked, 8 bytes\n",
+        "blorp: leak check: 07 allocs, 07 releases, 0 leaked, 0 bytes\n",
+        "blorp: leak check: -1 allocs, -1 releases, 0 leaked, 0 bytes\n",
+        "blorp: leak check: 9223372036854775808 allocs, 9223372036854775808 releases, 0 leaked, 0 bytes\n",
+        "blorp: leak check: x allocs, x releases, 0 leaked, 0 bytes\n",
+        "blorp: leak check: 1 allocs, 1 releases, 0 leaked, 0 bytes",
+        "extra\nblorp: leak check: 1 allocs, 1 releases, 0 leaked, 0 bytes\n",
+        "blorp: leak check: 1 allocs, 1 releases, 0 leaked, 0 bytes\nextra\n",
+        "blorp: leak check: 1 allocs, 1 releases, 0 leaked, 0 bytes\nblorp: leak check: 1 allocs, 1 releases, 0 leaked, 0 bytes\n",
+    ]
+    reports.all(
+        pure func(report: String): verify_accounting(report, False)
+            .is_ok()
+            .not(),
+    )
+
+
+pure func test_a_balanced_report_names_its_allocation_count() -> Bool:
+    zero = (
+        report_allocations("blorp: leak check: 0 allocs, 0 releases, 0 leaked, 0 bytes\n")
+        == Ok(0)
+    )
+    positive = (
+        report_allocations("blorp: leak check: 131100 allocs, 131100 releases, 0 leaked, 0 bytes\n")
+        == Ok(131100)
+    )
+    zero.and(positive)
+
+
+pure func test_a_compile_report_must_show_positive_allocations() -> Bool:
+    positive = (
+        positive_allocations("blorp: leak check: 7 allocs, 7 releases, 0 leaked, 0 bytes\n")
+        == Ok(7)
+    )
+    zero = positive_allocations("blorp: leak check: 0 allocs, 0 releases, 0 leaked, 0 bytes\n")
+        .is_ok()
+        .not()
+    positive.and(zero)
+
+
+pure func test_an_unbalanced_or_leaking_report_names_no_count() -> Bool:
+    report_allocations("blorp: leak check: 7 allocs, 6 releases, 0 leaked, 0 bytes\n")
+        .is_ok()
+        .not()
+        .and(
+            report_allocations("blorp: leak check: 7 allocs, 7 releases, 1 leaked, 8 bytes\n")
+                .is_ok()
+                .not(),
+        )
+
+
+-- The report of `/usr/bin/time -l true` on macOS, trimmed to the counters around
+-- the instruction line.
+private TIMING_REPORT: String =
+    |        0.00 real         0.00 user         0.01 sys
+    |             1179648  maximum resident set size
+    |                   6  involuntary context switches
+    |            11669676  instructions retired
+    |             5833086  cycles elapsed
+    |              884952  peak memory footprint
+    |
+
+
+pure func test_the_instruction_counter_is_read_from_a_timing_report() -> Bool:
+    parse_instructions(TIMING_REPORT) == Ok(11669676)
+
+
+pure func test_a_timing_report_without_exactly_one_positive_counter_fails() -> Bool:
+    reports: List[String] = [
+        "",
+        "        0.00 real\n             5833086  cycles elapsed\n",
+        TIMING_REPORT + TIMING_REPORT,
+        "                   0  instructions retired\n",
+        "      instructions retired\n",
+        "  many  instructions retired\n",
+        "99999999999999999999  instructions retired\n",
+    ]
+    reports.all(
+        pure func(report: String): parse_instructions(report)
+            .is_ok()
+            .not(),
+    )
+
+
+pure func test_a_cost_at_its_ceiling_passes_and_above_it_names_both_numbers() -> Bool:
+    at_ceiling = within_ceiling("compile allocations", 140000, 140000).is_ok()
+    above = match within_ceiling("compile allocations", 140001, 140000):
+        Err(message): message.equals("compile allocations 140001 exceed the ceiling 140000")
+        Ok(_): False
+    at_ceiling.and(above)
+
+
+TESTS: TestSuite = {
+    description = "Self-hosted e2e accounting reports",
+    tests = [
+        (
+            "zero and positive policies accept only their accounting reports",
+            test_balanced_reports_respect_zero_and_positive_policies,
+        ),
+        (
+            "missing malformed unbalanced extra and duplicate reports reject",
+            test_malformed_unbalanced_and_extra_reports_fail,
+        ),
+        (
+            "a balanced report names its allocation count",
+            test_a_balanced_report_names_its_allocation_count,
+        ),
+        (
+            "a compile report must show positive allocations",
+            test_a_compile_report_must_show_positive_allocations,
+        ),
+        (
+            "an unbalanced or leaking report names no count",
+            test_an_unbalanced_or_leaking_report_names_no_count,
+        ),
+        (
+            "the instruction counter is read from a timing report",
+            test_the_instruction_counter_is_read_from_a_timing_report,
+        ),
+        (
+            "a timing report without exactly one positive counter fails",
+            test_a_timing_report_without_exactly_one_positive_counter_fails,
+        ),
+        (
+            "a cost at its ceiling passes and above it names both numbers",
+            test_a_cost_at_its_ceiling_passes_and_above_it_names_both_numbers,
+        ),
+    ],
+}

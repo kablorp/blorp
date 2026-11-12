@@ -32,7 +32,7 @@ not rely on a remembered list. Each time:
    TARGET_COMPONENT_SOURCES=<paths>` for a component suite.
 3. For a change under `blorp/`, run `make -C blorp test`.
 4. Run `scripts/blorp-fixpoint --prove` when the change alters emitted C, and
-   `bash blorp/test/tooling/test_bootstrap.sh` when it touches
+   `bash blorp/test/test_bootstrap/test_bootstrap.sh` when it touches
    `scripts/blorp-compiler-bootstrap`, `blorp/Makefile` or `blorp/bootstrap.env`.
 5. For a change to `benchmarks/`, run `bash benchmarks/bench.sh <name>` for a
    benchmark the change touches. For a docs-only change, check links and paths

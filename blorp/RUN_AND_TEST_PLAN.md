@@ -31,7 +31,7 @@ when R0 was decided.
   arguments, stdout_path, stderr_path, timeout_ms)`: an absolute program
   path, output written to two files, stdin from `/dev/null`, a required
   positive timeout, and no environment control (callers wrap with
-  `/usr/bin/env NAME=value`, as `self_hosted_harness.brp:22` does). The child
+  `/usr/bin/env NAME=value`, as `harness.brp:22` does). The child
   runs in its own process group (`src/common/codegen/runtime/process.brp:191-194`) so
   a timeout can kill everything it started.
 - **The approved process API** (`PROCESS_DECISIONS.md`) replaces it with
@@ -44,7 +44,7 @@ when R0 was decided.
   The pinned seed knows `process.run_to_files`; it does not know the new
   process natives.
 - **Flags in use**: the harness links with `-std=c11 -O0`, the diagnostics
-  macro and `-lm -lpthread` (`self_hosted_harness.brp:410-429`); a leak under
+  macro and `-lm -lpthread` (`harness.brp:410-429`); a leak under
   `BLORP_LEAK_CHECK=strict` exits 99 (`blorp/README.md`, Measuring); a test
   program exits 0 when every test passes and 1 otherwise
   (`standard_library/test.brp:43`).
@@ -151,15 +151,15 @@ e2e driver onto `blorp test`, watch modes, `--link`, Windows.
 
 ## Testing
 
-- `test/unit/test_main/` unit tests for both commands' parses and usage errors,
+- `test/test_main/` unit tests for both commands' parses and usage errors,
   including R6's argument handling.
-- e2e cases in `self_hosted_cli.brp`, exact output and status, every row of
+- e2e cases in `cli.brp`, exact output and status, every row of
   R5: a program that prints and exits 3; arguments with `--flag` words; a
   program reading stdin (R0 a only); a compile error; a missing `--cc`; a
   passing suite, a failing suite, a leaking suite, and a suite killed by a
   signal; no temporary directory left under `/tmp` afterwards.
 - Gates: `make -C blorp test`, then `make -C blorp test-e2e
-  INSTRUCTION_CHECK=on`, `bash blorp/test/tooling/test_bootstrap.sh`,
+  INSTRUCTION_CHECK=on`, `bash blorp/test/test_bootstrap/test_bootstrap.sh`,
   `scripts/blorp-fixpoint --prove`.
 
 ## Acceptance criteria
@@ -167,7 +167,7 @@ e2e driver onto `blorp test`, watch modes, `--link`, Windows.
 - `blorp run hello.brp` from any directory runs the program and exits with
   its status (live output under R0 a).
 - From the repository root, `blorp test
-  blorp/test/unit/test_format/test_layout.brp` passes with the leak check
+  blorp/test/test_format/test_layout.brp` passes with the leak check
   on (the suite reads its fixtures relative to the repository root).
 - All gates pass; nothing is left under `/tmp`.
 

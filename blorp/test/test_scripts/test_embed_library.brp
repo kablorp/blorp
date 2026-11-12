@@ -1,0 +1,237 @@
+---
+Tests for the embedded library generator's pure rendering: the module it writes
+parses with the production parser, and every file's text decodes from its
+literal byte for byte, whatever bytes the file holds.
+---
+import:
+    bool: and, or
+    int: Int methods
+    list: List methods
+    option: Option methods
+    string: String methods
+    test: TestSuite
+    ../../scripts/embed_library: library_rows, render_embedded_library
+    ../../src/common/analysis/assemble: parsed_contents
+    ../../src/common/analysis/ids: inventory_constants, inventory_functions
+    ../../src/common/syntax/lex: lex
+    ../../src/common/syntax/names: program_names
+    ../../src/common/syntax/source: module_source, root_module_id
+    ../../src/common/syntax/syntax:
+        ExpressionBase(DirectApplication, ListExpression, StringExpression),
+        LiteralPattern(ExactBytes),
+        ParsedBody(ParsedMatchBody),
+        ParsedMatchArm,
+        ParsedPattern(PatternLiteral, PatternWildcard),
+        ValueExpression,
+    ../support/input: parse
+
+
+-- Every byte that needs an escape, a brace after a dollar, a lone dollar and
+-- brace, and multi-byte text, which is written as it is.
+private TRICKY: String = "quote \" slash \\ lf \n tab \t cr \r nul \0 one \u{1} us \u{1F} del \u{7F} \u{1B}[0m hole $\{x} dollar $\{y} $ { é 😀 end"
+
+
+private pure func sample() -> List[(String, String)]:
+    [("a.brp", "plain text\n"), ("b.brp", TRICKY), ("c.brp", "")]
+
+
+private pure func string_value(value: ValueExpression) -> Option[String]:
+    match value.base:
+        StringExpression(text): Some(text)
+        _: None
+
+
+-- The (path, text) of an arm that embeds a file; None for any other arm.
+private pure func arm_file(arm: ParsedMatchArm) -> Option[(String, String)]:
+    match (arm.pattern, arm.block.value):
+        (PatternLiteral(ExactBytes(path), _), Some(value)):
+            match value.base:
+                DirectApplication(_, [argument]):
+                    argument
+                        .string_value()
+                        .map(pure func(text: String): (path, text))
+                _:
+                    None
+        _:
+            None
+
+
+private pure func file_arms(arms: List[ParsedMatchArm]) -> List[(String, String)]:
+    var files: List[(String, String)] = []
+    for arm in arms:
+        match arm_file(arm):
+            Some(file): files = files.append(file)
+            None: void
+    files
+
+
+private pure func string_elements(elements: List[ValueExpression]) -> List[String]:
+    var strings: List[String] = []
+    for element in elements:
+        match string_value(element):
+            Some(text): strings = strings.append(text)
+            None: void
+    strings
+
+
+private pure func is_wildcard(arm: ParsedMatchArm) -> Bool:
+    match arm.pattern:
+        PatternWildcard(_): True
+        _: False
+
+
+-- The module the generator rendered, read back through the production parser.
+private record Rendered {
+    files: List[(String, String)],
+    wildcard_arms: Int,
+    paths: List[String],
+}
+
+
+private pure func rendered_module(files: List[(String, String)]) -> Option[Rendered]:
+    match render_embedded_library(files):
+        Err(_): None
+        Ok(text): parsed_module(text)
+
+
+private pure func parsed_module(text: String) -> Option[Rendered]:
+    lexed = lex(module_source(root_module_id()), text, program_names().names)
+    match lexed:
+        Err(_):
+            None
+        Ok(tokens):
+            match parse(tokens):
+                Err(_):
+                    None
+                Ok(parsed):
+                    declarations = parsed_contents(parsed).declarations
+                    match (inventory_functions(declarations), inventory_constants(declarations)):
+                        ([function], [constant]):
+                            match (function.declaration.body, constant.declaration.value.base):
+                                (ParsedMatchBody(match_body), ListExpression(elements)):
+                                    Some({
+                                        files = file_arms(match_body.arms),
+                                        wildcard_arms = match_body.arms
+                                            .filter(is_wildcard)
+                                            .length(),
+                                        paths = string_elements(elements),
+                                    })
+                                _:
+                                    None
+                        _:
+                            None
+
+
+-- Tuples are not Equatable, so the rows are compared field by field.
+private pure func same_files(left: List[(String, String)], right: List[(String, String)]) -> Bool:
+    var same = left.length() == right.length()
+    for position in 0..left.length():
+        match (left.get(position), right.get(position)):
+            (Some((left_path, left_text)), Some((right_path, right_text))):
+                same = and(same, and(left_path == right_path, left_text == right_text))
+            _:
+                same = False
+    same
+
+
+pure func test_every_file_decodes_to_its_exact_text() -> Bool:
+    match rendered_module(sample()):
+        Some(rendered): same_files(rendered.files, sample())
+        None: False
+
+
+pure func test_the_module_ends_in_a_wildcard_arm_and_lists_every_path() -> Bool:
+    match rendered_module(sample()):
+        Some(rendered):
+            and(rendered.wildcard_arms == 1, rendered.paths == ["a.brp", "b.brp", "c.brp"])
+        None:
+            False
+
+
+pure func test_no_files_render_a_module_with_only_the_wildcard_arm() -> Bool:
+    match rendered_module([]):
+        Some(rendered):
+            and(
+                rendered.files.is_empty(),
+                and(rendered.wildcard_arms == 1, rendered.paths.is_empty()),
+            )
+        None:
+            False
+
+
+private FIRST_PRINTABLE_BYTE: Int = 32
+
+private DELETE_BYTE: Int = 127
+
+private LINE_FEED_BYTE: Int = 10
+
+
+private pure func is_allowed_byte(byte: Int) -> Bool:
+    or(and(byte >= FIRST_PRINTABLE_BYTE, byte != DELETE_BYTE), byte == LINE_FEED_BYTE)
+
+
+-- The rendered text, or the empty String when rendering failed; the other tests
+-- fail on that, since an empty text has no generated notice.
+private pure func rendered_text() -> String:
+    match render_embedded_library(sample()):
+        Ok(text): text
+        Err(_): ""
+
+
+-- A raw control byte or DEL would end the literal or be rejected by the lexer;
+-- only the line feed that ends a line may appear.
+pure func test_the_module_holds_no_raw_control_bytes() -> Bool:
+    rendered = rendered_text()
+    var clean: Bool = rendered.length() > 0
+    for position in 0..rendered.length():
+        match rendered.byte_at(position):
+            Some(byte): clean = and(clean, is_allowed_byte(byte))
+            None: clean = False
+    clean
+
+
+pure func test_the_module_starts_with_its_generated_notice() -> Bool:
+    rendered_text().starts_with(
+        "-- Generated from blorp/standard_library by blorp/scripts/embed_library.brp\n",
+    )
+
+
+private pure func row_path(row: (String, String)) -> String:
+    (path, _) = row
+    path
+
+
+private NESTED_LIBRARY: String = "blorp/test/test_scripts/library_inputs"
+
+
+-- The tree holds `io.brp` beside `io/`, and `.` sorts before `/`, so byte order
+-- puts `io.brp` ahead of the folder's files, which a walk finds first.
+func test_a_nested_library_is_listed_by_relative_path_in_byte_order() -> Bool:
+    match library_rows(NESTED_LIBRARY):
+        Ok(rows): rows.map(row_path) == ["a.brp", "io.brp", "io/deep/x.brp", "io/status.brp"]
+        Err(_): False
+
+
+TESTS: TestSuite = {
+    description = "Blorp embedded library generator",
+    tests = [
+        (
+            "a nested library is listed by relative path in byte order",
+            test_a_nested_library_is_listed_by_relative_path_in_byte_order,
+        ),
+        ("every file decodes to its exact text", test_every_file_decodes_to_its_exact_text),
+        (
+            "the module ends in a wildcard arm and lists every path",
+            test_the_module_ends_in_a_wildcard_arm_and_lists_every_path,
+        ),
+        (
+            "no files render a module with only the wildcard arm",
+            test_no_files_render_a_module_with_only_the_wildcard_arm,
+        ),
+        ("the module holds no raw control bytes", test_the_module_holds_no_raw_control_bytes),
+        (
+            "the module starts with its generated notice",
+            test_the_module_starts_with_its_generated_notice,
+        ),
+    ],
+}

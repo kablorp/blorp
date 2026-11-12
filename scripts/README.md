@@ -12,7 +12,7 @@ This directory holds the shell entrypoints for building and proving Blorp:
 
 Changes under `blorp/` are validated with `make -C blorp test`, plus
 `scripts/blorp-fixpoint --prove` when the change alters emitted C and
-`bash blorp/test/tooling/test_bootstrap.sh` when it touches the bootstrap
+`bash blorp/test/test_bootstrap/test_bootstrap.sh` when it touches the bootstrap
 resolver or the Makefile recipes. [`blorp/AGENTS.md`](../blorp/AGENTS.md)
 owns the rest of the validation rules.
 
@@ -27,7 +27,7 @@ fixtures under both generations, and publishes that commit's seed as the
 immutable release `blorp-seed-<12hex>`, whose assets are `blorp-<target>`.
 
 The Makefile's explicit component selection (`COMPONENT_SOURCES` in
-`blorp/test/e2e/self_hosted.brp`; `TARGET_COMPONENT_SOURCES=<paths>` overrides
+`blorp/test/driver/driver.brp`; `TARGET_COMPONENT_SOURCES=<paths>` overrides
 it) runs through ordinary target TestSuite entries, one program per listed
 directory (its phase), with C11 `-O0` linking and strict native memory checks.
 The Blorp test driver that `make` builds runs it and the e2e selection.
@@ -76,7 +76,7 @@ The `example` target uses the newly built `blorp` command. `test` builds the tes
 compiler and runs its explicit self-hosted component and native e2e selections;
 `test-target-components` uses an already-built test compiler.
 Run the isolated behavioral shell tests with
-`bash blorp/test/tooling/test_bootstrap.sh`; they use fake transport,
+`bash blorp/test/test_bootstrap/test_bootstrap.sh`; they use fake transport,
 seed and C compiler tools, including quoted paths and parallel target requests.
 It is the one sanctioned shell test: the resolver and recipes it covers are
 shell tooling. Cold/warm clean-checkout qualification uses the actual
@@ -112,7 +112,7 @@ Rotate the tag, source commit and all three digests together, and only after
 
 The seed is driven as `compile INPUT --library-root DIR -o OUTPUT` by
 `generate-compiler` and the generator target in `blorp/Makefile`, the seed step of
-`blorp-seed.yml`, and the fake seed in `blorp/test/tooling/test_bootstrap.sh` (its
+`blorp-seed.yml`, and the fake seed in `blorp/test/test_bootstrap/test_bootstrap.sh` (its
 two seed argument lists). A change to the seed's command line moves those with the pin.
 
 The seed workflow's fixture parity step deliberately accepts only exit 0 and 1

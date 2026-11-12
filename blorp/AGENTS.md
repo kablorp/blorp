@@ -100,7 +100,7 @@ make -C blorp compiler                  # build the compiler from the pinned see
 make -C blorp test                      # components and native e2e
 make -C blorp test-target-components TARGET_COMPONENT_SOURCES=<paths>   # one suite
 scripts/blorp-fixpoint --prove          # A builds B, B builds C, B == C
-bash blorp/test/tooling/test_bootstrap.sh   # bootstrap resolver and Makefile recipes
+bash blorp/test/test_bootstrap/test_bootstrap.sh   # bootstrap resolver and Makefile recipes
 bash benchmarks/bench.sh <name>           # cross-language speed table (see benchmarks/README.md)
 ```
 
@@ -119,33 +119,39 @@ library on disk; the freshness test fails when the module is stale.
 
 **Tests.** Compiler tests are Blorp `TestSuite`s, not a test `main` or Python.
 The one sanctioned shell test is
-[test/tooling/test_bootstrap.sh](test/tooling/test_bootstrap.sh): it tests the
+[test/test_bootstrap/test_bootstrap.sh](test/test_bootstrap/test_bootstrap.sh): it tests the
 download, verify and cache failure modes of `scripts/blorp-compiler-bootstrap`
 and the Makefile recipes with fixture releases, which is shell tooling tested
 in shell. CI runs it after `make -C blorp test`; porting it to a Blorp
 program is a separate change.
-Every compiler source module has a unit suite under
-[test/unit/](test/unit/), in the `test_<stage>/` folder that mirrors the module's
-folder under `src/`: a module `src/<dir>/<name>.brp` has its suite in
-`test/unit/test_<dir>/`. A module `src/common/<layer>/<name>.brp` has its
-suite in `test/unit/test_common/test_<layer>/`. A module that has a folder of
-its own (`src/common/syntax/lex.brp` is
-`test/unit/test_common/test_syntax/test_lex/`) gets a subfolder. `src/main.brp`'s
-suite is in `test/unit/test_main/`. [test/unit/test_layout/](test/unit/test_layout/)
+The folders of [test/](test/) mirror `src/`, so a test folder names where its
+subject is. A test of `src/<a>/<b>/<name>.brp` is in `test/test_<a>/test_<b>/`, in
+a `test_<name>/` subfolder when the module has many suites
+(`src/common/syntax/lex.brp` is tested in
+`test/test_common/test_syntax/test_lex/`). `src/main.brp` is tested in
+`test/test_main/`, with the `blorp` command as a user runs it; `blorp compile`
+end to end is `test/test_compile/`, `src/format/` is `test/test_format/`, and
+`test/test_lsp/` arrives with `src/lsp/`. A subject outside `src/` gets a folder
+named after it: `test_standard_library/` mirrors `standard_library/` (tests of
+`io/…` modules are in `test_io/…`), `test_scripts/` tests `scripts/`,
+`test_driver/` tests the test driver, `test_bootstrap/` tests the bootstrap
+resolver and `test_grammar/` tests the EBNF. [test/test_layout/](test/test_layout/)
 enforces which directory may import which, and fails for a `.brp` file under
-`src/` that no layer owns. Grammar cases live under
-[test/test_grammar/](test/test_grammar/) and change with the EBNF.
+`src/` that no layer owns. Code that is not a test lives in a folder without the
+`test_` prefix: [test/driver/](test/driver/) is the test driver and
+[test/support/](test/support/) holds the helper modules several test folders
+share. A helper used by one folder lives in that folder.
 Target component suites declare an ordinary `TESTS: TestSuite` constant in the
 suite file itself.
 `make -C blorp test` builds the test compiler, `blorp/build/blorp-test`
 (memory diagnostics on), runs the explicit component selection
-(`COMPONENT_SOURCES` in [test/e2e/self_hosted.brp](test/e2e/self_hosted.brp))
+(`COMPONENT_SOURCES` in [test/driver/driver.brp](test/driver/driver.brp))
 through its ordinary TestSuite entries, and runs the self-hosted native
 e2e selection. `test-target-components` runs that selection
 with the already-built test compiler, which `make -C blorp compiler` or
 `test-compiler` links; `TARGET_COMPONENT_SOURCES=<paths>` makes
-it run exactly those suites instead. Every `test_*.brp` file under the
-test roots is selected: a full run fails before it builds anything, naming each
+it run exactly those suites instead. Every `test_*.brp` file under
+`blorp/test/` is selected: a full run fails before it builds anything, naming each
 file that `COMPONENT_SOURCES` does not list. Add a new suite to the list, or
 delete it.
 Rejections check exact message, help and span. Embedded programs use aligned
@@ -153,9 +159,10 @@ multiline strings with exact contents; keep quoted escapes where they make
 the bytes clearer, such as CRLF or malformed indentation. Using multiline
 literals in tests does not add them to the pilot's input grammar.
 
-**End-to-end.** Sources remain under [test/e2e/](test/e2e/), with programs in
-[test/e2e/fixtures/](test/e2e/fixtures/). `make -C blorp test-e2e` runs the native cases and process-runtime
-checks. Its approved orchestration entry is an ordinary `main(args)` that
+**End-to-end.** The cases are in [test/test_compile/](test/test_compile/), with
+programs in [test/test_compile/fixtures/](test/test_compile/fixtures/), and the
+driver that runs them is [test/driver/driver.brp](test/driver/driver.brp).
+`make -C blorp test-e2e` runs the native cases and process-runtime checks. Its approved orchestration entry is an ordinary `main(args)` that
 constructs Blorp `TestSuite`s and calls `test.run_suite`. Make builds it once per
 invocation with the compiler under test and passes a mode (`components`
 or `e2e`), the exact compiler and C compiler paths and, for the
@@ -167,8 +174,8 @@ fixture mains. Existing fixture parity checks compare compiler outputs only;
 they do not establish native execution. Keep artifacts under ignored `build/`.
 
 **The direct C exception.** Unit tests of target runtime helpers under
-`test/runtime/` may be C, compiled and run by a Blorp `TestSuite`. This includes
-String and generated concrete aggregate helpers for supported records, unions
+`test/test_common/test_codegen/test_runtime/` may be C, compiled and run by a
+Blorp `TestSuite`. This includes String and generated concrete aggregate helpers for supported records, unions
 and collections, as explicitly approved on 2026-10-13. Tests use the same pure
 production runtime/emission fragments as normal compilation and test-local
 allocator wrappers that delegate to actual allocation/free. Observe allocation

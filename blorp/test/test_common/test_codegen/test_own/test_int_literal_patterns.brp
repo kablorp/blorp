@@ -1,0 +1,107 @@
+import:
+    bool: Bool methods
+    int: INT_MIN
+    list: List methods
+    test: TestSuite
+    ../../../../src/common/codegen/own/own as own
+    ../../../../src/common/codegen/specialize/specialize as specialized
+    ../../../../src/common/syntax/syntax: IntegerFormat(Int64Format), LiteralPattern(ExactInt)
+    ../../../support/int_pattern_inputs: owned_int_patterns, top_level_joins
+
+
+-- The Int literals a selection tests, in node order.
+private pure func int_literals(selection: own.OwnedSelection) -> List[Int]:
+    var values: List[Int] = []
+    for node in selection.nodes:
+        match node:
+            own.TestLiteral(_, ExactInt(value), _, _): values = values.append(value)
+            _: void
+    values
+
+
+-- An Int is plain data: matching one enters every arm with no borrow,
+-- acquire, release or transfer.
+private pure func plain_scalar_join(join: own.OwnedJoin) -> Bool:
+    scrutinee_unmanaged: Bool = match join.selection.scrutinee:
+        own.UnmanagedArgument(_): True
+        _: False
+    edges_plain = join.selection.nodes.all(pure func(node: own.OwnedDecisionNode) -> Bool:
+        match node:
+            own.EnterArm(edge):
+                edge.operations
+                    .is_empty()
+                    .and(edge.transfers.is_empty())
+            _:
+                True
+    )
+    scrutinee_unmanaged
+        .and(edges_plain)
+        .and(join.entering.is_empty())
+
+
+pure func test_an_int_root_match_owns_nothing() -> Bool:
+    match owned_int_patterns():
+        Err(_):
+            False
+        Ok(program):
+            roots = program.functions
+                .map(top_level_joins)
+                .filter(
+                    pure func(joins): joins.any(
+                        pure func(join): int_literals(join.selection).contains(-1),
+                    ),
+                )
+            match roots:
+                [[join]]:
+                    values = int_literals(join.selection)
+                    plain_scalar_join(join)
+                        .and(values.length() == 3)
+                        .and(values.contains(0))
+                        .and(values.contains(-1))
+                        .and(values.contains(INT_MIN))
+                _:
+                    False
+
+
+-- The filter has already pinned the field's literal to 0; the nodes are read
+-- with `ExactInt(_)`, so this test needs no Int pattern of its own and does
+-- not depend on how emission compiles one.
+pure func test_an_int_field_test_survives_ownership_insertion() -> Bool:
+    match owned_int_patterns():
+        Err(_):
+            False
+        Ok(program):
+            fields = program.functions
+                .map(top_level_joins)
+                .filter(
+                    pure func(joins): joins.any(
+                        pure func(join): int_literals(join.selection) == [0],
+                    ),
+                )
+            match fields:
+                [[join]]:
+                    join.selection.nodes.any(pure func(node: own.OwnedDecisionNode) -> Bool:
+                        match node:
+                            own.TestLiteral(place, ExactInt(_), _, _):
+                                match place.route:
+                                    specialized.UnionField(_, _):
+                                        place.value_type == specialized.IntegerType(Int64Format)
+                                    _:
+                                        False
+                            _:
+                                False
+                    )
+                _:
+                    False
+
+
+TESTS: TestSuite = {
+    description = "Blorp Int literal pattern ownership",
+    tests = [
+        ("an Int root match owns nothing", test_an_int_root_match_owns_nothing),
+        (
+            "an Int field test survives ownership insertion",
+            test_an_int_field_test_survives_ownership_insertion,
+        ),
+    ],
+}

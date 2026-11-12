@@ -1,0 +1,145 @@
+---
+Specialization closes an opaque type's arguments, then expands its underlying
+type under the declaration's own parameters. Layouts erase the opaque type;
+function instances keep its semantic arguments.
+---
+import:
+    bool: and
+    int: Int methods
+    test: TestSuite
+    ../../../../src/common/analysis/check/check: check
+    ../../../../src/common/codegen/specialize/specialize as specialized
+    ../../../../src/common/syntax/syntax: IntegerFormat(Int64Format)
+    ../../../support/module_input: parse_modules
+
+
+private pure func specialize_source(source: String) -> Option[specialized.SpecializedContents]:
+    match parse_modules([{ source = source, targets = [] }]):
+        Err(_):
+            None
+        Ok(parsed):
+            match check(parsed):
+                Err(_):
+                    None
+                Ok(accepted):
+                    match specialized.specialize(accepted):
+                        Err(_): None
+                        Ok(program): Some(specialized.specialized_contents(program))
+
+
+-- The element type of a one-field `Rows` layout: its List's element.
+private pure func rows_element(
+    records: List[specialized.ConcreteRecord],
+    value: specialized.TypeRef,
+) -> Option[specialized.TypeRef]:
+    match value:
+        specialized.RecordType(id):
+            match records.get(specialized.record_number(id)):
+                Some(layout):
+                    match specialized.record_fields(layout):
+                        [specialized.ListType(element)]: Some(element)
+                        _: None
+                None:
+                    None
+        _:
+            None
+
+
+-- Whether `function` takes one `parameter` and returns Rows of Rows of it.
+private pure func returns_nested_rows(
+    records: List[specialized.ConcreteRecord],
+    function: specialized.ConcreteFunction,
+    parameter: specialized.TypeRef,
+) -> Bool:
+    match function.signature.parameters:
+        [written]:
+            match rows_element(records, function.signature.return_type):
+                Some(inner):
+                    match rows_element(records, inner):
+                        Some(element): and(written == parameter, element == parameter)
+                        None: False
+                None:
+                    False
+        _:
+            False
+
+
+pure func test_nested_opaque_arguments_close_before_expanding() -> Bool:
+    source: String =
+        |record Rows[V] { values: List[V] }
+        |opaque type Box[V] = Rows[V]
+        |pure func wrap[V](value: V) -> Box[V]:
+        |    into_opaque Box({ values = [value] })
+        |pure func twice[V](value: V) -> Box[Box[V]]:
+        |    wrap(wrap(value))
+        |func main() -> Int:
+        |    ints = twice(7)
+        |    texts = twice("seven")
+        |    0
+        |
+    match specialize_source(source):
+        None:
+            False
+        Some(contents):
+            ints = contents.functions.any(
+                pure func(function): returns_nested_rows(
+                    contents.records,
+                    function,
+                    specialized.IntegerType(Int64Format),
+                ),
+            )
+            texts = contents.functions.any(
+                pure func(function): returns_nested_rows(
+                    contents.records,
+                    function,
+                    specialized.StringType,
+                ),
+            )
+            and(ints, texts)
+
+
+pure func test_phantom_arguments_split_instances_with_one_layout() -> Bool:
+    source: String =
+        |record User { name: String }
+        |record Order { total: Int }
+        |opaque type Id[T] = Int
+        |pure func user_id(number: Int) -> Id[User]:
+        |    into_opaque Id(number)
+        |pure func order_id(number: Int) -> Id[Order]:
+        |    into_opaque Id(number)
+        |pure func echo[X](value: X) -> X:
+        |    value
+        |func main() -> Int:
+        |    user = echo(user_id(3))
+        |    from_opaque Id(echo(order_id(4)))
+        |
+    match specialize_source(source):
+        None:
+            False
+        Some(contents):
+            match contents.functions:
+                [_, first, second, third, fourth]:
+                    [first, second, third, fourth].all(pure func(function):
+                        match (function.signature.parameters, function.signature.return_type):
+                            ([specialized.IntegerType(Int64Format)], specialized.IntegerType(Int64Format)):
+                                True
+                            _:
+                                False
+                    )
+                _:
+                    False
+
+
+TESTS: TestSuite = {
+    description = "Generic opaque specialization",
+    tests = [
+        (
+            "nested opaque arguments close before the underlying type expands",
+            test_nested_opaque_arguments_close_before_expanding,
+        ),
+        (
+            "phantom arguments split function instances that share one layout",
+            test_phantom_arguments_split_instances_with_one_layout,
+        ),
+    ],
+}

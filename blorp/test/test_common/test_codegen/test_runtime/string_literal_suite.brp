@@ -1,0 +1,141 @@
+import:
+    dict: Dict
+    io/process: Captured
+    result: Result methods
+    string: String methods
+    test: TestSuite
+    ../../../../src/common/codegen/runtime/memory: MEMORY_RUNTIME
+    ../../../../src/common/codegen/runtime/string: string_runtime
+    ../../../driver/file_access: write_file
+    ../../../driver/harness: isolated, run_expecting
+
+
+private COMPILE_TIMEOUT_MS: Int = 600000
+private CHILD_TIMEOUT_MS: Int = 10000
+-- The memory runtime's BLORP_STRICT_LEAK_EXIT_STATUS.
+private STRICT_LEAK_EXIT_STATUS: Int = 99
+-- The probe creates two literal Strings, one per site; teardown frees both.
+private STRICT_TOTAL: String = "blorp: leak check: 2 allocs, 2 releases, 0 leaked, 0 bytes\n"
+private UNBALANCED_LINE: String = "blorp: leak check: unbalanced string literals: 1\n"
+
+
+private func ready(c_compiler: String, directory: String) -> Result[String, String]:
+    _ ?= write_file(directory + "/memory_runtime.c", MEMORY_RUNTIME)
+    _ ?= write_file(directory + "/string_runtime.c", string_runtime())
+    executable = directory + "/string_literal_probe"
+    build ?= isolated(
+        c_compiler,
+        [
+            "-std=c11",
+            "-O0",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            "-pedantic",
+            "-fsanitize=address,undefined",
+            "-fno-sanitize-recover=all",
+            "-DBLORP_MEMORY_DIAGNOSTICS=1",
+            "-I",
+            directory,
+            "blorp/test/test_common/test_codegen/test_runtime/fixtures/string_literal_test.c",
+            "-o",
+            executable,
+        ],
+        COMPILE_TIMEOUT_MS,
+    )
+    built ?= run_expecting("string literal native build", build, 0)
+    if built.stderr == "":
+        Ok(executable)
+    else:
+        Err("string literal native build: " + built.stderr)
+
+
+-- Strict runs set BLORP_LEAK_CHECK; the others are diagnostic builds without it.
+private func run_probe(
+    executable: String,
+    mode: String,
+    strict: Bool,
+    status: Int,
+) -> Result[Captured, String]:
+    leak_check: Option[String] = if strict:
+        Some("strict")
+    else:
+        None
+    run ?= isolated(executable, [mode], CHILD_TIMEOUT_MS)
+    environment = run.environment
+        .set("BLORP_ALLOCATION_SITES", None)
+        .set("BLORP_LEAK_CHECK", leak_check)
+    run_expecting(mode, { run | environment = environment }, status)
+
+
+private func expect(label: String, actual: String, expected: String) -> Result[Void, String]:
+    if actual.equals(expected):
+        Ok(void)
+    else:
+        Err(label + ": expected [" + expected + "] got [" + actual + "]")
+
+
+private func outcome(
+    executable: String,
+    mode: String,
+    strict: Bool,
+    status: Int,
+    stderr: String,
+) -> Bool:
+    checked: Result[Void, String] = match run_probe(executable, mode, strict, status):
+        Err(error):
+            Err(error)
+        Ok(run):
+            match expect(mode + " stdout", run.stdout, ""):
+                Err(error): Err(error)
+                Ok(_): expect(mode + " stderr", run.stderr, stderr)
+    match checked:
+        Ok(_):
+            True
+        Err(error):
+            print_error(error)
+            False
+
+
+func suite(c_compiler: String, directory: String) -> TestSuite:
+    match ready(c_compiler, directory):
+        Err(error):
+            print_error(error)
+            {
+                description = "String literal setup",
+                tests = [("native probe builds", func(): False)],
+            }
+        Ok(executable):
+            {
+                description = "Shared String literals",
+                tests = [
+                    (
+                        "balanced literals are freed once at exit",
+                        func(): outcome(executable, "balanced", True, 0, STRICT_TOTAL),
+                    ),
+                    (
+                        "an over-released literal fails the strict check",
+                        func(): outcome(
+                            executable,
+                            "over_release",
+                            True,
+                            STRICT_LEAK_EXIT_STATUS,
+                            UNBALANCED_LINE + STRICT_TOTAL,
+                        ),
+                    ),
+                    (
+                        "an under-released literal fails the strict check",
+                        func(): outcome(
+                            executable,
+                            "under_release",
+                            True,
+                            STRICT_LEAK_EXIT_STATUS,
+                            UNBALANCED_LINE + STRICT_TOTAL,
+                        ),
+                    ),
+                    (
+                        "without the strict check an unbalanced literal still exits 0",
+                        func(): outcome(executable, "under_release", False, 0, ""),
+                    ),
+                ],
+            }

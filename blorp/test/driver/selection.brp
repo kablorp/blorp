@@ -1,0 +1,358 @@
+-- Argument parsing, source grouping and the unselected-source check of the Blorp
+-- test driver. Everything here is pure: the driver reads its arguments, never its
+-- environment, and its file system and process work live in the modules that
+-- import this one.
+import:
+    bool: not, and
+    int: Int methods
+    io/fs/entry: Entry, EntryKind(File, Directory)
+    io/process: Command, command
+    list: List methods
+    option: Option methods
+    path: Path, parent, to_path
+    result: Result methods
+    string: String methods
+    ./harness: LIBRARY_ROOT, strict_leak_check
+
+
+-- Where the component programs are built, and the root their directories
+-- mirror: blorp/test/test_common/test_syntax/test_lex builds in
+-- BUILD_ROOT/test_common/test_syntax/test_lex.
+-- Paths are relative to the repository root, where Make runs the driver.
+private TEST_ROOT: String = "blorp/test/"
+private BUILD_ROOT: String = "blorp/build/self-hosted-tests"
+private TEST_SOURCE_PREFIX: String = "test_"
+private TEST_SOURCE_SUFFIX: String = ".brp"
+
+
+-- The compilers and libraries a component program is built with. The libraries
+-- come from Make's TEST_COMPILER_LIBRARIES, so the driver never names them.
+record Tools {
+    compiler: String,
+    c_compiler: String,
+    libraries: List[String],
+}
+
+
+-- Sources that share a directory, in list order. The directory is the phase
+-- that owns them.
+record ComponentGroup {
+    directory: String,
+    sources: List[String],
+}
+
+
+NO_SOURCES_SELECTED: String = "no component sources selected; list them in COMPONENT_SOURCES or pass paths"
+
+
+-- The sources a run uses: the requested ones, else the driver's own list. An
+-- empty selection is an error, because running no suite would report success.
+pure func component_selection(
+    requested: List[String],
+    built_in: List[String],
+) -> Result[List[String], String]:
+    chosen = if requested.is_empty():
+        built_in
+    else:
+        requested
+    if chosen.is_empty():
+        Err(NO_SOURCES_SELECTED)
+    else:
+        Ok(chosen)
+
+
+private PATH_SEPARATOR: String = "/"
+
+
+-- The directory a source lives in. A source is never empty; the empty text, which
+-- is no path, is the current directory like a bare file name.
+private pure func directory_of(source: String) -> String:
+    match source.to_path():
+        Ok(path): "${path.parent()}"
+        Err(_): "."
+
+
+-- Directories in order of first appearance, each keeping list order, so each
+-- phase's imports compile once and a strict leak or crash is attributed to that
+-- phase.
+pure func group_sources(sources: List[String]) -> List[ComponentGroup]:
+    var directories: List[String] = []
+    for source in sources:
+        directory = source.directory_of()
+        if (
+            directories
+                .contains(directory)
+                .not()
+        ):
+            directories = directories.append(directory)
+    directories.map(
+        pure func(directory: String): {
+            directory = directory,
+            sources = sources.filter(
+                pure func(source: String): source
+                    .directory_of()
+                    .equals(directory),
+            ),
+        },
+    )
+
+
+-- A component program runs every suite of one phase directory under strict
+-- leak checking. Ten minutes is far above any observed run, and bounds a hang.
+private COMPONENT_TIMEOUT_MS: Int = 600000
+
+
+-- test-target-components linked these before the driver existed: warnings are
+-- errors, and diagnostics make the strict leak check observable.
+private COMPONENT_FLAGS: List[String] = [
+    "-std=c11",
+    "-Wall",
+    "-Wextra",
+    "-Werror",
+    "-pedantic",
+    "-O0",
+    "-DBLORP_MEMORY_DIAGNOSTICS=1",
+]
+
+
+-- The compiler's arguments; `program` is the path of a group's one program,
+-- with its C beside it.
+pure func compile_arguments(group: ComponentGroup, program: String) -> List[String]:
+    ["compile", "--test-suite"]
+        .concat(group.sources)
+        .concat(["--library-root", LIBRARY_ROOT, "-o", program + ".c"])
+
+
+-- The C compiler's arguments.
+pure func link_arguments(tools: Tools, program: String) -> List[String]:
+    COMPONENT_FLAGS
+        .concat([program + ".c", "-o", program])
+        .concat(tools.libraries)
+
+
+pure func run_command(program: Path) -> Command:
+    { command(program, []) |
+        environment = strict_leak_check(),
+        timeout_ms = Some(COMPONENT_TIMEOUT_MS),
+    }
+
+
+-- The group's program directory mirrors its place under blorp/test, so equally
+-- named groups of different roots never overwrite each other's C.
+pure func program_directory(group: ComponentGroup) -> Result[String, String]:
+    mirrored: Option[String] = if group.directory.starts_with(TEST_ROOT):
+        group.directory.slice(TEST_ROOT.length(), group.directory.length())
+    else:
+        None
+    mirrored
+        .map(pure func(relative: String): BUILD_ROOT + PATH_SEPARATOR + relative)
+        .to_result("component source directory " + group.directory + " is not under " + TEST_ROOT)
+
+
+private pure func is_test_source(name: String) -> Bool:
+    suffix_start = name.length() - TEST_SOURCE_SUFFIX.length()
+    match name.slice(suffix_start, name.length()):
+        Some(suffix):
+            name
+                .starts_with(TEST_SOURCE_PREFIX)
+                .and(suffix.equals(TEST_SOURCE_SUFFIX))
+        None:
+            False
+
+
+-- What one directory listing holds: its test sources, and the directories to
+-- read next. A link is neither: the walk never follows one, so it cannot loop.
+record DirectoryScan {
+    test_sources: List[String],
+    subdirectories: List[String],
+}
+
+
+private pure func is_test_file(entry: Entry) -> Bool:
+    match entry.kind:
+        File: is_test_source(entry.name)
+        _: False
+
+
+private pure func is_directory(entry: Entry) -> Bool:
+    match entry.kind:
+        Directory: True
+        _: False
+
+
+pure func scan_entries(directory: String, entries: List[Entry]) -> DirectoryScan:
+    {
+        test_sources = entries
+            .filter(is_test_file)
+            .map(pure func(entry: Entry): directory + PATH_SEPARATOR + entry.name),
+        subdirectories = entries
+            .filter(is_directory)
+            .map(pure func(entry: Entry): directory + PATH_SEPARATOR + entry.name),
+    }
+
+
+-- The test sources no component selection runs, in scan order.
+pure func unselected_sources(test_sources: List[String], selected: List[String]) -> List[String]:
+    test_sources.filter(
+        pure func(source: String): selected
+            .contains(source)
+            .not(),
+    )
+
+
+-- One rejection per unselected test source, each with the way to fix it.
+pure func unselected_message(unselected: List[String]) -> String:
+    unselected
+        .map(
+            pure func(source: String): "${source}: no suite runs this test file\nhelp: list it in COMPONENT_SOURCES in blorp/test/driver/driver.brp, or delete it",
+        )
+        .join("\n")
+
+
+-- Captured output ends with the newline that print adds again.
+pure func without_final_newline(text: String) -> String:
+    length = text.length()
+    match text.slice(length - 1, length):
+        Some(last):
+            if last.equals("\n"):
+                -- length - 1 is the start of the one-byte final character,
+                -- so the slice cannot fail.
+                match text.slice(0, length - 1):
+                    Some(trimmed): trimmed
+                    None: text
+            else:
+                text
+        None:
+            text
+
+
+-- The driver's three modes. Make passes absolute tool paths, so the driver never
+-- searches PATH or guesses a working directory.
+--   components COMPILER C_COMPILER [LIBRARY...] [-- SOURCE...]
+--       builds and runs one program per directory of SOURCE..., or of the
+--       built-in selection when none are given. The built-in selection first
+--       fails on any test_*.brp under blorp/test that it does not list.
+--   e2e COMPILER C_COMPILER TEMPORARY_PARENT [--check-instructions]
+--       runs the native examples in a directory made inside TEMPORARY_PARENT.
+--       With the flag, each ported example's compile must also stay within its
+--       retired-instruction ceiling (macOS /usr/bin/time -l); without it only
+--       the allocation ceilings are held.
+private COMPONENTS_MODE: String = "components"
+private E2E_MODE: String = "e2e"
+private SOURCES_SEPARATOR: String = "--"
+private CHECK_INSTRUCTIONS_FLAG: String = "--check-instructions"
+private PATH_ROOT: String = "/"
+
+
+USAGE: String = "usage: self-hosted components COMPILER C_COMPILER [LIBRARY...] [-- SOURCE...]\n       self-hosted e2e COMPILER C_COMPILER TEMPORARY_PARENT [--check-instructions]"
+
+
+NOT_ABSOLUTE: String = "self-hosted driver requires absolute compiler, C compiler and temporary-parent paths"
+
+
+record ComponentRun {
+    tools: Tools,
+    -- Empty selects the built-in list.
+    sources: List[String],
+}
+
+
+record EndToEndRun {
+    compiler: String,
+    c_compiler: String,
+    temporary_parent: String,
+    check_instructions: Bool,
+}
+
+
+union Invocation:
+    Components(ComponentRun)
+    EndToEnd(EndToEndRun)
+
+
+private pure func is_absolute(path: String) -> Bool:
+    path.starts_with(PATH_ROOT)
+
+
+-- Libraries come before the separator and sources after it.
+private pure func components_run(
+    compiler: String,
+    c_compiler: String,
+    rest: List[String],
+) -> ComponentRun:
+    var libraries: List[String] = []
+    var sources: List[String] = []
+    var reading_sources: Bool = False
+    for argument in rest:
+        if reading_sources:
+            sources = sources.append(argument)
+        else if argument.equals(SOURCES_SEPARATOR):
+            reading_sources = True
+        else:
+            libraries = libraries.append(argument)
+    {
+        tools = { compiler = compiler, c_compiler = c_compiler, libraries = libraries },
+        sources = sources,
+    }
+
+
+private pure func parse_components(rest: List[String]) -> Result[Invocation, String]:
+    compiler ?= rest
+        .get(0)
+        .to_result(USAGE)
+    c_compiler ?= rest
+        .get(1)
+        .to_result(USAGE)
+    if is_absolute(compiler).and(is_absolute(c_compiler)):
+        invocation: Invocation = Components(components_run(compiler, c_compiler, rest.drop(2)))
+        Ok(invocation)
+    else:
+        Err(NOT_ABSOLUTE)
+
+
+-- The three paths, then optionally the instruction flag; nothing else.
+private pure func parse_end_to_end(rest: List[String]) -> Result[Invocation, String]:
+    compiler ?= rest
+        .get(0)
+        .to_result(USAGE)
+    c_compiler ?= rest
+        .get(1)
+        .to_result(USAGE)
+    temporary_parent ?= rest
+        .get(2)
+        .to_result(USAGE)
+    flags = rest.drop(3)
+    check_instructions: Bool ?= if flags.is_empty():
+        Ok(False)
+    else if flags == [CHECK_INSTRUCTIONS_FLAG]:
+        Ok(True)
+    else:
+        Err(USAGE)
+    if (
+        is_absolute(compiler)
+            .and(is_absolute(c_compiler))
+            .and(is_absolute(temporary_parent))
+    ):
+        run: EndToEndRun = {
+            compiler = compiler,
+            c_compiler = c_compiler,
+            temporary_parent = temporary_parent,
+            check_instructions = check_instructions,
+        }
+        invocation: Invocation = EndToEnd(run)
+        Ok(invocation)
+    else:
+        Err(NOT_ABSOLUTE)
+
+
+-- `arguments` start with the program name.
+pure func parse_invocation(arguments: List[String]) -> Result[Invocation, String]:
+    words = arguments.drop(1)
+    mode = words.get_or(0, "")
+    rest = words.drop(1)
+    if mode.equals(COMPONENTS_MODE):
+        parse_components(rest)
+    else if mode.equals(E2E_MODE):
+        parse_end_to_end(rest)
+    else:
+        Err(USAGE)

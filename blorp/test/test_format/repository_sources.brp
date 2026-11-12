@@ -1,0 +1,97 @@
+import:
+    io/fs/entry: Entry, EntryKind(Directory, File)
+    list: List methods
+    path: join
+    result: Result methods
+    string: String methods
+    ../../src/common/syntax/lex: lex
+    ../../src/common/syntax/names: program_names
+    ../../src/common/syntax/parse: ParsedModuleContents, module_contents, parse_module
+    ../../src/common/syntax/source: module_source, root_module_id
+    ../../src/common/syntax/syntax: Comment, Diagnostic, Token
+    ../driver/file_access: read_file, list_entries
+
+
+-- Every source the repository keeps under it, which the tests run from.
+REPOSITORY_ROOT: String = "blorp"
+
+-- Ignored build output is not repository source.
+private BUILD_DIRECTORY: String = "build"
+
+private SOURCE_SUFFIX: String = ".brp"
+
+
+-- One source file, read.
+record SourceFile {
+    path: String,
+    text: String,
+}
+
+
+-- One source, lexed and parsed on its own, as the formatter reads it.
+record ParsedSource {
+    tokens: List[Token],
+    comments: List[Comment],
+    contents: ParsedModuleContents,
+}
+
+
+pure func parsed_source(text: String) -> Result[ParsedSource, Diagnostic]:
+    lexed ?= lex(module_source(root_module_id()), text, program_names().names).map_err(
+        pure func(failure): failure.error,
+    )
+    parsed ?= parse_module(lexed, root_module_id())
+    Ok({ tokens = lexed.tokens, comments = lexed.comments, contents = module_contents(parsed) })
+
+
+private pure func is_source(entry: Entry) -> Bool:
+    match entry.kind:
+        File:
+            length = entry.name.length()
+            match entry.name.slice(length - SOURCE_SUFFIX.length(), length):
+                Some(suffix): suffix == SOURCE_SUFFIX
+                None: False
+        _:
+            False
+
+
+private pure func is_source_directory(entry: Entry) -> Bool:
+    match entry.kind:
+        Directory: entry.name != BUILD_DIRECTORY
+        _: False
+
+
+-- The `.brp` paths under `directory`, depth first.
+func source_paths_under(directory: String) -> Result[List[String], String]:
+    entries ?= list_entries(directory)
+    var found: List[String] = entries
+        .filter(is_source)
+        .map(pure func(entry: Entry): directory + "/" + entry.name)
+    var failure: Option[String] = None
+    for entry in entries.filter(is_source_directory):
+        match source_paths_under(directory + "/" + entry.name):
+            Ok(nested):
+                found = found.concat(nested)
+            Err(error):
+                failure = Some(error)
+                break
+    match failure:
+        Some(error): Err(error)
+        None: Ok(found)
+
+
+-- Every repository source, read.
+func repository_sources() -> Result[List[SourceFile], String]:
+    paths ?= source_paths_under(REPOSITORY_ROOT)
+    var files: List[SourceFile] = []
+    var failure: Option[String] = None
+    for path in paths:
+        match read_file(path):
+            Ok(text):
+                files = files.append({ path = path, text = text })
+            Err(error):
+                failure = Some(error)
+                break
+    match failure:
+        Some(error): Err(error)
+        None: Ok(files)

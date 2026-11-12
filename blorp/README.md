@@ -22,7 +22,7 @@ Every command runs from the repository root.
 
 ```sh
 make -C blorp                  # build blorp/build/blorp and blorp/build/blorp-test from the seed
-make -C blorp example          # compile, build and run test/e2e/fixtures/return/zero.brp
+make -C blorp example          # compile, build and run test/test_compile/fixtures/return/zero.brp
 ```
 
 The `blorp` command (`blorp/build/blorp`, also `bin/blorp`) has the commands
@@ -52,7 +52,7 @@ C and leaves an existing output file as it was. Programs that use Float need
 ```sh
 make -C blorp test             # build the test compiler, run components and e2e
 make -C blorp test-e2e         # e2e only, with the test compiler already built
-make -C blorp test-target-components TARGET_COMPONENT_SOURCES=blorp/test/unit/test_common/test_utils/test_text.brp
+make -C blorp test-target-components TARGET_COMPONENT_SOURCES=blorp/test/test_common/test_utils/test_text.brp
 make -C blorp test INSTRUCTION_CHECK=on   # macOS: also hold retired-instruction ceilings
 ```
 
@@ -70,7 +70,7 @@ the test layout and gates; [Tests](#tests) describes `TestSuite`.
 bin/blorp format                                  # every .brp file under the current directory
 bin/blorp format blorp/src blorp/src/main.brp     # directories and files, rewritten in place
 bin/blorp format --check blorp/src                # report, change nothing
-bin/blorp format --exclude blorp/test/unit/test_format/fixtures blorp/test
+bin/blorp format --exclude blorp/test/test_format/fixtures blorp/test
 ```
 
 Each `PATH` is a `.brp` file or a directory, which is walked recursively in byte
@@ -144,7 +144,7 @@ func main() -> Int:
     0
 ```
 
-This is [`effects/hello.brp`](test/e2e/fixtures/effects/hello.brp). It prints
+This is [`effects/hello.brp`](test/test_compile/fixtures/effects/hello.brp). It prints
 `Hello, World!` and exits 0.
 
 A program has exactly one `main`, in its root file. It is not generic, takes
@@ -233,7 +233,7 @@ func main() -> Int:
     answer()
 ```
 
-This is [`pure/calls.brp`](test/e2e/fixtures/pure/calls.brp); it exits 1. A
+This is [`pure/calls.brp`](test/test_compile/fixtures/pure/calls.brp); it exits 1. A
 body is zero or more statements followed by a final expression, which is the
 result; there is no `return`. Declarations may appear in any order, calls pass
 exactly the declared number of arguments, and function names are unique
@@ -269,7 +269,7 @@ func main() -> Int:
     preserve()
 ```
 
-This is [`binding/basic.brp`](test/e2e/fixtures/binding/basic.brp); it exits 1.
+This is [`binding/basic.brp`](test/test_compile/fixtures/binding/basic.brp); it exits 1.
 `name = value` declares an immutable binding or reassigns an existing `var`,
 and is rejected for an existing immutable binding. `var name = value`
 declares a mutable one. `name: Type = value` always declares a new binding
@@ -326,7 +326,7 @@ division or remainder by zero gives 0. `INT_MIN / -1` is `INT_MIN` and
 `INT_MIN % -1` is 0. When a wrapped result would be wrong, call `int`'s
 `add_checked`, `subtract_checked`, `multiply_checked`, `divide_checked`,
 `remainder_checked` or `negate_checked`, which return `Result[Int, MathError]`
-(see the [checked fixture](test/e2e/fixtures/arithmetic/checked.brp)). Naming
+(see the [checked fixture](test/test_compile/fixtures/arithmetic/checked.brp)). Naming
 `MathError` or its cases `Overflow` and `DivisionByZero` needs
 `_base: MathError(DivisionByZero, Overflow)`; `int: INT_MIN, INT_MAX` imports
 the limits.
@@ -577,7 +577,7 @@ long chain is iterative. `Node(Tree, Tree)` or a generic `Next(Box[T])` reports
 "recursive aggregate types are not supported yet". It
 may also be recursive through records and Lists, as `Form` is through
 `Call(String, List[Expr])` in the
-[tree fixture](test/e2e/fixtures/recursive/tree.brp). The rule is that values
+[tree fixture](test/test_compile/fixtures/recursive/tree.brp). The rule is that values
 stored by value form no cycle: a union stores its payloads by value, while a
 record field, a List element and a union's one direct self payload are
 references a cycle may pass through. A cycle through unions alone (`A(B)` and
@@ -603,7 +603,7 @@ func main() -> Int:
 An opaque type is distinct from its underlying type during checking and has
 its layout at run time, with no wrapper. Only its declaring module may use
 `into_opaque` and `from_opaque`; other modules use the functions it exports,
-as in the [two-file example](test/e2e/fixtures/opaque/int/main.brp). Opaque
+as in the [two-file example](test/test_compile/fixtures/opaque/int/main.brp). Opaque
 types may have type parameters, including phantom ones the underlying type
 does not mention (`id: Id[User] = into_opaque Id(7)`). Conversions take no
 written type arguments. An opaque type inherits no fields or methods, and one
@@ -731,7 +731,7 @@ values (no String, List or counted record) in its signature and in everything
 it evaluates, even an unused initializer. All next arguments are evaluated
 before any parameter is replaced. Other calls, mutual recursion included, use
 the ordinary stack, and the annotation does not prove termination. See the
-[accumulator fixture](test/e2e/fixtures/tail_recursion/accumulator.brp).
+[accumulator fixture](test/test_compile/fixtures/tail_recursion/accumulator.brp).
 
 ### Option, Result and propagation
 
@@ -975,7 +975,7 @@ pure func answer() -> Int:
     42
 ```
 
-This is [`import/basic`](test/e2e/fixtures/import/basic/main.brp); it exits 42.
+This is [`import/basic`](test/test_compile/fixtures/import/basic/main.brp); it exits 42.
 Each file is a module. An import block comes before the declarations, and each
 row names one module:
 
@@ -1077,9 +1077,9 @@ writes the LF only after the text was written in full, and never retries.
 `main(args: List[String])` receives the arguments, with the executable name at
 index 0. `args.get(1)` is `Some(text)` or `None`, and `parse_int` and
 `parse_float` convert text strictly. The
-[addition](test/e2e/fixtures/calculator/addition.brp),
-[integer](test/e2e/fixtures/calculator/integer.brp) and
-[Float](test/e2e/fixtures/calculator/float.brp) calculators print a result, or
+[addition](test/test_compile/fixtures/calculator/addition.brp),
+[integer](test/test_compile/fixtures/calculator/integer.brp) and
+[Float](test/test_compile/fixtures/calculator/float.brp) calculators print a result, or
 print `missing input`, `unknown operation`, `invalid integer` or
 `invalid float` and exit 1. They check the operation first, then each operand
 in order, and ignore extra arguments.
@@ -1092,7 +1092,7 @@ in order, and ignore extra arguments.
 `PermissionDenied`, `InvalidUtf8`, `Unreachable` (Linux's working directory
 outside the process's root) or `OtherOs(errno)`; match on the variant, and
 `"${error}"` reads as text. It prints nothing. See the
-[complete program](test/e2e/fixtures/current_directory/basic.brp).
+[complete program](test/test_compile/fixtures/current_directory/basic.brp).
 
 #### Paths and the fs library
 
@@ -1165,7 +1165,7 @@ lambdas are rejected. A lowercase `tests` constant is a naming error that
 says to write `TESTS`. Compile one or more suite files into one program:
 
 ```sh
-bin/blorp compile --test-suite blorp/test/unit/test_common/test_utils/test_text.brp \
+bin/blorp compile --test-suite blorp/test/test_common/test_utils/test_text.brp \
   [MORE_SUITES.brp ...] --library-root blorp/standard_library -o blorp/build/test_text.c
 ```
 
@@ -1177,10 +1177,10 @@ only once, and a `private tests` constant is accepted only in the first file.
 
 The component gate compiles each phase directory's suites into one program,
 `all_suites`, under `blorp/build/self-hosted-tests/`, and runs it with strict
-leak checking. The full run first fails on any `test_*.brp` under the test
-roots that `COMPONENT_SOURCES` does not list. Each native e2e
+leak checking. The full run first fails on any `test_*.brp` under `blorp/test/`
+that `COMPONENT_SOURCES` does not list. Each native e2e
 case is a `Program` built with the constructors in
-[`self_hosted_harness.brp`](test/e2e/self_hosted_harness.brp): one compile,
+[`harness.brp`](test/driver/harness.brp): one compile,
 against its `library_root` (the standard library unless the program names
 another), within its allocation ceiling, then each run with its exact status, stdout,
 stderr and strict allocation count. `INSTRUCTION_CHECK=on` also holds the
@@ -1480,6 +1480,6 @@ selection. Artifacts stay under `blorp/build/fixpoint/`.
 A seed rotation moves the pin forward. Once the seed workflow has published
 and qualified a release for every target, one change updates the tag, source
 commit and all three digests in `bootstrap.env` together, after
-`make -C blorp test`, the fixpoint and `bash blorp/test/tooling/test_bootstrap.sh`
+`make -C blorp test`, the fixpoint and `bash blorp/test/test_bootstrap/test_bootstrap.sh`
 pass against the new pin. [scripts/README.md](../scripts/README.md#rotating-the-seed-pin)
 describes the resolver, its cache and the rotation in full.

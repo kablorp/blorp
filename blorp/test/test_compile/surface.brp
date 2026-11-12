@@ -1,0 +1,3296 @@
+-- Native cases and rejections for the language surface: generics, Lists, owned
+-- prefixes, local modules, bindings, UFCS, syntax, namespaces, traits and stored
+-- callables. Each program compiles once within its ceiling, then runs once per
+-- case with exact status, stdout and stderr and strict allocation counts.
+-- Rejections check the exact diagnostic; where the rejected program had to
+-- publish nothing, also that no C is created or overwritten.
+import:
+    int: Int methods
+    io/environment: get_current_directory
+    list: List methods
+    result: Result methods
+    string: String methods
+    test: TestSuite
+    ../driver/file_access: write_file, make_directories
+    ../driver/harness:
+        CompileCeiling,
+        CompileInput(SingleSource),
+        FIXTURES,
+        LIBRARY_ROOT,
+        NativeRun,
+        Program,
+        exits_with,
+        fixture_program,
+        once,
+        once_given,
+        prints,
+        repeated,
+        reported,
+        verify_program,
+        verify_rejection,
+        verify_unpublished_against,
+        verify_unpublished_expecting,
+        verify_unpublished_rejection,
+        with_arguments,
+
+
+-- Every program's compile ceiling is its measured cost plus 15%, rounded up to
+-- a whole count: allocations from the compiler's strict report, retired
+-- instructions (the larger of the serial runs) from /usr/bin/time -l, both for
+-- the -O0 compiler under test. The commit that changes a ceiling states the
+-- measured cost in its message.
+
+
+private RECEIVER_ONLY_HELP: String = "declare the function locally or import it by name; type selections enable receiver calls only"
+
+
+private UNKNOWN_FUNCTION: String = "unknown function"
+private UNKNOWN_OPAQUE_MESSAGE: String = "unknown opaque type"
+private OPAQUE_CONVERSION_HELP: String = "import or declare an opaque type before converting it"
+private PROPAGATION_BLOCK_MESSAGE: String = "`?=` cannot be used inside an `if` or `match` block"
+
+
+private PROPAGATION_BLOCK_HELP: String = "match on the Result or Option in place, or move the block into its own function and use `?=` at its top"
+
+
+private RENAME_HELP: String = "choose a different name for this binding"
+
+
+-- The module that the cross-file field rejection imports: a record with an Int
+-- field, which `main` fills with a String.
+private FIELD_HELPER_SOURCE: String = "record Holder { number: Int }\npure func take(value: Holder) -> Int:\n    value.number\n"
+
+
+private UINT8_VALUES_OUTPUT: String = "byte 200, next 201, wrapped 56, zero no\nmaybe Some(200), signature [ 137 80 ]\nlarger 200 200 smaller 3, count 5\nwrap 255 0 144 44\ndivide 28 4 0 0\nequal yes yes\norder yes yes yes no\nto_int 1200, hash 200\nto_uint8 Some(0) Some(255) None None\nparse Some(17) Some(255) None None None None Some(17) None Some(0) None\npixel 255 0\npatterns zero max other\nlist [ 1 2 250 ] length 3 second Some(2)\n"
+
+
+private BYTES_OPERATIONS_OUTPUT: String = "length 4 empty no yes\nget Some(255) None None\nget_or 255 7\nto_list 4 72\nslice [ 20 30 ] [ 10 20 30 40 ]\nclamped [ 10 20 ] [ 30 40 ] [ ]\ninverted [ ] [ ]\nstarts yes no\nstarts edge yes yes no\njoined [ 1 2 3 ] left [ 1 2 ] equal yes no yes\nhash equal yes unequal pair no\ndict 2 30 20 -1\nto_bytes [ 72 195 169 0 ]\nto_text Some(Hé\0) None\nempty Some() 0\noverlong None\nsurrogate None\nabove U+10FFFF None\nlone continuation None\ntruncated None\nfour bytes Some(😀)\n"
+
+
+private BYTES_FILES_OUTPUT: String = "write ok\nread 263 bytes, identical yes\nrewrite ok\nempty 0 bytes\nmissing no such file / no such file same yes\ndirectory is a directory / is a directory same yes\n"
+
+
+-- The text a compiler error adds after the source path: location, message, help.
+private pure func diagnostic(location: String, message: String, help: String) -> String:
+    ":" + location + ": error: " + message + "\nhelp: " + help + "\n"
+
+
+-- The note that names an earlier declaration, in a fixture under FIXTURES.
+private pure func previous_note(fixture: String, location: String) -> String:
+    FIXTURES + fixture + ".brp:" + location + ": note: previous declaration or import here\n"
+
+
+-- A program compiled against its own library root, from a source that is not
+-- under FIXTURES.
+private pure func rooted_program(
+    name: String,
+    library_root: String,
+    source: String,
+    ceiling: CompileCeiling,
+    runs: List[NativeRun],
+) -> Program:
+    {
+        name = name,
+        input = SingleSource(source),
+        library_root = library_root,
+        ceiling = ceiling,
+        runs = runs,
+    }
+
+
+-- A function body with this many statement lines, then a line the checker
+-- rejects. The base pilot (ba57e368a) exits 139 on it at the default stack
+-- because the parser recursed once per statement; 2,000 lines still passed.
+-- With the loop, parsing completes and the checker's exact diagnostic on
+-- line 3 is reached before any later phase runs.
+private LONG_BODY_STATEMENTS: Int = 3000
+
+
+private pure func long_body_source() -> String:
+    "func main() -> Int:\n" + repeated("\tx = 0\n", LONG_BODY_STATEMENTS) + "\t0\n"
+
+
+-- Generated programs of CHAIN_MODULES modules. Under the strict leak check the
+-- namespace scopes commit measured the direct chain at 248 M instructions and
+-- 79,774 allocations and the flat program at 132 M and 27,515, where the
+-- program-wide namespace before it measured 528 M and 375 M. The ceilings
+-- keep rejecting that namespace; the two workloads have independent oracles.
+private CHAIN_MODULES: Int = 64
+
+
+-- main calls m1, each module calls the next and selects Box from the last one,
+-- which declares it.
+private pure func direct_chain_files() -> List[(String, String)]:
+    last = CHAIN_MODULES.to_string()
+    var files: List[(String, String)] = [
+        (
+            "main.brp",
+            (
+                "import:\n    ./m1: f1\n    ./m"
+                + last
+                + ": Box(Pack)\nfunc main() -> Int:\n    match f1():\n        Pack(value): value\n"
+            ),
+        ),
+    ]
+    for position in 1..CHAIN_MODULES:
+        number = position.to_string()
+        next = (position + 1).to_string()
+        imports = if next.equals(last):
+            "import:\n    ./m" + last + ": f" + last + ", Box(Pack)\n"
+        else:
+            "import:\n    ./m" + next + ": f" + next + "\n    ./m" + last + ": Box(Pack)\n"
+        body = (
+            "pure func f"
+            + number
+            + "() -> Box:\n    match f"
+            + next
+            + "():\n        Pack(value): Pack(value)\n"
+        )
+        files = files.append(("m" + number + ".brp", imports + body))
+    files.append(
+        (
+            "m" + last + ".brp",
+            "union Box:\n    Pack(Int)\npure func f" + last + "() -> Box:\n    Pack(0)\n",
+        ),
+    )
+
+
+-- main selects one type from each module, each declaring its own.
+private pure func flat_files() -> List[(String, String)]:
+    var imports = "import:\n"
+    var files: List[(String, String)] = []
+    for position in 1..(CHAIN_MODULES + 1):
+        number = position.to_string()
+        imports = imports + "    ./m" + number + ": Type" + number + "\n"
+        files = files.append(
+            ("m" + number + ".brp", "union Type" + number + "[T]:\n    Make" + number + "(T)\n"),
+        )
+    files.append(("main.brp", imports + "func main() -> Int:\n    0\n"))
+
+
+-- Writes each (file name, text) under `directory`, creating it first.
+private func write_files(directory: String, files: List[(String, String)]) -> Result[Void, String]:
+    _ ?= make_directories(directory)
+    var outcome: Result[Void, String] = Ok(void)
+    for file in files:
+        match outcome:
+            Ok(_): outcome = write_file(directory + "/" + file[0], file[1])
+            Err(_): void
+    outcome
+
+
+-- A program of generated modules, written under its own directory of the work
+-- directory before it compiles.
+private func verify_generated(
+    compiler: String,
+    c_compiler: String,
+    work_directory: String,
+    check_instructions: Bool,
+    name: String,
+    files: List[(String, String)],
+    ceiling: CompileCeiling,
+    allocations: Int,
+) -> Result[Void, String]:
+    directory = work_directory + "/" + name + "_modules"
+    _ ?= write_files(directory, files)
+    verify_program(
+        compiler,
+        c_compiler,
+        work_directory,
+        check_instructions,
+        rooted_program(
+            name,
+            LIBRARY_ROOT,
+            directory + "/main.brp",
+            ceiling,
+            once(0, "", allocations),
+        ),
+    )
+
+
+-- A rejection whose notes name absolute paths under the current directory.
+private func with_current_directory(check: (String) -> Result[Void, String]) -> Bool:
+    match get_current_directory():
+        Ok(current): reported(check("${current}"))
+        Err(error): reported(Err("${error}"))
+
+
+-- The root keeps its command-line spelling; dependencies display their absolute
+-- normalized paths, so the closing import is located in the absolute helper path.
+private func verify_cycle(
+    compiler: String,
+    work_directory: String,
+    name: String,
+    current: String,
+) -> Result[Void, String]:
+    root = FIXTURES + "import/cycle/main.brp"
+    helper = current + "/" + FIXTURES + "import/cycle/helper.brp"
+    verify_unpublished_expecting(
+        compiler,
+        LIBRARY_ROOT,
+        work_directory,
+        name,
+        root,
+        (
+            helper
+            + ":2:5: error: import cycle: "
+            + root
+            + " -> "
+            + helper
+            + " -> "
+            + root
+            + "\nhelp: move the declarations both modules need into a third module that both import\n"
+        ),
+    )
+
+
+-- A root module gives a helper's record a String field; the error is in the
+-- root, and its note names the helper written beside it.
+private func verify_cross_file_field(
+    compiler: String,
+    work_directory: String,
+    name: String,
+) -> Result[Void, String]:
+    helper = work_directory + "/" + name + "_helper.brp"
+    _ ?= write_file(helper, FIELD_HELPER_SOURCE)
+    root = (
+        "import:\n    ./"
+        + name
+        + "_helper: take\nfunc main() -> Int:\n    take({ number = 42.to_string() })\n"
+    )
+    verify_unpublished_rejection(
+        compiler,
+        work_directory,
+        name,
+        root,
+        (
+            diagnostic("4:21", "record field requires Int", "use an expression of type Int here")
+            + helper
+            + ":1:25: note: record field declared here\n"
+        ),
+    )
+
+
+func suite(
+    compiler: String,
+    c_compiler: String,
+    work_directory: String,
+    check_instructions: Bool,
+) -> TestSuite:
+    run_program = func(program: Program) -> Bool: reported(
+        verify_program(compiler, c_compiler, work_directory, check_instructions, program),
+    )
+    reject_fixture = func(name: String, fixture: String, expected: String) -> Bool: reported(
+        verify_rejection(compiler, work_directory, {
+            name = name,
+            source = FIXTURES + fixture + ".brp",
+            diagnostic = expected,
+        }),
+    )
+    reject_unpublished = func(name: String, fixture: String, expected: String) -> Bool: reported(
+        verify_unpublished_against(compiler, LIBRARY_ROOT, work_directory, {
+            name = name,
+            source = FIXTURES + fixture + ".brp",
+            diagnostic = expected,
+        }),
+    )
+    reject_in_root = func(
+        name: String,
+        library_root: String,
+        source: String,
+        expected: String,
+    ) -> Bool: reported(
+        verify_unpublished_against(compiler, library_root, work_directory, {
+            name = name,
+            source = source,
+            diagnostic = expected,
+        }),
+    )
+    reject_text = func(name: String, text: String, expected: String) -> Bool: reported(
+        verify_unpublished_rejection(compiler, work_directory, name, text, expected),
+    )
+    reject_cycle = func(name: String) -> Bool: with_current_directory(
+        func(current: String): verify_cycle(compiler, work_directory, name, current),
+    )
+    reject_cross_file_field = func(name: String) -> Bool: reported(
+        verify_cross_file_field(compiler, work_directory, name),
+    )
+    run_generated = func(
+        name: String,
+        files: List[(String, String)],
+        ceiling: CompileCeiling,
+        allocations: Int,
+    ) -> Bool: reported(
+        verify_generated(
+            compiler,
+            c_compiler,
+            work_directory,
+            check_instructions,
+            name,
+            files,
+            ceiling,
+            allocations,
+        ),
+    )
+    {
+        description = "Blorp language surface",
+        tests = [
+            -- generic declarations, callbacks and specialization
+            -- generic/lambda/capture_managed is not run: a lambda that captures only a
+            -- Void value (its `from_void`) makes the emitter write `struct blorp_r_N{}`,
+            -- which -pedantic -Werror rejects. The case returns when the emitter is fixed.
+            (
+                "typed siblings contextualize nominal literals once in written order",
+                func(): run_program(
+                    prints(
+                        "generics_contextual_nominal_siblings",
+                        "generic/contextual/nominal_siblings",
+                        { allocations = 130130, instructions = 521447665 },
+                        "left\nright\n7\nreverse-left\nreverse-right\n7\nnested-left\nnested-right\n7\nchoice-left\nchoice-right\n7\nchoice-reverse-left\nchoice-reverse-right\n7\n",
+                        15,
+                    ),
+                ),
+            ),
+            (
+                "immutable scalar capture forwards its environment through a declared helper",
+                func(): run_program(
+                    exits_with(
+                        "generics_lambda_capture_scalar",
+                        "generic/lambda/capture_scalar",
+                        { allocations = 122616, instructions = 486518765 },
+                        42,
+                        0,
+                    ),
+                ),
+            ),
+            (
+                "managed noncapturing callbacks retain original and returned aliases",
+                func(): run_program(
+                    prints(
+                        "generics_lambda_managed",
+                        "generic/lambda/managed",
+                        { allocations = 123435, instructions = 500521032 },
+                        "é\0\né\0\né\0\n",
+                        3,
+                    ),
+                ),
+            ),
+            (
+                "noncapturing inline and annotated block callbacks use direct calls",
+                func(): run_program(
+                    exits_with(
+                        "generics_lambda_noncapture",
+                        "generic/lambda/noncapture",
+                        { allocations = 125177, instructions = 485907097 },
+                        42,
+                        0,
+                    ),
+                ),
+            ),
+            (
+                "local annotation checks a scalar initializer",
+                func(): run_program(
+                    exits_with(
+                        "generics_annotations_identity",
+                        "annotations/identity",
+                        { allocations = 119608, instructions = 471205422 },
+                        7,
+                        0,
+                    ),
+                ),
+            ),
+            (
+                "local annotation infers a generic List and preserves its old alias",
+                func(): run_program(
+                    exits_with(
+                        "generics_annotations_contextual_list",
+                        "annotations/contextual_list",
+                        { allocations = 121735, instructions = 473612759 },
+                        1,
+                        1,
+                    ),
+                ),
+            ),
+            (
+                "ordered named callbacks and binary builtin keep distinct results",
+                func(): run_program(
+                    prints(
+                        "generics_named_ordered",
+                        "generic/named/ordered",
+                        { allocations = 126758, instructions = 511107816 },
+                        "7\n8\n7\n42\n",
+                        4,
+                    ),
+                ),
+            ),
+            (
+                "managed callbacks retain aliases and evaluate defaults eagerly",
+                func(): run_program(
+                    prints(
+                        "generics_named_managed",
+                        "generic/named/managed",
+                        { allocations = 130284, instructions = 523228332 },
+                        "eager\né\0\né\0\neager\nfallback!\né\0\n42\n",
+                        10,
+                    ),
+                ),
+            ),
+            (
+                "named generic callback is erased to a direct call",
+                func(): run_program(
+                    exits_with(
+                        "generics_named_identity",
+                        "generic/named/identity",
+                        { allocations = 120595, instructions = 475831302 },
+                        17,
+                        0,
+                    ),
+                ),
+            ),
+            (
+                "Option and Result callbacks select branches and preserve managed payloads",
+                func(): run_program(
+                    prints(
+                        "generics_managed_option_result_callbacks",
+                        "generic/managed/option_result_callbacks",
+                        { allocations = 150973, instructions = 576841564 },
+                        "42é\0!\n42é\0\nnone\n7\nunchanged!\n42\nkept!\n8!\nbypass!\nunit!\nreceiver\neager!\n",
+                        31,
+                    ),
+                ),
+            ),
+            (
+                "explicit Option and Result helpers preserve eager defaults and managed values",
+                func(): run_program(
+                    prints(
+                        "generics_managed_option_result_helpers",
+                        "generic/managed/option_result_helpers",
+                        { allocations = 140112, instructions = 540268229 },
+                        "eager\né\0\ntrue\nfallback\nfallback\n7\neager-error\ntrue\nfalse\nfalse\ntrue\ntrue\nfalse\nok\nerror\n",
+                        13,
+                    ),
+                ),
+            ),
+            (
+                "repeated result retains common partial nominal head",
+                func(): run_program(
+                    exits_with(
+                        "generics_contextual_repeated_hint",
+                        "generic/contextual/repeated_hint",
+                        { allocations = 122129, instructions = 489357216 },
+                        7,
+                        0,
+                    ),
+                ),
+            ),
+            (
+                "expected result solves empty call",
+                func(): run_program(
+                    exits_with(
+                        "generics_contextual_expected_result",
+                        "generic/contextual/expected_result",
+                        { allocations = 121540, instructions = 479915379 },
+                        7,
+                        0,
+                    ),
+                ),
+            ),
+            (
+                "nested result preserves caller rigid ownership",
+                func(): run_program(
+                    exits_with(
+                        "generics_contextual_nested_rigid",
+                        "generic/contextual/nested_rigid",
+                        { allocations = 122473, instructions = 487563865 },
+                        7,
+                        0,
+                    ),
+                ),
+            ),
+            (
+                "later sibling solves earlier call",
+                func(): run_program(
+                    exits_with(
+                        "generics_contextual_sibling",
+                        "generic/contextual/sibling",
+                        { allocations = 122325, instructions = 481356155 },
+                        7,
+                        0,
+                    ),
+                ),
+            ),
+            (
+                "partial nominal constructor solves payload",
+                func(): run_program(
+                    exits_with(
+                        "generics_contextual_partial_constructor",
+                        "generic/contextual/partial_constructor",
+                        { allocations = 121431, instructions = 479555889 },
+                        9,
+                        0,
+                    ),
+                ),
+            ),
+            (
+                "unique UFCS partial nominal receiver solves payload",
+                func(): run_program(
+                    exits_with(
+                        "generics_contextual_partial_ufcs",
+                        "generic/contextual/partial_ufcs",
+                        { allocations = 121439, instructions = 478631273 },
+                        9,
+                        0,
+                    ),
+                ),
+            ),
+            (
+                "managed generic basic",
+                func(): run_program(
+                    exits_with(
+                        "generics_managed_basic",
+                        "generic/managed/basic",
+                        { allocations = 122407, instructions = 481786437 },
+                        2,
+                        1,
+                    ),
+                ),
+            ),
+            (
+                "managed generic saved",
+                func(): run_program(
+                    exits_with(
+                        "generics_managed_saved",
+                        "generic/managed/saved",
+                        { allocations = 122919, instructions = 482388077 },
+                        2,
+                        2,
+                    ),
+                ),
+            ),
+            (
+                "managed generic current",
+                func(): run_program(
+                    exits_with(
+                        "generics_managed_current",
+                        "generic/managed/current",
+                        { allocations = 123086, instructions = 482391829 },
+                        1,
+                        2,
+                    ),
+                ),
+            ),
+            (
+                "managed generic shared",
+                func(): run_program(
+                    exits_with(
+                        "generics_managed_shared",
+                        "generic/managed/shared",
+                        { allocations = 122513, instructions = 481795701 },
+                        2,
+                        1,
+                    ),
+                ),
+            ),
+            (
+                "managed generic unused",
+                func(): run_program(
+                    exits_with(
+                        "generics_managed_unused",
+                        "generic/managed/unused",
+                        { allocations = 121558, instructions = 480448212 },
+                        0,
+                        1,
+                    ),
+                ),
+            ),
+            (
+                "managed generic shared Box survives replacement",
+                func(): run_program(
+                    exits_with(
+                        "generics_managed_shared_box",
+                        "generic/managed/shared_box",
+                        { allocations = 123444, instructions = 486763109 },
+                        2,
+                        2,
+                    ),
+                ),
+            ),
+            (
+                "managed generic nested",
+                func(): run_program(
+                    exits_with(
+                        "generics_managed_nested",
+                        "generic/managed/nested",
+                        { allocations = 123506, instructions = 484260903 },
+                        2,
+                        1,
+                    ),
+                ),
+            ),
+            (
+                "managed generic nested_saved",
+                func(): run_program(
+                    exits_with(
+                        "generics_managed_nested_saved",
+                        "generic/managed/nested_saved",
+                        { allocations = 124110, instructions = 487143095 },
+                        2,
+                        2,
+                    ),
+                ),
+            ),
+            (
+                "managed generic both_variants",
+                func(): run_program(
+                    exits_with(
+                        "generics_managed_both_variants",
+                        "generic/managed/both_variants",
+                        { allocations = 124070, instructions = 488478744 },
+                        1,
+                        2,
+                    ),
+                ),
+            ),
+            (
+                "managed generic unmanaged_variant",
+                func(): run_program(
+                    exits_with(
+                        "generics_managed_unmanaged_variant",
+                        "generic/managed/unmanaged_variant",
+                        { allocations = 123536, instructions = 486455188 },
+                        7,
+                        1,
+                    ),
+                ),
+            ),
+            (
+                "managed generic nullary_variant",
+                func(): run_program(
+                    exits_with(
+                        "generics_managed_nullary_variant",
+                        "generic/managed/nullary_variant",
+                        { allocations = 123162, instructions = 484205061 },
+                        7,
+                        1,
+                    ),
+                ),
+            ),
+            (
+                "managed generic deep",
+                func(): run_program(
+                    exits_with(
+                        "generics_managed_deep",
+                        "generic/managed/deep",
+                        { allocations = 158617, instructions = 580273377 },
+                        2,
+                        1,
+                    ),
+                ),
+            ),
+            (
+                "nested generic inferred",
+                func(): run_program(
+                    exits_with(
+                        "generics_nested_inferred",
+                        "generic/nested/inferred",
+                        { allocations = 122630, instructions = 482090934 },
+                        7,
+                        0,
+                    ),
+                ),
+            ),
+            (
+                "nested generic written",
+                func(): run_program(
+                    exits_with(
+                        "generics_nested_written",
+                        "generic/nested/written",
+                        { allocations = 123710, instructions = 488383653 },
+                        7,
+                        0,
+                    ),
+                ),
+            ),
+            (
+                "nested generic heterogeneous_left",
+                func(): run_program(
+                    exits_with(
+                        "generics_nested_heterogeneous_left",
+                        "generic/nested/heterogeneous_left",
+                        { allocations = 124532, instructions = 496832684 },
+                        7,
+                        0,
+                    ),
+                ),
+            ),
+            (
+                "nested generic heterogeneous_right",
+                func(): run_program(
+                    exits_with(
+                        "generics_nested_heterogeneous_right",
+                        "generic/nested/heterogeneous_right",
+                        { allocations = 124282, instructions = 495538073 },
+                        9,
+                        0,
+                    ),
+                ),
+            ),
+            (
+                "nested generic record_first",
+                func(): run_program(
+                    exits_with(
+                        "generics_nested_record_first",
+                        "generic/nested/record_first",
+                        { allocations = 122462, instructions = 480984338 },
+                        7,
+                        0,
+                    ),
+                ),
+            ),
+            (
+                "nested generic record_second",
+                func(): run_program(
+                    exits_with(
+                        "generics_nested_record_second",
+                        "generic/nested/record_second",
+                        { allocations = 122462, instructions = 481864741 },
+                        9,
+                        0,
+                    ),
+                ),
+            ),
+            (
+                "nested generic saved",
+                func(): run_program(
+                    exits_with(
+                        "generics_nested_saved",
+                        "generic/nested/saved",
+                        { allocations = 123219, instructions = 483950144 },
+                        7,
+                        0,
+                    ),
+                ),
+            ),
+            (
+                "nested generic current",
+                func(): run_program(
+                    exits_with(
+                        "generics_nested_current",
+                        "generic/nested/current",
+                        { allocations = 123409, instructions = 483314587 },
+                        9,
+                        0,
+                    ),
+                ),
+            ),
+            (
+                "nested generic enum_off",
+                func(): run_program(
+                    exits_with(
+                        "generics_nested_enum_off",
+                        "generic/nested/enum_off",
+                        { allocations = 123276, instructions = 483813935 },
+                        7,
+                        0,
+                    ),
+                ),
+            ),
+            (
+                "nested generic enum_on",
+                func(): run_program(
+                    exits_with(
+                        "generics_nested_enum_on",
+                        "generic/nested/enum_on",
+                        { allocations = 123276, instructions = 495920441 },
+                        9,
+                        0,
+                    ),
+                ),
+            ),
+            (
+                "nested generic deep",
+                func(): run_program(
+                    exits_with(
+                        "generics_nested_deep",
+                        "generic/nested/deep",
+                        { allocations = 157554, instructions = 584202545 },
+                        7,
+                        0,
+                    ),
+                ),
+            ),
+            (
+                "union type parameters ok",
+                func(): run_program(
+                    exits_with(
+                        "generics_union_parameters_ok",
+                        "generic/union_parameters/ok",
+                        { allocations = 122025, instructions = 489918150 },
+                        7,
+                        0,
+                    ),
+                ),
+            ),
+            (
+                "union type parameters err",
+                func(): run_program(
+                    exits_with(
+                        "generics_union_parameters_err",
+                        "generic/union_parameters/err",
+                        { allocations = 122025, instructions = 496769930 },
+                        9,
+                        0,
+                    ),
+                ),
+            ),
+            (
+                "union type parameters third",
+                func(): run_program(
+                    exits_with(
+                        "generics_union_parameters_third",
+                        "generic/union_parameters/third",
+                        { allocations = 122011, instructions = 491033748 },
+                        11,
+                        0,
+                    ),
+                ),
+            ),
+            (
+                "union type parameters unwrap_or",
+                func(): run_program(
+                    exits_with(
+                        "generics_union_parameters_unwrap_or",
+                        "generic/union_parameters/unwrap_or",
+                        { allocations = 122998, instructions = 492781637 },
+                        7,
+                        0,
+                    ),
+                ),
+            ),
+            (
+                "union type parameters phantom_keys",
+                func(): run_program(
+                    exits_with(
+                        "generics_union_parameters_phantom_keys",
+                        "generic/union_parameters/phantom_keys",
+                        { allocations = 123232, instructions = 497347639 },
+                        5,
+                        0,
+                    ),
+                ),
+            ),
+            (
+                "function type parameters second",
+                func(): run_program(
+                    exits_with(
+                        "generics_function_parameters_second",
+                        "generic/function_parameters/second",
+                        { allocations = 120690, instructions = 474419935 },
+                        2,
+                        1,
+                    ),
+                ),
+            ),
+            (
+                "function type parameters third",
+                func(): run_program(
+                    exits_with(
+                        "generics_function_parameters_third",
+                        "generic/function_parameters/third",
+                        { allocations = 120930, instructions = 476127967 },
+                        3,
+                        2,
+                    ),
+                ),
+            ),
+            (
+                "function type parameters forwarding",
+                func(): run_program(
+                    exits_with(
+                        "generics_function_parameters_forwarding",
+                        "generic/function_parameters/forwarding",
+                        { allocations = 121340, instructions = 484326349 },
+                        2,
+                        1,
+                    ),
+                ),
+            ),
+            (
+                "function type parameters saved_result",
+                func(): run_program(
+                    exits_with(
+                        "generics_function_parameters_saved_result",
+                        "generic/function_parameters/saved_result",
+                        { allocations = 121665, instructions = 477770501 },
+                        3,
+                        4,
+                    ),
+                ),
+            ),
+            (
+                "function type parameters boxed",
+                func(): run_program(
+                    exits_with(
+                        "generics_function_parameters_boxed",
+                        "generic/function_parameters/boxed",
+                        { allocations = 121953, instructions = 482104971 },
+                        7,
+                        0,
+                    ),
+                ),
+            ),
+            (
+                "wide call stays flat in C",
+                func(): run_program(
+                    exits_with(
+                        "generics_multiple_arguments_wide",
+                        "multiple_arguments/wide",
+                        { allocations = 123766, instructions = 486766151 },
+                        39,
+                        0,
+                    ),
+                ),
+            ),
+            (
+                "generic arguments",
+                func(): run_program(
+                    exits_with(
+                        "generics_arguments",
+                        "generic/arguments",
+                        { allocations = 120072, instructions = 473658201 },
+                        7,
+                        0,
+                    ),
+                ),
+            ),
+            (
+                "generic arguments first string",
+                func(): run_program(
+                    exits_with(
+                        "generics_arguments_first_string",
+                        "generic/arguments_first_string",
+                        { allocations = 121367, instructions = 474529624 },
+                        1,
+                        3,
+                    ),
+                ),
+            ),
+            (
+                "generic arguments second string",
+                func(): run_program(
+                    exits_with(
+                        "generics_arguments_second_string",
+                        "generic/arguments_second_string",
+                        { allocations = 121369, instructions = 474681150 },
+                        3,
+                        3,
+                    ),
+                ),
+            ),
+            (
+                "generic arguments repeated string",
+                func(): run_program(
+                    exits_with(
+                        "generics_arguments_repeated_string",
+                        "generic/arguments_repeated_string",
+                        { allocations = 121261, instructions = 476212104 },
+                        3,
+                        2,
+                    ),
+                ),
+            ),
+            (
+                "generic arguments later",
+                func(): run_program(
+                    exits_with(
+                        "generics_arguments_later",
+                        "generic/arguments_later",
+                        { allocations = 120078, instructions = 471074042 },
+                        42,
+                        0,
+                    ),
+                ),
+            ),
+            (
+                "generic arguments box",
+                func(): run_program(
+                    exits_with(
+                        "generics_arguments_box",
+                        "generic/arguments_box",
+                        { allocations = 122148, instructions = 480788608 },
+                        7,
+                        0,
+                    ),
+                ),
+            ),
+            (
+                "multiple arguments order",
+                func(): run_program(
+                    exits_with(
+                        "generics_multiple_arguments_order",
+                        "multiple_arguments/order",
+                        { allocations = 121302, instructions = 474936931 },
+                        9,
+                        0,
+                    ),
+                ),
+            ),
+            (
+                "generic union wraps and matches its payload",
+                func(): run_program(
+                    exits_with(
+                        "generics_box",
+                        "generic/box",
+                        { allocations = 121619, instructions = 480061580 },
+                        7,
+                        0,
+                    ),
+                ),
+            ),
+            (
+                "generic forwarding accepts a concrete union argument",
+                func(): run_program(
+                    exits_with(
+                        "generics_union_identity",
+                        "generic/union_identity",
+                        { allocations = 123103, instructions = 488763882 },
+                        7,
+                        0,
+                    ),
+                ),
+            ),
+            (
+                "phantom applications preserve distinct nominal arguments",
+                func(): run_program(
+                    exits_with(
+                        "generics_phantom",
+                        "generic/phantom",
+                        { allocations = 122570, instructions = 483381557 },
+                        1,
+                        0,
+                    ),
+                ),
+            ),
+            (
+                "String argument with fixed Int payload remains unmanaged",
+                func(): run_program(
+                    exits_with(
+                        "generics_tagged_int",
+                        "generic/tagged_int",
+                        { allocations = 121361, instructions = 480392867 },
+                        7,
+                        0,
+                    ),
+                ),
+            ),
+            (
+                "one declaration specializes for Int and String",
+                func(): run_program(
+                    exits_with(
+                        "generics_identity",
+                        "generic/identity",
+                        { allocations = 121110, instructions = 476403391 },
+                        1,
+                        1,
+                    ),
+                ),
+            ),
+            (
+                "generic forwarding specializes its callee",
+                func(): run_program(
+                    exits_with(
+                        "generics_forward",
+                        "generic/forward",
+                        { allocations = 120452, instructions = 478475732 },
+                        42,
+                        0,
+                    ),
+                ),
+            ),
+            (
+                "String forwarding retains a borrowed argument across replacement",
+                func(): run_program(
+                    exits_with(
+                        "generics_forward_string",
+                        "generic/forward_string",
+                        { allocations = 121379, instructions = 479873827 },
+                        1,
+                        2,
+                    ),
+                ),
+            ),
+            (
+                "binding and reassignment types specialize independently",
+                func(): run_program(
+                    exits_with(
+                        "generics_bindings",
+                        "generic/bindings",
+                        { allocations = 121252, instructions = 475884401 },
+                        2,
+                        1,
+                    ),
+                ),
+            ),
+            -- owned Lists
+            (
+                "ordinary List get_or import reaches real main",
+                func(): run_program(
+                    exits_with(
+                        "lists_supplement_imports_get_or",
+                        "list/supplement/imports/get_or",
+                        { allocations = 121205, instructions = 474196569 },
+                        7,
+                        1,
+                    ),
+                ),
+            ),
+            (
+                "ordinary List is_empty import reaches real main",
+                func(): run_program(
+                    exits_with(
+                        "lists_supplement_imports_is_empty",
+                        "list/supplement/imports/is_empty",
+                        { allocations = 121440, instructions = 474277903 },
+                        0,
+                        1,
+                    ),
+                ),
+            ),
+            (
+                "ordinary List last import reaches real main",
+                func(): run_program(
+                    exits_with(
+                        "lists_supplement_imports_last",
+                        "list/supplement/imports/last",
+                        { allocations = 121958, instructions = 477120877 },
+                        7,
+                        1,
+                    ),
+                ),
+            ),
+            (
+                "List membership preserves generic aliases and predicate callbacks",
+                func(): run_program(
+                    prints(
+                        "lists_contains_int",
+                        "list/contains_int",
+                        { allocations = 139753, instructions = 539234868 },
+                        "false\ntrue\ntrue\nfalse\ntrue\nfalse\nneedle\ntrue\nfalse\ntrue\nfalse\ntrue\nfalse\ntrue\nfalse\n",
+                        21,
+                    ),
+                ),
+            ),
+            (
+                "set_index distinguishes bounds and preserves managed aliases",
+                func(): run_program(
+                    prints(
+                        "lists_checked_set",
+                        "list/checked_set",
+                        { allocations = 142851, instructions = 547310538 },
+                        "7\n2\n1\n9\nreplacement\nnone\nnone\nnone\nvoid-some\n42\n7\n42\n7\n42é\0\n7\n",
+                        23,
+                    ),
+                ),
+            ),
+            (
+                "managed Entry escapes its List",
+                func(): run_program(
+                    prints(
+                        "lists_entries",
+                        "list/entries",
+                        { allocations = 127448, instructions = 507625264 },
+                        "7\nkept\n",
+                        4,
+                    ),
+                ),
+            ),
+            (
+                "mortal String escapes List and Entry",
+                func(): run_program(
+                    prints(
+                        "lists_mortal_entry",
+                        "list/mortal_entry",
+                        { allocations = 125520, instructions = 503675000 },
+                        "42\n",
+                        3,
+                    ),
+                ),
+            ),
+            (
+                "String escapes nested Lists",
+                func(): run_program(
+                    prints(
+                        "lists_nested",
+                        "list/nested",
+                        { allocations = 126444, instructions = 505104923 },
+                        "42\n",
+                        3,
+                    ),
+                ),
+            ),
+            (
+                "zero is a present Int element",
+                func(): run_program(
+                    exits_with(
+                        "lists_zero",
+                        "list/zero",
+                        { allocations = 122047, instructions = 475544476 },
+                        0,
+                        1,
+                    ),
+                ),
+            ),
+            (
+                "Void is a present element",
+                func(): run_program(
+                    exits_with(
+                        "lists_void",
+                        "list/void",
+                        { allocations = 121971, instructions = 475415679 },
+                        7,
+                        1,
+                    ),
+                ),
+            ),
+            (
+                "empty String is a present element",
+                func(): run_program(
+                    prints(
+                        "lists_empty_string",
+                        "list/empty_string",
+                        { allocations = 123226, instructions = 497518312 },
+                        "\n",
+                        2,
+                    ),
+                ),
+            ),
+            (
+                "append grows empty and nonempty Int Lists",
+                func(): run_program(
+                    prints(
+                        "lists_append_int",
+                        "list/append_int",
+                        { allocations = 126331, instructions = 505594108 },
+                        "0\n-1\n-1\n1\n7\n-1\n3\n7\n9\n",
+                        12,
+                    ),
+                ),
+            ),
+            (
+                "append acquires a repeated managed Entry",
+                func(): run_program(
+                    prints(
+                        "lists_append_entries",
+                        "list/append_entries",
+                        { allocations = 127478, instructions = 511084431 },
+                        "2\n42\nmissing\n3\n42\n42\n4\n42\n42\n",
+                        11,
+                    ),
+                ),
+            ),
+            (
+                "append copies inline Points",
+                func(): run_program(
+                    prints(
+                        "lists_append_points",
+                        "list/append_points",
+                        { allocations = 129320, instructions = 513547347 },
+                        "0\n-1\n-1\n1\n1\n-1\n3\n1\n6\n",
+                        12,
+                    ),
+                ),
+            ),
+            (
+                "set replaces in range and preserves out-of-range values",
+                func(): run_program(
+                    prints(
+                        "lists_set_int",
+                        "list/set_int",
+                        { allocations = 128044, instructions = 510600635 },
+                        "3\n1\n1\n3\n7\n1\n3\n1\n9\n3\n1\n1\n3\n1\n1\n0\n-1\n-1\n",
+                        24,
+                    ),
+                ),
+            ),
+            (
+                "set preserves Entry aliases and surviving children",
+                func(): run_program(
+                    prints(
+                        "lists_set_entries",
+                        "list/set_entries",
+                        { allocations = 128243, instructions = 509765122 },
+                        "2\n42\n42\n2\n42\n7\n2\n42\n42\n2\n42\n42\n",
+                        14,
+                    ),
+                ),
+            ),
+            (
+                "set replaces an inline Point",
+                func(): run_program(
+                    prints(
+                        "lists_set_points",
+                        "list/set_points",
+                        { allocations = 129021, instructions = 510934492 },
+                        "2\n1\n1\n2\n3\n1\n2\n1\n1\n",
+                        12,
+                    ),
+                ),
+            ),
+            (
+                "concat joins empty and nonempty Int Lists",
+                func(): run_program(
+                    prints(
+                        "lists_concat_int",
+                        "list/concat_int",
+                        { allocations = 127283, instructions = 510344010 },
+                        "2\n1\n-1\n2\n1\n-1\n5\n1\n2\n0\n-1\n-1\n",
+                        18,
+                    ),
+                ),
+            ),
+            (
+                "concat acquires Entries from both sides",
+                func(): run_program(
+                    prints(
+                        "lists_concat_entries",
+                        "list/concat_entries",
+                        { allocations = 128372, instructions = 510878787 },
+                        "3\n42\n7\n4\n42\n42\n2\n42\nmissing\n",
+                        13,
+                    ),
+                ),
+            ),
+            (
+                "concat copies inline Points",
+                func(): run_program(
+                    prints(
+                        "lists_concat_points",
+                        "list/concat_points",
+                        { allocations = 129723, instructions = 515220622 },
+                        "3\n1\n4\n2\n3\n-1\n1\n1\n-1\n",
+                        13,
+                    ),
+                ),
+            ),
+            (
+                "Int literal is one root of three slots",
+                func(): run_program(
+                    prints(
+                        "lists_literal_int",
+                        "list/literal_int",
+                        { allocations = 124302, instructions = 499320105 },
+                        "3\n1\n3\n",
+                        4,
+                    ),
+                ),
+            ),
+            (
+                "managed literal acquires a repeated Entry twice",
+                func(): run_program(
+                    prints(
+                        "lists_literal_entries",
+                        "list/literal_entries",
+                        { allocations = 126385, instructions = 505146219 },
+                        "2\n42\n42\n42\n",
+                        5,
+                    ),
+                ),
+            ),
+            (
+                "literal element takes the expected record type",
+                func(): run_program(
+                    prints(
+                        "lists_literal_points",
+                        "list/literal_points",
+                        { allocations = 124719, instructions = 501719333 },
+                        "1\n2\n",
+                        3,
+                    ),
+                ),
+            ),
+            (
+                "empty literal takes E from parameter, return and generic argument",
+                func(): run_program(
+                    prints(
+                        "lists_literal_empty",
+                        "list/literal_empty",
+                        { allocations = 123788, instructions = 500779193 },
+                        "0\n0\n1\n",
+                        4,
+                    ),
+                ),
+            ),
+            (
+                "literal feeds append, get and concat directly",
+                func(): run_program(
+                    prints(
+                        "lists_literal_calls",
+                        "list/literal_calls",
+                        { allocations = 125238, instructions = 503494142 },
+                        "3\n7\n3\n",
+                        7,
+                    ),
+                ),
+            ),
+            (
+                "nested empty literal takes its element from an earlier sibling",
+                func(): run_program(
+                    prints(
+                        "lists_literal_nested",
+                        "list/literal_nested",
+                        { allocations = 125743, instructions = 504688881 },
+                        "3\n2\n0\n1\n",
+                        7,
+                    ),
+                ),
+            ),
+            (
+                "generic membership selects equality across values and stored references",
+                func(): run_program(
+                    fixture_program(
+                        "lists_contains_equatable",
+                        "list/contains_equatable",
+                        { allocations = 156073, instructions = 589055313 },
+                        once(23, "needle\n", 27),
+                    ),
+                ),
+            ),
+            (
+                "mixed element types are rejected at the second element",
+                func(): reject_fixture(
+                    "lists_literal_mixed",
+                    "list/literal_mixed",
+                    diagnostic(
+                        "2:18",
+                        "list elements must have one type: element 2 is Float, element 1 is Int",
+                        "give every element the type Int",
+                    ),
+                ),
+            ),
+            (
+                "empty literal without a List context is rejected",
+                func(): reject_fixture(
+                    "lists_literal_empty_untyped",
+                    "list/literal_empty_untyped",
+                    diagnostic(
+                        "2:14",
+                        "cannot infer the element type of an empty list literal",
+                        "give it a context with a List type, such as a List parameter, return type or append argument",
+                    ),
+                ),
+            ),
+            -- owned values before a terminating match
+            (
+                "owned record prefix reaches the selected arm",
+                func(): run_program(
+                    exits_with(
+                        "owned_prefix_record",
+                        "owned_prefix/record",
+                        { allocations = 122079, instructions = 484109305 },
+                        2,
+                        2,
+                    ),
+                ),
+            ),
+            (
+                "record prefix is used or unused in the selected variant arm",
+                func(): run_program(
+                    fixture_program(
+                        "owned_prefix_record_arms",
+                        "owned_prefix/record_arms",
+                        { allocations = 123950, instructions = 483370502 },
+                        [
+                            with_arguments("Yes reads the prefix child", [], 2, "", 4),
+                            with_arguments("No does not read the prefix child", ["no"], 0, "", 5),
+                        ],
+                    ),
+                ),
+            ),
+            (
+                "unused record prefix reaches either arm exit",
+                func(): run_program(
+                    fixture_program(
+                        "owned_prefix_unused_record",
+                        "owned_prefix/unused_record",
+                        { allocations = 122360, instructions = 479423075 },
+                        [
+                            with_arguments("first arm", [], 7, "", 4),
+                            with_arguments("second arm", ["no"], 9, "", 5),
+                        ],
+                    ),
+                ),
+            ),
+            (
+                "unused String prefix reaches either arm exit",
+                func(): run_program(
+                    fixture_program(
+                        "owned_prefix_unused_string",
+                        "owned_prefix/unused_string",
+                        { allocations = 121659, instructions = 479555549 },
+                        [
+                            with_arguments("first arm", [], 7, "", 3),
+                            with_arguments("second arm", ["no"], 9, "", 4),
+                        ],
+                    ),
+                ),
+            ),
+            (
+                "unused owning union prefix reaches either arm exit",
+                func(): run_program(
+                    fixture_program(
+                        "owned_prefix_unused_union",
+                        "owned_prefix/unused_union",
+                        { allocations = 122759, instructions = 484818575 },
+                        [
+                            with_arguments("first arm", [], 7, "", 3),
+                            with_arguments("second arm", ["no"], 9, "", 4),
+                        ],
+                    ),
+                ),
+            ),
+            (
+                "unused List alias prefix reaches either arm exit",
+                func(): run_program(
+                    fixture_program(
+                        "owned_prefix_unused_list",
+                        "owned_prefix/unused_list",
+                        { allocations = 121885, instructions = 478399475 },
+                        [
+                            with_arguments("first arm", [], 7, "", 2),
+                            with_arguments("second arm", ["no"], 9, "", 3),
+                        ],
+                    ),
+                ),
+            ),
+            (
+                "acquired record projection is the managed scrutinee",
+                func(): run_program(
+                    fixture_program(
+                        "owned_prefix_projected_scrutinee",
+                        "owned_prefix/projected_scrutinee",
+                        { allocations = 124041, instructions = 502304025 },
+                        [
+                            with_arguments(
+                                "Some preserves the projected String",
+                                ["kept"],
+                                4,
+                                "kept\n",
+                                4,
+                            ),
+                            with_arguments("None selects the empty arm", [], 0, "missing\n", 4),
+                            with_arguments("empty String remains present", [""], 0, "\n", 4),
+                        ],
+                    ),
+                ),
+            ),
+            (
+                "prefix record root transfers through a helper match",
+                func(): run_program(
+                    fixture_program(
+                        "owned_prefix_root_escape",
+                        "owned_prefix/root_escape",
+                        { allocations = 123400, instructions = 485397610 },
+                        [
+                            with_arguments("return the prefix root", [], 2, "", 4),
+                            with_arguments("return a fresh arm root", ["no"], 1, "", 7),
+                        ],
+                    ),
+                ),
+            ),
+            (
+                "prefix child escapes through a helper match",
+                func(): run_program(
+                    fixture_program(
+                        "owned_prefix_child_escape",
+                        "owned_prefix/child_escape",
+                        { allocations = 123257, instructions = 480331402 },
+                        [
+                            with_arguments("return the acquired prefix child", [], 2, "", 4),
+                            with_arguments("return a fresh arm String", ["no"], 1, "", 6),
+                        ],
+                    ),
+                ),
+            ),
+            (
+                "prefix projection returns directly or through borrowed identity",
+                func(): run_program(
+                    fixture_program(
+                        "owned_prefix_projection_escape",
+                        "owned_prefix/projection_escape",
+                        { allocations = 123647, instructions = 479802251 },
+                        [
+                            with_arguments("transfer projected owner", [], 2, "", 4),
+                            with_arguments("identity acquires its own result", ["no"], 2, "", 5),
+                        ],
+                    ),
+                ),
+            ),
+            (
+                "prefix identity RHS and reassignment preserve the old alias",
+                func(): run_program(
+                    fixture_program(
+                        "owned_prefix_reassignment_aliases",
+                        "owned_prefix/reassignment_aliases",
+                        { allocations = 125563, instructions = 505112309 },
+                        [
+                            with_arguments(
+                                "observe original then replacement",
+                                [],
+                                0,
+                                "42\n7\nyes\n",
+                                7,
+                            ),
+                            with_arguments(
+                                "observe replacement then original",
+                                ["no"],
+                                0,
+                                "7\n42\nno\n",
+                                8,
+                            ),
+                        ],
+                    ),
+                ),
+            ),
+            (
+                "two prefix record roots share an independently owned child",
+                func(): run_program(
+                    fixture_program(
+                        "owned_prefix_shared_child_roots",
+                        "owned_prefix/shared_child_roots",
+                        { allocations = 124600, instructions = 483234379 },
+                        [
+                            with_arguments("read both children in first arm", [], 4, "", 5),
+                            with_arguments("read both children in second arm", ["no"], 22, "", 6),
+                        ],
+                    ),
+                ),
+            ),
+            (
+                "borrowed caller record survives either helper arm",
+                func(): run_program(
+                    fixture_program(
+                        "owned_prefix_borrowed_parameter",
+                        "owned_prefix/borrowed_parameter",
+                        { allocations = 124678, instructions = 482527728 },
+                        [
+                            with_arguments("use caller and local child", [], 5, "", 6),
+                            with_arguments("use caller and retire unused local", ["no"], 4, "", 7),
+                        ],
+                    ),
+                ),
+            ),
+            (
+                "prefix runs once and only the selected arm has effects",
+                func(): run_program(
+                    fixture_program(
+                        "owned_prefix_selected_effects",
+                        "owned_prefix/selected_effects",
+                        { allocations = 125234, instructions = 503926285 },
+                        [
+                            with_arguments(
+                                "only yes prints after prefix",
+                                [],
+                                2,
+                                "prefix\nyes\n",
+                                6,
+                            ),
+                            with_arguments(
+                                "only no prints after prefix",
+                                ["no"],
+                                3,
+                                "prefix\nno\n",
+                                7,
+                            ),
+                        ],
+                    ),
+                ),
+            ),
+            (
+                "owned prefix reaches both explicit arms and a useful default",
+                func(): run_program(
+                    fixture_program(
+                        "owned_prefix_default_arm",
+                        "owned_prefix/default_arm",
+                        { allocations = 126300, instructions = 487042874 },
+                        [
+                            with_arguments("First explicit arm", [], 2, "", 4),
+                            with_arguments("Second explicit arm", ["second"], 12, "", 5),
+                            with_arguments("Third uses default", ["third", "extra"], 22, "", 6),
+                        ],
+                    ),
+                ),
+            ),
+            (
+                "returned borrowed parameter or local child has an independent owner",
+                func(): run_program(
+                    fixture_program(
+                        "owned_prefix_borrowed_child_return",
+                        "owned_prefix/borrowed_child_return",
+                        { allocations = 124395, instructions = 501124860 },
+                        [
+                            with_arguments(
+                                "caller String returned and caller remains live",
+                                [],
+                                0,
+                                "42\n42\n",
+                                5,
+                            ),
+                            with_arguments(
+                                "local child returned and caller remains live",
+                                ["no"],
+                                0,
+                                "42\n7\n",
+                                6,
+                            ),
+                        ],
+                    ),
+                ),
+            ),
+            (
+                "owned union scrutinee coexists with an owned String prefix",
+                func(): run_program(
+                    fixture_program(
+                        "owned_prefix_owned_union_scrutinee",
+                        "owned_prefix/owned_union_scrutinee",
+                        { allocations = 122842, instructions = 477645195 },
+                        [
+                            with_arguments(
+                                "Some arm observes both Strings and presence",
+                                ["kept"],
+                                7,
+                                "",
+                                4,
+                            ),
+                            with_arguments("None arm observes the prefix String", [], 2, "", 3),
+                            with_arguments(
+                                "Some empty String is distinct from None",
+                                [""],
+                                3,
+                                "",
+                                4,
+                            ),
+                        ],
+                    ),
+                ),
+            ),
+            (
+                "prefix List root transfers independently through either arm",
+                func(): run_program(
+                    fixture_program(
+                        "owned_prefix_list_escape",
+                        "owned_prefix/list_escape",
+                        { allocations = 122698, instructions = 477158991 },
+                        [
+                            with_arguments("first arm returns one-element argv", [], 1, "", 2),
+                            with_arguments(
+                                "second arm returns two-element argv",
+                                ["kept"],
+                                2,
+                                "",
+                                3,
+                            ),
+                        ],
+                    ),
+                ),
+            ),
+            (
+                "prefix owning union transfers independently through either arm",
+                func(): run_program(
+                    fixture_program(
+                        "owned_prefix_union_escape",
+                        "owned_prefix/union_escape",
+                        { allocations = 123847, instructions = 478829050 },
+                        [
+                            with_arguments("first arm returns the prefix union", [], 2, "", 3),
+                            with_arguments("second arm returns the prefix union", ["no"], 2, "", 4),
+                        ],
+                    ),
+                ),
+            ),
+            (
+                "managed projected scrutinee supports Int and String payload reads",
+                func(): run_program(
+                    fixture_program(
+                        "owned_prefix_mixed_int_scrutinee",
+                        "owned_prefix/mixed_int_scrutinee",
+                        { allocations = 125206, instructions = 494296377 },
+                        [
+                            with_arguments("Left reads scalar payload", [], 42, "", 3),
+                            with_arguments("Right reads owned String payload", ["kept"], 4, "", 4),
+                        ],
+                    ),
+                ),
+            ),
+            (
+                "managed projected scrutinee supports Void and String payload reads",
+                func(): run_program(
+                    fixture_program(
+                        "owned_prefix_mixed_void_scrutinee",
+                        "owned_prefix/mixed_void_scrutinee",
+                        { allocations = 125581, instructions = 493370413 },
+                        [
+                            with_arguments("Left reads Void payload", [], 0, "", 3),
+                            with_arguments("Right reads owned String payload", ["kept"], 4, "", 4),
+                        ],
+                    ),
+                ),
+            ),
+            -- local modules
+            (
+                "selective import executes",
+                func(): run_program(
+                    exits_with(
+                        "imports_basic",
+                        "import/basic/main",
+                        { allocations = 120383, instructions = 476920384 },
+                        42,
+                        0,
+                    ),
+                ),
+            ),
+            (
+                "callee keeps its defining scope",
+                func(): run_program(
+                    exits_with(
+                        "imports_home",
+                        "import/home/main",
+                        { allocations = 120787, instructions = 478077792 },
+                        42,
+                        0,
+                    ),
+                ),
+            ),
+            (
+                "a user read module and io/fs/read coexist",
+                func(): run_program(
+                    exits_with(
+                        "imports_user_read",
+                        "import/user_read/main",
+                        { allocations = 185997, instructions = 684340996 },
+                        42,
+                        1,
+                    ),
+                ),
+            ),
+            (
+                "diamond shares one module",
+                func(): run_program(
+                    exits_with(
+                        "imports_diamond",
+                        "import/diamond/main",
+                        { allocations = 122648, instructions = 485644574 },
+                        42,
+                        0,
+                    ),
+                ),
+            ),
+            (
+                "dependency cycle is rejected at its closing import",
+                func(): reject_cycle("imports_cycle"),
+            ),
+            (
+                "foreign nominal value through generic UFCS",
+                func(): run_program(
+                    exits_with(
+                        "imports_managed",
+                        "import/managed/main",
+                        { allocations = 123938, instructions = 488979732 },
+                        2,
+                        1,
+                    ),
+                ),
+            ),
+            (
+                "two independent method modules preserve type identity",
+                func(): run_program(
+                    exits_with(
+                        "imports_method_modules",
+                        "import/method_modules/main",
+                        { allocations = 123453, instructions = 485906200 },
+                        42,
+                        0,
+                    ),
+                ),
+            ),
+            (
+                "methods reaches functions on a type imported elsewhere",
+                func(): run_program(
+                    exits_with(
+                        "imports_forwarding",
+                        "import/forwarding/main",
+                        { allocations = 122720, instructions = 486664462 },
+                        42,
+                        0,
+                    ),
+                ),
+            ),
+            (
+                "a module does not reexport an imported union",
+                func(): with_current_directory(
+                    func(current: String): verify_unpublished_against(
+                        compiler,
+                        LIBRARY_ROOT,
+                        work_directory,
+                        {
+                            name = "imports_facade",
+                            source = FIXTURES + "import/forwarding/facade.brp",
+                            diagnostic = (
+                                diagnostic(
+                                    "2:12",
+                                    "Box is imported by ./ops, not declared there",
+                                    "import Box from the module that declares it, or write ./ops: Box methods to use the functions ./ops declares on Box",
+                                )
+                                + current
+                                + "/"
+                                + FIXTURES
+                                + "import/forwarding/box.brp:1:7: note: declared here\n"
+                            ),
+                        },
+                    ),
+                ),
+            ),
+            (
+                "helper module receives the default prelude",
+                func(): run_program(
+                    exits_with(
+                        "imports_prelude_helper",
+                        "import/prelude_helper/main",
+                        { allocations = 120949, instructions = 475276211 },
+                        2,
+                        1,
+                    ),
+                ),
+            ),
+            (
+                "explicit base import overlaps the prelude",
+                func(): run_program(
+                    exits_with(
+                        "imports_explicit_base",
+                        "import/explicit_base/main",
+                        { allocations = 121433, instructions = 474567819 },
+                        42,
+                        0,
+                    ),
+                ),
+            ),
+            (
+                "same-named methods resolve by receiver type",
+                func(): run_program(
+                    exits_with(
+                        "imports_receiver_types",
+                        "import/receiver_types/main",
+                        { allocations = 122506, instructions = 482113055 },
+                        42,
+                        1,
+                    ),
+                ),
+            ),
+            (
+                "generic methods preserve managed values",
+                func(): run_program(
+                    exits_with(
+                        "imports_generic_methods",
+                        "import/generic_methods/main",
+                        { allocations = 124732, instructions = 491651040 },
+                        4,
+                        1,
+                    ),
+                ),
+            ),
+            (
+                "method-only exposure cannot be called directly",
+                func(): reject_unpublished(
+                    "imports_direct_rejected",
+                    "import/method_modules/direct_rejected",
+                    diagnostic("7:5", UNKNOWN_FUNCTION, RECEIVER_ONLY_HELP),
+                ),
+            ),
+            (
+                "method-only selection needs exact visible type",
+                func(): reject_unpublished(
+                    "imports_missing_type",
+                    "import/method_modules/missing_type",
+                    diagnostic(
+                        "2:15",
+                        "method receiver type is not independently visible",
+                        "import the exact type with an ordinary type selection before using methods",
+                    ),
+                ),
+            ),
+            (
+                "default prelude exposes receiver calls only",
+                func(): reject_unpublished(
+                    "imports_prelude_direct_rejected",
+                    "import/prelude_helper/direct_rejected",
+                    diagnostic("2:5", UNKNOWN_FUNCTION, RECEIVER_ONLY_HELP),
+                ),
+            ),
+            (
+                "cross-file field diagnostic preserves output",
+                func(): reject_cross_file_field("imports_field"),
+            ),
+            (
+                "direct module chain stays within its cost ceiling",
+                func(): run_generated(
+                    "imports_direct_chain",
+                    direct_chain_files(),
+                    { allocations = 212848, instructions = 825588209 },
+                    0,
+                ),
+            ),
+            (
+                "flat modules stay within their cost ceiling",
+                func(): run_generated(
+                    "imports_flat",
+                    flat_files(),
+                    { allocations = 220831, instructions = 2679964078 },
+                    0,
+                ),
+            ),
+            -- bindings
+            (
+                "original survives reassignment with cost limits",
+                func(): run_program(
+                    exits_with(
+                        "bindings_basic",
+                        "binding/basic",
+                        { allocations = 120426, instructions = 473495363 },
+                        1,
+                        0,
+                    ),
+                ),
+            ),
+            (
+                "current after reassignment",
+                func(): run_program(
+                    exits_with(
+                        "bindings_values",
+                        "binding/values",
+                        { allocations = 120356, instructions = 473728946 },
+                        42,
+                        0,
+                    ),
+                ),
+            ),
+            (
+                "self assignment",
+                func(): run_program(
+                    exits_with(
+                        "bindings_self_assignment",
+                        "binding/self_assignment",
+                        { allocations = 119946, instructions = 471112699 },
+                        7,
+                        0,
+                    ),
+                ),
+            ),
+            (
+                "parameter initializer",
+                func(): run_program(
+                    exits_with(
+                        "bindings_parameter_shadow",
+                        "binding/parameter_shadow",
+                        { allocations = 120155, instructions = 470837492 },
+                        17,
+                        0,
+                    ),
+                ),
+            ),
+            (
+                "pure mutation",
+                func(): run_program(
+                    exits_with(
+                        "bindings_pure_mutation",
+                        "binding/pure_mutation",
+                        { allocations = 120476, instructions = 475065166 },
+                        42,
+                        0,
+                    ),
+                ),
+            ),
+            (
+                "unused initializer value",
+                func(): run_program(
+                    exits_with(
+                        "bindings_unused_initializer",
+                        "binding/unused_initializer",
+                        { allocations = 120271, instructions = 472659796 },
+                        0,
+                        0,
+                    ),
+                ),
+            ),
+            (
+                "ordered reassignment value",
+                func(): run_program(
+                    exits_with(
+                        "bindings_ordered_calls",
+                        "binding/ordered_calls",
+                        { allocations = 121165, instructions = 475311532 },
+                        42,
+                        0,
+                    ),
+                ),
+            ),
+            (
+                "union original",
+                func(): run_program(
+                    exits_with(
+                        "bindings_union_original",
+                        "binding/union_original",
+                        { allocations = 121474, instructions = 477207761 },
+                        42,
+                        0,
+                    ),
+                ),
+            ),
+            (
+                "union current",
+                func(): run_program(
+                    exits_with(
+                        "bindings_union_current",
+                        "binding/union_current",
+                        { allocations = 121396, instructions = 475663998 },
+                        0,
+                        0,
+                    ),
+                ),
+            ),
+            (
+                "capture preserves outer local",
+                func(): run_program(
+                    exits_with(
+                        "bindings_capture_shadow",
+                        "binding/capture_shadow",
+                        { allocations = 121372, instructions = 474784348 },
+                        42,
+                        0,
+                    ),
+                ),
+            ),
+            (
+                "immutable assignment diagnostic preserves output",
+                func(): reject_text(
+                    "bindings_immutable_assignment",
+                    "func main() -> Int:\n\tvalue = 1\n\tvalue = 42\n\tvalue\n",
+                    diagnostic(
+                        "3:2",
+                        "cannot assign to an immutable binding",
+                        "declare the binding with var to allow reassignment",
+                    ),
+                ),
+            ),
+            -- UFCS
+            (
+                "UFCS native execution and cost",
+                func(): run_program(
+                    exits_with(
+                        "ufcs_calls",
+                        "ufcs/calls",
+                        { allocations = 120191, instructions = 471635892 },
+                        1,
+                        0,
+                    ),
+                ),
+            ),
+            (
+                "chain native execution and cost",
+                func(): run_program(
+                    exits_with(
+                        "ufcs_chain",
+                        "ufcs/chain",
+                        { allocations = 120326, instructions = 472987665 },
+                        0,
+                        0,
+                    ),
+                ),
+            ),
+            (
+                "64-link chain native execution and cost",
+                func(): run_program(
+                    exits_with(
+                        "ufcs_chain_64",
+                        "ufcs/chain_64",
+                        { allocations = 126464, instructions = 491724430 },
+                        65,
+                        0,
+                    ),
+                ),
+            ),
+            -- surface syntax
+            (
+                "line breaks inside brackets continue the line",
+                func(): run_program(
+                    exits_with(
+                        "syntax_continuation",
+                        "syntax/continuation",
+                        { allocations = 120980, instructions = 475395689 },
+                        7,
+                        0,
+                    ),
+                ),
+            ),
+            (
+                "import selections on indented lines",
+                func(): run_program(
+                    exits_with(
+                        "syntax_import_block",
+                        "syntax/import_block",
+                        { allocations = 120421, instructions = 472824554 },
+                        7,
+                        0,
+                    ),
+                ),
+            ),
+            (
+                "parentheses group an expression",
+                func(): run_program(
+                    exits_with(
+                        "syntax_grouping",
+                        "syntax/grouping",
+                        { allocations = 120855, instructions = 474633341 },
+                        7,
+                        0,
+                    ),
+                ),
+            ),
+            (
+                "value on the line after '='",
+                func(): run_program(
+                    exits_with(
+                        "syntax_next_line_value",
+                        "syntax/next_line_value",
+                        { allocations = 119618, instructions = 472135953 },
+                        7,
+                        0,
+                    ),
+                ),
+            ),
+            (
+                "a standalone annotated lambda can be stored without invocation",
+                func(): run_program(
+                    exits_with(
+                        "syntax_standalone_annotated_lambda",
+                        "syntax/standalone_annotated_lambda",
+                        { allocations = 120039, instructions = 471514578 },
+                        0,
+                        0,
+                    ),
+                ),
+            ),
+            (
+                "pipe and raw Strings keep their lines",
+                func(): run_program(
+                    prints(
+                        "syntax_pipe_string",
+                        "syntax/pipe_string",
+                        { allocations = 121332, instructions = 495118547 },
+                        "first\n|second\n\\n||$" + "{\n\n",
+                        2,
+                    ),
+                ),
+            ),
+            (
+                "unclosed bracket is rejected at the end of the file",
+                func(): reject_text(
+                    "syntax_unclosed",
+                    "import:\n\tint: add\n\nfunc main() -> Int:\n\tadd(1,\n\t\t2\n",
+                    diagnostic(
+                        "7:1",
+                        "expected ')' after the call arguments",
+                        "separate complete expressions with commas, then close the call with ')'",
+                    ),
+                ),
+            ),
+            (
+                "Char literal is rejected until the Char type exists",
+                func(): reject_text(
+                    "syntax_char",
+                    "func main() -> Int:\n\t'a'\n",
+                    diagnostic(
+                        "2:2",
+                        "Char literals are not supported yet",
+                        "use a one-character String literal such as \"a\"",
+                    ),
+                ),
+            ),
+            (
+                "a 3,000-statement body is parsed in one frame and reaches the checker",
+                func(): reject_text(
+                    "syntax_long_body",
+                    long_body_source(),
+                    diagnostic(
+                        "3:2",
+                        "cannot assign to an immutable binding",
+                        "declare the binding with var to allow reassignment",
+                    ),
+                ),
+            ),
+            -- syntax admission and placement
+            (
+                "opaque support module as root still requires main",
+                func(): reject_fixture(
+                    "unsupported_opaque_import_m",
+                    "unsupported/opaque_import/m",
+                    diagnostic(
+                        "2:1",
+                        "expected a main function",
+                        "declare func main() -> Int: as the entrypoint",
+                    ),
+                ),
+            ),
+            (
+                "imported opaque declaration is accepted",
+                func(): run_program(
+                    exits_with(
+                        "unsupported_opaque_import_main",
+                        "unsupported/opaque_import/main",
+                        { allocations = 120153, instructions = 473675366 },
+                        0,
+                        0,
+                    ),
+                ),
+            ),
+            (
+                "unused opaque declaration has a finite representation",
+                func(): run_program(
+                    exits_with(
+                        "unsupported_opaque_type",
+                        "unsupported/opaque_type",
+                        { allocations = 119555, instructions = 470995420 },
+                        0,
+                        0,
+                    ),
+                ),
+            ),
+            (
+                "into_opaque",
+                func(): reject_fixture(
+                    "unsupported_into_opaque",
+                    "unsupported/into_opaque",
+                    diagnostic("3:17", UNKNOWN_OPAQUE_MESSAGE, OPAQUE_CONVERSION_HELP),
+                ),
+            ),
+            (
+                "from_opaque",
+                func(): reject_fixture(
+                    "unsupported_from_opaque",
+                    "unsupported/from_opaque",
+                    diagnostic("3:17", UNKNOWN_OPAQUE_MESSAGE, OPAQUE_CONVERSION_HELP),
+                ),
+            ),
+            (
+                "range",
+                func(): reject_fixture(
+                    "unsupported_range",
+                    "unsupported/range",
+                    diagnostic(
+                        "3:5",
+                        "ranges are not supported yet",
+                        "iterate with an explicit index; low..high arrives with the loops milestone",
+                    ),
+                ),
+            ),
+            (
+                "if",
+                func(): reject_fixture(
+                    "unsupported_if",
+                    "unsupported/if",
+                    diagnostic(
+                        "3:9",
+                        "an if nested inside another expression is not supported yet",
+                        "bind the if result to a local before using it here",
+                    ),
+                ),
+            ),
+            (
+                "propagation requires a Result-returning function",
+                func(): reject_fixture(
+                    "unsupported_propagation",
+                    "unsupported/propagation",
+                    diagnostic(
+                        "3:5",
+                        "`?=` requires a Result-returning function",
+                        "return Result[Value, Error] from this function, or match on the value explicitly",
+                    ),
+                ),
+            ),
+            (
+                "propagation in an untaken if block is rejected during parsing",
+                func(): reject_fixture(
+                    "unsupported_propagation_if",
+                    "unsupported/propagation_if",
+                    diagnostic("3:15", PROPAGATION_BLOCK_MESSAGE, PROPAGATION_BLOCK_HELP),
+                ),
+            ),
+            (
+                "propagation in a tail match arm is rejected during parsing",
+                func(): reject_fixture(
+                    "unsupported_propagation_match",
+                    "unsupported/propagation_match",
+                    diagnostic("4:19", PROPAGATION_BLOCK_MESSAGE, PROPAGATION_BLOCK_HELP),
+                ),
+            ),
+            (
+                "source while condition requires Bool",
+                func(): reject_fixture(
+                    "unsupported_while",
+                    "unsupported/while",
+                    diagnostic(
+                        "3:11",
+                        "condition must have the designated Bool type",
+                        "use a Bool value as the condition",
+                    ),
+                ),
+            ),
+            (
+                "source for iterable requires a List or an Int range",
+                func(): reject_fixture(
+                    "unsupported_for",
+                    "unsupported/for",
+                    diagnostic(
+                        "3:17",
+                        "for iterable must be a List or an Int range",
+                        "iterate a List value, or write start..end with Int bounds",
+                    ),
+                ),
+            ),
+            (
+                "self call at the tail of a nested match",
+                func(): reject_fixture(
+                    "unsupported_tail_call_nested_match",
+                    "unsupported/tail_call_nested_match",
+                    diagnostic(
+                        "15:23",
+                        "a recursive call at the tail of a nested match is not supported yet",
+                        "make it an arm of the function's own match, or remove @tail_recursive; backedges from nested matches arrive with the loops milestone",
+                    ),
+                ),
+            ),
+            (
+                "match inside a larger expression",
+                func(): reject_fixture(
+                    "unsupported_match_in_expression",
+                    "unsupported/match_in_expression",
+                    diagnostic(
+                        "8:9",
+                        "a `match` inside a larger expression is not supported yet",
+                        "bind the match first with name = match ..., then use the name",
+                    ),
+                ),
+            ),
+            (
+                "exhaustive nested pattern makes the fallback unreachable",
+                func(): reject_fixture(
+                    "unsupported_nested_pattern",
+                    "unsupported/nested_pattern",
+                    diagnostic(
+                        "18:9",
+                        "match arm is unreachable",
+                        "remove this arm; earlier arms already cover all values it could match",
+                    ),
+                ),
+            ),
+            (
+                "bare nested constructor still requires the other inner variant",
+                func(): reject_fixture(
+                    "unsupported_nested_constructor_name",
+                    "unsupported/nested_constructor_name",
+                    diagnostic(
+                        "19:5",
+                        "non-exhaustive match",
+                        "add an arm for the missing pattern: Wrap(B)",
+                    ),
+                ),
+            ),
+            (
+                "Char literal pattern",
+                func(): reject_fixture(
+                    "unsupported_char_pattern",
+                    "unsupported/char_pattern",
+                    diagnostic(
+                        "13:9",
+                        "Char literal patterns are not supported yet",
+                        "compare the character in the arm; literal patterns arrive with the pattern-compilation milestone",
+                    ),
+                ),
+            ),
+            (
+                "qualified constructor pattern needs a declared alias",
+                func(): reject_fixture(
+                    "unsupported_qualified_pattern",
+                    "unsupported/qualified_pattern",
+                    diagnostic(
+                        "14:9",
+                        "unknown module alias shapes",
+                        "add path as shapes to the import block",
+                    ),
+                ),
+            ),
+            -- module aliases, qualified names and private declarations
+            (
+                "alias call reaches the module's function",
+                func(): run_program(
+                    prints(
+                        "namespace_alias_call",
+                        "namespace/alias_call",
+                        { allocations = 121308, instructions = 494590888 },
+                        "3\n",
+                        1,
+                    ),
+                ),
+            ),
+            (
+                "alias constructors and calls build and read a local module's values",
+                func(): run_program(
+                    prints(
+                        "namespace_alias_constructor",
+                        "namespace/alias_constructor",
+                        { allocations = 126757, instructions = 510014171 },
+                        "12\n9\n1\n",
+                        3,
+                    ),
+                ),
+            ),
+            (
+                "alias type names a module's record in a signature",
+                func(): run_program(
+                    prints(
+                        "namespace_alias_type",
+                        "namespace/alias_type",
+                        { allocations = 125606, instructions = 506512578 },
+                        "5\n",
+                        1,
+                    ),
+                ),
+            ),
+            (
+                "one import row combines an alias with selections",
+                func(): run_program(
+                    prints(
+                        "namespace_combined_import",
+                        "namespace/combined_import",
+                        { allocations = 126343, instructions = 508810307 },
+                        "12\n0\n",
+                        2,
+                    ),
+                ),
+            ),
+            (
+                "private functions are called within their modules",
+                func(): run_program(
+                    prints(
+                        "namespace_private_local",
+                        "namespace/private_local",
+                        { allocations = 127301, instructions = 514976178 },
+                        "42\n7\n7\n",
+                        3,
+                    ),
+                ),
+            ),
+            (
+                "a constant is selected beside an imported type of the same name",
+                func(): run_program(
+                    prints(
+                        "namespace_constant_beside_imported_type_main",
+                        "namespace/constant_beside_imported_type/main",
+                        { allocations = 122659, instructions = 502485920 },
+                        "42\n",
+                        1,
+                    ),
+                ),
+            ),
+            (
+                "discarded parameters take their arguments, repeat and bind nothing",
+                func(): run_program(
+                    exits_with(
+                        "discard_parameters",
+                        "discard/parameters",
+                        { allocations = 123559, instructions = 538071185 },
+                        14,
+                        1,
+                    ),
+                ),
+            ),
+            (
+                "a type selection binds the module's public methods",
+                func(): run_program(
+                    prints(
+                        "namespace_public_method",
+                        "namespace/public_method",
+                        { allocations = 123359, instructions = 503258189 },
+                        "3\n",
+                        1,
+                    ),
+                ),
+            ),
+            (
+                "a type selection never binds a private method",
+                func(): reject_fixture(
+                    "namespace_private_method",
+                    "namespace/private_method",
+                    diagnostic("6:20", UNKNOWN_FUNCTION, RECEIVER_ONLY_HELP),
+                ),
+            ),
+            (
+                "methods never binds a private method",
+                func(): reject_fixture(
+                    "namespace_private_methods",
+                    "namespace/private_methods",
+                    diagnostic("7:20", UNKNOWN_FUNCTION, RECEIVER_ONLY_HELP),
+                ),
+            ),
+            (
+                "selecting a private function is rejected",
+                func(): reject_fixture(
+                    "namespace_private_selection",
+                    "namespace/private_selection",
+                    diagnostic(
+                        "2:15",
+                        "secret is private to ./hidden",
+                        "remove private or import a public declaration",
+                    ),
+                ),
+            ),
+            (
+                "selecting a private type is rejected",
+                func(): reject_fixture(
+                    "namespace_private_type_selection",
+                    "namespace/private_type_selection",
+                    diagnostic(
+                        "2:15",
+                        "Point is private to ./hidden",
+                        "remove private or import a public declaration",
+                    ),
+                ),
+            ),
+            (
+                "qualifying a private function is rejected",
+                func(): reject_fixture(
+                    "namespace_private_qualified",
+                    "namespace/private_qualified",
+                    diagnostic(
+                        "6:12",
+                        "secret is private to ./hidden",
+                        "remove private or qualify a public declaration",
+                    ),
+                ),
+            ),
+            (
+                "unknown qualified name names the alias and module",
+                func(): reject_fixture(
+                    "namespace_unknown_qualified",
+                    "namespace/unknown_qualified",
+                    diagnostic(
+                        "6:12",
+                        "module ./hidden declares no public missing",
+                        "hidden names module ./hidden; qualify a public function, constructor or type it declares; imports are not reexported",
+                    ),
+                ),
+            ),
+            (
+                "a bare alias is not a value",
+                func(): reject_fixture(
+                    "namespace_bare_alias",
+                    "namespace/bare_alias",
+                    diagnostic(
+                        "6:13",
+                        "hidden is a module alias",
+                        "write hidden.name to use a declaration of that module",
+                    ),
+                ),
+            ),
+            (
+                "a qualified function can be stored without invocation",
+                func(): run_program(
+                    prints(
+                        "namespace_qualified_not_called",
+                        "namespace/qualified_not_called",
+                        { allocations = 121876, instructions = 478174332 },
+                        "",
+                        0,
+                    ),
+                ),
+            ),
+            (
+                "two aliases of one module are two imports",
+                func(): reject_fixture(
+                    "namespace_two_aliases",
+                    "namespace/two_aliases",
+                    (
+                        diagnostic(
+                            "3:5",
+                            "module imported more than once",
+                            "combine the alias and the selected names into one import, such as path as alias: name",
+                        )
+                        + previous_note("namespace/two_aliases", "2:5")
+                    ),
+                ),
+            ),
+            (
+                "an alias row and a selection row of one module are two imports",
+                func(): reject_fixture(
+                    "namespace_alias_and_plain",
+                    "namespace/alias_and_plain",
+                    (
+                        diagnostic(
+                            "3:5",
+                            "module imported more than once",
+                            "combine the alias and the selected names into one import, such as path as alias: name",
+                        )
+                        + previous_note("namespace/alias_and_plain", "2:5")
+                    ),
+                ),
+            ),
+            (
+                "an alias cannot reuse a visible name",
+                func(): reject_fixture(
+                    "namespace_alias_conflict",
+                    "namespace/alias_conflict",
+                    (
+                        diagnostic(
+                            "2:23",
+                            "area is already a module alias",
+                            "choose another alias for that module, or omit area from this selection",
+                        )
+                        + previous_note("namespace/alias_conflict", "2:17")
+                    ),
+                ),
+            ),
+            (
+                "a qualified type needs its alias in the import block",
+                func(): reject_fixture(
+                    "namespace_unknown_qualified_type",
+                    "namespace/unknown_qualified_type",
+                    diagnostic(
+                        "1:23",
+                        "unknown module alias shared",
+                        "add path as shared to the import block",
+                    ),
+                ),
+            ),
+            -- union variants written through their union
+            (
+                "a variant written through its union needs no annotation",
+                func(): run_program(
+                    exits_with(
+                        "variants_qualified",
+                        "variants/qualified_variants",
+                        { allocations = 126225, instructions = 532238820 },
+                        5,
+                        1,
+                    ),
+                ),
+            ),
+            (
+                "two imported unions sharing a variant name are written through their unions",
+                func(): run_program(
+                    prints(
+                        "variants_shared_names",
+                        "variants/shared_names",
+                        { allocations = 127273, instructions = 507823509 },
+                        "111\n",
+                        1,
+                    ),
+                ),
+            ),
+            (
+                "prelude unions take their variants through their names",
+                func(): run_program(
+                    prints(
+                        "variants_prelude_unions",
+                        "variants/prelude_unions",
+                        { allocations = 129037, instructions = 508609272 },
+                        "plain counted 2\n3 0\n5 -1\n",
+                        16,
+                    ),
+                ),
+            ),
+            (
+                "a variant of an imported union that was not imported is reached through the union",
+                func(): reject_fixture(
+                    "variants_unimported_value",
+                    "variants/unimported_value",
+                    diagnostic(
+                        "7:15",
+                        "NotFound is a variant of ReadError but is not imported",
+                        "write ReadError.NotFound, or import it as ReadError(NotFound)",
+                    ),
+                ),
+            ),
+            (
+                "a bare variant name shared by two visible unions offers both qualified forms",
+                func(): reject_fixture(
+                    "variants_shared_bare_value",
+                    "variants/shared_bare_value",
+                    diagnostic(
+                        "8:15",
+                        "NotFound is a variant of several unions in scope: ReadError, WriteError",
+                        "write it through one of them: ReadError.NotFound, WriteError.NotFound",
+                    ),
+                ),
+            ),
+            (
+                "a bare pattern of an imported union suggests the qualified variant",
+                func(): with_current_directory(
+                    func(current: String): verify_unpublished_against(
+                        compiler,
+                        LIBRARY_ROOT,
+                        work_directory,
+                        {
+                            name = "variants_unimported_pattern",
+                            source = FIXTURES + "variants/unimported_pattern.brp",
+                            diagnostic = (
+                                diagnostic(
+                                    "8:9",
+                                    "NotFound is a constructor of ReadError but is not imported",
+                                    "write ReadError.NotFound, or import NotFound with its union: ReadError(NotFound)",
+                                )
+                                + current
+                                + "/"
+                                + previous_note("variants/read_errors", "2:5")
+                            ),
+                        },
+                    ),
+                ),
+            ),
+            (
+                "two selected variants with one name point at the qualified form",
+                func(): reject_fixture(
+                    "variants_shared_imports",
+                    "variants/shared_imports",
+                    (
+                        diagnostic(
+                            "4:32",
+                            "NotFound is already imported",
+                            "select NotFound from one module only, reach the other through a module alias, or import both unions and write the variant through its union, as Union.NotFound",
+                        )
+                        + previous_note("variants/shared_imports", "3:30")
+                    ),
+                ),
+            ),
+            (
+                "a private union of another module is not in scope",
+                func(): reject_fixture(
+                    "variants_private_union",
+                    "variants/private_union",
+                    diagnostic(
+                        "7:14",
+                        "Hidden is not a union in scope",
+                        "import the union from the module that declares it, as in `module_name: Hidden`",
+                    ),
+                ),
+            ),
+            (
+                "an alias cannot be followed by a union and its variant",
+                func(): reject_fixture(
+                    "variants_alias_union_variant",
+                    "variants/alias_union_variant",
+                    diagnostic(
+                        "7:30",
+                        "fields and methods are lower_snake_case",
+                        "name the variant through its union, as in `Union.Variant`, or through the alias alone, as in `alias.Variant`; `alias.Union.Variant` is not a form",
+                    ),
+                ),
+            ),
+            (
+                "a qualified pattern must name a variant of the matched union",
+                func(): reject_fixture(
+                    "variants_wrong_union_pattern",
+                    "variants/wrong_union_pattern",
+                    diagnostic(
+                        "9:9",
+                        "WriteError.Full is a variant of WriteError, but the matched value has type ReadError",
+                        "match a variant of ReadError, or match a value of type WriteError",
+                    ),
+                ),
+            ),
+            -- UInt8 and Bytes
+            (
+                "UInt8 literals, wrapping arithmetic, conversions, ordering and storage",
+                func(): run_program(
+                    fixture_program(
+                        "uint8_values",
+                        "uint8/values",
+                        { allocations = 173169, instructions = 653082128 },
+                        once(0, UINT8_VALUES_OUTPUT, 161),
+                    ),
+                ),
+            ),
+            (
+                "Bytes access, clamped slices, prefixes, concatenation, Dict keys and decoding",
+                func(): run_program(
+                    fixture_program(
+                        "bytes_operations",
+                        "bytes/operations",
+                        { allocations = 222348, instructions = 765871505 },
+                        once(0, BYTES_OPERATIONS_OUTPUT, 188),
+                    ),
+                ),
+            ),
+            (
+                "a binary file round trip keeps NUL and 0xFF, and read_bytes fails as read_text does",
+                func(): run_program(
+                    fixture_program(
+                        "bytes_files",
+                        "bytes/files",
+                        { allocations = 259125, instructions = 900280039 },
+                        once_given([work_directory], 0, BYTES_FILES_OUTPUT, 51),
+                    ),
+                ),
+            ),
+            (
+                "a UInt8 literal outside 0 to 255 is rejected at the literal",
+                func(): reject_fixture(
+                    "uint8_reject_range",
+                    "uint8/reject_range",
+                    diagnostic("2:19", "300 does not fit in UInt8", "UInt8 holds 0 to 255"),
+                ),
+            ),
+            (
+                "a negative UInt8 literal is rejected at the literal",
+                func(): reject_fixture(
+                    "uint8_reject_negative",
+                    "uint8/reject_negative",
+                    diagnostic("2:19", "-1 does not fit in UInt8", "UInt8 holds 0 to 255"),
+                ),
+            ),
+            (
+                "negating a UInt8 points to the wrapping subtraction",
+                func(): reject_fixture(
+                    "uint8_reject_negation",
+                    "uint8/reject_negation",
+                    diagnostic(
+                        "3:15",
+                        "UInt8 has no negation",
+                        "write 0 - value for the wrapping result",
+                    ),
+                ),
+            ),
+            (
+                "UInt8 and Int do not mix, and the help names both conversions",
+                func(): reject_fixture(
+                    "uint8_reject_mixing",
+                    "uint8/reject_mixing",
+                    diagnostic(
+                        "4:18",
+                        "argument type does not match the parameter type",
+                        "UInt8 and Int do not mix: convert the Int with to_uint8(), or the UInt8 with to_int()",
+                    ),
+                ),
+            ),
+            (
+                "an Int local from a lone literal is suggested a UInt8 annotation",
+                func(): reject_fixture(
+                    "uint8_reject_unannotated",
+                    "uint8/reject_unannotated",
+                    diagnostic(
+                        "4:21",
+                        "argument type does not match the parameter type",
+                        "Int and UInt8 do not mix: convert the UInt8 with to_int(), or the Int with to_uint8(); or declare var total: UInt8 = 0",
+                    ),
+                ),
+            ),
+            -- concrete authored traits
+            (
+                "prelude-selected library trait supports derived default and callable paths",
+                func(): run_program(
+                    rooted_program(
+                        "traits_location",
+                        "blorp/test/test_compile/trait_inputs/location/library",
+                        "blorp/test/test_compile/trait_inputs/location/main.brp",
+                        { allocations = 13459, instructions = 56124280 },
+                        once(23, "", 1),
+                    ),
+                ),
+            ),
+            (
+                "concrete equals uses an ordinary body and native entrypoint",
+                func(): run_program(
+                    rooted_program(
+                        "traits_concrete",
+                        "blorp/test/test_compile/trait_inputs/concrete/library",
+                        "blorp/test/test_compile/trait_inputs/concrete/main.brp",
+                        { allocations = 4277, instructions = 32857756 },
+                        once(23, "", 0),
+                    ),
+                ),
+            ),
+            (
+                "managed List receiver has balanced positive target allocations",
+                func(): run_program(
+                    rooted_program(
+                        "traits_managed",
+                        "blorp/test/test_compile/trait_inputs/concrete/library",
+                        "blorp/test/test_compile/trait_inputs/concrete/managed.brp",
+                        { allocations = 9117, instructions = 44041761 },
+                        once(23, "", 6),
+                    ),
+                ),
+            ),
+            (
+                "wrong implementation signature preserves missing/existing output",
+                func(): reject_in_root(
+                    "traits_reject_signature",
+                    "blorp/test/test_compile/trait_inputs/concrete/library",
+                    "blorp/test/test_compile/trait_inputs/concrete/reject_signature.brp",
+                    diagnostic(
+                        "7:15",
+                        "implementation signature does not match the trait requirement",
+                        "match the requirement's purity, parameter types and return type, replacing Self with the receiver",
+                    ),
+                ),
+            ),
+            -- bounded defaults and contextual method values
+            (
+                "generic method values keep opaque choice and written order",
+                func(): run_program(
+                    rooted_program(
+                        "trait_bounds_dispatch",
+                        "blorp/test/test_compile/trait_inputs/bounds/library",
+                        "blorp/test/test_compile/trait_inputs/bounds/dispatch/main.brp",
+                        { allocations = 21136, instructions = 78424288 },
+                        once(23, "left\nright\n", 5),
+                    ),
+                ),
+            ),
+            (
+                "default lexical scope and authored override remain distinct",
+                func(): run_program(
+                    rooted_program(
+                        "trait_bounds_defaults",
+                        "blorp/test/test_compile/trait_inputs/bounds/library",
+                        "blorp/test/test_compile/trait_inputs/bounds/defaults/main.brp",
+                        { allocations = 14619, instructions = 59919507 },
+                        once(23, "", 2),
+                    ),
+                ),
+            ),
+            (
+                "finite generic dispatch reaches real native values",
+                func(): run_program(
+                    rooted_program(
+                        "trait_bounds_finite",
+                        "blorp/test/test_compile/trait_inputs/bounds/library",
+                        "blorp/test/test_compile/trait_inputs/bounds/finite/main.brp",
+                        { allocations = 31698, instructions = 100055842 },
+                        once(23, "", 25),
+                    ),
+                ),
+            ),
+            (
+                "uncalled unbounded body rejects and preserves output",
+                func(): reject_in_root(
+                    "trait_bounds_reject_unbounded",
+                    "blorp/test/test_compile/trait_inputs/bounds/library",
+                    "blorp/test/test_compile/trait_inputs/bounds/reject_unbounded.brp",
+                    diagnostic(
+                        "6:5",
+                        "type does not satisfy the required trait bound",
+                        "add the required trait to this function's type parameter bounds, or provide an implementation for the concrete receiver",
+                    ),
+                ),
+            ),
+            -- binding and constructor name rejections
+            (
+                "a capitalized bare typo is an unknown constructor, never a capture",
+                func(): reject_unpublished(
+                    "binding_names_typo",
+                    "names/typo",
+                    diagnostic(
+                        "9:9",
+                        "unknown constructor pattern",
+                        "a capitalized name in a pattern must be a variant of the matched union; to bind a value, write it in lower_snake_case",
+                    ),
+                ),
+            ),
+            (
+                "a capitalized payload name is an unknown constructor, never a capture",
+                func(): reject_unpublished(
+                    "binding_names_capital_payload",
+                    "names/capital_payload",
+                    diagnostic(
+                        "3:14",
+                        "unknown constructor pattern",
+                        "a capitalized name in a pattern must be a variant of the matched union; to bind a value, write it in lower_snake_case",
+                    ),
+                ),
+            ),
+            (
+                "a lowercase bare name in a match arm rejects without publishing C",
+                func(): reject_unpublished(
+                    "binding_names_lowercase_arm",
+                    "names/lowercase_arm",
+                    diagnostic(
+                        "9:9",
+                        "a bare name in a match arm is a constructor; use `_` to match anything",
+                        "use a visible constructor of the matched union, or write `_` and use the match's scrutinee in the arm",
+                    ),
+                ),
+            ),
+            (
+                "parameter cannot hide a function",
+                func(): reject_unpublished(
+                    "binding_names_function_parameter",
+                    "names/function_parameter",
+                    (
+                        diagnostic(
+                            "5:15",
+                            "`helper` is already a function in this module",
+                            RENAME_HELP,
+                        )
+                        + previous_note("names/function_parameter", "1:11")
+                    ),
+                ),
+            ),
+            (
+                "local cannot hide a function",
+                func(): reject_unpublished(
+                    "binding_names_function_local",
+                    "names/function_local",
+                    (
+                        diagnostic(
+                            "6:5",
+                            "`helper` is already a function in this module",
+                            RENAME_HELP,
+                        )
+                        + previous_note("names/function_local", "1:11")
+                    ),
+                ),
+            ),
+            (
+                "var cannot hide a parameter",
+                func(): reject_unpublished(
+                    "binding_names_parameter_shadow",
+                    "names/parameter_shadow",
+                    (
+                        diagnostic(
+                            "2:9",
+                            "`value` is already a parameter in this function",
+                            RENAME_HELP,
+                        )
+                        + previous_note("names/parameter_shadow", "1:15")
+                    ),
+                ),
+            ),
+            (
+                "duplicate var keeps the first declaration note",
+                func(): reject_unpublished(
+                    "binding_names_duplicate_var",
+                    "names/duplicate_var",
+                    (
+                        diagnostic(
+                            "3:9",
+                            "`value` is already a local in this function",
+                            RENAME_HELP,
+                        )
+                        + previous_note("names/duplicate_var", "2:9")
+                    ),
+                ),
+            ),
+            (
+                "bare constructor needs its import",
+                func(): with_current_directory(
+                    func(current: String): verify_unpublished_against(
+                        compiler,
+                        LIBRARY_ROOT,
+                        work_directory,
+                        {
+                            name = "binding_names_unimported_main",
+                            source = FIXTURES + "names/unimported/main.brp",
+                            diagnostic = (
+                                diagnostic(
+                                    "8:9",
+                                    "Square is a constructor of Shape but is not imported",
+                                    "write Shape.Square, or import Square with its union: Shape(Square)",
+                                )
+                                + current
+                                + "/"
+                                + previous_note("names/unimported/shapes", "3:5")
+                            ),
+                        },
+                    ),
+                ),
+            ),
+            (
+                "nested constructor needs its import",
+                func(): with_current_directory(
+                    func(current: String): verify_unpublished_against(
+                        compiler,
+                        LIBRARY_ROOT,
+                        work_directory,
+                        {
+                            name = "binding_names_unimported_nested",
+                            source = FIXTURES + "names/unimported/nested.brp",
+                            diagnostic = (
+                                diagnostic(
+                                    "11:15",
+                                    "Square is a constructor of Shape but is not imported",
+                                    "write Shape.Square, or import Square with its union: Shape(Square)",
+                                )
+                                + current
+                                + "/"
+                                + previous_note("names/unimported/shapes", "3:5")
+                            ),
+                        },
+                    ),
+                ),
+            ),
+            -- stored callable values
+            (
+                "same pure entry is stored twice and both record fields are invoked",
+                func(): run_program(
+                    fixture_program(
+                        "stored_callables_pure_storage",
+                        "callable_values/pure_storage",
+                        { allocations = 123340, instructions = 479003954 },
+                        once(42, "", 3),
+                    ),
+                ),
+            ),
+            (
+                "heterogeneous captured environments survive List aliasing",
+                func(): run_program(
+                    fixture_program(
+                        "stored_callables_heterogeneous",
+                        "callable_values/heterogeneous",
+                        { allocations = 127358, instructions = 499487153 },
+                        once(0, "left\ntext\nnumber\nnumber\n", 10),
+                    ),
+                ),
+            ),
+            (
+                "forwarded callable and dynamic String survive both creators and a copy",
+                func(): run_program(
+                    fixture_program(
+                        "stored_callables_forwarded_capture",
+                        "callable_values/forwarded_capture",
+                        { allocations = 123894, instructions = 501738410 },
+                        once(0, "kept!\nkept!\n", 5),
+                    ),
+                ),
+            ),
+            (
+                "direct callable Lists preserve copies and distinct signatures",
+                func(): run_program(
+                    fixture_program(
+                        "stored_callables_direct_list_copy",
+                        "callable_values/direct_list_copy",
+                        { allocations = 133232, instructions = 505999181 },
+                        once(25, "", 7),
+                    ),
+                ),
+            ),
+            (
+                "stored receiver is produced once before its ordinary argument",
+                func(): run_program(
+                    fixture_program(
+                        "stored_callables_receiver_order",
+                        "callable_values/receiver_order",
+                        { allocations = 123139, instructions = 498972349 },
+                        once(0, "receiver\nargument\n17\n", 3),
+                    ),
+                ),
+            ),
+        ],
+    }

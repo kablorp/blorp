@@ -67,7 +67,7 @@ and the README's naming rules and the library's exact-error convention apply her
   - `lsp_command.brp`: the help text and the transport, the only impure code
     (read, step, analyse on request, write).
 
-  The layer suite (`test/unit/test_layout/test_dependencies.brp`) gains an
+  The layer suite (`test/test_layout/test_dependencies.brp`) gains an
   `lsp/` layer that imports itself and `common/`. `main.brp` dispatches
   `lsp` there.
 - **CLion plugin** (`editor/intellij/`): it launches `blorp lsp`, as the
@@ -692,11 +692,11 @@ Each landing starts with a failing test.
 | 3 | An unclosed string keeps the tokens before it and drops its own. The loader's diagnostic is unchanged. |
 | 4 | Existing suites, unchanged. |
 | 5 | One case per `Referent` case, checking the use's span and, through `declaration_span`, its declaration's. Mutation proof: stop recording one case, and only its test fails. |
-| 6 | Direct C tests of the natives, under `test/runtime/`. |
+| 6 | Direct C tests of the natives, under `test/test_common/test_codegen/test_runtime/`. |
 | 8 | e2e programs through `capture`: LF and CRLF, a last line without LF, header and body in one chunk, a short `read_exact`, a zero count at end of input, bytes that are not UTF-8 through each read, `write` output before a read, `print` and `write` output in order, a write after the reader closes, and `write` imported beside `io/fs/write`'s `write_text`. |
-| 9 | `test/unit/test_lsp/`: framing; a body that is not UTF-8; positions for `é`, an astral emoji and `\r`; token splitting; a broken file's lexer tokens; lifecycle errors; staleness after a new import, a late open, a shared file's edit and a close; each request through `receive`. An e2e session in `self_hosted_cli.brp` runs `initialize` through `exit` and checks replies, a diagnostic and the status. |
+| 9 | `test/test_lsp/`: framing; a body that is not UTF-8; positions for `é`, an astral emoji and `\r`; token splitting; a broken file's lexer tokens; lifecycle errors; staleness after a new import, a late open, a shared file's edit and a close; each request through `receive`. An e2e session in `cli.brp` runs `initialize` through `exit` and checks replies, a diagnostic and the status. |
 | 10 | A manual checklist in the plugin's README. |
-| 11 | `test/unit/test_lsp/`: edit windows, with positions before, inside and after one, and two distant edits. |
+| 11 | `test/test_lsp/`: edit windows, with positions before, inside and after one, and two distant edits. |
 
 **Commands:** those in `blorp/AGENTS.md`, `scripts/blorp-fixpoint --prove`
 for compiler landings, and `make -C blorp test-e2e INSTRUCTION_CHECK=on`

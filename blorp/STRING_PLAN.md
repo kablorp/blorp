@@ -408,7 +408,7 @@ grows capacity without touching either count.
   cost 5.14% of a -O2 diagnostics self-compile, above its 3% ceiling. Every
   e2e program, component suite and runtime probe runs strict, so they all
   still recount.
-- **The stale probes are driven, not deleted.** `test/runtime/string_suite.brp`
+- **The stale probes are driven, not deleted.** `test/test_common/test_codegen/test_runtime/string_suite.brp`
   runs `string_test.c`, `string_concat_test.c` and the new
   `string_codepoints_test.c`. The revived concatenation probe caught
   `from_bytes` counting a negative length's bytes before allocation could
@@ -510,7 +510,7 @@ The L2 reproduction (fixpoint stage B at -O0 with diagnostics,
 | the 6.2 G harness compile | 6,215,987,687 | 6,811,050,507 | passes |
 | `fs_lines` | 1,196,778,594 | 1,286,899,142 | passes |
 | `fs_directories` | 1,347,097,145 | 1,435,575,057 | passes |
-| `path_join/arguments` (`self_hosted_strings.brp:1022`) | 574,758,593 | 589,617,289 | 575,586,952 to 578,115,851 |
+| `path_join/arguments` (`strings.brp:1022`) | 574,758,593 | 589,617,289 | 575,586,952 to 578,115,851 |
 | `path_join/aliases` | 570,000,000 | 583,219,072 | 570,826,670 to 570,977,539 |
 
 Failing ceilings fell from 17 in 4 tests to 2. With the recount off the
@@ -603,7 +603,7 @@ reproduction: `path_normalize/edges` sits 1.47% under its ceiling, `fs/write`
        `next_lines`, directory names, argv, process capture and the current
        directory.
      - The new C functions have no Blorp caller until L3, so a runtime suite
-       tests them directly in C. It follows `test/runtime/string_literal_suite.brp`,
+       tests them directly in C. It follows `test/test_common/test_codegen/test_runtime/string_literal_suite.brp`,
        which writes `string_runtime()` beside a C fixture and compiles them
        together.
    - **Compile ceilings.** The e2e records' `{ allocations, instructions }`
@@ -640,14 +640,14 @@ reproduction: `path_normalize/edges` sits 1.47% under its ceiling, `fs/write`
    - **Tests:** the byte-length expectations change. `string_literal/unicode`,
      `unicode_escapes` and `union` go from 6 to 2; `tail_arms` from 7 to 6;
      `normalization` from 5 to 3. `fs/lines.brp` and its harness
-     expectation (`self_hosted_harness.brp:95-98`) are rewritten around
+     expectation (`harness.brp:95-98`) are rewritten around
      `length` and `byte_length`, and `test_json.brp:401-402` moves to
      `byte_length`. Each test that indexes by byte moves to `byte_*`. The
      census names these, among them:
-     - `test/unit/text_search.brp`;
+     - `test/support/text_search.brp`;
      - `test_embed_library.brp`;
      - the lexer and format suites;
-     - `test/runtime/process_suite.brp`.
+     - `test/test_common/test_codegen/test_runtime/process_suite.brp`.
    - **Docs:** `README.md` "Strings" and "String operations", `grammar.ebnf`
      (lines 77-79, 225, 290, 298, 598) and `standard_library/README.md`.
 5. **L4, later and only on demand:** an `Ascii` type (S5) and a code-point
@@ -680,9 +680,9 @@ against its parent commit, interleaved, as in S0.
   normalized); a `Char` type; UTF-16 helpers (the language server writes its
   own); display width for wide or zero-width characters (the formatter keeps
   counting code points).
-- Found, not fixed: `test/runtime/fixtures/string_test.c` and
+- Found, not fixed: `test/test_common/test_codegen/test_runtime/fixtures/string_test.c` and
   `string_concat_test.c` were referenced by no suite or Makefile rule, so they
-  never ran. L1 drives them from `test/runtime/string_suite.brp`. L1 found
+  never ran. L1 drives them from `test/test_common/test_codegen/test_runtime/string_suite.brp`. L1 found
   that `argv_test.c`, with its `aggregate_runtime_test.h`, runs nowhere
   either; it is left for a later change.
 - Concurrent work:
@@ -733,7 +733,7 @@ against its parent commit, interleaved, as in S0.
 - **Commands:** iterate with the owning unit suite or fixture. Before review,
   run `make -C blorp test`, `make -C blorp test-compiler` and then
   `make -C blorp test-e2e INSTRUCTION_CHECK=on`,
-  `bash blorp/test/tooling/test_bootstrap.sh` and `scripts/blorp-fixpoint --prove`.
+  `bash blorp/test/test_bootstrap/test_bootstrap.sh` and `scripts/blorp-fixpoint --prove`.
 
 ## Acceptance criteria
 

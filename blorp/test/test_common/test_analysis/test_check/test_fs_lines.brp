@@ -1,0 +1,133 @@
+import:
+    bool: Bool methods
+    int: Int methods
+    list: List methods
+    option: Option methods
+    string: String methods
+    test: TestSuite
+    ../../../../src/common/analysis/check/check: check
+    ../../../../src/common/analysis/check/render: render_failure
+    ../../../../src/common/syntax/source: module_source, root_module_id
+    ../../../support/module_input: parse_modules
+
+
+private HELP_OPEN_READ: String = "declare an impure nongeneric function with one String parameter returning Result[Int, Int]"
+
+
+-- The first contract with two different parameters names them with "and".
+private HELP_NEXT_LINES: String = "declare an impure nongeneric function with Int and String parameters returning Result[List[String], Int]"
+
+
+private HELP_CLOSE: String = "declare an impure nongeneric function with one Int parameter returning Result[Void, Int]"
+
+
+private pure func body_for(label: String) -> String:
+    "\n    builtin(\"${label}\")\nfunc main() -> Int:\n    0\n"
+
+
+private pure func accepts(header: String, label: String) -> Bool:
+    match parse_modules([{ source = "${header}${body_for(label)}", targets = [] }]):
+        Err(_):
+            False
+        Ok(parsed):
+            match check(parsed):
+                Ok(_): True
+                Err(_): False
+
+
+-- The declaration must be refused where the label is written, with the help
+-- rendered from the operation's contract row.
+private pure func rejects(header: String, label: String, help: String) -> Bool:
+    match parse_modules([{ source = "${header}${body_for(label)}", targets = [] }]):
+        Err(_):
+            False
+        Ok(parsed):
+            match check(parsed):
+                Ok(_):
+                    False
+                Err(failure):
+                    errors = render_failure(failure)
+                    actual = errors.first
+                    start = header.length() + ("\n    builtin(".length())
+                    actual.message
+                        .equals("builtin declaration does not match its runtime contract")
+                        .and(actual.help.equals(help))
+                        .and(actual.span.start.equals(start))
+                        .and(actual.span.end.equals(start + ("\"${label}\"".length())))
+                        .and(actual.span.source == module_source(root_module_id()))
+                        .and(errors.remaining.is_empty())
+                        .and(actual.note.is_none())
+
+
+pure func test_exact_contracts_are_accepted() -> Bool:
+    accepts("func open(path: String) -> Result[Int, Int]:", "fs.open_read")
+        .and(
+            accepts(
+                "func next(descriptor: Int, carried: String) -> Result[List[String], Int]:",
+                "fs.next_lines",
+            ),
+        )
+        .and(accepts("func close(descriptor: Int) -> Result[Void, Int]:", "fs.close"))
+
+
+-- A batch is a List[String]: no single String, other List or Void takes its place.
+pure func test_next_lines_succeeds_with_a_string_list() -> Bool:
+    [
+        "func next(descriptor: Int, carried: String) -> Result[String, Int]:",
+        "func next(descriptor: Int, carried: String) -> Result[List[Int], Int]:",
+        "func next(descriptor: Int, carried: String) -> Result[Void, Int]:",
+        "func next(descriptor: Int, carried: String) -> Result[List[String], String]:",
+    ].all(pure func(header: String) -> Bool: rejects(header, "fs.next_lines", HELP_NEXT_LINES))
+
+
+-- The descriptor comes first and the carried line second, and the call is impure.
+pure func test_next_lines_parameters_and_purity_are_closed() -> Bool:
+    [
+        "func next(carried: String, descriptor: Int) -> Result[List[String], Int]:",
+        "func next(descriptor: Int) -> Result[List[String], Int]:",
+        "func next(descriptor: Int, carried: String, extra: String) -> Result[List[String], Int]:",
+        "pure func next(descriptor: Int, carried: String) -> Result[List[String], Int]:",
+        "func next[Element](descriptor: Int, carried: String) -> Result[List[String], Int]:",
+    ].all(pure func(header: String) -> Bool: rejects(header, "fs.next_lines", HELP_NEXT_LINES))
+
+
+pure func test_open_read_succeeds_with_a_descriptor() -> Bool:
+    [
+        "func open(path: String) -> Result[String, Int]:",
+        "func open(path: String) -> Result[Void, Int]:",
+        "func open(path: Int) -> Result[Int, Int]:",
+        "pure func open(path: String) -> Result[Int, Int]:",
+    ].all(pure func(header: String) -> Bool: rejects(header, "fs.open_read", HELP_OPEN_READ))
+
+
+pure func test_close_takes_a_descriptor_and_succeeds_with_void() -> Bool:
+    [
+        "func close(descriptor: String) -> Result[Void, Int]:",
+        "func close(descriptor: Int) -> Result[Int, Int]:",
+        "func close(descriptor: Int) -> Result[Void, String]:",
+        "pure func close(descriptor: Int) -> Result[Void, Int]:",
+    ].all(pure func(header: String) -> Bool: rejects(header, "fs.close", HELP_CLOSE))
+
+
+TESTS: TestSuite = {
+    description = "fs line builtin contracts",
+    tests = [
+        ("each exact contract is accepted", test_exact_contracts_are_accepted),
+        (
+            "fs.next_lines succeeds with a List[String] and nothing else",
+            test_next_lines_succeeds_with_a_string_list,
+        ),
+        (
+            "fs.next_lines takes an Int then a String and is impure and nongeneric",
+            test_next_lines_parameters_and_purity_are_closed,
+        ),
+        (
+            "fs.open_read takes one String and succeeds with an Int",
+            test_open_read_succeeds_with_a_descriptor,
+        ),
+        (
+            "fs.close takes one Int and succeeds with Void",
+            test_close_takes_a_descriptor_and_succeeds_with_void,
+        ),
+    ],
+}

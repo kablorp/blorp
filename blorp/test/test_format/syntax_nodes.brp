@@ -1,0 +1,1386 @@
+import:
+    bool: and, not
+    float: Float methods
+    int: Int methods
+    list: List methods
+    option: Option methods
+    string: String methods
+    ../../src/common/syntax/names: NameTable, name_spelling
+    ../../src/common/syntax/parse:
+        ImportOrigin(RelativeImport, LibraryImport),
+        ImportSelection(NamedSelection, ConstructorSelection, MethodsSelection),
+        ParsedImport,
+        ParsedModuleContents,
+    ../../src/common/syntax/syntax:
+        ArithmeticOperator(
+            AddOperator,
+            SubtractOperator,
+            MultiplyOperator,
+            DivideOperator,
+            RemainderOperator,
+        ),
+        ComparisonOperator(
+            EqualOperator,
+            NotEqualOperator,
+            LessOperator,
+            GreaterOperator,
+            LessEqualOperator,
+            GreaterEqualOperator,
+        ),
+        ElseBranch(ElseIf, ElseBlock),
+        ExpressionBase(
+            VoidExpression,
+            IntegerExpression,
+            FloatExpression,
+            StringExpression,
+            InterpolatedString,
+            NameExpression,
+            DirectApplication,
+            QualifiedName,
+            QualifiedApplication,
+            VariantName,
+            VariantApplication,
+            OpaqueWrap,
+            OpaqueUnwrap,
+            ListExpression,
+            TupleExpression,
+            RangeExpression,
+            ComparisonExpression,
+            ArithmeticExpression,
+            NegationExpression,
+            IfExpression,
+            MatchExpression,
+            LambdaExpression,
+            RecordExpression,
+            RecordUpdateExpression,
+            DictExpression,
+        ),
+        ForBinder(SingleForBinder, TupleForBinder),
+        Keyword(
+            MatchKeyword,
+            VarKeyword,
+            VoidKeyword,
+            IfKeyword,
+            WhileKeyword,
+            ForKeyword,
+            BreakKeyword,
+            ContinueKeyword,
+            TraitKeyword,
+            ImplementsKeyword,
+            IntoOpaqueKeyword,
+            FromOpaqueKeyword,
+        ),
+        LambdaBody(InlineBody, BlockBody),
+        ParsedBinder(NamedBinder, DiscardBinder),
+        ParsedBlock,
+        ParsedBody(ParsedBuiltinBody, ParsedValueBody, ParsedMatchBody),
+        ParsedBuiltinType(IntegerBuiltin, FloatBuiltin, StringBuiltin, VoidBuiltin, ListBuiltin),
+        ParsedFunction,
+        ParsedFunctionGroup(FreeFunction, ImplementationGroup),
+        ParsedIf,
+        ParsedMatch,
+        ParsedField,
+        ParsedParameter,
+        ParsedPattern(
+            PatternName,
+            PatternVariantName,
+            PatternWildcard,
+            PatternConstructor,
+            PatternOr,
+            PatternList,
+            PatternTuple,
+            PatternLiteral,
+            PatternChar,
+        ),
+        LiteralPattern(ExactBytes, ExactInt),
+        ParsedReceiverHead(ReceiverName, QualifiedReceiverName),
+        ParsedStatement(
+            BindingStatement,
+            TupleBinding,
+            PropagatingBinding,
+            ExpressionStatement,
+            WhileLoop,
+            ForLoop,
+            Break,
+            Continue,
+        ),
+        ParsedTraitMethod(AbstractTraitMethod, DefaultTraitMethod),
+        ParsedTypeParameter,
+        PatternHead(BareHead, QualifiedHead, UnionVariantHead),
+        PostfixOperation(ReceiverInvocation, FieldAccess, TupleIndex),
+        Purity(Pure, Impure),
+        Span,
+        SpreadTarget(SpreadName, SpreadWildcard),
+        Symbol(LeftParen, LeftBracket, LeftBrace, Minus, Wildcard),
+        TypeSyntax(AtomicType, AppliedType, QualifiedType, CallableTypeSyntax, TupleTypeSyntax),
+        ValueExpression,
+        Visibility(Public, Private),
+        WrittenName,
+
+
+-- What a node's first token must be. Every node with a span records one, so a
+-- test can check that the span starts at that token.
+union FirstToken:
+    NameFirst
+    KeywordFirst(Keyword)
+    SymbolFirst(Symbol)
+    -- A numeric literal, or the minus folded into a negative one.
+    NumberFirst
+    -- A quoted, pipe or raw String, the start of an interpolated one, or a
+    -- text segment inside one.
+    StringFirst
+    CharFirst
+    -- `pure` or `func`, which start a lambda, a callable type or a signature.
+    CallableFirst
+    -- `private`, `pure`, `fixed`, `@` or a declaration keyword or name.
+    DeclarationFirst
+    -- `.`, `..` or a name, which start an import path.
+    PathFirst
+    -- A node that starts where another node does: a chain at its left operand.
+    StartsWith(Int)
+
+
+record NodeStart {
+    offset: Int,
+    first: FirstToken,
+}
+
+
+-- One parse-tree node in pre-order: a span-free label naming its kind, its
+-- spellings and decoded values, and how many children follow, and where its
+-- span starts. Two trees are the same program when their labels are equal.
+record SyntaxNode {
+    label: String,
+    start: Option[NodeStart],
+    -- A pair the formatter may remove or add, which no comparison counts.
+    layout_pair: Option[Span],
+}
+
+
+-- A written pair the formatter may remove or add: located, so its span is
+-- checked, but not compared.
+private LAYOUT_LABEL: String = "layout parentheses"
+
+
+private pure func node(label: String, offset: Int, first: FirstToken) -> SyntaxNode:
+    { label = label, start = Some({ offset = offset, first = first }), layout_pair = None }
+
+
+private pure func unlocated(label: String) -> SyntaxNode:
+    { label = label, start = None, layout_pair = None }
+
+
+-- Every name in the tree came from this table, so a missing spelling is a
+-- defect the label shows rather than hides.
+private pure func spelled(names: NameTable, name: WrittenName) -> String:
+    match names.name_spelling(name.id):
+        Some(spelling): spelling
+        None: "<missing name>"
+
+
+private pure func count(label: String, items: Int) -> String:
+    "${label} ${items}"
+
+
+private pure func visibility_label(visibility: Visibility) -> String:
+    match visibility:
+        Public: "public"
+        Private(_): "private"
+
+
+private pure func purity_label(purity: Purity) -> String:
+    match purity:
+        Pure: "pure"
+        Impure: "impure"
+
+
+private pure func type_nodes(
+    nodes: List[SyntaxNode],
+    names: NameTable,
+    written: TypeSyntax,
+) -> List[SyntaxNode]:
+    match written:
+        AtomicType(name):
+            nodes.append(node("type ${names.spelled(name)}", name.span.start, NameFirst))
+        AppliedType(name, arguments, span):
+            var gathered = nodes.append(
+                node(
+                    count("applied type ${names.spelled(name)}", arguments.length()),
+                    span.start,
+                    NameFirst,
+                ),
+            )
+            for argument in arguments:
+                gathered = gathered.type_nodes(names, argument)
+            gathered
+        QualifiedType(qualified, arguments, span):
+            label = "qualified type ${names.spelled(qualified.module)}.${names.spelled(qualified.name)}"
+            var gathered = nodes.append(
+                node(count(label, arguments.length()), span.start, NameFirst),
+            )
+            for argument in arguments:
+                gathered = gathered.type_nodes(names, argument)
+            gathered
+        CallableTypeSyntax(purity, parameters, result, span):
+            var gathered = nodes.append(
+                node(
+                    count("callable type ${purity.purity_label()}", parameters.length()),
+                    span.start,
+                    CallableFirst,
+                ),
+            )
+            for parameter in parameters:
+                gathered = gathered.type_nodes(names, parameter)
+            gathered.type_nodes(names, result)
+        TupleTypeSyntax(elements, span):
+            var gathered = nodes.append(
+                node(count("tuple type", elements.length()), span.start, SymbolFirst(LeftParen)),
+            )
+            for element in elements:
+                gathered = gathered.type_nodes(names, element)
+            gathered
+
+
+private pure func optional_type_nodes(
+    nodes: List[SyntaxNode],
+    names: NameTable,
+    written: Option[TypeSyntax],
+) -> List[SyntaxNode]:
+    match written:
+        Some(present):
+            nodes
+                .append(unlocated("annotated"))
+                .type_nodes(names, present)
+        None:
+            nodes.append(unlocated("unannotated"))
+
+
+private pure func binder_node(names: NameTable, binder: ParsedBinder) -> SyntaxNode:
+    match binder:
+        NamedBinder(name): node("binder ${names.spelled(name)}", name.span.start, NameFirst)
+        DiscardBinder(span): node("binder _", span.start, SymbolFirst(Wildcard))
+
+
+private pure func head_node(
+    names: NameTable,
+    head: PatternHead,
+    fields: Int,
+    span: Span,
+) -> SyntaxNode:
+    label = match head:
+        BareHead(name):
+            names.spelled(name)
+        QualifiedHead(qualified):
+            "${names.spelled(qualified.module)}.${names.spelled(qualified.name)}"
+        UnionVariantHead(variant):
+            "${names.spelled(variant.union_name)}.${names.spelled(variant.variant)}"
+    node(count("constructor pattern ${label}", fields), span.start, NameFirst)
+
+
+private pure func pattern_nodes(
+    nodes: List[SyntaxNode],
+    names: NameTable,
+    pattern: ParsedPattern,
+) -> List[SyntaxNode]:
+    match pattern:
+        PatternName(name) | PatternVariantName(name):
+            nodes.append(node("name pattern ${names.spelled(name)}", name.span.start, NameFirst))
+        PatternWildcard(span):
+            nodes.append(node("wildcard pattern", span.start, SymbolFirst(Wildcard)))
+        PatternConstructor(head, fields, span):
+            var gathered = nodes.append(names.head_node(head, fields.length(), span))
+            for field in fields:
+                gathered = gathered.pattern_nodes(names, field)
+            gathered
+        PatternOr(alternatives, span):
+            first_start = match alternatives.get(0):
+                Some(first): first.pattern_start()
+                None: span.start
+            var gathered = nodes.append(
+                node(
+                    count("or pattern", alternatives.length()),
+                    span.start,
+                    StartsWith(first_start),
+                ),
+            )
+            for alternative in alternatives:
+                gathered = gathered.pattern_nodes(names, alternative)
+            gathered
+        PatternList(elements, spread, span):
+            spread_label = match spread:
+                Some(SpreadName(name)): " ...${names.spelled(name)}"
+                Some(SpreadWildcard(_)): " ..._"
+                None: ""
+            var gathered = nodes.append(
+                node(
+                    count("list pattern${spread_label}", elements.length()),
+                    span.start,
+                    SymbolFirst(LeftBracket),
+                ),
+            )
+            for element in elements:
+                gathered = gathered.pattern_nodes(names, element)
+            gathered
+        PatternTuple(elements, span):
+            var gathered = nodes.append(
+                node(count("tuple pattern", elements.length()), span.start, SymbolFirst(LeftParen)),
+            )
+            for element in elements:
+                gathered = gathered.pattern_nodes(names, element)
+            gathered
+        PatternLiteral(ExactBytes(bytes), span):
+            nodes.append(node("string pattern ${bytes}", span.start, StringFirst))
+        PatternLiteral(ExactInt(value), span):
+            nodes.append(node("int pattern ${value}", span.start, NumberFirst))
+        PatternChar(span):
+            nodes.append(node("char pattern", span.start, CharFirst))
+
+
+private pure func pattern_start(pattern: ParsedPattern) -> Int:
+    match pattern:
+        PatternName(name) | PatternVariantName(name): name.span.start
+        PatternWildcard(span): span.start
+        PatternConstructor(_, _, span): span.start
+        PatternOr(_, span): span.start
+        PatternList(_, _, span): span.start
+        PatternTuple(_, span): span.start
+        PatternLiteral(_, span): span.start
+        PatternChar(span): span.start
+
+
+private pure func arithmetic_label(operator: ArithmeticOperator) -> String:
+    match operator:
+        AddOperator: "+"
+        SubtractOperator: "-"
+        MultiplyOperator: "*"
+        DivideOperator: "/"
+        RemainderOperator: "%"
+
+
+private pure func comparison_label(operator: ComparisonOperator) -> String:
+    match operator:
+        EqualOperator: "=="
+        NotEqualOperator: "!="
+        LessOperator: "<"
+        GreaterOperator: ">"
+        LessEqualOperator: "<="
+        GreaterEqualOperator: ">="
+
+
+-- The token a value's base must start with; a binary form starts at its left
+-- operand.
+private pure func base_first(base: ExpressionBase) -> FirstToken:
+    match base:
+        VoidExpression:
+            KeywordFirst(VoidKeyword)
+        IntegerExpression(_) | FloatExpression(_):
+            NumberFirst
+        StringExpression(_) | InterpolatedString(_):
+            StringFirst
+        NameExpression(_) | DirectApplication(_, _) | QualifiedName(_) | QualifiedApplication(_, _) | VariantName(_) | VariantApplication(_, _):
+            NameFirst
+        OpaqueWrap(_, _):
+            KeywordFirst(IntoOpaqueKeyword)
+        OpaqueUnwrap(_, _):
+            KeywordFirst(FromOpaqueKeyword)
+        ListExpression(_):
+            SymbolFirst(LeftBracket)
+        TupleExpression(_):
+            SymbolFirst(LeftParen)
+        RangeExpression(low, _):
+            StartsWith(low.span.start)
+        ComparisonExpression(_, _, left, _):
+            StartsWith(left.span.start)
+        ArithmeticExpression(_, _, left, _):
+            StartsWith(left.span.start)
+        NegationExpression(_, _):
+            SymbolFirst(Minus)
+        IfExpression(_):
+            KeywordFirst(IfKeyword)
+        MatchExpression(_):
+            KeywordFirst(MatchKeyword)
+        LambdaExpression(_):
+            CallableFirst
+        RecordExpression(_) | RecordUpdateExpression(_, _) | DictExpression(_):
+            SymbolFirst(LeftBrace)
+
+
+private pure func values_nodes(
+    nodes: List[SyntaxNode],
+    names: NameTable,
+    values: List[ValueExpression],
+) -> List[SyntaxNode]:
+    var gathered = nodes
+    for value in values:
+        gathered = gathered.value_nodes(names, value)
+    gathered
+
+
+-- Arguments and elements, each a whole value.
+private pure func whole_values_nodes(
+    nodes: List[SyntaxNode],
+    names: NameTable,
+    values: List[ValueExpression],
+) -> List[SyntaxNode]:
+    var gathered = nodes
+    for value in values:
+        gathered = gathered.whole_value_nodes(names, value)
+    gathered
+
+
+-- Whether a written pair is layout: one that wraps a whole value at a
+-- position where the formatter removes and adds pairs (README, "Formatting"),
+-- except around an `if`, `match` or block lambda, which the formatter keeps.
+-- Every other pair is part of what is compared.
+private pure func layout_pair(value: ValueExpression, pair: Span, whole: Bool) -> Bool:
+    content_end = match value.applications.last():
+        Some(ReceiverInvocation(call)): call.span.end
+        Some(FieldAccess(field)): field.span.end
+        Some(TupleIndex(_, span)): span.end
+        None: value.base_span.end
+    holds_block: Bool = match value.base:
+        IfExpression(_) | MatchExpression(_):
+            True
+        LambdaExpression(lambda):
+            match lambda.body:
+                BlockBody(_): True
+                InlineBody(_): False
+        _:
+            False
+    and(whole, and(pair.end >= content_end, holds_block.not()))
+
+
+private pure func pair_nodes(
+    nodes: List[SyntaxNode],
+    value: ValueExpression,
+    whole: Bool,
+) -> List[SyntaxNode]:
+    var gathered = nodes
+    for pair in value.parentheses:
+        located = node("parentheses", pair.start, SymbolFirst(LeftParen))
+        gathered = if value.layout_pair(pair, whole):
+            gathered.append({ located | label = LAYOUT_LABEL, layout_pair = Some(pair) })
+        else:
+            gathered.append(located)
+    gathered
+
+
+-- A value's base, then its postfix operations. Parentheses are layout: the
+-- labels omit them, but each pair's span must start at its `(`, and the value
+-- at its outermost pair.
+private pure func single_value_nodes(
+    nodes: List[SyntaxNode],
+    names: NameTable,
+    value: ValueExpression,
+    whole: Bool,
+) -> List[SyntaxNode]:
+    value_first: FirstToken = match value.parentheses.get(0):
+        Some(outermost): StartsWith(outermost.start)
+        None: StartsWith(value.base_span.start)
+    var gathered = nodes
+        .append(node(count("value", value.applications.length()), value.span.start, value_first))
+        .pair_nodes(value, whole)
+    gathered = gathered.base_nodes(names, value.base, value.base_span)
+    for application in value.applications:
+        gathered = match application:
+            ReceiverInvocation(call):
+                gathered
+                    .append(
+                        node(
+                            count(
+                                "receiver call ${names.spelled(call.callee)}",
+                                call.arguments.length(),
+                            ),
+                            call.span.start,
+                            NameFirst,
+                        ),
+                    )
+                    .whole_values_nodes(names, call.arguments)
+            FieldAccess(field):
+                gathered.append(node("field ${names.spelled(field)}", field.span.start, NameFirst))
+            TupleIndex(index, span):
+                gathered
+                    .append(node("index", span.start, SymbolFirst(LeftBracket)))
+                    .value_nodes(names, index)
+    gathered
+
+
+-- The same nodes in the same order as recursion would give, but a sum's left
+-- spine is walked in a loop, since a 2,000-term sum nests 2,000 deep: each
+-- operator's nodes outermost first, then the leftmost operand, then each right
+-- operand innermost first.
+pure func value_nodes(
+    nodes: List[SyntaxNode],
+    names: NameTable,
+    value: ValueExpression,
+) -> List[SyntaxNode]:
+    nodes.placed_value_nodes(names, value, False)
+
+
+-- A value at a whole-value position: a binding's, an argument, an element, a
+-- condition, a match scrutinee, a for loop's iterable (a header encloses a
+-- broken chain in parentheses), a body's final value, a field's or entry's
+-- value, a `?=` value.
+pure func whole_value_nodes(
+    nodes: List[SyntaxNode],
+    names: NameTable,
+    value: ValueExpression,
+) -> List[SyntaxNode]:
+    nodes.placed_value_nodes(names, value, True)
+
+
+private pure func placed_value_nodes(
+    nodes: List[SyntaxNode],
+    names: NameTable,
+    value: ValueExpression,
+    whole: Bool,
+) -> List[SyntaxNode]:
+    var spine: List[ValueExpression] = []
+    var rights: List[ValueExpression] = []
+    var leftmost = value
+    var walking: Bool = True
+    while walking:
+        walking = False
+        match leftmost.base:
+            ArithmeticExpression(operator, _, left, right):
+                if leftmost.applications.is_empty():
+                    spine = spine.append(leftmost)
+                    rights = rights.append(right)
+                    leftmost = left
+                    walking = True
+            _:
+                void
+    var gathered = nodes
+    -- Only the outermost value stands at the caller's position.
+    var link_whole = whole
+    for link in spine:
+        value_first: FirstToken = match link.parentheses.get(0):
+            Some(outermost): StartsWith(outermost.start)
+            None: StartsWith(link.base_span.start)
+        gathered = gathered
+            .append(node(count("value", 0), link.span.start, value_first))
+            .pair_nodes(link, link_whole)
+        link_whole = False
+        gathered = match link.base:
+            ArithmeticExpression(operator, _, _, _):
+                gathered.append(
+                    node(
+                        "arithmetic ${operator.arithmetic_label()}",
+                        link.base_span.start,
+                        link.base.base_first(),
+                    ),
+                )
+            _:
+                gathered
+    gathered = gathered.single_value_nodes(names, leftmost, link_whole)
+    for right in rights.reverse():
+        gathered = gathered.value_nodes(names, right)
+    gathered
+
+
+private pure func base_nodes(
+    nodes: List[SyntaxNode],
+    names: NameTable,
+    base: ExpressionBase,
+    span: Span,
+) -> List[SyntaxNode]:
+    located = pure func(label: String) -> SyntaxNode: node(label, span.start, base.base_first())
+    match base:
+        VoidExpression:
+            nodes.append(located("void"))
+        IntegerExpression(value):
+            nodes.append(located("integer ${value}"))
+        FloatExpression(value):
+            nodes.append(located("float ${value}"))
+        StringExpression(bytes):
+            nodes.append(located("string ${bytes}"))
+        InterpolatedString(parts):
+            nodes
+                .append(located(count("interpolated", parts.length())))
+                .values_nodes(names, parts)
+        NameExpression(name):
+            nodes.append(located("name ${names.spelled(name)}"))
+        DirectApplication(callee, arguments):
+            nodes
+                .append(located(count("call ${names.spelled(callee)}", arguments.length())))
+                .whole_values_nodes(names, arguments)
+        QualifiedName(qualified):
+            nodes.append(
+                located(
+                    "qualified ${names.spelled(qualified.module)}.${names.spelled(qualified.name)}",
+                ),
+            )
+        QualifiedApplication(qualified, arguments):
+            label = "qualified call ${names.spelled(qualified.module)}.${names.spelled(qualified.name)}"
+            nodes
+                .append(located(count(label, arguments.length())))
+                .whole_values_nodes(names, arguments)
+        VariantName(variant):
+            nodes.append(
+                located(
+                    "variant ${names.spelled(variant.union_name)}.${names.spelled(variant.variant)}",
+                ),
+            )
+        VariantApplication(variant, arguments):
+            label = "variant call ${names.spelled(variant.union_name)}.${names.spelled(variant.variant)}"
+            nodes
+                .append(located(count(label, arguments.length())))
+                .whole_values_nodes(names, arguments)
+        OpaqueWrap(name, value):
+            nodes
+                .append(located("into_opaque ${names.spelled(name)}"))
+                .value_nodes(names, value)
+        OpaqueUnwrap(name, value):
+            nodes
+                .append(located("from_opaque ${names.spelled(name)}"))
+                .value_nodes(names, value)
+        ListExpression(elements):
+            nodes
+                .append(located(count("list", elements.length())))
+                .whole_values_nodes(names, elements)
+        TupleExpression(elements):
+            nodes
+                .append(located(count("tuple", elements.length())))
+                .whole_values_nodes(names, elements)
+        RangeExpression(low, high):
+            nodes
+                .append(located("range"))
+                .value_nodes(names, low)
+                .value_nodes(names, high)
+        ComparisonExpression(operator, _, left, right):
+            nodes
+                .append(located("comparison ${operator.comparison_label()}"))
+                .value_nodes(names, left)
+                .value_nodes(names, right)
+        ArithmeticExpression(operator, _, left, right):
+            nodes
+                .append(located("arithmetic ${operator.arithmetic_label()}"))
+                .value_nodes(names, left)
+                .value_nodes(names, right)
+        NegationExpression(_, operand):
+            nodes
+                .append(located("negation"))
+                .value_nodes(names, operand)
+        IfExpression(form):
+            nodes.if_nodes(names, form)
+        MatchExpression(form):
+            nodes.match_nodes(names, form)
+        LambdaExpression(lambda):
+            return_label = match lambda.return_type:
+                Some(_): " returning"
+                None: ""
+            var gathered = nodes.append(
+                node(
+                    count(
+                        "lambda ${lambda.purity.purity_label()}${return_label}",
+                        lambda.parameters.length(),
+                    ),
+                    lambda.span.start,
+                    CallableFirst,
+                ),
+            )
+            for parameter in lambda.parameters:
+                gathered = gathered
+                    .append(names.binder_node(parameter.binder))
+                    .optional_type_nodes(names, parameter.annotation)
+            gathered = match lambda.return_type:
+                Some(returned): gathered.type_nodes(names, returned)
+                None: gathered
+            match lambda.body:
+                InlineBody(value):
+                    gathered
+                        .append(unlocated("inline body"))
+                        .whole_value_nodes(names, value)
+                BlockBody(block):
+                    gathered
+                        .append(unlocated("block body"))
+                        .block_nodes(names, block)
+        RecordExpression(fields):
+            var gathered = nodes.append(located(count("record", fields.length())))
+            for field in fields:
+                gathered = gathered
+                    .append(
+                        node(
+                            "field ${names.spelled(field.name)}",
+                            field.name.span.start,
+                            NameFirst,
+                        ),
+                    )
+                    .whole_value_nodes(names, field.value)
+            gathered
+        RecordUpdateExpression(updated, fields):
+            var gathered = nodes
+                .append(located(count("update", fields.length())))
+                .value_nodes(names, updated)
+            for field in fields:
+                gathered = gathered
+                    .append(
+                        node(
+                            "field ${names.spelled(field.name)}",
+                            field.name.span.start,
+                            NameFirst,
+                        ),
+                    )
+                    .whole_value_nodes(names, field.value)
+            gathered
+        DictExpression(entries):
+            var gathered = nodes.append(located(count("dict", entries.length())))
+            for entry in entries:
+                gathered = gathered
+                    .value_nodes(names, entry.key)
+                    .whole_value_nodes(names, entry.value)
+            gathered
+
+
+private pure func if_nodes(
+    nodes: List[SyntaxNode],
+    names: NameTable,
+    form: ParsedIf,
+) -> List[SyntaxNode]:
+    else_label = match form.else_branch:
+        None: "without else"
+        Some(ElseIf(_)): "else if"
+        Some(ElseBlock(_)): "else"
+    gathered = nodes
+        .append(node("if ${else_label}", form.span.start, KeywordFirst(IfKeyword)))
+        .whole_value_nodes(names, form.condition)
+        .block_nodes(names, form.then_block)
+    match form.else_branch:
+        None: gathered
+        Some(ElseIf(nested)): gathered.if_nodes(names, nested)
+        Some(ElseBlock(block)): gathered.block_nodes(names, block)
+
+
+private pure func match_nodes(
+    nodes: List[SyntaxNode],
+    names: NameTable,
+    form: ParsedMatch,
+) -> List[SyntaxNode]:
+    var gathered = nodes
+        .append(
+            node(count("match", form.arms.length()), form.span.start, KeywordFirst(MatchKeyword)),
+        )
+        .append(node("match keyword", form.keyword_span.start, KeywordFirst(MatchKeyword)))
+        .whole_value_nodes(names, form.scrutinee)
+    for arm in form.arms:
+        gathered = gathered
+            .append(node("arm", arm.span.start, StartsWith(arm.pattern.pattern_start())))
+            .pattern_nodes(names, arm.pattern)
+            .block_nodes(names, arm.block)
+    gathered
+
+
+-- Where a statement's own first token is. A binding has no span of its own:
+-- its first token is `var` or its name, and only the name is located.
+private pure func statement_start(statement: ParsedStatement) -> Int:
+    match statement:
+        BindingStatement(binding): binding.name.span.start
+        TupleBinding(_, _, span): span.start
+        PropagatingBinding(propagation): propagation.span.start
+        ExpressionStatement(value): value.span.start
+        WhileLoop(loop): loop.span.start
+        ForLoop(loop): loop.span.start
+        Break(span): span.start
+        Continue(span): span.start
+
+
+private pure func statement_nodes(
+    nodes: List[SyntaxNode],
+    names: NameTable,
+    statement: ParsedStatement,
+) -> List[SyntaxNode]:
+    match statement:
+        BindingStatement(binding):
+            mutable = if binding.mutable:
+                "var "
+            else:
+                ""
+            nodes
+                .append(
+                    node(
+                        "binding ${mutable}${names.spelled(binding.name)}",
+                        binding.name.span.start,
+                        NameFirst,
+                    ),
+                )
+                .optional_type_nodes(names, binding.annotation)
+                .whole_value_nodes(names, binding.initializer)
+        TupleBinding(binders, value, span):
+            var gathered = nodes.append(
+                node(count("tuple binding", binders.length()), span.start, SymbolFirst(LeftParen)),
+            )
+            for binder in binders:
+                gathered = gathered.append(names.binder_node(binder))
+            gathered.whole_value_nodes(names, value)
+        PropagatingBinding(propagation):
+            binder = names.binder_node(propagation.binder)
+            nodes
+                .append({ binder | label = "propagation ${binder.label}" })
+                .optional_type_nodes(names, propagation.annotation)
+                .whole_value_nodes(names, propagation.value)
+        ExpressionStatement(value):
+            nodes
+                .append(unlocated("expression statement"))
+                .value_nodes(names, value)
+        WhileLoop(loop):
+            nodes
+                .append(node("while", loop.span.start, KeywordFirst(WhileKeyword)))
+                .whole_value_nodes(names, loop.condition)
+                .block_nodes(names, loop.body)
+        ForLoop(loop):
+            var gathered = nodes.append(node("for", loop.span.start, KeywordFirst(ForKeyword)))
+            gathered = match loop.binder:
+                SingleForBinder(binder):
+                    gathered.append(names.binder_node(binder))
+                TupleForBinder(binders, span):
+                    var tupled = gathered.append(
+                        node(
+                            count("tuple binder", binders.length()),
+                            span.start,
+                            SymbolFirst(LeftParen),
+                        ),
+                    )
+                    for binder in binders:
+                        tupled = tupled.append(names.binder_node(binder))
+                    tupled
+            gathered
+                .whole_value_nodes(names, loop.iterable)
+                .block_nodes(names, loop.body)
+        Break(span):
+            nodes.append(node("break", span.start, KeywordFirst(BreakKeyword)))
+        Continue(span):
+            nodes.append(node("continue", span.start, KeywordFirst(ContinueKeyword)))
+
+
+private pure func block_nodes(
+    nodes: List[SyntaxNode],
+    names: NameTable,
+    block: ParsedBlock,
+) -> List[SyntaxNode]:
+    value_label = match block.value:
+        Some(_): " with value"
+        None: ""
+    -- A mutable binding's first token is `var`, which only the block's span
+    -- locates.
+    first: FirstToken = match (block.statements.get(0), block.value):
+        (Some(BindingStatement(binding)), _):
+            if binding.mutable:
+                KeywordFirst(VarKeyword)
+            else:
+                StartsWith(binding.name.span.start)
+        (Some(statement), _):
+            StartsWith(statement.statement_start())
+        (None, Some(value)):
+            StartsWith(value.span.start)
+        (None, None):
+            StartsWith(block.span.start)
+    var gathered = nodes.append(
+        node(count("block${value_label}", block.statements.length()), block.span.start, first),
+    )
+    for statement in block.statements:
+        gathered = gathered.statement_nodes(names, statement)
+    match block.value:
+        Some(value): gathered.whole_value_nodes(names, value)
+        None: gathered
+
+
+private pure func type_parameter_nodes(
+    nodes: List[SyntaxNode],
+    names: NameTable,
+    parameters: List[ParsedTypeParameter],
+) -> List[SyntaxNode]:
+    var gathered = nodes
+    for parameter in parameters:
+        gathered = gathered.append(
+            node(
+                count("type parameter ${names.spelled(parameter.name)}", parameter.bounds.length()),
+                parameter.name.span.start,
+                NameFirst,
+            ),
+        )
+        for bound in parameter.bounds:
+            gathered = gathered.type_nodes(names, bound)
+    gathered
+
+
+private pure func parameter_nodes(
+    nodes: List[SyntaxNode],
+    names: NameTable,
+    parameters: List[ParsedParameter],
+) -> List[SyntaxNode]:
+    var gathered = nodes
+    for parameter in parameters:
+        parameter_node = match parameter.binder:
+            NamedBinder(name): node("parameter ${names.spelled(name)}", name.span.start, NameFirst)
+            DiscardBinder(span): node("discarded parameter", span.start, SymbolFirst(Wildcard))
+        gathered = gathered
+            .append(parameter_node)
+            .type_nodes(names, parameter.type_name)
+    gathered
+
+
+private pure func field_nodes(
+    nodes: List[SyntaxNode],
+    names: NameTable,
+    fields: List[ParsedField],
+) -> List[SyntaxNode]:
+    var gathered = nodes
+    for field in fields:
+        gathered = gathered
+            .append(
+                node("parameter ${names.spelled(field.name)}", field.name.span.start, NameFirst),
+            )
+            .type_nodes(names, field.type_name)
+    gathered
+
+
+-- A signature's parts, after the node that names it.
+private pure func signature_nodes(
+    nodes: List[SyntaxNode],
+    names: NameTable,
+    type_parameters: List[ParsedTypeParameter],
+    parameters: List[ParsedParameter],
+    return_type: Option[TypeSyntax],
+) -> List[SyntaxNode]:
+    nodes
+        .append(unlocated(count("type parameters", type_parameters.length())))
+        .type_parameter_nodes(names, type_parameters)
+        .append(unlocated(count("parameters", parameters.length())))
+        .parameter_nodes(names, parameters)
+        .optional_type_nodes(names, return_type)
+
+
+-- A method's visibility is its implementation's or trait's, so only a free
+-- function's is labelled.
+private pure func function_nodes(
+    nodes: List[SyntaxNode],
+    names: NameTable,
+    function: ParsedFunction,
+    visibility: String,
+) -> List[SyntaxNode]:
+    tail = match function.tail_annotation:
+        Some(_): "tail recursive "
+        None: ""
+    label = "function ${visibility}${tail}${function.purity.purity_label()} ${names.spelled(function.function_name)}"
+    var gathered = nodes
+        .append(
+            node(
+                count(label, function.statements.length()),
+                function.start.start,
+                DeclarationFirst,
+            ),
+        )
+        .append(node("function name", function.function_name.span.start, NameFirst))
+        .signature_nodes(names, function.type_parameters, function.parameters, function.return_type)
+    for statement in function.statements:
+        gathered = gathered.statement_nodes(names, statement)
+    match function.body:
+        -- The formatter copies the label from the source, so it cannot change.
+        ParsedBuiltinBody(_, label_span):
+            gathered.append(node("builtin body", label_span.start, StringFirst))
+        ParsedValueBody(value):
+            gathered
+                .append(unlocated("value body"))
+                .whole_value_nodes(names, value)
+        ParsedMatchBody(form):
+            gathered
+                .append(unlocated("match body"))
+                .match_nodes(names, form)
+
+
+private pure func selection_nodes(
+    nodes: List[SyntaxNode],
+    names: NameTable,
+    selection: ImportSelection,
+) -> List[SyntaxNode]:
+    match selection:
+        NamedSelection(name):
+            nodes.append(node("select ${names.spelled(name)}", name.span.start, NameFirst))
+        ConstructorSelection(name, constructors):
+            var gathered = nodes.append(
+                node(
+                    count("select constructors ${names.spelled(name)}", constructors.length()),
+                    name.span.start,
+                    NameFirst,
+                ),
+            )
+            for constructor in constructors:
+                gathered = gathered.append(
+                    node(
+                        "constructor ${names.spelled(constructor)}",
+                        constructor.span.start,
+                        NameFirst,
+                    ),
+                )
+            gathered
+        MethodsSelection(name, modifier):
+            nodes
+                .append(node("select methods ${names.spelled(name)}", name.span.start, NameFirst))
+                .append(node("methods word", modifier.start, NameFirst))
+
+
+-- The path as written, which is also the order imports sort in.
+pure func import_path_text(names: NameTable, row: ParsedImport) -> String:
+    prefix = match row.path.origin:
+        LibraryImport:
+            ""
+        RelativeImport(parents):
+            var written = "./"
+            if parents > 0:
+                written = ""
+                for _ in 0..parents:
+                    written = written + "../"
+            written
+    parts = row.path.parts.map(
+        pure func(part): names
+            .name_spelling(part)
+            .get_or("<missing name>"),
+    )
+    prefix + parts.join("/")
+
+
+pure func string_less(left: String, right: String) -> Bool:
+    var position = 0
+    var decided: Option[Bool] = None
+    while and(
+        decided.is_none(),
+        (
+            position
+            < left
+                .length()
+                .max(right.length())
+        ),
+    ):
+        decided = match (left.byte_at(position), right.byte_at(position)):
+            (Some(first), Some(second)):
+                if first == second:
+                    None
+                else:
+                    Some(first < second)
+            (None, _):
+                Some(True)
+            (_, None):
+                Some(False)
+        position = position + 1
+    decided.get_or(False)
+
+
+-- Library modules first, then relative paths, each in byte order.
+pure func import_sorts_before(names: NameTable, left: ParsedImport, right: ParsedImport) -> Bool:
+    left_library: Bool = match left.path.origin:
+        LibraryImport: True
+        RelativeImport(_): False
+    right_library: Bool = match right.path.origin:
+        LibraryImport: True
+        RelativeImport(_): False
+    if left_library != right_library:
+        left_library
+    else:
+        string_less(names.import_path_text(left), names.import_path_text(right))
+
+
+-- Insertion sort; an import block has tens of rows.
+private pure func sorted_imports(names: NameTable, rows: List[ParsedImport]) -> List[ParsedImport]:
+    var sorted: List[ParsedImport] = []
+    for row in rows:
+        var position = sorted.length()
+        while and(
+            position > 0,
+            names.import_sorts_before(
+                row,
+                sorted
+                    .get(position - 1)
+                    .get_or(row),
+            ),
+        ):
+            position = position - 1
+        sorted = sorted
+            .take(position)
+            .append(row)
+            .concat(sorted.drop(position))
+    sorted
+
+
+private pure func import_nodes(
+    nodes: List[SyntaxNode],
+    names: NameTable,
+    row: ParsedImport,
+) -> List[SyntaxNode]:
+    alias_text = match row.module_alias:
+        Some(name): " as ${names.spelled(name)}"
+        None: ""
+    var gathered = nodes.append(
+        node(
+            count("import ${names.import_path_text(row)}${alias_text}", row.symbols.length()),
+            row.span.start,
+            PathFirst,
+        ),
+    )
+    gathered = match row.module_alias:
+        Some(name): gathered.append(node("module alias", name.span.start, NameFirst))
+        None: gathered
+    for selection in row.symbols:
+        gathered = gathered.selection_nodes(names, selection)
+    gathered
+
+
+-- The whole module in a span-free, layout-free form: imports sorted, then each
+-- declaration kind in written order.
+pure func module_nodes(contents: ParsedModuleContents) -> List[SyntaxNode]:
+    names = contents.names
+    var nodes: List[SyntaxNode] = []
+    for row in names.sorted_imports(contents.imports):
+        nodes = nodes.import_nodes(names, row)
+    for declaration in contents.builtin_types:
+        kind = match declaration.kind:
+            IntegerBuiltin(_, _): "Int"
+            FloatBuiltin(_): "Float"
+            StringBuiltin(_): "String"
+            VoidBuiltin(_): "Void"
+            ListBuiltin(_, parameter): "List[${names.spelled(parameter)}]"
+        nodes = nodes.append(
+            node("builtin type ${kind}", declaration.start.start, DeclarationFirst),
+        )
+        nodes = match declaration.kind:
+            ListBuiltin(_, parameter):
+                nodes.append(node("list parameter", parameter.span.start, NameFirst))
+            _:
+                nodes
+    for group in contents.functions:
+        nodes = match group:
+            FreeFunction(function):
+                nodes.function_nodes(names, function, "${function.visibility.visibility_label()} ")
+            ImplementationGroup(header, methods):
+                receiver = match header.receiver:
+                    ReceiverName(name):
+                        names.spelled(name)
+                    QualifiedReceiverName(qualified):
+                        "${names.spelled(qualified.module)}.${names.spelled(qualified.name)}"
+                var gathered = nodes
+                    .append(
+                        node(
+                            count(
+                                "implementation ${header.visibility.visibility_label()} for ${receiver}",
+                                methods.length(),
+                            ),
+                            header.start.start,
+                            DeclarationFirst,
+                        ),
+                    )
+                    .append(
+                        node(
+                            "implementation header",
+                            header.span.start,
+                            KeywordFirst(ImplementsKeyword),
+                        ),
+                    )
+                    .type_nodes(names, header.trait_name)
+                    .type_parameter_nodes(names, header.type_parameters)
+                for method in methods:
+                    gathered = gathered.function_nodes(names, method, "")
+                gathered
+    for declaration in contents.traits:
+        var gathered = nodes
+            .append(
+                node(
+                    count(
+                        "trait ${declaration.visibility.visibility_label()} ${names.spelled(declaration.type_name)}",
+                        declaration.methods.length(),
+                    ),
+                    declaration.start.start,
+                    DeclarationFirst,
+                ),
+            )
+            .append(node("trait header", declaration.span.start, KeywordFirst(TraitKeyword)))
+            .append(unlocated(count("supertraits", declaration.supertraits.length())))
+        for supertrait in declaration.supertraits:
+            gathered = gathered.type_nodes(names, supertrait)
+        for method in declaration.methods:
+            gathered = match method:
+                AbstractTraitMethod(header, span):
+                    gathered
+                        .append(
+                            node(
+                                "abstract method ${header.purity.purity_label()} ${names.spelled(header.function_name)}",
+                                span.start,
+                                CallableFirst,
+                            ),
+                        )
+                        .signature_nodes(
+                            names,
+                            header.type_parameters,
+                            header.parameters,
+                            header.return_type,
+                        )
+                DefaultTraitMethod(function, span):
+                    gathered
+                        .append(node("default method", span.start, CallableFirst))
+                        .function_nodes(names, function, "")
+        nodes = gathered
+    for declaration in contents.unions:
+        fixed = if declaration.fixed:
+            "fixed "
+        else:
+            ""
+        var gathered = nodes
+            .append(
+                node(
+                    count(
+                        "union ${declaration.visibility.visibility_label()} ${fixed}${names.spelled(declaration.type_name)}",
+                        declaration.variants.length(),
+                    ),
+                    declaration.start.start,
+                    DeclarationFirst,
+                ),
+            )
+            .type_parameter_nodes(names, declaration.type_parameters)
+        for variant in declaration.variants:
+            gathered = gathered.append(
+                node(
+                    count("variant ${names.spelled(variant.name)}", variant.fields.length()),
+                    variant.name.span.start,
+                    NameFirst,
+                ),
+            )
+            for field in variant.fields:
+                gathered = gathered.type_nodes(names, field)
+        nodes = gathered
+    for declaration in contents.records:
+        fixed = if declaration.fixed:
+            "fixed "
+        else:
+            ""
+        nodes = nodes
+            .append(
+                node(
+                    count(
+                        "record ${declaration.visibility.visibility_label()} ${fixed}${names.spelled(declaration.type_name)}",
+                        declaration.fields.length(),
+                    ),
+                    declaration.start.start,
+                    DeclarationFirst,
+                ),
+            )
+            .type_parameter_nodes(names, declaration.type_parameters)
+            .field_nodes(names, declaration.fields)
+    for declaration in contents.opaques:
+        nodes = nodes
+            .append(
+                node(
+                    "opaque ${declaration.visibility.visibility_label()} ${names.spelled(declaration.type_name)}",
+                    declaration.start.start,
+                    DeclarationFirst,
+                ),
+            )
+            .type_parameter_nodes(names, declaration.type_parameters)
+            .type_nodes(names, declaration.underlying)
+    for declaration in contents.constants:
+        nodes = nodes
+            .append(
+                node(
+                    "constant ${declaration.visibility.visibility_label()} ${names.spelled(declaration.name)}",
+                    declaration.start.start,
+                    DeclarationFirst,
+                ),
+            )
+            .type_nodes(names, declaration.type_name)
+            .whole_value_nodes(names, declaration.value)
+    nodes
+
+
+-- The offsets of the brackets of layout pairs, in order: each pair's `(` and
+-- its `)`.
+pure func layout_brackets(nodes: List[SyntaxNode]) -> List[Int]:
+    var offsets: List[Int] = []
+    for syntax in nodes:
+        match syntax.layout_pair:
+            Some(pair):
+                offsets = offsets
+                    .append(pair.start)
+                    .append(pair.end - 1)
+            None:
+                void
+    offsets.sort_by(pure func(offset: Int) -> Int: offset)
+
+
+-- The labels alone: the program, without where it was written or the
+-- parentheses that are only layout.
+pure func node_labels(nodes: List[SyntaxNode]) -> List[String]:
+    nodes
+        .filter(pure func(syntax: SyntaxNode) -> Bool: syntax.label != LAYOUT_LABEL)
+        .map(pure func(syntax: SyntaxNode) -> String: syntax.label)
+
+
+-- One declaration where it starts, labelled by its kind and name.
+private record PlacedDeclaration {
+    start: Int,
+    label: String,
+}
+
+
+-- The declarations of every kind in written order, which the per-kind lists
+-- above do not show: the formatter must not move one kind past another.
+pure func declaration_order(contents: ParsedModuleContents) -> List[String]:
+    names = contents.names
+    var placed: List[PlacedDeclaration] = []
+    for declaration in contents.builtin_types:
+        placed = placed.append({ start = declaration.start.start, label = "builtin type" })
+    for group in contents.functions:
+        placed = match group:
+            FreeFunction(function):
+                placed.append({
+                    start = function.start.start,
+                    label = "function ${names.spelled(function.function_name)}",
+                })
+            ImplementationGroup(header, _):
+                placed.append({ start = header.start.start, label = "implementation" })
+    for declaration in contents.traits:
+        placed = placed.append({
+            start = declaration.start.start,
+            label = "trait ${names.spelled(declaration.type_name)}",
+        })
+    for declaration in contents.unions:
+        placed = placed.append({
+            start = declaration.start.start,
+            label = "union ${names.spelled(declaration.type_name)}",
+        })
+    for declaration in contents.records:
+        placed = placed.append({
+            start = declaration.start.start,
+            label = "record ${names.spelled(declaration.type_name)}",
+        })
+    for declaration in contents.opaques:
+        placed = placed.append({
+            start = declaration.start.start,
+            label = "opaque ${names.spelled(declaration.type_name)}",
+        })
+    for declaration in contents.constants:
+        placed = placed.append({
+            start = declaration.start.start,
+            label = "constant ${names.spelled(declaration.name)}",
+        })
+    placed
+        .sort_by(pure func(declaration: PlacedDeclaration) -> Int: declaration.start)
+        .map(pure func(declaration: PlacedDeclaration) -> String: declaration.label)
+
+
+-- Where the first declaration starts, after any imports.
+pure func first_declaration_start(contents: ParsedModuleContents) -> Int:
+    var first = contents.end.start
+    for declaration in contents.builtin_types:
+        first = first.min(declaration.start.start)
+    for group in contents.functions:
+        first = match group:
+            FreeFunction(function): first.min(function.start.start)
+            ImplementationGroup(header, _): first.min(header.start.start)
+    for declaration in contents.traits:
+        first = first.min(declaration.start.start)
+    for declaration in contents.unions:
+        first = first.min(declaration.start.start)
+    for declaration in contents.records:
+        first = first.min(declaration.start.start)
+    for declaration in contents.opaques:
+        first = first.min(declaration.start.start)
+    for declaration in contents.constants:
+        first = first.min(declaration.start.start)
+    first

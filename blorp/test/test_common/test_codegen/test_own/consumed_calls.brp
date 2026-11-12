@@ -1,0 +1,109 @@
+import:
+    bool: Bool methods
+    int: Int methods
+    list: List methods
+    ../../../../src/common/codegen/own/own as own
+    ../../../../src/common/codegen/specialize/specialize as specialized
+
+
+-- Every operation of a block and the blocks nested in it.
+private pure func flatten(operations: List[own.OwnershipOperation]) -> List[own.OwnershipOperation]:
+    var all: List[own.OwnershipOperation] = []
+    for operation in operations:
+        all = all.append(operation)
+        match operation:
+            own.ExecuteLoop(loop):
+                all = all.concat(flatten_loop_block(loop.body))
+            own.ExecuteJoin(join):
+                for arm in join.arms:
+                    all = all.concat(flatten(arm.operations))
+                    match arm.exit:
+                        own.TransferLoop(_, tail): all = all.concat(flatten_loop_tail(tail))
+                        own.Yield(_): void
+            _:
+                void
+    all
+
+
+private pure func flatten_loop_block(block: own.OwnedLoopBlock) -> List[own.OwnershipOperation]:
+    flatten(block.operations).concat(flatten_loop_tail(block.tail))
+
+
+private pure func flatten_loop_tail(tail: own.OwnedLoopTail) -> List[own.OwnershipOperation]:
+    var all: List[own.OwnershipOperation] = []
+    match tail:
+        own.ExitLoop(_):
+            void
+        own.MatchLoop(matched):
+            for arm in matched.arms:
+                all = all.concat(flatten_loop_block(arm.body))
+    all
+
+
+-- One entry per selected call, True when it takes its first argument's last
+-- owner. A call that passes a fresh occurrence acquired for it still consumes
+-- that occurrence, but the accumulator keeps its own, so the update copies.
+pure func first_argument_consumed(
+    operations: List[own.OwnershipOperation],
+    selected: pure (own.OwnedDefinition) -> Bool,
+) -> List[Bool]:
+    all = flatten(operations)
+    var acquired: List[Int] = []
+    for operation in all:
+        match operation:
+            own.AcquireOwner(owner, _, _): acquired = acquired.append(own.owner_number(owner))
+            _: void
+    var consumed: List[Bool] = []
+    for operation in all:
+        match operation:
+            own.DefineValue(definition):
+                match definition.operation:
+                    own.CallDefinition(_, arguments):
+                        if selected(definition):
+                            match arguments:
+                                [own.ConsumedArgument(_, owner), ..._]:
+                                    consumed = consumed.append(
+                                        acquired
+                                            .contains(own.owner_number(owner))
+                                            .not(),
+                                    )
+                                _:
+                                    consumed = consumed.append(False)
+                    _:
+                        void
+            _:
+                void
+    consumed
+
+
+-- Passes only when the function has at least `expected` selected calls and
+-- every one consumes its accumulator.
+pure func all_consumed(consumed: List[Bool], expected: Int) -> Bool:
+    (consumed.length() >= expected).and(consumed.all(pure func(taken: Bool): taken))
+
+
+-- One entry per selected call, True when the call receives its first argument
+-- as an owned occurrence rather than a borrow. A borrowed in-place operand makes
+-- the helper copy. An owned one is unique at run time only if every other holder
+-- was released first, and these rows do not show that: the Dict witness checks the
+-- parameter is owned, and the strict allocation pin of the e2e `linear_build`
+-- fixture catches an update that still copies.
+pure func first_argument_owned(
+    operations: List[own.OwnershipOperation],
+    selected: pure (own.OwnedDefinition) -> Bool,
+) -> List[Bool]:
+    var owned: List[Bool] = []
+    for operation in flatten(operations):
+        match operation:
+            own.DefineValue(definition):
+                match definition.operation:
+                    own.CallDefinition(_, arguments):
+                        if selected(definition):
+                            match arguments:
+                                [own.ConsumedArgument(_, _), ..._]: owned = owned.append(True)
+                                _: owned = owned.append(False)
+                    _:
+                        void
+            _:
+                void
+    owned

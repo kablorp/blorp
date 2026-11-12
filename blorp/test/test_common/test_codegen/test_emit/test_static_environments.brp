@@ -1,0 +1,123 @@
+---
+A capture environment passed only to a static callee is emitted by value: a
+plain struct typedef with no count and no `make` helper, dup and drop helpers
+that act on each owned field (and skip a Void field, which has no member),
+and field reads through `.`.
+---
+import:
+    bool: Bool methods
+    result: Result methods
+    test: TestSuite
+    ../../../../src/common/analysis/check/check: check
+    ../../../../src/common/analysis/check/render: render_failure
+    ../../../../src/common/codegen/emit/emit: emit
+    ../../../../src/common/codegen/lower/lower: lower
+    ../../../../src/common/codegen/own/own: own
+    ../../../../src/common/codegen/specialize/specialize: specialize
+    ../../../../src/common/codegen/verify/verify: verify
+    ../../../../src/common/syntax/syntax: Diagnostic
+    ../../../support/module_input: parse_modules
+    ../../../support/text_search: has_text
+
+
+-- The lambda captures a Void and a String, in that order, so its environment,
+-- the program's only record, has fields 0 (Void) and 1 (String).
+private PROGRAM: String =
+    |pure func pick(ignored: Void, value: String) -> String:
+    |    value
+    |pure func apply(callback: pure (Int) -> String, value: Int) -> String:
+    |    callback(value)
+    |func main() -> Int:
+    |    text = "kept"
+    |    nothing = void
+    |    result = apply(pure func(item: Int) -> String: pick(nothing, text), 0)
+    |    0
+    |
+
+
+private pure func stage_failure(stage: String, diagnostic: Diagnostic) -> String:
+    "${stage}: ${diagnostic.message}"
+
+
+private pure func emitted() -> Result[String, String]:
+    parsed ?= parse_modules([{ source = PROGRAM, targets = [] }]).map_err(
+        pure func(error: Diagnostic) -> String: stage_failure("parse", error),
+    )
+    checked ?= check(parsed).map_err(
+        pure func(failure) -> String: stage_failure("check", render_failure(failure).first),
+    )
+    specialized ?= specialize(checked).map_err(
+        pure func(error: Diagnostic) -> String: stage_failure("specialize", error),
+    )
+    lowered ?= lower(specialized).map_err(
+        pure func(error: Diagnostic) -> String: stage_failure("lower", error),
+    )
+    owned ?= own(lowered).map_err(
+        pure func(error: Diagnostic) -> String: stage_failure("own", error),
+    )
+    verified ?= verify(owned).map_err(
+        pure func(error: Diagnostic) -> String: stage_failure("verify", error),
+    )
+    emit(verified).map_err(pure func(error: Diagnostic) -> String: stage_failure("emit", error))
+
+
+func with_code(check_code: pure (String) -> Bool) -> Bool:
+    match emitted():
+        Ok(code):
+            check_code(code)
+        Err(message):
+            print_error("the environment program was rejected at ${message}")
+            False
+
+
+private pure func struct_without_count(code: String) -> Bool:
+    has_text(code, "typedef struct blorp_r_0 blorp_r_0;")
+        .and(has_text(code, "struct blorp_r_0{struct blorp_string* blorp_rf_0_1;}"))
+        .and(has_text(code, "blorp_record_make_0(").not())
+
+
+private pure func helpers_act_on_owned_fields(code: String) -> Bool:
+    has_text(
+        code,
+        "void blorp_record_dup_0(blorp_r_0 value){(void)value;blorp_string_retain(value.blorp_rf_0_1);}",
+    ).and(
+        has_text(
+            code,
+            "void blorp_record_drop_0(blorp_r_0 value){(void)value;blorp_string_release(value.blorp_rf_0_1);}",
+        ),
+    )
+
+
+private pure func lambda_reads_by_value(code: String) -> Bool:
+    has_text(code, "=blorp_vl_0.blorp_rf_0_1;").and(has_text(code, "->blorp_rf_0_").not())
+
+
+func test_environment_struct_has_no_count_and_no_make() -> Bool:
+    with_code(struct_without_count)
+
+
+func test_environment_helpers_act_on_each_owned_field() -> Bool:
+    with_code(helpers_act_on_owned_fields)
+
+
+func test_lambda_reads_a_capture_through_the_value() -> Bool:
+    with_code(lambda_reads_by_value)
+
+
+TESTS: TestSuite = {
+    description = "Emitted by-value capture environments",
+    tests = [
+        (
+            "an environment struct has no count and no make helper",
+            test_environment_struct_has_no_count_and_no_make,
+        ),
+        (
+            "environment dup and drop act on each owned field",
+            test_environment_helpers_act_on_each_owned_field,
+        ),
+        (
+            "a lambda reads its capture through the value",
+            test_lambda_reads_a_capture_through_the_value,
+        ),
+    ],
+}

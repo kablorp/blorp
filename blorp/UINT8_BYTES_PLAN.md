@@ -86,7 +86,7 @@ How Int and Float are built in today:
   `Int`, `String`, `List[String]` or `Void` (`builtins.brp:192-203`).
   `emit.brp:1275` hard-codes the String list.
 - **Fixtures.** Test fixtures may bring their own `_base` that declares
-  built-in types (`test/e2e/trait_inputs/*/library/_base.brp`). New compiler
+  built-in types (`test/test_compile/trait_inputs/*/library/_base.brp`). New compiler
   support can therefore be tested before the production library uses it.
 - **Bootstrap.** The pinned seed parses `_base` and every library module the
   compiler imports: `bool`, `int`, `option`, `result`, `list`, `string`,

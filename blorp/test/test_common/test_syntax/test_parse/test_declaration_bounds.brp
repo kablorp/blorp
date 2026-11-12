@@ -1,0 +1,212 @@
+import:
+    bool: and
+    int: Int methods
+    list: List methods
+    option: Option methods
+    result: map_err
+    string: String methods
+    test: TestSuite
+    ../../../../src/common/syntax/lex: lex
+    ../../../../src/common/syntax/names: program_names
+    ../../../../src/common/syntax/parse: ParsedModule, module_contents, parse_module
+    ../../../../src/common/syntax/source: module_source, root_module_id
+    ../../../../src/common/syntax/syntax:
+        Diagnostic,
+        Span,
+        ParsedTypeParameter,
+        TypeSyntax(AtomicType, QualifiedType),
+
+
+private pure func parse_source(source: String) -> Result[ParsedModule, Diagnostic]:
+    tokens ?= lex(module_source(root_module_id()), source, program_names().names).map_err(
+        pure func(failure): failure.error,
+    )
+    parse_module(tokens, root_module_id())
+
+
+private pure func spans(span: Span, start: Int, end: Int) -> Bool:
+    span.start
+        .equals(start)
+        .and(span.end.equals(end))
+
+
+-- The parameter's name and each bound are bare names at the given offsets.
+private pure func bounded(
+    parameter: ParsedTypeParameter,
+    name: (Int, Int),
+    bounds: List[(Int, Int)],
+) -> Bool:
+    (name_start, name_end) = name
+    var matched = spans(parameter.name.span, name_start, name_end).and(
+        parameter.bounds.length() == bounds.length(),
+    )
+    var position = 0
+    for bound in parameter.bounds:
+        matched = match (bound, bounds.get(position)):
+            (AtomicType(written), Some((start, end))): matched.and(spans(written.span, start, end))
+            _: False
+        position = position + 1
+    matched
+
+
+private pure func rejects(
+    source: String,
+    start: Int,
+    end: Int,
+    message: String,
+    help: String,
+) -> Bool:
+    match parse_source(source):
+        Ok(_):
+            False
+        Err(error):
+            spans(error.span, start, end)
+                .and(error.message == message)
+                .and(error.help == help)
+                .and(error.note.is_none())
+
+
+-- A bound follows its parameter's `:`; bounds join with `+`, and an unbounded
+-- parameter may follow a bounded one.
+pure func test_a_record_parameter_takes_bounds() -> Bool:
+    match parse_source(
+        "record Table[K: Hashable + Equatable, V] { keys: List[K], values: List[V] }\n",
+    ):
+        Err(_):
+            False
+        Ok(parsed):
+            match module_contents(parsed).records:
+                [declaration]:
+                    match declaration.type_parameters:
+                        [key, value]:
+                            bounded(key, (13, 14), [(16, 24), (27, 36)]).and(
+                                bounded(value, (38, 39), []),
+                            )
+                        _:
+                            False
+                _:
+                    False
+
+
+pure func test_a_union_parameter_takes_bounds() -> Bool:
+    match parse_source("union Tree[T: Orderable]:\n    Leaf(T)\n    Empty\n"):
+        Err(_):
+            False
+        Ok(parsed):
+            match module_contents(parsed).unions:
+                [declaration]:
+                    match declaration.type_parameters:
+                        [parameter]:
+                            bounded(parameter, (11, 12), [(14, 23)]).and(
+                                declaration.variants.length() == 2,
+                            )
+                        _:
+                            False
+                _:
+                    False
+
+
+pure func test_an_opaque_parameter_takes_bounds() -> Bool:
+    match parse_source("opaque type Index[K: Hashable, V] = List[K]\n"):
+        Err(_):
+            False
+        Ok(parsed):
+            match module_contents(parsed).opaques:
+                [declaration]:
+                    match declaration.type_parameters:
+                        [key, value]:
+                            bounded(key, (18, 19), [(21, 29)]).and(bounded(value, (31, 32), []))
+                        _:
+                            False
+                _:
+                    False
+
+
+pure func test_a_qualified_bound_keeps_its_span() -> Bool:
+    match parse_source("record Box[T: base.Named] { value: T }\n"):
+        Err(_):
+            False
+        Ok(parsed):
+            match module_contents(parsed).records:
+                [declaration]:
+                    match declaration.type_parameters:
+                        [parameter]:
+                            match parameter.bounds:
+                                [QualifiedType(name, [], span)]:
+                                    spans(span, 14, 24)
+                                        .and(spans(name.module.span, 14, 18))
+                                        .and(spans(name.name.span, 19, 24))
+                                _:
+                                    False
+                        _:
+                            False
+                _:
+                    False
+
+
+-- A fixed declaration still takes no parameters, bounded or not; the whole
+-- written list is reported.
+pure func test_a_fixed_declaration_rejects_bounded_parameters() -> Bool:
+    rejects(
+        "fixed record Point[T: Named] { x: Int }\n",
+        18,
+        28,
+        "a fixed record cannot declare type parameters",
+        "remove fixed to declare an ordinary generic record, or remove the type parameters",
+    ).and(
+        rejects(
+            "fixed union Mark[T: Named]:\n    Set(T)\n",
+            16,
+            26,
+            "a fixed union cannot declare type parameters",
+            "remove fixed to declare an ordinary generic union, or remove the type parameters",
+        ),
+    )
+
+
+pure func test_a_bound_needs_a_trait_name() -> Bool:
+    rejects(
+        "record Box[T: ] { value: T }\n",
+        14,
+        15,
+        "expected a trait name after ':' or '+'",
+        "use an ASCII identifier starting with a letter; keywords and lone '_' are reserved",
+    ).and(
+        rejects(
+            "opaque type Index[K: Hashable +] = List[K]\n",
+            31,
+            32,
+            "expected a trait name after ':' or '+'",
+            "use an ASCII identifier starting with a letter; keywords and lone '_' are reserved",
+        ),
+    )
+
+
+pure func test_bounds_end_at_a_comma_or_the_closing_bracket() -> Bool:
+    rejects(
+        "union Tree[T: Orderable Named]:\n    Leaf(T)\n",
+        24,
+        29,
+        "expected ',' or ']' after a type parameter",
+        "separate type parameters with commas and close the list with ']'",
+    )
+
+
+TESTS: TestSuite = {
+    description = "declaration bound parsing",
+    tests = [
+        ("a record parameter takes bounds", test_a_record_parameter_takes_bounds),
+        ("a union parameter takes bounds", test_a_union_parameter_takes_bounds),
+        ("an opaque parameter takes bounds", test_an_opaque_parameter_takes_bounds),
+        ("a qualified bound keeps its span", test_a_qualified_bound_keeps_its_span),
+        (
+            "a fixed declaration rejects bounded parameters",
+            test_a_fixed_declaration_rejects_bounded_parameters,
+        ),
+        ("a bound needs a trait name", test_a_bound_needs_a_trait_name),
+        (
+            "bounds end at a comma or the closing bracket",
+            test_bounds_end_at_a_comma_or_the_closing_bracket,
+        ),
+    ],
+}

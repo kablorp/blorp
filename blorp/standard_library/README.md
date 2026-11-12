@@ -648,9 +648,10 @@ A caller that mixes operations writes its own error union and wraps with a
       fold_lines(path, 0, add_score, pure func(error: ReadError) -> ScoreError: Unreadable(error))
   ```
 
-The runtime C is tested by `test/runtime/fs_suite.brp`, and the examples
-`test/e2e/fixtures/fs/read.brp`, `lines.brp`, `write.brp` and `directories.brp`
-run the library through ordinary mains. The harness runs `lines.brp` with at
+The runtime C is tested by
+`test/test_common/test_codegen/test_runtime/fs_suite.brp`, and the examples
+`test/test_compile/fixtures/fs/read.brp`, `lines.brp`, `write.brp` and
+`directories.brp` run the library through ordinary mains. The harness runs `lines.brp` with at
 most 256 open descriptors, so a fold that left its file open would fail its
 1,000 early stops and 300 failed reads on every machine.
 
@@ -708,7 +709,7 @@ run in registration order, including entries after a False result. Empty suites
 pass. `run_suite_result` prints results and returns `TestCounts { passed, failed }`;
 `suites_exit_status` returns 0 when no suite failed and 1 otherwise, and
 `run_suite` does the same for one suite. See the
-[text suite](../test/unit/test_common/test_utils/test_text.brp).
+[text suite](../test/test_common/test_utils/test_text.brp).
 
 ## Process execution
 

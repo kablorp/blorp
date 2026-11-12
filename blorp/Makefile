@@ -19,7 +19,7 @@ BLORP_TEST_COMPILER := blorp/build/blorp-test
 BLORP_COMPILER_C := blorp/build/blorp.c
 TEST_COMPILER_FLAGS := -O0
 TEST_COMPILER_LIBRARIES := -lm -lpthread
-# The component programs are listed in test/e2e/self_hosted.brp. Setting this
+# The component programs are listed in test/driver/driver.brp. Setting this
 # to source paths runs exactly those instead, for the narrow loop.
 TARGET_COMPONENT_SOURCES :=
 # Set to `on` on macOS (`make test INSTRUCTION_CHECK=on`) to also hold each
@@ -28,8 +28,8 @@ TARGET_COMPONENT_SOURCES :=
 # Any other value is an error, so `INSTRUCTION_CHECK=off` cannot enable it.
 INSTRUCTION_CHECK :=
 # Beside the component programs, whose root is BUILD_ROOT in
-# test/e2e/self_hosted_selection.brp. No test directory is named `driver`, so
-# no component program overwrites it.
+# test/driver/selection.brp. Component programs are built from `test_*.brp`
+# files, so none is named `driver` and none overwrites it.
 TEST_DRIVER_DIRECTORY := blorp/build/self-hosted-tests/driver
 TEST_DRIVER := $(TEST_DRIVER_DIRECTORY)/driver
 
@@ -79,7 +79,7 @@ link-compiler:
 
 example: compiler
 	@mkdir -p build
-	@cd .. && "$(BLORP_COMPILER)" compile blorp/test/e2e/fixtures/return/zero.brp \
+	@cd .. && "$(BLORP_COMPILER)" compile blorp/test/test_compile/fixtures/return/zero.brp \
 		--library-root blorp/standard_library -o blorp/build/return_zero.c
 	@"$(BLORP_CC)" -std=c11 -Wall -Wextra -Werror -pedantic -O0 \
 		build/return_zero.c -o build/return_zero
@@ -112,12 +112,12 @@ test:
 # run alone it needs `make -C blorp test-compiler` (or `compiler`) beforehand.
 FORMAT_ROOTS := blorp/scripts blorp/src blorp/standard_library blorp/test
 FORMAT_EXCLUDED := \
-	blorp/test/unit/test_format/fixtures \
-	blorp/test/e2e/fixtures/opaque/generic/explicit_arguments.brp \
-	blorp/test/e2e/fixtures/unsupported/propagation_if.brp \
-	blorp/test/e2e/fixtures/unsupported/propagation_match.brp \
-	blorp/test/e2e/fixtures/variants/alias_union_variant.brp \
-	blorp/test/e2e/trait_inputs/operators/reject_chain.brp
+	blorp/test/test_format/fixtures \
+	blorp/test/test_compile/fixtures/opaque/generic/explicit_arguments.brp \
+	blorp/test/test_compile/fixtures/unsupported/propagation_if.brp \
+	blorp/test/test_compile/fixtures/unsupported/propagation_match.brp \
+	blorp/test/test_compile/fixtures/variants/alias_union_variant.brp \
+	blorp/test/test_compile/trait_inputs/operators/reject_chain.brp
 
 format-check:
 	@$(RESOLVE_TEST_TOOLS); \
@@ -138,7 +138,7 @@ format-check:
 build-test-driver:
 	@set -eu; $(RESOLVE_TEST_TOOLS); \
 		mkdir -p "$(TEST_DRIVER_DIRECTORY)"; rm -f "$(TEST_DRIVER)"; \
-		BLORP_LEAK_CHECK=strict "$$compiler_path" compile blorp/test/e2e/self_hosted.brp \
+		BLORP_LEAK_CHECK=strict "$$compiler_path" compile blorp/test/driver/driver.brp \
 			--library-root blorp/standard_library -o "$(TEST_DRIVER).c"; \
 		"$$cc_path" -std=c11 -Wall -Wextra -Werror -pedantic -O0 \
 			-fsanitize=undefined -fno-sanitize-recover=all \

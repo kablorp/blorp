@@ -1,0 +1,406 @@
+import:
+    bool: Bool methods
+    option: Option methods
+    result: Result methods
+    test: TestSuite
+    ../../../../src/common/analysis/namespace/builtins as builtins
+    ../../../../src/common/codegen/lower/lower as lower
+    ../../../../src/common/codegen/own/own as own
+    ../../../../src/common/codegen/specialize/specialize as specialized
+    ../../../../src/common/codegen/verify/verify: verify
+    ../../../../src/common/syntax/syntax:
+        IntegerFormat(Int64Format),
+        compiler_span,
+        Entrypoint(NoArguments),
+        EntryResult(IntegerExitStatus),
+        SystemOperation(FsWriteText),
+    ../../../support/fs_write_inputs: FsWriteSeed, fs_write_seed
+    ../../../support/list_update_inputs: placeholder_label
+    ../../../support/module_input: test_base
+    ../../../support/ownership_inputs: InputIds, input_ids, span
+
+
+private pure func with_fs_write_inputs(callback: pure (FsWriteSeed, InputIds) -> Bool) -> Bool:
+    match (fs_write_seed(test_base()), input_ids()):
+        (Ok(seed), Ok(ids)): callback(seed, ids)
+        _: False
+
+
+private pure func arguments(ids: InputIds) -> List[own.OwnedArgument]:
+    [
+        own.BorrowedArgument({ value = ids.first, source = own.OwnerBorrow(own.owner_id(0)) }),
+        own.BorrowedArgument({ value = ids.second, source = own.OwnerBorrow(own.owner_id(1)) }),
+    ]
+
+
+private pure func call_result(seed: FsWriteSeed, ids: InputIds) -> own.OwnedDefinition:
+    {
+        id = ids.third,
+        value_type = specialized.UnionType(specialized.variant_owner(seed.constructors.ok)),
+        operation = own.CallDefinition(
+            specialized.RuntimeFunction(builtins.SystemCall(FsWriteText, seed.constructors)),
+            arguments(ids),
+        ),
+        result = own.UnmanagedResult,
+        span = span(30),
+    }
+
+
+private pure func drops() -> List[own.OwnershipOperation]:
+    [own.DropOwner(own.owner_id(0), span(40)), own.DropOwner(own.owner_id(1), span(41))]
+
+
+-- Raw definitions, borrows and owner transfers are independent of insertion.
+private pure func raw_result(
+    seed: FsWriteSeed,
+    ids: InputIds,
+    result: own.OwnedDefinition,
+    before: List[own.OwnershipOperation],
+    after: List[own.OwnershipOperation],
+) -> own.OwnershipProgram:
+    path: own.OwnedDefinition = {
+        id = ids.first,
+        value_type = specialized.StringType,
+        operation = own.StringDefinition("path"),
+        result = own.OwnedResult(own.owner_id(0)),
+        span = span(10),
+    }
+    contents = { path |
+        id = ids.second,
+        result = own.OwnedResult(own.owner_id(1)),
+        span = span(20),
+    }
+    zero: own.OwnedDefinition = {
+        id = ids.fourth,
+        value_type = specialized.IntegerType(Int64Format),
+        operation = own.IntegerDefinition(Int64Format, 0),
+        result = own.UnmanagedResult,
+        span = span(50),
+    }
+    function: own.OwnedFunction = {
+        label = placeholder_label("main"),
+        parameters = [],
+        return_type = specialized.IntegerType(Int64Format),
+        operations = [own.DefineValue(path), own.DefineValue(contents)]
+            .concat(before)
+            .append(own.DefineValue(result))
+            .concat(after)
+            .append(own.DefineValue(zero)),
+        result = own.UnmanagedReturn(ids.fourth),
+    }
+    {
+        records = [],
+        unions = lower.lowered_functions(seed.lowered).unions,
+        functions = [function],
+        entrypoint = NoArguments(ids.entrypoint, IntegerExitStatus),
+    }
+
+
+private pure func rejects(program: own.OwnershipProgram, message: String, at: Int) -> Bool:
+    match verify(program):
+        Ok(_):
+            False
+        Err(error):
+            (error.message == "ownership verification failed: " + message)
+                .and(error.help == "report this compiler error with the input program")
+                .and(error.span.source == span(at).source)
+                .and(error.span.start == at)
+                .and(error.span.end == at + 1)
+                .and(error.note.is_none())
+
+
+private pure func changed_arguments(
+    seed: FsWriteSeed,
+    ids: InputIds,
+    supplied: List[own.OwnedArgument],
+) -> own.OwnedDefinition:
+    result = call_result(seed, ids)
+    { result |
+        operation = own.CallDefinition(
+            specialized.RuntimeFunction(builtins.SystemCall(FsWriteText, seed.constructors)),
+            supplied,
+        ),
+    }
+
+
+private pure func wrong_layout(
+    seed: FsWriteSeed,
+    ids: InputIds,
+    variants: List[List[specialized.TypeRef]],
+) -> Bool:
+    program = raw_result(seed, ids, call_result(seed, ids), [], drops())
+    unions: List[specialized.ConcreteUnion] = [specialized.PlainCases(variants)]
+    rejects({ program | unions = unions }, "variant payload does not match its operation", 30)
+
+
+-- A managed payload in a plain union is caught by the layout check, which has no source span.
+private pure func plain_layout_with_string_error_rejects(seed: FsWriteSeed, ids: InputIds) -> Bool:
+    program = raw_result(seed, ids, call_result(seed, ids), [], drops())
+    unions: List[specialized.ConcreteUnion] = [
+        specialized.PlainCases([[specialized.VoidType], [specialized.StringType]]),
+    ]
+    match verify({ program | unions = unions }):
+        Ok(_):
+            False
+        Err(error):
+            (error.message == "ownership verification failed: union ownership summary does not match its payloads")
+                .and(error.help == "report this compiler error with the input program")
+                .and(error.span == compiler_span())
+                .and(error.note.is_none())
+
+
+pure func test_raw_two_borrows_and_unmanaged_result_verify() -> Bool:
+    with_fs_write_inputs(
+        pure func(seed, ids): verify(raw_result(seed, ids, call_result(seed, ids), [], drops())).is_ok(),
+    )
+
+
+pure func test_same_string_can_supply_both_live_borrows() -> Bool:
+    with_fs_write_inputs(pure func(seed, ids):
+        match arguments(ids):
+            [first, _]:
+                verify(
+                    raw_result(
+                        seed,
+                        ids,
+                        changed_arguments(seed, ids, [first, first]),
+                        [],
+                        drops(),
+                    ),
+                ).is_ok()
+            _:
+                False
+    )
+
+
+private pure func wrong_argument_type(seed: FsWriteSeed, ids: InputIds, position: Int) -> Bool:
+    supplied = if position == 0:
+        [
+            own.UnmanagedArgument(ids.first),
+            own.BorrowedArgument({ value = ids.second, source = own.OwnerBorrow(own.owner_id(0)) }),
+        ]
+    else:
+        [
+            own.BorrowedArgument({ value = ids.first, source = own.OwnerBorrow(own.owner_id(0)) }),
+            own.UnmanagedArgument(ids.second),
+        ]
+    result = changed_arguments(seed, ids, supplied)
+    cleanup = [own.DropOwner(own.owner_id(0), span(40))]
+    program = raw_result(seed, ids, result, [], cleanup)
+    match program.functions:
+        [function]:
+            match function.operations:
+                [own.DefineValue(path), own.DefineValue(contents), ...remaining]:
+                    original = if position == 0:
+                        path
+                    else:
+                        contents
+                    wrong = { original |
+                        value_type = specialized.IntegerType(Int64Format),
+                        operation = own.IntegerDefinition(Int64Format, 7),
+                        result = own.UnmanagedResult,
+                    }
+                    prefix = if position == 0:
+                        [
+                            own.DefineValue(wrong),
+                            own.DefineValue(
+                                { contents | result = own.OwnedResult(own.owner_id(0)) },
+                            ),
+                        ]
+                    else:
+                        [own.DefineValue(path), own.DefineValue(wrong)]
+                    rejects(
+                        { program |
+                            functions = [{ function | operations = prefix.concat(remaining) }],
+                        },
+                        "call argument type does not match its contract",
+                        30,
+                    )
+                _:
+                    False
+        _:
+            False
+
+
+pure func test_wrong_path_type_rejects() -> Bool:
+    with_fs_write_inputs(pure func(seed, ids): wrong_argument_type(seed, ids, 0))
+
+
+pure func test_wrong_contents_type_rejects() -> Bool:
+    with_fs_write_inputs(pure func(seed, ids): wrong_argument_type(seed, ids, 1))
+
+
+pure func test_swapped_constructor_roles_reject() -> Bool:
+    with_fs_write_inputs(pure func(seed, ids):
+        result = call_result(seed, ids)
+        swapped = { seed.constructors | ok = seed.constructors.err, err = seed.constructors.ok }
+        changed = { result |
+            operation = own.CallDefinition(
+                specialized.RuntimeFunction(builtins.SystemCall(FsWriteText, swapped)),
+                arguments(ids),
+            ),
+        }
+        rejects(
+            raw_result(seed, ids, changed, [], drops()),
+            "variant payload does not match its operation",
+            30,
+        )
+    )
+
+
+pure func test_wrong_borrow_owner_rejects() -> Bool:
+    with_fs_write_inputs(pure func(seed, ids):
+        wrong = own.BorrowedArgument({
+            value = ids.first,
+            source = own.OwnerBorrow(own.owner_id(1)),
+        })
+        rejects(
+            raw_result(seed, ids, changed_arguments(seed, ids, [wrong, wrong]), [], drops()),
+            "owner 1 does not own value 0",
+            30,
+        )
+    )
+
+
+pure func test_early_path_drop_rejects() -> Bool:
+    with_fs_write_inputs(pure func(seed, ids):
+        rejects(
+            raw_result(
+                seed,
+                ids,
+                call_result(seed, ids),
+                [own.DropOwner(own.owner_id(0), span(25))],
+                drops(),
+            ),
+            "borrow refers to discharged owner 0",
+            30,
+        )
+    )
+
+
+pure func test_early_contents_drop_rejects() -> Bool:
+    with_fs_write_inputs(pure func(seed, ids):
+        rejects(
+            raw_result(
+                seed,
+                ids,
+                call_result(seed, ids),
+                [own.DropOwner(own.owner_id(1), span(25))],
+                drops(),
+            ),
+            "borrow refers to discharged owner 1",
+            30,
+        )
+    )
+
+
+pure func test_wrong_return_type_rejects() -> Bool:
+    with_fs_write_inputs(pure func(seed, ids):
+        result = { call_result(seed, ids) |
+            value_type = specialized.IntegerType(Int64Format),
+            result = own.UnmanagedResult,
+        }
+        rejects(
+            raw_result(seed, ids, result, [], drops()),
+            "call result type does not match its contract",
+            30,
+        )
+    )
+
+
+pure func test_missing_string_drop_rejects() -> Bool:
+    with_fs_write_inputs(pure func(seed, ids):
+        rejects(
+            raw_result(seed, ids, call_result(seed, ids), [], [
+                own.DropOwner(own.owner_id(1), span(41)),
+            ]),
+            "owner 0 remains live at return",
+            50,
+        )
+    )
+
+
+pure func test_double_string_drop_rejects() -> Bool:
+    with_fs_write_inputs(pure func(seed, ids):
+        rejects(
+            raw_result(
+                seed,
+                ids,
+                call_result(seed, ids),
+                [],
+                drops().append(own.DropOwner(own.owner_id(0), span(45))),
+            ),
+            "owner 0 has already been discharged",
+            45,
+        )
+    )
+
+
+pure func test_wrong_void_success_slot_rejects() -> Bool:
+    with_fs_write_inputs(
+        pure func(seed, ids): wrong_layout(seed, ids, [
+            [specialized.IntegerType(Int64Format)],
+            [specialized.IntegerType(Int64Format)],
+        ]),
+    )
+
+
+pure func test_wrong_string_error_slot_rejects() -> Bool:
+    with_fs_write_inputs(plain_layout_with_string_error_rejects)
+
+
+pure func test_missing_contents_rejects() -> Bool:
+    with_fs_write_inputs(
+        pure func(seed, ids): rejects(
+            raw_result(
+                seed,
+                ids,
+                changed_arguments(seed, ids, arguments(ids).take(1)),
+                [],
+                drops(),
+            ),
+            "call is missing its argument",
+            30,
+        ),
+    )
+
+
+pure func test_extra_argument_rejects() -> Bool:
+    with_fs_write_inputs(
+        pure func(seed, ids): rejects(
+            raw_result(
+                seed,
+                ids,
+                changed_arguments(seed, ids, arguments(ids).concat(arguments(ids))),
+                [],
+                drops(),
+            ),
+            "call has an unexpected argument",
+            30,
+        ),
+    )
+
+
+TESTS: TestSuite = {
+    description = "Blorp independent fs.write_text verification",
+    tests = [
+        (
+            "raw two-borrow unmanaged Result is valid",
+            test_raw_two_borrows_and_unmanaged_result_verify,
+        ),
+        ("same value may be borrowed twice", test_same_string_can_supply_both_live_borrows),
+        ("wrong Void success slot rejects", test_wrong_void_success_slot_rejects),
+        ("plain union with a String error slot rejects", test_wrong_string_error_slot_rejects),
+        ("swapped Void/Int roles reject", test_swapped_constructor_roles_reject),
+        ("non-String path rejects", test_wrong_path_type_rejects),
+        ("non-String contents reject", test_wrong_contents_type_rejects),
+        ("missing contents rejects", test_missing_contents_rejects),
+        ("extra argument rejects", test_extra_argument_rejects),
+        ("wrong borrow owner rejects", test_wrong_borrow_owner_rejects),
+        ("early path drop rejects", test_early_path_drop_rejects),
+        ("early contents drop rejects", test_early_contents_drop_rejects),
+        ("wrong return type rejects", test_wrong_return_type_rejects),
+        ("missing String drop rejects", test_missing_string_drop_rejects),
+        ("double String drop rejects", test_double_string_drop_rejects),
+    ],
+}

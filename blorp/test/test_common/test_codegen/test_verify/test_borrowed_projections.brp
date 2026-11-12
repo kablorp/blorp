@@ -1,0 +1,504 @@
+import:
+    bool: Bool methods
+    int: Int methods
+    list: List methods
+    option: Option methods
+    result: Result methods
+    string: String methods
+    test: TestSuite
+    ../../../../src/common/codegen/lower/lower as lower
+    ../../../../src/common/codegen/own/own as own
+    ../../../../src/common/codegen/specialize/specialize as specialized
+    ../../../../src/common/codegen/verify/verify: verify
+    ../../../../src/common/syntax/syntax:
+        IntegerFormat(Int64Format),
+        Diagnostic,
+        DiagnosticKind(ProgramProblem),
+    ../../../support/list_update_inputs: lowered, placeholder_label, span, UPDATE_DECLARATIONS
+
+
+-- Lowering mints the identities; every ownership fact below is written by
+-- hand, independently of insertion.
+private SEED: String =
+    |record Bag { items: List[Int], extra: List[Int] }
+    |record Holder { bag: Bag }
+    |func main() -> Int:
+    |    empty: List[Int] = []
+    |    bag: Bag = { items = empty, extra = empty }
+    |    holder: Holder = { bag = bag }
+    |    inner = holder.bag
+    |    count = length(inner.items)
+    |    count
+    |
+
+
+private record NestedSeed {
+    program: lower.LoweredFunctions,
+    empty: lower.ValueId,
+    bag: lower.ValueId,
+    holder: lower.ValueId,
+    inner: lower.ValueId,
+    items: lower.ValueId,
+    count: lower.ValueId,
+    bag_type: specialized.RecordInstanceId,
+    holder_type: specialized.RecordInstanceId,
+    bag_fields: List[specialized.FieldInstanceId],
+    holder_field: specialized.FieldInstanceId,
+    items_field: specialized.FieldInstanceId,
+    length: specialized.CallTarget,
+    wrapper: own.OwnedFunction,
+}
+
+
+-- The `length` wrapper borrows its List and calls the runtime operation.
+private pure func raw_wrapper(function: lower.LoweredFunction) -> Option[own.OwnedFunction]:
+    match function.steps:
+        [lower.Define(parameter), lower.Define(call)]:
+            match call.operation:
+                lower.CallValue(target, _):
+                    borrowed: own.BorrowedValue = {
+                        value = parameter.id,
+                        source = own.ParameterBorrow(parameter.id),
+                    }
+                    Some({
+                        label = placeholder_label("length"),
+                        parameters = [
+                            own.ManagedParameter({
+                                value_type = parameter.value_type,
+                                owned = False,
+                            }),
+                        ],
+                        return_type = specialized.IntegerType(Int64Format),
+                        operations = [
+                            own.DefineValue({
+                                id = parameter.id,
+                                value_type = parameter.value_type,
+                                operation = own.ParameterDefinition(0),
+                                result = own.BorrowedResult(own.ParameterBorrow(parameter.id)),
+                                span = span(1),
+                            }),
+                            own.DefineValue({
+                                id = call.id,
+                                value_type = specialized.IntegerType(Int64Format),
+                                operation = own.CallDefinition(target, [
+                                    own.BorrowedArgument(borrowed),
+                                ]),
+                                result = own.UnmanagedResult,
+                                span = span(2),
+                            }),
+                        ],
+                        result = own.UnmanagedReturn(call.id),
+                    })
+                _:
+                    None
+        _:
+            None
+
+
+private pure func nested_seed() -> Result[NestedSeed, Diagnostic]:
+    program ?= lowered(UPDATE_DECLARATIONS + SEED).map(lower.lowered_functions)
+    failure: Diagnostic = {
+        span = span(0),
+        kind = ProgramProblem,
+        note = None,
+        message = "unexpected borrowed projection seed",
+        help = "fix the borrowed projection test seed",
+    }
+    match program.functions:
+        [main, length_function]:
+            match (main.steps, raw_wrapper(length_function)):
+                ([lower.Define(empty), lower.Define(bag), lower.Define(holder), lower.Define(inner), lower.Define(items), lower.Define(count)], Some(wrapper)):
+                    match (bag.operation, holder.operation, inner.operation, items.operation):
+                        (lower.ConstructRecordValue(bag_type, bag_fields), lower.ConstructRecordValue(holder_type, [_]), lower.ReadRecordFieldValue(read_holder, _), lower.ReadRecordFieldValue(items_field, _)):
+                            match count.operation:
+                                lower.CallValue(length, _):
+                                    Ok({
+                                        program = program,
+                                        empty = empty.id,
+                                        bag = bag.id,
+                                        holder = holder.id,
+                                        inner = inner.id,
+                                        items = items.id,
+                                        count = count.id,
+                                        bag_type = bag_type,
+                                        holder_type = holder_type,
+                                        bag_fields = bag_fields.map(pure func(field): field.field),
+                                        holder_field = read_holder,
+                                        items_field = items_field,
+                                        length = length,
+                                        wrapper = wrapper,
+                                    })
+                                _:
+                                    Err(failure)
+                        _:
+                            Err(failure)
+                _:
+                    Err(failure)
+        _:
+            Err(failure)
+
+
+private pure func define(
+    id: lower.ValueId,
+    value_type: specialized.TypeRef,
+    operation: own.OwnedValueOperation,
+    result: own.ResultOwnership,
+    at: Int,
+) -> own.OwnershipOperation:
+    own.DefineValue({
+        id = id,
+        value_type = value_type,
+        operation = operation,
+        result = result,
+        span = span(at),
+    })
+
+
+private pure func owned_by(value: lower.ValueId, owner: Int) -> own.BorrowedValue:
+    { value = value, source = own.OwnerBorrow(own.owner_id(owner)) }
+
+
+private pure func lent_by(value: lower.ValueId, parent: lower.ValueId) -> own.BorrowedValue:
+    { value = value, source = own.PayloadBorrow(parent) }
+
+
+-- One raw fault per test. The accepted form builds Bag (owner 3) and Holder
+-- (owner 5), reads `holder.bag` and then `.items` as borrows of their parents
+-- with no acquisition, passes the grandchild to `length`, and drops only the
+-- holder afterwards.
+private union ProjectionFault:
+    NoFault
+    ParentDroppedBeforeRead
+    AcquiredAfterParentDrop
+    WrongParent
+    ClaimsAnOwner
+
+
+private pure func raw_program(seed: NestedSeed, fault: ProjectionFault) -> own.OwnershipProgram:
+    list_type = specialized.ListType(specialized.IntegerType(Int64Format))
+    bag_type = specialized.RecordType(seed.bag_type)
+    -- Each of Bag's fields stores its own acquisition of the empty List.
+    var stored_bag: List[own.OwnedRecordField] = []
+    var owner = 1
+    for field in seed.bag_fields:
+        stored_bag = stored_bag.append({
+            field = field,
+            value = own.OwnedPayload(seed.empty, own.owner_id(owner)),
+        })
+        owner = owner + 1
+    built: List[own.OwnershipOperation] = [
+        define(
+            seed.empty,
+            list_type,
+            own.ConstructListDefinition([]),
+            own.OwnedResult(own.owner_id(0)),
+            10,
+        ),
+        own.AcquireOwner(own.owner_id(1), owned_by(seed.empty, 0), span(11)),
+        own.AcquireOwner(own.owner_id(2), owned_by(seed.empty, 0), span(12)),
+        define(
+            seed.bag,
+            bag_type,
+            own.ConstructRecordDefinition(seed.bag_type, stored_bag),
+            own.OwnedResult(own.owner_id(3)),
+            13,
+        ),
+        own.DropOwner(own.owner_id(0), span(14)),
+        own.AcquireOwner(own.owner_id(4), owned_by(seed.bag, 3), span(15)),
+        define(
+            seed.holder,
+            specialized.RecordType(seed.holder_type),
+            own.ConstructRecordDefinition(seed.holder_type, [
+                { field = seed.holder_field, value = own.OwnedPayload(seed.bag, own.owner_id(4)) },
+            ]),
+            own.OwnedResult(own.owner_id(5)),
+            16,
+        ),
+        own.DropOwner(own.owner_id(3), span(17)),
+        define(
+            seed.inner,
+            bag_type,
+            own.ReadRecordFieldDefinition(
+                seed.holder_field,
+                own.BorrowedArgument(owned_by(seed.holder, 5)),
+            ),
+            own.BorrowedResult(own.PayloadBorrow(seed.holder)),
+            20,
+        ),
+        define(
+            seed.items,
+            list_type,
+            own.ReadRecordFieldDefinition(
+                seed.items_field,
+                own.BorrowedArgument(lent_by(seed.inner, seed.holder)),
+            ),
+            own.BorrowedResult(own.PayloadBorrow(seed.inner)),
+            21,
+        ),
+    ]
+    read: own.BorrowedValue = match fault:
+        WrongParent: lent_by(seed.items, seed.holder)
+        ClaimsAnOwner: owned_by(seed.items, 5)
+        _: lent_by(seed.items, seed.inner)
+    counted = define(
+        seed.count,
+        specialized.IntegerType(Int64Format),
+        own.CallDefinition(seed.length, [own.BorrowedArgument(read)]),
+        own.UnmanagedResult,
+        30,
+    )
+    holder_drop = own.DropOwner(own.owner_id(5), span(40))
+    operations = match fault:
+        ParentDroppedBeforeRead:
+            built.concat([holder_drop, counted])
+        AcquiredAfterParentDrop:
+            built.concat([
+                counted,
+                holder_drop,
+                own.AcquireOwner(own.owner_id(6), lent_by(seed.inner, seed.holder), span(41)),
+                own.DropOwner(own.owner_id(6), span(42)),
+            ])
+        _:
+            built.concat([counted, holder_drop])
+    main: own.OwnedFunction = {
+        label = placeholder_label("main"),
+        parameters = [],
+        return_type = specialized.IntegerType(Int64Format),
+        operations = operations,
+        result = own.UnmanagedReturn(seed.count),
+    }
+    {
+        records = seed.program.records,
+        unions = seed.program.unions,
+        functions = [main, seed.wrapper],
+        entrypoint = seed.program.entrypoint,
+    }
+
+
+private pure func rejects(fault: ProjectionFault, message: String, at: Int) -> Bool:
+    match nested_seed():
+        Err(_):
+            False
+        Ok(seed):
+            match verify(raw_program(seed, fault)):
+                Ok(_):
+                    False
+                Err(error):
+                    (error.message == "ownership verification failed: " + message).and(
+                        error.span.start == at,
+                    )
+
+
+-- `bag.items` is read as a borrow of `bag`, `bag` is then stored in a Holder,
+-- and the borrow is passed to `length` afterwards.
+private MOVED_SEED: String =
+    |record Bag { items: List[Int], extra: List[Int] }
+    |record Holder { bag: Bag }
+    |func main() -> Int:
+    |    empty: List[Int] = []
+    |    bag: Bag = { items = empty, extra = empty }
+    |    items = bag.items
+    |    holder: Holder = { bag = bag }
+    |    count = length(items)
+    |    count
+    |
+
+
+-- The Holder takes Bag's owner 3 when `moves`, which ends it as a drop
+-- would; otherwise it stores a fresh acquisition and owner 3 stays live.
+private pure func stored_parent(moves: Bool) -> Result[own.OwnershipProgram, Diagnostic]:
+    program ?= lowered(UPDATE_DECLARATIONS + MOVED_SEED).map(lower.lowered_functions)
+    failure: Diagnostic = {
+        span = span(0),
+        kind = ProgramProblem,
+        note = None,
+        message = "unexpected moved parent seed",
+        help = "fix the moved parent test seed",
+    }
+    match program.functions:
+        [main, length_function]:
+            match (main.steps, raw_wrapper(length_function)):
+                ([lower.Define(empty), lower.Define(bag), lower.Define(items), lower.Define(holder), lower.Define(count)], Some(wrapper)):
+                    match (bag.operation, items.operation, holder.operation, count.operation):
+                        (lower.ConstructRecordValue(bag_type, bag_fields), lower.ReadRecordFieldValue(items_field, _), lower.ConstructRecordValue(holder_type, [holder_field]), lower.CallValue(length, _)):
+                            list_type = specialized.ListType(specialized.IntegerType(Int64Format))
+                            var stored_bag: List[own.OwnedRecordField] = []
+                            var owner = 1
+                            for field in bag_fields:
+                                stored_bag = stored_bag.append({
+                                    field = field.field,
+                                    value = own.OwnedPayload(empty.id, own.owner_id(owner)),
+                                })
+                                owner = owner + 1
+                            built: List[own.OwnershipOperation] = [
+                                define(
+                                    empty.id,
+                                    list_type,
+                                    own.ConstructListDefinition([]),
+                                    own.OwnedResult(own.owner_id(0)),
+                                    10,
+                                ),
+                                own.AcquireOwner(own.owner_id(1), owned_by(empty.id, 0), span(11)),
+                                own.AcquireOwner(own.owner_id(2), owned_by(empty.id, 0), span(12)),
+                                define(
+                                    bag.id,
+                                    specialized.RecordType(bag_type),
+                                    own.ConstructRecordDefinition(bag_type, stored_bag),
+                                    own.OwnedResult(own.owner_id(3)),
+                                    13,
+                                ),
+                                own.DropOwner(own.owner_id(0), span(14)),
+                                define(
+                                    items.id,
+                                    list_type,
+                                    own.ReadRecordFieldDefinition(
+                                        items_field,
+                                        own.BorrowedArgument(owned_by(bag.id, 3)),
+                                    ),
+                                    own.BorrowedResult(own.PayloadBorrow(bag.id)),
+                                    20,
+                                ),
+                            ]
+                            stored_owner = if moves:
+                                3
+                            else:
+                                4
+                            holder_owner = stored_owner + 1
+                            stored = define(
+                                holder.id,
+                                specialized.RecordType(holder_type),
+                                own.ConstructRecordDefinition(holder_type, [
+                                    {
+                                        field = holder_field.field,
+                                        value = own.OwnedPayload(
+                                            bag.id,
+                                            own.owner_id(stored_owner),
+                                        ),
+                                    },
+                                ]),
+                                own.OwnedResult(own.owner_id(holder_owner)),
+                                25,
+                            )
+                            counted = define(
+                                count.id,
+                                specialized.IntegerType(Int64Format),
+                                own.CallDefinition(length, [
+                                    own.BorrowedArgument(lent_by(items.id, bag.id)),
+                                ]),
+                                own.UnmanagedResult,
+                                30,
+                            )
+                            operations = if moves:
+                                built.concat([
+                                    stored,
+                                    counted,
+                                    own.DropOwner(own.owner_id(holder_owner), span(40)),
+                                ])
+                            else:
+                                built.concat([
+                                    own.AcquireOwner(
+                                        own.owner_id(stored_owner),
+                                        owned_by(bag.id, 3),
+                                        span(24),
+                                    ),
+                                    stored,
+                                    counted,
+                                    own.DropOwner(own.owner_id(3), span(40)),
+                                    own.DropOwner(own.owner_id(holder_owner), span(41)),
+                                ])
+                            entry: own.OwnedFunction = {
+                                label = placeholder_label("main"),
+                                parameters = [],
+                                return_type = specialized.IntegerType(Int64Format),
+                                operations = operations,
+                                result = own.UnmanagedReturn(count.id),
+                            }
+                            Ok({
+                                records = program.records,
+                                unions = program.unions,
+                                functions = [entry, wrapper],
+                                entrypoint = program.entrypoint,
+                            })
+                        _:
+                            Err(failure)
+                _:
+                    Err(failure)
+        _:
+            Err(failure)
+
+
+pure func test_borrowed_projections_backed_by_a_live_parent_are_accepted() -> Bool:
+    match nested_seed():
+        Err(_): False
+        Ok(seed): verify(raw_program(seed, NoFault)).is_ok()
+
+
+pure func test_a_read_after_the_grandparent_drops_is_rejected() -> Bool:
+    rejects(ParentDroppedBeforeRead, "borrow refers to discharged owner 5", 30)
+
+
+pure func test_a_read_after_an_acquiring_store_of_the_parent_is_accepted() -> Bool:
+    match stored_parent(False):
+        Ok(program): verify(program).is_ok()
+        Err(_): False
+
+
+pure func test_a_read_after_the_parent_moves_into_a_store_is_rejected() -> Bool:
+    match stored_parent(True):
+        Err(_):
+            False
+        Ok(program):
+            match verify(program):
+                Ok(_):
+                    False
+                Err(error):
+                    (error.message == "ownership verification failed: borrow refers to discharged owner 3").and(
+                        error.span.start == 30,
+                    )
+
+
+pure func test_an_escape_acquired_after_the_parent_drops_is_rejected() -> Bool:
+    rejects(AcquiredAfterParentDrop, "borrow refers to discharged owner 5", 41)
+
+
+pure func test_a_borrow_naming_the_wrong_parent_is_rejected() -> Bool:
+    rejects(WrongParent, "payload borrow has the wrong parent value", 30)
+
+
+pure func test_a_borrowed_projection_cannot_claim_an_owner() -> Bool:
+    rejects(ClaimsAnOwner, "owner 5 does not own value 4", 30)
+
+
+TESTS: TestSuite = {
+    description = "Borrowed record projection verification",
+    tests = [
+        (
+            "borrowed projections of a live parent are accepted",
+            test_borrowed_projections_backed_by_a_live_parent_are_accepted,
+        ),
+        (
+            "a read after the grandparent drops is rejected",
+            test_a_read_after_the_grandparent_drops_is_rejected,
+        ),
+        (
+            "a read after an acquiring store of the parent is accepted",
+            test_a_read_after_an_acquiring_store_of_the_parent_is_accepted,
+        ),
+        (
+            "a read after the parent moves into a store is rejected",
+            test_a_read_after_the_parent_moves_into_a_store_is_rejected,
+        ),
+        (
+            "an escape acquired after the parent drops is rejected",
+            test_an_escape_acquired_after_the_parent_drops_is_rejected,
+        ),
+        (
+            "a borrow naming the wrong parent is rejected",
+            test_a_borrow_naming_the_wrong_parent_is_rejected,
+        ),
+        (
+            "a borrowed projection cannot claim an owner",
+            test_a_borrowed_projection_cannot_claim_an_owner,
+        ),
+    ],
+}

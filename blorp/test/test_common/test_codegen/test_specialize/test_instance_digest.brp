@@ -1,0 +1,672 @@
+import:
+    bool: and
+    int: Int methods
+    list: List methods
+    test: TestSuite
+    ../../../../src/common/analysis/check/check: check
+    ../../../../src/common/codegen/specialize/specialize as specialized
+    ../../../../src/common/syntax/syntax: IntegerFormat(Int64Format)
+    ../../../../src/common/utils/text: concat
+    ../../../support/module_input: parse_modules
+
+
+-- A slot digest is a hint consistent with equality: equal keys must share one, or
+-- a lookup misses the instance it should find and prepares a second. So most of
+-- these tests count the instances a program prepares. `Maybe[T]` is the shape
+-- that matters: one declaration with many instances, told apart only by their
+-- arguments, whose union slots are indexed before an argument that names a
+-- layout still being built has resolved to an instance number. The `TypeRef` hash
+-- keys the sealed tables, so its cases test the relations a Dict key needs.
+
+
+-- Where specialization of a source stopped, so a failing case names its stage.
+private union Specialization:
+    ParseRejected
+    CheckRejected
+    SpecializeRejected
+    Specialized(specialized.SpecializedContents)
+
+
+private pure func specialization(source: String) -> Specialization:
+    match parse_modules([{ source = source, targets = [] }]):
+        Err(_):
+            ParseRejected
+        Ok(parsed):
+            match check(parsed):
+                Err(_):
+                    CheckRejected
+                Ok(accepted):
+                    match specialized.specialize(accepted):
+                        Err(_): SpecializeRejected
+                        Ok(program): Specialized(specialized.specialized_contents(program))
+
+
+private MAYBE: String =
+    |union Maybe[T]:
+    |    Just(T)
+    |    Nothing
+    |record First { value: Int }
+    |record Second { value: Int }
+    |
+
+
+-- Each case declares a Holder and a `make` that builds it; `main` calls `make`
+-- so that every layout is prepared.
+private MAIN: String =
+    |func main() -> Int:
+    |    unused = make()
+    |    0
+    |
+
+
+private pure func source_of(declarations: String) -> String:
+    concat(concat(MAYBE, declarations), MAIN)
+
+
+-- Maybe[First] and Maybe[Second] share a declaration: two instances.
+private DISTINCT_ARGUMENTS: String =
+    |record Holder { first: Maybe[First], second: Maybe[Second] }
+    |pure func make() -> Holder:
+    |    { first = Nothing, second = Nothing }
+    |
+
+
+-- The same instance requested twice is one instance.
+private REPEATED_ARGUMENT: String =
+    |record Holder { first: Maybe[First], second: Maybe[First] }
+    |pure func make() -> Holder:
+    |    { first = Nothing, second = Nothing }
+    |
+
+
+-- Nested generic arguments: Maybe[First], Maybe[Maybe[First]], Maybe[Second]
+-- and Maybe[Maybe[Second]], with the second requested twice.
+private NESTED_ARGUMENTS: String =
+    |record Holder { a: Maybe[Maybe[First]], b: Maybe[Maybe[First]], c: Maybe[Maybe[Second]] }
+    |pure func make() -> Holder:
+    |    { a = Nothing, b = Nothing, c = Nothing }
+    |
+
+
+-- Callable and List arguments, which a slot digests by their case alone: the
+-- full comparison tells Maybe[List[First]] from Maybe[List[Second]].
+private CALLABLE_AND_LIST_ARGUMENTS: String =
+    |record Holder {
+    |    a: Maybe[pure (Int) -> Int],
+    |    b: Maybe[pure (Int) -> String],
+    |    c: Maybe[pure (Int) -> Int],
+    |    d: Maybe[List[First]],
+    |    e: Maybe[List[Second]],
+    |    f: Maybe[List[First]],
+    |}
+    |pure func make() -> Holder:
+    |    { a = Nothing, b = Nothing, c = Nothing, d = Nothing, e = Nothing, f = Nothing }
+    |
+
+
+-- Maybe[A] is indexed while B is in progress, with a pending record argument.
+-- Holder then names Maybe[A] and Maybe[B] with both complete.
+private PENDING_RECORD_ARGUMENT: String =
+    |record A { next: Maybe[B] }
+    |record B { back: Maybe[A] }
+    |record Holder { a: Maybe[A], b: Maybe[B] }
+    |pure func make() -> Holder:
+    |    { a = Nothing, b = Nothing }
+    |
+
+
+-- Maybe[Tree] is indexed while Tree is in progress, with a pending union
+-- argument. A generic union may not recurse into itself directly, so Tree
+-- recurses through a record field.
+private PENDING_UNION_ARGUMENT: String =
+    |union Tree:
+    |    Leaf
+    |    Branch(Wrap)
+    |record Wrap { next: Maybe[Tree] }
+    |record Holder { first: Maybe[Tree], second: Maybe[Tree] }
+    |pure func make() -> Holder:
+    |    { first = Nothing, second = Nothing }
+    |
+
+
+-- Wrap's direct field is still pending when its record slot is published.
+-- In PENDING_UNION_ARGUMENT the indirection through Maybe already gives Wrap
+-- a known union identity, so only that union's key and payload need filling.
+private PENDING_RECORD_FIELD: String =
+    |union Tree:
+    |    Leaf
+    |    Branch(Wrap)
+    |record Wrap { next: Tree }
+    |record Holder { first: Tree, second: Tree }
+    |pure func make() -> Holder:
+    |    { first = Leaf, second = Leaf }
+    |
+
+
+-- Maybe[List[Node]] is indexed while Node is in progress, with a pending List argument.
+private PENDING_LIST_ARGUMENT: String =
+    |record Node { next: Maybe[List[Node]] }
+    |record Holder { first: Maybe[List[Node]] }
+    |pure func make() -> Holder:
+    |    { first = Nothing }
+    |
+
+
+-- Maybe[(Node) -> Int] is indexed while Node is in progress, with a pending callable argument.
+private PENDING_CALLABLE_ARGUMENT: String =
+    |record Node { next: Maybe[pure (Node) -> Int] }
+    |record Holder { first: Maybe[pure (Node) -> Int] }
+    |pure func make() -> Holder:
+    |    { first = Nothing }
+    |
+
+
+private pure func all_sources() -> List[String]:
+    [
+        DISTINCT_ARGUMENTS,
+        REPEATED_ARGUMENT,
+        NESTED_ARGUMENTS,
+        CALLABLE_AND_LIST_ARGUMENTS,
+        PENDING_RECORD_ARGUMENT,
+        PENDING_UNION_ARGUMENT,
+        PENDING_RECORD_FIELD,
+        PENDING_LIST_ARGUMENT,
+        PENDING_CALLABLE_ARGUMENT,
+    ].map(source_of)
+
+
+-- Whether the case `declarations` prepares exactly this many union and record instances.
+private pure func prepares(declarations: String, unions: Int, records: Int) -> Bool:
+    match specialization(source_of(declarations)):
+        Specialized(contents):
+            and(contents.unions.length() == unions, contents.records.length() == records)
+        _:
+            False
+
+
+pure func test_every_source_parses() -> Bool:
+    all_sources().all(pure func(source: String) -> Bool:
+        match specialization(source):
+            ParseRejected: False
+            _: True
+    )
+
+
+pure func test_every_source_checks() -> Bool:
+    all_sources().all(pure func(source: String) -> Bool:
+        match specialization(source):
+            ParseRejected | CheckRejected: False
+            _: True
+    )
+
+
+pure func test_every_source_specializes() -> Bool:
+    all_sources().all(pure func(source: String) -> Bool:
+        match specialization(source):
+            Specialized(_): True
+            _: False
+    )
+
+
+pure func test_instances_of_one_declaration_with_distinct_records_stay_apart() -> Bool:
+    prepares(DISTINCT_ARGUMENTS, 2, 3)
+
+
+pure func test_a_repeated_argument_is_one_instance() -> Bool:
+    prepares(REPEATED_ARGUMENT, 1, 2)
+
+
+pure func test_nested_generic_arguments_are_found_again() -> Bool:
+    prepares(NESTED_ARGUMENTS, 4, 3)
+
+
+pure func test_callable_and_list_arguments_are_told_apart_by_comparison() -> Bool:
+    prepares(CALLABLE_AND_LIST_ARGUMENTS, 4, 3)
+
+
+pure func test_a_complete_record_argument_finds_the_slot_indexed_while_it_was_pending() -> Bool:
+    prepares(PENDING_RECORD_ARGUMENT, 2, 3)
+
+
+-- The two Holder fields must reuse the same published union identity.
+private pure func repeated_holder_union(
+    contents: specialized.SpecializedContents,
+) -> Option[specialized.UnionInstanceId]:
+    match contents.functions:
+        [_, make]:
+            match make.signature.return_type:
+                specialized.RecordType(holder):
+                    match contents.records.get(specialized.record_number(holder)):
+                        Some(layout):
+                            match specialized.record_fields(layout):
+                                [specialized.UnionType(first), specialized.UnionType(second)]:
+                                    if first == second:
+                                        Some(first)
+                                    else:
+                                        None
+                                _:
+                                    None
+                        _:
+                            None
+                _:
+                    None
+        _:
+            None
+
+
+-- Follow Holder -> Maybe[Tree] -> Tree.Branch(Wrap) -> Wrap.next after
+-- sealing; counts alone cannot detect a stale reference to a different slot.
+pure func test_a_complete_union_argument_finds_the_slot_indexed_while_it_was_pending() -> Bool:
+    match specialization(source_of(PENDING_UNION_ARGUMENT)):
+        Specialized(contents):
+            match repeated_holder_union(contents):
+                Some(maybe): sealed_union_cycle(contents, maybe)
+                None: False
+        _:
+            False
+
+
+private pure func sealed_union_cycle(
+    contents: specialized.SpecializedContents,
+    maybe: specialized.UnionInstanceId,
+) -> Bool:
+    match contents.unions.get(specialized.union_number(maybe)):
+        Some(layout):
+            match specialized.union_variants(layout):
+                [[specialized.UnionType(tree)], []]:
+                    match tree_record_field(contents, tree):
+                        Some(back):
+                            and(
+                                back == specialized.UnionType(maybe),
+                                and(contents.unions.length() == 2, contents.records.length() == 2),
+                            )
+                        None:
+                            False
+                _:
+                    False
+        _:
+            False
+
+
+-- Tree's Branch payload names Wrap; return Wrap.next's published field type.
+private pure func tree_record_field(
+    contents: specialized.SpecializedContents,
+    tree: specialized.UnionInstanceId,
+) -> Option[specialized.TypeRef]:
+    match contents.unions.get(specialized.union_number(tree)):
+        Some(tree_layout):
+            match specialized.union_variants(tree_layout):
+                [[], [specialized.RecordType(wrap)]]:
+                    match contents.records.get(specialized.record_number(wrap)):
+                        Some(wrap_layout):
+                            match specialized.record_fields(wrap_layout):
+                                [back]: Some(back)
+                                _: None
+                        _:
+                            None
+                _:
+                    None
+        _:
+            None
+
+
+pure func test_a_pending_record_field_resolves_to_the_completed_union() -> Bool:
+    match specialization(source_of(PENDING_RECORD_FIELD)):
+        Specialized(contents):
+            match repeated_holder_union(contents):
+                Some(tree):
+                    match tree_record_field(contents, tree):
+                        Some(back):
+                            and(
+                                back == specialized.UnionType(tree),
+                                and(contents.unions.length() == 1, contents.records.length() == 2),
+                            )
+                        None:
+                            False
+                None:
+                    False
+        _:
+            False
+
+
+pure func test_a_complete_list_argument_finds_the_slot_indexed_while_it_was_pending() -> Bool:
+    prepares(PENDING_LIST_ARGUMENT, 1, 2)
+
+
+pure func test_a_complete_callable_argument_finds_the_slot_indexed_while_it_was_pending() -> Bool:
+    prepares(PENDING_CALLABLE_ARGUMENT, 1, 2)
+
+
+-- The instance types a function's signature names, whose numbers only the
+-- builder issues: Maybe[First] and Maybe[Second] are unions 0 and 1, First and
+-- Second records 0 and 1.
+private pure func instance_types() -> List[specialized.TypeRef]:
+    match specialization(concat(MAYBE, TAKE_INSTANCES)):
+        Specialized(contents):
+            var found: List[specialized.TypeRef] = []
+            for function in contents.functions:
+                if function.signature.parameters.length() == 4:
+                    found = function.signature.parameters
+            found
+        _:
+            []
+
+
+pure func test_instance_types_hash_by_case_and_number() -> Bool:
+    match instance_types():
+        [first_union, second_union, first_record, second_record]:
+            and(
+                and(differs(first_union, second_union), differs(first_record, second_record)),
+                -- The same number under UnionType and RecordType.
+                differs(first_union, first_record),
+            )
+        _:
+            False
+
+
+-- Unions 0 and 1 are Maybe[First] and Maybe[Second]; records 0 and 1 are First and Second.
+private TAKE_INSTANCES: String =
+    |pure func take(a: Maybe[First], b: Maybe[Second], c: First, d: Second) -> Int:
+    |    0
+    |func main() -> Int:
+    |    take(Nothing, Nothing, { value = 1 }, { value = 2 })
+    |
+
+
+private pure func differs(left: specialized.TypeRef, right: specialized.TypeRef) -> Bool:
+    left.hash() != right.hash()
+
+
+-- `Maybe[Int]` and `Maybe[String]` share a declaration, so only their arguments tell them apart.
+pure func test_instances_of_one_declaration_with_different_arguments_differ() -> Bool:
+    and(
+        [specialized.IntegerType(Int64Format)].hash() != [specialized.StringType].hash(),
+        (
+            [specialized.ListType(specialized.IntegerType(Int64Format))].hash()
+            != [specialized.ListType(specialized.StringType)].hash()
+        ),
+    )
+
+
+pure func test_argument_order_and_count_change_the_hash() -> Bool:
+    both = [specialized.IntegerType(Int64Format), specialized.StringType].hash()
+    swapped = [specialized.StringType, specialized.IntegerType(Int64Format)].hash()
+    one = [specialized.IntegerType(Int64Format)].hash()
+    no_arguments: List[specialized.TypeRef] = []
+    and(both != swapped, and(both != one, one != no_arguments.hash()))
+
+
+pure func test_equal_types_hash_equally_however_deeply_nested() -> Bool:
+    nested = specialized.CallableType(
+        [specialized.ListType(specialized.IntegerType(Int64Format)), specialized.StringType],
+        specialized.ListType(specialized.FloatType),
+    )
+    same = specialized.CallableType(
+        [specialized.ListType(specialized.IntegerType(Int64Format)), specialized.StringType],
+        specialized.ListType(specialized.FloatType),
+    )
+    other = specialized.CallableType(
+        [specialized.ListType(specialized.IntegerType(Int64Format)), specialized.StringType],
+        specialized.ListType(specialized.IntegerType(Int64Format)),
+    )
+    and(and(nested == same, nested.hash() == same.hash()), differs(nested, other))
+
+
+-- This seed participates in emitted instance identities; adding the format
+-- payload must not change it to a derived hash of a new enum representation.
+pure func test_int64_keeps_its_type_hash_seed() -> Bool:
+    specialized.IntegerType(Int64Format).hash() == 2
+
+
+pure func test_scalar_list_and_callable_types_have_distinct_hashes() -> Bool:
+    void_type = specialized.VoidType.hash()
+    int_type = specialized.IntegerType(Int64Format).hash()
+    float_type = specialized.FloatType.hash()
+    string_type = specialized.StringType.hash()
+    scalars_differ = and(
+        and(
+            and(void_type != int_type, void_type != float_type),
+            and(void_type != string_type, int_type != float_type),
+        ),
+        and(int_type != string_type, float_type != string_type),
+    )
+    and(
+        scalars_differ,
+        and(
+            differs(
+                specialized.ListType(specialized.IntegerType(Int64Format)),
+                specialized.ListType(specialized.StringType),
+            ),
+            and(
+                differs(
+                    specialized.ListType(specialized.IntegerType(Int64Format)),
+                    specialized.IntegerType(Int64Format),
+                ),
+                differs(
+                    specialized.CallableType(
+                        [specialized.IntegerType(Int64Format)],
+                        specialized.StringType,
+                    ),
+                    specialized.CallableType(
+                        [specialized.StringType],
+                        specialized.IntegerType(Int64Format),
+                    ),
+                ),
+            ),
+        ),
+    )
+
+
+-- Record slots digest the declaration origin and argument count, so these
+-- different concrete arguments exercise one real production bucket.
+private BOX: String =
+    |record Box[T] { value: T }
+    |pure func box[T](value: T) -> Box[T]:
+    |    { value = value }
+    |
+
+
+private BOX_REQUESTS: String =
+    |func main() -> Int:
+    |    first = box(7)
+    |    second = box("text")
+    |    repeated = box(8)
+    |    first.value
+    |
+
+
+-- Resolve the published constructor's identity through its return type and
+-- check its actual field references against the sealed layout.
+private pure func constructs_box(
+    contents: specialized.SpecializedContents,
+    function: specialized.ConcreteFunction,
+    element: specialized.TypeRef,
+) -> Bool:
+    match (function.signature.parameters, function.signature.return_type, function.body):
+        ([parameter], specialized.RecordType(returned), specialized.ConcreteValueBody(specialized.ReturnExpression(value))):
+            match (value.form, contents.records.get(specialized.record_number(returned))):
+                (specialized.ConstructRecord(owner, [field]), Some(layout)):
+                    and(
+                        and(parameter == element, specialized.record_fields(layout) == [element]),
+                        and(
+                            and(
+                                owner == returned,
+                                value.value_type == specialized.RecordType(returned),
+                            ),
+                            and(
+                                specialized.field_owner(field.field) == returned,
+                                and(
+                                    specialized.field_number(field.field) == 0,
+                                    field.value.value_type == element,
+                                ),
+                            ),
+                        ),
+                    )
+                _:
+                    False
+        _:
+            False
+
+
+pure func test_the_first_record_request_populates_an_empty_index() -> Bool:
+    main: String =
+        |func main() -> Int:
+        |    first = box(7)
+        |    first.value
+        |
+    match specialization(concat(BOX, main)):
+        Specialized(contents):
+            match (contents.records, contents.functions):
+                ([_], [_, constructor]):
+                    constructs_box(contents, constructor, specialized.IntegerType(Int64Format))
+                _:
+                    False
+        _:
+            False
+
+
+pure func test_a_missing_record_key_in_an_occupied_bucket_gets_its_own_layout() -> Bool:
+    match specialization(concat(BOX, BOX_REQUESTS)):
+        Specialized(contents):
+            match (contents.records, contents.functions):
+                ([integer, text], [_, integer_constructor, text_constructor]):
+                    and(
+                        and(
+                            (
+                                specialized.record_fields(integer)
+                                == [specialized.IntegerType(Int64Format)]
+                            ),
+                            specialized.record_fields(text) == [specialized.StringType],
+                        ),
+                        and(
+                            constructs_box(
+                                contents,
+                                integer_constructor,
+                                specialized.IntegerType(Int64Format),
+                            ),
+                            constructs_box(contents, text_constructor, specialized.StringType),
+                        ),
+                    )
+                _:
+                    False
+        _:
+            False
+
+
+pure func test_repeated_record_requests_reuse_the_constructor_and_sealed_layout() -> Bool:
+    match specialization(concat(BOX, BOX_REQUESTS)):
+        Specialized(contents):
+            match contents.functions:
+                [main, integer_constructor, text_constructor]:
+                    match main.statements:
+                        [specialized.InitializeBinding(_, first), specialized.InitializeBinding(_, second), specialized.InitializeBinding(_, repeated)]:
+                            match (first.form, second.form, repeated.form):
+                                (specialized.InvokeFunction(first_call, [_]), specialized.InvokeFunction(second_call, [_]), specialized.InvokeFunction(repeated_call, [_])):
+                                    match (
+                                        first_call.target,
+                                        second_call.target,
+                                        repeated_call.target,
+                                    ):
+                                        (specialized.UserFunction(first_id), specialized.UserFunction(second_id), specialized.UserFunction(repeated_id)):
+                                            and(
+                                                and(
+                                                    first_id == repeated_id,
+                                                    and(
+                                                        specialized.function_number(first_id) == 1,
+                                                        specialized.function_number(second_id) == 2,
+                                                    ),
+                                                ),
+                                                and(
+                                                    and(
+                                                        first.value_type == repeated.value_type,
+                                                        first.value_type != second.value_type,
+                                                    ),
+                                                    and(
+                                                        (
+                                                            first.value_type
+                                                            == integer_constructor.signature.return_type
+                                                        ),
+                                                        (
+                                                            second.value_type
+                                                            == text_constructor.signature.return_type
+                                                        ),
+                                                    ),
+                                                ),
+                                            )
+                                        _:
+                                            False
+                                _:
+                                    False
+                        _:
+                            False
+                _:
+                    False
+        _:
+            False
+
+
+TESTS: TestSuite = {
+    description = "Blorp specialization instance digests",
+    tests = [
+        ("every source parses", test_every_source_parses),
+        ("every source checks", test_every_source_checks),
+        ("every source specializes", test_every_source_specializes),
+        (
+            "instances of one declaration with distinct records stay apart",
+            test_instances_of_one_declaration_with_distinct_records_stay_apart,
+        ),
+        ("a repeated argument is one instance", test_a_repeated_argument_is_one_instance),
+        ("nested generic arguments are found again", test_nested_generic_arguments_are_found_again),
+        (
+            "callable and list arguments are told apart by comparison",
+            test_callable_and_list_arguments_are_told_apart_by_comparison,
+        ),
+        (
+            "a complete record argument finds the slot indexed while it was pending",
+            test_a_complete_record_argument_finds_the_slot_indexed_while_it_was_pending,
+        ),
+        (
+            "a complete union argument finds the slot indexed while it was pending",
+            test_a_complete_union_argument_finds_the_slot_indexed_while_it_was_pending,
+        ),
+        (
+            "a pending record field resolves to the completed union",
+            test_a_pending_record_field_resolves_to_the_completed_union,
+        ),
+        (
+            "a complete list argument finds the slot indexed while it was pending",
+            test_a_complete_list_argument_finds_the_slot_indexed_while_it_was_pending,
+        ),
+        (
+            "a complete callable argument finds the slot indexed while it was pending",
+            test_a_complete_callable_argument_finds_the_slot_indexed_while_it_was_pending,
+        ),
+        ("instance types hash by case and number", test_instance_types_hash_by_case_and_number),
+        ("Int64 keeps its type hash seed", test_int64_keeps_its_type_hash_seed),
+        (
+            "instances of one declaration with different arguments differ",
+            test_instances_of_one_declaration_with_different_arguments_differ,
+        ),
+        ("argument order and count change the hash", test_argument_order_and_count_change_the_hash),
+        (
+            "equal types hash equally however deeply nested",
+            test_equal_types_hash_equally_however_deeply_nested,
+        ),
+        (
+            "scalar, list and callable types have distinct hashes",
+            test_scalar_list_and_callable_types_have_distinct_hashes,
+        ),
+        (
+            "the first record request populates an empty index",
+            test_the_first_record_request_populates_an_empty_index,
+        ),
+        (
+            "a missing record key in an occupied bucket gets its own layout",
+            test_a_missing_record_key_in_an_occupied_bucket_gets_its_own_layout,
+        ),
+        (
+            "repeated record requests reuse the constructor and sealed layout",
+            test_repeated_record_requests_reuse_the_constructor_and_sealed_layout,
+        ),
+    ],
+}

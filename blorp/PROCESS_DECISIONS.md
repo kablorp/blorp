@@ -296,7 +296,7 @@ will make it import `process`, and that needs a rotation first.
      the read-backs.
    - Delete `run_to_files`, with its native, C and label.
    - Update both READMEs.
-   - Coordinate the harness changes with whoever owns `blorp/test/e2e/`.
+   - Coordinate the harness changes with whoever owns the test driver, `blorp/test/driver/`.
 
 Each landing gets its own brief, and sets numerical ceilings before
 implementation.

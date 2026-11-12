@@ -1,0 +1,153 @@
+---
+The parser reads an integer's format from a builtin type's name and from an
+operation's label, so each later phase receives the format as data.
+---
+import:
+    bool: Bool methods
+    list: List methods
+    result: Result methods
+    test: TestSuite
+    ../../../../src/common/syntax/lex: lex
+    ../../../../src/common/syntax/names: program_names
+    ../../../../src/common/syntax/parse: ParsedModuleContents, module_contents, parse_module
+    ../../../../src/common/syntax/source: module_source, root_module_id
+    ../../../../src/common/syntax/syntax:
+        Diagnostic,
+        IntegerFormat(Int64Format, UInt8Format),
+        ParsedBody(ParsedBuiltinBody),
+        ParsedBuiltinType(IntegerBuiltin),
+        ParsedFunctionGroup(FreeFunction),
+        ParsedRuntimeOperation(
+            IntegerAddBuiltin,
+            IntegerSubtractBuiltin,
+            IntegerMultiplyBuiltin,
+            IntegerDivideBuiltin,
+            IntegerRemainderBuiltin,
+            IntegerToStringBuiltin,
+            IntegerConvertBuiltin,
+            IntegerEqualsBuiltin,
+            IntegerLessThanBuiltin,
+            StringToBytesBuiltin,
+            BytesToTextBuiltin,
+            SystemBuiltin,
+        ),
+        SystemOperation(FsReadBytes, FsWriteBytes),
+
+
+private pure func parsed(source: String) -> Result[ParsedModuleContents, Diagnostic]:
+    tokens ?= lex(module_source(root_module_id()), source, program_names().names).map_err(
+        pure func(failure): failure.error,
+    )
+    module ?= parse_module(tokens, root_module_id())
+    Ok(module_contents(module))
+
+
+-- The operation each free function's builtin body names, in order.
+private pure func operations(source: String) -> List[ParsedRuntimeOperation]:
+    var found: List[ParsedRuntimeOperation] = []
+    match parsed(source):
+        Ok(contents):
+            for group in contents.functions:
+                match group:
+                    FreeFunction(function):
+                        match function.body:
+                            ParsedBuiltinBody(operation, _): found = found.append(operation)
+                            _: void
+                    _:
+                        void
+        Err(_):
+            void
+    found
+
+
+pure func test_uint8_builtin_type_carries_its_format() -> Bool:
+    match parsed("type UInt8 = builtin\ntype Int = builtin\n"):
+        Ok(contents):
+            match contents.builtin_types.map(pure func(declaration): declaration.kind):
+                [IntegerBuiltin(_, UInt8Format), IntegerBuiltin(_, Int64Format)]: True
+                _: False
+        Err(_):
+            False
+
+
+pure func test_uint8_labels_name_their_operations_in_the_uint8_format() -> Bool:
+    source: String =
+        |pure func a(x: UInt8, y: UInt8) -> UInt8:
+        |    builtin("uint8.add")
+        |pure func b(x: UInt8, y: UInt8) -> UInt8:
+        |    builtin("uint8.subtract")
+        |pure func c(x: UInt8, y: UInt8) -> UInt8:
+        |    builtin("uint8.multiply")
+        |pure func d(x: UInt8, y: UInt8) -> UInt8:
+        |    builtin("uint8.divide")
+        |pure func e(x: UInt8, y: UInt8) -> UInt8:
+        |    builtin("uint8.remainder")
+        |pure func f(x: UInt8) -> String:
+        |    builtin("uint8.to_string")
+        |pure func g(x: UInt8, y: UInt8) -> Bool:
+        |    builtin("uint8.equals")
+        |pure func h(x: UInt8, y: UInt8) -> Bool:
+        |    builtin("uint8.less_than")
+        |
+    expected: List[ParsedRuntimeOperation] = [
+        IntegerAddBuiltin(UInt8Format),
+        IntegerSubtractBuiltin(UInt8Format),
+        IntegerMultiplyBuiltin(UInt8Format),
+        IntegerDivideBuiltin(UInt8Format),
+        IntegerRemainderBuiltin(UInt8Format),
+        IntegerToStringBuiltin(UInt8Format),
+        IntegerEqualsBuiltin(UInt8Format),
+        IntegerLessThanBuiltin(UInt8Format),
+    ]
+    operations(source) == expected
+
+
+pure func test_conversion_labels_name_their_source_and_target() -> Bool:
+    source: String =
+        |pure func widen(x: UInt8) -> Int:
+        |    builtin("uint8.to_int")
+        |pure func wrap(x: Int) -> UInt8:
+        |    builtin("int.wrap_to_uint8")
+        |
+    expected: List[ParsedRuntimeOperation] = [
+        IntegerConvertBuiltin(UInt8Format, Int64Format),
+        IntegerConvertBuiltin(Int64Format, UInt8Format),
+    ]
+    operations(source) == expected
+
+
+pure func test_byte_native_labels_name_their_operations() -> Bool:
+    source: String =
+        |func read(path: String) -> Result[List[UInt8], Int]:
+        |    builtin("fs.read_bytes")
+        |func write(path: String, data: List[UInt8]) -> Result[Void, Int]:
+        |    builtin("fs.write_bytes")
+        |pure func bytes(text: String) -> List[UInt8]:
+        |    builtin("string.to_bytes")
+        |pure func text(data: List[UInt8]) -> Option[String]:
+        |    builtin("bytes.to_text")
+        |
+    expected: List[ParsedRuntimeOperation] = [
+        SystemBuiltin(FsReadBytes),
+        SystemBuiltin(FsWriteBytes),
+        StringToBytesBuiltin,
+        BytesToTextBuiltin,
+    ]
+    operations(source) == expected
+
+
+TESTS: TestSuite = {
+    description = "Blorp UInt8 builtin parsing",
+    tests = [
+        ("UInt8 builtin type carries its format", test_uint8_builtin_type_carries_its_format),
+        (
+            "UInt8 labels name their operations in the UInt8 format",
+            test_uint8_labels_name_their_operations_in_the_uint8_format,
+        ),
+        (
+            "conversion labels name their source and target",
+            test_conversion_labels_name_their_source_and_target,
+        ),
+        ("byte native labels name their operations", test_byte_native_labels_name_their_operations),
+    ],
+}
