@@ -6,6 +6,7 @@ import:
     string: String methods
     ../common/syntax/source: SourceId
     ../common/syntax/syntax:
+        Comment,
         Diagnostic,
         Span,
         StringForm(PipeStringForm),
@@ -14,8 +15,8 @@ import:
         internal_error,
 
 
--- What the lexer drops between two tokens, in source order. Every item is
--- recovered from the gaps between lexed tokens, so a token never hides one.
+-- What the lexer drops between two tokens, in source order. Comments come
+-- from the lexer; blank lines are found in the gaps between lexed tokens.
 union Trivia:
     -- A comment after code on its line, which stays at the end of that line.
     TrailingComment(Span)
@@ -42,8 +43,6 @@ LINE_FEED_BYTE: Int = 10
 SPACE_BYTE: Int = 32
 TAB_BYTE: Int = 9
 MINUS_BYTE: Int = 45
--- A documentation fence is three minus signs at column 1 (grammar `doc_fence`).
-private FENCE_WIDTH: Int = 3
 -- The lexer counts four spaces as one indentation level, as it does one tab.
 private SPACES_PER_LEVEL: Int = 4
 
@@ -108,34 +107,6 @@ pure func first_on_line(source: String, offset: Int) -> Bool:
     cursor == offset
 
 
--- A fence line: three minus signs at its start, then only spaces.
-private pure func fence_at(source: String, offset: Int) -> Bool:
-    var cursor = offset + FENCE_WIDTH
-    while source.byte_is(cursor, SPACE_BYTE):
-        cursor = cursor + 1
-    and(
-        and(
-            source.byte_is(offset, MINUS_BYTE),
-            and(source.byte_is(offset + 1, MINUS_BYTE), source.byte_is(offset + 2, MINUS_BYTE)),
-        ),
-        or(cursor == source.length(), source.byte_is(cursor, LINE_FEED_BYTE)),
-    )
-
-
--- The end of the documentation block opening at `fence`: the end of its
--- closing fence line. The lexer has already rejected an unterminated block.
-private pure func documentation_end(source: String, fence: Int) -> Int:
-    var line = source.line_end(fence) + 1
-    while and(
-        line < source.length(),
-        source
-            .fence_at(line)
-            .not(),
-    ):
-        line = source.line_end(line) + 1
-    source.line_end(line.min(source.length()))
-
-
 -- A comment's text without the spaces and tabs that may end its line.
 private pure func trimmed_end(source: String, start: Int, end: Int) -> Int:
     var trimmed = end
@@ -144,8 +115,20 @@ private pure func trimmed_end(source: String, start: Int, end: Int) -> Int:
     trimmed
 
 
+-- The comment of `comments` at index `next` if it starts at `cursor`.
+private pure func comment_at(comments: List[Comment], next: Int, cursor: Int) -> Option[Comment]:
+    match comments.get(next):
+        Some(comment):
+            if comment.span.start == cursor:
+                Some(comment)
+            else:
+                None
+        None:
+            None
+
+
 -- The trivia of the gaps between `tokens`, in order. A gap may hold only
--- spaces, tabs, LFs, `--` comments and documentation blocks; anything else
+-- spaces, tabs, LFs and the lexer's `comments`; anything else
 -- means a span is wrong, and the formatter stops rather than guess. The one
 -- exception is inside a pipe String with holes: its text tokens leave out
 -- each continuation line's indentation and marker, and it can hold no
@@ -154,11 +137,13 @@ pure func source_trivia(
     origin: SourceId,
     source: String,
     tokens: List[Token],
+    comments: List[Comment],
 ) -> Result[List[Trivia], Diagnostic]:
     var items: List[Trivia] = []
     var failure: Option[Diagnostic] = None
     var cursor = 0
     var position = 0
+    var next_comment = 0
     var in_pipe_string: Bool = False
     while and(failure.is_none(), position <= tokens.length()):
         next: Option[Token] = tokens.get(position)
@@ -182,34 +167,32 @@ pure func source_trivia(
                     items = items.append(BlankLine(cursor))
                 line_has_text = False
                 cursor = cursor + 1
-            else if and(source.byte_is(cursor, MINUS_BYTE), source.byte_is(cursor + 1, MINUS_BYTE)):
-                comment_end = source.line_end(cursor)
-                if and(source.line_start(cursor) == cursor, source.fence_at(cursor)):
-                    end = source.documentation_end(cursor)
-                    items = items.append(
-                        DocumentationBlock({ source = origin, start = cursor, end = end }),
-                    )
-                    cursor = end
-                else:
-                    span: Span = {
-                        source = origin,
-                        start = cursor,
-                        end = source.trimmed_end(cursor, comment_end),
-                    }
-                    item: Trivia = if line_has_text:
-                        TrailingComment(span)
-                    else:
-                        OwnLineComment(span, source.source_level(cursor))
-                    items = items.append(item)
-                    cursor = comment_end
-                line_has_text = True
             else:
-                failure = Some(
-                    internal_error(
-                        { source = origin, start = cursor, end = cursor + 1 },
-                        "the formatter found text outside every token, so a token's span is wrong; the file was left unchanged",
-                    ),
-                )
+                match comments.comment_at(next_comment, cursor):
+                    Some(comment):
+                        if comment.documentation:
+                            items = items.append(DocumentationBlock(comment.span))
+                        else:
+                            trimmed: Span = {
+                                source = origin,
+                                start = cursor,
+                                end = source.trimmed_end(cursor, comment.span.end),
+                            }
+                            item: Trivia = if line_has_text:
+                                TrailingComment(trimmed)
+                            else:
+                                OwnLineComment(trimmed, source.source_level(cursor))
+                            items = items.append(item)
+                        cursor = comment.span.end
+                        next_comment = next_comment + 1
+                        line_has_text = True
+                    None:
+                        failure = Some(
+                            internal_error(
+                                { source = origin, start = cursor, end = cursor + 1 },
+                                "the formatter found text outside every token, so a token's span is wrong; the file was left unchanged",
+                            ),
+                        )
         match next:
             Some(token):
                 cursor = cursor.max(token.span.end)
