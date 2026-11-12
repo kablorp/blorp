@@ -48,11 +48,13 @@ done.
     so the name-use rows of landing 5 take no allocation each.
 - **String code points:** [`STRING_PLAN.md`](STRING_PLAN.md).
   - **Status:** approved on 2026-11-10: `length` counts code points, from a
-    count stored in each String, and byte work uses `byte_*` functions. S0
-    measured the count's cost, and S3 to S9 and the ceilings are approved as
-    recommended.
-  - **Next:** L1, where the runtime keeps the count and the compiler learns
-    the new operations, then a seed rotation and the breaking switch (L3).
+    count stored in each String, and byte work uses `byte_*` functions. L1
+    landed on 2026-11-12: every String keeps its count, the compiler knows the
+    five byte and code point operations, and strict runs recount each String
+    on release.
+  - **Next:** a cheaper recount, because L2's seed would otherwise push the
+    e2e compiles over their 15% instruction margin; then L2, a seed rotation,
+    and the breaking switch (L3).
 - **Filesystem:** [`FILESYSTEM_DECISIONS.md`](FILESYSTEM_DECISIONS.md).
   - **Status:** Part 1 has landed through `fold_lines`. Part 2, lent
     resources, waits for a consumer.
@@ -145,6 +147,12 @@ None of these is planned yet. Each wants its own short design or brief.
 - **Constants cannot call functions,** so a `Bytes` constant such as a file
   signature must be written as a function.
 
+- **The e2e driver prints a ceiling failure mid-line,** interleaved with the
+  next PASS line, so a gate log hides it; search the raw log for "exceed the
+  ceiling".
+- **`test/runtime/fixtures/argv_test.c` is run by no suite,** like the two
+  String probes that L1 brought back under `string_suite.brp`.
+
 ## Working notes for agents
 
 - **Never run compiled binaries in parallel with another session's** on macOS.
@@ -152,6 +160,11 @@ None of these is planned yet. Each wants its own short design or brief.
   `pgrep -f '^[^ ]*self-hosted-tests/driver/driver'` and
   `pgrep -f '^[^ ]*blorp/build/(blorp|compiler|fixpoint)'` to come back empty. The
   pattern is anchored so that a waiting shell never matches itself.
+- **e2e compile allocations grow with the checkout's depth,** by about four
+  per directory level: the compiler normalizes each absolute path it is
+  given, one String per component. A deep worktree can exceed an exact
+  ceiling that CI meets; compare with main at the same path before calling
+  it a regression.
 - **A subagent's commands move to the background after about 180 s.** Put the
   busy check inside your own scripts, start long scripts in the background,
   and wait for their exit notification rather than polling.

@@ -73,7 +73,7 @@ static void assert_frees(size_t id, size_t expected) {
 static void assert_text(const struct blorp_string *value,
                         const char *expected, int64_t length) {
     assert(value->length == length);
-    assert(blorp_string_length(value) == length);
+    assert(blorp_string_byte_length(value) == length);
     assert(memcmp(value->bytes, expected, (size_t)length) == 0);
     assert(value->bytes[length] == '\0');
 }

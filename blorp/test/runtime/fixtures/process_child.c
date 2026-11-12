@@ -264,8 +264,8 @@ static int capture_closed_stdio(const char *program) {
     }
     /* The child inherits this probe's strict leak check, whose report follows its stderr. */
     const int correct = succeeded && strcmp(reply->values[0]->bytes, "0") == 0 &&
-        strcmp(reply->values[1]->bytes, "stdout text\n") == 0 &&
-        strncmp(reply->values[2]->bytes, "stderr text\n", strlen("stderr text\n")) == 0;
+        strcmp(reply->values[1]->bytes, "stdout caf\303\251\n") == 0 &&
+        strncmp(reply->values[2]->bytes, "stderr caf\303\251\n", strlen("stderr caf\303\251\n")) == 0;
     if (succeeded) blorp_list_drop_0_s(reply);
     blorp_list_drop_0_s(none);
     blorp_list_drop_0_s(argument_list);
@@ -305,15 +305,16 @@ static int capture_stray_report_holder(const char *program) {
 }
 
 /* find_program on a PATH of an empty entry, a relative one, a non-executable file,
- * a directory and then the real one, each with a "tool", finds only the last. */
+ * a directory and then the real one, each with a "tool", finds only the last.
+ * The real one's name is not ASCII, so the found path counts its code points. */
 static int find_program_case(const char *directory) {
     char path[4096];
     if (mkdir(directory, S_IRWXU) != 0 || chdir(directory) != 0) return 1;
-    static const char *const directories[] = {"relative", "plain", "folder", "folder/tool", "real"};
+    static const char *const directories[] = {"relative", "plain", "folder", "folder/tool", "r\303\251al"};
     for (size_t index = 0; index < sizeof directories / sizeof *directories; index++) {
         if (mkdir(directories[index], S_IRWXU) != 0) return 1;
     }
-    static const char *const files[] = {"tool", "relative/tool", "plain/tool", "real/tool"};
+    static const char *const files[] = {"tool", "relative/tool", "plain/tool", "r\303\251al/tool"};
     static const mode_t modes[] = {S_IRWXU, S_IRWXU, S_IRUSR | S_IWUSR, S_IRWXU};
     for (size_t index = 0; index < sizeof files / sizeof *files; index++) {
         const int file = open(files[index], O_WRONLY | O_CREAT | O_EXCL, modes[index]);
@@ -321,7 +322,7 @@ static int find_program_case(const char *directory) {
     }
     char current[2048];
     if (getcwd(current, sizeof current) == NULL) return 1;
-    const int written = snprintf(path, sizeof path, ":relative:%s/plain:%s/folder:%s/real", current,
+    const int written = snprintf(path, sizeof path, ":relative:%s/plain:%s/folder:%s/r\303\251al", current,
                                  current, current);
     if (written < 0 || (size_t)written >= sizeof path || setenv("PATH", path, 1) != 0) return 1;
     struct blorp_string *name = blorp_string_from_bytes("tool", 4);
@@ -329,7 +330,7 @@ static int find_program_case(const char *directory) {
     int64_t error = 0;
     const uint8_t located = blorp_process_find_program(name, &found, &error);
     char expected[2100];
-    (void)snprintf(expected, sizeof expected, "%s/real/tool", current);
+    (void)snprintf(expected, sizeof expected, "%s/r\303\251al/tool", current);
     const int correct = located && strcmp(found->bytes, expected) == 0;
     if (found != NULL) blorp_string_release(found);
     /* With only the empty and relative entries, the tool in both is not found. */
@@ -351,8 +352,9 @@ static int child_case(int argc, char **argv) {
         return 0;
     }
     if (strcmp(argv[1], "streams") == 0) {
-        fputs("stdout text\n", stdout);
-        fputs("stderr text\n", stderr);
+        /* Not ASCII, so each captured String must count its code points. */
+        fputs("stdout caf\303\251\n", stdout);
+        fputs("stderr caf\303\251\n", stderr);
         return 0;
     }
     if (strcmp(argv[1], "pause") == 0) { for (;;) pause(); }

@@ -5,7 +5,9 @@ import:
 
 -- String is one managed leaf: its bytes are inline in the
 -- root allocation, so final release has no child ownership to traverse.
--- Its validated length counts bytes, including embedded NUL and UTF-8 bytes.
+-- Its validated length counts bytes, including embedded NUL and UTF-8 bytes,
+-- and code_points counts the Unicode scalars those bytes spell. Every writer
+-- keeps both; memory diagnostics recount at release (blorp_string_release).
 -- Only a transferred, uniquely owned root may mutate or grow its storage.
 pure func string_runtime() -> String:
     raw
@@ -48,10 +50,22 @@ pure func string_runtime() -> String:
         |}
         |struct blorp_string {
         |atomic_size_t references;
-        |int64_t length;
+        |int64_t length; /* Bytes, excluding the trailing NUL. */
+        |int64_t code_points; /* Unicode scalars: equal to length exactly when every byte is ASCII. */
         |size_t capacity; /* Byte capacity, excluding the trailing NUL. */
         |char bytes[];
         |};
+        |/* RFC 3629: a continuation byte has the leading bits 10xxxxxx. */
+        |enum {BLORP_UTF8_CONTINUATION_MASK=0xc0,BLORP_UTF8_CONTINUATION_TAG=0x80};
+        |static int blorp_utf8_is_continuation(char byte) {
+        |return ((unsigned char)byte&BLORP_UTF8_CONTINUATION_MASK)==BLORP_UTF8_CONTINUATION_TAG;
+        |}
+        |/* The scalars in counted valid UTF-8, where every byte but a continuation starts one. */
+        |static int64_t blorp_utf8_code_points(const char *bytes,size_t length) {
+        |int64_t count=0;
+        |for(size_t position=0;position<length;position++){count+=!blorp_utf8_is_continuation(bytes[position]);}
+        |return count;
+        |}
         |static size_t blorp_string_maximum_capacity(void) {
         |const size_t storage_limit=SIZE_MAX-sizeof(struct blorp_string)-1;
         |return (uintmax_t)storage_limit>(uintmax_t)INT64_MAX?(size_t)INT64_MAX:storage_limit;
@@ -66,22 +80,30 @@ pure func string_runtime() -> String:
         |/* Growth doubles the current capacity, so it must never be zero. */
         |_Static_assert(BLORP_STRING_MINIMUM_CAPACITY>0,"String capacity doubling requires a positive minimum");
         |/* The one String constructor: unique, with unwritten bytes. The caller
-        | * writes the bytes and the trailing NUL. */
-        |static struct blorp_string *blorp_string_allocate(int64_t length) {
+        | * writes the bytes, which spell code_points scalars, and the trailing NUL. */
+        |static struct blorp_string *blorp_string_allocate(int64_t length,int64_t code_points) {
         |if(length<0||(uintmax_t)length>(uintmax_t)blorp_string_maximum_capacity()){abort();}
         |const size_t capacity=(size_t)length<BLORP_STRING_MINIMUM_CAPACITY?BLORP_STRING_MINIMUM_CAPACITY:(size_t)length;
         |struct blorp_string *result=blorp_memory_allocate(sizeof *result+capacity+1);
         |if(result==NULL){abort();}
         |atomic_init(&result->references,1);
         |result->length=length;
+        |result->code_points=code_points;
         |result->capacity=capacity;
         |return result;
         |}
-        |/* Precondition: the counted bytes already contain valid UTF-8. */
-        |struct blorp_string *blorp_string_from_bytes(const char *bytes,int64_t length) {
-        |struct blorp_string *result=blorp_string_allocate(length);
+        |/* Precondition: the counted bytes are valid UTF-8 that spells code_points scalars. */
+        |static struct blorp_string *blorp_string_from_counted_bytes(const char *bytes,int64_t length,int64_t code_points) {
+        |struct blorp_string *result=blorp_string_allocate(length,code_points);
         |memcpy(result->bytes,bytes,(size_t)length);
         |result->bytes[length]='\0';
+        |return result;
+        |}
+        |/* Precondition: the counted bytes already contain valid UTF-8. They are counted
+        | * in the copy, once allocation has refused a length no String can have. */
+        |struct blorp_string *blorp_string_from_bytes(const char *bytes,int64_t length) {
+        |struct blorp_string *result=blorp_string_from_counted_bytes(bytes,length,0);
+        |result->code_points=blorp_utf8_code_points(result->bytes,(size_t)length);
         |return result;
         |}
         |/* Int64 decimal needs at most one sign and 19 digits. */
@@ -102,14 +124,38 @@ pure func string_runtime() -> String:
         |char buffer[BLORP_INT64_DECIMAL_CAPACITY];
         |int64_t length;
         |const char *digits=blorp_int64_decimal(value,buffer,&length);
-        |return blorp_string_from_bytes(digits,length);
+        |return blorp_string_from_counted_bytes(digits,length,length); /* ASCII digits */
         |}
-        |int64_t blorp_string_length(const struct blorp_string *value) {
+        |int64_t blorp_string_byte_length(const struct blorp_string *value) {
         |return value->length;
+        |}
+        |int64_t blorp_string_codepoint_length(const struct blorp_string *text) {
+        |return text->code_points;
         |}
         |uint8_t blorp_string_byte_at(const struct blorp_string *value,int64_t index,int64_t *result) {
         |if(index<0||index>=value->length){return (uint8_t)0;}
         |*result=(int64_t)(unsigned char)value->bytes[index];
+        |return (uint8_t)1;
+        |}
+        |/* The byte offset `scalars` code points after `offset`, a character boundary,
+        | * stopping at the end: direct when every byte is ASCII, else one scan. */
+        |static int64_t blorp_string_codepoint_offset(const struct blorp_string *text,int64_t offset,int64_t scalars) {
+        |if(text->length==text->code_points){return offset+scalars;}
+        |for(;scalars>0&&offset<text->length;scalars--){
+        |do{offset++;}while(offset<text->length&&blorp_utf8_is_continuation(text->bytes[offset]));
+        |}
+        |return offset;
+        |}
+        |/* RFC 3629: a lead byte below 0x80 is the whole scalar, one below 0xe0 starts
+        | * two bytes, below 0xf0 three, else four. The lead keeps its low 7-width bits
+        | * and each continuation adds six. 0 leaves `result` unset. */
+        |uint8_t blorp_string_codepoint_at(const struct blorp_string *text,int64_t index,int64_t *result) {
+        |if(index<0||index>=text->code_points){return (uint8_t)0;}
+        |const unsigned char *bytes=(const unsigned char *)text->bytes+blorp_string_codepoint_offset(text,0,index);
+        |const int width=bytes[0]<0x80?1:bytes[0]<0xe0?2:bytes[0]<0xf0?3:4;
+        |int64_t scalar=width==1?bytes[0]:bytes[0]&(0x7f>>width);
+        |for(int position=1;position<width;position++){scalar=(scalar<<6)|(bytes[position]&0x3f);}
+        |*result=scalar;
         |return (uint8_t)1;
         |}
         |enum {BLORP_UNICODE_SCALAR_MAX=0x10ffff,BLORP_SURROGATE_FIRST=0xd800,BLORP_SURROGATE_LAST=0xdfff,BLORP_UTF8_SCALAR_CAPACITY=4};
@@ -129,14 +175,28 @@ pure func string_runtime() -> String:
         |}else{
         |length=4;bytes[0]=(char)(0xf0|(codepoint>>18));bytes[1]=(char)(0x80|((codepoint>>12)&0x3f));bytes[2]=(char)(0x80|((codepoint>>6)&0x3f));bytes[3]=(char)(0x80|(codepoint&0x3f));
         |}
-        |*result=blorp_string_from_bytes(bytes,length);
+        |*result=blorp_string_from_counted_bytes(bytes,length,1);
         |return (uint8_t)1;
         |}
         |void blorp_string_retain(struct blorp_string *value) {
         |atomic_fetch_add_explicit(&value->references,1,memory_order_relaxed);
         |}
+        |#if BLORP_MEMORY_DIAGNOSTICS
+        |/* A writer that forgot code_points leaves a count its bytes disagree with.
+        | * Under the strict leak check every String is recounted once, when it is
+        | * freed. The recount reads every byte a run frees, about 5% of a
+        | * self-compile at -O2, so other diagnostic runs skip it (STRING_PLAN, S9). */
+        |static void blorp_string_check_code_points(const struct blorp_string *value) {
+        |if(blorp_memory_strict&&blorp_utf8_code_points(value->bytes,(size_t)value->length)!=value->code_points){
+        |blorp_memory_fail("error: target String code point count disagrees with its bytes\n");
+        |}
+        |}
+        |#else
+        |#define blorp_string_check_code_points(value) ((void)0)
+        |#endif
         |void blorp_string_release(struct blorp_string *value) {
         |if(atomic_fetch_sub_explicit(&value->references,1,memory_order_acq_rel)==1){
+        |blorp_string_check_code_points(value);
         |blorp_memory_release(value);
         |}
         |}
@@ -178,6 +238,7 @@ pure func string_runtime() -> String:
         |size_t unbalanced=0;
         |for(struct blorp_string_literal_site *site=blorp_string_literal_sites;site!=NULL;site=site->next){
         |if(atomic_load_explicit(&site->value->references,memory_order_relaxed)!=BLORP_STRING_LITERAL_REFERENCES){unbalanced++;}
+        |blorp_string_check_code_points(site->value);
         |blorp_memory_release(site->value);
         |site->value=NULL;
         |}
@@ -192,27 +253,34 @@ pure func string_runtime() -> String:
         |
 
 
+-- Half-open slices: byte offsets fail inside a character, and code point
+-- indices, which are always boundaries, clamp instead.
 STRING_SLICE_RUNTIME: String =
     raw
-        |/* RFC 3629: a continuation byte has the leading bits 10xxxxxx. */
-        |enum { BLORP_UTF8_CONTINUATION_MASK=0xc0, BLORP_UTF8_CONTINUATION_TAG=0x80 };
-        |uint8_t blorp_string_slice(
+        |uint8_t blorp_string_byte_slice(
         |    const struct blorp_string *value,int64_t start,int64_t end,
         |    struct blorp_string **result
         |) {
         |    if(start<0||end<start||end>value->length){
         |        return (uint8_t)0;
         |    }
-        |    if(start<value->length&&
-        |       ((unsigned char)value->bytes[start]&BLORP_UTF8_CONTINUATION_MASK)==BLORP_UTF8_CONTINUATION_TAG){
+        |    if(start<value->length&&blorp_utf8_is_continuation(value->bytes[start])){
         |        return (uint8_t)0;
         |    }
-        |    if(end<value->length&&
-        |       ((unsigned char)value->bytes[end]&BLORP_UTF8_CONTINUATION_MASK)==BLORP_UTF8_CONTINUATION_TAG){
+        |    if(end<value->length&&blorp_utf8_is_continuation(value->bytes[end])){
         |        return (uint8_t)0;
         |    }
         |    *result=blorp_string_from_bytes(value->bytes+start,end-start);
         |    return (uint8_t)1;
+        |}
+        |/* Code points start..end, both clamped into 0..code_points; start>end gives "".
+        | * Every code point index is a character boundary, so it cannot fail. */
+        |struct blorp_string *blorp_string_codepoint_slice(const struct blorp_string *text,int64_t start,int64_t end) {
+        |const int64_t first=start<0?0:start>text->code_points?text->code_points:start;
+        |const int64_t last=end<first?first:end>text->code_points?text->code_points:end;
+        |const int64_t offset=blorp_string_codepoint_offset(text,0,first);
+        |const int64_t stop=blorp_string_codepoint_offset(text,offset,last-first);
+        |return blorp_string_from_counted_bytes(text->bytes+offset,stop-offset,last-first);
         |}
         |
 

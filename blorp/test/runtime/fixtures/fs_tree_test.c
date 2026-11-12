@@ -1096,11 +1096,17 @@ static int case_temporary_created(const char *directory) {
     /* An empty prefix is six bytes of name. */
     struct blorp_string *bare = temporary("relative", "");
     expect_temporary(bare, "relative/");
+    /* A prefix that is not ASCII keeps its code points: two in "\303\251-". */
+    struct blorp_string *accented = temporary("relative", "\303\251-");
+    expect_temporary(accented, "relative/\303\251-");
+    assert(accented->code_points == (int64_t)strlen("relative/") + 2 + 6);
     assert(rmdir(first->bytes) == 0 && rmdir(second->bytes) == 0 && rmdir(relative->bytes) == 0 && rmdir(bare->bytes) == 0);
+    assert(rmdir(accented->bytes) == 0);
     blorp_string_release(first);
     blorp_string_release(second);
     blorp_string_release(relative);
     blorp_string_release(bare);
+    blorp_string_release(accented);
     return 0;
 }
 

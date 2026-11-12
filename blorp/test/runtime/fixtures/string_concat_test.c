@@ -67,8 +67,19 @@ static void *observed_realloc(void *pointer, size_t bytes) {
 #undef malloc
 #undef realloc
 
+/* The code points the counted bytes spell, counted here independently of the
+ * runtime: every byte but a UTF-8 continuation (10xxxxxx) starts one. */
+static int64_t expected_code_points(const char *bytes, int64_t length) {
+    int64_t count = 0;
+    for (int64_t index = 0; index < length; index++) {
+        if (((unsigned char)bytes[index] & 0xc0) != 0x80) count++;
+    }
+    return count;
+}
+
 static void assert_bytes(const struct blorp_string *text, const char *bytes, int64_t length) {
     assert(text->length == length);
+    assert(text->code_points == expected_code_points(bytes, length));
     assert(text->capacity >= (size_t)length);
     assert(text->capacity <= blorp_string_maximum_capacity());
     assert(memcmp(text->bytes, bytes, (size_t)length) == 0);

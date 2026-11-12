@@ -23,18 +23,30 @@ static void runtime_test_deallocate(void *value) {
     free(value);
 }
 
-/* Use the exact fragment supplied by string_runtime(), with real allocation
- * and destruction. The aliases affect only this include, never libc headers. */
+/* Use the exact fragments string_suite.brp writes after MEMORY_RUNTIME, with
+ * real allocation and destruction. The aliases affect only this include, never
+ * libc headers, which are already included above. */
 #define malloc runtime_test_allocate
 #define free runtime_test_deallocate
 #include "string_runtime.c"
 #undef free
 #undef malloc
 
+/* The code points the counted bytes spell, counted here independently of the
+ * runtime: every byte but a UTF-8 continuation (10xxxxxx) starts one. */
+static int64_t expected_code_points(const char *bytes, int64_t length) {
+    int64_t count = 0;
+    for (int64_t index = 0; index < length; index++) {
+        if (((unsigned char)bytes[index] & 0xc0) != 0x80) count++;
+    }
+    return count;
+}
+
 static void assert_decimal(int64_t number, const char *expected, int64_t length) {
     struct blorp_string *value = blorp_int_to_string(number);
     assert(value->length == length);
-    assert(blorp_string_length(value) == length);
+    assert(value->code_points == length);
+    assert(blorp_string_byte_length(value) == length);
     assert(strcmp(value->bytes, expected) == 0);
     assert(strlen(value->bytes) == (size_t)length);
     blorp_string_release(value);
@@ -64,7 +76,7 @@ static void test_nonfinal_release(void) {
     blorp_string_release(value);
     assert(atomic_load(&value->references) == 1);
     assert(destruction_count == 0);
-    assert(blorp_string_length(value) == 2);
+    assert(blorp_string_byte_length(value) == 2);
     assert(strcmp(value->bytes, "-7") == 0);
     blorp_string_release(value);
 }
@@ -90,7 +102,7 @@ static void test_independent_objects(void) {
     blorp_string_release(first);
     assert(destruction_count == 1);
     assert(atomic_load(&second->references) == 1);
-    assert(blorp_string_length(second) == 3);
+    assert(blorp_string_byte_length(second) == 3);
     assert(strcmp(second->bytes, "-42") == 0);
     blorp_string_release(second);
     assert(allocation_count == 2);
@@ -157,7 +169,8 @@ static void test_edge_old_alias(void) {
 
 static void assert_bytes(const struct blorp_string *value, const char *expected, int64_t length) {
     assert(value->length == length);
-    assert(blorp_string_length(value) == length);
+    assert(value->code_points == expected_code_points(expected, length));
+    assert(blorp_string_byte_length(value) == length);
     assert(memcmp(value->bytes, expected, (size_t)length) == 0);
     assert(value->bytes[length] == '\0');
 }
@@ -510,7 +523,7 @@ static void test_slice_values(void) {
     for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
         const size_t allocated = allocation_count, destroyed = destruction_count;
         struct blorp_string *result = NULL;
-        assert(blorp_string_slice(source, cases[i].start, cases[i].end, &result) == 1);
+        assert(blorp_string_byte_slice(source, cases[i].start, cases[i].end, &result) == 1);
         assert(destruction_count == destroyed);
         assert(allocation_count == allocated + 1);
         assert(result != source);
@@ -535,7 +548,7 @@ static void test_slice_bounds(void) {
     const size_t allocated = allocation_count, destroyed = destruction_count;
     for (size_t i = 0; i < sizeof bounds / sizeof bounds[0]; i++) {
         struct blorp_string *result = source;
-        assert(blorp_string_slice(source, bounds[i][0], bounds[i][1], &result) == 0);
+        assert(blorp_string_byte_slice(source, bounds[i][0], bounds[i][1], &result) == 0);
         assert(destruction_count == destroyed);
         assert(allocation_count == allocated);
         assert(result == source);
@@ -549,7 +562,7 @@ static void test_slice_ownership(void) {
     struct blorp_string *source = blorp_string_from_bytes(slice_input, 22);
     blorp_string_retain(source);
     struct blorp_string *result = NULL;
-    assert(blorp_string_slice(source, 5, 8, &result) == 1);
+    assert(blorp_string_byte_slice(source, 5, 8, &result) == 1);
     assert(destruction_count == 0);
     assert(allocation_count == 2);
     assert(source != result);
@@ -564,7 +577,7 @@ static void test_slice_ownership(void) {
 
     source = blorp_string_from_bytes("", 0);
     result = NULL;
-    assert(blorp_string_slice(source, 0, 0, &result) == 1);
+    assert(blorp_string_byte_slice(source, 0, 0, &result) == 1);
     assert(destruction_count == 2);
     assert(allocation_count == 4);
     assert(source != result);
@@ -577,6 +590,7 @@ static void test_slice_ownership(void) {
 }
 
 int main(int argc, char **argv) {
+    blorp_memory_start();
     assert(argc == 2);
     if (strcmp(argv[1], "slice_values") == 0) {
         test_slice_values();
@@ -681,5 +695,5 @@ int main(int argc, char **argv) {
         return EXIT_FAILURE;
     }
     assert(allocation_count == destruction_count);
-    return EXIT_SUCCESS;
+    return blorp_memory_finish(EXIT_SUCCESS);
 }

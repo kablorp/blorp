@@ -15,7 +15,11 @@ functions whose names say "byte". The decisions below settle the rest.
 **Status:** approved. Keith approved S3 to S9 and the ceilings as
 recommended on 2026-11-10. The S0 cost spike is done: the stored count costs
 +0.16% instructions and +0.11% peak heap on a self-compile (see "S0
-results"). L1 has not started.
+results"). L1 landed on 2026-11-12 within its ceilings, with S9's recount
+limited to strict runs (see "L1 results"). That recount costs a strict -O0
+test compiler about 18%, which L2's e2e instruction ceilings cannot absorb as
+planned; the next step is a cheaper recount (see "The risk this leaves for
+L2").
 
 ## Problem
 
@@ -351,6 +355,145 @@ Nothing read the field.
 - **The emitted C** differs only in its embedded runtime text.
 - **This table is the record.** The raw files were not kept.
 
+## L1 results
+
+Written and measured against origin/main `7ddaebf32` (UInt8 L1 and its
+seed), at candidate `d3af35192`, before the branch was rebased onto
+`af2f0909a`.
+
+**The writer census.** Every C that makes or fills a String, found from each
+call of `blorp_string_allocate` and `blorp_string_from_bytes` and each write
+to `->length`:
+
+| Writer | Where | How it sets `code_points` |
+| --- | --- | --- |
+| `blorp_string_allocate` | `runtime/string.brp` | a parameter: the one constructor states both counts |
+| `blorp_string_from_counted_bytes` | `runtime/string.brp` | the caller's count |
+| `blorp_string_from_bytes` | `runtime/string.brp` | counts its copy, once allocation has refused a bad length |
+| literals | `runtime/string.brp` | `from_bytes`, once per site |
+| `int_to_string` | `runtime/string.brp` | the digit count: digits are ASCII |
+| `from_codepoint` | `runtime/string.brp` | 1 |
+| `bytes_to_text` | `runtime/string.brp` | `from_bytes`, after validation |
+| `byte_slice` (today's `slice`) | `STRING_SLICE_RUNTIME` | `from_bytes` on the slice |
+| `codepoint_slice` | `STRING_SLICE_RUNTIME` | `last - first`, without a rescan |
+| concatenation, interpolation | `runtime/string_concat.brp` | the sum of both counts |
+| in-place append | `runtime/string_concat.brp` | adds the suffix's count |
+| `append_int`, borrowed and in place | `runtime/string_concat.brp` | adds the digit count |
+| `float_to_string` | `runtime/float.brp` | `from_bytes` (ASCII) |
+| `read_text`, `next_lines` | `runtime/fs.brp` | `from_bytes`, after validation |
+| directory entries | `runtime/fs.brp` | 1 for the ASCII entry code, plus the name's count |
+| `create_temporary_directory` | `runtime/fs.brp` | `from_bytes` |
+| `current_directory` | `runtime/system.brp` | `from_bytes`, after validation |
+| argv | `runtime/list.brp` | `from_bytes`, after validation |
+| capture (exit text, stdout, stderr), `find_program` | `runtime/process.brp` | `from_bytes` |
+
+`string_to_bytes` only reads a String, and `blorp_string_reserve_unique`
+grows capacity without touching either count.
+
+**What L1 decided beyond the text above.**
+- **One C function per meaning.** `blorp_string_length` and
+  `blorp_string_slice` became `blorp_string_byte_length` and
+  `blorp_string_byte_slice`, which both the old and the new byte labels
+  call. L3 deletes only the `string.length` and `string.slice` labels and
+  their operations.
+- **External input is counted in a second pass.** It is validated, then
+  `from_bytes` counts its copy, not the one pass "Code" suggests. Fusing the
+  two would change every native for a saving the measurement cannot see.
+- **Where the functions live.** `codepoint_length` and `codepoint_at` are in
+  `string_runtime()`, beside `byte_at`; both slices share
+  `STRING_SLICE_RUNTIME`.
+- **S9 runs only under `BLORP_LEAK_CHECK=strict`**, because the full recount
+  cost 5.14% of a -O2 diagnostics self-compile, above its 3% ceiling. Every
+  e2e program, component suite and runtime probe runs strict, so they all
+  still recount.
+- **The stale probes are driven, not deleted.** `test/runtime/string_suite.brp`
+  runs `string_test.c`, `string_concat_test.c` and the new
+  `string_codepoints_test.c`. The revived concatenation probe caught
+  `from_bytes` counting a negative length's bytes before allocation could
+  refuse it, which L1 fixes.
+
+**Non-ASCII text reaches every writer** under strict runs. Literals,
+concatenation, the in-place append, interpolation, `slice`, `next_lines`,
+argv, directory names, `read_text` and `bytes_to_text` already had it. L1
+adds it to capture (the probe child's streams), `find_program` (the
+directory it finds), the current directory and a temporary directory's
+prefix.
+
+**A broken writer fails.** With the in-place append's
+`left->code_points+=suffix_code_points` removed:
+- the String runtime suite fails 9 of its 76 cases, at their count
+  assertions;
+- `string_operations/concat_reuse`, compiled by that test compiler, prints
+  its first line and aborts with `error: target String code point count
+  disagrees with its bytes` (exit 134);
+- a test driver compiled by that compiler aborts the same way.
+
+With the recount disabled instead, only the suite's `wrong count faults at
+release` case fails.
+
+**Costs.** Measured 2026-11-12 on an Apple M4 (macOS 26.7.1, Apple clang
+21.0.0), base `7ddaebf32`, candidate `d3af35192`:
+- **Stage 2,** as in S0. Each tree's seed-built compiler emits its own
+  compiler with its own runtime. clang links that at -O2 with
+  `-DBLORP_MEMORY_DIAGNOSTICS=0` and `=1`, and at -O0 with `=1` (the test
+  compiler's flags). Every binary compiles the base tree's `main.brp` and
+  library.
+- **Rounds:** five, alternating sides, for each -O2 variant; one for each
+  -O0 variant.
+- **Peak heap:** both trees carried the same uncommitted probe for peak live
+  requested bytes.
+
+| Variant | Metric | Base | Candidate | Change | Ceiling |
+| --- | --- | --- | --- | --- | --- |
+| -O2, no diagnostics | instructions | 12.249 G | 12.290 G | +0.34% | +0.5% |
+| -O2, diagnostics | instructions | 13.716 G | 13.813 G | +0.70% | +3% |
+| -O2, diagnostics, strict | instructions | 13.718 G | 14.423 G | +5.14% | none: strict only |
+| -O0, diagnostics | instructions | 43.376 G | 43.584 G | +0.48% | none |
+| -O0, diagnostics, strict | instructions | 43.356 G | 51.065 G | +17.78% | L2's 15% e2e margin |
+| diagnostics, strict | allocations | 14,070,305 | 14,070,306 | +1 | +50 |
+| diagnostics, strict | peak heap | 162,756,577 B | 162,936,818 B | +0.11% | +0.3% |
+
+- **Stage 1** (`scripts/self-compile-cost 7ddaebf32 d3af35192`, 11 rounds):
+  the compiler-side change costs nothing measurable. Fixed input: +1
+  allocation, -0.04% instructions. Own source: +0.18% allocations and +0.15%
+  instructions, from the larger source.
+- **Output identity.** The emitted C for the fixed input differs only in the
+  runtime text and in the renamed `blorp_string_byte_length` and
+  `blorp_string_byte_slice` calls.
+- **Production lines:** +178 net (`blorp/src` +226, -48):
+  - the header and writers, +22;
+  - S9, +15;
+  - the labels and operations, +141 (+35 of it runtime C).
+
+  The estimate before coding was +157. Test lines: +812 net.
+- **Raw samples** are under `blorp/build/string-codepoints-l1-cost/` in the
+  L1 worktree.
+
+**The risk this leaves for L2.** The e2e harness runs every timed compile
+under `BLORP_LEAK_CHECK=strict` (it reads the allocation report), so once
+L2's seed carries S9, a timed compile pays about the -O0 strict row's 18%.
+Limiting S9 to strict runs does not keep L2 within the 15% margin. Ways out,
+for the coordinator and Keith:
+- (a) a cheaper count, such as eight bytes per step;
+- (b) time e2e compiles without strict, with the allocations from a second
+  run;
+- (c) a separate opt-in for the recount;
+- (d) new e2e ceilings at L2.
+
+The coordinator's recommendation (2026-11-12): try (a) before L2. Counting
+eight bytes per step changes no decision and no interface; re-measure the
+-O0 strict row. Bring (b), (c) or (d) to Keith only if (a) still leaves L2
+over the 15% margin; (d) would break the rule above that L2 raises no
+ceiling.
+
+**A coordinator ceiling correction at landing.** The fs write program's
+compile allocation ceiling rose from 222,217 to 222,218, because the branch
+measures one allocation more than main at the same path. These counts also
+grow with the checkout's depth, by about four per directory level (the
+compiler's `Path.normalize` allocates one String per component), so in a
+deep worktree both main and this branch exceed two exact ceilings that CI
+meets.
+
 ## Landings
 
 1. **S0, a spike** that never lands (done). It measured the stored count's
@@ -447,9 +590,10 @@ against its parent commit, interleaved, as in S0.
   own); display width for wide or zero-width characters (the formatter keeps
   counting code points).
 - Found, not fixed: `test/runtime/fixtures/string_test.c` and
-  `string_concat_test.c` are referenced by no suite or Makefile rule, so they
-  never run. L1 should either drive them from its new runtime suite or
-  delete them.
+  `string_concat_test.c` were referenced by no suite or Makefile rule, so they
+  never ran. L1 drives them from `test/runtime/string_suite.brp`. L1 found
+  that `argv_test.c`, with its `aggregate_runtime_test.h`, runs nowhere
+  either; it is left for a later change.
 - Concurrent work:
   - The Bytes plan's L4 edits the same `byte_at` call sites. Whichever lands
     second rebases; the conflict is mechanical.

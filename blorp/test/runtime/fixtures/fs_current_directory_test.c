@@ -141,6 +141,7 @@ int main(int argc, char **argv) {
         status = case_failure(EINTR, -4) + (calls == 1 ? 0 : 1);
     }
     if (strcmp(name, "short_path") == 0) status = case_success("/short", 1);
+    if (strcmp(name, "non_ascii_path") == 0) status = case_success("/caf\303\251/\360\237\230\200", 1);
     if (strcmp(name, "grows_past_initial") == 0) {
         char long_path[600];
         memset(long_path, 'a', sizeof long_path - 1);
