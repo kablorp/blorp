@@ -18,8 +18,9 @@ recommended on 2026-11-10. The S0 cost spike is done: the stored count costs
 results"). L1 landed on 2026-11-12 within its ceilings, with S9's recount
 limited to strict runs (see "L1 results"). That recount costs a strict -O0
 test compiler about 18%, which L2's e2e instruction ceilings cannot absorb as
-planned; the next step is a cheaper recount (see "The risk this leaves for
-L2").
+planned. Counting eight bytes per step (see "Recount") and resetting three
+path ceilings (see "Keith's ruling") let L2 proceed; its acceptance test is
+the stage-B e2e run with no ceiling raised at L2.
 
 ## Problem
 
@@ -485,6 +486,62 @@ eight bytes per step changes no decision and no interface; re-measure the
 -O0 strict row. Bring (b), (c) or (d) to Keith only if (a) still leaves L2
 over the 15% margin; (d) would break the rule above that L2 raises no
 ceiling.
+
+**Recount (2026-11-12, `blorp/string-recount`).** `blorp_utf8_code_points`
+now counts continuations eight bytes per step: a byte is a continuation when
+its bit 7 is set and its bit 6 is clear, so `word & ~(word << 1) & 0x80...80`
+marks them, and a multiply by `0x01...01` sums the marks into the top byte.
+The tail is a per-byte loop with no call. This is plain C11 (no
+`__builtin_popcountll`; the runtime has no precedent for builtins). One
+function serves the strict recount and `from_bytes`. The suite's
+`word_count` case checks lengths 0, 1, 7, 8, 9, 15, 16 and 17, and scalars of
+every width starting at every offset in a word, against the per-byte count.
+So do words made only of continuation bytes, and invalid bytes (`0xff`,
+`0xc0`) mixed with continuations at every prefix length. Production +18 net
+lines.
+
+The L2 reproduction (fixpoint stage B at -O0 with diagnostics,
+`make -C blorp test-e2e INSTRUCTION_CHECK=on BLORP_TEST_COMPILER=<stage_b>`):
+
+| Case | Ceiling | Before | After |
+| --- | --- | --- | --- |
+| `source_loops/nesting` | 565,332,965 | 664,939,712 | passes |
+| the 6.2 G harness compile | 6,215,987,687 | 6,811,050,507 | passes |
+| `fs_lines` | 1,196,778,594 | 1,286,899,142 | passes |
+| `fs_directories` | 1,347,097,145 | 1,435,575,057 | passes |
+| `path_join/arguments` (`self_hosted_strings.brp:1022`) | 574,758,593 | 589,617,289 | 575,586,952 to 578,115,851 |
+| `path_join/aliases` | 570,000,000 | 583,219,072 | 570,826,670 to 570,977,539 |
+
+Failing ceilings fell from 17 in 4 tests to 2. With the recount off the
+`path_join/aliases` compile measures 569.5 M against its 570 M ceiling and
+run-to-run noise is about 0.1%, so what remains is the count's own upkeep
+(+0.48%) plus a recount of about 0.3%. A zero-padded word for the tail
+(no byte loop) measured no better. A third run also took `path_parent/edges`
+0.15% over. Once `203541220` reset those three ceilings (see "Keith's
+ruling"), the reproduction passed on the rebased commit: 236 of 236 tests,
+with no ceiling exceeded.
+
+Costs, measured 2026-11-12 on an Apple M4 against origin/main `95f37e437`
+(the candidate is the commit before its review fixes, whose runtime text
+differs only in a constant's name and two comments). Stage 2 as in S0: each
+tree's seed-built compiler emits its own compiler, clang links it, and every
+binary compiles the base tree's `main.brp` and library; five rounds,
+alternating sides, medians:
+
+| Variant | Metric | Base | Candidate | Change |
+| --- | --- | --- | --- | --- |
+| -O2, no diagnostics | instructions | 12.387 G | 12.374 G | -0.10% |
+| -O2, diagnostics | instructions | 13.851 G | 13.827 G | -0.17% |
+| -O2, diagnostics, strict | instructions | 14.470 G | 14.083 G | -2.67% |
+| -O0, diagnostics | instructions | 43.875 G | 43.752 G | -0.28% |
+| -O0, diagnostics, strict | instructions | 51.381 G | 44.631 G | -13.14% |
+| diagnostics, strict | allocations | 14,130,124 | 14,130,124 | identical |
+
+A strict -O0 compile now costs +2.0% over the same compile without strict
+(it was +17.1%). `self-compile-cost origin/main HEAD --rounds 5` (stage 1):
+fixed input +0 allocations and +0.019% instructions; own source +17
+allocations and +0.014% instructions. Raw samples:
+`blorp/build/string-recount-cost/` in the recount worktree.
 
 **A coordinator ceiling correction at landing.** The fs write program's
 compile allocation ceiling rose from 222,217 to 222,218, because the branch

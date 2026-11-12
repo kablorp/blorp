@@ -60,11 +60,29 @@ pure func string_runtime() -> String:
         |static int blorp_utf8_is_continuation(char byte) {
         |return ((unsigned char)byte&BLORP_UTF8_CONTINUATION_MASK)==BLORP_UTF8_CONTINUATION_TAG;
         |}
+        |/* Eight bytes per step: a byte is a continuation when its bit 7 is set and its bit 6 is clear. */
+        |enum {BLORP_UTF8_WORD_BYTES=sizeof(uint64_t),BLORP_UTF8_TOP_BIT_SHIFT=7,BLORP_UTF8_BYTE_SUM_SHIFT=56};
+        |#define BLORP_UTF8_HIGH_BITS UINT64_C(0x8080808080808080)
+        |#define BLORP_UTF8_LOW_BITS UINT64_C(0x0101010101010101)
         |/* The scalars in counted valid UTF-8, where every byte but a continuation starts one. */
         |static int64_t blorp_utf8_code_points(const char *bytes,size_t length) {
-        |int64_t count=0;
-        |for(size_t position=0;position<length;position++){count+=!blorp_utf8_is_continuation(bytes[position]);}
-        |return count;
+        |int64_t continuations=0;
+        |size_t position=0;
+        |const size_t words_end=length-length%BLORP_UTF8_WORD_BYTES;
+        |for(;position<words_end;position+=BLORP_UTF8_WORD_BYTES){
+        |uint64_t word;
+        |memcpy(&word,bytes+position,sizeof word); /* No alignment assumed. */
+        |/* word<<1 moves each byte's bit 6 to its own bit 7, so the mask reads only that byte's
+        | * bits (the shift also carries bit 7 into the next byte's bit 0, which the mask drops).
+        | * Each byte of the masked word is then 0 or 0x80; the shift makes it 0 or 1, and the
+        | * multiply sums the eight into the top byte, at most 8, so no byte carries. */
+        |continuations+=(int64_t)((((word&~(word<<1)&BLORP_UTF8_HIGH_BITS)>>BLORP_UTF8_TOP_BIT_SHIFT)*BLORP_UTF8_LOW_BITS)>>BLORP_UTF8_BYTE_SUM_SHIFT);
+        |}
+        |/* Per byte, with no call: -O0 does not inline. */
+        |for(;position<length;position++){
+        |continuations+=((unsigned char)bytes[position]&BLORP_UTF8_CONTINUATION_MASK)==BLORP_UTF8_CONTINUATION_TAG;
+        |}
+        |return (int64_t)length-continuations;
         |}
         |static size_t blorp_string_maximum_capacity(void) {
         |const size_t storage_limit=SIZE_MAX-sizeof(struct blorp_string)-1;

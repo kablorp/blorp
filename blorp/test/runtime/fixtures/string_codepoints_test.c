@@ -156,6 +156,66 @@ static void byte_slice(void) {
     blorp_string_release(empty);
 }
 
+/* The per-byte definition of the count: every byte but a continuation starts a scalar.
+ * It repeats the byte tests rather than using the runtime's, so the two stay independent. */
+static int64_t counted_per_byte(const char *bytes, size_t length) {
+    int64_t count = 0;
+    for (size_t position = 0; position < length; position++) {
+        if (((unsigned char)bytes[position] & 0xc0) != 0x80) count++;
+    }
+    return count;
+}
+
+static void assert_counted(const char *bytes, size_t length, int64_t code_points) {
+    assert(counted_per_byte(bytes, length) == code_points);
+    struct blorp_string *value = text(bytes, (int64_t)length);
+    assert(value->code_points == code_points);
+    blorp_string_release(value);
+}
+
+/* The eight-byte step and its tail: lengths around each word boundary, and a
+ * scalar of every width starting at every offset in a word, so its
+ * continuations meet both ends of a word. */
+static void word_count(void) {
+    static const size_t lengths[] = {0, 1, 7, 8, 9, 15, 16, 17};
+    char buffer[128];
+    for (size_t index = 0; index < sizeof lengths / sizeof lengths[0]; index++) {
+        memset(buffer, 'a', sizeof buffer);
+        assert_counted(buffer, lengths[index], (int64_t)lengths[index]);
+    }
+    static const char *const scalars[] = {"a", "\xc3\xa9", "\xe2\x82\xac", "\xf0\x9f\x98\x80"};
+    for (size_t kind = 0; kind < sizeof scalars / sizeof scalars[0]; kind++) {
+        const size_t width = strlen(scalars[kind]);
+        for (size_t prefix = 0; prefix <= 2 * BLORP_UTF8_WORD_BYTES + 1; prefix++) {
+            for (size_t repeats = 0; repeats <= 5; repeats++) {
+                size_t length = 0;
+                memset(buffer, 'a', prefix);
+                length = prefix;
+                for (size_t repeat = 0; repeat < repeats; repeat++) {
+                    memcpy(buffer + length, scalars[kind], width);
+                    length += width;
+                }
+                assert_counted(buffer, length, (int64_t)(prefix + repeats));
+            }
+        }
+    }
+    /* Three four-byte scalars: each word holds a lead byte and continuations. */
+    assert_counted("\xf0\x9f\x98\x80\xf0\x9f\x98\x80\xf0\x9f\x98\x80", 12, 3);
+    /* Invalid input is counted by the same definition: a word of nothing but
+     * continuations, with lengths 8, 16 and 17 (a tail), then 0xff and 0xc0
+     * (both have bit 7 set) mixed among continuations. */
+    static const size_t continuation_lengths[] = {8, 16, 17};
+    for (size_t index = 0; index < sizeof continuation_lengths / sizeof continuation_lengths[0];
+         index++) {
+        memset(buffer, 0x80, sizeof buffer);
+        assert_counted(buffer, continuation_lengths[index], 0);
+    }
+    static const char mixed_invalid[] = "\xff\x80\xc0\x80\xbf\xff\x80\xc0\x80\x80\xc0\xff\xbf\xbf\x80\xc0\x80";
+    for (size_t length = 0; length < sizeof mixed_invalid; length++) {
+        assert_counted(mixed_invalid, length, counted_per_byte(mixed_invalid, length));
+    }
+}
+
 /* S9: a String whose count disagrees with its bytes aborts at its release
  * with the named fault, as a writer that forgot its count would. */
 static void wrong_count_faults(void) {
@@ -172,6 +232,7 @@ int main(int argc, char **argv) {
     else if (strcmp(name, "codepoint_at") == 0) codepoint_at();
     else if (strcmp(name, "codepoint_slice") == 0) codepoint_slice();
     else if (strcmp(name, "byte_slice") == 0) byte_slice();
+    else if (strcmp(name, "word_count") == 0) word_count();
     else if (strcmp(name, "wrong_count_faults") == 0) wrong_count_faults();
     else {
         fprintf(stderr, "unknown String code point test: %s\n", name);
