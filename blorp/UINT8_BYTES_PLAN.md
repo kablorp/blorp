@@ -11,8 +11,9 @@ eventually anyway", and `opaque type Bytes = List[UInt8]`, with no separate
 
 **Status:** S0 and L0 implementation/local qualification are complete. Full
 instruction-enabled tests, fixpoint, fixture parity, independent code/test
-reviews and four-platform CI pass. L0 is published on origin/main. L1
-started on 2026-11-11, when Keith asked for `Bytes` in the library. The corrected L0 line allowance is recorded under Ceilings;
+reviews and four-platform CI pass. L0 and L1 (`0bb93894d`) have landed,
+and L2 pins the seed built from L1, `blorp-seed-0bb93894dcf2`; L3, the
+library, is next. The corrected L0 line allowance is recorded under Ceilings;
 performance caps are unchanged. Measured L0 costs, all within the caps:
 fixed-input allocations +0 and instructions +0.014% (median of 3); own-source
 allocations +0.21% and instructions +0.17%.
@@ -427,6 +428,8 @@ keeps what a later landing needs. What it found:
    "Rotating the seed pin"). The seed family switch to `blorp` and the move to
    the `compile INPUT --library-root DIR -o OUTPUT` command line landed with
    the modules plan's landing 6, so L2 changes only the pin.
+   - **Done, 2026-11-12.** The pin names `blorp-seed-0bb93894dcf2`, which
+     main's CI built from L1's commit `0bb93894d`.
 5. **L3, the library.** This landing adds:
    - `type UInt8 = builtin` in `_base`, which makes the role mandatory, and
      the prelude exports;

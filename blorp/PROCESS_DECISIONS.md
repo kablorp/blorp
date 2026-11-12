@@ -688,11 +688,11 @@ imports `io/terminal`.
    Test lines are reported separately; about 350 are expected, most of them
    C probes.
 4. **L4, the seed rotation.** `blorp run` makes the compiler import
-   `io/terminal`, whose `process.run` label the pinned seed (`4acd2377961d`)
-   does not know; it knows `capture`'s three. If the commit that
-   `UINT8_BYTES_PLAN.md`'s L2 rotation pins includes L3, that plain rotation
-   carries `process.run` (and P11's label) and L4 is dropped; otherwise L4 is
-   a plain rotation of its own.
+   `io/terminal`, whose `process.run` label the pinned seed
+   (`0bb93894dcf2`, built from UInt8 L1) does not know; it knows `capture`'s
+   three. UInt8's L2 rotation pinned a commit without L3, so L4 is a plain
+   rotation of its own that carries `process.run` and P11's label, unless a
+   later rotation that includes L3 lands first.
 5. Then `RUN_AND_TEST_PLAN.md`'s CLI landing. One question for it, which
    this amendment does not decide: `blorp run` compiles the C with `capture`,
    whose child leads its own group, so Ctrl-C during that compile ends

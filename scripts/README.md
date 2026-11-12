@@ -64,7 +64,7 @@ The separate cache defaults to `$XDG_CACHE_HOME/blorp/seed` or
 is its only explicit override. Relative cache paths resolve from the repository
 root. Release identity cannot be overridden through environment variables.
 Before running the seed the resolver prints one line to stderr, such as
-`Blorp bootstrap: seed blorp-seed-4acd2377961d (cached)` (or `downloaded`), so a
+`Blorp bootstrap: seed blorp-seed-0bb93894dcf2 (cached)` (or `downloaded`), so a
 build log shows which seed built the compiler.
 `--print-path` verifies the seed without running it; `--print-id` validates and
 prints the repository, tag and source commit without downloading it. Other

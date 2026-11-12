@@ -9,21 +9,14 @@ done.
 ## Workstreams
 
 - **UInt8 and Bytes:** [`UINT8_BYTES_PLAN.md`](UINT8_BYTES_PLAN.md).
-  - **Status:** U1 to U9 and B1 to B3 are decided. S0 and the L0
-    `IntegerType(Int64Format)` refactor are implemented and independently
-    reviewed and published; combined local gates and four-platform CI pass. Matched costs
-    pass unchanged performance ceilings.
-  - **Next:** L1, adding UInt8 with deferred integer literals, started on
-    2026-11-11 (branch `blorp/uint8-l1`). `LSP_PLAN.md`'s landing 6 waits
-    for L1 and its landing 8 for L3; if landing 6 is nearly ready when L1
-    lands, L2's rotation waits briefly to carry its labels too.
-  - **Afterwards:**
-    - L1, the compiler learns `UInt8`, with deferred integer literals;
-    - L2, a plain seed rotation onto L1 (the seed family and command-line switch
-      landed with an earlier seed rotation);
-    - L3, the library: `_base`, `uint8.brp`, `bytes.brp`, and
-      `fs.read_bytes`/`write_bytes`;
-    - L4, `String.byte_at` returns `Option[UInt8]`.
+  - **Status:** U1 to U9 and B1 to B3 are decided. L0, the
+    `IntegerType(Int64Format)` refactor, and L1, the compiler's `UInt8` with
+    deferred integer literals and the byte natives (`0bb93894d`), have
+    landed. L2 pins the seed built from L1 (`blorp-seed-0bb93894dcf2`).
+  - **Next:** L3, the library: `_base`, `uint8.brp`, `bytes.brp`, and
+    `fs.read_bytes`/`write_bytes`. `LSP_PLAN.md`'s landing 6 needs only L1;
+    its console labels ride a later rotation. Its landing 8 waits for L3.
+  - **Afterwards:** L4, `String.byte_at` returns `Option[UInt8]`.
 - **Process API:** [`PROCESS_DECISIONS.md`](PROCESS_DECISIONS.md).
   - **Status:** L0 is implemented and independently reviewed; final combined
     landing gates and four-platform CI pass; L0 is published. Shared
@@ -34,8 +27,9 @@ done.
     never builds aborts through `process.fault`.
     L2 landed on 2026-11-11: every caller uses `capture` or `output`,
     `run_to_files` is deleted, and `Command.program` is a `Path`.
-  - **Next:** `blorp run` and `blorp test` (`RUN_AND_TEST_PLAN.md`), which
-    need the terminal-sharing `run` amendment and a seed rotation.
+  - **Next:** the terminal-sharing `run` (the amendment Keith approved on
+    2026-11-11, P6 to P11), then a seed rotation, then `blorp run` and
+    `blorp test` (`RUN_AND_TEST_PLAN.md`).
   - **Later:** binary capture after `Bytes`, and `run` with streaming.
 - **Language server (`blorp lsp`):** [`LSP_PLAN.md`](LSP_PLAN.md).
   - **Status:** the plan was written and revised on 2026-11-10 (name uses
