@@ -173,9 +173,10 @@ has risen by about 0.18%.
   file. A separate `Stop` variant waits for a consumer that needs one.
 - **D40, 2026-11-05, collecting lines.** A pure String `lines()` with the same
   line rules, used as `read_text(path).lines()`, rather than an
-  `fs.read_lines`. It is its own change after `fold_lines` and is not built
-  yet. A List accumulator in `fold_lines` copies the list on every line, so
-  collecting lines goes through `read_text` for now.
+  `fs.read_lines`. Built: `string.lines`, whose agreement with `fold_lines`
+  the `fs/lines` example checks on every rule case. A List accumulator in
+  `fold_lines` copies the list on every line, so collecting lines goes through
+  `read_text`.
 - **D13, 2026-11-05, a `Path` type.** Deferred. Reopen with `Bytes`, or if D8's error
   turns out to be common. Amended 2026-11-11: a `Path` type exists, a UTF-8
   spelling that is never empty and never holds NUL.

@@ -283,6 +283,10 @@ foundation's designated Bool and Option, found by name in `_base.brp`, and
 layout follows the unions' declaration order. FFI remains inactive.
 
 `string.starts_with` is an ordinary pure counted-byte prefix helper.
+`string.lines(text) -> List[String]` splits at each LF and drops it with a CR just
+before it, exactly as `fold_lines` does: a last line without LF is kept, a lone CR
+stays in its line, and empty text has no lines. It reads the text once and
+appends to a growing List in place.
 `string.slice(String, Int, Int) -> Option[String]` uses half-open UTF-8 byte
 offsets: invalid bounds or an endpoint inside a scalar return None. A valid
 empty or full slice returns Some with an independently owned String, preserving

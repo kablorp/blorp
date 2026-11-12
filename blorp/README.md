@@ -1005,7 +1005,10 @@ needs no import. Other direct calls need named imports: console output is in
 the prelude, while files, processes and the environment are explicit imports.
 A user module cannot declare `print` or `print_error` ("print is provided by
 the prelude"). Selecting them from `io/console` as well is redundant but
-accepted: an import of a name already in scope enters once. Library modules
+accepted: an import of a name already in scope enters once. A function whose
+first parameter is a String and whose name is a String method the prelude
+provides, such as `lines`, is rejected as well, with "two functions named lines
+can accept the same receiver"; give it another name. Library modules
 receive nothing implicitly and cannot import user modules. Any module may
 import the foundation module as `_base`.
 

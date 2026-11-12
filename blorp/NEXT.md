@@ -56,7 +56,7 @@ done.
 - **Filesystem:** [`FILESYSTEM_DECISIONS.md`](FILESYSTEM_DECISIONS.md).
   - **Status:** Part 1 has landed through `fold_lines`. Part 2, lent
     resources, waits for a consumer.
-  - **Next:** D40, a pure `String.lines()` with `fold_lines`'s line rules, so
+  - **Built:** D40, a pure `String.lines()` with `fold_lines`'s line rules, so
     `read_text(path).lines()` collects lines.
   - **Later:** the plan's "Later" list.
 
@@ -83,6 +83,11 @@ None of these is planned yet. Each wants its own short design or brief.
   - `starts_with` and `index_of` for `T: Equatable`;
   - lexicographic `Orderable` for `List[T: Orderable]`.
 - **Names and errors:**
+  - **The clash message for a prelude String method's name.** A user function
+    `lines(text: String)` reports "two functions named lines can accept the
+    same receiver" with the help "rename one of them" and the notes "String
+    and String". It should say, as the `max` clash does, that the name is
+    provided by the prelude, and its help should name only the user's function.
   - **A test-visible form of `private`.** The decoders in `io/environment`,
     `io/process` and `io/_codes` are public with a "not API" comment so that
     tests can pass them literal codes.
