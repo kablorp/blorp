@@ -2,8 +2,11 @@
 
 Status: approved by Keith on 2026-11-10, with the recommended answer to each
 of K1–K4. Landed on 2026-11-10 as `bcc6bfdb1`.
-Test lines came to +461 against the +450 ceiling; self-compile allocations
-13,563,081 to 13,563,080 and retired instructions −0.02%. Written against
+Test lines came to +461 against the +450 ceiling. Coordinator correction,
+2026-11-11, under the standing delegation: the test ceiling is +461 (was
++450); the extra 11 lines are correctness tests, which the plan says not to
+shorten to meet a figure. Self-compile allocations 13,563,081 to 13,563,080
+and retired instructions −0.02%. Written against
 `ce8753b6f` on 2026-11-09.
 
 ## Problem
@@ -444,7 +447,7 @@ instructions. Re-measure the base and do not reuse those figures.
 | Self C and every e2e fixture's C or diagnostics | byte-identical to base | identical |
 | E2e allocation and instruction ceilings | unchanged | pass |
 | Production lines (`src/`), net | at most −150 | about −230: −277 in emit.brp, −20 in diagnostics.brp, +25 in verify.brp, +40 for the new loop |
-| Test lines (`test/`), added | at most +450 | about +300 |
+| Test lines (`test/`), added | at most +450, corrected to +461 on 2026-11-11 | about +300 |
 
 Report production and test additions, deletions and net counts separately,
 from `git diff --numstat`. Repeat an apparent miss before believing it. Bring

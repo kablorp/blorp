@@ -81,11 +81,6 @@ done.
   [`EMBEDDED_LIBRARY_PLAN.md`](EMBEDDED_LIBRARY_PLAN.md). Other sessions own
   them; see each plan's status line, and `git log` for what has landed since
   (the embedded library landed in `1a68dbd3b`).
-- **Aggregate definition order:** [`AGGREGATE_ORDER_PLAN.md`](AGGREGATE_ORDER_PLAN.md).
-  - **Status:** landed 2026-11-10 as `bcc6bfdb1`. Test lines came to +461
-    against a +450 ceiling, awaiting the coordinator's budget correction.
-  - **Next:** none; remove this entry once the ceiling is settled.
-
 ## Smaller follow-ups
 
 None of these is planned yet. Each wants its own short design or brief.
