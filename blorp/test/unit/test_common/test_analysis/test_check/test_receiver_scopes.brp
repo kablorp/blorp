@@ -21,7 +21,7 @@ import:
     ../../../../../src/common/syntax/syntax:
         Diagnostic,
         DiagnosticKind(ProgramProblem),
-        DiagnosticNote(PreviousDeclaration, NoteLines),
+        DiagnosticNote(PreviousDeclaration, NoteLines, CompetingDeclarations),
         Span,
         diagnostic,
         compiler_span,
@@ -690,6 +690,208 @@ private pure func test_unused_overlaps_keep_the_first_qualifying_duplicate_impor
     )
 
 
+-- `map` takes its result's element type from its lambda, whose body is checked
+-- only after the receiver call that follows `map` is chosen.
+private MAP: String =
+    |pure func map[T, U](values: List[T], transform: pure (T) -> U) -> List[U]:
+    |    []
+    |
+
+
+private LIST_JOIN: String =
+    |pure func join(values: List[String], separator: String) -> String:
+    |    separator
+    |
+
+
+private FOO_JOIN: String =
+    |import:
+    |    ./types: Foo
+    |pure func join(base: Foo, child: Foo) -> Foo:
+    |    base
+    |
+
+
+private INT_JOIN: String =
+    |pure func join(left: Int, right: Int) -> Int:
+    |    left
+    |
+
+
+private STRING_DESCRIBE: String =
+    |pure func describe(values: List[String]) -> Int:
+    |    0
+    |
+
+
+private INT_DESCRIBE: String =
+    |pure func describe(values: List[Int]) -> Int:
+    |    0
+    |
+
+
+private MAPPED: String =
+    |    values
+    |        .map(pure func(value: String): value)
+    |        .
+
+
+-- The receiver is a List whose element type is still unknown, which only the
+-- List[String] join can accept, so that join is chosen before the lambda is.
+private pure func test_a_receiver_still_being_inferred_selects_its_one_fitting_function() -> Bool:
+    root =
+        |import:
+        |    ./map: List methods
+        |    ./list_join: List methods
+        |    ./types: Foo
+        |    ./foo_join: Foo methods
+        |pure func message(values: List[String]) -> String:
+        |
+    calls_are(
+        parse_modules([
+            { source = root + MAPPED + "join(\",\")\n" + EMPTY_MAIN, targets = [1, 2, 3, 4] },
+            { source = MAP, targets = [] },
+            { source = LIST_JOIN, targets = [] },
+            { source = FOO, targets = [] },
+            { source = FOO_JOIN, targets = [3] },
+        ]),
+        0,
+        [2, 3],
+    )
+
+
+-- Neither join accepts a List of any element type, so no later inference can
+-- choose one.
+private pure func test_a_receiver_still_being_inferred_can_fit_no_function() -> Bool:
+    imports =
+        |import:
+        |    ./map: List methods
+        |    ./types: Foo
+        |    ./foo_join: Foo methods
+        |    ./int_join: Int methods
+        |
+    prefix = imports + "pure func message(values: List[String]) -> Int:\n" + MAPPED
+    foo_import = "import:\n    ./map: List methods\n    ./types: Foo\n    ./foo_join: "
+    rejects(
+        parse_modules([
+            { source = prefix + "join(1)\n" + EMPTY_MAIN, targets = [1, 2, 3, 4] },
+            { source = MAP, targets = [] },
+            { source = FOO, targets = [] },
+            { source = FOO_JOIN, targets = [2] },
+            { source = INT_JOIN, targets = [] },
+        ]),
+        {
+            span = site(0, prefix, "join"),
+            kind = ProgramProblem,
+            note = Some(
+                CompetingDeclarations([
+                    site(3, "import:\n    ./types: Foo\npure func ", "join"),
+                    site(0, foo_import, "Foo"),
+                    site(4, "pure func ", "join"),
+                    site(0, foo_import + "Foo methods\n    ./int_join: ", "Int"),
+                ]),
+            ),
+            message = "no method accepts this receiver type",
+            help = "use a value of a declared receiver type, or import a function accepting this type",
+        },
+    )
+
+
+-- Both functions accept a List, and only the lambda's unchecked result would
+-- say which; the call names both rather than an inference failure inside `map`.
+private pure func test_a_receiver_still_being_inferred_that_fits_two_functions_needs_a_type() -> Bool:
+    imports =
+        |import:
+        |    ./map: List methods
+        |    ./strings: List methods
+        |    ./numbers: List methods
+        |
+    prefix = imports + "pure func message(values: List[String]) -> Int:\n" + MAPPED
+    rejects(
+        parse_modules([
+            { source = prefix + "describe()\n" + EMPTY_MAIN, targets = [1, 2, 3] },
+            { source = MAP, targets = [] },
+            { source = STRING_DESCRIBE, targets = [] },
+            { source = INT_DESCRIBE, targets = [] },
+        ]),
+        {
+            span = site(0, prefix, "describe"),
+            kind = ProgramProblem,
+            note = Some(
+                CompetingDeclarations([
+                    site(2, "pure func ", "describe"),
+                    site(0, "import:\n    ./map: List methods\n    ./strings: ", "List"),
+                    site(3, "pure func ", "describe"),
+                    site(
+                        0,
+                        "import:\n    ./map: List methods\n    ./strings: List methods\n    ./numbers: ",
+                        "List",
+                    ),
+                ]),
+            ),
+            message = "method receiver needs an explicit type",
+            help = "bind the receiver to a local with a declared type, or call a uniquely imported function directly",
+        },
+    )
+
+
+-- The annotated lambda result solves `map`'s element type before `.describe`
+-- is chosen, so the solution, not an open variable, decides the receiver.
+private pure func test_a_receiver_variable_already_solved_selects_by_its_solution() -> Bool:
+    root =
+        |import:
+        |    ./map: List methods
+        |    ./strings: List methods
+        |    ./numbers: List methods
+        |pure func message(values: List[String]) -> Int:
+        |    values
+        |        .map(pure func(value: String) -> String: value)
+        |        .describe()
+        |
+    calls_are(
+        parse_modules([
+            { source = root + EMPTY_MAIN, targets = [1, 2, 3] },
+            { source = MAP, targets = [] },
+            { source = STRING_DESCRIBE, targets = [] },
+            { source = INT_DESCRIBE, targets = [] },
+        ]),
+        0,
+        [2, 3],
+    )
+
+
+-- The caller's own type parameter is rigid, not a variable to solve: whatever
+-- `count` is called with, List[Element] fits neither function.
+private pure func test_a_callers_type_parameter_stays_rigid_in_receiver_selection() -> Bool:
+    imports =
+        |import:
+        |    ./strings: List methods
+        |    ./numbers: List methods
+        |
+    prefix = imports + "pure func count[Element](values: List[Element]) -> Int:\n    values."
+    rejects(
+        parse_modules([
+            { source = prefix + "describe()\n" + EMPTY_MAIN, targets = [1, 2] },
+            { source = STRING_DESCRIBE, targets = [] },
+            { source = INT_DESCRIBE, targets = [] },
+        ]),
+        {
+            span = site(0, prefix, "describe"),
+            kind = ProgramProblem,
+            note = Some(
+                CompetingDeclarations([
+                    site(1, "pure func ", "describe"),
+                    site(0, "import:\n    ./strings: ", "List"),
+                    site(2, "pure func ", "describe"),
+                    site(0, "import:\n    ./strings: List methods\n    ./numbers: ", "List"),
+                ]),
+            ),
+            message = "no method accepts this receiver type",
+            help = "use a value of a declared receiver type, or import a function accepting this type",
+        },
+    )
+
+
 TESTS: TestSuite = {
     description = "Complete admitted receiver scopes",
     tests = [
@@ -764,5 +966,25 @@ TESTS: TestSuite = {
         ),
         ("unused family conflict precedes overlap within its module", family_before_overlap),
         ("earliest dependency module precedes a later family conflict", earliest_dependency_error),
+        (
+            "a receiver still being inferred selects its one fitting function",
+            test_a_receiver_still_being_inferred_selects_its_one_fitting_function,
+        ),
+        (
+            "a receiver still being inferred can fit no function",
+            test_a_receiver_still_being_inferred_can_fit_no_function,
+        ),
+        (
+            "a receiver still being inferred that fits two functions needs a type",
+            test_a_receiver_still_being_inferred_that_fits_two_functions_needs_a_type,
+        ),
+        (
+            "a receiver variable already solved selects by its solution",
+            test_a_receiver_variable_already_solved_selects_by_its_solution,
+        ),
+        (
+            "a caller's type parameter stays rigid in receiver selection",
+            test_a_callers_type_parameter_stays_rigid_in_receiver_selection,
+        ),
     ],
 }

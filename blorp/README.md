@@ -983,6 +983,19 @@ distinct. Import cycles, including a module importing itself, are rejected at
 the import that closes the cycle, and a module reached along several paths is
 loaded once. Every loaded module is checked, including unused declarations.
 
+Same-named functions that UFCS reaches on different receivers, such as List's
+and Path's `join` once `path: Path` is selected, are told apart by the
+receiver's type. Receivers may differ only in their type arguments, as
+`List[String]` and `List[Int]` do, but two functions that one receiver type
+could fit are rejected at the import that brings the second. A call needs
+only the part of the receiver's type that tells them apart: in
+`names.map(pure func(name: String): "${name}!").join(", ")` the receiver is
+known to be a List before the lambda's result is, which chooses List's `join`.
+When the known part still fits several, as a List whose element type is not
+yet known fits both `List[String]` and `List[Int]`, the call reports
+`method receiver needs an explicit type`; bind the receiver to a local with a
+declared type.
+
 The [prelude](standard_library/prelude.brp) is the only implicit import. User
 modules receive its selections: the base types, `Bool`, `Option` and `Result`
 with their constructors, the operator traits, `Equatable`, `Hashable`,

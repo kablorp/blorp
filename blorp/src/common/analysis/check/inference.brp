@@ -16,7 +16,6 @@ import:
     ./callables:
         FunctionContract,
         accepted_function,
-        ResolvedReceiver(UniqueReceiver, ReceiverCandidates),
         ResolutionContext,
         method_sites,
         Caller,
@@ -24,7 +23,7 @@ import:
     ./errors:
         CheckError,
         GenericConflict,
-        MethodError(AmbiguousMethod, NoApplicableMethod),
+        MethodError(NoApplicableMethod, MethodReceiverNeedsType),
         method_error,
         ExpectedTypeSite(SourceAnnotation),
         ValueError(ExpressionTypeMismatch),
@@ -2027,8 +2026,45 @@ private pure func solve_overlap_arguments(
                         parent.solve_overlap_arguments(left, right, position + 1, next_slots)
 
 
+-- One unbound slot per declared parameter, numbered after `slots`.
+private pure func with_flexible_parameters(
+    slots: List[InferenceSlot],
+    parameters: List[TypeParameterId],
+    span: Span,
+) -> List[InferenceSlot]:
+    var flexible = slots
+    for declared_parameter in parameters:
+        flexible = flexible.append({
+            parameter = declared_parameter,
+            call_span = span,
+            first_argument = None,
+            state = UnboundVariable(0),
+        })
+    flexible
+
+
+-- Whether some solution of `slots`' unbound variables and of `declared`'s own
+-- parameters makes `declared` equal to `actual`. The trial solution is discarded.
+private pure func admits(
+    declared: TypeRef,
+    declared_parameters: List[TypeParameterId],
+    actual: InferenceType,
+    slots: List[InferenceSlot],
+    span: Span,
+) -> Result[Bool, CheckError]:
+    equality: InferenceEquality = {
+        expected = declared.inference_type(declared_parameters, slots.length()),
+        actual = actual,
+        origin = ReceiverOverlapConstraint(span),
+        relation = RequireEquality,
+        parameter = None,
+    }
+    match equality.solve_overlap(slots.with_flexible_parameters(declared_parameters, span)):
+        Err(invariant): Err(invariant)
+        Ok(unified): Ok(unified.is_some())
+
+
 -- Both declarations' parameters are flexible in separate variable ranges.
--- A call supplies [] for its actual receiver, keeping caller parameters rigid.
 pure func types_overlap(
     left: TypeRef,
     left_parameters: List[TypeParameterId],
@@ -2046,31 +2082,25 @@ pure func types_overlap(
     else if left.disjoint_heads(right):
         Ok(False)
     else:
-        var slots: List[InferenceSlot] = []
-        for declared_parameter in left_parameters.concat(right_parameters):
-            slots = slots.append({
-                parameter = declared_parameter,
-                call_span = span,
-                first_argument = None,
-                state = UnboundVariable(0),
-            })
-        equality: InferenceEquality = {
-            expected = left.inference_type(left_parameters, 0),
-            actual = right.inference_type(right_parameters, left_parameters.length()),
-            origin = ReceiverOverlapConstraint(span),
-            relation = RequireEquality,
-            parameter = None,
-        }
-        match equality.solve_overlap(slots):
-            Err(invariant): Err(invariant)
-            Ok(unified): Ok(unified.is_some())
+        -- The right side's variables number from 0, as its slots start empty.
+        left.admits(
+            left_parameters,
+            right.inference_type(right_parameters, 0),
+            with_flexible_parameters([], right_parameters, span),
+            span,
+        )
 
 
--- Declaration validation guarantees at most one type-compatible receiver.
+-- The one candidate whose receiver the receiver's type, as far as it is known,
+-- can still fit. Its unsolved variables stay open, as `values.map(f)`'s element
+-- type is before `f`'s body is checked; the caller's type parameters stay rigid.
+-- Declaration validation admits no two candidates that one complete type fits,
+-- so several survivors mean the receiver is not yet known well enough.
 private pure func choose_receiver(
     callee: WrittenName,
     candidates: List[ReceiverFunction],
-    actual: TypeUse,
+    actual: InferenceUse,
+    slots: List[InferenceSlot],
     signatures: List[AcceptedFunction],
 ) -> Result[ReceiverFunction, CheckError]:
     var compatible: List[ReceiverFunction] = []
@@ -2084,10 +2114,10 @@ private pure func choose_receiver(
                     None:
                         void
                     Some(receiver_parameter):
-                        match receiver_parameter.value_type.types_overlap(
+                        match receiver_parameter.value_type.admits(
                             accepted.signature.type_parameters,
                             actual.value_type,
-                            [],
+                            slots,
                             actual.span,
                         ):
                             Err(invariant): failure = Some(invariant)
@@ -2105,12 +2135,20 @@ private pure func choose_receiver(
                         Err(error):
                             Err(error)
                         Ok(sites):
-                            Err(
-                                method_error(
-                                    callee.span,
-                                    NoApplicableMethod(callee.id, actual.value_type, sites),
-                                ),
-                            )
+                            match actual.value_type.publish_inference_type(
+                                slots,
+                                DiagnosticInference,
+                                actual.span,
+                            ):
+                                Err(error):
+                                    Err(error)
+                                Ok(receiver):
+                                    Err(
+                                        method_error(
+                                            callee.span,
+                                            NoApplicableMethod(callee.id, receiver, sites),
+                                        ),
+                                    )
                 [selected]:
                     Ok(selected)
                 _:
@@ -2121,32 +2159,26 @@ private pure func choose_receiver(
                             Err(
                                 method_error(
                                     callee.span,
-                                    AmbiguousMethod(callee.id, actual.value_type, sites),
+                                    MethodReceiverNeedsType(callee.id, sites),
                                 ),
                             )
 
 
 pure func select_receiver_contract(
     application: ReceiverApplication,
-    receiver: ResolvedReceiver,
-    actual: TypeUse,
+    candidates: List[ReceiverFunction],
+    actual: InferenceUse,
+    slots: List[InferenceSlot],
     context: ResolutionContext,
 ) -> Result[FunctionContract, CheckError]:
-    match receiver:
-        UniqueReceiver(contract):
-            Ok(contract)
-        ReceiverCandidates(candidates):
-            match application.callee.choose_receiver(candidates, actual, context.signatures):
-                Err(selection_error):
-                    Err(selection_error)
-                Ok(selected):
-                    context.caller.function_contract(
-                        application.callee,
-                        True,
-                        application.arguments,
-                        selected.id,
-                        context.signatures,
-                    )
+    selected ?= application.callee.choose_receiver(candidates, actual, slots, context.signatures)
+    context.caller.function_contract(
+        application.callee,
+        True,
+        application.arguments,
+        selected.id,
+        context.signatures,
+    )
 
 
 private pure func lambda_constraint_error(
