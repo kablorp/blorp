@@ -1,7 +1,6 @@
 import:
     bool: and
-    int: Int methods
-    io/process: run_to_files
+    io/process: Captured
     result: Result methods
     string: String methods
     test: TestSuite
@@ -12,7 +11,8 @@ import:
     ../../src/common/codegen/runtime/string: string_runtime
     ../../src/common/codegen/specialize/specialize as specialized
     ../../src/common/codegen/verify/verify: verify, verified_contents, VerifiedProgram
-    ../e2e/file_access: read_file, write_file
+    ../e2e/file_access: write_file
+    ../e2e/self_hosted_harness: isolated, run_expecting, strict_leak_check
     ../e2e/self_hosted_reports: verify_accounting
     ../unit/list_update_inputs: lowered
 
@@ -22,6 +22,8 @@ private EXPECTED_CAPACITY_ABORT: Int = 73
 -- The memory runtime's BLORP_STRICT_LEAK_EXIT_STATUS.
 private STRICT_LEAK_EXIT_STATUS: Int = 99
 private UNBALANCED_EMPTY_PREFIX: String = "blorp: leak check: unbalanced empty list owners: "
+private BUILD_TIMEOUT_MS: Int = 600000
+private PROBE_TIMEOUT_MS: Int = 10000
 
 
 -- Only the public phases establish the concrete aggregate helpers. The C probe
@@ -111,8 +113,7 @@ private func ready(c_compiler: String, directory: String) -> Result[String, Stri
     _ ?= write_file(directory + "/list_memory.c", MEMORY_RUNTIME)
     _ ?= write_file(directory + "/list_values.c", (string_runtime() + aggregates) + "\n")
     executable = directory + "/list_reuse_probe"
-    prefix = directory + "/list-reuse-build"
-    status ?= run_to_files(
+    build ?= isolated(
         c_compiler,
         [
             "-std=c11",
@@ -130,107 +131,71 @@ private func ready(c_compiler: String, directory: String) -> Result[String, Stri
             "-o",
             executable,
         ],
-        prefix + ".out",
-        prefix + ".err",
-        600000,
+        BUILD_TIMEOUT_MS,
     )
-    out ?= read_file(prefix + ".out")
-    err ?= read_file(prefix + ".err")
-    if and(status.equals(0), and(out.equals(""), err.equals(""))):
+    built ?= run_expecting("list reuse native build", build, 0)
+    if and(built.stdout == "", built.stderr == ""):
         Ok(executable)
     else:
-        Err("list reuse native build: " + err)
+        Err("list reuse native build: " + built.stderr)
 
 
-private func probe(executable: String, directory: String, name: String) -> Bool:
-    prefix = directory + "/list-reuse-" + name
-    result: Result[Void, String] = match run_to_files(
-        "/usr/bin/env",
-        ["-u", "BLORP_MEMORY_STATS", "BLORP_LEAK_CHECK=strict", executable, name],
-        prefix + ".out",
-        prefix + ".err",
-        10000,
-    ):
-        Err(error):
-            Err(error)
-        Ok(status):
-            match read_file(prefix + ".out"):
-                Err(error):
-                    Err(error)
-                Ok(out):
-                    match read_file(prefix + ".err"):
-                        Err(error):
-                            Err(error)
-                        Ok(err):
-                            if and(status.equals(0), out.equals("")):
-                                verify_accounting(err, False)
-                            else:
-                                Err(("list reuse " + name + ": ") + err)
+-- Runs the probe in `mode`, strictly when `strict`, requiring `status`.
+private func run_probe(
+    executable: String,
+    mode: String,
+    strict: Bool,
+    status: Int,
+) -> Result[Captured, String]:
+    run ?= isolated(executable, [mode], PROBE_TIMEOUT_MS)
+    if strict:
+        run_expecting("list reuse " + mode, { run | environment = strict_leak_check() }, status)
+    else:
+        run_expecting("list reuse " + mode, run, status)
+
+
+private func reported(result: Result[Void, String]) -> Bool:
     match result:
         Ok(_):
             True
         Err(error):
             print_error(error)
             False
+
+
+private func probe(executable: String, name: String) -> Result[Void, String]:
+    ran ?= run_probe(executable, name, True, 0)
+    if ran.stdout == "":
+        verify_accounting(ran.stderr, False)
+    else:
+        Err("list reuse " + name + " wrote stdout: " + ran.stdout)
 
 
 -- A strict run whose `[]` owners end at `owners` instead of 0 must report that
 -- balance before an otherwise balanced allocation report and fail.
 private func unbalanced_empty(
     executable: String,
-    directory: String,
     name: String,
     owners: String,
-) -> Bool:
-    prefix = directory + "/list-reuse-" + name
+) -> Result[Void, String]:
     line = (UNBALANCED_EMPTY_PREFIX + owners) + "\n"
-    result: Result[Void, String] = match run_to_files(
-        "/usr/bin/env",
-        ["-u", "BLORP_MEMORY_STATS", "BLORP_LEAK_CHECK=strict", executable, name],
-        prefix + ".out",
-        prefix + ".err",
-        10000,
-    ):
-        Err(error):
-            Err(error)
-        Ok(status):
-            match (read_file(prefix + ".out"), read_file(prefix + ".err")):
-                (Ok(out), Ok(err)):
-                    if and(
-                        status.equals(STRICT_LEAK_EXIT_STATUS),
-                        and(out.equals(""), err.starts_with(line)),
-                    ):
-                        match err.slice(line.length(), err.length()):
-                            Some(accounting): verify_accounting(accounting, False)
-                            None: Err("list reuse " + name + ": truncated report")
-                    else:
-                        Err("list reuse " + name + ": exit " + status.to_string() + ": " + err)
-                (Err(error), _):
-                    Err(error)
-                (_, Err(error)):
-                    Err(error)
-    match result:
-        Ok(_):
-            True
-        Err(error):
-            print_error(error)
-            False
+    ran ?= run_probe(executable, name, True, STRICT_LEAK_EXIT_STATUS)
+    if and(ran.stdout == "", ran.stderr.starts_with(line)):
+        match ran.stderr.slice(line.length(), ran.stderr.length()):
+            Some(accounting): verify_accounting(accounting, False)
+            None: Err("list reuse " + name + ": truncated report")
+    else:
+        Err("list reuse " + name + ": " + ran.stderr)
 
 
 -- The C probe maps SIGABRT to this fixed status before invoking only the
 -- checked helper. A normal return and any other signal fail this oracle.
-private func rejected_capacity(executable: String, directory: String, mode: String) -> Bool:
-    prefix = directory + "/list-reuse-" + mode
-    match run_to_files(executable, [mode], prefix + ".out", prefix + ".err", 10000):
-        Err(error):
-            print_error(error)
-            False
-        Ok(status):
-            match (read_file(prefix + ".out"), read_file(prefix + ".err")):
-                (Ok(out), Ok(err)):
-                    and(status.equals(EXPECTED_CAPACITY_ABORT), and(out.equals(""), err.equals("")))
-                _:
-                    False
+private func rejected_capacity(executable: String, mode: String) -> Result[Void, String]:
+    ran ?= run_probe(executable, mode, False, EXPECTED_CAPACITY_ABORT)
+    if and(ran.stdout == "", ran.stderr == ""):
+        Ok(void)
+    else:
+        Err("list reuse " + mode + " printed: " + ran.stdout + ran.stderr)
 
 
 func suite(c_compiler: String, directory: String) -> TestSuite:
@@ -247,101 +212,95 @@ func suite(c_compiler: String, directory: String) -> TestSuite:
                 tests = [
                     (
                         "capacity boundaries 0 1 3 4 5 8 9",
-                        func(): probe(executable, directory, "boundaries"),
+                        func(): reported(probe(executable, "boundaries")),
                     ),
                     (
                         "unique relocation preserves child obligations",
-                        func(): probe(executable, directory, "strings"),
+                        func(): reported(probe(executable, "strings")),
                     ),
                     (
                         "shared roots preserve aliases and acquire once",
-                        func(): probe(executable, directory, "shared"),
+                        func(): reported(probe(executable, "shared")),
                     ),
                     (
                         "nested root occurrence remains independently owned",
-                        func(): probe(executable, directory, "nested"),
+                        func(): reported(probe(executable, "nested")),
                     ),
                     (
                         "inline record slots move by value",
-                        func(): probe(executable, directory, "inline"),
+                        func(): reported(probe(executable, "inline")),
                     ),
                     (
                         "managed records and owning unions retain exact children",
-                        func(): probe(executable, directory, "managed"),
+                        func(): reported(probe(executable, "managed")),
                     ),
                     (
                         "callable environments and Void slots",
-                        func(): probe(executable, directory, "callable"),
+                        func(): reported(probe(executable, "callable")),
                     ),
                     (
                         "unique set has constant slot work and invalid indices have no hooks",
-                        func(): probe(executable, directory, "set-work"),
+                        func(): reported(probe(executable, "set-work")),
                     ),
                     (
                         "same child replacement acquires before its last release",
-                        func(): probe(executable, directory, "set-equal"),
+                        func(): reported(probe(executable, "set-equal")),
                     ),
                     (
                         "set and concat preserve every aggregate element family",
-                        func(): probe(executable, directory, "update-families"),
+                        func(): reported(probe(executable, "update-families")),
                     ),
                     (
                         "unique concat acquires only right slots with at most one relocation",
-                        func(): probe(executable, directory, "concat-work"),
+                        func(): reported(probe(executable, "concat-work")),
                     ),
                     (
                         "shared set and concat preserve counted aliases",
-                        func(): probe(executable, directory, "updates-shared"),
+                        func(): reported(probe(executable, "updates-shared")),
                     ),
                     (
                         "empty update operands preserve roots and obligations",
-                        func(): probe(executable, directory, "updates-empty"),
+                        func(): reported(probe(executable, "updates-empty")),
                     ),
                     (
                         "the immortal empty root is never written, freed or resized",
-                        func(): probe(executable, directory, "static-empty"),
+                        func(): reported(probe(executable, "static-empty")),
                     ),
                     (
                         "an extra drop of an empty literal fails the strict check",
-                        func(): unbalanced_empty(
-                            executable,
-                            directory,
-                            "static-empty-extra-drop",
-                            "-1",
+                        func(): reported(
+                            unbalanced_empty(executable, "static-empty-extra-drop", "-1"),
                         ),
                     ),
                     (
                         "a missing drop of an empty literal fails the strict check",
-                        func(): unbalanced_empty(
-                            executable,
-                            directory,
-                            "static-empty-missing-drop",
-                            "1",
+                        func(): reported(
+                            unbalanced_empty(executable, "static-empty-missing-drop", "1"),
                         ),
                     ),
                     (
                         "copying append and concat start at the first-growth capacity",
-                        func(): probe(executable, directory, "copy-floor"),
+                        func(): reported(probe(executable, "copy-floor")),
                     ),
                     (
                         "concat Int64 bound aborts before storage access",
-                        func(): rejected_capacity(executable, directory, "concat-length-overflow"),
+                        func(): reported(rejected_capacity(executable, "concat-length-overflow")),
                     ),
                     (
                         "concat byte bound aborts before storage access",
-                        func(): rejected_capacity(executable, directory, "concat-byte-overflow"),
+                        func(): reported(rejected_capacity(executable, "concat-byte-overflow")),
                     ),
                     (
                         "capacity clamps to byte and Int64 bounds",
-                        func(): probe(executable, directory, "bounds"),
+                        func(): reported(probe(executable, "bounds")),
                     ),
                     (
                         "required capacity beyond byte limit aborts",
-                        func(): rejected_capacity(executable, directory, "required-overflow"),
+                        func(): reported(rejected_capacity(executable, "required-overflow")),
                     ),
                     (
                         "invalid current capacity aborts before growth",
-                        func(): rejected_capacity(executable, directory, "current-overflow"),
+                        func(): reported(rejected_capacity(executable, "current-overflow")),
                     ),
                 ],
             }

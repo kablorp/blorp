@@ -1634,3 +1634,35 @@ The legacy `generic/lambda/capture_managed` case is not run (below), so it has n
 | `value_if_list_aliases` | 544,223,568 | 365,054,600 | 419,812,790 |
 | `value_if_return` | 588,122,648 | 335,827,931 | 386,202,121 |
 | `written_names` | 587,951,330 | 335,887,606 | 386,270,747 |
+
+## `process_native_together` after process L2, 2026-11-11
+
+**Why.** Process L2 deleted `process.run_to_files`, so
+`fixtures/process/natives_together.brp` now calls the three natives that
+remain, `capture`, `find_program` and `fault` (declared, and called only with an
+argument the run does not pass). Its program changed, so its ceilings are
+re-measured by this file's rule: the largest reading plus 15%, rounded up.
+Its run now prints `17\n7\n` and makes 10 allocations instead of 13.
+
+- **Compiler:** the `-O0 -DBLORP_MEMORY_DIAGNOSTICS=1` test compiler,
+  measured as the harness measures (`BLORP_LEAK_CHECK=strict`,
+  `/usr/bin/time -l`), nine readings in three serial sets: two built from the
+  uncommitted deletion on `2138b46c7` (on `c4e04dded`), one from `be59d562d`
+  (on `7bd2b7047`). The branch was later rebased onto `873869eb0` (lexer
+  constants, checking without `main`, plan edits) without re-measuring; the
+  gates with `INSTRUCTION_CHECK=on` hold it to these ceilings there. Host:
+  Apple M4, macOS 26.7.1, load average about 3 from other sessions.
+- **Readings:** allocations 100,264 (eight) and 100,265 (one); instructions
+  372,680,865 to 374,848,452.
+- **Drift check:** unchanged siblings read slightly above their 2026-11-09
+  measurements in the same sets: `process_native_capture` 365.7M to 367.6M
+  (was 364.7M) and `process_native_fault` 361.8M to 365.1M (was 360.9M), so
+  most of this program's rise over its old 367.1M is its new content.
+- **Raw samples:** the task's scratch `logs/` directory: `narrow2.log`
+  (`a8a3de7d296afc8ddf14006a7f5cc6359dbd2fba1cc81296570a7c036a8de6fc`),
+  `controls.log` (`38c59f753357c61a03bb0fc87c5f1caf8016648d8d91fcf22997a44fcd030b2b`)
+  and `gate-fixture.log` (`4f533aec4b705c1ba090b648afb2b78fa6a8fa806890b60fc5a9bb62520d94c4`).
+
+| Program | Old allocations ceiling | New | Old instruction ceiling | New |
+| --- | --- | --- | --- | --- |
+| `process_native_together` | 116,766 | 115,305 | 422,152,629 | 431,075,720 |

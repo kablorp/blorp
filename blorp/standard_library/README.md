@@ -653,7 +653,7 @@ union CommitError:
 
 func current_commit(repository: Path) -> Result[String, CommitError]:
     git ?= find_program("git").map_err(pure func(error: FindProgramError): GitMissing(error))
-    output({ command("${git}", ["rev-parse", "HEAD"]) | directory = Some(repository) })
+    output({ command(git, ["rev-parse", "HEAD"]) | directory = Some(repository) })
         .map_err(pure func(error: OutputError): GitFailed(error))
 ```
 
@@ -665,8 +665,9 @@ value, so the wrapping is a `match` or a lambda.
 - `command(program, arguments)` builds a `Command`; change its `directory`,
   `environment` (`Some` sets a variable, `None` removes it, the rest is
   inherited), `stdin` (`None` is `/dev/null`) and `timeout_ms` by record
-  update. `directory` is an `Option[Path]`. `program` is a path: there is no shell and no PATH search, and every
-  argument is literal. A relative program is found from `directory`.
+  update. `program` is a `Path`, such as the one `find_program` returns, and
+  `directory` an `Option[Path]`. There is no shell and no PATH search, and
+  every argument is literal. A relative program is found from `directory`.
 - `capture(command)` returns `Ok(Captured { exit, stdout, stderr })` for
   every way the child can end: `Exited(status)`, `Signaled(signal)` or
   `TimedOut`; its error is a `CaptureError`. `output(command)` returns stdout
@@ -687,8 +688,8 @@ value, so the wrapping is a `match` or a lambda.
   `StderrNotUtf8(exit)`. After `Signaled` or `TimedOut`, up to three bytes of a
   character cut off at the end of a stream are dropped first.
 - `CaptureError` has no program in it. `InvalidVariableName` (an empty name
-  or one with `=`) and `ContainsNul` (in the program, an argument or the
-  environment) are found before any system call. A directory the child cannot
+  or one with `=`) and `ContainsNul` (in an argument or the environment; a
+  `Path` holds none) are found before any system call. A directory the child cannot
   enter is `DirectoryFailed(cause)`. `NotExecutable` is ENOEXEC, such as a
   script without `#!`; every other launch failure is `LaunchFailed(cause)`. A
   cause is a `SystemCallError`: `NotFound`, `PermissionDenied`, `NotADirectory`
@@ -710,42 +711,3 @@ value, so the wrapping is a `match` or a lambda.
   followed by the child's stderr, and `DirectoryFailed(cause)` is "cannot
   enter the directory: <cause>". A `SystemCallError` is worded like the `io/fs/` errors
   words the errno.
-
-### run_to_files
-
-`run_to_files` remains until its callers move to `capture`.
-Explicitly import `io/process: run_to_files`; the prelude and compiler source do not
-import it. This is a target-only impure operation:
-
-```blorp
-func run_to_files(
-    program: String, arguments: List[String],
-    stdout_path: String, stderr_path: String, timeout_ms: Int,
-) -> Result[Int, String]
-```
-
-`program` is an explicit executable path; arguments exclude argv[0]. No shell,
-PATH search or quoting interpretation occurs. Empty, spaced and Unicode
-arguments are literal. The child inherits cwd/environment and reads stdin from
-`/dev/null`. The timeout must be positive; paths and arguments must contain no
-embedded NUL. Validation precedes capture creation.
-
-The operation exclusively creates two new regular files; existing destinations,
-including symlinks and FIFOs, fail without truncation. On failure a newly-created
-partial capture may remain; the caller owns its directory and cleanup.
-Ordinary exits, including nonzero and 127, produce `Ok(status)`. Setup/exec,
-signal, timeout and cleanup failures produce `Err(message)`, never fabricated
-exit codes. A monotonic deadline covers exec startup and waiting and initiates
-forced direct-child cleanup; OS cleanup latency is not bounded. The direct child
-is terminated and reaped; group SIGKILL is a best-effort attempt before reaping
-the leader, without claiming descendant termination. macOS can return EPERM for
-a group containing only its already-exited leader. Direct-child signal/wait
-errors remain failures. Child-process ownership
-requires the default SIGCHLD disposition without SA_NOCLDWAIT; unsupported
-dispositions are rejected before creating files and are never modified.
-
-Commands must wait for their own work: background writers, detached daemons and
-grandchild supervision are outside this API. The first e2e driver passes explicit
-`/usr/bin/env` argv to isolate child leak-check settings. Make owns temporary
-directories and executable resolution; this API adds no environment, cwd,
-temporary-directory or general process-handle framework.

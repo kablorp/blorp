@@ -45,8 +45,10 @@ done.
     L1 is implemented: the `process.capture`, `process.find_program` and
     `process.fault` natives, the C core and `process.brp`. A reply the C side
     never builds aborts through `process.fault`.
-  - **Next:** L2, migrating the 17 `run_to_files` call sites and deleting it.
-    `PATH_PLAN.md`'s landing 6 has given the process API its exact errors.
+    L2 landed on 2026-11-11: every caller uses `capture` or `output`,
+    `run_to_files` is deleted, and `Command.program` is a `Path`.
+  - **Next:** `blorp run` and `blorp test` (`RUN_AND_TEST_PLAN.md`), which
+    need the terminal-sharing `run` amendment and a seed rotation.
   - **Later:** binary capture after `Bytes`, and `run` with streaming.
 - **Language server (`blorp lsp`):** [`LSP_PLAN.md`](LSP_PLAN.md).
   - **Status:** the plan was written and revised on 2026-11-10 (name uses

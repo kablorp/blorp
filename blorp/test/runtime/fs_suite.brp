@@ -1,7 +1,5 @@
 import:
-    bool: not, and
-    int: Int methods
-    io/process: run_to_files
+    io/process: OutputError, command, output
     list: List methods
     result: Result methods
     string: String methods
@@ -32,11 +30,11 @@ import:
     ../../src/common/codegen/runtime/string: string_runtime
     ../../src/common/codegen/runtime/system: SYSTEM_CURRENT_DIRECTORY_RUNTIME
     ../../src/common/codegen/specialize/specialize: TypeRef(StringType)
-    ../e2e/file_access: read_file, write_file
+    ../e2e/file_access: path_of, write_file
+    ../e2e/self_hosted_harness: isolated, run_expecting, strict_leak_check
     ../e2e/self_hosted_reports: verify_accounting
 
 
-private ENVIRONMENT_TOOL: String = "/usr/bin/env"
 private IDENTITY_TOOL: String = "/usr/bin/id"
 private COMPILE_TIMEOUT_MS: Int = 600000
 private CASE_TIMEOUT_MS: Int = 30000
@@ -64,8 +62,7 @@ private func ready(
     )
     _ ?= write_file(directory + "/" + name + "_runtime.c", fragments)
     executable = directory + "/" + name + "_test"
-    prefix = directory + "/" + name + "-build"
-    status ?= run_to_files(
+    build ?= isolated(
         c_compiler,
         [
             "-std=c11",
@@ -85,19 +82,13 @@ private func ready(
             "-lm",
             "-lpthread",
         ],
-        prefix + ".out",
-        prefix + ".err",
         COMPILE_TIMEOUT_MS,
     )
-    err ?= read_file(prefix + ".err")
-    if (
-        status
-            .equals(0)
-            .and(err.equals(""))
-    ):
+    built ?= run_expecting(name + " native build", build, 0)
+    if built.stderr == "":
         Ok(executable)
     else:
-        Err(name + " native build: " + err)
+        Err(name + " native build: " + built.stderr)
 
 
 -- A case passes with exit 0, nothing on stdout, and one balanced strict
@@ -107,45 +98,24 @@ private func native_case(
     directory: String,
     name: String,
 ) -> Result[Void, String]:
-    prefix = executable + "-case-" + name
-    arguments = ["-u", "BLORP_MEMORY_STATS", "BLORP_LEAK_CHECK=strict", executable, name, directory]
-    status ?= run_to_files(
-        ENVIRONMENT_TOOL,
-        arguments,
-        prefix + ".out",
-        prefix + ".err",
-        CASE_TIMEOUT_MS,
-    )
-    out ?= read_file(prefix + ".out")
-    err ?= read_file(prefix + ".err")
-    if (
-        status
-            .equals(0)
-            .not()
-    ):
-        Err(name + ": exit " + status.to_string() + ": " + err)
-    else if (
-        out
-            .equals("")
-            .not()
-    ):
-        Err(name + ": wrote stdout: " + out)
+    case ?= isolated(executable, [name, directory], CASE_TIMEOUT_MS)
+    ran ?= run_expecting(name, { case | environment = strict_leak_check() }, 0)
+    if ran.stdout != "":
+        Err(name + ": wrote stdout: " + ran.stdout)
     else:
-        verify_accounting(err, True).map_err(
-            pure func(message: String): name + ": " + message + ": " + err,
+        verify_accounting(ran.stderr, True).map_err(
+            pure func(message: String): name + ": " + message + ": " + ran.stderr,
         )
 
 
 -- Root may write a read-only file and create one in a read-only directory, so
 -- the permission case cannot provoke PermissionDenied there.
-private func running_as_root(directory: String) -> Result[Bool, String]:
-    prefix = directory + "/fs-identity"
-    status ?= run_to_files(IDENTITY_TOOL, ["-u"], prefix + ".out", prefix + ".err", CASE_TIMEOUT_MS)
-    out ?= read_file(prefix + ".out")
-    if status.equals(0):
-        Ok(out.equals("0\n"))
-    else:
-        Err(IDENTITY_TOOL + " -u exited " + status.to_string())
+private func running_as_root() -> Result[Bool, String]:
+    identity ?= path_of(IDENTITY_TOOL)
+    user ?= output({ command(identity, ["-u"]) | timeout_ms = Some(CASE_TIMEOUT_MS) }).map_err(
+        pure func(error: OutputError) -> String: "${IDENTITY_TOOL} -u: ${error}",
+    )
+    Ok(user == "0\n")
 
 
 private func reported(result: Result[Void, String]) -> Bool:
@@ -681,9 +651,8 @@ private pure func directory_operations() -> String:
 
 func suite(c_compiler: String, directory: String) -> TestSuite:
     -- A probe that does not build is one failing test, and the other probe's
-    -- cases still run. The user is asked once: its capture files are created
-    -- exclusively.
-    root = running_as_root(directory)
+    -- cases still run. The user is asked once.
+    root = running_as_root()
     read: List[(String, () -> Bool)] = match ready(
         c_compiler,
         directory,

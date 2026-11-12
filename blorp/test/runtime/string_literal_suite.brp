@@ -1,23 +1,15 @@
 import:
-    bool: and
-    int: Int methods
-    io/process: run_to_files
+    dict: Dict
+    io/process: Captured
     result: Result methods
     string: String methods
     test: TestSuite
     ../../src/common/codegen/runtime/memory: MEMORY_RUNTIME
     ../../src/common/codegen/runtime/string: string_runtime
-    ../e2e/file_access: read_file, write_file
+    ../e2e/file_access: write_file
+    ../e2e/self_hosted_harness: isolated, run_expecting
 
 
-record ProbeRun {
-    status: Int,
-    stdout: String,
-    stderr: String,
-}
-
-
-private ENVIRONMENT_TOOL: String = "/usr/bin/env"
 private COMPILE_TIMEOUT_MS: Int = 600000
 private CHILD_TIMEOUT_MS: Int = 10000
 -- The memory runtime's BLORP_STRICT_LEAK_EXIT_STATUS.
@@ -31,8 +23,7 @@ private func ready(c_compiler: String, directory: String) -> Result[String, Stri
     _ ?= write_file(directory + "/memory_runtime.c", MEMORY_RUNTIME)
     _ ?= write_file(directory + "/string_runtime.c", string_runtime())
     executable = directory + "/string_literal_probe"
-    prefix = directory + "/string-literal-build"
-    status ?= run_to_files(
+    build ?= isolated(
         c_compiler,
         [
             "-std=c11",
@@ -50,46 +41,31 @@ private func ready(c_compiler: String, directory: String) -> Result[String, Stri
             "-o",
             executable,
         ],
-        prefix + ".out",
-        prefix + ".err",
         COMPILE_TIMEOUT_MS,
     )
-    err ?= read_file(prefix + ".err")
-    if (
-        status
-            .equals(0)
-            .and(err.equals(""))
-    ):
+    built ?= run_expecting("string literal native build", build, 0)
+    if built.stderr == "":
         Ok(executable)
     else:
-        Err("string literal native build: " + err)
+        Err("string literal native build: " + built.stderr)
 
 
 -- Strict runs set BLORP_LEAK_CHECK; the others are diagnostic builds without it.
 private func run_probe(
     executable: String,
-    directory: String,
     mode: String,
     strict: Bool,
-) -> Result[ProbeRun, String]:
-    (label, leak_check) = if strict:
-        ("-strict", ["BLORP_LEAK_CHECK=strict"])
+    status: Int,
+) -> Result[Captured, String]:
+    leak_check: Option[String] = if strict:
+        Some("strict")
     else:
-        ("-plain", ["-u", "BLORP_LEAK_CHECK"])
-    prefix = directory + "/string-literal-" + mode + label
-    arguments = ["-u", "BLORP_MEMORY_STATS", "-u", "BLORP_ALLOCATION_SITES"]
-        .concat(leak_check)
-        .concat([executable, mode])
-    status ?= run_to_files(
-        ENVIRONMENT_TOOL,
-        arguments,
-        prefix + ".out",
-        prefix + ".err",
-        CHILD_TIMEOUT_MS,
-    )
-    out ?= read_file(prefix + ".out")
-    err ?= read_file(prefix + ".err")
-    Ok({ status = status, stdout = out, stderr = err })
+        None
+    run ?= isolated(executable, [mode], CHILD_TIMEOUT_MS)
+    environment = run.environment
+        .set("BLORP_ALLOCATION_SITES", None)
+        .set("BLORP_LEAK_CHECK", leak_check)
+    run_expecting(mode, { run | environment = environment }, status)
 
 
 private func expect(label: String, actual: String, expected: String) -> Result[Void, String]:
@@ -101,23 +77,18 @@ private func expect(label: String, actual: String, expected: String) -> Result[V
 
 private func outcome(
     executable: String,
-    directory: String,
     mode: String,
     strict: Bool,
     status: Int,
     stderr: String,
 ) -> Bool:
-    checked: Result[Void, String] = match run_probe(executable, directory, mode, strict):
+    checked: Result[Void, String] = match run_probe(executable, mode, strict, status):
         Err(error):
             Err(error)
         Ok(run):
-            match expect(mode + " exit status", run.status.to_string(), status.to_string()):
-                Err(error):
-                    Err(error)
-                Ok(_):
-                    match expect(mode + " stdout", run.stdout, ""):
-                        Err(error): Err(error)
-                        Ok(_): expect(mode + " stderr", run.stderr, stderr)
+            match expect(mode + " stdout", run.stdout, ""):
+                Err(error): Err(error)
+                Ok(_): expect(mode + " stderr", run.stderr, stderr)
     match checked:
         Ok(_):
             True
@@ -140,13 +111,12 @@ func suite(c_compiler: String, directory: String) -> TestSuite:
                 tests = [
                     (
                         "balanced literals are freed once at exit",
-                        func(): outcome(executable, directory, "balanced", True, 0, STRICT_TOTAL),
+                        func(): outcome(executable, "balanced", True, 0, STRICT_TOTAL),
                     ),
                     (
                         "an over-released literal fails the strict check",
                         func(): outcome(
                             executable,
-                            directory,
                             "over_release",
                             True,
                             STRICT_LEAK_EXIT_STATUS,
@@ -157,7 +127,6 @@ func suite(c_compiler: String, directory: String) -> TestSuite:
                         "an under-released literal fails the strict check",
                         func(): outcome(
                             executable,
-                            directory,
                             "under_release",
                             True,
                             STRICT_LEAK_EXIT_STATUS,
@@ -166,7 +135,7 @@ func suite(c_compiler: String, directory: String) -> TestSuite:
                     ),
                     (
                         "without the strict check an unbalanced literal still exits 0",
-                        func(): outcome(executable, directory, "under_release", False, 0, ""),
+                        func(): outcome(executable, "under_release", False, 0, ""),
                     ),
                 ],
             }

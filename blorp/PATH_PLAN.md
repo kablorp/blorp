@@ -103,9 +103,9 @@ numbers; each is approved as drafted there unless amended here.
 - **P8 (amended):** no String errors. `get_current_directory` returns
   `Result[Path, CurrentDirectoryError]`. `Entry.name` stays a String,
   `Command.directory` becomes `Option[Path]`, `find_program` returns `Path`,
-  and `main(args: List[String])` is unchanged. `Command.program` stays a
-  String until process L2 decides it, so until then a found program is
-  passed as `found.to_string()`.
+  and `main(args: List[String])` is unchanged. Process L2 made
+  `Command.program` a `Path` on 2026-11-11 (Keith), so a found program goes
+  straight into `command`.
 - **P9:** non-UTF-8 paths stay refused until `Path` is byte-backed.
 - **P10:** `path.brp` becomes `Path`'s module, and its String functions are
   deleted:

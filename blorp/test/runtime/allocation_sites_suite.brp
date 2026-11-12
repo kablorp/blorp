@@ -1,22 +1,15 @@
 import:
-    bool: and, or
-    int: Int methods
-    io/process: run_to_files
+    bool: or
+    dict: Dict
+    io/process: Captured
     result: Result methods
     string: String methods
     test: TestSuite
     ../../src/common/codegen/runtime/memory: MEMORY_RUNTIME
     ../e2e/file_access: read_file, write_file
+    ../e2e/self_hosted_harness: isolated, run_expecting, strict_leak_check
 
 
-record ProbeRun {
-    status: Int,
-    stdout: String,
-    stderr: String,
-}
-
-
-private ENVIRONMENT_TOOL: String = "/usr/bin/env"
 private SYMBOLIZER: String = "blorp/scripts/allocation-sites"
 private COMPILE_TIMEOUT_MS: Int = 600000
 private CHILD_TIMEOUT_MS: Int = 30000
@@ -43,21 +36,11 @@ private BAD_PATH_MESSAGE: String =
     |
 
 
-private func quiet_run(
-    program: String,
-    arguments: List[String],
-    prefix: String,
-    timeout: Int,
-) -> Result[Int, String]:
-    run_to_files(program, arguments, prefix + ".out", prefix + ".err", timeout)
-
-
 -- Builds the probe with frame pointers and debug info so the symbolizer can name frames.
 private func ready(c_compiler: String, directory: String) -> Result[String, String]:
     _ ?= write_file(directory + "/memory_runtime.c", MEMORY_RUNTIME)
     executable = directory + "/allocation_sites_probe"
-    prefix = directory + "/allocation-sites-build"
-    status ?= quiet_run(
+    build ?= isolated(
         c_compiler,
         [
             "-std=c11",
@@ -77,51 +60,38 @@ private func ready(c_compiler: String, directory: String) -> Result[String, Stri
             "-o",
             executable,
         ],
-        prefix,
         COMPILE_TIMEOUT_MS,
     )
-    err ?= read_file(prefix + ".err")
-    if (
-        status
-            .equals(0)
-            .and(err.equals(""))
-    ):
+    built ?= run_expecting("allocation sites native build", build, 0)
+    if built.stderr == "":
         Ok(executable)
     else:
-        Err("allocation sites native build: " + err)
+        Err("allocation sites native build: " + built.stderr)
 
 
--- Runs the probe with strict accounting and, when `report` is given, the site report.
+-- Runs the probe with strict accounting and, when `report` is given, the site
+-- report, requiring `status`.
 private func run_probe(
     executable: String,
-    directory: String,
     name: String,
     report: Option[String],
     mode: List[String],
-) -> Result[ProbeRun, String]:
-    prefix = directory + "/allocation-sites-" + name
-    arguments = match report:
-        Some(path):
-            [
-                "-u",
-                "BLORP_MEMORY_STATS",
-                "BLORP_LEAK_CHECK=strict",
-                "BLORP_ALLOCATION_SITES=" + path,
-                executable,
-            ].concat(mode)
-        None:
-            [
-                "-u",
-                "BLORP_MEMORY_STATS",
-                "-u",
-                "BLORP_ALLOCATION_SITES",
-                "BLORP_LEAK_CHECK=strict",
-                executable,
-            ].concat(mode)
-    status ?= quiet_run(ENVIRONMENT_TOOL, arguments, prefix, CHILD_TIMEOUT_MS)
-    out ?= read_file(prefix + ".out")
-    err ?= read_file(prefix + ".err")
-    Ok({ status = status, stdout = out, stderr = err })
+    status: Int,
+) -> Result[Captured, String]:
+    probe ?= isolated(executable, mode, CHILD_TIMEOUT_MS)
+    environment = strict_leak_check().set("BLORP_ALLOCATION_SITES", report)
+    run_expecting("allocation sites " + name, { probe | environment = environment }, status)
+
+
+-- Runs the symbolizer script on `arguments`, requiring `status`.
+private func symbolize(
+    name: String,
+    arguments: List[String],
+    status: Int,
+    timeout_ms: Int,
+) -> Result[Captured, String]:
+    symbolizer ?= isolated(SYMBOLIZER, arguments, timeout_ms)
+    run_expecting(name, symbolizer, status)
 
 
 private func expect(label: String, actual: String, expected: String) -> Result[Void, String]:
@@ -147,18 +117,20 @@ private func counts_match_strict_total(
     directory: String,
 ) -> Result[Void, String]:
     report = directory + "/counts.txt"
-    result ?= run_probe(executable, directory, "counts", Some(report), [])
-    _ ?= expect("exit status", result.status.to_string(), "0")
+    result ?= run_probe(executable, "counts", Some(report), [], 0)
     _ ?= expect("stdout", result.stdout, "")
     _ ?= expect("strict stderr", result.stderr, STRICT_TOTAL)
-    prefix = directory + "/allocation-sites-counts-script"
-    status ?= quiet_run(SYMBOLIZER, [report, executable], prefix, COMPILE_TIMEOUT_MS)
-    _ ?= expect("symbolizer status", status.to_string(), "0")
-    out ?= read_file(prefix + ".out")
-    if out.starts_with(TOTAL_LINE):
+    symbolized ?= symbolize("counts symbolizer", [report, executable], 0, COMPILE_TIMEOUT_MS)
+    if symbolized.stdout.starts_with(TOTAL_LINE):
         Ok(void)
     else:
-        Err(("symbolized total: expected prefix [" + TOTAL_LINE + "] got [") + out + "]")
+        Err(
+            (
+                ("symbolized total: expected prefix [" + TOTAL_LINE + "] got [")
+                + symbolized.stdout
+                + "]"
+            ),
+        )
 
 
 private func expected_tables(first: String, second: String) -> String:
@@ -199,36 +171,27 @@ private func attribution(
     else:
         "bare"
     report = (directory + "/" + name) + ".txt"
-    result ?= run_probe(executable, directory, name, Some(report), [])
-    _ ?= expect("exit status", result.status.to_string(), "0")
-    prefix = (directory + "/allocation-sites-" + name) + "-script"
+    _ ?= run_probe(executable, name, Some(report), [], 0)
     arguments = if with_names:
         [report, executable, "blorp/test/runtime/fixtures/allocation_sites_test.c"]
     else:
         [report, executable]
-    status ?= quiet_run(SYMBOLIZER, arguments, prefix, COMPILE_TIMEOUT_MS)
-    _ ?= expect("symbolizer status", status.to_string(), "0")
-    out ?= read_file(prefix + ".out")
+    symbolized ?= symbolize(name + " symbolizer", arguments, 0, COMPILE_TIMEOUT_MS)
     if with_names:
         expect(
             "named attribution",
-            out,
+            symbolized.stdout,
             expected_tables("fixture.first (blorp_f_10)", "fixture.second (blorp_f_20)"),
         )
     else:
-        expect("bare attribution", out, expected_tables("blorp_f_10", "blorp_f_20"))
+        expect("bare attribution", symbolized.stdout, expected_tables("blorp_f_10", "blorp_f_20"))
 
 
 -- An empty value must mean "unset": taken as a path, fopen("") would fail and exit 1.
-private func unset_or_empty_changes_nothing(
-    executable: String,
-    directory: String,
-) -> Result[Void, String]:
-    unset ?= run_probe(executable, directory, "unset", None, [])
-    _ ?= expect("unset exit status", unset.status.to_string(), "0")
+private func unset_or_empty_changes_nothing(executable: String) -> Result[Void, String]:
+    unset ?= run_probe(executable, "unset", None, [], 0)
     _ ?= expect("unset stderr", unset.stderr, STRICT_TOTAL)
-    empty ?= run_probe(executable, directory, "empty", Some(""), [])
-    _ ?= expect("empty exit status", empty.status.to_string(), "0")
+    empty ?= run_probe(executable, "empty", Some(""), [], 0)
     expect("empty stderr", empty.stderr, STRICT_TOTAL)
 
 
@@ -238,8 +201,7 @@ private func nothing_allocated_writes_empty_report(
     directory: String,
 ) -> Result[Void, String]:
     report = directory + "/idle.txt"
-    result ?= run_probe(executable, directory, "idle", Some(report), ["idle"])
-    _ ?= expect("exit status", result.status.to_string(), "0")
+    result ?= run_probe(executable, "idle", Some(report), ["idle"], 0)
     _ ?= expect(
         "stderr",
         result.stderr,
@@ -249,9 +211,8 @@ private func nothing_allocated_writes_empty_report(
     expect("report", contents, "")
 
 
-private func bad_path_fails(executable: String, directory: String) -> Result[Void, String]:
-    result ?= run_probe(executable, directory, "bad-path", Some(BAD_DIRECTORY_REPORT), [])
-    _ ?= expect("exit status", result.status.to_string(), "1")
+private func bad_path_fails(executable: String) -> Result[Void, String]:
+    result ?= run_probe(executable, "bad-path", Some(BAD_DIRECTORY_REPORT), [], 1)
     _ ?= expect("stdout", result.stdout, "")
     expect("stderr", result.stderr, BAD_PATH_MESSAGE)
 
@@ -265,10 +226,8 @@ private func symbolizer_failure(
 ) -> Result[String, String]:
     report = (directory + "/" + name) + ".txt"
     _ ?= write_file(report, contents)
-    prefix = (directory + "/allocation-sites-" + name) + "-script"
-    status ?= quiet_run(SYMBOLIZER, [report, binary], prefix, CHILD_TIMEOUT_MS)
-    _ ?= expect(name + " exit status", status.to_string(), "1")
-    read_file(prefix + ".err")
+    symbolized ?= symbolize(name + " symbolizer", [report, binary], 1, CHILD_TIMEOUT_MS)
+    Ok(symbolized.stderr)
 
 
 private func malformed_report_line_fails(
@@ -327,7 +286,7 @@ func suite(c_compiler: String, directory: String) -> TestSuite:
                     ),
                     (
                         "unset or empty variable leaves the run unchanged",
-                        func(): reported(unset_or_empty_changes_nothing(executable, directory)),
+                        func(): reported(unset_or_empty_changes_nothing(executable)),
                     ),
                     (
                         "a run that allocates nothing writes an empty report",
@@ -337,7 +296,7 @@ func suite(c_compiler: String, directory: String) -> TestSuite:
                     ),
                     (
                         "unwritable path exits non-zero with a clear message",
-                        func(): reported(bad_path_fails(executable, directory)),
+                        func(): reported(bad_path_fails(executable)),
                     ),
                     (
                         "a malformed report line names the file and line",

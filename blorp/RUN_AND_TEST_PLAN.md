@@ -22,7 +22,12 @@ linking with the C compiler and running.
 
 ## Background
 
-- **Running a program from Blorp today** is `process.run_to_files(program,
+Since this was written, process L0 to L2 have landed: `Command`, `capture`,
+`output` and `find_program` exist, `run_to_files` is deleted (2026-11-11), and
+`Command.program` is a `Path`. The first two items below describe the state
+when R0 was decided.
+
+- **Running a program from Blorp then** is `process.run_to_files(program,
   arguments, stdout_path, stderr_path, timeout_ms)`: an absolute program
   path, output written to two files, stdin from `/dev/null`, a required
   positive timeout, and no environment control (callers wrap with

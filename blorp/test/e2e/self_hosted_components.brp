@@ -1,26 +1,22 @@
 import:
-    int: Int methods
     io/fs/entry: EntryKind(File)
-    io/process: run_to_files
+    io/process: CaptureError, Command, Exit(Exited), capture
     list: List methods
     result: Result methods
     string: String methods
     test: TestSuite
-    ./file_access: read_file, make_directories, kind_of, remove_tree
-    ./self_hosted_harness: command, reported, ENVIRONMENT_TOOL, COMPILATION_TIMEOUT_MS
+    ./file_access: make_directories, kind_of, path_of
+    ./self_hosted_harness: COMPILATION_TIMEOUT_MS, ending, isolated, reported, run_expecting
     ./self_hosted_selection:
         ComponentGroup,
         Tools,
         program_directory,
         compile_arguments,
         link_arguments,
-        run_arguments,
+        run_command,
         without_final_newline,
 
 
--- A component program runs every suite of one phase directory under strict
--- leak checking. Ten minutes is far above any observed run, and bounds a hang.
-private COMPONENT_TIMEOUT_MS: Int = 600000
 private PROGRAM_NAME: String = "all_suites"
 
 
@@ -41,60 +37,36 @@ private func require_sources(sources: List[String]) -> Result[Void, String]:
     outcome
 
 
--- Capture files must be new, so a rerun starts from an empty directory. The
--- previous run's C and binary stay until then, for inspection.
-private func empty_directory(directory: String) -> Result[Void, String]:
-    existing ?= kind_of(directory)
-    _ ?= match existing:
-        Some(_): remove_tree(directory)
-        None: Ok(void)
-    make_directories(directory)
-
-
--- Prints what the program wrote, however it ended, so a crash or a timeout
--- keeps the output that explains it.
-private func relay(prefix: String) -> Result[Void, String]:
-    output ?= read_file(prefix + ".stdout")
-    errors ?= read_file(prefix + ".stderr")
-    if output.length() > 0:
-        print(without_final_newline(output))
-    if errors.length() > 0:
-        print_error(without_final_newline(errors))
-    Ok(void)
-
-
--- Not `command`: it quotes the program's stderr in its error, and relay has
--- already printed it.
-private func run_program(program: String) -> Result[Void, String]:
-    prefix = program + ".run"
-    outcome = run_to_files(
-        ENVIRONMENT_TOOL,
-        run_arguments(program),
-        prefix + ".stdout",
-        prefix + ".stderr",
-        COMPONENT_TIMEOUT_MS,
+-- Not run_expecting: it prints what the program wrote, however it ended, so a
+-- crash or a timeout keeps the output that explains it, and its error does not
+-- quote that output again.
+private func run_program(program: String, invocation: Command) -> Result[Void, String]:
+    captured ?= capture(invocation).map_err(
+        pure func(error: CaptureError) -> String: "${program}: ${error}",
     )
-    relayed = relay(prefix)
-    status ?= outcome.map_err(pure func(error: String): program + ": " + error)
-    if status.equals(0):
-        relayed
+    if captured.stdout.length() > 0:
+        print(without_final_newline(captured.stdout))
+    if captured.stderr.length() > 0:
+        print_error(without_final_newline(captured.stderr))
+    if captured.exit == Exited(0):
+        Ok(void)
     else:
-        Err(program + ": exit " + status.to_string())
+        Err("${program}: ${captured.exit.ending(invocation.timeout_ms)}")
 
 
+-- The previous run's C and binary stay in the program directory until this run
+-- replaces them, for inspection.
 private func run_component(tools: Tools, group: ComponentGroup) -> Result[Void, String]:
     directory ?= program_directory(group)
     _ ?= require_sources(group.sources)
-    _ ?= empty_directory(directory)
+    _ ?= make_directories(directory)
     program = directory + "/" + PROGRAM_NAME
-    _ ?= command(
-        compile_arguments(tools, group, program),
-        program + ".compile",
-        0,
-        COMPILATION_TIMEOUT_MS,
-    )
-    _ ?= command(link_arguments(tools, program), program + ".link", 0, COMPILATION_TIMEOUT_MS)
-    run_program(program)
+    compile ?= isolated(tools.compiler, compile_arguments(group, program), COMPILATION_TIMEOUT_MS)
+    _ ?= run_expecting(program + ".compile", compile, 0)
+    link ?= isolated(tools.c_compiler, link_arguments(tools, program), COMPILATION_TIMEOUT_MS)
+    _ ?= run_expecting(program + ".link", link, 0)
+    binary ?= path_of(program)
+    run_program(program, run_command(binary))
 
 
 -- One case per group, so a failure names the phase that owns it.

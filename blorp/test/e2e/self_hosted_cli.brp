@@ -3,18 +3,14 @@
 import:
     bool: and, not
     int: Int methods
+    io/process: Captured, FindProgramError, command, find_program
     list: List methods
     result: Result methods
     string: String methods
     test: TestSuite
     ../../src/common/cli/usage: EXIT_PATH, EXIT_REJECTED, EXIT_USAGE
     ./file_access: read_file, write_file, make_directories
-    ./self_hosted_harness:
-        COMPILATION_TIMEOUT_MS,
-        LIBRARY_ROOT,
-        WITHOUT_DIAGNOSTICS,
-        command,
-        reported,
+    ./self_hosted_harness: COMPILATION_TIMEOUT_MS, LIBRARY_ROOT, isolated, reported, run_expecting
 
 
 private FORMATTED: String = "func main() -> Int:\n    x = 1\n    x + 1\n"
@@ -87,13 +83,6 @@ private HELP_HELP: String =
     |Shows the overview of blorp, or the options of one command.
 
 
--- What one run printed.
-private record CliOutput {
-    stdout: String,
-    stderr: String,
-}
-
-
 private pure func expect(
     actual: String,
     expected: String,
@@ -111,24 +100,15 @@ private pure func expect(
 private func run(
     compiler: String,
     arguments: List[String],
-    prefix: String,
+    name: String,
     status: Int,
-) -> Result[CliOutput, String]:
-    _ ?= command(
-        WITHOUT_DIAGNOSTICS
-            .concat([compiler])
-            .concat(arguments),
-        prefix,
-        status,
-        COMPILATION_TIMEOUT_MS,
-    )
-    stdout ?= read_file(prefix + ".stdout")
-    stderr ?= read_file(prefix + ".stderr")
-    Ok({ stdout = stdout, stderr = stderr })
+) -> Result[Captured, String]:
+    invocation ?= isolated(compiler, arguments, COMPILATION_TIMEOUT_MS)
+    run_expecting(name, invocation, status)
 
 
 private pure func expect_output(
-    output: CliOutput,
+    output: Captured,
     stdout: String,
     stderr: String,
 ) -> Result[Void, String]:
@@ -156,9 +136,22 @@ private pure func has_text(haystack: String, needle: String) -> Bool:
     found
 
 
+-- A system tool found on PATH, such as ln or cp, for what no fs operation does.
+private func tool(name: String, arguments: List[String], label: String) -> Result[Void, String]:
+    program ?= find_program(name).map_err(
+        pure func(error: FindProgramError) -> String: "${name}: ${error}",
+    )
+    _ ?= run_expecting(
+        label,
+        { command(program, arguments) | timeout_ms = Some(COMPILATION_TIMEOUT_MS) },
+        0,
+    )
+    Ok(void)
+
+
 -- A symbolic link, which no fs operation can make.
-private func linked(target: String, link: String, prefix: String) -> Result[Void, String]:
-    command(["ln", "-s", target, link], prefix, 0, COMPILATION_TIMEOUT_MS)
+private func linked(target: String, link: String, label: String) -> Result[Void, String]:
+    tool("ln", ["-s", target, link], label)
 
 
 -- Every file is unformatted, so a walk's visits are visible. In walk order:
@@ -333,7 +326,7 @@ private func a_library_root_wins_over_the_embedded_library(
 ) -> Result[Void, String]:
     prefix = "${work_directory}/cli_override"
     copy = prefix + "_library"
-    _ ?= command(["cp", "-R", LIBRARY_ROOT, copy], prefix + "_copy", 0, COMPILATION_TIMEOUT_MS)
+    _ ?= tool("cp", ["-R", LIBRARY_ROOT, copy], prefix + "_copy")
     original ?= read_file("${copy}/list.brp")
     _ ?= written("${copy}/list.brp", original + "\nfunc broken( -> Int:\n")
     source = prefix + ".brp"

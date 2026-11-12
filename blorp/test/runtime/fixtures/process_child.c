@@ -79,145 +79,6 @@ static int probe_execve(const char *path, char *const arguments[], char *const e
     return execve(path, arguments, environment);
 }
 
-static int closed_stdio(const char *program, const char *out, const char *err) {
-    int saved[3];
-    for (int index = 0; index < 3; index++) {
-        saved[index] = fcntl(index, F_DUPFD_CLOEXEC, 3);
-        if (saved[index] < 0) return 1;
-    }
-    struct blorp_string *program_value = blorp_string_from_bytes(program, (int64_t)strlen(program));
-    struct blorp_string *output = blorp_string_from_bytes(out, (int64_t)strlen(out));
-    struct blorp_string *errors = blorp_string_from_bytes(err, (int64_t)strlen(err));
-    struct blorp_string *exit_argument = blorp_string_from_bytes("exit", 4);
-    struct blorp_l_0_s *arguments = blorp_list_repeat_0_s(exit_argument, 2);
-    blorp_string_release(exit_argument);
-    blorp_string_release(arguments->values[1]);
-    arguments->values[1] = blorp_string_from_bytes("0", 1);
-    for (int index = 0; index < 3; index++) {
-        if (close(index) != 0) return 1;
-    }
-    int64_t code = 0;
-    struct blorp_string *error = NULL;
-    const uint8_t succeeded = blorp_process_run_to_files(program_value, arguments, output, errors,
-                                                       INT64_C(10000), &code, &error);
-    for (int index = 0; index < 3; index++) {
-        if (dup2(saved[index], index) < 0 || close(saved[index]) != 0) return 1;
-    }
-    blorp_list_drop_0_s(arguments);
-    blorp_string_release(program_value);
-    blorp_string_release(output);
-    blorp_string_release(errors);
-    if (error != NULL) blorp_string_release(error);
-    return succeeded && code == 0 ? 0 : 1;
-}
-
-static int unsupported_sigchld(const char *program, const char *out, const char *err) {
-    struct sigaction original, changed;
-    memset(&changed, 0, sizeof changed);
-    changed.sa_handler = SIG_IGN;
-    if (sigemptyset(&changed.sa_mask) != 0 || sigaction(SIGCHLD, &changed, &original) != 0) return 1;
-    struct blorp_string *program_value = blorp_string_from_bytes(program, (int64_t)strlen(program));
-    struct blorp_string *output = blorp_string_from_bytes(out, (int64_t)strlen(out));
-    struct blorp_string *errors = blorp_string_from_bytes(err, (int64_t)strlen(err));
-    struct blorp_string *argument = blorp_string_from_bytes("exit", 4);
-    struct blorp_l_0_s *arguments = blorp_list_repeat_0_s(argument, 0);
-    blorp_string_release(argument);
-    int64_t code = 0;
-    struct blorp_string *error = NULL;
-    const uint8_t succeeded = blorp_process_run_to_files(program_value, arguments, output, errors,
-                                                       INT64_C(10000), &code, &error);
-    const int rejected = !succeeded && error != NULL &&
-        strcmp(error->bytes, "process.run_to_files: requires default SIGCHLD") == 0;
-    if (sigaction(SIGCHLD, &original, NULL) != 0) return 1;
-    if (error != NULL) blorp_string_release(error);
-    /* Reusing both paths proves unsupported disposition was rejected before file creation. */
-    error = NULL;
-    const uint8_t after = blorp_process_run_to_files(program_value, arguments, output, errors,
-                                                  INT64_C(10000), &code, &error);
-    blorp_list_drop_0_s(arguments);
-    blorp_string_release(program_value);
-    blorp_string_release(output);
-    blorp_string_release(errors);
-    if (error != NULL) blorp_string_release(error);
-    return rejected && after ? 0 : 1;
-}
-
-/* Probe the production helper's ownership boundary: no direct zombie remains. */
-static int direct_reaping(const char *program, const char *out, const char *err,
-                          const char *mode) {
-    struct blorp_string *program_value = blorp_string_from_bytes(program, (int64_t)strlen(program));
-    struct blorp_string *output = blorp_string_from_bytes(out, (int64_t)strlen(out));
-    struct blorp_string *errors = blorp_string_from_bytes(err, (int64_t)strlen(err));
-    const char *operation = strcmp(mode, "reap-exit") == 0 ? "exit" :
-                            strcmp(mode, "reap-signal") == 0 ? "signal" : "pause";
-    struct blorp_string *argument = blorp_string_from_bytes(operation, (int64_t)strlen(operation));
-    const int normal = strcmp(mode, "reap-exit") == 0;
-    struct blorp_l_0_s *arguments = blorp_list_repeat_0_s(argument, normal ? 2 : 1);
-    blorp_string_release(argument);
-    if (normal) {
-        blorp_string_release(arguments->values[1]);
-        arguments->values[1] = blorp_string_from_bytes("0", 1);
-    }
-    int64_t code = 0;
-    struct blorp_string *error = NULL;
-    const int startup = strcmp(mode, "reap-startup") == 0;
-    int ready[2] = {-1, -1};
-    if (startup) {
-        if (pipe(ready) != 0 || fcntl(ready[0], F_SETFL, O_NONBLOCK) != 0) return 1;
-        exec_ready_writer = ready[1];
-        stall_exec = 1;
-    }
-    const int64_t timeout_ms = startup || strcmp(mode, "reap-timeout") == 0 ?
-        INT64_C(1000) : INT64_C(10000);
-    const uint8_t succeeded = blorp_process_run_to_files(program_value, arguments, output, errors,
-                                                       timeout_ms, &code, &error);
-    int acknowledged = 1;
-    if (startup) {
-        stall_exec = 0;
-        exec_ready_writer = -1;
-        unsigned char byte = 0;
-        acknowledged = read(ready[0], &byte, sizeof byte) == (ssize_t)sizeof byte && byte == 1;
-        if (close(ready[0]) != 0) acknowledged = 0;
-        if (close(ready[1]) != 0) acknowledged = 0;
-    }
-    int status = 0;
-    errno = 0;
-    const pid_t remaining = waitpid(-1, &status, WNOHANG);
-    const int no_child = remaining == -1 && errno == ECHILD;
-    const char *expected = strcmp(mode, "reap-signal") == 0 ?
-        "process.run_to_files: child terminated by signal" : "process.run_to_files: timed out";
-    const int correct = normal ? succeeded && code == 0 :
-        !succeeded && error != NULL && strcmp(error->bytes, expected) == 0;
-    blorp_list_drop_0_s(arguments);
-    blorp_string_release(program_value);
-    blorp_string_release(output);
-    blorp_string_release(errors);
-    if (error != NULL) blorp_string_release(error);
-    return correct && no_child && acknowledged ? 0 : 1;
-}
-
-/* A lost group race leaves the spawn intact, and the child leads its own group. */
-static int group_race(const char *program, const char *out, const char *err) {
-    struct blorp_string *program_value = blorp_string_from_bytes(program, (int64_t)strlen(program));
-    struct blorp_string *output = blorp_string_from_bytes(out, (int64_t)strlen(out));
-    struct blorp_string *errors = blorp_string_from_bytes(err, (int64_t)strlen(err));
-    struct blorp_string *argument = blorp_string_from_bytes("group-leader", 12);
-    struct blorp_l_0_s *arguments = blorp_list_repeat_0_s(argument, 1);
-    blorp_string_release(argument);
-    int64_t code = 0;
-    struct blorp_string *error = NULL;
-    lose_group_race = 1;
-    const uint8_t succeeded = blorp_process_run_to_files(program_value, arguments, output, errors,
-                                                       INT64_C(10000), &code, &error);
-    lose_group_race = 0;
-    blorp_list_drop_0_s(arguments);
-    blorp_string_release(program_value);
-    blorp_string_release(output);
-    blorp_string_release(errors);
-    if (error != NULL) blorp_string_release(error);
-    return succeeded && code == 0 ? 0 : 1;
-}
-
 /* A List[String] of owned copies, as the emitter passes one. */
 static struct blorp_l_0_s *strings(int count, const char *const items[]) {
     struct blorp_string *empty = blorp_string_from_bytes("", 0);
@@ -309,24 +170,96 @@ static int capture_sigchld(const char *program) {
     return !succeeded && error == expected && fork_count == forks ? 0 : 1;
 }
 
-/* No child remains after an exit or a timeout, and a zero timeout never forks. */
+/* Whether no child of this process remains, reaped or not. */
+static int no_child(void) {
+    int status = 0;
+    errno = 0;
+    return waitpid(-1, &status, WNOHANG) == -1 && errno == ECHILD;
+}
+
+/* No child remains after a timeout, an exit or a signal, and a zero timeout never forks. */
 static int capture_reap(const char *program) {
     const char *const pause_arguments[] = {"pause"};
     const char *const exit_arguments[] = {"exit", "0"};
+    const char *const signal_arguments[] = {"signal"};
     int64_t exit = -1, error = 0;
     const uint8_t timed = run_capture(program, 1, pause_arguments, NULL, 0, INT64_C(200), &exit, &error);
-    const int timed_out = timed && exit == BLORP_PROCESS_TIMED_OUT * BLORP_PROCESS_EXIT_SPAN;
-    errno = 0;
-    int status = 0;
-    const int none_after_timeout = waitpid(-1, &status, WNOHANG) == -1 && errno == ECHILD;
+    const int timed_out = timed && exit == BLORP_PROCESS_TIMED_OUT * BLORP_PROCESS_EXIT_SPAN &&
+        no_child();
     const uint8_t ended = run_capture(program, 2, exit_arguments, NULL, 0, INT64_C(10000), &exit, &error);
-    errno = 0;
-    const int none_after_exit = waitpid(-1, &status, WNOHANG) == -1 && errno == ECHILD;
+    const int exited = ended && exit == BLORP_PROCESS_EXITED * BLORP_PROCESS_EXIT_SPAN && no_child();
+    const uint8_t killed = run_capture(program, 1, signal_arguments, NULL, 0, INT64_C(10000), &exit,
+                                       &error);
+    const int signaled = killed && exit == BLORP_PROCESS_SIGNALED * BLORP_PROCESS_EXIT_SPAN + SIGTERM &&
+        no_child();
     const int forks = fork_count;
     const uint8_t at_once = run_capture(program, 2, exit_arguments, NULL, 0, INT64_C(0), &exit, &error);
     const int unstarted = at_once && exit == BLORP_PROCESS_TIMED_OUT * BLORP_PROCESS_EXIT_SPAN &&
         fork_count == forks;
-    return timed_out && none_after_timeout && ended && exit != -1 && none_after_exit && unstarted ? 0 : 1;
+    return timed_out && exited && signaled && unstarted ? 0 : 1;
+}
+
+/* A child stalled before exec has neither exec'd nor written its report: the deadline
+ * covers startup, so the call times out and the child is killed and reaped. The stall
+ * writes one byte first, so the probe knows the child reached exec. */
+static int capture_startup(const char *program) {
+    int ready[2] = {-1, -1};
+    if (pipe(ready) != 0 || fcntl(ready[0], F_SETFL, O_NONBLOCK) != 0) return 1;
+    exec_ready_writer = ready[1];
+    stall_exec = 1;
+    const char *const arguments[] = {"exit", "0"};
+    int64_t exit = -1, error = 0;
+    const uint8_t succeeded = run_capture(program, 2, arguments, NULL, 0, INT64_C(1000), &exit, &error);
+    stall_exec = 0;
+    exec_ready_writer = -1;
+    unsigned char byte = 0;
+    const int acknowledged = read(ready[0], &byte, sizeof byte) == (ssize_t)sizeof byte && byte == 1;
+    if (close(ready[0]) != 0 || close(ready[1]) != 0) return 1;
+    return succeeded && exit == BLORP_PROCESS_TIMED_OUT * BLORP_PROCESS_EXIT_SPAN && acknowledged &&
+        no_child() ? 0 : 1;
+}
+
+/* With stdin, stdout and stderr closed, each descriptor capture opens would take one of
+ * their numbers; it moves them above stderr, so the child's streams stay its own. */
+static int capture_closed_stdio(const char *program) {
+    int saved[3];
+    for (int index = 0; index < 3; index++) {
+        saved[index] = fcntl(index, F_DUPFD_CLOEXEC, 3);
+        if (saved[index] < 0) return 1;
+    }
+    for (int index = 0; index < 3; index++) {
+        if (close(index) != 0) return 1;
+    }
+    const char *const arguments[] = {"streams"};
+    struct blorp_string *program_value = blorp_string_from_bytes(program, (int64_t)strlen(program));
+    struct blorp_l_0_s *argument_list = strings(1, arguments);
+    struct blorp_l_0_s *none = strings(0, NULL);
+    struct blorp_l_0_s *reply = NULL;
+    int64_t error = 0;
+    const uint8_t succeeded = blorp_process_capture(program_value, argument_list, none, none, none,
+                                                    INT64_C(10000), &reply, &error);
+    for (int index = 0; index < 3; index++) {
+        if (dup2(saved[index], index) < 0 || close(saved[index]) != 0) return 1;
+    }
+    /* The child inherits this probe's strict leak check, whose report follows its stderr. */
+    const int correct = succeeded && strcmp(reply->values[0]->bytes, "0") == 0 &&
+        strcmp(reply->values[1]->bytes, "stdout text\n") == 0 &&
+        strncmp(reply->values[2]->bytes, "stderr text\n", strlen("stderr text\n")) == 0;
+    if (succeeded) blorp_list_drop_0_s(reply);
+    blorp_list_drop_0_s(none);
+    blorp_list_drop_0_s(argument_list);
+    blorp_string_release(program_value);
+    return correct ? 0 : 1;
+}
+
+/* A lost group race leaves the launch intact: only the child creates its group. */
+static int capture_group_race(const char *program) {
+    const char *const arguments[] = {"group-leader"};
+    int64_t exit = -1, error = 0;
+    lose_group_race = 1;
+    const uint8_t succeeded = run_capture(program, 1, arguments, NULL, 0, INT64_C(10000), &exit, &error);
+    lose_group_race = 0;
+    return succeeded && exit == BLORP_PROCESS_EXITED * BLORP_PROCESS_EXIT_SPAN ? 0 : 1;
 }
 
 /* A stray process holds the exec report's write end open for STRAY_LIFETIME_SECONDS. The
@@ -407,11 +340,6 @@ static int child_case(int argc, char **argv) {
     if (strcmp(argv[1], "signal") == 0) {
         if (raise(SIGTERM) != 0) return 1;
         return 1;
-    }
-    if (strcmp(argv[1], "wait") == 0 && argc == 3) {
-        const int ready = open(argv[2], O_WRONLY | O_CREAT | O_EXCL, S_IRUSR | S_IWUSR);
-        if (ready < 0 || write(ready, "ready\n", 6) != 6 || close(ready) != 0) return 1;
-        for (;;) pause();
     }
     if (strcmp(argv[1], "invalid-executable") == 0 && argc == 3) {
         const int output = open(argv[2], O_WRONLY | O_CREAT | O_EXCL, S_IRWXU);
@@ -508,20 +436,17 @@ static int child_case(int argc, char **argv) {
         int64_t error = 0;
         return blorp_process_fault(message, &error);
     }
-    if (strcmp(argv[1], "capture-signals") == 0 && argc == 5) return capture_signals(argv[2]);
-    if (strcmp(argv[1], "capture-sigchld") == 0 && argc == 5) return capture_sigchld(argv[2]);
-    if (strcmp(argv[1], "capture-reap") == 0 && argc == 5) return capture_reap(argv[2]);
-    if (strcmp(argv[1], "capture-stray-report") == 0 && argc == 5)
-        return capture_stray_report_holder(argv[2]);
-    if (strcmp(argv[1], "find-program") == 0 && argc == 5) return find_program_case(argv[3]);
-    if (strcmp(argv[1], "fifo") == 0 && argc == 3) return mkfifo(argv[2], S_IRUSR | S_IWUSR) == 0 ? 0 : 1;
-    if (strcmp(argv[1], "symlink") == 0 && argc == 4) return symlink(argv[2], argv[3]) == 0 ? 0 : 1;
-    if (strcmp(argv[1], "closedstdio") == 0 && argc == 5) return closed_stdio(argv[2], argv[3], argv[4]);
-    if (argc == 5 && (strcmp(argv[1], "reap-exit") == 0 || strcmp(argv[1], "reap-signal") == 0 ||
-                      strcmp(argv[1], "reap-timeout") == 0 || strcmp(argv[1], "reap-startup") == 0))
-        return direct_reaping(argv[2], argv[3], argv[4], argv[1]);
-    if (strcmp(argv[1], "group-race") == 0 && argc == 5) return group_race(argv[2], argv[3], argv[4]);
-    if (strcmp(argv[1], "sigchld") == 0 && argc == 5) return unsupported_sigchld(argv[2], argv[3], argv[4]);
+    /* A native probe is given this program's own path, then a path it may create. */
+    if (argc == 4) {
+        if (strcmp(argv[1], "capture-signals") == 0) return capture_signals(argv[2]);
+        if (strcmp(argv[1], "capture-sigchld") == 0) return capture_sigchld(argv[2]);
+        if (strcmp(argv[1], "capture-reap") == 0) return capture_reap(argv[2]);
+        if (strcmp(argv[1], "capture-startup") == 0) return capture_startup(argv[2]);
+        if (strcmp(argv[1], "capture-closed-stdio") == 0) return capture_closed_stdio(argv[2]);
+        if (strcmp(argv[1], "capture-group-race") == 0) return capture_group_race(argv[2]);
+        if (strcmp(argv[1], "capture-stray-report") == 0) return capture_stray_report_holder(argv[2]);
+        if (strcmp(argv[1], "find-program") == 0) return find_program_case(argv[3]);
+    }
     return 1;
 }
 

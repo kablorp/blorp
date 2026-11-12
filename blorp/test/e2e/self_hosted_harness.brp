@@ -1,25 +1,22 @@
 import:
     bool: not, and
+    dict: Dict
     int: Int methods
     io/fs/entry: EntryKind
-    io/process: run_to_files
+    io/process: Captured, CaptureError, Command, Exit(Exited, Signaled, TimedOut), capture, command
     list: List methods, repeat
+    path: Path
     result: Result methods
     string: String methods
     test: TestSuite
     ../../src/common/cli/usage: EXIT_PATH, EXIT_REJECTED
-    ./file_access: read_file, write_file, kind_of
+    ./file_access: read_file, write_file, kind_of, path_of
     ./self_hosted_reports: parse_instructions, positive_allocations, within_ceiling
 
 
-ENVIRONMENT_TOOL: String = "/usr/bin/env"
 private SHELL: String = "/bin/sh"
 LIBRARY_ROOT: String = "blorp/standard_library"
 FIXTURES: String = "blorp/test/e2e/fixtures/"
--- Children that must not inherit a leak-check or statistics setting run with
--- these removed (through ENVIRONMENT_TOOL), so their output is the same
--- wherever the driver runs.
-WITHOUT_DIAGNOSTICS: List[String] = ["-u", "BLORP_LEAK_CHECK", "-u", "BLORP_MEMORY_STATS"]
 -- Compilation includes C sanitizer linking; native fixtures should finish quickly.
 COMPILATION_TIMEOUT_MS: Int = 600000
 private NATIVE_TIMEOUT_MS: Int = 10000
@@ -320,37 +317,56 @@ private pure func expect(
         Err(description + ": expected [" + expected + "], got [" + actual + "]")
 
 
-func command(
+-- Children that must not inherit a leak-check or statistics setting run with
+-- these removed, so their output is the same wherever the driver runs.
+pure func without_diagnostics() -> Dict[String, Option[String]]:
+    { "BLORP_LEAK_CHECK" => None, "BLORP_MEMORY_STATS" => None }
+
+
+-- A program under test reports its allocations on stderr, and fails on a leak.
+pure func strict_leak_check() -> Dict[String, Option[String]]:
+    { "BLORP_LEAK_CHECK" => Some("strict"), "BLORP_MEMORY_STATS" => None }
+
+
+-- `program`, a path the suites build or are given as text, with `arguments`,
+-- without the settings of without_diagnostics, and stopped after `timeout_ms`.
+pure func isolated(
+    program: String,
     arguments: List[String],
-    prefix: String,
-    expected_status: Int,
     timeout_ms: Int,
-) -> Result[Void, String]:
-    actual: Int ?= run_to_files(
-        ENVIRONMENT_TOOL,
-        arguments,
-        prefix + ".stdout",
-        prefix + ".stderr",
-        timeout_ms,
-    ).map_err(pure func(error: String): prefix + ": " + error)
-    if actual.equals(expected_status):
-        Ok(void)
+) -> Result[Command, String]:
+    binary ?= path_of(program)
+    Ok(
+        { command(binary, arguments) |
+            environment = without_diagnostics(),
+            timeout_ms = Some(timeout_ms),
+        },
+    )
+
+
+-- How a child ended, for a failure: "exited 2", "killed by signal 9" or
+-- "timed out after 10000 ms".
+pure func ending(exit: Exit, timeout_ms: Option[Int]) -> String:
+    match (exit, timeout_ms):
+        (Exited(status), _): "exited ${status}"
+        (Signaled(signal), _): "killed by signal ${signal}"
+        (TimedOut, Some(limit)): "timed out after ${limit} ms"
+        (TimedOut, None): "timed out"
+
+
+-- Runs `invocation` and returns what it printed when it exits with `status`.
+-- Anything else is an error that starts with `name` and ends with the child's
+-- stderr, so a crash or a timeout keeps the output that explains it.
+func run_expecting(name: String, invocation: Command, status: Int) -> Result[Captured, String]:
+    captured ?= capture(invocation).map_err(
+        pure func(error: CaptureError) -> String: "${name}: ${error}",
+    )
+    if captured.exit == Exited(status):
+        Ok(captured)
     else:
-        match read_file(prefix + ".stderr"):
-            Ok(captured):
-                Err(
-                    (
-                        prefix
-                        + ": expected exit "
-                        + expected_status.to_string()
-                        + ", got "
-                        + actual.to_string()
-                        + ": "
-                        + captured
-                    ),
-                )
-            Err(error):
-                Err(error)
+        Err(
+            "${name}: expected exit ${status}; ${captured.exit.ending(invocation.timeout_ms)}: ${captured.stderr}",
+        )
 
 
 -- Returns the compile's allocations, from its strict report. With
@@ -364,24 +380,24 @@ private func compile_timed(
     inputs: List[String],
     prefix: String,
 ) -> Result[Int, String]:
-    timer = if check_instructions:
-        [PROCESS_TIMER, "-l", "-o", prefix + ".instructions"]
+    arguments = ["compile"]
+        .concat(inputs)
+        .concat(["--library-root", library_root, "-o", prefix + ".c"])
+    compile ?= if check_instructions:
+        isolated(
+            PROCESS_TIMER,
+            ["-l", "-o", prefix + ".instructions", compiler].concat(arguments),
+            COMPILATION_TIMEOUT_MS,
+        )
     else:
-        []
-    _ ?= command(
-        ["-u", "BLORP_MEMORY_STATS", "BLORP_LEAK_CHECK=strict"]
-            .concat(timer)
-            .concat([compiler, "compile"])
-            .concat(inputs)
-            .concat(["--library-root", library_root, "-o", prefix + ".c"]),
+        isolated(compiler, arguments, COMPILATION_TIMEOUT_MS)
+    compiled ?= run_expecting(
         prefix + ".compile",
+        { compile | environment = strict_leak_check() },
         0,
-        COMPILATION_TIMEOUT_MS,
     )
-    output: String ?= read_file(prefix + ".compile.stdout")
-    _ ?= expect(output, "", "compiler stdout")
-    report: String ?= read_file(prefix + ".compile.stderr")
-    allocations: Int ?= positive_allocations(report)
+    _ ?= expect(compiled.stdout, "", "compiler stdout")
+    allocations: Int ?= positive_allocations(compiled.stderr)
     generated: String ?= read_file(prefix + ".c")
     if (
         generated
@@ -402,9 +418,9 @@ private func link_fixture(
         NormalNative: (".normal", "-DBLORP_MEMORY_DIAGNOSTICS=0")
         StrictNative: (".strict", "-DBLORP_MEMORY_DIAGNOSTICS=1")
     binary = prefix + suffix
-    _ ?= command(
-        WITHOUT_DIAGNOSTICS.concat([
-            c_compiler,
+    link ?= isolated(
+        c_compiler,
+        [
             "-std=c11",
             "-Wall",
             "-Wextra",
@@ -419,22 +435,19 @@ private func link_fixture(
             binary,
             "-lm",
             "-lpthread",
-        ]),
-        binary + ".link",
-        0,
+        ],
         COMPILATION_TIMEOUT_MS,
     )
-    stdout: String ?= read_file(binary + ".link.stdout")
-    _ ?= expect(stdout, "", "C compiler stdout")
-    stderr: String ?= read_file(binary + ".link.stderr")
-    expect(stderr, "", "C compiler stderr")
+    linked ?= run_expecting(binary + ".link", link, 0)
+    _ ?= expect(linked.stdout, "", "C compiler stdout")
+    expect(linked.stderr, "", "C compiler stderr")
 
 
 -- One native invocation. A run that shares its fixture with others has a
--- `label` naming its capture files and error text; `directory` is where the
--- program starts (None keeps the runner's own), and `descriptor_limit` the most
--- files it may hold open (None keeps the runner's own). `stderr` is everything
--- the program itself writes to stderr, byte for byte.
+-- `label` naming it in error text; `directory` is where the program starts
+-- (None keeps the runner's own), and `descriptor_limit` the most files it may
+-- hold open (None keeps the runner's own). `stderr` is everything the program
+-- itself writes to stderr, byte for byte.
 record NativeRun {
     label: Option[String],
     arguments: List[String],
@@ -447,21 +460,26 @@ record NativeRun {
 }
 
 
--- The shell only changes directory and then replaces itself with the program.
-private CHANGE_DIRECTORY: String = "cd \"$1\" && shift && exec \"$@\""
 -- The shell only lowers its open-file limit, which the program inherits, and
--- then replaces itself with the program.
+-- then replaces itself with the program. The process API sets no limits.
 private LIMIT_DESCRIPTORS: String = "ulimit -n \"$1\" && shift && exec \"$@\""
 
 
-private pure func launch(binary: String, run: NativeRun) -> List[String]:
-    started = match run.directory:
-        None: [binary]
-        Some(directory): [SHELL, "-c", CHANGE_DIRECTORY, "sh", directory, binary]
-    limited = match run.descriptor_limit:
-        None: started
-        Some(limit): [SHELL, "-c", LIMIT_DESCRIPTORS, "sh", limit.to_string()].concat(started)
-    limited.concat(run.arguments)
+-- One run of `binary`, isolated; a strict run changes its environment.
+private pure func launch(binary: String, run: NativeRun) -> Result[Command, String]:
+    started ?= match run.descriptor_limit:
+        None:
+            isolated(binary, run.arguments, NATIVE_TIMEOUT_MS)
+        Some(limit):
+            isolated(
+                SHELL,
+                ["-c", LIMIT_DESCRIPTORS, "sh", limit.to_string(), binary].concat(run.arguments),
+                NATIVE_TIMEOUT_MS,
+            )
+    directory: Option[Path] ?= match run.directory:
+        None: Ok(None)
+        Some(text): path_of(text).map(pure func(place: Path) -> Option[Path]: Some(place))
+    Ok({ started | directory = directory })
 
 
 private pure func label_suffix(run: NativeRun) -> String:
@@ -471,32 +489,20 @@ private pure func label_suffix(run: NativeRun) -> String:
 
 
 private func run_normal(prefix: String, run: NativeRun) -> Result[Void, String]:
-    capture = prefix + label_suffix(run)
-    _ ?= command(
-        WITHOUT_DIAGNOSTICS.concat(launch(prefix + ".normal", run)),
-        capture + ".normal.run",
-        run.status,
-        NATIVE_TIMEOUT_MS,
-    )
-    output: String ?= read_file(capture + ".normal.run.stdout")
-    _ ?= expect(output, run.stdout, "native stdout" + label_suffix(run))
-    errors: String ?= read_file(capture + ".normal.run.stderr")
-    expect(errors, run.stderr, "native stderr" + label_suffix(run))
+    launched ?= launch(prefix + ".normal", run)
+    ran ?= run_expecting(prefix + label_suffix(run) + ".normal.run", launched, run.status)
+    _ ?= expect(ran.stdout, run.stdout, "native stdout" + label_suffix(run))
+    expect(ran.stderr, run.stderr, "native stderr" + label_suffix(run))
 
 
 private func run_strict(prefix: String, run: NativeRun) -> Result[Void, String]:
-    capture = prefix + label_suffix(run)
-    _ ?= command(
-        ["-u", "BLORP_MEMORY_STATS", "BLORP_LEAK_CHECK=strict"].concat(
-            launch(prefix + ".strict", run),
-        ),
-        capture + ".strict.run",
+    launched ?= launch(prefix + ".strict", run)
+    ran ?= run_expecting(
+        prefix + label_suffix(run) + ".strict.run",
+        { launched | environment = strict_leak_check() },
         run.status,
-        NATIVE_TIMEOUT_MS,
     )
-    strict_output: String ?= read_file(capture + ".strict.run.stdout")
-    _ ?= expect(strict_output, run.stdout, "strict native stdout" + label_suffix(run))
-    accounting: String ?= read_file(capture + ".strict.run.stderr")
+    _ ?= expect(ran.stdout, run.stdout, "strict native stdout" + label_suffix(run))
     -- The runtime writes its report as the program's last act, after everything
     -- the program wrote to the same stream.
     report = (
@@ -505,7 +511,7 @@ private func run_strict(prefix: String, run: NativeRun) -> Result[Void, String]:
         + " releases, 0 leaked, 0 bytes\n"
     )
     expect(
-        accounting,
+        ran.stderr,
         run.stderr + report,
         "strict native stderr and accounting" + label_suffix(run),
     )
@@ -840,18 +846,10 @@ func expect_status(
     status: Int,
     expected_stderr: String,
 ) -> Result[Void, String]:
-    _ ?= command(
-        WITHOUT_DIAGNOSTICS
-            .concat([compiler])
-            .concat(arguments),
-        prefix + ".compile",
-        status,
-        COMPILATION_TIMEOUT_MS,
-    )
-    stdout: String ?= read_file(prefix + ".compile.stdout")
-    _ ?= expect(stdout, "", "failed compiler stdout")
-    stderr: String ?= read_file(prefix + ".compile.stderr")
-    expect(stderr, expected_stderr, "failed compiler diagnostic")
+    invocation ?= isolated(compiler, arguments, COMPILATION_TIMEOUT_MS)
+    compiled ?= run_expecting(prefix + ".compile", invocation, status)
+    _ ?= expect(compiled.stdout, "", "failed compiler stdout")
+    expect(compiled.stderr, expected_stderr, "failed compiler diagnostic")
 
 
 -- The same, for a rejection: status 1, the code needs fixing.
@@ -965,7 +963,6 @@ private func fs_tree_tests(
     tree = work_directory + "/fs_tree"
     write_tree = work_directory + "/fs_write_tree"
     directories_tree = work_directory + "/fs_directories_tree"
-    prefix = work_directory + "/fs_prepare"
     read = fixture_program(
         "fs_read",
         "fs/read",
@@ -1000,22 +997,16 @@ private func fs_tree_tests(
         { allocations = 407508, instructions = 1266349840 },
         once_given([directories_tree], 0, FS_DIRECTORIES_OUTPUT, 591),
     )
-    match run_to_files(
-        SHELL,
-        [FS_PREPARE_SCRIPT, tree],
-        prefix + ".stdout",
-        prefix + ".stderr",
-        NATIVE_TIMEOUT_MS,
-    ):
+    match tree_built(tree):
         Err(error):
             [("the fs example tree is prepared", func(): reported(Err(error)))]
-        Ok(status):
-            if status.equals(FS_NOT_RUN_STATUS):
+        Ok(built):
+            if built.not():
                 print_error(
                     "fs examples not run: their trees need a user that file permissions refuse",
                 )
                 []
-            else if status.equals(0):
+            else:
                 [
                     (
                         "fs read_text and entry_kind return each kind, and to_string words each one",
@@ -1070,32 +1061,35 @@ private func fs_tree_tests(
                         ),
                     ),
                 ]
-            else:
-                [
-                    (
-                        "the fs example tree is prepared",
-                        func(): reported(Err(FS_PREPARE_SCRIPT + " exited " + status.to_string())),
-                    ),
-                ]
+
+
+-- A prepare script, which builds on `directory` a tree no fs operation can.
+private pure func preparation(script: String, directory: String) -> Result[Command, String]:
+    isolated(SHELL, [script, directory], NATIVE_TIMEOUT_MS)
+
+
+-- Whether prepare.sh built the fs example tree: False when it exits
+-- FS_NOT_RUN_STATUS, as root, and an error, with its stderr, for any other
+-- ending but Exited(0).
+private func tree_built(tree: String) -> Result[Bool, String]:
+    invocation ?= preparation(FS_PREPARE_SCRIPT, tree)
+    prepared ?= capture(invocation).map_err(
+        pure func(error: CaptureError) -> String: "${FS_PREPARE_SCRIPT}: ${error}",
+    )
+    if prepared.exit == Exited(0):
+        Ok(True)
+    else if prepared.exit == Exited(FS_NOT_RUN_STATUS):
+        Ok(False)
+    else:
+        ended = prepared.exit.ending(invocation.timeout_ms)
+        Err("${FS_PREPARE_SCRIPT} ${ended}: ${prepared.stderr}")
 
 
 -- Rebuilds the directory a program that changes it is given, from nothing.
-private func rebuilt_tree(
-    script: String,
-    directory: String,
-    prefix: String,
-) -> Result[Void, String]:
-    status ?= run_to_files(
-        SHELL,
-        [script, directory],
-        prefix + ".stdout",
-        prefix + ".stderr",
-        NATIVE_TIMEOUT_MS,
-    )
-    if status.equals(0):
-        Ok(void)
-    else:
-        Err(script + " exited " + status.to_string())
+private func rebuilt_tree(script: String, directory: String) -> Result[Void, String]:
+    invocation ?= preparation(script, directory)
+    _ ?= run_expecting(script, invocation, 0)
+    Ok(void)
 
 
 -- The write and directories programs change the directory they are given, so
@@ -1131,10 +1125,9 @@ private func run_on_rebuilt_tree(
     directory: String,
     script: String,
 ) -> Result[Void, String]:
-    capture = prefix + label_suffix(run)
-    _ ?= rebuilt_tree(script, directory, capture + ".normal.prepare")
+    _ ?= rebuilt_tree(script, directory)
     _ ?= run_normal(prefix, run)
-    _ ?= rebuilt_tree(script, directory, capture + ".strict.prepare")
+    _ ?= rebuilt_tree(script, directory)
     run_strict(prefix, run)
 
 
@@ -2569,9 +2562,9 @@ func suite(
                     prints(
                         "process_native_together",
                         "process/natives_together",
-                        { allocations = 116766, instructions = 422152629 },
-                        "process.run_to_files: timeout must be positive\n17\n7\n",
-                        13,
+                        { allocations = 115305, instructions = 431075720 },
+                        "17\n7\n",
+                        10,
                     ),
                 ),
             ),

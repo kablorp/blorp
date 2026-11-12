@@ -18,8 +18,10 @@ Earlier, Keith had approved the direction:
 - streaming later;
 - `Exit` as a `fixed union`.
 
-L0 is implemented, and L1 implements the API beside `run_to_files`; L2 is not
-implemented. The feasibility review had prototyped the C core on macOS 26 and
+L0, L1 and L2 are implemented. L2 (2026-11-11) moved every caller to
+`capture` and `output` and deleted `run_to_files`, and Keith decided then that
+`Command.program` is a `Path`. The Problem below describes the state before
+L2. The feasibility review had prototyped the C core on macOS 26 and
 Linux arm64, and compiled every declaration and example below against a
 scratch library.
 
@@ -51,7 +53,7 @@ import:
 
 -- What to run. Build one with `command`, then change fields by record update.
 record Command {
-    program: String,                             -- a path; find_program searches PATH
+    program: Path,                               -- find_program searches PATH
     arguments: List[String],                     -- without argv[0]; each passed literally
     directory: Option[Path],                     -- None runs in the parent's directory
     environment: Dict[String, Option[String]],   -- Some sets, None removes, the rest is inherited
@@ -80,7 +82,7 @@ union FindProgramError:
 
 union CaptureError:
     InvalidVariableName(String)    -- empty, or contains "="; before any system call
-    ContainsNul                    -- in the program, an argument or the environment; before any system call
+    ContainsNul                    -- in an argument or the environment; before any system call
     LaunchFailed(SystemCallError)  -- exec, fork or a pipe failed
     NotExecutable                  -- ENOEXEC: a file the system cannot run, such as a script without #!
     DirectoryFailed(SystemCallError)  -- the child could not enter `directory`
@@ -91,7 +93,7 @@ union OutputError:
     CaptureFailed(CaptureError)
     Unsuccessful(Captured)         -- anything but Exited(0), with everything the child printed
 
-pure func command(program: String, arguments: List[String]) -> Command
+pure func command(program: Path, arguments: List[String]) -> Command
 -- { program, arguments, directory = None, environment = {}, stdin = None, timeout_ms = None }
 
 func capture(invocation: Command) -> Result[Captured, CaptureError]    -- every Exit is Ok
@@ -120,18 +122,18 @@ union CommitError:
 -- Run, require success, use stdout.
 func current_commit(repository: Path) -> Result[String, CommitError]:
     git ?= find_program("git").map_err(pure func(error: FindProgramError): GitMissing(error))
-    output({ command("${git}", ["rev-parse", "HEAD"]) | directory = Some(repository) })
+    output({ command(git, ["rev-parse", "HEAD"]) | directory = Some(repository) })
         .map_err(pure func(error: OutputError): GitFailed(error))
 
 -- A sequence that stops at the first failure, sharing one base command.
-func rebuild(make: String, project: Path) -> Result[Void, OutputError]:
+func rebuild(make: Path, project: Path) -> Result[Void, OutputError]:
     base = { command(make, []) | directory = Some(project) }
     _ ?= output({ base | arguments = ["clean"] })
     _ ?= output({ base | arguments = ["all"] })
     Ok(void)
 
 -- Input text and a timeout.
-func sorted(sort: String, text: String) -> Result[String, OutputError]:
+func sorted(sort: Path, text: String) -> Result[String, OutputError]:
     output({ command(sort, []) | stdin = Some(text), timeout_ms = Some(5000) })
 
 -- Every outcome is a value.
@@ -148,13 +150,15 @@ func report(result: Result[Captured, CaptureError]) -> Void:
 
 `Exited(0)` uses the Int literal patterns that landed in `c3b304e60`.
 
-The e2e harness after migration needs no `/usr/bin/env` and no capture files:
+The e2e harness needs no `/usr/bin/env` and no capture files. Each child is
+a command like this one (the harness's own `isolated` first turns the text
+path its suites build into a `Path`):
 
 ```blorp
-private func isolated(binary: String, arguments: List[String]) -> Result[Captured, CaptureError]:
-    capture({ command(binary, arguments) |
+pure func isolated(binary: Path, arguments: List[String], timeout_ms: Int) -> Command:
+    { command(binary, arguments) |
         environment = { "BLORP_LEAK_CHECK" => None, "BLORP_MEMORY_STATS" => None },
-        timeout_ms = Some(CHILD_TIMEOUT_MS) })
+        timeout_ms = Some(timeout_ms) }
 ```
 
 ## Behaviour
@@ -178,8 +182,9 @@ private func isolated(binary: String, arguments: List[String]) -> Result[Capture
   system would reap the child itself and the wait would report ECHILD.
 - A timeout of 0 or less is `Ok` with `TimedOut` and empty output as soon as
   the command is validated, without starting the program.
-- A `directory` is a `Path`, which cannot hold NUL, so `DirectoryFailed`
-  has no NUL case.
+- The program and a `directory` are `Path`s, which cannot hold NUL, so
+  `ContainsNul` is about the arguments and the environment, and
+  `DirectoryFailed` has no NUL case. The native still checks every input.
 - `find_program` skips empty and relative PATH entries (Go's `ErrDot`) and
   entries that are not UTF-8, and accepts a regular file the process may
   execute (`faccessat(X_OK, AT_EACCESS)`). A name that is empty or contains
@@ -278,7 +283,10 @@ will make it import `process`, and that needs a rotation first.
      lines.
    - `process.brp`, growing from 13 lines to about 230, and its suites.
    - The old `run_to_files` stays for now.
-3. **L2, the migration.**
+3. **L2, the migration** (landed 2026-11-11; costs and call sites in
+   `benchmarks/results/blorp_process_l2_2026-11-11.md`).
+   - `Command.program` becomes a `Path` (Keith, 2026-11-11), which
+     `PATH_PLAN.md`'s P8 left to this landing.
    - Move the call sites over, removing the `env` and `sh -c` wrappers and
      the read-backs.
    - Delete `run_to_files`, with its native, C and label.

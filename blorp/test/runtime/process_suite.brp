@@ -1,7 +1,6 @@
 import:
     bool: and
     dict: Dict
-    int: Int methods
     io/process:
         Captured,
         Command,
@@ -25,7 +24,6 @@ import:
         decode_system_call_error,
         find_program,
         output,
-        run_to_files,
     list: List methods
     option: Option methods
     path: Path, PathError, to_path
@@ -45,10 +43,10 @@ import:
         PROCESS_FIND_PROGRAM_RUNTIME,
         PROCESS_FAULT_RUNTIME,
         process_capture_runtime,
-        process_runtime,
     ../../src/common/codegen/runtime/string: string_runtime
     ../../src/common/codegen/specialize/specialize: TypeRef(StringType)
     ../e2e/file_access: make_directories, path_of, read_file, write_file
+    ../e2e/self_hosted_harness: run_expecting, strict_leak_check, without_diagnostics
     ../e2e/self_hosted_reports: verify_accounting
 
 
@@ -58,50 +56,7 @@ private CHILD_TIMEOUT_MS: Int = 10000
 private TIMEOUT_PROBE_MS: Int = 1000
 
 
-private func invocation(
-    program: String,
-    arguments: List[String],
-    prefix: String,
-    timeout: Int,
-) -> Result[Int, String]:
-    run_to_files(program, arguments, prefix + ".out", prefix + ".err", timeout)
-
-
-private func isolated(
-    child: String,
-    arguments: List[String],
-    prefix: String,
-) -> Result[Int, String]:
-    invocation(
-        ENVIRONMENT_TOOL,
-        ["-u", "BLORP_LEAK_CHECK", "-u", "BLORP_MEMORY_STATS", child].concat(arguments),
-        prefix,
-        CHILD_TIMEOUT_MS,
-    )
-
-
-private func expect_status(actual: Int, expected: Int) -> Result[Void, String]:
-    match actual.equals(expected):
-        True:
-            Ok(void)
-        False:
-            Err(
-                (
-                    ("process unit exit: expected " + expected.to_string() + ", got ")
-                    + actual.to_string()
-                ),
-            )
-
-
-private func empty_output(prefix: String) -> Result[Void, String]:
-    out: String ?= read_file(prefix + ".out")
-    err: String ?= read_file(prefix + ".err")
-    match and(out.equals(""), err.equals("")):
-        True: Ok(void)
-        False: Err("process unit expected empty output: " + prefix)
-
-
-private func child_ready(c_compiler: String, directory: String) -> Result[String, String]:
+private func child_ready(c_compiler: String, directory: String) -> Result[Path, String]:
     key = list_element_key(StringType)
     fragments = (
         PROCESS_POSIX_PRELUDE
@@ -117,7 +72,6 @@ private func child_ready(c_compiler: String, directory: String) -> Result[String
         )
         + FS_HELPERS_RUNTIME
         + PROCESS_HELPERS_RUNTIME
-        + process_runtime(list_c_type(key))
         + process_capture_runtime(list_c_type(key))
         + PROCESS_FIND_PROGRAM_RUNTIME
         + PROCESS_FAULT_RUNTIME
@@ -125,30 +79,30 @@ private func child_ready(c_compiler: String, directory: String) -> Result[String
     written: Void ?= write_file(directory + "/process_runtime.c", fragments)
     source: String ?= read_file("blorp/test/runtime/fixtures/process_child.c")
     copied: Void ?= write_file(directory + "/process_child.c", source)
-    executable = directory + "/process_child"
-    prefix = directory + "/runtime-build"
-    status: Int ?= isolated(
-        c_compiler,
-        [
-            "-std=c11",
-            "-Wall",
-            "-Wextra",
-            "-Werror",
-            "-pedantic",
-            "-O0",
-            "-fsanitize=address,undefined",
-            "-fno-sanitize-recover=all",
-            "-DBLORP_MEMORY_DIAGNOSTICS=1",
-            directory + "/process_child.c",
-            "-o",
-            executable,
-            "-lm",
-            "-lpthread",
-        ],
-        prefix,
+    executable ?= path_of(directory + "/process_child")
+    compiler ?= path_of(c_compiler)
+    build = child_command(compiler, [
+        "-std=c11",
+        "-Wall",
+        "-Wextra",
+        "-Werror",
+        "-pedantic",
+        "-O0",
+        "-fsanitize=address,undefined",
+        "-fno-sanitize-recover=all",
+        "-DBLORP_MEMORY_DIAGNOSTICS=1",
+        directory + "/process_child.c",
+        "-o",
+        "${executable}",
+        "-lm",
+        "-lpthread",
+    ])
+    built ?= run_expecting(
+        "process probe build",
+        { build | timeout_ms = Some(COMPILE_TIMEOUT_MS) },
+        0,
     )
-    linked: Void ?= expect_status(status, 0)
-    quiet: Void ?= empty_output(prefix)
+    _ ?= expect_text(built.stdout + built.stderr, "")
     Ok(executable)
 
 
@@ -161,218 +115,13 @@ private func reported(result: Result[Void, String]) -> Bool:
             False
 
 
-private func exit_case(child: String, directory: String, status: Int) -> Result[Void, String]:
-    prefix = (directory + "/exit-").append_int(status)
-    actual: Int ?= isolated(child, ["exit", status.to_string()], prefix)
-    matched: Void ?= expect_status(actual, status)
-    empty_output(prefix)
-
-
-private func literal_case(child: String, directory: String) -> Result[Void, String]:
-    prefix = directory + "/literal-argv"
-    status: Int ?= isolated(child, ["argv", "", "two words", "literal*$;'", "café"], prefix)
-    matched: Void ?= expect_status(status, 0)
-    empty_output(prefix)
-
-
-private func stream_case(child: String, directory: String) -> Result[Void, String]:
-    prefix = directory + "/streams"
-    status: Int ?= isolated(child, ["streams"], prefix)
-    matched: Void ?= expect_status(status, 0)
-    out: String ?= read_file(prefix + ".out")
-    err: String ?= read_file(prefix + ".err")
-    match and(out.equals("stdout text\n"), err.equals("stderr text\n")):
-        True: Ok(void)
-        False: Err("stdout/stderr captures were not distinct")
-
-
-private func input_case(child: String, directory: String) -> Result[Void, String]:
-    prefix = directory + "/input-eof"
-    status: Int ?= isolated(child, ["stdin"], prefix)
-    matched: Void ?= expect_status(status, 0)
-    empty_output(prefix)
-
-
-private func error_is(actual: Result[Int, String], expected: String) -> Result[Void, String]:
-    match actual:
-        Ok(code):
-            Err("expected process failure, got exit " + code.to_string())
-        Err(error):
-            match error.equals(expected):
-                True: Ok(void)
-                False: Err("wrong process error: " + error)
-
-
--- Native errno values are platform-owned; pin the operation that failed.
-private func capture_error(
-    actual: Result[Int, String],
-    expected_prefix: String,
-) -> Result[Void, String]:
-    match actual:
-        Ok(code):
-            Err("expected capture failure, got exit " + code.to_string())
-        Err(error):
-            match error.starts_with(expected_prefix):
-                True: Ok(void)
-                False: Err("wrong capture error: " + error)
-
-
-private func signal_case(child: String, directory: String) -> Result[Void, String]:
-    error_is(
-        isolated(child, ["signal"], directory + "/signal"),
-        "process.run_to_files: child terminated by signal",
-    )
-
-
-private func timeout_case(child: String, directory: String) -> Result[Void, String]:
-    ready_path = directory + "/timeout.ready"
-    timed: Void ?= error_is(
-        invocation(child, ["wait", ready_path], directory + "/timeout", TIMEOUT_PROBE_MS),
-        "process.run_to_files: timed out",
-    )
-    ready: String ?= read_file(ready_path)
-    match ready.equals("ready\n"):
-        True: Ok(void)
-        False: Err("timeout child never acknowledged readiness")
-
-
-private func validation_case(child: String, directory: String, kind: Int) -> Result[Void, String]:
-    prefix = (directory + "/validation-").append_int(kind)
-    out = prefix + ".out"
-    err = prefix + ".err"
-    actual: Result[Int, String] = match kind.equals(0):
-        True:
-            run_to_files(child, ["exit", "0"], out, err, 0)
-        False:
-            match kind.equals(1):
-                True:
-                    run_to_files(child, ["bad\0argument"], out, err, CHILD_TIMEOUT_MS)
-                False:
-                    match kind.equals(2):
-                        True: run_to_files(child, [], out, "", CHILD_TIMEOUT_MS)
-                        False: run_to_files(child, [], out, "bad\0path", CHILD_TIMEOUT_MS)
-    expected = match kind.equals(0):
-        True:
-            "process.run_to_files: timeout must be positive"
-        False:
-            match kind.equals(1):
-                True:
-                    "process.run_to_files: argument contains embedded NUL"
-                False:
-                    match kind.equals(2):
-                        True: "process.run_to_files: capture path is empty"
-                        False: "process.run_to_files: path contains embedded NUL"
-    rejected: Void ?= error_is(actual, expected)
-    -- The same paths must remain available after validation failure.
-    status: Int ?= run_to_files(child, ["exit", "0"], out, err, CHILD_TIMEOUT_MS)
-    expect_status(status, 0)
-
-
-private func existing_case(child: String, directory: String, second: Bool) -> Result[Void, String]:
-    prefix = match second:
-        True: directory + "/second-existing"
-        False: directory + "/first-existing"
-    path = match second:
-        True: prefix + ".err"
-        False: prefix + ".out"
-    written: Void ?= write_file(path, "preserve capture")
-    expected = match second:
-        True: "process.run_to_files: create stderr capture; errno="
-        False: "process.run_to_files: create stdout capture; errno="
-    failed: Void ?= capture_error(
-        invocation(child, ["exit", "0"], prefix, CHILD_TIMEOUT_MS),
-        expected,
-    )
-    unchanged: String ?= read_file(path)
-    match unchanged.equals("preserve capture"):
-        True: Ok(void)
-        False: Err("existing capture was overwritten")
-
-
-private func duplicate_case(child: String, directory: String) -> Result[Void, String]:
-    path = directory + "/duplicate.capture"
-    capture_error(
-        run_to_files(child, ["exit", "0"], path, path, CHILD_TIMEOUT_MS),
-        "process.run_to_files: create stderr capture; errno=",
-    )
-
-
-private func alias_case(child: String, directory: String) -> Result[Void, String]:
-    out = directory + "/alias.capture"
-    err = directory + "/./alias.capture"
-    capture_error(
-        run_to_files(child, ["exit", "0"], out, err, CHILD_TIMEOUT_MS),
-        "process.run_to_files: create stderr capture; errno=",
-    )
-
-
-private func exec_case(child: String, directory: String, invalid: Bool) -> Result[Void, String]:
-    path = match invalid:
-        True: directory + "/invalid-executable"
-        False: directory + "/missing-executable"
-    prepared: Void ?= match invalid:
-        False:
-            Ok(void)
-        True:
-            match isolated(child, ["invalid-executable", path], directory + "/prepare-invalid"):
-                Ok(code): expect_status(code, 0)
-                Err(error): Err(error)
-    prefix = match invalid:
-        True: directory + "/invalid-exec"
-        False: directory + "/missing-exec"
-    match invocation(path, [], prefix, CHILD_TIMEOUT_MS):
-        Ok(code):
-            Err("failed exec became ordinary exit " + code.to_string())
-        Err(error):
-            match error.starts_with("process.run_to_files: exec or child setup; errno="):
-                True: Ok(void)
-                False: Err("wrong exec error: " + error)
-
-
-private func unsafe_capture_case(
-    child: String,
-    directory: String,
-    fifo: Bool,
-) -> Result[Void, String]:
-    prefix = match fifo:
-        True: directory + "/fifo"
-        False: directory + "/symlink"
-    destination = prefix + ".capture"
-    preparation: List[String] = match fifo:
-        True: ["fifo", destination]
-        False: ["symlink", directory + "/symlink-target", destination]
-    created: Int ?= isolated(child, preparation, prefix + "-prepare")
-    ready: Void ?= expect_status(created, 0)
-    capture_error(
-        run_to_files(child, [], destination, prefix + ".err", CHILD_TIMEOUT_MS),
-        "process.run_to_files: create stdout capture; errno=",
-    )
-
-
-private func native_probe(child: String, directory: String, mode: String) -> Result[Void, String]:
-    prefix = directory + "/" + mode
-    actual: Int ?= invocation(
-        ENVIRONMENT_TOOL,
-        [
-            "-u",
-            "BLORP_MEMORY_STATS",
-            "BLORP_LEAK_CHECK=strict",
-            child,
-            mode,
-            child,
-            prefix + "-inner.out",
-            prefix + "-inner.err",
-        ],
-        prefix,
-        CHILD_TIMEOUT_MS,
-    )
-    matched: Void ?= expect_status(actual, 0)
-    out: String ?= read_file(prefix + ".out")
-    quiet: Void ?= match out.equals(""):
-        True: Ok(void)
-        False: Err("runtime probe wrote stdout")
-    report: String ?= read_file(prefix + ".err")
-    verify_accounting(report, True)
+-- The probe runs as the program's own path, given `mode`, its own path again,
+-- which the probe launches, and a path it may create.
+private func native_probe(child: Path, directory: String, mode: String) -> Result[Void, String]:
+    probe = child_command(child, [mode, "${child}", directory + "/" + mode])
+    ran ?= run_expecting(mode, { probe | environment = strict_leak_check() }, 0)
+    _ ?= expect_text(ran.stdout, "")
+    verify_accounting(ran.stderr, True)
 
 
 -- The capture tests render every outcome as text, independently of the
@@ -426,15 +175,11 @@ private pure func expect_text(actual: String, expected: String) -> Result[Void, 
         Err("process capture: expected [${expected}], got [${actual}]")
 
 
--- The fixture child reports leaks when these are set, so every child runs
--- without them, which also exercises removal.
-private pure func quiet_environment() -> Dict[String, Option[String]]:
-    { "BLORP_LEAK_CHECK" => None, "BLORP_MEMORY_STATS" => None }
-
-
-private pure func child_command(child: String, arguments: List[String]) -> Command:
+-- The fixture child reports leaks and statistics when the diagnostics variables
+-- are set, so every child runs without them, which also exercises removal.
+private pure func child_command(child: Path, arguments: List[String]) -> Command:
     { command(child, arguments) |
-        environment = quiet_environment(),
+        environment = without_diagnostics(),
         timeout_ms = Some(CHILD_TIMEOUT_MS),
     }
 
@@ -445,7 +190,7 @@ private func captured_as(run: Command, expected: String) -> Result[Void, String]
         .expect_text(expected)
 
 
-private func exits_case(child: String) -> Result[Void, String]:
+private func exits_case(child: Path) -> Result[Void, String]:
     _ ?= child_command(child, ["streams"]).captured_as("Exited(0) [stdout text\n] [stderr text\n]")
     _ ?= child_command(child, ["exit", "23"]).captured_as("Exited(23) [] []")
     _ ?= child_command(child, ["exit", "127"]).captured_as("Exited(127) [] []")
@@ -454,12 +199,12 @@ private func exits_case(child: String) -> Result[Void, String]:
     )
 
 
-private func signaled_case(child: String) -> Result[Void, String]:
+private func signaled_case(child: Path) -> Result[Void, String]:
     _ ?= child_command(child, ["signal"]).captured_as("Signaled(15) [] []")
     child_command(child, ["partial-signal"]).captured_as("Signaled(15) [ok] []")
 
 
-private func timed_out_case(child: String, directory: String) -> Result[Void, String]:
+private func timed_out_case(child: Path, directory: String) -> Result[Void, String]:
     ready_path = directory + "/capture-timeout.ready"
     timed = { child_command(child, ["partial", ready_path]) | timeout_ms = Some(TIMEOUT_PROBE_MS) }
     _ ?= timed.captured_as("TimedOut [ok] [er]")
@@ -469,14 +214,14 @@ private func timed_out_case(child: String, directory: String) -> Result[Void, St
 
 -- The call returns when the child exits, and the group kill ends the
 -- grandchild that still holds both pipes.
-private func grandchild_case(child: String, directory: String) -> Result[Void, String]:
+private func grandchild_case(child: Path, directory: String) -> Result[Void, String]:
     pid_path = directory + "/capture-grandchild.pid"
     _ ?= child_command(child, ["grandchild", pid_path]).captured_as("Exited(0) [parent done\n] []")
     pid: String ?= read_file(pid_path)
     child_command(child, ["gone", pid]).captured_as("Exited(0) [] []")
 
 
-private func utf8_case(child: String) -> Result[Void, String]:
+private func utf8_case(child: Path) -> Result[Void, String]:
     _ ?= child_command(child, ["cut-off-exit", "4"]).captured_as("StdoutNotUtf8(Exited(4))")
     child_command(child, ["invalid-stderr", "0"]).captured_as("StderrNotUtf8(Exited(0))")
 
@@ -490,7 +235,7 @@ private pure func large_text() -> String:
     text
 
 
-private func stdin_case(child: String) -> Result[Void, String]:
+private func stdin_case(child: Path) -> Result[Void, String]:
     text = large_text()
     echoed = capture({ child_command(child, ["echo-stdin"]) | stdin = Some(text) })
     _ ?= match echoed:
@@ -505,7 +250,7 @@ private func stdin_case(child: String) -> Result[Void, String]:
     { child_command(child, ["stdin"]) | stdin = Some("") }.captured_as("Exited(0) [] []")
 
 
-private func unread_stdin_case(child: String) -> Result[Void, String]:
+private func unread_stdin_case(child: Path) -> Result[Void, String]:
     text = large_text() + large_text() + large_text() + large_text()
     _ ?= { child_command(child, ["close-stdin"]) | stdin = Some(text) }.captured_as(
         "Exited(0) [] []",
@@ -545,11 +290,12 @@ private pure func entries_named(listing: String, prefix: String) -> String:
 -- /usr/bin/env lists the environment it received. The fixture child cannot be
 -- used here: AddressSanitizer warns on stderr when PATH is unset.
 private func environment_case() -> Result[Void, String]:
-    changed = quiet_environment()
+    changed = without_diagnostics()
         .set("BLORP_PROCESS_SET", Some("one=two"))
         .set("PATH", None)
         .set("HOME", Some("/replaced"))
-    listed: Captured ?= capture({ command(ENVIRONMENT_TOOL, []) | environment = changed }).map_err(
+    env ?= path_of(ENVIRONMENT_TOOL)
+    listed: Captured ?= capture({ command(env, []) | environment = changed }).map_err(
         capture_error_text,
     )
     _ ?= expect_text(
@@ -562,7 +308,7 @@ private func environment_case() -> Result[Void, String]:
         ].join(" | "),
         "Exited(0) | BLORP_PROCESS_SET=one=two |  | HOME=/replaced | ",
     )
-    inherited: Captured ?= capture(command(ENVIRONMENT_TOOL, [])).map_err(capture_error_text)
+    inherited: Captured ?= capture(command(env, [])).map_err(capture_error_text)
     if (
         inherited.stdout
             .entries_named("PATH=/")
@@ -575,16 +321,16 @@ private func environment_case() -> Result[Void, String]:
 
 
 -- The program does not exist, so an error other than the expected one, such
--- as LaunchFailed, would show that a system call came first.
+-- as LaunchFailed, would show that a system call came first. A Path holds no
+-- NUL, so only an argument or the environment can.
 private func rejection_case(directory: String) -> Result[Void, String]:
-    missing = directory + "/no-such-program"
+    missing ?= path_of(directory + "/no-such-program")
     _ ?= { command(missing, []) | environment = { "" => Some("x") } }.captured_as(
         "InvalidVariableName()",
     )
     _ ?= { command(missing, []) | environment = { "A=B" => None } }.captured_as(
         "InvalidVariableName(A=B)",
     )
-    _ ?= command(missing + "\0", []).captured_as("ContainsNul")
     _ ?= command(missing, ["a\0b"]).captured_as("ContainsNul")
     _ ?= { command(missing, []) | environment = { "NAME" => Some("a\0b") } }.captured_as(
         "ContainsNul",
@@ -592,7 +338,7 @@ private func rejection_case(directory: String) -> Result[Void, String]:
     { command(missing, []) | environment = { "NA\0ME" => None } }.captured_as("ContainsNul")
 
 
-private func directory_case(child: String, directory: String) -> Result[Void, String]:
+private func directory_case(child: Path, directory: String) -> Result[Void, String]:
     place = directory + "/capture-place"
     _ ?= make_directories(place)
     _ ?= write_file(place + "/marker.txt", "marked\n")
@@ -610,19 +356,21 @@ private func directory_case(child: String, directory: String) -> Result[Void, St
     )
 
 
-private func launch_case(child: String, directory: String) -> Result[Void, String]:
-    missing = directory + "/capture-missing-program"
+private func launch_case(child: Path, directory: String) -> Result[Void, String]:
+    missing ?= path_of(directory + "/capture-missing-program")
     _ ?= command(missing, []).captured_as("LaunchFailed(NotFound)")
     plain = directory + "/capture-plain-file"
     _ ?= write_file(plain, "not a program\n")
-    _ ?= command(plain, []).captured_as("LaunchFailed(PermissionDenied)")
+    plain_file ?= path_of(plain)
+    _ ?= command(plain_file, []).captured_as("LaunchFailed(PermissionDenied)")
     script = directory + "/capture-invalid-executable"
     _ ?= child_command(child, ["invalid-executable", script]).captured_as("Exited(0) [] []")
-    command(script, []).captured_as("NotExecutable")
+    script_file ?= path_of(script)
+    command(script_file, []).captured_as("NotExecutable")
 
 
 private func zero_timeout_case(directory: String) -> Result[Void, String]:
-    missing = directory + "/never-started"
+    missing ?= path_of(directory + "/never-started")
     _ ?= { command(missing, []) | timeout_ms = Some(0) }.captured_as("TimedOut [] []")
     { command(missing, []) | timeout_ms = Some(-5) }.captured_as("TimedOut [] []")
 
@@ -636,20 +384,19 @@ private pure func expect_output_error(
         Err(error): expect_text(error.output_error_text(), expected)
 
 
-private func output_case(child: String, directory: String) -> Result[Void, String]:
+private func output_case(child: Path, directory: String) -> Result[Void, String]:
     _ ?= match output(child_command(child, ["streams"])):
         Ok(text): expect_text(text, "stdout text\n")
         Err(error): Err(error.output_error_text())
-    _ ?= output(command(directory + "/output-missing-program", [])).expect_output_error(
-        "CaptureFailed(LaunchFailed(NotFound))",
-    )
+    missing ?= path_of(directory + "/output-missing-program")
+    _ ?= output(command(missing, [])).expect_output_error("CaptureFailed(LaunchFailed(NotFound))")
     output(child_command(child, ["fail-streams"])).expect_output_error(
         "Unsuccessful(Exited(7) [out\n] [err\n])",
     )
 
 
 -- SIGABRT is 6 on macOS and Linux.
-private func defect_case(child: String) -> Result[Void, String]:
+private func defect_case(child: Path) -> Result[Void, String]:
     _ ?= child_command(child, ["bad-error-code"]).captured_as(
         "Signaled(6) [] [blorp: process runtime defect: an error code outside the tags the library decodes\n]",
     )
@@ -686,19 +433,17 @@ private func find_program_case() -> Result[Void, String]:
     _ ?= find_program("s\0h")
         .found_text()
         .expect_text("NameContainsNul")
-    match find_program("sh"):
-        Ok(found):
-            text = "${found}"
-            if (
-                text
-                    .starts_with("/")
-                    .and(text.ends_with_sh())
-            ):
-                Ok(void)
-            else:
-                Err("find_program(sh) gave " + text)
-        Err(error):
-            Err("${error}")
+    found ?= find_program("sh").map_err(pure func(error: FindProgramError) -> String: "${error}")
+    _: Void ?= if (
+        "${found}"
+            .starts_with("/")
+            .and("${found}".ends_with_sh())
+    ):
+        Ok(void)
+    else:
+        Err("find_program(sh) gave ${found}")
+    -- A found program goes straight to command.
+    command(found, ["-c", "printf found"]).captured_as("Exited(0) [found] []")
 
 
 private pure func ends_with_sh(path: String) -> Bool:
@@ -812,7 +557,7 @@ private pure func test_to_string_words_every_capture_error() -> Bool:
             InvalidVariableName("A=B"),
             "invalid environment variable name \"A=B\"; a name is nonempty and has no =",
         ),
-        (ContainsNul, "the program, an argument or the environment contains a NUL byte"),
+        (ContainsNul, "an argument or the environment contains a NUL byte"),
         (LaunchFailed(PermissionDenied), "permission denied"),
         (LaunchFailed(OtherOs(7)), "operating system error 7"),
         (NotExecutable, "not a program the system can run; a script needs a #! line"),
@@ -858,7 +603,7 @@ private pure func test_succeeded_is_exited_zero() -> Bool:
     )
 
 
-private func capture_tests(child: String, directory: String) -> List[(String, () -> Bool)]:
+private func capture_tests(child: Path, directory: String) -> List[(String, () -> Bool)]:
     [
         (
             "capture: Exited carries 0, 23 and 127, with stdout and stderr kept apart and arguments literal",
@@ -913,7 +658,7 @@ private func capture_tests(child: String, directory: String) -> List[(String, ()
             func(): reported(output_case(child, directory)),
         ),
         (
-            "find_program: finds sh; a missing name, a name with a / or an empty one is NotOnPath, NUL ContainsNul",
+            "find_program: finds sh, which runs as found; a missing name, a name with a / or an empty one is NotOnPath, NUL ContainsNul",
             func(): reported(find_program_case()),
         ),
         (
@@ -944,8 +689,20 @@ private func capture_tests(child: String, directory: String) -> List[(String, ()
             func(): reported(native_probe(child, directory, "capture-sigchld")),
         ),
         (
-            "capture reaps its child after an exit and a timeout, and a zero timeout never forks",
+            "capture reaps its child after a timeout, an exit and a signal, and a zero timeout never forks",
             func(): reported(native_probe(child, directory, "capture-reap")),
+        ),
+        (
+            "capture times out a child stalled before exec, and reaps it",
+            func(): reported(native_probe(child, directory, "capture-startup")),
+        ),
+        (
+            "capture moves its descriptors above closed stdin, stdout and stderr",
+            func(): reported(native_probe(child, directory, "capture-closed-stdio")),
+        ),
+        (
+            "capture: a lost group race still leaves the child leading its group",
+            func(): reported(native_probe(child, directory, "capture-group-race")),
         ),
         (
             "capture returns once its child has exited although a stray process holds the exec report open",
@@ -967,101 +724,4 @@ func suite(c_compiler: String, directory: String) -> TestSuite:
                 tests = [("native probe build", func(): False)],
             }
         Ok(child):
-            {
-                description = "Process runtime lifecycle",
-                tests = [
-                    ("ordinary exit zero", func(): reported(exit_case(child, directory, 0))),
-                    ("ordinary exit 23", func(): reported(exit_case(child, directory, 23))),
-                    (
-                        "ordinary exit 127 differs from exec failure",
-                        func(): reported(exit_case(child, directory, 127)),
-                    ),
-                    (
-                        "literal empty spaced metacharacter Unicode argv",
-                        func(): reported(literal_case(child, directory)),
-                    ),
-                    (
-                        "stdout and stderr stay distinct",
-                        func(): reported(stream_case(child, directory)),
-                    ),
-                    ("stdin is EOF", func(): reported(input_case(child, directory))),
-                    ("signal is an error", func(): reported(signal_case(child, directory))),
-                    (
-                        "ready child times out and is cleaned",
-                        func(): reported(timeout_case(child, directory)),
-                    ),
-                    (
-                        "zero timeout rejects before files",
-                        func(): reported(validation_case(child, directory, 0)),
-                    ),
-                    (
-                        "NUL argument rejects before files",
-                        func(): reported(validation_case(child, directory, 1)),
-                    ),
-                    (
-                        "empty stderr path rejects before files",
-                        func(): reported(validation_case(child, directory, 2)),
-                    ),
-                    (
-                        "NUL path rejects before files",
-                        func(): reported(validation_case(child, directory, 3)),
-                    ),
-                    (
-                        "existing stdout preserved",
-                        func(): reported(existing_case(child, directory, False)),
-                    ),
-                    (
-                        "second capture creation failure preserves existing stderr",
-                        func(): reported(existing_case(child, directory, True)),
-                    ),
-                    ("duplicate capture fails", func(): reported(duplicate_case(child, directory))),
-                    (
-                        "distinct spellings of one capture fail",
-                        func(): reported(alias_case(child, directory)),
-                    ),
-                    (
-                        "missing executable is an error",
-                        func(): reported(exec_case(child, directory, False)),
-                    ),
-                    (
-                        "invalid executable is an error",
-                        func(): reported(exec_case(child, directory, True)),
-                    ),
-                    (
-                        "FIFO capture rejected without blocking",
-                        func(): reported(unsafe_capture_case(child, directory, True)),
-                    ),
-                    (
-                        "symlink capture rejected",
-                        func(): reported(unsafe_capture_case(child, directory, False)),
-                    ),
-                    (
-                        "closed stdio descriptors stay private and balanced",
-                        func(): reported(native_probe(child, directory, "closedstdio")),
-                    ),
-                    (
-                        "ordinary exit reaps the direct child",
-                        func(): reported(native_probe(child, directory, "reap-exit")),
-                    ),
-                    (
-                        "signal reaps the direct child",
-                        func(): reported(native_probe(child, directory, "reap-signal")),
-                    ),
-                    (
-                        "exec handshake timeout reaps the acknowledged child",
-                        func(): reported(native_probe(child, directory, "reap-startup")),
-                    ),
-                    (
-                        "timeout reaps the direct child",
-                        func(): reported(native_probe(child, directory, "reap-timeout")),
-                    ),
-                    (
-                        "a lost group race still leaves the child leading its group",
-                        func(): reported(native_probe(child, directory, "group-race")),
-                    ),
-                    (
-                        "unsupported SIGCHLD fails before files",
-                        func(): reported(native_probe(child, directory, "sigchld")),
-                    ),
-                ].concat(capture_tests(child, directory)),
-            }
+            { description = "Process runtime", tests = capture_tests(child, directory) }
