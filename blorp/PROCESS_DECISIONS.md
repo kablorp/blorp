@@ -1,8 +1,8 @@
 # Process API
 
 `describe` below is history: the error unions implement `Stringable` instead
-(MODULES_AND_STRINGABLE_PLAN.md, landing 3). The module is now `io/process`
-(landing 4). PATH_PLAN.md landing 6 replaced `ProcessError` and
+(the `Stringable` landing). The module is now `io/process`. The `Path`
+landing replaced `ProcessError` and
 `ProcessErrorKind` with one exact union per operation, none holding the
 program or the directory, and made `Command.directory` an `Option[Path]` and
 `find_program` return a `Path`; the types below are as they are now.
@@ -286,8 +286,8 @@ will make it import `process`, and that needs a rotation first.
 3. **L2, the migration** (landed 2026-11-11; self-compile
    allocations −0.030% and retired instructions −0.073%, identical C for the
    fixed input).
-   - `Command.program` becomes a `Path` (Keith, 2026-11-11), which
-     `PATH_PLAN.md`'s P8 left to this landing.
+   - `Command.program` becomes a `Path` (Keith, 2026-11-11), a change
+     the `Path` landing left to this one.
    - Move the call sites over, removing the `env` and `sh -c` wrappers and
      the read-backs.
    - Delete `run_to_files`, with its native, C and label.

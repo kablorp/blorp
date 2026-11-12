@@ -91,8 +91,8 @@ until a seed knows it. Every landing below is shaped by that.
 **Related plans.**
 - `UINT8_BYTES_PLAN.md`: `Bytes` is a copied `List[UInt8]`, and its L4 changes
   `byte_at` to `Option[UInt8]`.
-- `PATH_PLAN.md`: landing 1 enforces naming case, and landing 5 is a seed
-  rotation.
+- The `Path` plan has landed: naming case is enforced, and its seed rotation
+  is done.
 - The language-server plan needs a UTF-8 byte length for `Content-Length`. It
   computes UTF-16 positions itself.
 

@@ -97,7 +97,42 @@ file unchanged; move the comment above the line. `make -C blorp test` runs that
 check first, and `git config
 blame.ignoreRevsFile .git-blame-ignore-revs` hides the commit that applied the
 formatter from `git blame`.
-[FORMATTER_PLAN.md](FORMATTER_PLAN.md) records the layout rules.
+
+The layout rules:
+
+- Four-space indentation, lines wrapped at 100 columns. LF line endings and
+  one final newline. A trailing comment is never moved, even past the width.
+- Imports are sorted: library modules, then relative paths, each
+  alphabetical. The names inside one selection keep their written order. A
+  comment on an import's line, or directly above it, moves with it.
+- A list of parameters, arguments, fields, elements or selections is on one
+  line or has one item per line with a trailing comma. A final list literal,
+  record literal or block lambda hugs the line when everything before it fits.
+- A chain of two or more method calls always breaks, one call per line, one
+  level deeper than its head. In a block header (`if`, `while`, `for`,
+  `match`) the formatter wraps such a chain in parentheses. A chain of one
+  call breaks only by the width rule, and interpolation holes never break.
+  Field reads and a leading direct call belong to the head and do not count
+  toward the two calls; `and`, `or` and `not` are ordinary calls.
+- Parentheses are removed only where they wrap a whole value (a binding
+  value, argument, element, condition, body's final value, record field or
+  Dict entry value, or `?=` value) and added there only to break an operator
+  chain. Every other pair stays as written.
+- If any arm of a `match` is a block, every arm of that `match` is. An arm is
+  a block when its body has more than one statement, its value does not fit on
+  the pattern's line, or it holds an own-line comment.
+- A `record` declaration always has one field per line.
+- An own-line comment goes to the deepest open block whose source level does
+  not exceed its own, so it keeps the nesting its author gave it.
+- Two blank lines separate top-level declarations, except that a run of
+  one-line constants keeps the one or no blank line it was written with.
+  Inside a body at most one blank line stays.
+- An `else:` block holding only an `if` is not rewritten to `else if`: the
+  two are different trees and compile to different C.
+- The formatter lexes and parses with the compiler's front end and prints the
+  tree, so it never recognizes syntax on its own. The parse tree keeps
+  parentheses and declaration starts for it, and comments and blank lines
+  come from the source between nodes.
 
 ## The language
 

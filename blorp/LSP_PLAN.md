@@ -52,7 +52,7 @@ process `capture`, which can feed standard input.
 - **The console cannot read**, and `print` always adds a newline.
 
 **Related plans:** `STRING_PLAN.md` moves byte work to `byte_*` functions,
-and `PATH_PLAN.md`'s naming and exact-error rules apply here.
+and the README's naming rules and the library's exact-error convention apply here.
 
 ## Proposed solution
 
@@ -435,7 +435,7 @@ func read_exact(byte_count: Int) -> Result[Option[Bytes], ReadExactError]
 
 
 -- Why standard input could not be read: one exact union per operation, as
--- `PATH_PLAN.md` requires. Both implement Stringable.
+-- the library's exact-error convention requires. Both implement Stringable.
 fixed union ReadLineError:
     -- EISDIR: standard input is a directory.
     IsADirectory
@@ -564,7 +564,7 @@ backs it out; for landing 7, re-pinning the previous seed does.
 4. **Fixed identities:** the seven types become `fixed`.
 5. **Name uses**, always recorded.
 6. **Console labels:** builtin labels, runtime and emission, no library.
-7. **Seed rotation**, a plain one (`PATH_PLAN.md`'s landed as `c0512c385`).
+7. **Seed rotation**, a plain one (the `Path` landing's was `c0512c385`).
 8. **The `io/console` functions.**
 9. **`blorp lsp`:** the `src/lsp/` modules, the transport, and the README's
    v1 limitation.

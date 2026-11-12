@@ -133,7 +133,7 @@ blorp test [--cc PATH] [--library-root DIR] SUITE.brp [SUITE.brp ...]
 ## Scope and non-goals
 
 In scope: `run` and `test` in the CLI, help, README, AGENTS.md, and
-`CLI_PLAN.md`'s wording on `--test-suite`. The process API work R0(a) needs
+retiring the `compile --test-suite` mode that `test` replaces. The process API work R0(a) needs
 is planned in `PROCESS_DECISIONS.md` (its L0, L1 and a new amendment for
 `run`), not here. Not in scope: build caching, parallel suites, moving the
 e2e driver onto `blorp test`, watch modes, `--link`, Windows.

@@ -219,7 +219,7 @@ How Int and Float are built in today:
 
   Binary process capture and `Path` (D13) follow in their own plans.
 
-  **Since revision 3,** `PATH_PLAN.md` gave the library `Path` and exact
+  **Since revision 3,** the `Path` work gave the library `Path` and exact
   errors, and split `fs.brp` into `io/fs/` modules. So L3 adds
   `read_bytes(path: Path) -> Result[Bytes, ReadError]` to `io/fs/read` and
   `write_bytes(path: Path, data: Bytes) -> Result[Void, WriteError]` to
@@ -432,7 +432,7 @@ was needed; the original allocation and instruction caps remain unchanged.
   names no `List[UInt8]`, because `emit.brp:1275` hard-codes the String list
   today.
 - **Other `TypeRef` matches.** Code outside `blorp/src` may match on
-  `TypeRef`, such as the formatter that `FORMATTER_PLAN.md` begins. L0 must
+  `TypeRef`, such as the formatter (`src/format/`). L0 must
   find it all.
 
 ## Testing

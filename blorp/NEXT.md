@@ -1,6 +1,6 @@
 # What's next
 
-An index of open work, as of 2026-11-09. Each entry says where the work
+An index of open work, as of 2026-11-11. Each entry says where the work
 stands, its next step, any decision it waits on, and the document that owns
 it. The owning document is the authority; this file only points to it.
 Update the entry when a workstream moves, and delete it when the work is
@@ -19,24 +19,11 @@ done.
     lands, L2's rotation waits briefly to carry its labels too.
   - **Afterwards:**
     - L1, the compiler learns `UInt8`, with deferred integer literals;
-    - L2, a plain seed rotation onto L1 (the family and command-line switch landed
-      with the modules plan's landing 6);
+    - L2, a plain seed rotation onto L1 (the seed family and command-line switch
+      landed with an earlier seed rotation);
     - L3, the library: `_base`, `uint8.brp`, `bytes.brp`, and
       `fs.read_bytes`/`write_bytes`;
     - L4, `String.byte_at` returns `Option[UInt8]`.
-- **`Path` and exact I/O errors:** [`PATH_PLAN.md`](PATH_PLAN.md), which
-  completes [`MODULES_AND_STRINGABLE_PLAN.md`](MODULES_AND_STRINGABLE_PLAN.md).
-  - **Status:** done. The naming rules, `Union.Variant`, `Path`, exact
-    process, environment and file errors, and the `io/fs/` modules have
-    landed. Keith dropped `Path` from the prelude on 2026-11-11 because of
-    its compile cost.
-  - **Follow-ups, in the plan:** the errno masks, the `_` parameters, the
-    shared ASCII constants and `ends_in_separator` landed on 2026-11-11.
-    Open:
-    - a test-visible form of `private` for the error decoders;
-    - an opaque `DeclaredName`, measured at +120 to +170 lines and not
-      done; revisit with the LSP plan's name identities;
-    - embedded-library size, which affects every compile.
 - **Process API:** [`PROCESS_DECISIONS.md`](PROCESS_DECISIONS.md).
   - **Status:** L0 is implemented and independently reviewed; final combined
     landing gates and four-platform CI pass; L0 is published. Shared
@@ -59,8 +46,8 @@ done.
     byte console API, so landing 6 waits for the UInt8 plan's L1 and landing 8 for its
     L3. Its foundations have
     landed: the `json` codec
-    and loader source snapshots
-    ([`SOURCE_SNAPSHOTS_DECISIONS.md`](SOURCE_SNAPSHOTS_DECISIONS.md)).
+    and loader source snapshots (`load_program_with_sources`, in the README's
+    Load phase).
   - **Landed:** landing 1, analysis without an entry point.
   - **Next:** landing 2, comments as lexer output.
 - **String code points:** [`STRING_PLAN.md`](STRING_PLAN.md).
@@ -76,11 +63,7 @@ done.
   - **Next:** D40, a pure `String.lines()` with `fold_lines`'s line rules, so
     `read_text(path).lines()` collects lines.
   - **Later:** the plan's "Later" list.
-- **Formatter, `blorp` command, embedded standard library:**
-  [`FORMATTER_PLAN.md`](FORMATTER_PLAN.md), [`CLI_PLAN.md`](CLI_PLAN.md) and
-  [`EMBEDDED_LIBRARY_PLAN.md`](EMBEDDED_LIBRARY_PLAN.md). Other sessions own
-  them; see each plan's status line, and `git log` for what has landed since
-  (the embedded library landed in `1a68dbd3b`).
+
 ## Smaller follow-ups
 
 None of these is planned yet. Each wants its own short design or brief.
@@ -103,6 +86,37 @@ None of these is planned yet. Each wants its own short design or brief.
   - `slice(start, end)`;
   - `starts_with` and `index_of` for `T: Equatable`;
   - lexicographic `Orderable` for `List[T: Orderable]`.
+- **Names and errors:**
+  - **A test-visible form of `private`.** The decoders in `io/environment`,
+    `io/process` and `io/_codes` are public with a "not API" comment so that
+    tests can pass them literal codes.
+  - **An opaque `DeclaredName`,** so a declaring site cannot skip its naming
+    check even by calling the token reader directly. It needs the syntax
+    tree's declaration fields (about 12 in `syntax.brp`, read in 22 files) to
+    hold the checked type: measured at +120 to +170 production lines and not
+    done. Revisit with the LSP plan's name identities.
+  - **Embedded-library size.** A trivial compile costs about 9% more
+    instructions since `Path` and the `io/fs/` modules, because it follows
+    the size of the embedded library text. `Path` stays an explicit import
+    for the same reason (about +31,000 allocations and +26% instructions to
+    compile an empty program as a prelude name); revisit once the checker
+    checks only the declarations a program uses.
+  - **Temporary-directory cleanup and `ENOSPC`.** One native serves
+    `RemoveTreeError`, which has no `NoSpace`, and a temporary directory's
+    cleanup, so `ENOSPC` during cleanup arrives as `OtherOs(28)`.
+  - **`entry_kind` has no injected-errno test,** because its C fixture has
+    no `lstat` hook.
+- **A human-facing `Displayable`** with `display`, beside `Stringable`, which
+  promises only a conversion to String. Wait for a use that needs the
+  distinction.
+- **Verify's function loop** does not `break` after the return-type
+  membership failure (noticed 2026-11-10, not fixed).
+- **The natives' path NUL guards are unreachable,** now that no `Path` holds
+  NUL, though they send `PATH_CONTAINS_NUL`, which most error unions lack.
+- **`import: dict` alone gives no qualified access,** so tests alias it as
+  `dict_ops`.
+- **`alias.Union.Variant` is deliberately unsupported** (Keith, 2026-11-10): a
+  pattern head has two parts, and importing the union serves.
 - **Tooling found broken or quiet while landing work:**
   - `scripts/blorp-compiler-bootstrap` prints nothing when it downloads or
     reuses a cached seed, so a build log cannot show which seed it used.

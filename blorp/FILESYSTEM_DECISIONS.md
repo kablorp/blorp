@@ -1,10 +1,9 @@
 # Filesystem decisions
 
 `fs`, `io` and `system` became `io/fs`, `io/error` and `io/environment`
-(MODULES_AND_STRINGABLE_PLAN.md, landing 4). PATH_PLAN.md landing 7 then
-replaced `io/fs` and `io/error` with one module per operation under `io/fs/`,
-each owning an exact error union, and made every operation take a `Path`. Names
-below are as written when each decision was made; the amendments say what
+(the modules landing). The `Path` landing then replaced `io/fs` and `io/error`
+with one module per operation under `io/fs/`, each owning an exact error union,
+and made every operation take a `Path`. Names below are as written when each decision was made; the amendments say what
 changed. `IOError`, `IOErrorKind` and `default_if_not_found` no longer exist.
 
 This file records the decisions behind the `fs` library and the lent-resource
@@ -14,7 +13,7 @@ contract of each operation lives in the
 file says why it is that way and what is still open. Every decision below was
 approved by Keith on the date given, except those marked open or deferred.
 `io.describe` below is history: `IOError` and `IOErrorKind` implement
-`Stringable` instead (MODULES_AND_STRINGABLE_PLAN.md, landing 3).
+`Stringable` instead.
 
 ## Where it stands
 
@@ -50,14 +49,13 @@ has risen by about 0.18%.
   and limitation has a clear explanation.
 - **R3.** Console output (`print`, `print_error`) is in the prelude; all other
   IO stays an explicit import. Amended 2026-11-10 from "IO stays an explicit
-  import, and the prelude does not change" (MODULES_AND_STRINGABLE_PLAN.md
-  decision 7). Amended 2026-11-11: each file operation is an explicit import
-  of its own `io/fs/` module, and `Path` stays an explicit import too, because
-  landing 8, which would have put `Path` and `to_path` in the prelude, was
-  dropped.
+  import, and the prelude does not change". Amended 2026-11-11: each file
+  operation is an explicit import of its own `io/fs/` module, and `Path` stays
+  an explicit import too, because landing 8, which would have put `Path` and
+  `to_path` in the prelude, was dropped.
 - **R4, from the roadmap.** Paths stay `String`. Errors carry fixed text, never `strerror` text.
   A NUL in a path is rejected before the system call.
-  Amended 2026-11-11 (PATH_PLAN.md P1, P2, P6 and P7): operations take a
+  Amended 2026-11-11 (the `Path` landing): operations take a
   `Path`, which cannot be empty or hold NUL, so no operation reports a NUL
   path; an error carries no path (`"${path}: ${error}"` is the caller's to
   write). Errors still carry fixed text.
@@ -105,7 +103,7 @@ has risen by about 0.18%.
 - **D14, 2026-11-03.** An `IOError`'s `path` is always the path the caller
   passed. Naming the failing component would need an error payload carrying
   a String beside the code; revisit when a consumer needs it. Superseded
-  2026-11-11 by PATH_PLAN.md P7: errors carry no path at all, so a failure
+  2026-11-11 by the `Path` landing: errors carry no path at all, so a failure
   never says whether the path or one of its parents refused.
 - **D34, 2026-11-04, the exception to D14.** When `with_temporary_directory`
   cannot remove its directory, the error names that directory, not
@@ -119,8 +117,7 @@ has risen by about 0.18%.
   checks errno to code against numeric literals.
 - **D8, 2026-11-03.** A file name that is not UTF-8 fails the whole listing
   with `InvalidUtf8` until a `Path` type exists, rather than silently
-  skipping the entry. A `Path` is still UTF-8 (PATH_PLAN.md P9), so the
-  rule stands until `Path` is byte-backed.
+  skipping the entry. A `Path` is still UTF-8, so the rule stands until `Path` is byte-backed.
 
 **Reading and writing**
 
@@ -180,8 +177,8 @@ has risen by about 0.18%.
   yet. A List accumulator in `fold_lines` copies the list on every line, so
   collecting lines goes through `read_text` for now.
 - **D13, 2026-11-05, a `Path` type.** Deferred. Reopen with `Bytes`, or if D8's error
-  turns out to be common. Amended 2026-11-11: a `Path` type exists (PATH_PLAN.md
-  landings 3 and 7), a UTF-8 spelling that is never empty and never holds NUL.
+  turns out to be common. Amended 2026-11-11: a `Path` type exists, a UTF-8
+  spelling that is never empty and never holds NUL.
   The byte-backed form stays deferred.
 
 - **`rename` and `IsADirectory`, 2026-11-11.** Renaming a file onto a
