@@ -61,10 +61,9 @@ done.
     and loader source snapshots
     ([results](../benchmarks/results/blorp-source-snapshots-2026-11-09.md),
     [`SOURCE_SNAPSHOTS_DECISIONS.md`](SOURCE_SNAPSHOTS_DECISIONS.md)).
-  - **Next:** the plan's landing 1, analysis without an entry point, is in
-    progress on `blorp/lsp-analyze`. The
-    source layout it waited for has landed
-    ([`SOURCE_LAYOUT_PLAN.md`](SOURCE_LAYOUT_PLAN.md)).
+  - **Landed:** landing 1, analysis without an entry point
+    ([results](../benchmarks/results/blorp-lsp-analyze-2026-11-11.md)).
+  - **Next:** landing 2, comments as lexer output.
 - **String code points:** [`STRING_PLAN.md`](STRING_PLAN.md).
   - **Status:** approved on 2026-11-10: `length` counts code points, from a
     count stored in each String, and byte work uses `byte_*` functions. S0

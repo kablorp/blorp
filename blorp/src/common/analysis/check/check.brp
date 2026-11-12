@@ -1,9 +1,12 @@
 ---
-Checking's public boundary: composes the phases in order and seals either a
-CheckedProgram or a CheckFailure carrying the first error.
+Checking's public boundary: composes the phases in order and seals either an
+Analysis (every declaration and body checked, entry function optional), a
+CheckedProgram (an analysis whose root declares the entry function) or a
+CheckFailure carrying the first error.
 ---
 import:
     result: Result methods
+    ../../syntax/syntax: Entrypoint
     ../assemble: ParsedProgram
     ../ids: FunctionId, RecordId, UnionId, DeclarationInventory
     ../namespace/builtins: CheckedFoundation, ParsedProgram methods
@@ -13,11 +16,20 @@ import:
     ./declarations: validate_declarations, CheckedDeclarations
     ./errors:
         BuiltinError(BuiltinTypesRejected),
+        SignatureError(MissingMain),
         CheckError,
         CheckErrors,
         builtin_error,
         namespace_rejection,
-    ./model: CheckedFunctions
+        signature_error,
+    ./model:
+        AcceptedTraits,
+        CheckedFunction,
+        CheckedFunctions,
+        CheckedLambda,
+        CheckedOpaque,
+        CheckedRecord,
+        CheckedUnion,
     ./receiver_clashes: Namespace methods
     ./recursion: validate_recursive_instantiation, finalize_trait_instances, FinalTraits
     ./signatures: AcceptedFunction, validate_signatures
@@ -68,7 +80,23 @@ private record FailureContents {
 opaque type CheckFailure = FailureContents
 
 
-private pure func check_program(program: ParsedProgram) -> Result[CheckedProgram, CheckFailure]:
+-- Every declaration and body checked. The entry function is optional: this is
+-- what an editor analyses.
+private record AnalysisContents {
+    traits: AcceptedTraits,
+    records: List[CheckedRecord],
+    unions: List[CheckedUnion],
+    opaques: List[CheckedOpaque],
+    functions: List[CheckedFunction],
+    lambdas: List[CheckedLambda],
+    entrypoint: Option[Entrypoint[FunctionId]],
+}
+
+
+opaque type Analysis = AnalysisContents
+
+
+private pure func analyze_program(program: ParsedProgram) -> Result[Analysis, CheckFailure]:
     parsed = program.parsed_contents()
 
     foundation_result: Result[CheckedFoundation, CheckError] = match program.check_builtin_types():
@@ -162,7 +190,7 @@ private pure func check_program(program: ParsedProgram) -> Result[CheckedProgram
         )
         .map_err(pure func(error): failed(program, error, signatures.functions))
     Ok(
-        into_opaque CheckedProgram({
+        into_opaque Analysis({
             traits = final.final_traits(),
             unions = declarations.unions,
             records = declarations.records,
@@ -186,8 +214,30 @@ private pure func failed(
     })
 
 
+pure func analyze(program: ParsedProgram) -> Result[Analysis, CheckFailure]:
+    program.analyze_program()
+
+
+-- What compilation needs: an analysis whose root declares the entry function.
+-- The six checked facts move into the program, so no two values hold them.
 pure func check(program: ParsedProgram) -> Result[CheckedProgram, CheckFailure]:
-    program.check_program()
+    analysis ?= program.analyze()
+    contents = from_opaque Analysis(analysis)
+    match contents.entrypoint:
+        Some(entrypoint):
+            Ok(
+                into_opaque CheckedProgram({
+                    traits = contents.traits,
+                    unions = contents.unions,
+                    records = contents.records,
+                    opaques = contents.opaques,
+                    functions = contents.functions,
+                    lambdas = contents.lambdas,
+                    entrypoint = entrypoint,
+                }),
+            )
+        None:
+            Err(failed(program, signature_error(program.parsed_contents().end, MissingMain), []))
 
 
 -- Only failed post-signature checking keeps this borrowed accepted view for

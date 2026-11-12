@@ -1,7 +1,7 @@
 # Language server: `blorp lsp`
 
 **Status: plan, 2026-11-10; Keith settled its decisions and asked for a byte
-console on 2026-11-11. Landing 1 is in progress.**
+console on 2026-11-11. Landing 1 has landed; landing 2 is next.**
 
 ## Problem
 

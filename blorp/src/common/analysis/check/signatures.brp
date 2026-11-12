@@ -9,6 +9,7 @@ import:
     bool: Bool methods
     int: Int methods
     option: Option methods
+    result: Result methods
     ../../syntax/names: NameId, NameTable
     ../../syntax/source: FunctionLabel, ModuleId, declared_label, root_module_id
     ../../syntax/syntax:
@@ -79,13 +80,7 @@ import:
     ./errors:
         CheckError,
         CheckerInvariant(InvalidFunctionContract, InvalidResolvedFunction, RuntimeContractMismatch),
-        SignatureError(
-            GenericMain,
-            MainHasParameters,
-            MainParameterType,
-            MainReturnType,
-            MissingMain,
-        ),
+        SignatureError(GenericMain, MainHasParameters, MainParameterType, MainReturnType),
         checker_invariant,
         or_checker_invariant,
         type_declaration_error,
@@ -164,7 +159,9 @@ private pure func function_label(
 record CheckedSignatures {
     implementation_headers: List[ImplementationHeader],
     functions: List[AcceptedFunction],
-    entrypoint: Entrypoint[FunctionId],
+    -- None when the root module declares no entry function: a fact, not an
+    -- error. `check` rejects it; an editor's analysis does not.
+    entrypoint: Option[Entrypoint[FunctionId]],
 }
 
 
@@ -184,23 +181,32 @@ pure func validate_signatures(
         _: None
     headers ?= parsed.implementation_headers(namespace)
     functions ?= parsed.accept_functions(namespace, designated, entrypoint, headers, contracts, [])
-    id: FunctionId ?= match entrypoint:
-        Some(present): Ok(present)
-        None: Err(signature_error(parsed.end, MissingMain))
+    accepted: Option[Entrypoint[FunctionId]] ?= match entrypoint:
+        None: Ok(None)
+        Some(id): entry_shape(functions, id, parsed.end).map(pure func(entry): Some(entry))
+
+    Ok({ functions = functions, implementation_headers = headers, entrypoint = accepted })
+
+
+-- The process-ABI shape of the validated entry function: its exit-status
+-- convention and whether it takes the program arguments.
+private pure func entry_shape(
+    functions: List[AcceptedFunction],
+    id: FunctionId,
+    end: Span,
+) -> Result[Entrypoint[FunctionId], CheckError]:
     main ?= functions
         .get(id.function_number())
-        .or_checker_invariant(parsed.end, InvalidResolvedFunction(id))
+        .or_checker_invariant(end, InvalidResolvedFunction(id))
 
     result: EntryResult = if main.signature.return_type.value_type == VoidType:
         SuccessfulExit
     else:
         IntegerExitStatus
 
-    accepted: Entrypoint[FunctionId] = match main.signature.parameters:
-        []: NoArguments(id, result)
-        _: WithArguments(id, result)
-
-    Ok({ functions = functions, implementation_headers = headers, entrypoint = accepted })
+    match main.signature.parameters:
+        []: Ok(NoArguments(id, result))
+        _: Ok(WithArguments(id, result))
 
 
 private pure func accept_functions(
