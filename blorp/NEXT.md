@@ -44,9 +44,10 @@ done.
     and loader source snapshots (`load_program_with_sources`, in the README's
     Load phase).
   - **Landed:** landing 1, analysis without an entry point; landing 2,
-    comments as lexer output; and landing 3, the lexer's prefix on failure.
-  - **Next:** landing 4, fixed identities: seven plain types become `fixed`,
-    so the name-use rows of landing 5 take no allocation each.
+    comments as lexer output; landing 3, the lexer's prefix on failure; and
+    landing 4, fixed identities.
+  - **Next:** landing 5, name uses: analysis records one inline row per name
+    used in source, its span and the identity it resolves to.
 - **String code points:** [`STRING_PLAN.md`](STRING_PLAN.md).
   - **Status:** approved on 2026-11-10: `length` counts code points, from a
     count stored in each String, and byte work uses `byte_*` functions. L1
