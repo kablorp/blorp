@@ -46,7 +46,7 @@ commands.
 
 `scripts/blorp-fixpoint --prove` proves that the compiler reproduces its own C
 from its own source. `benchmarks/bench.sh` compares Blorp with C, Go, OCaml and
-Python on small programs; see [benchmarks/README.md](benchmarks/README.md).
+Python on the programs that have a Blorp port; see [benchmarks/README.md](benchmarks/README.md).
 
 ## In Brief
 

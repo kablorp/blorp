@@ -18,8 +18,6 @@ from dataclasses import dataclass
 EXPECTED_OUTPUTS = {
     "fib": "Fib(40) = 102334155\n",
     "numeric_loop": "Total Collatz steps: 131434272\n",
-    "array_sum": "Completed 10000 iterations, total: 4995000000\n",
-    "array_ops": "Completed 10000 iterations, final sum: 44955000000\n",
     "dict_ops": (
         "build: done\n"
         "lookup_hit checksum: 34996500000\n"
@@ -34,14 +32,6 @@ EXPECTED_OUTPUTS = {
         "fold checksum: 99990000000\n"
         "reverse checksum: 10000000\n"
         "concat checksum: 10000000\n"
-    ),
-    "set_ops": (
-        "build: done\n"
-        "contains_hit: 2000000\n"
-        "contains_miss: 2000000\n"
-        "union: 5000000\n"
-        "intersect: 2500000\n"
-        "difference: 2500000\n"
     ),
     "compiler_ast": "compiler_ast checksum: 2390849568879\n",
     "compiler_emit": (
@@ -61,7 +51,7 @@ EXPECTED_OUTPUTS = {
     ),
 }
 BENCH_RE = re.compile(
-    r"^BENCH\s+.*(?:seconds=([0-9]+(?:\.[0-9]+)?)|microseconds=([0-9]+)|micros=([0-9]+))",
+    r"^BENCH\s+.*seconds=([0-9]+(?:\.[0-9]+)?)",
     re.M,
 )
 RESOURCE_TIMER = ["/usr/bin/time", "-l"]
@@ -120,13 +110,7 @@ def run_once(
             sys.stderr.write(proc.stderr)
         raise SystemExit(125)
 
-    seconds, microseconds, micros = match.groups()
-    if seconds is not None:
-        elapsed = float(seconds)
-    elif microseconds is not None:
-        elapsed = float(microseconds) / 1_000_000.0
-    else:
-        elapsed = float(micros) / 1_000_000.0
+    elapsed = float(match.group(1))
 
     if not resource_stats:
         return elapsed, None
