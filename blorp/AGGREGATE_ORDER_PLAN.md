@@ -1,9 +1,9 @@
 # Emit aggregates in the order Verify proved
 
 Status: approved by Keith on 2026-11-10, with the recommended answer to each
-of K1–K4. Landed on 2026-11-10 as `bcc6bfdb1`; the evidence is in
-[`blorp-aggregate-order-2026-11-10.md`](../benchmarks/results/blorp-aggregate-order-2026-11-10.md).
-Test lines came to +461 against the +450 ceiling. Written against
+of K1–K4. Landed on 2026-11-10 as `bcc6bfdb1`.
+Test lines came to +461 against the +450 ceiling; self-compile allocations
+13,563,081 to 13,563,080 and retired instructions −0.02%. Written against
 `ce8753b6f` on 2026-11-09.
 
 ## Problem
@@ -432,14 +432,7 @@ Add both suites to `COMPONENT_SOURCES` in `test/e2e/self_hosted.brp`.
 ## Cost ceilings
 
 These are set before implementation, per [AGENTS.md](../AGENTS.md). Measure
-as in
-[`blorp_supertrait_walks_2026-11-09.md`](../benchmarks/results/blorp_supertrait_walks_2026-11-09.md):
-
-- generate both compilers' C with the candidate compiler;
-- link them with `clang -O2 -DBLORP_MEMORY_DIAGNOSTICS=1`;
-- have each compile the candidate's `blorp/src/main.brp` under
-  `BLORP_LEAK_CHECK=strict`;
-- run three alternating serial rounds.
+with `blorp/scripts/self-compile-cost`.
 
 The reference at `95e86ab87` was 13,615,420 allocations and 13.22 G retired
 instructions. Re-measure the base and do not reuse those figures.
@@ -457,8 +450,7 @@ Report production and test additions, deletions and net counts separately,
 from `git diff --numstat`. Repeat an apparent miss before believing it. Bring
 a repeatable miss back to the coordinator, who may correct a routine budget
 and record it under the standing delegation. Do not shorten tests to meet a
-line figure. Write the evidence to
-`benchmarks/results/blorp-aggregate-order-<date>.md`.
+line figure. Record the evidence in this plan.
 
 ## Decisions
 
@@ -494,8 +486,8 @@ the ceilings as set.
       prints nothing.
 - [ ] `verify_layout_graph` returns the order, and `VerifiedProgram` is the
       only carrier of it.
-- [ ] Every ceiling in the cost table is met, and the results file records
-      source, binaries, flags, inputs, raw sample paths and output identity.
+- [ ] Every ceiling in the cost table is met, and this plan records
+      source, binaries, flags, inputs and output identity.
 - [ ] A code-reviewer and a test-runner have each approved the final diff.
 
 ## Release strategy

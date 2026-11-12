@@ -199,12 +199,14 @@ sanitizers, balanced counts and coverage do not replace them.
   surfaced, and report host-compiler defects explicitly.
 
 **Costs.** E2e tests own their allocation and retired-instruction ceilings;
-change a ceiling only with retained evidence, and do not special-case code
-for a small allocation change. Every cost claim follows the parent's
-measurement rules: matched, serial baseline and candidate runs against one
-frozen baseline on a quiet machine, covering the targeted boundary and the
-whole compilation, with source, binary, flags, inputs, raw samples and
-output identity recorded in a `benchmarks/results/` report. Check an
+change a ceiling only with measured evidence stated in its commit message, and
+do not special-case code for a small allocation change. Every cost claim follows
+the parent's measurement rules: matched, serial baseline and candidate runs
+against one frozen baseline on a quiet machine, covering the targeted boundary
+and the whole compilation, with source, binary, flags, inputs and output
+identity. The full record goes in the owning plan and raw samples under
+`build/`; the commit message carries only the headline numbers.
+`blorp/scripts/self-compile-cost` measures the whole compilation. Check an
 artifact's inputs and toolchain before reusing it, and run cheap publication
 checks early. Until self-compilation works, label owned-input measurements
 as proxies and say what they omit.

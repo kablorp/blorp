@@ -13,8 +13,9 @@ eventually anyway", and `opaque type Bytes = List[UInt8]`, with no separate
 instruction-enabled tests, fixpoint, fixture parity, independent code/test
 reviews and four-platform CI pass. L0 is published on origin/main. L1
 started on 2026-11-11, when Keith asked for `Bytes` in the library. The corrected L0 line allowance is recorded under Ceilings;
-performance caps are unchanged. See the
-[L0 measurement report](../benchmarks/results/blorp-integer-model-l0-2026-11-08.md).
+performance caps are unchanged. Measured L0 costs, all within the caps:
+fixed-input allocations +0 and instructions +0.014% (median of 3); own-source
+allocations +0.21% and instructions +0.17%.
 
 **Stale citations.** The `src/` layout split (`065e5e9ce`) and the
 repository-wide formatting (`1ca080abd`) landed after revision 2:

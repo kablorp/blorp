@@ -621,7 +621,7 @@ when compile cost changes.
 - [ ] **4.** Output identity holds on the e2e fixtures, and the
   measurements are recorded.
 - [ ] **5.** Every `Referent` case passes, and the measurements are in
-  `benchmarks/results/`.
+  this plan.
 - [ ] **7.** `scripts/blorp-fixpoint --prove` passes with the new seed.
 - [ ] **8.** The console e2e programs pass on all four CI platforms, and
   both reads return bytes that are not UTF-8 unchanged.

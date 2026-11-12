@@ -14,9 +14,7 @@ load_program_with_sources(root_path, library, sources)
 ```
 
 Here `sources` is a list of `SourceFile` rows, each a path and its contents.
-`blorp/README.md` (the Load phase) gives the exact rules, and
-[`blorp-source-snapshots-2026-11-09.md`](../benchmarks/results/blorp-source-snapshots-2026-11-09.md)
-gives the costs.
+`blorp/README.md` (the Load phase) gives the exact rules.
 
 - **One map.** Paths are normalized the same way loading normalizes them,
   and they key one checked map. The map is the opaque `SourceOverrides` in

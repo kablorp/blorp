@@ -3,8 +3,7 @@
 **Status: approved by Keith on 2026-11-10, with its four choices as
 recommended.** It lands before the language server (`LSP_PLAN.md`) and
 before any other material change to `src/`. Both steps have landed: step 1
-as `acecd2a5c`, and step 2 in the commit that splits `main.brp` and `cli.brp`
-([results](../benchmarks/results/blorp-source-layout-step2-2026-11-10.md)).
+as `acecd2a5c`, and step 2 in the commit that splits `main.brp` and `cli.brp`.
 
 ## Problem
 
@@ -302,7 +301,7 @@ repository, and stays.
 
 **Not in scope:**
 
-- `benchmarks/results/` and landed decision records keep their paths,
+- Landed decision records keep their paths,
   because they record the tree as it was;
 - any behaviour, name or API change beyond the four choices above;
 - the LSP's own modules.
@@ -389,7 +388,7 @@ rewrite script in reverse.
 - [ ] **Step 1.**
   - `git diff -M --summary` lists only renames for `src/` and `test/`.
   - The self-compile C equals the parent's (`cmp` exits 0).
-  - `git grep -nE 'src/(compile|syntax|utils|source_walk)' -- ':!benchmarks/results'`
+  - `git grep -nE 'src/(compile|syntax|utils|source_walk)'`
     prints only lines from landed records, and each is listed in the handback.
   - `git check-ignore blorp/src/common/codegen/runtime/new.brp` prints
     nothing.

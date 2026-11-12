@@ -250,4 +250,4 @@ with no ownership or specialization change.
   reported as not run, so a root-only CI would not test the decoders end to
   end.
 - Binding a lambda to a local before passing it costs an allocation that an
-  inline lambda does not (`benchmarks/results/blorp_fs_lines_2026-11-05.md`).
+  inline lambda does not.

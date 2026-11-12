@@ -144,12 +144,12 @@ main. Review (rule 12) checks this.
 - **Fast**: optimize afterward, guided by measurement.
 
 Do not bend a design to avoid a cost the compiler imposes today. Measure the
-cost instead (allocations and retired instructions, per rule 9). Record it in
-the change's design document or as one markdown summary in
-`benchmarks/results/`, so that compiler work can remove it. Raw samples stay
-under the ignored `build/` directory, and a report is deleted when the decision
-it supports is superseded. A change still stays within any cost ceiling its
-spec sets.
+cost instead with `blorp/scripts/self-compile-cost` (allocations and retired
+instructions, per rule 9). Record the full measurement (host, revisions, flags,
+commands, samples, output identity) in the change's plan or design document, so
+that compiler work can remove it; the commit message carries only the headline
+numbers. Raw samples stay under the ignored `build/` directory. A change still
+stays within any cost ceiling its spec sets.
 
 Any compiler data-model refactor in `blorp/` requires matched
 before/after self-compile allocations and retired instructions, with
@@ -260,7 +260,7 @@ For codegen changes, read the generated C.
 **11. Keep commit messages short.** A one-line subject and a body of a few
 lines at most: what was wrong, what changed, and one or two headline numbers.
 No issue numbers or names, no pasted tables or gate lists; that detail lives
-in `benchmarks/results/` and the plan documents.
+in the plan documents.
 
 **12. Get it reviewed.** Every change gets reviewed before commit. Use the code-reviewer and
 test-runner agents. No exceptions for "trivial" changes — trivial changes have trivial reviews.

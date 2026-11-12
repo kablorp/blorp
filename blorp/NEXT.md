@@ -12,8 +12,7 @@ done.
   - **Status:** U1 to U9 and B1 to B3 are decided. S0 and the L0
     `IntegerType(Int64Format)` refactor are implemented and independently
     reviewed and published; combined local gates and four-platform CI pass. Matched costs
-    pass unchanged performance ceilings; see
-    [`L0 results`](../benchmarks/results/blorp-integer-model-l0-2026-11-08.md).
+    pass unchanged performance ceilings.
   - **Next:** L1, adding UInt8 with deferred integer literals, started on
     2026-11-11 (branch `blorp/uint8-l1`). `LSP_PLAN.md`'s landing 6 waits
     for L1 and its landing 8 for L3; if landing 6 is nearly ready when L1
@@ -43,7 +42,6 @@ done.
     landing gates and four-platform CI pass; L0 is published. Shared
     errors/formatting belong to `io`,
     with one internal native-code decoder. Existing imports are migrated.
-    [`L0 results`](../benchmarks/results/blorp-process-l0-2026-11-08.md).
     L1 is implemented: the `process.capture`, `process.find_program` and
     `process.fault` natives, the C core and `process.brp`. A reply the C side
     never builds aborts through `process.fault`.
@@ -61,12 +59,9 @@ done.
     byte console API, so landing 6 waits for the UInt8 plan's L1 and landing 8 for its
     L3. Its foundations have
     landed: the `json` codec
-    ([results](../benchmarks/results/blorp-json-foundation-2026-11-08.md))
     and loader source snapshots
-    ([results](../benchmarks/results/blorp-source-snapshots-2026-11-09.md),
-    [`SOURCE_SNAPSHOTS_DECISIONS.md`](SOURCE_SNAPSHOTS_DECISIONS.md)).
-  - **Landed:** landing 1, analysis without an entry point
-    ([results](../benchmarks/results/blorp-lsp-analyze-2026-11-11.md)).
+    ([`SOURCE_SNAPSHOTS_DECISIONS.md`](SOURCE_SNAPSHOTS_DECISIONS.md)).
+  - **Landed:** landing 1, analysis without an entry point.
   - **Next:** landing 2, comments as lexer output.
 - **String code points:** [`STRING_PLAN.md`](STRING_PLAN.md).
   - **Status:** approved on 2026-11-10: `length` counts code points, from a
@@ -119,7 +114,7 @@ None of these is planned yet. Each wants its own short design or brief.
 - **Compiler costs found while landing work:**
   - **A named lambda costs one allocation per call.** Binding a lambda to a
     local before passing it costs an allocation that an inline lambda does
-    not (`benchmarks/results/blorp_fs_lines_2026-11-05.md`).
+    not.
   - **`max` and `min` are receiver-only.** `max(a, b)` reports "unknown
     function", so only `a.max(b)` works.
 - **No never-returning type.** `process.brp`'s `fault` calls the `process.fault`

@@ -283,8 +283,9 @@ will make it import `process`, and that needs a rotation first.
      lines.
    - `process.brp`, growing from 13 lines to about 230, and its suites.
    - The old `run_to_files` stays for now.
-3. **L2, the migration** (landed 2026-11-11; costs and call sites in
-   `benchmarks/results/blorp_process_l2_2026-11-11.md`).
+3. **L2, the migration** (landed 2026-11-11; self-compile
+   allocations −0.030% and retired instructions −0.073%, identical C for the
+   fixed input).
    - `Command.program` becomes a `Path` (Keith, 2026-11-11), which
      `PATH_PLAN.md`'s P8 left to this landing.
    - Move the call sites over, removing the `env` and `sh -c` wrappers and

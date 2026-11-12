@@ -33,8 +33,6 @@ benchmarks/
   args/<name>.txt        # optional shared CLI args
 ```
 
-`results/` holds markdown summaries only (see [Recording Results](#recording-results)).
-
 The benchmark name is the filename without the extension. A benchmark must have
 a Blorp source file; C, Go, OCaml, and Python counterparts are optional. A
 program without a Blorp source compares nothing to Blorp and does not belong here.
@@ -184,11 +182,8 @@ blorp compiles to C with ARC memory management. Common overhead sources are:
 
 ## Recording Results
 
-A measurement lands as one markdown file, `benchmarks/results/<topic>_<date>.md`,
-that stands on its own: host, source and binary revisions, flags, input hash,
-commands, run order, sample count, headline numbers with spread, output
-identity and caveats. Raw samples, logs, manifests, copied C and per-run
-directories stay under the ignored `build/` directory; `.gitignore` admits only
-markdown into `benchmarks/results/`. Link each report from the plan, README,
-cost ceiling or source comment it supports, and delete the report when that
-decision is superseded.
+A benchmark run's full record (host, revisions, flags, input hash, commands,
+samples, output identity) goes in the plan that relies on it, and the commit
+message carries only the headline numbers. There are no report files. Raw samples,
+logs, manifests, copied C and per-run directories stay under the ignored
+`build/` directory.
