@@ -33,20 +33,25 @@ directory (its phase), with C11 `-O0` linking and strict native memory checks.
 The Blorp test driver that `make` builds runs it and the e2e selection.
 The native e2e selection runs the real-main cases and process-runtime
 lifecycle checks through ordinary Blorp TestSuites, with exact output, strict
-accounting and ASan/UBSan checks. `test-e2e` uses an already-built diagnostic Blorp
-compiler. Every `test_*.brp` file is selected and run; the
+accounting and ASan/UBSan checks. The test targets use the already-built test
+compiler, `blorp/build/blorp-test`. Every `test_*.brp` file is selected and run; the
 full component run fails on one that `COMPONENT_SOURCES` does not list.
 
 ## Blorp seed build
 
 `make -C blorp` (or the explicit `compiler` target) uses
 `scripts/blorp-compiler-bootstrap` to generate compiler C through a pinned
-Blorp seed's direct CLI, then links normal mode at `-O0` with memory
-diagnostics disabled. `test-compiler` generates once and links diagnostic
-mode instead. `link-test-compiler` still links an explicitly supplied C path
-for fixpoint stages. Output paths, `BLORP_CC`, `TEST_COMPILER_FLAGS` and
-`TEST_COMPILER_LIBRARIES` accept Make command-line overrides. Build targets
-are serialized because normal and diagnostic modes share the output path.
+Blorp seed's direct CLI, then links it twice at `-O0`: the `blorp` command,
+`blorp/build/blorp` (`BLORP_COMPILER`), with memory diagnostics disabled, and
+the test compiler, `blorp/build/blorp-test` (`BLORP_TEST_COMPILER`), with them
+enabled. `test-compiler` generates once and links only the test compiler.
+`link-test-compiler` still links an explicitly supplied C path for fixpoint
+stages. The test targets run only `BLORP_TEST_COMPILER`: e2e checks the strict
+allocation report on every compile, which only a diagnostic link prints, and
+the two builds never share a path. Output paths, `BLORP_CC`,
+`TEST_COMPILER_FLAGS` and `TEST_COMPILER_LIBRARIES` accept Make command-line
+overrides. Recipes run one at a time, because `compiler` and `test-compiler`
+both link the test compiler and the test targets run compiled programs.
 
 The resolver uses the real `blorp/bootstrap.env` pin, recorded after all
 three native seed assets were qualified. It validates the full source commit, matching
@@ -64,9 +69,9 @@ arguments are forwarded unchanged from the repository root.
 The cache was `$XDG_CACHE_HOME/blorp/blorp2-bootstrap` before the rename to Blorp; that
 directory is no longer read and can be deleted.
 
-The `example` target uses the newly built Blorp compiler. `test` builds Blorp and
-runs its explicit self-hosted component and native e2e selections; `test-target-components` uses an
-already-built Blorp compiler.
+The `example` target uses the newly built `blorp` command. `test` builds the test
+compiler and runs its explicit self-hosted component and native e2e selections;
+`test-target-components` uses an already-built test compiler.
 Run the isolated behavioral shell tests with
 `bash blorp/test/tooling/test_bootstrap.sh`; they use fake transport,
 seed and C compiler tools, including quoted paths and parallel target requests.

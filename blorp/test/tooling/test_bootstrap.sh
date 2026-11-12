@@ -113,6 +113,8 @@ fi
 SEED
 		;;
 esac
+# Names the link's mode in the binary, so a test can tell which build a target ran.
+printf '# memory diagnostics: %s\n' "$mode" >>"$output"
 chmod +x "$output"
 SH
 chmod +x "$tools/"*
@@ -281,8 +283,9 @@ pass 'help works before publication and missing manifest has useful error'
 make -s -C "$fixture/blorp" -j compiler test-compiler BLORP_CC="$tools/fake cc" >"$scratch/make.stdout" 2>"$scratch/make.stderr" || { cat "$scratch/make.stderr" >&2; fail 'parallel requested build targets'; }
 # The seed builds the embedded-library generator (and the fake cc links it with
 # no diagnostics flag, hence "link:example"), the generator runs once ("built"),
-# and only then does the seed generate the compiler.
-printf 'seed\nlink:example\nbuilt\nseed\nlink:0\nlink:1\n' >"$scratch/expected"
+# and only then does the seed generate the compiler. compiler links the blorp
+# command and the test compiler; test-compiler links the test compiler again.
+printf 'seed\nlink:example\nbuilt\nseed\nlink:0\nlink:1\nlink:1\n' >"$scratch/expected"
 cmp -s "$TEST_CC_LOG" "$scratch/expected" || fail 'generation/link ordering or diagnostic modes'
 [ -s "$fixture/blorp/build/generated/embedded_library.brp" ] || fail 'generator did not write the embedded library module'
 printf 'cwd:%s\0arg:%s\0arg:%s\0arg:%s\0arg:%s\0arg:%s\0arg:%s\0' "$fixture" \
@@ -293,17 +296,20 @@ printf 'cwd:%s\0arg:%s\0arg:%s\0arg:%s\0arg:%s\0arg:%s\0arg:%s\0' "$fixture" \
 cmp -s "$TEST_SEED_LOG" "$scratch/expected" || fail 'make seed CLI or generation count'
 printf '%s\0' -O1 blorp/build/generated/embed_library.c -o blorp/build/generated/embed_library -lm -lpthread \
 	-O0 -DBLORP_MEMORY_DIAGNOSTICS=0 blorp/build/blorp.c -o blorp/build/blorp -lm -lpthread \
-	-O0 -DBLORP_MEMORY_DIAGNOSTICS=1 blorp/build/blorp.c -o blorp/build/blorp -lm -lpthread >"$scratch/expected"
+	-O0 -DBLORP_MEMORY_DIAGNOSTICS=1 blorp/build/blorp.c -o blorp/build/blorp-test -lm -lpthread \
+	-O0 -DBLORP_MEMORY_DIAGNOSTICS=1 blorp/build/blorp.c -o blorp/build/blorp-test -lm -lpthread >"$scratch/expected"
 cmp -s "$TEST_CC_ARGS" "$scratch/expected" || fail 'link flags or operand argv'
 pass 'parallel requested normal/diagnostic builds generate once and link serially'
 
 : >"$TEST_CC_LOG"
 make -s -C "$fixture/blorp" BLORP_CC="$tools/fake cc" \
 	BLORP_COMPILER='blorp/build/output compiler' \
+	BLORP_TEST_COMPILER='blorp/build/output test compiler' \
 	BLORP_COMPILER_C='blorp/build/output compiler.c' >"$scratch/make.stdout" 2>"$scratch/make.stderr" || { cat "$scratch/make.stderr" >&2; fail 'default compiler with quoted outputs'; }
-printf 'seed\nlink:0\n' >"$scratch/expected"
-cmp -s "$TEST_CC_LOG" "$scratch/expected" || fail 'default target normal mode'
-[ -x "$fixture/blorp/build/output compiler" ] || fail 'explicit binary override'
+printf 'seed\nlink:0\nlink:1\n' >"$scratch/expected"
+cmp -s "$TEST_CC_LOG" "$scratch/expected" || fail 'default target normal and diagnostic modes'
+[ -x "$fixture/blorp/build/output compiler" ] && grep -Fxq '# memory diagnostics: 0' "$fixture/blorp/build/output compiler" || fail 'explicit binary override'
+[ -x "$fixture/blorp/build/output test compiler" ] && grep -Fxq '# memory diagnostics: 1' "$fixture/blorp/build/output test compiler" || fail 'explicit test binary override'
 pass 'default target and explicit output paths with spaces work'
 
 # A changed library file regenerates the module without rebuilding the generator;
@@ -316,13 +322,13 @@ generated="$fixture/blorp/build/generated"
 touch -t "$long_ago" "$generated/embedded_library.brp"
 touch "$fixture/blorp/standard_library/stub.brp"
 make -s -C "$fixture/blorp" BLORP_CC="$tools/fake cc" >"$scratch/make.stdout" 2>"$scratch/make.stderr" || { cat "$scratch/make.stderr" >&2; fail 'build after a library change'; }
-printf 'built\nseed\nlink:0\n' >"$scratch/expected"
+printf 'built\nseed\nlink:0\nlink:1\n' >"$scratch/expected"
 cmp -s "$TEST_CC_LOG" "$scratch/expected" || { cat "$TEST_CC_LOG" >&2; fail 'a library change must rerun only the generator'; }
 : >"$TEST_CC_LOG"
 touch -t "$long_ago" "$generated/embed_library" "$generated/embedded_library.brp"
 touch "$fixture/blorp/scripts/embed_library.brp"
 make -s -C "$fixture/blorp" BLORP_CC="$tools/fake cc" >"$scratch/make.stdout" 2>"$scratch/make.stderr" || { cat "$scratch/make.stderr" >&2; fail 'build after a generator change'; }
-printf 'seed\nlink:example\nbuilt\nseed\nlink:0\n' >"$scratch/expected"
+printf 'seed\nlink:example\nbuilt\nseed\nlink:0\nlink:1\n' >"$scratch/expected"
 cmp -s "$TEST_CC_LOG" "$scratch/expected" || { cat "$TEST_CC_LOG" >&2; fail 'a generator change must rebuild and rerun it'; }
 # A deleted library file leaves nothing for a wildcard to name; the directory's
 # own modification time regenerates the module.
@@ -338,7 +344,7 @@ touch -t 200006010000 "$generated/embed_library"
 touch -t 200101010000 "$generated/embedded_library.brp"
 rm "$fixture/blorp/standard_library/second.brp"
 make -s -C "$fixture/blorp" BLORP_CC="$tools/fake cc" >"$scratch/make.stdout" 2>"$scratch/make.stderr" || { cat "$scratch/make.stderr" >&2; fail 'build after a library file was deleted'; }
-printf 'built\nseed\nlink:0\n' >"$scratch/expected"
+printf 'built\nseed\nlink:0\nlink:1\n' >"$scratch/expected"
 cmp -s "$TEST_CC_LOG" "$scratch/expected" || { cat "$TEST_CC_LOG" >&2; fail 'a deleted library file must regenerate the module'; }
 # A file in a subfolder is an input too: only it changes, so only the module
 # regenerates.
@@ -349,7 +355,7 @@ touch -t 200101010000 "$generated/embedded_library.brp"
 : >"$TEST_CC_LOG"
 touch "$fixture/blorp/standard_library/nested/deep.brp"
 make -s -C "$fixture/blorp" BLORP_CC="$tools/fake cc" >"$scratch/make.stdout" 2>"$scratch/make.stderr" || { cat "$scratch/make.stderr" >&2; fail 'build after a nested library file changed'; }
-printf 'built\nseed\nlink:0\n' >"$scratch/expected"
+printf 'built\nseed\nlink:0\nlink:1\n' >"$scratch/expected"
 cmp -s "$TEST_CC_LOG" "$scratch/expected" || { cat "$TEST_CC_LOG" >&2; fail 'a nested library file change must regenerate the module'; }
 # Deleting that file leaves nothing for a match to name; the subfolder's own
 # modification time regenerates the module.
@@ -379,7 +385,7 @@ link_parent="$scratch/link parent"
 mkdir "$real_parent"
 ln -s "$real_parent" "$link_parent"
 real_parent=$(cd "$real_parent" && pwd -P)
-expected_compiler="$fixture/blorp/build/output compiler"
+expected_compiler="$fixture/blorp/build/output test compiler"
 expected_cc="$tools/fake cc"
 reset_driver_logs() {
 	: >"$TEST_DRIVER_LOG"
@@ -392,9 +398,23 @@ run_test_target() {
 	target="$1"
 	shift
 	TMPDIR="$link_parent" make -s -C "$fixture/blorp" "$target" BLORP_CC="$tools/fake cc" \
-		BLORP_COMPILER='blorp/build/output compiler' \
+		BLORP_TEST_COMPILER='blorp/build/output test compiler' \
 		BLORP_COMPILER_C='blorp/build/output compiler.c' "$@" >"$scratch/make.stdout" 2>"$scratch/make.stderr"
 }
+
+# Only a diagnostic link prints the strict allocation report that e2e checks on
+# every compile, so a test target run after `make compiler`, which links the
+# blorp command without diagnostics, must still run a diagnostic build.
+make -s -C "$fixture/blorp" compiler BLORP_CC="$tools/fake cc" >"$scratch/make.stdout" 2>"$scratch/make.stderr" || { cat "$scratch/make.stderr" >&2; fail 'compiler before the test targets'; }
+grep -Fxq '# memory diagnostics: 0' "$fixture/blorp/build/blorp" || fail 'compiler did not link the blorp command without diagnostics'
+for target in test-target-components test-e2e; do
+	reset_driver_logs
+	TMPDIR="$link_parent" make -s -C "$fixture/blorp" "$target" BLORP_CC="$tools/fake cc" >"$scratch/make.stdout" 2>"$scratch/make.stderr" || { cat "$scratch/make.stderr" >&2; fail "$target after compiler"; }
+	given_compiler=$(cut -d '|' -f 2 "$TEST_DRIVER_ARGS")
+	[ "$given_compiler" = "$fixture/blorp/build/blorp-test" ] || fail "$target after compiler ran $given_compiler, not the test compiler"
+	grep -Fxq '# memory diagnostics: 1' "$given_compiler" || fail "$target after compiler ran a build without memory diagnostics"
+done
+pass 'after compiler, every test target runs the diagnostic test compiler'
 
 reset_driver_logs
 if ! run_test_target test-e2e; then cat "$scratch/make.stderr" >&2; fail 'test-e2e must run the driver'; fi
@@ -439,7 +459,7 @@ pass "test-target-components leaves an empty selection to the driver's built-in 
 # `test` builds the driver once, then runs components and e2e.
 reset_driver_logs
 if ! TMPDIR="$link_parent" make -s -C "$fixture/blorp" test BLORP_CC="$tools/fake cc" \
-	BLORP_COMPILER='blorp/build/output compiler' \
+	BLORP_TEST_COMPILER='blorp/build/output test compiler' \
 	BLORP_COMPILER_C='blorp/build/output compiler.c' >"$scratch/make.stdout" 2>"$scratch/make.stderr"; then
 	cat "$scratch/make.stderr" >&2
 	fail 'test must run the self-hosted driver'
@@ -447,6 +467,7 @@ fi
 [ "$(grep -c '^compiler:strict$' "$TEST_COMPILER_ARGS")" = 1 ] || fail 'test did not build the driver exactly once'
 printf 'driver:components:strict:%s\ndriver:e2e:strict:%s\n' "$fixture" "$fixture" >"$scratch/expected"
 cmp -s "$TEST_DRIVER_LOG" "$scratch/expected" || fail 'test did not run components and e2e in that order'
+[ "$(cut -d '|' -f 2 "$TEST_DRIVER_ARGS" | sort -u)" = "$expected_compiler" ] || fail 'test did not run the test compiler it linked'
 pass 'test builds the driver once and runs components and e2e in order'
 
 for failure_kind in driver-compile driver-link driver-run; do
@@ -467,7 +488,7 @@ done
 unset TEST_DRIVER_COMPILE_STATUS TEST_CC_STATUS TEST_DRIVER_STATUS
 
 for target in test-target-components test-e2e; do
-	expect_failure 'missing Blorp test compiler' make -s -C "$fixture/blorp" "$target" BLORP_COMPILER=missing-compiler
+	expect_failure 'missing Blorp test compiler' make -s -C "$fixture/blorp" "$target" BLORP_TEST_COMPILER=missing-compiler
 done
 pass 'every test target fails with actionable build help when the compiler is missing'
 printf '%s tests passed\n' "$passed"
