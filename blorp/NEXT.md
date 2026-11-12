@@ -78,10 +78,17 @@ None of these is planned yet. Each wants its own short design or brief.
 - **Binary patterns.** Erlang-style matching and construction on `Bytes`, with
   sized, endian segments and storage-sharing slices. It waits for a
   binary-format consumer.
-- **Generic List gaps:**
-  - `slice(start, end)`;
-  - `starts_with` and `index_of` for `T: Equatable`;
-  - lexicographic `Orderable` for `List[T: Orderable]`.
+- **Checking a bounded generic function costs time quadratic in their number.**
+  - Every compile checks every library module the prelude reaches, so
+    adding `List.starts_with` (23 M instructions) and `Orderable for List`
+    (20 M) raised a hello program's compile from 322 M to 395 M instructions
+    (+22%, `-O0`), 51 M of it from the List additions.
+  - Probe: N copies of `pure func ne_i[E: Equatable](a: E, b: E) -> Bool: a != b`
+    beside hello cost 416 M with none, 653 M for N=10, 2.43 G for N=40 and
+    7.12 G for N=80. `==` costs about a tenth as much as `!=` (642 M for 40).
+  - Lead: the allocations come from `instantiation_paths.insert` and
+    `recursion.dependency_graph`. Raw data is in the main checkout's ignored
+    `build/measurements/bounded-generic-checking-2026-11-12/`.
 - **Names and errors:**
   - **The clash message for a prelude String method's name.** A user function
     `lines(text: String)` reports "two functions named lines can accept the

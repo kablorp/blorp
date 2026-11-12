@@ -209,6 +209,9 @@ The combined library also supplies these ordinary pure helpers:
 | `take[T](values, count) -> List[T]` | Keep a prefix, clamping count to `0..length`. |
 | `drop[T](values, count) -> List[T]` | Remove a prefix with the same clamping. |
 | `remove[T](values, index) -> Option[List[T]]` | Remove exactly one valid element; invalid indexes return None. |
+| `slice[T](values, start, end) -> List[T]` | Keep `start` up to, not including, `end`. Both bounds clamp to `0..length` and an `end` before `start` gives an empty List, so it never fails. |
+| `starts_with[Element: Equatable](values, prefix) -> Bool` | Whether the leading elements equal `prefix`; every List starts with `[]`. |
+| `index_of[Element: Equatable](values, needle) -> Option[Int]` | The index of the first element equal to `needle`, or None. |
 | `reverse[T](values) -> List[T]` | Reverse element order. |
 | `find[T](values, predicate: pure (T) -> Bool) -> Option[T]` | Return the first match in input order and skip later elements. |
 | `all[T](values, predicate: pure (T) -> Bool) -> Bool` | Stop at the first False; empty input returns True. |
@@ -225,6 +228,10 @@ the other with `set`, so a sort does O(n log n) key comparisons and copies with
 constant stack, and allocates at most two Lists, each buffer's first copy of a
 shared input.
 Integrated correctness, self-compilation and resource acceptance remain separate.
+
+A List of `Orderable` elements is `Orderable`: lexicographic, the first differing
+position decides, and a prefix sorts before the longer List. `[1, 2] < [1, 3]`,
+`[1] < [1, 2]`.
 
 ### List membership
 
