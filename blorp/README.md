@@ -1328,6 +1328,23 @@ label. Recording stacks is slow, so use it for attribution, not timing. Keep
 frame pointers, which macOS `backtrace()` follows; inlining merges helpers
 into callers.
 
+### Self-compile cost
+
+```sh
+blorp/scripts/self-compile-cost BASE CANDIDATE [--rounds N] [--optimize LEVEL] [--output DIR]
+```
+
+Compares two git revisions' cost compiling Blorp. It builds each from the
+pinned seed in a detached worktree (normal and `-DBLORP_MEMORY_DIAGNOSTICS=1`
+binaries at `--optimize`, default `-O2`), waiting while another session's
+compiler, fixpoint or test driver is running. For two workloads, the base's
+source compiled by both compilers (so only the compiler differs) and each
+revision's own source, it prints strict-leak-check allocations (a leak fails
+the run) and the median retired instructions of `--rounds` (default 11)
+alternating runs from `/usr/bin/time -l` or `perf stat`. It also says whether
+both compilers emit identical C for the fixed input. Raw samples stay under
+`--output`, by default `blorp/build/self-compile-cost/<base>-<candidate>/`.
+
 ### Self-compile attribution
 
 ```sh

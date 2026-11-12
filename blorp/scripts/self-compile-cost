@@ -1,0 +1,210 @@
+#!/usr/bin/env python3
+"""Measure what a change costs the Blorp compiler compiling Blorp.
+
+    self-compile-cost BASE CANDIDATE [--rounds N] [--optimize LEVEL] [--output DIR]
+
+BASE and CANDIDATE are git revisions. Each is checked out as a detached
+worktree under blorp/build/self-compile-cost/ and built from the pinned seed
+with the Makefile's own recipes (generate-compiler, link-compiler,
+link-test-compiler), once normally and once with -DBLORP_MEMORY_DIAGNOSTICS=1.
+Two workloads are measured:
+
+  fixed input   both compilers compile the base's blorp/src/main.brp and
+                library from the same working directory, so only the compiler
+                differs; the emitted C is hashed for identity.
+  own source    each compiler compiles its own source and library.
+
+Instructions are the median of --rounds normal runs per side, alternating which
+side goes first: "instructions retired" from /usr/bin/time -l on macOS, or
+perf stat on Linux. Allocations come from one BLORP_LEAK_CHECK=strict run of the
+diagnostic binary, which is deterministic; a leak fails the script. Raw samples
+are written under --output. Python 3 standard library only.
+"""
+
+import argparse
+import hashlib
+import os
+import re
+import shutil
+import statistics
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[2]
+SIDES = ("base", "candidate")
+# Another session's compiled binary is running when either pattern matches; the
+# shared busy checks of the repository's workers (see AGENTS.md).
+BUSY_PATTERNS = (
+    r"^[^ ]*self-hosted-tests/driver/driver",
+    r"^[^ ]*blorp/build/(compiler|fixpoint)",
+)
+BUSY_POLL_SECONDS = 15
+# Both binaries live here inside each worktree, where the busy check sees them.
+BINARY_DIRECTORY = "blorp/build/compiler-cost"
+MAIN_SOURCE = "blorp/src/main.brp"
+LIBRARY_ROOT = "blorp/standard_library"
+LEAK_LINE = re.compile(r"blorp: leak check: (\d+) allocs, (\d+) releases, (\d+) leaked, (\d+) bytes")
+MACOS_INSTRUCTIONS = re.compile(r"^\s*(\d+)\s+instructions retired", re.MULTILINE)
+PERF_INSTRUCTIONS = re.compile(r"^(\d+),,instructions", re.MULTILINE)
+
+
+def fail(message):
+    sys.exit("error: self-compile-cost: " + message)
+
+
+def wait_until_idle():
+    while any(subprocess.run(["pgrep", "-f", pattern], capture_output=True).stdout
+              for pattern in BUSY_PATTERNS):
+        time.sleep(BUSY_POLL_SECONDS)
+
+
+def sha256(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def git(*arguments):
+    result = subprocess.run(["git", "-C", str(ROOT), *arguments], capture_output=True, text=True)
+    if result.returncode != 0:
+        fail("git %s: %s" % (" ".join(arguments), result.stderr.strip()))
+    return result.stdout.strip()
+
+
+def build_side(worktree, optimize):
+    """Builds the normal and diagnostic compilers from the pinned seed."""
+    flags = "TEST_COMPILER_FLAGS=" + optimize
+    for variant, target in (("", "link-compiler"), ("-diagnostic", "link-test-compiler")):
+        wait_until_idle()
+        binary = "%s/compiler%s" % (BINARY_DIRECTORY, variant)
+        steps = ["generate-compiler", target] if not variant else [target]
+        result = subprocess.run(
+            ["make", "-C", "blorp", "--no-print-directory", *steps, flags,
+             "BLORP_COMPILER_C=%s/compiler.c" % BINARY_DIRECTORY, "BLORP_COMPILER=" + binary],
+            cwd=worktree, capture_output=True, text=True)
+        if result.returncode != 0:
+            fail("build failed in %s:\n%s" % (worktree, result.stderr[-2000:]))
+
+
+def compile_command(worktree, output_c):
+    binary = worktree / BINARY_DIRECTORY / "compiler"
+    return [str(binary), "compile", MAIN_SOURCE, "--library-root", LIBRARY_ROOT, "-o", str(output_c)]
+
+
+def instruction_counter():
+    """Returns the command prefix and output pattern of this host's counter."""
+    if sys.platform == "darwin":
+        return ["/usr/bin/time", "-l"], MACOS_INSTRUCTIONS
+    if shutil.which("perf"):
+        return ["perf", "stat", "-x,", "-e", "instructions:u"], PERF_INSTRUCTIONS
+    fail("no instruction counter: needs /usr/bin/time -l (macOS) or perf (Linux)")
+
+
+def timed_run(counter, command, cwd, report):
+    """Runs one normal compile; returns its retired instructions."""
+    prefix, pattern = counter
+    wait_until_idle()
+    result = subprocess.run([*prefix, *command], cwd=cwd, capture_output=True, text=True)
+    report.write_text(result.stderr)
+    if result.returncode != 0:
+        fail("compile failed (%d); see %s" % (result.returncode, report))
+    found = pattern.search(result.stderr)
+    if not found:
+        fail("no instruction count in %s" % report)
+    return int(found.group(1))
+
+
+def strict_allocations(command, cwd, report):
+    wait_until_idle()
+    environment = dict(os.environ, BLORP_LEAK_CHECK="strict")
+    result = subprocess.run(command, cwd=cwd, capture_output=True, text=True, env=environment)
+    report.write_text(result.stderr)
+    found = LEAK_LINE.search(result.stderr)
+    if result.returncode != 0 or not found:
+        fail("strict diagnostic run failed (%d); see %s" % (result.returncode, report))
+    allocations, _, leaked, _ = (int(group) for group in found.groups())
+    if leaked != 0:
+        fail("leak reported; see %s" % report)
+    return allocations
+
+
+def percent(base, candidate):
+    return "%+.4f%%" % ((candidate - base) * 100.0 / base) if base else "n/a"
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Compare two revisions' self-compile cost.")
+    parser.add_argument("base")
+    parser.add_argument("candidate")
+    parser.add_argument("--rounds", type=int, default=11)
+    parser.add_argument("--optimize", default="-O2")
+    parser.add_argument("--output")
+    arguments = parser.parse_args()
+    if arguments.rounds < 1:
+        fail("--rounds must be at least 1")
+    counter = instruction_counter()
+    revisions = dict(zip(SIDES, (git("rev-parse", "--verify", arguments.base + "^{commit}"),
+                                 git("rev-parse", "--verify", arguments.candidate + "^{commit}"))))
+    label = "%s-%s" % (revisions["base"][:9], revisions["candidate"][:9])
+    scratch = ROOT / "blorp/build/self-compile-cost" / label
+    output = Path(arguments.output).resolve() if arguments.output else scratch
+    shutil.rmtree(scratch, ignore_errors=True)
+    git("worktree", "prune")
+    output.mkdir(parents=True, exist_ok=True)
+    worktrees = {side: scratch / ("worktree-" + side) for side in SIDES}
+    try:
+        for side in SIDES:
+            git("worktree", "add", "--detach", str(worktrees[side]), revisions[side])
+            print("building %s %s" % (side, revisions[side][:9]), flush=True)
+            build_side(worktrees[side], arguments.optimize)
+        report = measure(counter, arguments.rounds, worktrees, output)
+    finally:
+        for side in SIDES:
+            subprocess.run(["git", "-C", str(ROOT), "worktree", "remove", "--force",
+                            str(worktrees[side])], capture_output=True)
+    print(report)
+    (output / "report.txt").write_text(report + "\n")
+
+
+def measure(counter, rounds, worktrees, output):
+    # Each workload is its name and the directory each side's compiler runs in;
+    # every compiler binary is its own worktree's.
+    base_tree = worktrees["base"]
+    workloads = (("fixed input", {side: base_tree for side in SIDES}),
+                 ("own source", dict(worktrees)))
+    rows, identity = [], {}
+    for name, cwds in workloads:
+        key = name.replace(" ", "-")
+        allocations, samples = {}, {side: [] for side in SIDES}
+        for side in SIDES:
+            diagnostic = worktrees[side] / BINARY_DIRECTORY / "compiler-diagnostic"
+            emitted = output / ("%s-%s-diagnostic.c" % (key, side))
+            command = [str(diagnostic), "compile", MAIN_SOURCE, "--library-root", LIBRARY_ROOT,
+                       "-o", str(emitted)]
+            allocations[side] = strict_allocations(command, cwds[side],
+                                                   output / ("%s-%s-strict.stderr" % (key, side)))
+            identity[(key, side)] = sha256(emitted)
+        for round_number in range(rounds):
+            order = SIDES if round_number % 2 == 0 else SIDES[::-1]
+            for side in order:
+                command = compile_command(worktrees[side], output / ("%s-%s.c" % (key, side)))
+                samples[side].append(timed_run(
+                    counter, command, cwds[side], output / ("%s-%s-%d.stderr" % (key, side, round_number))))
+        (output / (key + "-instructions.txt")).write_text(
+            "".join("%s %d\n" % (side, value) for side in SIDES for value in samples[side]))
+        median = {side: int(statistics.median_low(samples[side])) for side in SIDES}
+        rows.append((name + " allocations", allocations["base"], allocations["candidate"]))
+        rows.append((name + " instructions, median of %d" % rounds, median["base"], median["candidate"]))
+    lines = ["%-36s %16s %16s %10s" % ("", "base", "candidate", "change")]
+    for label, base, candidate in rows:
+        lines.append("%-36s %16s %16s %10s" % (label, format(base, ","), format(candidate, ","),
+                                               percent(base, candidate)))
+    same = identity[("fixed-input", "base")] == identity[("fixed-input", "candidate")]
+    lines.append("fixed-input C: %s (base %s, candidate %s)" % (
+        "identical" if same else "DIFFERENT", identity[("fixed-input", "base")][:16],
+        identity[("fixed-input", "candidate")][:16]))
+    return "\n".join(lines)
+
+
+if __name__ == "__main__":
+    main()

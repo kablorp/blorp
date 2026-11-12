@@ -240,10 +240,10 @@ constraints in checking. If a check belongs earlier, move it there. If it must s
 
 **9. Measure, don't guess.** If there's any doubt about efficiency, use Blorp's measurement
 tools: `BLORP_ALLOCATION_SITES` with `blorp/scripts/allocation-sites` for where allocations
-come from, `blorp/scripts/attribution/run` for reference-count and copy attribution, and a
+come from, `blorp/scripts/self-compile-cost` for a change's self-compile cost,
+`blorp/scripts/attribution/run` for reference-count and copy attribution, and a
 `-DBLORP_MEMORY_DIAGNOSTICS=1` build with `BLORP_LEAK_CHECK=strict` for memory;
-`blorp/README.md` documents them. Claims like "this is
-faster" require before/after evidence.
+`blorp/README.md` documents them. Claims like "this is faster" require before/after evidence.
 Elapsed latency matters, but it is often noisy and can hide the mechanism. During investigation,
 also prefer direct and repeatable signals such as allocation and release counts, retired
 instructions, peak and retained memory, deterministic work counters, and native samples. Use the
