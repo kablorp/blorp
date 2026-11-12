@@ -646,13 +646,14 @@ import:
         Command, Exit(Exited, Signaled, TimedOut), Captured, CaptureError, FindProgramError,
         OutputError, command, capture, output, find_program
     path: Path
+    result: Result methods
 
 union CommitError:
     GitMissing(FindProgramError)
     GitFailed(OutputError)
 
 func current_commit(repository: Path) -> Result[String, CommitError]:
-    git ?= find_program("git").map_err(pure func(error: FindProgramError): GitMissing(error))
+    git: Path ?= find_program("git").map_err(pure func(error: FindProgramError): GitMissing(error))
     output({ command(git, ["rev-parse", "HEAD"]) | directory = Some(repository) })
         .map_err(pure func(error: OutputError): GitFailed(error))
 ```

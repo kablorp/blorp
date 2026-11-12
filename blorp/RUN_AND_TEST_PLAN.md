@@ -95,14 +95,17 @@ links with diagnostics off.
 | the C compiler cannot start | 3 | 3 |
 | the emitted C fails to compile or link | 4 (a fault in Blorp) | 4 |
 | `Exited(n)` | `n` | 0 → 0; 1 → 1; 99 (leak) → 1, after printing the leak line; anything else → 4 |
-| `Signaled(s)` | `128 + s`, as shells report it | `128 + s` |
+| `Signaled(2)`, SIGINT (Ctrl-C) | ends by SIGINT itself, after removing its temporary directory | the same |
+| any other `Signaled(s)` | `128 + s`, as shells report it | `128 + s` |
 
 `blorp run` passes the program's status through, so a program that exits 1
 and a compile diagnostic are both 1; stderr tells them apart, as with `cargo
-run`. A link failure is 4 because standard-library programs always link;
-`foreign` libraries need link flags that `run` does not take yet, and a
-program using one gets a link error until a `--link` option exists (not in
-scope).
+run`. After Ctrl-C, `blorp` ends the way its program did, so that a shell
+loop over `blorp run` stops (`PROCESS_DECISIONS.md`, P11); exiting 130
+instead would let the loop go on. A link failure is 4 because
+standard-library programs always link; `foreign` libraries need link flags
+that `run` does not take yet, and a program using one gets a link error
+until a `--link` option exists (not in scope).
 
 **R6. Arguments.** `blorp run [OPTION ...] INPUT.brp [ARGUMENT ...]`: options
 before the input; everything after it goes to the program verbatim, including
