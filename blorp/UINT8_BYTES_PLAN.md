@@ -171,8 +171,9 @@ How Int and Float are built in today:
   `or` and `not`. Until then, a big-endian 16-bit value is
   `high.to_int() * 256 + low.to_int()`.
 - **U8, visibility.** *Recommended:* `_base` declares `UInt8`, and the
-  prelude exports it with `uint8: UInt8 methods, Int methods`, since
-  `to_uint8` has an Int receiver and lives in `uint8.brp`. It is a base type,
+  prelude exports it with `uint8: UInt8 methods, Int methods, String methods`,
+  since `to_uint8` has an Int receiver and lives in `uint8.brp`, and
+  `String methods` makes `text.parse_uint8()` (U5) work. It is a base type,
   not an import.
 - **U9, `String.byte_at`.** It returns `Option[Int]` today, which would
   disagree with `Bytes.get`. *Recommended:* change it to `Option[UInt8]` in a
@@ -430,7 +431,7 @@ keeps what a later landing needs. What it found:
    the modules plan's landing 6, so L2 changes only the pin.
    - **Done, 2026-11-12.** The pin names `blorp-seed-0bb93894dcf2`, which
      main's CI built from L1's commit `0bb93894d`.
-5. **L3, the library.** This landing adds:
+5. **L3, the library. Done, 2026-11-12.** This landing adds:
    - `type UInt8 = builtin` in `_base`, which makes the role mandatory, and
      the prelude exports;
    - `uint8.brp`, with its traits, conversions and `parse_uint8`;
@@ -440,6 +441,19 @@ keeps what a later landing needs. What it found:
    - e2e examples covering literals, wrapping, conversions, mixing errors,
      Bytes, and binary file round trips including NUL and 0xFF, all under
      ASan and the strict leak check.
+   - **Execution, 2026-11-12.** Library +217 lines (`uint8.brp` 96,
+     `bytes.brp` 84); compiler +5 −5 (the mandatory role and help text);
+     tests +397 −534. `read_bytes` and `write_bytes` are in `io/fs/read` and
+     `io/fs/write`. Self-compile against `af2f0909a`, 5 rounds: own-source
+     allocations +0.13%, instructions +0.11%. Hello-world compile
+     allocations 107,786 to 112,481 (+4.36%), instructions 445,960,042 to
+     450,940,714 (+1.12%). Nine e2e ceilings were re-measured as old times
+     new cost over old cost (`fs_write`, the string-literal and path
+     fixtures, two derived fixtures). `scripts/self-compile-cost` cannot
+     measure a change that makes a base role mandatory: its fixed-input
+     workload compiles the base's library with the candidate compiler, which
+     now rejects it. The figures above took the fixed input from the
+     candidate tree with an uncommitted copy of the script.
 6. **L4, `byte_at`** (U9). Change its result to `Option[UInt8]` and update
    its callers, including the compiler's lexer.
 

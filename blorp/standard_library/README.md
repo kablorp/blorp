@@ -12,7 +12,7 @@ measurement provenance; current commands use `blorp/standard_library`.
 
 The library root contains two designated foundation modules:
 
-- `_base.brp` owns Int, Float, String, Void, List, Bool, Option, Result, the
+- `_base.brp` owns Int, UInt8, Float, String, Void, List, Bool, Option, Result, the
   `Equatable`, `Orderable`, `Hashable` and `Stringable` traits and the arithmetic traits
   `Addable`, `Subtractable`, `Multipliable`, `Divisible`, `Modulable` and
   `Negatable`, plus the checked-arithmetic error `MathError`. It is the only
@@ -233,6 +233,55 @@ A List of `Orderable` elements is `Orderable`: lexicographic, the first differin
 position decides, and a prefix sorts before the longer List. `[1, 2] < [1, 3]`,
 `[1] < [1, 2]`.
 
+### UInt8
+
+`UInt8` is declared by `_base.brp` and implemented in `uint8.brp`; the prelude
+selects `uint8: UInt8 methods, Int methods, String methods`, so these work
+everywhere:
+
+- `to_int(value: UInt8) -> Int` always succeeds.
+- `to_uint8(count: Int) -> Option[UInt8]` is `None` outside 0 to 255; there is
+  no wrapping or truncating conversion.
+- `parse_uint8(text: String) -> Option[UInt8]` is `parse_int` followed by
+  `to_uint8`, written in Blorp, with `parse_int`'s strictness.
+- `Equatable`, `Orderable`, `Hashable` (the value as an `Int`), `Stringable`
+  (decimal digits), `Addable`, `Subtractable`, `Multipliable`, `Divisible` and
+  `Modulable`. Arithmetic wraps modulo 256 and division or remainder by zero
+  gives 0. There is no `Negatable`: write `0 - value` for the wrapping result.
+  `Stringable` is here because interpolating a byte needs it, as Int's does.
+
+There are no bit operations or shifts yet; a big-endian 16-bit value is
+`high.to_int() * 256 + low.to_int()`.
+
+### Bytes
+
+`bytes.brp` declares `opaque type Bytes = List[UInt8]`, a byte sequence that is
+not a list of small numbers to the checker. It is not in the prelude. Import it
+as `bytes: Bytes, from_list, String methods`: selecting `Bytes` gives its
+functions through UFCS, `from_list` takes a List so it is imported by name, and
+`String methods` reaches `text.to_bytes()`. A module alias also works: `bytes as
+B`, then `B.from_list([1, 2])`.
+
+| Function | Result |
+| --- | --- |
+| `from_list(values: List[UInt8])` | `Bytes`; erased, so it does not copy |
+| `to_list(data)` | the `List[UInt8]`; erased, so it does not copy |
+| `length(data)`, `is_empty(data)` | `Int`, `Bool` |
+| `get(data, index)` | `Option[UInt8]`, `None` out of range |
+| `get_or(data, index, fallback)` | the byte, or `fallback` out of range |
+| `slice(data, start, end)` | the bytes from `start` up to `end`; both bounds clamp to the data and an `end` before `start` gives empty data, as `take` and `drop` clamp their count |
+| `starts_with(data, prefix)` | `Bool`; every data starts with the empty data |
+| `to_text(data)` | `Option[String]`, `None` unless the bytes are valid UTF-8; the empty data is `""` |
+| `to_bytes(text)` | the text's UTF-8 bytes, including any NUL |
+
+`Bytes` implements `Equatable`, `Addable` (concatenation) and `Hashable`, so it
+works as a `Dict` key. Two limits are stated rather than fixed:
+
+- A constant cannot call a function, so a `Bytes` constant such as a file
+  signature is a function returning `from_list([137, 80, 78, 71])`.
+- `for byte in data` needs `for byte in data.to_list()`; `to_list` also hands
+  `map`, `filter` and `find` to the List library at no cost.
+
 ### Largest and smallest
 
 `max[T: Orderable](first, second) -> T` and `min[T: Orderable](first, second) -> T`
@@ -435,8 +484,8 @@ denied"`), never `strerror` text.
 
 | Module (`io/fs/…`) | Operations | Error | Variants |
 | --- | --- | --- | --- |
-| `read` | `read_text`, `fold_lines` | `ReadError` | `NotFound` `PermissionDenied` `NotADirectory` `IsADirectory` `FileTooLarge` `InvalidUtf8` `OtherOs` |
-| `write` | `write_text` | `WriteError` | `NotFound` `PermissionDenied` `AlreadyExists` `NotADirectory` `IsADirectory` `DirectoryNotEmpty` `NotARegularFile` `ReadOnlyFilesystem` `NoSpace` `FileTooLarge` `OtherOs` |
+| `read` | `read_text`, `read_bytes`, `fold_lines` | `ReadError` | `NotFound` `PermissionDenied` `NotADirectory` `IsADirectory` `FileTooLarge` `InvalidUtf8` `OtherOs` |
+| `write` | `write_text`, `write_bytes` | `WriteError` | `NotFound` `PermissionDenied` `AlreadyExists` `NotADirectory` `IsADirectory` `DirectoryNotEmpty` `NotARegularFile` `ReadOnlyFilesystem` `NoSpace` `FileTooLarge` `OtherOs` |
 | `entry` | `entry_kind`, `Entry`, `EntryKind` | `EntryError` | `PermissionDenied` `OtherOs` |
 | `list` | `list_directory` | `ListError` | `NotFound` `PermissionDenied` `NotADirectory` `InvalidUtf8` `OtherOs` |
 | `create_directory` | `create_directory`, `create_directories` | `CreateDirectoryError` | `NotFound` `PermissionDenied` `AlreadyExists` `NotADirectory` `ReadOnlyFilesystem` `NoSpace` `OtherOs` |
@@ -470,6 +519,10 @@ A caller that mixes operations writes its own error union and wraps with a
   `IsADirectory`; interrupted `open` and `read` calls are retried. A FIFO
   blocks until its writer closes. There is no size limit: reading `/dev/zero`
   exhausts memory and the allocation aborts, an infrastructure exception.
+- `read_bytes(path) -> Result[Bytes, ReadError]` reads the file as `read_text`
+  does, with the same open and read rules, errors and limits, and never fails
+  on content, so `InvalidUtf8` is not an outcome. The bytes are returned as
+  they are, NUL included.
 - `write_text(path, text) -> Result[Void, WriteError]` replaces the file
   atomically: the text goes into a new file beside the target, named
   `.blorp-tmp-<pid>-<counter>`, which is flushed and then renamed over the
@@ -503,6 +556,9 @@ A caller that mixes operations writes its own error union and wraps with a
   - writing past `RLIMIT_FSIZE` raises SIGXFSZ, which ends the process unless
     the program ignores that signal; a library does not change signal
     dispositions.
+- `write_bytes(path, data: Bytes) -> Result[Void, WriteError]` writes the bytes
+  exactly, NUL and 0xFF included, and replaces the file as `write_text` does:
+  the same atomicity, modes, limits and errors.
 - `entry_kind(path) -> Result[Option[EntryKind], EntryError]` uses `lstat`, so
   a link is never followed. A missing path, or a file used as a directory, is
   `Ok(None)`; there is no `exists` that returns a Bool. `EntryKind` is `File`,

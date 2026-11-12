@@ -13,10 +13,11 @@ done.
     `IntegerType(Int64Format)` refactor, and L1, the compiler's `UInt8` with
     deferred integer literals and the byte natives (`0bb93894d`), have
     landed. L2 pins the seed built from L1 (`blorp-seed-0bb93894dcf2`).
-  - **Next:** L3, the library: `_base`, `uint8.brp`, `bytes.brp`, and
-    `fs.read_bytes`/`write_bytes`. `LSP_PLAN.md`'s landing 6 needs only L1;
-    its console labels ride a later rotation. Its landing 8 waits for L3.
-  - **Afterwards:** L4, `String.byte_at` returns `Option[UInt8]`.
+  - **Landed:** L3, the library: `_base`, `uint8.brp`, `bytes.brp`, and
+    `read_bytes`/`write_bytes` in `io/fs/`. `LSP_PLAN.md`'s landing 6 needs
+    only L1; its console labels ride a later rotation. Its landing 8 can
+    now proceed.
+  - **Next:** L4, `String.byte_at` returns `Option[UInt8]`.
 - **Process API:** [`PROCESS_DECISIONS.md`](PROCESS_DECISIONS.md).
   - **Status:** L0 is implemented and independently reviewed; final combined
     landing gates and four-platform CI pass; L0 is published. Shared
@@ -137,6 +138,10 @@ None of these is planned yet. Each wants its own short design or brief.
     self-compile (`LSP_PLAN.md`, landing 2's measurement).
   - **`Orderable for String` is missing,** so `max` and `min`, which take any
     `Orderable`, do not take Strings.
+  - **`scripts/self-compile-cost` cannot measure a change that makes a base
+    role mandatory.** Its fixed-input workload compiles the base's library with
+    the candidate compiler, which now rejects a base without the role. UInt8
+    L3 took the fixed input from the candidate tree with an uncommitted copy.
 - **No never-returning type.** `process.brp`'s `fault` calls the `process.fault`
   native, which aborts, and then a second function that is never reached, to
   give the call every type. A never-returning builtin result, or a bottom type,

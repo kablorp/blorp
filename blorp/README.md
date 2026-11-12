@@ -339,6 +339,29 @@ false, and NaN is unequal to itself. `float` also has `abs`, `copysign`,
 digits that round-trips: `(6.5 * 2.0).to_string()` is `13` and `0.1 + 0.2`
 prints as `0.30000000000000004`.
 
+`UInt8` is an unsigned byte, 0 to 255, declared by the base and available
+everywhere. Its operations wrap and never fail, like Int's:
+
+- An integer literal takes its type from its context, so `x: UInt8 = 200`,
+  `byte + 1`, `byte == 0`, `[137, 80]` as a `List[UInt8]` and `Some(200)` where
+  an `Option[UInt8]` is expected all compile. A literal that nothing constrains
+  is `Int`. A literal outside the type is an error at the literal: `x: UInt8 =
+  300` says "300 does not fit in UInt8" and helps with "UInt8 holds 0 to 255",
+  and so does `-1`.
+- `+`, `-`, `*`, `/` and `%` wrap modulo 256, so `0 - 1` is `255` and
+  `200 + 100` is `44`. Division or remainder by zero gives 0.
+- There is no negation: `-byte` is an error that says to write `0 - byte`.
+- Nothing converts implicitly. `byte + count`, with `count` an `Int`, is a type
+  error whose help names `to_int()` and `to_uint8()`; for an `Int` local that
+  came from a lone literal it also suggests declaring `var total: UInt8 = 0`.
+- `byte.to_int()` always succeeds. `count.to_uint8()` is an `Option[UInt8]`,
+  `None` outside 0 to 255, and `text.parse_uint8()` is `parse_int` followed by
+  `to_uint8`. `byte.to_string()` and `"${byte}"` give decimal digits.
+- `UInt8` is `Equatable`, `Orderable` (so `max` and `min` work), `Hashable` and
+  has every arithmetic trait but `Negatable`. A `fixed record` may hold one.
+
+A sequence of bytes is `Bytes`, in the [`bytes` module](standard_library/README.md#bytes).
+
 `Bool` is a `fixed union` of `True` and `False`. There are no Boolean
 operators: the `bool` module's ordinary functions `not`, `and` and `or` are
 selected with `bool: not, and, or` (or `bool: Bool methods` for UFCS), and
@@ -1000,8 +1023,9 @@ The [prelude](standard_library/prelude.brp) is the only implicit import. User
 modules receive its selections: the base types, `Bool`, `Option` and `Result`
 with their constructors, the operator traits, `Equatable`, `Hashable`,
 `Stringable`, `Dict`, the console functions `print` and `print_error`, the
-generic `max` and `min` of any `Orderable`, and
-the methods of Int, Float, String and List, so `(42 + 1).to_string().length()`
+generic `max` and `min` of any `Orderable`, the conversions
+`to_uint8` and `parse_uint8`, and the methods of Int, UInt8, Float, String and
+List, so `(42 + 1).to_string().length()`
 needs no import. Other direct calls need named imports: console output is in
 the prelude, while files, processes and the environment are explicit imports.
 A user module cannot declare `print`, `print_error`, `max` or `min` ("max is
@@ -1009,8 +1033,8 @@ provided by the prelude", with the help "give this function another name").
 Selecting `print` or `print_error` from `io/console` as well is redundant but
 accepted: an import of a name already in scope enters once. A function whose
 first parameter is a String and whose name is a String method the prelude
-provides, such as `lines`, is rejected as well, with "two functions named lines
-can accept the same receiver"; give it another name. Library modules
+provides, such as `lines` or `parse_uint8`, is rejected as well, with "two
+functions named lines can accept the same receiver"; give it another name. Library modules
 receive nothing implicitly and cannot import user modules. Any module may
 import the foundation module as `_base`.
 
@@ -1110,8 +1134,8 @@ to read `settings.conf: no such file`. `json.ParseError` and the `io/process`
 errors do the same; match on the variant, never on the text.
 
 The library reads and atomically writes UTF-8 text files (`read_text`,
-`write_text`), inspects and lists directories (`entry_kind`, `list_directory`),
-creates, removes and renames entries (`create_directory`, `create_directories`,
+`write_text`) and binary files (`read_bytes`, `write_bytes`), inspects and
+lists directories (`entry_kind`, `list_directory`), creates, removes and renames entries (`create_directory`, `create_directories`,
 `remove_file`, `remove_directory`, `remove_directory_tree`, `rename`), folds
 over a file's lines a block at a time (`fold_lines`), and scopes a temporary
 directory to a callback (`with_temporary_directory`). The
@@ -1169,7 +1193,7 @@ renders pure JSON values, preserving exact numeric spelling and distinguishing
 absent object names from null. Parse errors report UTF-8 byte offsets.
 
 The library is ordinary Blorp under [`standard_library/`](standard_library/).
-`_base.brp` declares the builtin types `Int`, `Float`, `String`, `Void` and
+`_base.brp` declares the builtin types `Int`, `UInt8`, `Float`, `String`, `Void` and
 `List`, the unions `Bool`, `Option`, `Result` and `MathError`, and the
 `Equatable`, `Orderable`, `Hashable`, `Stringable` and arithmetic traits; only
 it may declare builtin types. `prelude.brp` is the implicit import, and the operation modules
