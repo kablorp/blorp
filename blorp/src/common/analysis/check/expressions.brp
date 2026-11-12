@@ -4112,37 +4112,26 @@ private pure func freeze_record_update(
     })
 
 
--- Balancing keeps the existing binary runtime operation while bounding recursive
--- consumers' depth. Its leaves still evaluate once, in written order.
-private pure func concat_checked_parts(
-    parts: List[CheckedExpr],
-    first: Int,
-    count: Int,
-    span: Span,
-) -> Result[CheckedExpr, CheckError]:
-    if count == 0:
-        Ok({ form = LiteralString(""), value_type = StringType, span = span })
-    else if count == 1:
-        match parts.get(first):
-            Some(part): Ok(part)
-            None: Err(checker_invariant(span, InvalidInferenceWorklist))
-    else:
-        left_count = count / 2
-        match parts.concat_checked_parts(first, left_count, span):
-            Err(error):
-                Err(error)
-            Ok(left):
-                match parts.concat_checked_parts(first + left_count, count - left_count, span):
-                    Err(error):
-                        Err(error)
-                    Ok(right):
-                        operation: RuntimeOperation[VariantId, TypeRef] = builtins.StringConcat
-                        call: CheckedCall = {
-                            target = RuntimeFunction(operation),
-                            operands = [ValueOperand(left), ValueOperand(right)],
-                            span = span,
-                        }
-                        Ok({ form = InvokeFunction(call), value_type = StringType, span = span })
+-- The parts joined as one left-nested chain, `(first + second) + third`, as a
+-- written `+` sum is: each part is appended to the String the earlier parts
+-- built, which only the chain holds, so it grows in place and no part but the
+-- first is ever copied. Later phases walk the chain in a loop, as they walk a
+-- long sum. Its parts evaluate once, in written order.
+private pure func concat_checked_parts(parts: List[CheckedExpr], span: Span) -> CheckedExpr:
+    match parts:
+        []:
+            { form = LiteralString(""), value_type = StringType, span = span }
+        [first, ..._]:
+            var joined = first
+            for part in parts.drop(1):
+                operation: RuntimeOperation[VariantId, TypeRef] = builtins.StringConcat
+                call: CheckedCall = {
+                    target = RuntimeFunction(operation),
+                    operands = [ValueOperand(joined), ValueOperand(part)],
+                    span = span,
+                }
+                joined = { form = InvokeFunction(call), value_type = StringType, span = span }
+            joined
 
 
 private pure func freeze_interpolated(
@@ -4174,7 +4163,7 @@ private pure func freeze_interpolated(
     _: Void ?= match failure:
         Some(error): Err(error)
         None: Ok(void)
-    checked.concat_checked_parts(0, checked.length(), span)
+    Ok(checked.concat_checked_parts(span))
 
 
 -- A hole is entered with no expected type. Once frozen, a String hole is its

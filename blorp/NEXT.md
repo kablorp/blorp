@@ -75,6 +75,13 @@ done.
     longer cost time quadratic in their number.
   - **Next:** option (b), elaborating a library body only when the program
     reaches it, waits on four decisions for Keith in the plan.
+- **Cost quirks:** [`COST_QUIRKS_PLAN.md`](COST_QUIRKS_PLAN.md).
+  - **Status:** Keith approved four stacked landings on 2026-11-12: L1,
+    interpolation as one left-nested chain; L2, loop iterations ending the
+    owners they inherit at their last read; L3, stale workaround notes; and
+    Q2, emit's failure-flag loops carrying a `Result`.
+  - **Next:** land them in order. Records by value moved here and wait for
+    the records design pilot.
 
 ## Smaller follow-ups
 
@@ -136,11 +143,8 @@ None of these is planned yet. Each wants its own short design or brief.
 - **Compiler costs found while landing work:**
   - **A named lambda costs one allocation per call.** Binding a lambda to a
     local before passing it costs an allocation that an inline lambda does
-    not.
-  - **A plain record returned by value is heap-allocated** even when the
-    caller destructures it at once. The lexer's `SkippedLines` (`CodeLine`
-    before landing 3) costs one allocation per code line, 37,160 in the
-    self-compile (`LSP_PLAN.md`, landing 2's measurement).
+    not. Keith, 2026-11-12: not worth a change while it has one site
+    (`COST_QUIRKS_PLAN.md`, decision 3).
   - **`Orderable for String` is missing,** so `max` and `min`, which take any
     `Orderable`, do not take Strings.
   - **`scripts/self-compile-cost` cannot measure a change that makes a base
