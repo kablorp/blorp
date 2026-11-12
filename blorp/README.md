@@ -21,7 +21,7 @@ working on the compiler are in [AGENTS.md](AGENTS.md).
 Every command runs from the repository root.
 
 ```sh
-make -C blorp                  # build blorp/build/blorp from the pinned seed
+make -C blorp                  # build blorp/build/blorp and blorp/build/blorp-test from the seed
 make -C blorp example          # compile, build and run test/e2e/fixtures/return/zero.brp
 ```
 
@@ -50,14 +50,16 @@ C and leaves an existing output file as it was. Programs that use Float need
 `-lm`. `BLORP_CC` selects the C compiler `make` uses (default `clang`).
 
 ```sh
-make -C blorp test             # build the diagnostic compiler, run components and e2e
-make -C blorp test-e2e         # e2e only, with the compiler already built
+make -C blorp test             # build the test compiler, run components and e2e
+make -C blorp test-e2e         # e2e only, with the test compiler already built
 make -C blorp test-target-components TARGET_COMPONENT_SOURCES=blorp/test/unit/test_common/test_utils/test_text.brp
 make -C blorp test INSTRUCTION_CHECK=on   # macOS: also hold retired-instruction ceilings
 ```
 
-`make -C blorp test` links the compiler with memory diagnostics and runs the
-component suites and native end-to-end cases. [`AGENTS.md`](AGENTS.md) owns
+`make -C blorp test` links the test compiler, `blorp/build/blorp-test` (the C of
+`blorp/build/blorp` with memory diagnostics), and runs the component suites and
+native end-to-end cases with it. Every test target runs that build, and
+`make -C blorp compiler` links it too. [`AGENTS.md`](AGENTS.md) owns
 the test layout and gates; [Tests](#tests) describes `TestSuite`.
 
 ### Formatting

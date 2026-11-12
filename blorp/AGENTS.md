@@ -104,8 +104,9 @@ bash blorp/test/tooling/test_bootstrap.sh   # bootstrap resolver and Makefile re
 bash benchmarks/bench.sh <name>           # cross-language speed table (see benchmarks/README.md)
 ```
 
-Run `blorp/build/blorp format <files>` on the `.brp` files you changed
-before committing them; `make -C blorp test` fails on any unformatted file.
+Run `blorp/build/blorp format <files>`, which `make -C blorp compiler` builds,
+on the `.brp` files you changed before committing them; `make -C blorp test`
+fails on any unformatted file.
 Do not run `blorp format blorp`: it would rewrite the generated, unformatted
 `blorp/build/generated/embedded_library.brp`.
 
@@ -136,11 +137,13 @@ enforces which directory may import which, and fails for a `.brp` file under
 [test/test_grammar/](test/test_grammar/) and change with the EBNF.
 Target component suites declare an ordinary `TESTS: TestSuite` constant in the
 suite file itself.
-`make -C blorp test` builds Blorp, runs the explicit component selection
+`make -C blorp test` builds the test compiler, `blorp/build/blorp-test`
+(memory diagnostics on), runs the explicit component selection
 (`COMPONENT_SOURCES` in [test/e2e/self_hosted.brp](test/e2e/self_hosted.brp))
 through its ordinary TestSuite entries, and runs the self-hosted native
 e2e selection. `test-target-components` runs that selection
-with an already-built Blorp compiler; `TARGET_COMPONENT_SOURCES=<paths>` makes
+with the already-built test compiler, which `make -C blorp compiler` or
+`test-compiler` links; `TARGET_COMPONENT_SOURCES=<paths>` makes
 it run exactly those suites instead. Every `test_*.brp` file under the
 test roots is selected: a full run fails before it builds anything, naming each
 file that `COMPONENT_SOURCES` does not list. Add a new suite to the list, or

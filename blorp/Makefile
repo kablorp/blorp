@@ -1,15 +1,21 @@
 BLORP_CC ?= clang
 .DEFAULT_GOAL := compiler
-# Normal and diagnostic targets share output overrides. Serialize this small
-# Makefile so `make -j compiler test-compiler` cannot race competing links.
+# compiler and test-compiler both link the test compiler, and every test target
+# runs compiled programs. Serialize this small Makefile so that `make -j` can
+# neither race two links of one file nor run two test targets at once.
 .NOTPARALLEL:
 # A generator that fails halfway must not leave a module that looks up to date.
 .DELETE_ON_ERROR:
 # Paths are relative to the repository root, where every recipe runs.
-# test-compiler links BLORP_COMPILER from BLORP_COMPILER_C;
-# scripts/blorp-fixpoint sets both per stage and links at -O0. A command-line
-# VAR=value overrides these; the environment does not (hence := and not ?=).
+# BLORP_COMPILER_C is linked at two paths, so that neither link replaces the
+# other: BLORP_COMPILER, the blorp command, without memory diagnostics, and
+# BLORP_TEST_COMPILER with them. Every test target runs BLORP_TEST_COMPILER,
+# because e2e checks the strict allocation report only a diagnostic link prints.
+# scripts/blorp-fixpoint sets BLORP_COMPILER_C and BLORP_TEST_COMPILER per
+# stage and links at -O0. A command-line VAR=value overrides these; the
+# environment does not (hence := and not ?=).
 BLORP_COMPILER := blorp/build/blorp
+BLORP_TEST_COMPILER := blorp/build/blorp-test
 BLORP_COMPILER_C := blorp/build/blorp.c
 TEST_COMPILER_FLAGS := -O0
 TEST_COMPILER_LIBRARIES := -lm -lpthread
@@ -37,8 +43,10 @@ EMBEDDED_LIBRARY := build/generated/embedded_library.brp
 
 .PHONY: compiler generate-compiler link-compiler example test format-check test-target-components test-compiler link-test-compiler test-e2e build-test-driver
 
+# Links the test compiler too, so that a test target run after `make compiler`
+# tests this C, not whatever test compiler an earlier build left.
 compiler: generate-compiler
-	@$(MAKE) --no-print-directory link-compiler
+	@$(MAKE) --no-print-directory link-compiler link-test-compiler
 
 # A pinned-seed change (bootstrap.env) or a change to the shared text helper it
 # imports rebuilds the generator too. -O1: the generator loops over every
@@ -80,7 +88,7 @@ example: compiler
 # Straight-line shell that gives the test recipes absolute tool paths.
 define RESOLVE_TEST_TOOLS
 cd ..; \
-	compiler_path="$(BLORP_COMPILER)"; \
+	compiler_path="$(BLORP_TEST_COMPILER)"; \
 	case "$$compiler_path" in /*) ;; *) compiler_path="$$PWD/$$compiler_path";; esac; \
 	if [ ! -x "$$compiler_path" ]; then \
 		printf '%s\n' 'missing Blorp test compiler; run make -C blorp test-compiler first' >&2; exit 1; \
@@ -100,7 +108,7 @@ test:
 # output. FORMAT_EXCLUDED holds the sources that are unformatted on purpose:
 # the formatter's own layout inputs, and must-fail fixtures that the parser
 # rejects (so the formatter cannot read them), whose rejections the e2e driver
-# checks. It uses the compiler already built; `make test` builds it first, and
+# checks. It uses the test compiler already built; `make test` builds it first, and
 # run alone it needs `make -C blorp test-compiler` (or `compiler`) beforehand.
 FORMAT_ROOTS := blorp/scripts blorp/src blorp/standard_library blorp/test
 FORMAT_EXCLUDED := \
@@ -150,10 +158,10 @@ test-compiler: generate-compiler
 	@$(MAKE) --no-print-directory link-test-compiler
 
 link-test-compiler:
-	@echo 'Link $(BLORP_COMPILER)'
-	@cd .. && mkdir -p "$$(dirname "$(BLORP_COMPILER)")" \
+	@echo 'Link $(BLORP_TEST_COMPILER)'
+	@cd .. && mkdir -p "$$(dirname "$(BLORP_TEST_COMPILER)")" \
 		&& "$(BLORP_CC)" $(TEST_COMPILER_FLAGS) -DBLORP_MEMORY_DIAGNOSTICS=1 \
-			"$(BLORP_COMPILER_C)" -o "$(BLORP_COMPILER)" $(TEST_COMPILER_LIBRARIES)
+			"$(BLORP_COMPILER_C)" -o "$(BLORP_TEST_COMPILER)" $(TEST_COMPILER_LIBRARIES)
 
 test-e2e: build-test-driver
 	@set -eu; $(RESOLVE_TEST_TOOLS); \
