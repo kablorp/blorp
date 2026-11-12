@@ -494,6 +494,35 @@ compiler's `Path.normalize` allocates one String per component), so in a
 deep worktree both main and this branch exceed two exact ceilings that CI
 meets.
 
+**Keith's ruling, 2026-11-12: two e2e instruction ceilings reset to measured
++15% before L2.** In the L2 reproduction (fixpoint stage B as the test
+compiler), only `path_join/aliases` and `path_join/arguments` stay over once
+the recount counts eight bytes per step, by 0.14% to 0.6%. Neither ceiling
+had the harness's 15% margin: UInt8 L3 had scaled both by its own growth, so
+whatever margin they had before carried over unchanged. Main's own test
+compiler, without the recount, measured them at:
+
+| Program | Old ceiling | Main's median (5 strict runs at `95f37e437`) | New ceiling |
+| --- | --- | --- | --- |
+| `path_join/aliases` | 570,000,000 | 569,342,696 | 654,744,100 |
+| `path_join/arguments` | 574,758,593 | 573,717,398 | 659,775,008 |
+
+One `arguments` run on main already measured 574,858,510, over its old
+ceiling. The new ceilings are main's medians plus 15%, set in their own
+commit before L2, so L2 still raises no ceiling. The samples are under
+`build/measurements/string-recount-l2-probe-2026-11-12/` in the main
+checkout.
+
+**Coordinator correction, same day: `path_parent/edges` 576,844,537 →
+659,963,073.** A third stage-B run took it 0.15% over (577,734,836). L3 had
+scaled it the same way, and main measures it at a median of 573,880,933, only
+0.52% under its ceiling. It is the only other ceiling that both failed the
+reproduction and sits under 1% from main's cost, so the coordinator gave it
+the same reset under the standing budget delegation. The other ceilings L3
+scaled that were measured stay as they are, because all pass the
+reproduction: `path_normalize/edges` sits 1.47% under its ceiling, `fs/write`
+3.6%, `string_slice/bounds` 9.7% and `uint8/values` 18.3%.
+
 ## Landings
 
 1. **S0, a spike** that never lands (done). It measured the stored count's
