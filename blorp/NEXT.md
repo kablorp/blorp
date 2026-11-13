@@ -150,9 +150,9 @@ None of these is planned yet. Each wants its own short design or brief.
 - **Peak heap is in the pinned seed** (`blorp-seed-d62b0aacb2f1`, rotated
   2026-11-13 with the process plan's L4). A diagnostic build's strict run
   ends with `blorp: peak heap: N bytes`, and `scripts/self-compile-cost` now
-  reports the compiler's peak. Still to do: compiles in the e2e driver use
-  `positive_allocations` and `compile_allocations` goes, and plans check
-  peak heap ceilings from the script's table.
+  reports the compiler's peak. The e2e driver requires the line from every
+  compile (`positive_allocations`). Plans can set peak heap ceilings from the
+  script's table.
 - **`scripts/self-compile-cost` leaves its worktrees behind when killed.** The
   next run with the same revisions then fails because
   `build/self-compile-cost/<label>/worktree-*` already exists.
