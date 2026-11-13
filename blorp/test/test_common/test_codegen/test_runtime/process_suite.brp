@@ -24,6 +24,14 @@ import:
         decode_system_call_error,
         find_program,
         output,
+    io/terminal:
+        RunError,
+        RunExit,
+        TerminalCommand,
+        decode_run_error,
+        decode_run_exit,
+        run,
+        terminal_command,
     list: List methods
     option: Option methods
     path: Path, PathError, to_path
@@ -43,7 +51,9 @@ import:
         PROCESS_LAUNCH_RUNTIME,
         PROCESS_FIND_PROGRAM_RUNTIME,
         PROCESS_FAULT_RUNTIME,
+        PROCESS_EXIT_INTERRUPTED_RUNTIME,
         process_capture_runtime,
+        process_run_runtime,
     ../../../../src/common/codegen/runtime/string: string_runtime
     ../../../../src/common/codegen/specialize/specialize: TypeRef(StringType)
     ../../../driver/file_access: make_directories, path_of, read_file, write_file
@@ -75,8 +85,10 @@ private func child_ready(c_compiler: String, directory: String) -> Result[Path, 
         + PROCESS_HELPERS_RUNTIME
         + PROCESS_LAUNCH_RUNTIME
         + process_capture_runtime(list_c_type(key))
+        + process_run_runtime(list_c_type(key))
         + PROCESS_FIND_PROGRAM_RUNTIME
         + PROCESS_FAULT_RUNTIME
+        + PROCESS_EXIT_INTERRUPTED_RUNTIME
     )
     written: Void ?= write_file(directory + "/process_runtime.c", fragments)
     source: String ?= read_file(
@@ -120,12 +132,24 @@ private func reported(result: Result[Void, String]) -> Bool:
 
 
 -- The probe runs as the program's own path, given `mode`, its own path again,
--- which the probe launches, and a path it may create.
-private func native_probe(child: Path, directory: String, mode: String) -> Result[Void, String]:
+-- which the probe launches, and a path it may create. It prints `printed` to its
+-- stdout, a pipe here, and nothing else. A probe that allocates nothing itself
+-- reports no allocations, as the terminal probe's sessions are other processes.
+private func native_probe_printing(
+    child: Path,
+    directory: String,
+    mode: String,
+    printed: String,
+    allocates: Bool,
+) -> Result[Void, String]:
     probe = child_command(child, [mode, "${child}", directory + "/" + mode])
     ran ?= run_expecting(mode, { probe | environment = strict_leak_check() }, 0)
-    _ ?= expect_text(ran.stdout, "")
-    verify_accounting(ran.stderr, True)
+    _ ?= expect_text(ran.stdout, printed)
+    verify_accounting(ran.stderr, allocates)
+
+
+private func native_probe(child: Path, directory: String, mode: String) -> Result[Void, String]:
+    native_probe_printing(child, directory, mode, "", True)
 
 
 -- The capture tests render every outcome as text, independently of the
@@ -188,8 +212,8 @@ private pure func child_command(child: Path, arguments: List[String]) -> Command
     }
 
 
-private func captured_as(run: Command, expected: String) -> Result[Void, String]:
-    capture(run)
+private func captured_as(invocation: Command, expected: String) -> Result[Void, String]:
+    capture(invocation)
         .outcome()
         .expect_text(expected)
 
@@ -702,6 +726,261 @@ private func capture_tests(child: Path, directory: String) -> List[(String, () -
     ]
 
 
+-- run shares each Exited and Signaled with capture's Exit, so the variants of
+-- RunExit and RunError are written with their type.
+private pure func run_exit_text(ended: RunExit) -> String:
+    match ended:
+        RunExit.Exited(status): "Exited(${status})"
+        RunExit.Signaled(signal): "Signaled(${signal})"
+
+
+private pure func run_error_text(error: RunError) -> String:
+    match error:
+        RunError.InvalidVariableName(name): "InvalidVariableName(${name})"
+        RunError.ContainsNul: "ContainsNul"
+        RunError.LaunchFailed(cause): "LaunchFailed(${cause.cause_text()})"
+        RunError.NotExecutable: "NotExecutable"
+        RunError.DirectoryFailed(cause): "DirectoryFailed(${cause.cause_text()})"
+
+
+-- The fixture child prints nothing in these cases, so the driver's terminal stays
+-- quiet; each reports what it found as its status.
+private pure func terminal_child(child: Path, arguments: List[String]) -> TerminalCommand:
+    { terminal_command(child, arguments) | environment = without_diagnostics() }
+
+
+private func ran_as(invocation: TerminalCommand, expected: String) -> Result[Void, String]:
+    text = match run(invocation):
+        Ok(ended): ended.run_exit_text()
+        Err(error): error.run_error_text()
+    expect_text(text, expected)
+
+
+private func run_exits_case(child: Path) -> Result[Void, String]:
+    _ ?= terminal_child(child, ["exit", "0"]).ran_as("Exited(0)")
+    _ ?= terminal_child(child, ["exit", "23"]).ran_as("Exited(23)")
+    _ ?= terminal_child(child, ["exit", "127"]).ran_as("Exited(127)")
+    _ ?= terminal_child(child, ["signal"]).ran_as("Signaled(15)")
+    terminal_child(child, ["argv", "", "two words", "literal*$;'", "café"]).ran_as("Exited(0)")
+
+
+-- A run child in this suite must not read stdin: it would get the driver's.
+private func run_environment_case(child: Path) -> Result[Void, String]:
+    set = without_diagnostics()
+        .set("BLORP_RUN_SET", Some("one=two"))
+        .set("HOME", None)
+    _ ?= { terminal_child(child, ["env-equals", "BLORP_RUN_SET", "one=two"]) | environment = set }.ran_as(
+        "Exited(0)",
+    )
+    _ ?= { terminal_child(child, ["env-unset", "HOME"]) | environment = set }.ran_as("Exited(0)")
+    -- The rest is inherited.
+    terminal_child(child, ["env-unset", "BLORP_RUN_SET"]).ran_as("Exited(0)")
+
+
+private func run_rejection_case(directory: String) -> Result[Void, String]:
+    missing ?= path_of(directory + "/no-such-program")
+    _ ?= { terminal_command(missing, []) | environment = { "" => Some("x") } }.ran_as(
+        "InvalidVariableName()",
+    )
+    _ ?= { terminal_command(missing, []) | environment = { "A=B" => None } }.ran_as(
+        "InvalidVariableName(A=B)",
+    )
+    _ ?= terminal_command(missing, ["a\0b"]).ran_as("ContainsNul")
+    _ ?= { terminal_command(missing, []) | environment = { "NAME" => Some("a\0b") } }.ran_as(
+        "ContainsNul",
+    )
+    { terminal_command(missing, []) | environment = { "NA\0ME" => None } }.ran_as("ContainsNul")
+
+
+private func run_directory_case(child: Path, directory: String) -> Result[Void, String]:
+    place = directory + "/run-place"
+    _ ?= make_directories(place)
+    _ ?= write_file(place + "/marker.txt", "marked\n")
+    place_path ?= path_of(place)
+    _ ?= { terminal_child(child, ["file-exists", "marker.txt"]) | directory = Some(place_path) }.ran_as(
+        "Exited(0)",
+    )
+    missing ?= path_of(directory + "/run-missing")
+    _ ?= { terminal_child(child, []) | directory = Some(missing) }.ran_as(
+        "DirectoryFailed(NotFound)",
+    )
+    inside_file ?= path_of(place + "/marker.txt")
+    { terminal_child(child, []) | directory = Some(inside_file) }.ran_as(
+        "DirectoryFailed(NotADirectory)",
+    )
+
+
+private func run_launch_case(child: Path, directory: String) -> Result[Void, String]:
+    missing ?= path_of(directory + "/run-missing-program")
+    _ ?= terminal_command(missing, []).ran_as("LaunchFailed(NotFound)")
+    plain = directory + "/run-plain-file"
+    _ ?= write_file(plain, "not a program\n")
+    plain_file ?= path_of(plain)
+    _ ?= terminal_command(plain_file, []).ran_as("LaunchFailed(PermissionDenied)")
+    script = directory + "/run-invalid-executable"
+    _ ?= child_command(child, ["invalid-executable", script]).captured_as("Exited(0) [] []")
+    script_file ?= path_of(script)
+    terminal_command(script_file, []).ran_as("NotExecutable")
+
+
+private pure func decoded_run_exit_text(code: Int) -> String:
+    match decode_run_exit(code):
+        Some(ended): ended.run_exit_text()
+        None: "None"
+
+
+-- The native never sends the kind that means a timeout, since run has no deadline.
+private pure func test_run_exit_decoder_maps_two_kinds() -> Bool:
+    cases_hold([
+        (decoded_run_exit_text(0), "Exited(0)"),
+        (decoded_run_exit_text(23), "Exited(23)"),
+        (decoded_run_exit_text(255), "Exited(255)"),
+        (decoded_run_exit_text(256 + 2), "Signaled(2)"),
+        (decoded_run_exit_text(256 + 15), "Signaled(15)"),
+        (decoded_run_exit_text(512), "None"),
+        (decoded_run_exit_text(768), "None"),
+        (decoded_run_exit_text(0 - 1), "None"),
+    ])
+
+
+private pure func decoded_run_error_text(code: Int) -> String:
+    match decode_run_error(code):
+        Some(error): error.run_error_text()
+        None: "None"
+
+
+private pure func test_run_error_decoder_maps_every_tag_and_refuses_the_rest() -> Bool:
+    cases_hold([
+        (decoded_run_error_text(1 + 16 * 1), "LaunchFailed(NotFound)"),
+        (decoded_run_error_text(1 + 16 * (0 - 62)), "LaunchFailed(OtherOs(62))"),
+        (decoded_run_error_text(2), "NotExecutable"),
+        (decoded_run_error_text(3 + 16 * 2), "DirectoryFailed(PermissionDenied)"),
+        (decoded_run_error_text(3 + 16 * 4), "DirectoryFailed(NotADirectory)"),
+        (decoded_run_error_text(4), "ContainsNul"),
+        -- Run has no output, so the UTF-8 tags are not its to send, nor is find_program's.
+        (decoded_run_error_text(5 + 16 * 4), "None"),
+        (decoded_run_error_text(6), "None"),
+        (decoded_run_error_text(7), "None"),
+        (decoded_run_error_text(0), "None"),
+        (decoded_run_error_text(2 + 16 * 1), "None"),
+        (decoded_run_error_text(4 + 16 * 1), "None"),
+    ])
+
+
+-- The five phrases RunError shares with CaptureError are written in both modules, so this
+-- compares them as well as spelling them out.
+private pure func test_to_string_words_every_run_error() -> Bool:
+    cases: List[(RunError, CaptureError, String)] = [
+        (
+            RunError.InvalidVariableName("A=B"),
+            InvalidVariableName("A=B"),
+            "invalid environment variable name \"A=B\"; a name is nonempty and has no =",
+        ),
+        (RunError.ContainsNul, ContainsNul, "an argument or the environment contains a NUL byte"),
+        (
+            RunError.LaunchFailed(PermissionDenied),
+            LaunchFailed(PermissionDenied),
+            "permission denied",
+        ),
+        (
+            RunError.NotExecutable,
+            NotExecutable,
+            "not a program the system can run; a script needs a #! line",
+        ),
+        (
+            RunError.DirectoryFailed(NotFound),
+            DirectoryFailed(NotFound),
+            "cannot enter the directory: no such file",
+        ),
+    ]
+    cases.all(pure func(case: (RunError, CaptureError, String)) -> Bool:
+        match case:
+            (error, captured, expected):
+                ("${error}" == expected)
+                    .and(error.to_string() == expected)
+                    .and("${captured}" == expected)
+    )
+
+
+private func run_tests(child: Path, directory: String) -> List[(String, () -> Bool)]:
+    [
+        (
+            "run: Exited carries 0, 23 and 127, Signaled the signal, and arguments are literal",
+            func(): reported(run_exits_case(child)),
+        ),
+        (
+            "run: the environment sets, removes and inherits variables",
+            func(): reported(run_environment_case(child)),
+        ),
+        (
+            "run: an invalid variable name and NUL are rejected before any system call",
+            func(): reported(run_rejection_case(directory)),
+        ),
+        (
+            "run: directory runs the child there, and DirectoryFailed names it",
+            func(): reported(run_directory_case(child, directory)),
+        ),
+        (
+            "run: a missing or unexecutable program is LaunchFailed, a file without #! NotExecutable",
+            func(): reported(run_launch_case(child, directory)),
+        ),
+        ("the run exit decoder maps two kinds", test_run_exit_decoder_maps_two_kinds),
+        (
+            "the run error decoder maps every tag and refuses what the native never sends",
+            test_run_error_decoder_maps_every_tag_and_refuses_the_rest,
+        ),
+        ("to_string words every run error", test_to_string_words_every_run_error),
+        (
+            "run restores SIGINT and SIGQUIT after Exited and Signaled, and the child sees them as the caller had them",
+            func(): reported(native_probe(child, directory, "run-signals")),
+        ),
+        (
+            "run: a SIGINT sent to the caller's group ends the child, and the caller survives it and reports Signaled",
+            func(): reported(native_probe(child, directory, "run-interrupt-group")),
+        ),
+        (
+            "run: what the caller printed on a pipe comes before the child's line",
+            func(): reported(
+                native_probe_printing(
+                    child,
+                    directory,
+                    "run-flush",
+                    "caller line\nchild line\n",
+                    True,
+                ),
+            ),
+        ),
+        (
+            "run with SIGCHLD ignored is LaunchFailed(OtherOs(ECHILD)) before forking",
+            func(): reported(native_probe(child, directory, "run-sigchld")),
+        ),
+        (
+            "run reports a failed fork as LaunchFailed and leaves SIGINT and SIGQUIT as they were",
+            func(): reported(native_probe(child, directory, "run-fork-failure")),
+        ),
+        (
+            "run on a pseudo-terminal: live output, a typed line, the foreground group, Ctrl-C and Ctrl-\\",
+            func(): reported(native_probe_printing(child, directory, "run-terminal", "", False)),
+        ),
+        (
+            "exit_interrupted ends the child by SIGINT with its buffered output first",
+            func(): reported(
+                native_probe_printing(
+                    child,
+                    directory,
+                    "run-exit-interrupted",
+                    "caller line\nchild buffered\n",
+                    True,
+                ),
+            ),
+        ),
+        (
+            "exit_interrupted returns when SIGINT is blocked",
+            func(): reported(native_probe(child, directory, "run-interrupt-blocked")),
+        ),
+    ]
+
+
 func suite(c_compiler: String, directory: String) -> TestSuite:
     match child_ready(c_compiler, directory):
         Err(error):
@@ -711,4 +990,7 @@ func suite(c_compiler: String, directory: String) -> TestSuite:
                 tests = [("native probe build", func(): False)],
             }
         Ok(child):
-            { description = "Process runtime", tests = capture_tests(child, directory) }
+            {
+                description = "Process runtime",
+                tests = capture_tests(child, directory).concat(run_tests(child, directory)),
+            }

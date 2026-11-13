@@ -1,11 +1,21 @@
 /* Native runtime-helper unit probe, built with unmodified production fragments. */
 #define _POSIX_C_SOURCE 200809L
+/* The pty probe needs posix_openpt and TIOCSCTTY, which glibc declares only under these;
+ * PROCESS_POSIX_PRELUDE sets them too, but after the headers below have fixed the macros. */
+#define _XOPEN_SOURCE 700
+#define _DEFAULT_SOURCE
+#if defined(__APPLE__)
+#define _DARWIN_C_SOURCE
+#endif
 #include <unistd.h>
 
 /* Only the startup-timeout probe stalls at the native exec boundary. */
 static int stall_exec = 0;
 static int exec_ready_writer = -1;
 static int probe_execve(const char *path, char *const arguments[], char *const environment[]);
+/* The run probes set this to how SIGINT and SIGQUIT must stand when the child execs, 0 for the
+ * default and 1 for ignored, which is the state a handler of the caller's must not reach. */
+static int interrupts_at_exec = -1;
 /* The group-race probe fails the parent's form of setpgid (another process's
  * pid) with the EPERM Darwin returns to the call that loses a race to create
  * the same group. */
@@ -34,6 +44,8 @@ static ssize_t probe_write(int descriptor, const void *bytes, size_t length);
 #undef fork
 #undef setpgid
 #undef execve
+#include <sys/ioctl.h>
+#include <sys/resource.h>
 
 static int probe_pipe(int ends[2]) {
     const int made = pipe(ends);
@@ -73,6 +85,17 @@ static int probe_setpgid(pid_t process, pid_t group) {
 }
 
 static int probe_execve(const char *path, char *const arguments[], char *const environment[]) {
+    if (interrupts_at_exec >= 0) {
+        const int numbers[] = {SIGINT, SIGQUIT};
+        for (size_t index = 0; index < 2; index++) {
+            struct sigaction action;
+            if (sigaction(numbers[index], NULL, &action) != 0 ||
+                action.sa_handler != (interrupts_at_exec == 1 ? SIG_IGN : SIG_DFL)) {
+                errno = EPERM;
+                return -1;
+            }
+        }
+    }
     if (stall_exec) {
         const unsigned char ready = 1;
         ssize_t written;
@@ -123,7 +146,7 @@ static uint8_t run_capture(const char *program, int count, const char *const arg
     return succeeded;
 }
 
-enum { LARGE_INPUT = 1 << 20 };
+enum { LARGE_INPUT = 1 << 20, INTERRUPT_WAIT_SECONDS = 5 };
 
 /* SIGCHLD keeps its disposition, the mask is restored, and the SIGPIPE our write
  * raised is consumed, while one already pending is left for the program. */
@@ -343,6 +366,263 @@ static int find_program_case(const char *directory) {
     return correct && skipped ? 0 : 1;
 }
 
+/* run, with the environment that keeps the child's own leak report out of this probe's stderr. */
+static uint8_t run_program(const char *program, int count, const char *const arguments[],
+                           int64_t *ended, int64_t *error) {
+    static const char *const removed[] = {"BLORP_LEAK_CHECK", "BLORP_MEMORY_STATS"};
+    struct blorp_string *program_value = blorp_string_from_bytes(program, (int64_t)strlen(program));
+    struct blorp_l_0_s *argument_list = strings(count, arguments);
+    struct blorp_l_0_s *none = strings(0, NULL);
+    struct blorp_l_0_s *environment = strings(2, removed);
+    const uint8_t succeeded = blorp_process_run(program_value, argument_list, none, environment,
+                                                ended, error);
+    blorp_list_drop_0_s(environment);
+    blorp_list_drop_0_s(none);
+    blorp_list_drop_0_s(argument_list);
+    blorp_string_release(program_value);
+    return succeeded;
+}
+
+#define RUN_EXITED(status) ((int64_t)BLORP_PROCESS_EXITED * BLORP_PROCESS_EXIT_SPAN + (status))
+#define RUN_SIGNALED(signal) ((int64_t)BLORP_PROCESS_SIGNALED * BLORP_PROCESS_EXIT_SPAN + (signal))
+
+enum { DISPOSITION_DEFAULT = 0, DISPOSITION_IGNORED = 1, DISPOSITION_OTHER = 2 };
+
+static int disposition_of(int signal_number) {
+    struct sigaction action;
+    if (sigaction(signal_number, NULL, &action) != 0) return DISPOSITION_OTHER;
+    if (action.sa_handler == SIG_DFL) return DISPOSITION_DEFAULT;
+    return action.sa_handler == SIG_IGN ? DISPOSITION_IGNORED : DISPOSITION_OTHER;
+}
+
+static void nothing(int signal_number) { (void)signal_number; }
+
+/* Sets SIGINT and SIGQUIT to `handler`; returns whether both calls worked. */
+static int set_interrupts(void (*handler)(int)) {
+    struct sigaction action;
+    memset(&action, 0, sizeof action);
+    action.sa_handler = handler;
+    return sigemptyset(&action.sa_mask) == 0 && sigaction(SIGINT, &action, NULL) == 0 &&
+           sigaction(SIGQUIT, &action, NULL) == 0;
+}
+
+/* A harness started in the background by a non-interactive shell (`&`) hands its children
+ * SIGINT and SIGQUIT ignored. The probes that read how the signals stand begin from the
+ * defaults, so they do not depend on how they were started. */
+static int start_from_defaults(void) { return set_interrupts(SIG_DFL); }
+
+/* SIGINT and SIGQUIT are restored after Exited and after Signaled, whatever they were: default,
+ * ignored (which the child then inherits) or a handler (which must not run in the child: both
+ * stand at the default from the fork until exec, which probe_execve checks). The child reports how it sees them as its status: 1 for SIGINT ignored and
+ * 2 for SIGQUIT. Each case ends by restoring the defaults. */
+static int run_signals(const char *program) {
+    const char *const observe[] = {"observe-signals"};
+    const char *const terminate[] = {"signal"};
+    int64_t ended = -1, error = 0;
+    interrupts_at_exec = 0;
+    int correct = start_from_defaults() && disposition_of(SIGINT) == DISPOSITION_DEFAULT &&
+                  disposition_of(SIGQUIT) == DISPOSITION_DEFAULT;
+    correct = correct && run_program(program, 1, observe, &ended, &error) && ended == RUN_EXITED(0) &&
+              disposition_of(SIGINT) == DISPOSITION_DEFAULT &&
+              disposition_of(SIGQUIT) == DISPOSITION_DEFAULT;
+    correct = correct && run_program(program, 1, terminate, &ended, &error) &&
+              ended == RUN_SIGNALED(SIGTERM) && disposition_of(SIGINT) == DISPOSITION_DEFAULT &&
+              disposition_of(SIGQUIT) == DISPOSITION_DEFAULT;
+    interrupts_at_exec = 1;
+    correct = correct && set_interrupts(SIG_IGN);
+    correct = correct && run_program(program, 1, observe, &ended, &error) && ended == RUN_EXITED(3) &&
+              disposition_of(SIGINT) == DISPOSITION_IGNORED &&
+              disposition_of(SIGQUIT) == DISPOSITION_IGNORED;
+    correct = correct && run_program(program, 1, terminate, &ended, &error) &&
+              ended == RUN_SIGNALED(SIGTERM) && disposition_of(SIGINT) == DISPOSITION_IGNORED &&
+              disposition_of(SIGQUIT) == DISPOSITION_IGNORED;
+    interrupts_at_exec = 0;
+    correct = correct && set_interrupts(nothing);
+    correct = correct && run_program(program, 1, observe, &ended, &error) && ended == RUN_EXITED(0) &&
+              disposition_of(SIGINT) == DISPOSITION_OTHER &&
+              disposition_of(SIGQUIT) == DISPOSITION_OTHER;
+    interrupts_at_exec = -1;
+    return set_interrupts(SIG_DFL) && correct ? 0 : 1;
+}
+
+/* Ctrl-C without a terminal: the child sends SIGINT to its own group, which is this
+ * process's, so it reaches this process too. The call survives it, reports the child's
+ * Signaled, and restores SIGINT. */
+static int run_interrupt_group(const char *program) {
+    const char *const arguments[] = {"interrupt-group"};
+    int64_t ended = -1, error = 0;
+    if (!start_from_defaults()) return 1;
+    const uint8_t succeeded = run_program(program, 1, arguments, &ended, &error);
+    return succeeded && ended == RUN_SIGNALED(SIGINT) &&
+           disposition_of(SIGINT) == DISPOSITION_DEFAULT &&
+           disposition_of(SIGQUIT) == DISPOSITION_DEFAULT ? 0 : 1;
+}
+
+/* What this process printed, still buffered because stdout is a pipe, comes before what the
+ * child prints. The driver compares the pipe's contents. */
+static int run_flush(const char *program) {
+    const char *const arguments[] = {"print-line"};
+    int64_t ended = -1, error = 0;
+    if (fputs("caller line\n", stdout) == EOF) return 1;
+    return run_program(program, 1, arguments, &ended, &error) && ended == RUN_EXITED(0) ? 0 : 1;
+}
+
+/* P11: a child that calls exit_interrupted with output still buffered is Signaled(SIGINT),
+ * and its output arrives after the caller's. */
+static int run_exit_interrupted(const char *program) {
+    const char *const arguments[] = {"exit-interrupted"};
+    int64_t ended = -1, error = 0;
+    if (fputs("caller line\n", stdout) == EOF) return 1;
+    return run_program(program, 1, arguments, &ended, &error) && ended == RUN_SIGNALED(SIGINT) ? 0 : 1;
+}
+
+/* exit_interrupted cannot end a process that has SIGINT blocked: the native returns, so the
+ * library's caller can exit 130 itself. The child blocks SIGINT and reports through its status. */
+static int run_interrupt_blocked(const char *program) {
+    const char *const arguments[] = {"interrupt-blocked"};
+    int64_t ended = -1, error = 0;
+    return run_program(program, 1, arguments, &ended, &error) && ended == RUN_EXITED(0) ? 0 : 1;
+}
+
+/* SIGCHLD ignored is LaunchFailed(OtherOs(ECHILD)), decided before forking. */
+static int run_sigchld(const char *program) {
+    struct sigaction original, changed;
+    memset(&changed, 0, sizeof changed);
+    changed.sa_handler = SIG_IGN;
+    if (sigemptyset(&changed.sa_mask) != 0 || sigaction(SIGCHLD, &changed, &original) != 0) return 1;
+    const char *const arguments[] = {"exit", "0"};
+    int64_t ended = -1, error = 0;
+    if (!start_from_defaults()) return 1;
+    const int forks = fork_count;
+    const uint8_t succeeded = run_program(program, 2, arguments, &ended, &error);
+    if (sigaction(SIGCHLD, &original, NULL) != 0) return 1;
+    const int64_t expected = blorp_process_error(-(int64_t)ECHILD, BLORP_PROCESS_LAUNCH_FAILED);
+    return !succeeded && error == expected && fork_count == forks &&
+           disposition_of(SIGINT) == DISPOSITION_DEFAULT ? 0 : 1;
+}
+
+/* A failed fork is LaunchFailed, and leaves SIGINT and SIGQUIT as they were. */
+static int run_fork_failure(const char *program) {
+    const char *const arguments[] = {"exit", "0"};
+    int64_t ended = -1, error = 0;
+    if (!start_from_defaults()) return 1;
+    fork_failure = ENOSPC;
+    const uint8_t failed = run_program(program, 2, arguments, &ended, &error);
+    fork_failure = 0;
+    return !failed && error == blorp_process_error(-(int64_t)ENOSPC, BLORP_PROCESS_LAUNCH_FAILED) &&
+           disposition_of(SIGINT) == DISPOSITION_DEFAULT &&
+           disposition_of(SIGQUIT) == DISPOSITION_DEFAULT && no_child() ? 0 : 1;
+}
+
+/* The session of the pty probe: runs `mode` of the child on this terminal and reports how it
+ * ended and how SIGINT and SIGQUIT stand afterwards. */
+static int run_session(const char *program, const char *mode) {
+    const char *const arguments[] = {mode};
+    int64_t ended = -1, error = 0;
+    if (!run_program(program, 1, arguments, &ended, &error)) {
+        printf("parent: failed %lld\n", (long long)error);
+        return fflush(stdout) == 0 ? 1 : 2;
+    }
+    printf("parent: %s(%lld)\n", ended / BLORP_PROCESS_EXIT_SPAN == BLORP_PROCESS_EXITED ? "Exited" : "Signaled",
+           (long long)(ended % BLORP_PROCESS_EXIT_SPAN));
+    printf("parent: SIGINT %s, SIGQUIT %s\n",
+           disposition_of(SIGINT) == DISPOSITION_DEFAULT ? "default" : "changed",
+           disposition_of(SIGQUIT) == DISPOSITION_DEFAULT ? "default" : "changed");
+    return fflush(stdout) == 0 ? 0 : 2;
+}
+
+/* A session on a pseudo-terminal: a new session whose controlling terminal is the pty, running
+ * this program in `run-session` mode. Linux makes the pty the controlling terminal when the
+ * session leader opens it; Darwin only on TIOCSCTTY, which Linux accepts again as a no-op. */
+enum { TERMINAL_LOG = 8192, TERMINAL_STEP_MS = 5000 };
+
+struct terminal_session {
+    int master;
+    pid_t leader;
+    char log[TERMINAL_LOG];
+    size_t used;
+};
+
+static int terminal_start(struct terminal_session *session, const char *program, const char *mode) {
+    session->used = 0;
+    session->log[0] = '\0';
+    session->master = posix_openpt(O_RDWR | O_NOCTTY);
+    if (session->master < 0 || grantpt(session->master) != 0 || unlockpt(session->master) != 0) return 1;
+    const char *name = ptsname(session->master);
+    if (name == NULL) return 1;
+    session->leader = fork();
+    if (session->leader == 0) {
+        if (setsid() < 0) _exit(120);
+        const int slave = open(name, O_RDWR);
+        if (slave < 0) _exit(121);
+#ifdef TIOCSCTTY
+        if (ioctl(slave, TIOCSCTTY, 0) != 0) _exit(122);
+#endif
+        if (dup2(slave, STDIN_FILENO) < 0 || dup2(slave, STDOUT_FILENO) < 0 ||
+            dup2(slave, STDERR_FILENO) < 0) _exit(123);
+        if (slave > STDERR_FILENO && close(slave) != 0) _exit(124);
+        char *const arguments[] = {(char *)program, "run-session", (char *)program, (char *)mode, NULL};
+        execv(program, arguments);
+        _exit(125);
+    }
+    return session->leader < 0;
+}
+
+/* Reads the terminal until the log holds `text`; a step that makes no progress for
+ * TERMINAL_STEP_MS fails, so a hung session cannot hang the probe. */
+static int terminal_expect(struct terminal_session *session, const char *text) {
+    while (strstr(session->log, text) == NULL) {
+        struct pollfd ready = {session->master, POLLIN, 0};
+        if (poll(&ready, 1, TERMINAL_STEP_MS) <= 0) return 1;
+        const ssize_t got = read(session->master, session->log + session->used,
+                                 TERMINAL_LOG - 1 - session->used);
+        if (got <= 0) return 1;
+        session->used += (size_t)got;
+        session->log[session->used] = '\0';
+    }
+    return 0;
+}
+
+static int terminal_type(struct terminal_session *session, const char *keys) {
+    return write(session->master, keys, strlen(keys)) == (ssize_t)strlen(keys) ? 0 : 1;
+}
+
+/* Reaps the session, and always kills its group first on failure, so no path leaves a child. */
+static int terminal_finish(struct terminal_session *session, int failed) {
+    if (failed) (void)kill(-session->leader, SIGKILL);
+    int status = 0;
+    while (waitpid(session->leader, &status, 0) < 0 && errno == EINTR) {}
+    const int ended = WIFEXITED(status) && WEXITSTATUS(status) == 0;
+    return close(session->master) == 0 && ended && !failed ? 0 : 1;
+}
+
+static int terminal_case(const char *program, const char *mode, const char *keys,
+                         const char *awaited, const char *const expected[]) {
+    struct terminal_session session;
+    if (terminal_start(&session, program, mode) != 0) return 1;
+    int failed = awaited != NULL && terminal_expect(&session, awaited);
+    failed = failed || (keys != NULL && terminal_type(&session, keys));
+    for (int index = 0; !failed && expected[index] != NULL; index++) {
+        failed = terminal_expect(&session, expected[index]);
+    }
+    return terminal_finish(&session, failed);
+}
+
+/* What a user does on a terminal: types a line the child reads, which shows live output and
+ * a child in the terminal's foreground group, then presses Ctrl-C and Ctrl-\. */
+static int run_terminal(const char *program) {
+    const char *const typed[] = {"child: second hello", "parent: Exited(0)",
+                                 "parent: SIGINT default, SIGQUIT default", NULL};
+    const char *const foreground[] = {"child: foreground", "parent: Exited(0)", NULL};
+    const char *const interrupted[] = {"parent: Signaled(2)", "parent: SIGINT default, SIGQUIT default", NULL};
+    const char *const quit[] = {"parent: Signaled(3)", "parent: SIGINT default, SIGQUIT default", NULL};
+    if (!start_from_defaults()) return 1;
+    return terminal_case(program, "live", "hello\n", "child: first", typed) == 0 &&
+           terminal_case(program, "foreground", NULL, NULL, foreground) == 0 &&
+           terminal_case(program, "wait", "\003", "child: waiting", interrupted) == 0 &&
+           terminal_case(program, "wait", "\034", "child: waiting", quit) == 0 ? 0 : 1;
+}
+
 static int child_case(int argc, char **argv) {
     if (argc < 2) return 0;
     if (strcmp(argv[1], "exit") == 0 && argc == 3) return (int)strtol(argv[2], NULL, 10);
@@ -451,6 +731,60 @@ static int child_case(int argc, char **argv) {
         fputs("err\n", stderr);
         return 7;
     }
+    /* The children of the run tests, which print nothing the driver would show: each reports
+     * what it found as its status. */
+    if (strcmp(argv[1], "env-equals") == 0 && argc == 4) {
+        const char *value = getenv(argv[2]);
+        return value != NULL && strcmp(value, argv[3]) == 0 ? 0 : 1;
+    }
+    if (strcmp(argv[1], "env-unset") == 0 && argc == 3) return getenv(argv[2]) == NULL ? 0 : 1;
+    if (strcmp(argv[1], "file-exists") == 0 && argc == 3) return access(argv[2], F_OK) == 0 ? 0 : 1;
+    /* The children of the run probes, which share the probe's terminal and group. */
+    if (strcmp(argv[1], "observe-signals") == 0) {
+        return (disposition_of(SIGINT) == DISPOSITION_IGNORED ? 1 : 0) +
+               (disposition_of(SIGQUIT) == DISPOSITION_IGNORED ? 2 : 0) +
+               (disposition_of(SIGINT) == DISPOSITION_OTHER || disposition_of(SIGQUIT) == DISPOSITION_OTHER ? 4 : 0);
+    }
+    if (strcmp(argv[1], "interrupt-group") == 0) {
+        if (kill(0, SIGINT) != 0) return 1;
+        sleep(INTERRUPT_WAIT_SECONDS);
+        return 2;
+    }
+    if (strcmp(argv[1], "print-line") == 0) return fputs("child line\n", stdout) == EOF ? 1 : 0;
+    if (strcmp(argv[1], "exit-interrupted") == 0) {
+        int64_t error = 0;
+        if (fputs("child buffered\n", stdout) == EOF) return 1;
+        (void)blorp_process_exit_interrupted(&error);
+        return 2;
+    }
+    /* With SIGINT blocked it cannot end the process: the native returns, as the library says. */
+    if (strcmp(argv[1], "interrupt-blocked") == 0) {
+        sigset_t interrupt_only;
+        int64_t error = -1;
+        if (sigemptyset(&interrupt_only) != 0 || sigaddset(&interrupt_only, SIGINT) != 0 ||
+            pthread_sigmask(SIG_BLOCK, &interrupt_only, NULL) != 0) return 1;
+        return blorp_process_exit_interrupted(&error) == BLORP_PROCESS_ERROR && error == 0 ? 0 : 1;
+    }
+    if (strcmp(argv[1], "live") == 0) {
+        char line[64];
+        if (fputs("child: first\n", stdout) == EOF || fflush(stdout) != 0) return 1;
+        while (fgets(line, sizeof line, stdin) == NULL) {
+            if (!ferror(stdin) || errno != EINTR) return 1;
+            clearerr(stdin);
+        }
+        return printf("child: second %s", line) < 0 ? 1 : 0;
+    }
+    if (strcmp(argv[1], "foreground") == 0) {
+        const int owned = tcgetpgrp(STDIN_FILENO) == getpgrp();
+        return fputs(owned ? "child: foreground\n" : "child: background\n", stdout) == EOF || !owned ? 1 : 0;
+    }
+    if (strcmp(argv[1], "wait") == 0) {
+        /* Ctrl-\ ends it with a core dump by default, which CI should not collect. */
+        const struct rlimit no_core = {0, 0};
+        if (setrlimit(RLIMIT_CORE, &no_core) != 0) return 1;
+        if (fputs("child: waiting\n", stdout) == EOF || fflush(stdout) != 0) return 1;
+        for (;;) pause();
+    }
     /* Each forces a reply the library cannot decode; the runtime aborts with the defect. */
     if (strcmp(argv[1], "bad-error-code") == 0) return (int)blorp_process_error(0, BLORP_PROCESS_NOT_ON_PATH + 2);
     if (strcmp(argv[1], "bad-exit") == 0) return (int)blorp_process_exit(BLORP_PROCESS_TIMED_OUT + 1, 0);
@@ -470,6 +804,15 @@ static int child_case(int argc, char **argv) {
         if (strcmp(argv[1], "capture-group-race") == 0) return capture_group_race(argv[2]);
         if (strcmp(argv[1], "capture-stray-report") == 0) return capture_stray_report_holder(argv[2]);
         if (strcmp(argv[1], "find-program") == 0) return find_program_case(argv[3]);
+        if (strcmp(argv[1], "run-signals") == 0) return run_signals(argv[2]);
+        if (strcmp(argv[1], "run-interrupt-group") == 0) return run_interrupt_group(argv[2]);
+        if (strcmp(argv[1], "run-flush") == 0) return run_flush(argv[2]);
+        if (strcmp(argv[1], "run-exit-interrupted") == 0) return run_exit_interrupted(argv[2]);
+        if (strcmp(argv[1], "run-sigchld") == 0) return run_sigchld(argv[2]);
+        if (strcmp(argv[1], "run-fork-failure") == 0) return run_fork_failure(argv[2]);
+        if (strcmp(argv[1], "run-terminal") == 0) return run_terminal(argv[2]);
+        if (strcmp(argv[1], "run-session") == 0) return run_session(argv[2], argv[3]);
+        if (strcmp(argv[1], "run-interrupt-blocked") == 0) return run_interrupt_blocked(argv[2]);
     }
     return 1;
 }

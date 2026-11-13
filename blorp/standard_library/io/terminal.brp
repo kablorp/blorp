@@ -1,0 +1,180 @@
+-- Run a program on this terminal: the child shares this process's standard
+-- streams and process group, so its output appears as it is written, it reads the
+-- real stdin and Ctrl-C reaches it. io/process captures a child's output instead.
+-- src/common/codegen/runtime/process.brp owns the C side, and io/_launch the
+-- protocol this module shares with io/process.
+import:
+    _base: Int, String, Void, List, Bool, Option(Some, None), Result(Ok, Err), Stringable
+    bool: Bool methods
+    dict: Dict
+    io/process: SystemCallError, decode_system_call_error
+    path: Path
+    ./_launch:
+        CONTAINS_NUL_TAG,
+        DIRECTORY_FAILED_TAG,
+        EXITED_KIND,
+        LAUNCH_FAILED_TAG,
+        NOT_EXECUTABLE_TAG,
+        SIGNALED_KIND,
+        directory_argument,
+        environment_entries,
+        fault,
+        invalid_variable_name,
+        split_error_code,
+        split_exit_code,
+
+
+-- What to run on this terminal. Build one with `terminal_command`, then change
+-- fields by record update. There is no stdin text and no timeout: the child reads
+-- the real stdin, and nothing ends it but itself or a signal.
+record TerminalCommand {
+    -- The program's path; find_program searches PATH.
+    program: Path,
+    -- Without argv[0]; each is passed literally.
+    arguments: List[String],
+    -- None runs in the parent's directory.
+    directory: Option[Path],
+    -- Some sets, None removes, and every other variable is inherited.
+    environment: Dict[String, Option[String]],
+}
+
+
+-- SIGINT, the signal Ctrl-C sends: 2 under XSI, which every supported platform
+-- follows.
+INTERRUPT_SIGNAL: Int = 2
+
+
+-- How the child ended. Each is an outcome, not an error.
+fixed union RunExit:
+    -- Its status, 0 to 255.
+    Exited(Int)
+    -- The signal number: Ctrl-C is Signaled(INTERRUPT_SIGNAL).
+    Signaled(Int)
+
+
+-- Why the program did not start: the cases of io/process's CaptureError that need no
+-- captured output.
+union RunError:
+    -- Empty, or contains "="; before any system call.
+    InvalidVariableName(String)
+    -- In an argument or the environment; before any system call.
+    ContainsNul
+    -- Exec, fork or the exec report's pipe failed.
+    LaunchFailed(SystemCallError)
+    -- ENOEXEC: a file the system cannot run, such as a script without #!.
+    NotExecutable
+    -- The child could not enter `directory`.
+    DirectoryFailed(SystemCallError)
+
+
+-- Program, arguments, then the directory as a list of zero or one element and
+-- the environment as "NAME=value" to set and "NAME" to remove. Ok holds the Exit
+-- code, which needs no text since nothing travels beside it.
+private func native_run(
+    program: String,
+    arguments: List[String],
+    directory: List[String],
+    environment: List[String],
+) -> Result[Int, Int]:
+    builtin("process.run")
+
+
+private func native_exit_interrupted() -> Result[Void, Int]:
+    builtin("process.exit_interrupted")
+
+
+pure func terminal_command(program: Path, arguments: List[String]) -> TerminalCommand:
+    { program = program, arguments = arguments, directory = None, environment = {} }
+
+
+-- The decoders below are public so that process_suite binds them to literal
+-- native codes; they are not part of the process API.
+--
+-- What run's native sends; None is anything else, which the caller faults. The
+-- native never sends the kind that means a timeout.
+pure func decode_run_exit(code: Int) -> Option[RunExit]:
+    match code.split_exit_code():
+        Some((kind, value)):
+            if kind == EXITED_KIND:
+                Some(Exited(value))
+            else if kind == SIGNALED_KIND:
+                Some(Signaled(value))
+            else:
+                None
+        None:
+            None
+
+
+pure func decode_run_error(code: Int) -> Option[RunError]:
+    (tag, detail) = code.split_error_code()
+    if tag == LAUNCH_FAILED_TAG:
+        Some(LaunchFailed(detail.decode_system_call_error()))
+    else if (tag == NOT_EXECUTABLE_TAG).and(detail == 0):
+        Some(NotExecutable)
+    else if tag == DIRECTORY_FAILED_TAG:
+        Some(DirectoryFailed(detail.decode_system_call_error()))
+    else if (tag == CONTAINS_NUL_TAG).and(detail == 0):
+        Some(ContainsNul)
+    else:
+        None
+
+
+-- Runs the program with no shell and no PATH search, on this terminal, and returns when
+-- the child has ended: every RunExit is Ok. What this process printed comes before
+-- what the child prints. SIGINT and SIGQUIT are ignored here until the child ends,
+-- so Ctrl-C ends the child and not this process. Ctrl-C is then
+-- Ok(Signaled(INTERRUPT_SIGNAL)), and Ctrl-\ Signaled(3). It ends only the current
+-- child: a caller that runs programs in turn must stop at Signaled(INTERRUPT_SIGNAL),
+-- as a shell does, and once it has cleaned up end with exit_interrupted.
+--
+-- Nothing is killed afterwards: a process the child started and left running goes on.
+-- With SIGCHLD not at its default, which only foreign code can change, the call is
+-- LaunchFailed(OtherOs(ECHILD)) before anything starts: the system would reap the
+-- child itself.
+func run(invocation: TerminalCommand) -> Result[RunExit, RunError]:
+    match invocation.environment.invalid_variable_name():
+        Some(name):
+            Err(InvalidVariableName(name))
+        None:
+            reply = native_run(
+                "${invocation.program}",
+                invocation.arguments,
+                invocation.directory.directory_argument(),
+                invocation.environment.environment_entries(),
+            )
+            match reply:
+                Ok(code):
+                    match code.decode_run_exit():
+                        Some(ended): Ok(ended)
+                        None: fault("process.run replied with the exit code ${code}")
+                Err(code):
+                    match code.decode_run_error():
+                        Some(error): Err(error)
+                        None: fault("process.run replied with the error code ${code}")
+
+
+-- Ends this process by SIGINT, as Ctrl-C would have, so that a shell running it in a
+-- loop stops too: flushes stdout and stderr, resets SIGINT to its default and raises
+-- it. For a caller whose child run reported Signaled(INTERRUPT_SIGNAL). It returns
+-- only if SIGINT cannot end the process, as when a parent left SIGINT blocked across
+-- exec; the caller then returns 130.
+func exit_interrupted() -> Void:
+    ignored = native_exit_interrupted()
+    void
+
+
+-- What happened, without the program: the phrases are those of io/process's
+-- CaptureError, written in both modules as each io/fs/ union writes its own.
+implements Stringable for RunError:
+    pure func to_string(value: Self) -> String:
+        match value:
+            InvalidVariableName(name):
+                "invalid environment variable name \"${name}\"; a name is nonempty and has no ="
+            ContainsNul:
+                "an argument or the environment contains a NUL byte"
+            LaunchFailed(cause):
+                cause.to_string()
+            NotExecutable:
+                "not a program the system can run; a script needs a #! line"
+            DirectoryFailed(cause):
+                "cannot enter the directory: ${cause}"

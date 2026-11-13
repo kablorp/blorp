@@ -31,9 +31,11 @@ done.
     never builds aborts through `process.fault`.
     L2 landed on 2026-11-11: every caller uses `capture` or `output`,
     `run_to_files` is deleted, and `Command.program` is a `Path`.
-  - **Next:** the terminal-sharing `run` (the amendment Keith approved on
-    2026-11-11, P6 to P11), then a seed rotation, then `blorp run` and
-    `blorp test` (`RUN_AND_TEST_PLAN.md`).
+    L3 is implemented: `io/terminal` (`run`, `exit_interrupted`), `io/_launch`
+    and the `process.run` and `process.exit_interrupted` natives, with no seed
+    rotation yet because the compiler does not import `io/terminal`.
+  - **Next:** a seed rotation that carries the two new labels (L4), then
+    `blorp run` and `blorp test` (`RUN_AND_TEST_PLAN.md`).
   - **Later:** binary capture after `Bytes`, and `run` with streaming.
 - **Language server (`blorp lsp`):** [`LSP_PLAN.md`](LSP_PLAN.md).
   - **Status:** the plan was written and revised on 2026-11-10 (name uses

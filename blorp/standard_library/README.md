@@ -391,8 +391,9 @@ Blorp has neither re-exports nor module-private imports, so its constants are
 public by necessity, but they are not part of the library's API. Programs should
 not import it, and it may change without notice. (`_base`, the foundation
 module, is the other underscore module, and any module may import it.) The
-decoders in the `io/fs/`, `io/environment` and `io/process` modules are public
-for the same reason: tests bind them to literal codes, and they are not API.
+decoders in the `io/fs/`, `io/environment`, `io/process` and `io/terminal` modules
+are public for the same reason: tests bind them to literal codes, and they are not API.
+`io/_launch`, which `io/process` and `io/terminal` share, is internal in the same way.
 
 ### JSON
 
@@ -713,8 +714,9 @@ pass. `run_suite_result` prints results and returns `TestCounts { passed, failed
 
 ## Process execution
 
-`io/process` runs a program, waits for it and keeps what it printed. The prelude
-and compiler source do not import it. [PROCESS_DECISIONS.md](../PROCESS_DECISIONS.md)
+`io/process` runs a program, waits for it and keeps what it printed. A program
+that should share this terminal instead, as a shell does, is `run` in `io/terminal`
+(below). The prelude and compiler source do not import either. [PROCESS_DECISIONS.md](../PROCESS_DECISIONS.md)
 records the design and its decisions.
 
 ```blorp
@@ -789,3 +791,65 @@ value, so the wrapping is a `match` or a lambda.
   followed by the child's stderr, and `DirectoryFailed(cause)` is "cannot
   enter the directory: <cause>". A `SystemCallError` is worded like the `io/fs/` errors
   words the errno.
+
+### Running a program on this terminal
+
+`io/terminal` is `run`: the child gets this process's terminal, as with
+`system(3)`, Python's `subprocess.run` and Go's `cmd.Run` with inherited descriptors.
+It is a module of its own because its `RunExit` and `RunError` use variant names
+(`Exited`, `ContainsNul`) that `io/process`'s unions already hold; a file that uses
+both qualifies one set, as `Exit.Exited(status)` beside `RunExit.Exited(status)`.
+`blorp run` and `blorp test` need exactly this: the user's program runs on the user's
+terminal and gets its Ctrl-C, and the caller survives it.
+
+```blorp
+import:
+    io/terminal:
+        INTERRUPT_SIGNAL, RunExit(Exited, Signaled), RunError, terminal_command, run, exit_interrupted
+    path: Path
+
+-- How a program that ran another one ends: the child's status, or by SIGINT
+-- itself, so that a shell running it in a loop stops too.
+func exit_status(ended: RunExit) -> Int:
+    match ended:
+        Exited(status):
+            status
+        Signaled(signal):
+            if signal == INTERRUPT_SIGNAL:
+                exit_interrupted()
+            128 + signal
+
+func run_suite(suite: Path) -> Result[RunExit, RunError]:
+    run({ terminal_command(suite, []) | environment = { "BLORP_LEAK_CHECK" => Some("strict") } })
+```
+
+- `terminal_command(program, arguments)` builds a `TerminalCommand` with the
+  `program`, `arguments`, `directory` and `environment` of a `Command`, which mean
+  the same here; there is no `stdin` text and no `timeout_ms`.
+- `run(command)` returns `Ok(Exited(status))` or `Ok(Signaled(signal))` when the
+  child ends; every `RunExit` is `Ok`. Its error is a `RunError`, `CaptureError`
+  without the UTF-8 variants, with the same checks, the same causes and the same
+  text. There is no shell and no PATH search, and a relative program is found
+  from `directory`.
+- The child keeps this process's stdin, stdout, stderr and process group, so
+  its output appears as it is written, it reads the real stdin, and Ctrl-C, Ctrl-\
+  and Ctrl-Z reach both it and this process. With no terminal (a pipe, a file, CI)
+  it reads and writes what this process would, and a signal to this process's group
+  reaches it too.
+- SIGINT and SIGQUIT are ignored in this process from just before the child starts until it
+  ends, then restored: the one disposition the process API changes. The child
+  starts with each as it was here, so one ignored by a shell's background job stays ignored. Ctrl-C
+  ends only the child, and `run` returns `Ok(Signaled(INTERRUPT_SIGNAL))`; Ctrl-\ is
+  `Signaled(3)`. A caller that runs programs in turn must stop at
+  `Signaled(INTERRUPT_SIGNAL)` as a shell does, and once it has cleaned up end with
+  `exit_interrupted`: it flushes stdout and stderr, resets SIGINT to its default
+  and raises it, so a shell loop around the caller stops as well. It returns only if
+  SIGINT cannot end the process, as when a parent left it blocked across exec; the
+  caller then returns 130. A signal sent to this process alone, such as SIGTERM, is
+  not intercepted: this process ends and the child runs on.
+- What this process printed before the call comes before what the child prints, on a
+  pipe as on a terminal: stdout and stderr are flushed before the child starts.
+  Input this process read ahead and did not consume is not the child's.
+- Nothing is killed afterwards, and there is no timeout: a process the child started
+  and left running goes on. SIGCHLD must keep its default disposition, as for
+  `capture`.

@@ -1143,7 +1143,8 @@ directory to a callback (`with_temporary_directory`). The
 operation's contract, edge cases and limits.
 
 `io/process` runs a program and captures its output (`command`, `capture`,
-`output`, `find_program`); its contract is in the
+`output`, `find_program`); `io/terminal` runs one on this terminal (`terminal_command`,
+`run`, `exit_interrupted`). Their contract is in the
 [standard library README](standard_library/README.md#process-execution).
 
 ### Tests

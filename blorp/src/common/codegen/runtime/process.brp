@@ -794,6 +794,150 @@ pure func process_capture_runtime(list_type: String) -> String:
         .concat(CAPTURE_BODY)
 
 
+-- What run needs beside the launch helpers: the caller's two dispositions. Only run
+-- calls these.
+private RUN_SUPPORT: String =
+    raw
+        |/* SIGINT and SIGQUIT as the caller had them, while run ignores them. Saving and restoring
+        | * them is exact only because a Blorp program has one thread (PROCESS_DECISIONS.md, P9). */
+        |struct blorp_process_dispositions {
+        |    struct sigaction interrupt;
+        |    struct sigaction quit;
+        |};
+        |/* Ignores both, saving how they were. Returns 0, or the errno; after a failure neither has
+        | * changed. */
+        |static int blorp_process_ignore_interrupts(struct blorp_process_dispositions *saved) {
+        |    struct sigaction ignore;
+        |    memset(&ignore, 0, sizeof ignore);
+        |    ignore.sa_handler = SIG_IGN;
+        |    if (sigemptyset(&ignore.sa_mask) != 0 || sigaction(SIGINT, &ignore, &saved->interrupt) != 0) {
+        |        return errno;
+        |    }
+        |    if (sigaction(SIGQUIT, &ignore, &saved->quit) != 0) {
+        |        const int problem = errno;
+        |        (void)sigaction(SIGINT, &saved->interrupt, NULL);
+        |        return problem;
+        |    }
+        |    return 0;
+        |}
+        |/* Sets both back to `saved`. Returns 0, or the errno of the first failure. */
+        |static int blorp_process_restore_interrupts(const struct blorp_process_dispositions *saved) {
+        |    const int interrupt = sigaction(SIGINT, &saved->interrupt, NULL) == 0 ? 0 : errno;
+        |    const int quit = sigaction(SIGQUIT, &saved->quit, NULL) == 0 ? 0 : errno;
+        |    return interrupt != 0 ? interrupt : quit;
+        |}
+        |/* What a signal is in the child until exec: ignored if the caller had it ignored, else the
+        | * default, so that a handler of the caller's never runs in the forked child. Async-signal-safe. */
+        |static int blorp_process_child_signal(int number, const struct sigaction *saved) {
+        |    if ((saved->sa_flags & SA_SIGINFO) == 0 && saved->sa_handler == SIG_IGN) {
+        |        return 0;
+        |    }
+        |    struct sigaction action;
+        |    memset(&action, 0, sizeof action);
+        |    action.sa_handler = SIG_DFL;
+        |    return sigemptyset(&action.sa_mask) == 0 && sigaction(number, &action, NULL) == 0 ? 0 : errno;
+        |}
+        |
+
+
+-- Validation, the launch and the wait. The child shares the caller's descriptors and
+-- process group, so there are no pipes, no poll loop and no group kill. SIGINT and
+-- SIGQUIT are ignored from before the fork until the child is reaped; the child
+-- starts with each as the caller had it.
+private RUN_BODY: String =
+    raw
+        |    const struct blorp_process_strings argument_strings = {arguments->values, arguments->length};
+        |    const struct blorp_process_strings directory_strings = {directory->values, directory->length};
+        |    const struct blorp_process_strings environment_strings = {environment->values, environment->length};
+        |    const char *place = NULL;
+        |    int64_t failure = blorp_process_check(program, argument_strings, directory_strings,
+        |                                          environment_strings, &place);
+        |    if (failure != 0) {
+        |        *error = failure;
+        |        return BLORP_PROCESS_ERROR;
+        |    }
+        |    struct blorp_process_launch launch;
+        |    failure = blorp_process_prepare(program, argument_strings, environment_strings, &launch);
+        |    if (failure != 0) {
+        |        *error = failure;
+        |        return BLORP_PROCESS_ERROR;
+        |    }
+        |    struct blorp_process_dispositions caller;
+        |    int report[2] = {-1, -1};
+        |    int ignoring = 0, status = 0;
+        |    pid_t child = -1;
+        |    int number = blorp_process_pipe(report);
+        |    if (number == 0) {
+        |        number = blorp_process_nonblocking(report[0]);
+        |    }
+        |    if (number == 0) {
+        |        /* What the caller printed comes before what the child prints, on a pipe as on a terminal. */
+        |        (void)fflush(stdout);
+        |        (void)fflush(stderr);
+        |        number = blorp_process_ignore_interrupts(&caller);
+        |        ignoring = number == 0;
+        |    }
+        |    if (number == 0) {
+        |        child = fork();
+        |        number = child < 0 ? errno : 0;
+        |    }
+        |    if (child == 0) {
+        |        int setup = blorp_process_child_signal(SIGINT, &caller.interrupt);
+        |        if (setup == 0) {
+        |            setup = blorp_process_child_signal(SIGQUIT, &caller.quit);
+        |        }
+        |        blorp_process_child_tail(setup, report[1], place, launch.argv, launch.envp);
+        |    }
+        |    (void)blorp_process_close(&report[1]);
+        |    if (number == 0) {
+        |        pid_t waited;
+        |        do {
+        |            waited = waitpid(child, &status, 0);
+        |        } while (waited < 0 && errno == EINTR);
+        |        number = waited == child ? 0 : errno;
+        |    }
+        |    if (ignoring) {
+        |        const int problem = blorp_process_restore_interrupts(&caller);
+        |        number = number != 0 ? number : problem;
+        |    }
+        |    /* The child is gone and the descriptor is nonblocking, so one read takes the report or
+        |     * finds none, and a descriptor an unrelated fork inherited cannot hold the call. */
+        |    int reported[2] = {0, 0};
+        |    size_t received = 0;
+        |    if (number == 0) {
+        |        number = blorp_process_read_report(&report[0], reported, &received);
+        |    }
+        |    (void)blorp_process_close(&report[0]);
+        |    blorp_process_release_launch(&launch);
+        |    if (number != 0) {
+        |        failure = blorp_process_launch_error(number);
+        |    } else if (received == sizeof reported) {
+        |        failure = blorp_process_stage_error(reported[0], reported[1]);
+        |    } else if (received != 0) {
+        |        blorp_process_defect("a partial exec report");
+        |    }
+        |    if (failure != 0) {
+        |        *error = failure;
+        |        return BLORP_PROCESS_ERROR;
+        |    }
+        |    *ended = WIFSIGNALED(status) ? blorp_process_exit(BLORP_PROCESS_SIGNALED, WTERMSIG(status))
+        |                                 : blorp_process_exit(BLORP_PROCESS_EXITED, WEXITSTATUS(status));
+        |    return BLORP_PROCESS_OK;
+        |}
+        |
+
+
+-- The emitter supplies the String-list C type from its existing typed key. The reply
+-- is the Exit code, which needs no text since nothing travels beside it.
+pure func process_run_runtime(list_type: String) -> String:
+    "\n"
+        .concat(RUN_SUPPORT)
+        .concat(
+            "uint8_t blorp_process_run(const struct blorp_string *program,${list_type} arguments,${list_type} directory,${list_type} environment,int64_t *ended,int64_t *error){\n",
+        )
+        .concat(RUN_BODY)
+
+
 -- The first absolute PATH entry, valid as UTF-8, that holds a regular file of
 -- this name the process may execute (faccessat with AT_EACCESS). A name that
 -- is empty or has a '/' is not searched for.
@@ -840,5 +984,28 @@ PROCESS_FAULT_RUNTIME: String =
         |uint8_t blorp_process_fault(const struct blorp_string *message, int64_t *error) {
         |    (void)error;
         |    blorp_process_defect(message->bytes);
+        |}
+        |
+
+
+-- Ends this process by SIGINT, as Ctrl-C would have, so that a shell running it in a loop
+-- stops too (PROCESS_DECISIONS.md, P11). It returns only if SIGINT cannot end the process,
+-- as when a parent left SIGINT blocked across exec; the library discards the error, which
+-- is the errno of the failed call, or 0 when the signal was raised and did nothing.
+PROCESS_EXIT_INTERRUPTED_RUNTIME: String =
+    raw
+        |uint8_t blorp_process_exit_interrupted(int64_t *error) {
+        |    (void)fflush(stdout);
+        |    (void)fflush(stderr);
+        |    struct sigaction default_action;
+        |    memset(&default_action, 0, sizeof default_action);
+        |    default_action.sa_handler = SIG_DFL;
+        |    int number = 0;
+        |    if (sigemptyset(&default_action.sa_mask) != 0 || sigaction(SIGINT, &default_action, NULL) != 0 ||
+        |        raise(SIGINT) != 0) {
+        |        number = errno;
+        |    }
+        |    *error = number;
+        |    return BLORP_PROCESS_ERROR;
         |}
         |

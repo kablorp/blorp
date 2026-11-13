@@ -305,7 +305,8 @@ implementation.
 
 Status: approved by Keith on 2026-11-11, with P6 to P11 decided as
 recommended, after an independent ergonomics and data-model review (an Opus
-code-reviewer: no blockers; its findings are folded in). Not implemented.
+code-reviewer: no blockers; its findings are folded in). Implemented by L3 (see its
+Done entry under Landings).
 `RUN_AND_TEST_PLAN.md`'s R0(a) asks for it: `blorp run` and `blorp test`
 need a child that shares the user's terminal. P3 deferred `run` until a
 consumer needed it; `blorp run` is that consumer. It needs no streaming,
@@ -432,7 +433,7 @@ reads and writes files does: `Exit.Exited(status)` beside
   before the fork until the child is reaped, then restored. This is the one
   disposition the process API changes, and only for the call. The child
   starts with each at its default, unless the caller had it ignored (a
-  script's background job, `nohup`), which the child then inherits, as from a
+  script's background job), which the child then inherits, as from a
   shell. A signal sent to the caller alone, such as SIGTERM, is not
   intercepted: the caller ends and the child runs on, as under `system(3)`.
   The save and restore are exact because a Blorp program has one thread;
@@ -687,6 +688,73 @@ imports `io/terminal`.
 
    Test lines are reported separately; about 350 are expected, most of them
    C probes.
+   **Done** (2026-11-12, two commits on `blorp/process-run`; the compiler
+   does not import `io/terminal`, so no rotation). Measured against the table
+   above:
+
+   | What | Ceiling | Measured |
+   | --- | --- | --- |
+   | native tables and `grammar.ebnf` | +60 | +44 (syntax 6, builtins 15, system 22 over both commits, grammar +1) |
+   | `runtime/process.brp`, commit 1 | +40 net | +56 |
+   | `runtime/process.brp`, commit 2 | +132 | +167 |
+   | `io/_launch.brp` | 120 | 115 |
+   | `io/process.brp` | -55 net | -60 |
+   | `io/terminal.brp` | 200 | 180 |
+   | self-compile allocations | +0.15% | +0.0688% (14,030,184 to 14,039,840) |
+   | self-compile retired instructions | +0.15% | +0.0249% (median of 5) |
+   | fixed-input C | identical | identical (`d0c1560513c34bfb`) |
+
+   The costs above were measured on the first tree against `86bc6b4f0`. A
+   rerun on the final tree against `01f27c350`, which already holds unrelated
+   instantiation changes, showed the fixed-input C identical
+   (`22bdf1329ee712b8`); its own-source rows (-0.24% allocations, -0.08%
+   instructions) and fixed-input instructions (+0.24%) compare against those
+   changes, not this one, so they prove nothing about L3.
+
+   Test lines for commit 2 are about 850, not 350: `process_child.c` 344
+   (the pty probe, its session and the signal probes), `process_suite.brp`
+   289, the contract tests 48, the compile cases 48, the fixtures 96 and the
+   label tests about 20. Both `runtime/process.brp` rows are over because the
+   moved code gained signatures, two structs and the shared fragment's header,
+   and commit 2 carries the child's signal reset. `ProcessLaunch` is a shared
+   fragment of its own because a fault-only program has no fs helpers for the
+   moved code to call.
+
+   **Coordinator budget correction, 2026-11-13: `runtime/process.brp`
+   commit 1 +40 → +56 net, commit 2 +132 → +167.** The coordinator asked for
+   a trim for quality, not for count: fold single-caller wrappers and cut
+   comments that restate the code. But `check`, `prepare`, `release_launch`
+   and `launch_error` each serve both `capture` and `run`, the two structs are
+   the interface those share, and the remaining comments explain signals,
+   groups and errno handling. So only two comments went. The code review then
+   added 14 lines to commit 2: the child resets SIGINT and SIGQUIT to their
+   defaults unless the caller ignores them, so a caller's handler never runs
+   in the forked child. The spike counted the moved helpers and the group
+   core, not the shared interface or that reset. Every other row, the
+   self-compile cost and the fixed-input C are within their ceilings.
+
+   The two `fault` branches of `run` cannot be reached with a real native,
+   which never replies outside the codes; the decoders' refusals are tested
+   directly, and `fault` itself by the capture suite's probe. CI log
+   timestamps mark stdout flushes, not test times. The driver's stdout is a
+   block-buffered pipe there, and `run` flushes it before each fork (P10), so
+   lines after the last `run` arrive together at exit. The macOS components
+   step took 8m29s before L3 and 8m45s with it.
+
+   A harness started in the background by a non-interactive shell (`&`) hands its
+   children SIGINT and SIGQUIT ignored, as P9 says a child inherits them. The
+   probes that read how the signals stand therefore begin by setting both to
+   their defaults, and the pty probe does the same before it starts sessions.
+
+   Manual check on Linux, which CI cannot run (it needs an interactive shell):
+   - run a small program that calls `run` on `cat` from bash;
+   - press Ctrl-Z: the shell reports the job stopped, and `fg` continues both
+     and a typed line reaches `cat`;
+   - start it with `&`: the child's read stops the job for tty input, and `fg`
+     lets a typed line through;
+   - press Ctrl-C at a prompt loop that ends with `exit_interrupted`: the loop
+     stops.
+
 4. **L4, the seed rotation.** `blorp run` makes the compiler import
    `io/terminal`, whose `process.run` label the pinned seed
    (`0bb93894dcf2`, built from UInt8 L1) does not know; it knows `capture`'s
