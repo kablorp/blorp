@@ -469,7 +469,9 @@ keeps what a later landing needs. What it found:
      Nothing calls it yet; the old label, the library and every caller are
      unchanged.
    - **A seed rotation,** shared with `PROCESS_DECISIONS.md`'s L4 rotation for
-     `process.run` if both have landed by then.
+     `process.run` if both have landed by then. **Done, 2026-11-13:** the
+     shared rotation pins `blorp-seed-d62b0aacb2f1`, which knows
+     `string.byte_at_uint8`.
    - **L4b.** `String.byte_at` points at the new label, every caller
      (about 49, the lexer included) is updated, and the old
      `string.byte_at` label is deleted. No further rotation is needed for the

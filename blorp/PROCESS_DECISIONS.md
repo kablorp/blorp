@@ -761,6 +761,12 @@ imports `io/terminal`.
    three. UInt8's L2 rotation pinned a commit without L3, so L4 is a plain
    rotation of its own that carries `process.run` and P11's label, unless a
    later rotation that includes L3 lands first.
+   - **Done, 2026-11-13.** A plain rotation. The pin names
+     `blorp-seed-d62b0aacb2f1`, which main's CI built from L3's commit
+     `d62b0aacb`. That seed also carries UInt8 L4a's `string.byte_at_uint8`
+     label, so the UInt8 plan shares this rotation. It also carries the
+     diagnostic runtime's peak heap line (`476ceef23`), so a strict run of
+     the seed-built compiler now ends with `blorp: peak heap: N bytes`.
 5. Then `RUN_AND_TEST_PLAN.md`'s CLI landing. One question for it, which
    this amendment does not decide: `blorp run` compiles the C with `capture`,
    whose child leads its own group, so Ctrl-C during that compile ends

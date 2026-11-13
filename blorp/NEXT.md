@@ -17,10 +17,10 @@ done.
     `read_bytes`/`write_bytes` in `io/fs/`. `LSP_PLAN.md`'s landing 6 needs
     only L1; its console labels ride a later rotation. Its landing 8 can
     now proceed.
-  - **Next:** L4 in two landings around a seed rotation: L4a adds the label
-    `string.byte_at_uint8` (compiler only, landed on its own); after the
-    rotation, L4b points `String.byte_at` at it (`Option[UInt8]`), updates
-    the callers and deletes the old label. See the plan's L4.
+  - **Next:** L4b. L4a's label `string.byte_at_uint8` has landed, and the
+    pinned seed knows it (`blorp-seed-d62b0aacb2f1`, shared with the
+    process plan's L4). L4b points `String.byte_at` at it (`Option[UInt8]`),
+    updates the callers and deletes the old label. See the plan's L4.
 - **Process API:** [`PROCESS_DECISIONS.md`](PROCESS_DECISIONS.md).
   - **Status:** L0 is implemented and independently reviewed; final combined
     landing gates and four-platform CI pass; L0 is published. Shared
@@ -31,11 +31,11 @@ done.
     never builds aborts through `process.fault`.
     L2 landed on 2026-11-11: every caller uses `capture` or `output`,
     `run_to_files` is deleted, and `Command.program` is a `Path`.
-    L3 is implemented: `io/terminal` (`run`, `exit_interrupted`), `io/_launch`
-    and the `process.run` and `process.exit_interrupted` natives, with no seed
-    rotation yet because the compiler does not import `io/terminal`.
-  - **Next:** a seed rotation that carries the two new labels (L4), then
-    `blorp run` and `blorp test` (`RUN_AND_TEST_PLAN.md`).
+    L3 landed on 2026-11-13: `io/terminal` (`run`, `exit_interrupted`),
+    `io/_launch`, and the `process.run` and `process.exit_interrupted`
+    natives. L4 pinned a seed that knows both labels
+    (`blorp-seed-d62b0aacb2f1`).
+  - **Next:** `blorp run` and `blorp test` (`RUN_AND_TEST_PLAN.md`).
   - **Later:** binary capture after `Bytes`, and `run` with streaming.
 - **Language server (`blorp lsp`):** [`LSP_PLAN.md`](LSP_PLAN.md).
   - **Status:** the plan was written and revised on 2026-11-10 (name uses
@@ -147,14 +147,12 @@ None of these is planned yet. Each wants its own short design or brief.
     role mandatory.** Its fixed-input workload compiles the base's library with
     the candidate compiler, which now rejects a base without the role. UInt8
     L3 took the fixed input from the candidate tree with an uncommitted copy.
-- **Peak heap rides the next seed rotation.** A diagnostic build's strict run
-  ends with `blorp: peak heap: N bytes`, but a compiler's own runtime comes
-  from the pinned seed, so `scripts/self-compile-cost` reports the compiler's
-  peak as `missing` until a seed built with the line is pinned. Whichever
-  workstream rotates next carries it, and its plan says so. After that
-  rotation, compiles in the e2e driver use `positive_allocations` and
-  `compile_allocations` goes, and plans check peak heap ceilings from the
-  script's table.
+- **Peak heap is in the pinned seed** (`blorp-seed-d62b0aacb2f1`, rotated
+  2026-11-13 with the process plan's L4). A diagnostic build's strict run
+  ends with `blorp: peak heap: N bytes`, and `scripts/self-compile-cost` now
+  reports the compiler's peak. Still to do: compiles in the e2e driver use
+  `positive_allocations` and `compile_allocations` goes, and plans check
+  peak heap ceilings from the script's table.
 - **`scripts/self-compile-cost` leaves its worktrees behind when killed.** The
   next run with the same revisions then fails because
   `build/self-compile-cost/<label>/worktree-*` already exists.
