@@ -35,6 +35,7 @@ import:
         PathOperation(KeepPath, PushPath, PopPath),
         PathBoundedness(BoundedPaths, UnboundedPaths),
         bound_instantiation_paths,
+        strong_components,
     ./model:
         BodyOwner(DeclaredBody, LambdaBody, DerivedEqualityBody),
         AggregateId(RecordAggregate, UnionAggregate),
@@ -409,59 +410,6 @@ private pure func append_dependencies(
     collected
 
 
-private pure func contains_parameter_id(
-    parameters: List[TypeParameterId],
-    requested: TypeParameterId,
-) -> Bool:
-    var found: Bool = False
-
-    for parameter in parameters:
-        if parameter == requested:
-            found = True
-            break
-
-    found
-
-
--- Whether a dependency path leads from `start` to `target`.
-private pure func parameter_reaches(
-    start: TypeParameterId,
-    target: TypeParameterId,
-    dependencies: List[ParameterDependency],
-) -> Bool:
-    var reached = [start]
-    var frontier = [start]
-
-    while (
-        frontier
-            .is_empty()
-            .not()
-    ):
-        var next: List[TypeParameterId] = []
-
-        for current in frontier:
-            for dependency in dependencies:
-                unreached_dependency: Bool = match (
-                    dependency.trait_derived
-                        .not()
-                        .and(dependency.source == current)
-                ):
-                    True:
-                        reached
-                            .contains_parameter_id(dependency.target)
-                            .not()
-                    False:
-                        False
-
-                if unreached_dependency:
-                    reached = reached.append(dependency.target)
-                    next = next.append(dependency.target)
-
-        frontier = next
-
-    reached.contains_parameter_id(target)
-
-
 private pure func automatic_origin(implementation: AcceptedImplementation) -> List[AggregateId]:
     var origin: List[AggregateId] = []
     for member in implementation.methods:
@@ -743,7 +691,7 @@ private pure func dependency_graph(dependencies: List[ParameterDependency]) -> D
         for parameter in [dependency.source, dependency.target]:
             if (
                 parameters
-                    .contains_parameter_id(parameter)
+                    .contains(parameter)
                     .not()
             ):
                 parameters = parameters.append(parameter)
@@ -802,28 +750,30 @@ private pure func bound_dependencies(graph: DependencyGraph) -> Result[PathBound
 private pure func validate_base_dependencies(
     dependencies: List[ParameterDependency],
 ) -> Result[Void, CheckError]:
+    graph = dependencies.dependency_graph()
+    -- An ordinary word holds only pushes, so an ordinary pushing edge grows its
+    -- argument, and it repeats without bound exactly when its ends share a
+    -- component of the ordinary graph, the graph without trait-derived edges.
+    components = strong_components(
+        graph.controls,
+        graph.edges
+            .filter(pure func(edge): edge.trait_derived.not())
+            .map(pure func(edge): edge.path),
+    )
     var growing: Option[Span] = None
-    for dependency in dependencies:
-        -- Ordinary substitutions contain only pushes, so a nonempty
-        -- word is exactly the original positive-growth condition.
-        if (
-            dependency.trait_derived
-                .not()
-                .and(
-                    dependency.operations
-                        .is_empty()
-                        .not()
-                        .and(dependency.target.parameter_reaches(dependency.source, dependencies)),
-                )
-        ):
-            growing = Some(dependency.span)
-            break
+    for edge in graph.edges:
+        pushes: Bool = match edge.path.operation:
+            KeepPath: False
+            PushPath(_) | PopPath(_): True
+        if pushes.and(edge.trait_derived.not()):
+            if components.get_or(edge.path.source, 0) == components.get_or(edge.path.target, 0):
+                growing = Some(edge.span)
+                break
     _: Void ?= match growing:
         Some(span): Err(recursion_error(span, GrowingRecursiveInstantiation))
         None: Ok(void)
     -- Trait-free inputs need only the existing ordinary check, not closure.
     if dependencies.any(pure func(dependency) -> Bool: dependency.trait_derived):
-        graph = dependencies.dependency_graph()
         match graph.bound_dependencies():
             Err(error):
                 Err(error)

@@ -164,6 +164,40 @@ and +178 e2e (a 166-line fixture).
 
 The fixed-input C is identical; the own-source rows grow with the source.
 
+Landing 2 adds `generic/many_bounded/equality`, forty bounded `==`
+functions, measured the same way against landing 1:
+
+| landing 2 | landing 1 | landing 2 | ceiling |
+|---|---:|---:|---:|
+| `equality`, instructions | 569.0 M | 431.4 M | 496.1 M |
+| `equality`, allocations | 123,201 | 122,408 | 140,770 |
+| `inequality`, instructions | 500.1 M | 448.5 M | 575.2 M, unchanged |
+| `effects/hello`, instructions | 384.2 M | 364.2 M | 504.2 M, unchanged |
+
+The new fixture exceeds its instruction ceiling on landing 1, 569 M
+against 496 M.
+
+**Gates, landing 2**, against landing 1, run before review simplified the
+growth loop: `make -C blorp test INSTRUCTION_CHECK=on`,
+`scripts/blorp-fixpoint --prove` and `git diff --check` pass. Output
+identity: 726 inputs, 128 of them rejections, byte-identical, including both
+growth rejections (`growth_hidden_in_constructor_child`,
+`reject_growing_unused`) with identical messages (`data/landing/g2/identity/`).
+The broken-mapping check still fails exactly landing 1's two position
+tests. Production lines -50; tests +178 e2e. Together the two landings add
+102 production lines. `blorp/scripts/self-compile-cost <landing 1>
+<landing 2> --rounds 5`:
+
+| self-compile | landing 1 | landing 2 | change |
+|---|---:|---:|---:|
+| fixed input allocations | 14,056,995 | 14,056,623 | -0.0026% |
+| fixed input instructions, median of 5 | 12,320,980,324 | 12,332,502,022 | +0.094% |
+| own source allocations | 14,056,995 | 14,054,474 | -0.018% |
+| own source instructions, median of 5 | 12,327,409,484 | 12,321,789,094 | -0.046% |
+
+The fixed-input C is identical; the instruction changes are within the
+noise of five runs on a shared machine.
+
 ## Option (b): elaborate library bodies when reached
 
 A proposal; it waits on Keith's decisions below.

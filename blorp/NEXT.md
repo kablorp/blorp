@@ -68,11 +68,11 @@ done.
 - **Library cost:** [`LIBRARY_COST_PLAN.md`](LIBRARY_COST_PLAN.md).
   - **Status:** hello's compile is about 99% standard-library work. Keith
     approved option (a) on 2026-11-12. Checking now closes instantiation
-    paths only within strongly connected components, so bounded `!=`
-    functions no longer cost time quadratic in their number.
-  - **Next:** option (a)'s second landing, deciding ordinary growth from the
-    same components. Option (b), elaborating a library body only when the
-    program reaches it, waits on four decisions for Keith in the plan.
+    paths only within strongly connected components and decides ordinary
+    growth from the same components, so bounded generic functions no
+    longer cost time quadratic in their number.
+  - **Next:** option (b), elaborating a library body only when the program
+    reaches it, waits on four decisions for Keith in the plan.
 
 ## Smaller follow-ups
 
