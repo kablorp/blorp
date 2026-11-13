@@ -6,10 +6,14 @@ import:
     ../support/text_search: find_text
 
 
--- External diagnostic format emitted by the target runtime, exactly once.
+-- External diagnostic formats emitted by the target runtime: a strict run ends
+-- with one leak check line, then one peak heap line, "blorp: peak heap: N bytes".
 private ACCOUNTING_PREFIX: String = "blorp: leak check: "
+private PEAK_PREFIX: String = "blorp: peak heap: "
+private PEAK_SUFFIX: String = " bytes\n"
 private ASCII_ZERO: Int = 48
 private ASCII_AFTER_NINE: Int = 58
+private ASCII_NEWLINE: Int = 10
 
 
 private pure func is_digit(byte: Int) -> Bool:
@@ -18,9 +22,39 @@ private pure func is_digit(byte: Int) -> Bool:
         .and(byte < ASCII_AFTER_NINE)
 
 
--- The allocation count of one complete balanced strict report: every
--- allocation released, nothing leaked, nothing else on stderr.
-pure func report_allocations(report: String) -> Result[Int, String]:
+private MISSING_PEAK: String = "expected the strict report to end with one peak heap line"
+
+
+-- What a strict run wrote before its last line, which must be one peak heap
+-- line with a count of bytes.
+pure func without_peak_heap(report: String) -> Result[String, String]:
+    start = start_of_run(
+        report,
+        report.length() - 1,
+        pure func(byte: Int): byte
+            .equals(ASCII_NEWLINE)
+            .not(),
+    )
+    before: String ?= report
+        .slice(0, start)
+        .to_result(MISSING_PEAK)
+    digits: String ?= report
+        .slice(start + PEAK_PREFIX.length(), report.length() - PEAK_SUFFIX.length())
+        .to_result(MISSING_PEAK)
+    peak: Int ?= digits
+        .parse_int()
+        .to_result(MISSING_PEAK)
+    well_formed = (peak < 0)
+        .not()
+        .and(report.equals((before + PEAK_PREFIX) + peak.to_string() + PEAK_SUFFIX))
+    if well_formed:
+        Ok(before)
+    else:
+        Err(MISSING_PEAK)
+
+
+-- The allocation count of one balanced leak check line, with nothing after it.
+private pure func leak_check_allocations(report: String) -> Result[Int, String]:
     prefix: Void ?= if report.starts_with(ACCOUNTING_PREFIX):
         Ok(void)
     else:
@@ -53,16 +87,41 @@ pure func report_allocations(report: String) -> Result[Int, String]:
         Err("expected one complete balanced allocation report with no leaks or extra stderr")
 
 
+-- The allocation count of one complete balanced strict report: every
+-- allocation released, nothing leaked, the peak heap, and nothing else on stderr.
+pure func report_allocations(report: String) -> Result[Int, String]:
+    accounting: String ?= without_peak_heap(report)
+    leak_check_allocations(accounting)
+
+
 private NOT_POSITIVE: String = "expected positive allocation accounting"
 
 
--- The count of a compile's report, which always allocates.
-pure func positive_allocations(report: String) -> Result[Int, String]:
-    count: Int ?= report_allocations(report)
+private pure func positive(count: Int) -> Result[Int, String]:
     if count.equals(0):
         Err(NOT_POSITIVE)
     else:
         Ok(count)
+
+
+-- The count of a report from a program that always allocates.
+pure func positive_allocations(report: String) -> Result[Int, String]:
+    count: Int ?= report_allocations(report)
+    positive(count)
+
+
+-- The count of a compile's report, which always allocates. The compiler's own
+-- runtime comes from the pinned seed, and a seed older than the peak heap line
+-- ends the report at the leak check line, so a report with no peak heap line
+-- counts as one; a malformed one is still rejected. Once the pinned seed prints
+-- it, compiles use positive_allocations and this goes.
+pure func compile_allocations(report: String) -> Result[Int, String]:
+    accounting: String ?= if find_text(report, PEAK_PREFIX, 0).is_some():
+        without_peak_heap(report)
+    else:
+        Ok(report)
+    count: Int ?= leak_check_allocations(accounting)
+    positive(count)
 
 
 pure func verify_accounting(report: String, require_positive: Bool) -> Result[Void, String]:

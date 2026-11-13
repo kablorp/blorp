@@ -5,16 +5,23 @@ import:
     string: String methods
     test: TestSuite
     ../driver/reports:
+        compile_allocations,
         positive_allocations,
         report_allocations,
         verify_accounting,
         parse_instructions,
         within_ceiling,
+        without_peak_heap,
+
+
+-- Every strict report ends with the peak heap line; its count is arbitrary here.
+private PEAK: String = "blorp: peak heap: 64 bytes\n"
+private SEVEN: String = "blorp: leak check: 7 allocs, 7 releases, 0 leaked, 0 bytes\n"
 
 
 pure func test_balanced_reports_respect_zero_and_positive_policies() -> Bool:
-    zero = "blorp: leak check: 0 allocs, 0 releases, 0 leaked, 0 bytes\n"
-    positive = "blorp: leak check: 7 allocs, 7 releases, 0 leaked, 0 bytes\n"
+    zero = "blorp: leak check: 0 allocs, 0 releases, 0 leaked, 0 bytes\nblorp: peak heap: 0 bytes\n"
+    positive = SEVEN + PEAK
     verify_accounting(zero, False)
         .is_ok()
         .and(
@@ -28,16 +35,29 @@ pure func test_balanced_reports_respect_zero_and_positive_policies() -> Bool:
 pure func test_malformed_unbalanced_and_extra_reports_fail() -> Bool:
     reports: List[String] = [
         "",
-        "blorp: leak check: 7 allocs, 6 releases, 0 leaked, 0 bytes\n",
-        "blorp: leak check: 7 allocs, 7 releases, 1 leaked, 8 bytes\n",
-        "blorp: leak check: 07 allocs, 07 releases, 0 leaked, 0 bytes\n",
-        "blorp: leak check: -1 allocs, -1 releases, 0 leaked, 0 bytes\n",
-        "blorp: leak check: 9223372036854775808 allocs, 9223372036854775808 releases, 0 leaked, 0 bytes\n",
-        "blorp: leak check: x allocs, x releases, 0 leaked, 0 bytes\n",
-        "blorp: leak check: 1 allocs, 1 releases, 0 leaked, 0 bytes",
-        "extra\nblorp: leak check: 1 allocs, 1 releases, 0 leaked, 0 bytes\n",
-        "blorp: leak check: 1 allocs, 1 releases, 0 leaked, 0 bytes\nextra\n",
-        "blorp: leak check: 1 allocs, 1 releases, 0 leaked, 0 bytes\nblorp: leak check: 1 allocs, 1 releases, 0 leaked, 0 bytes\n",
+        "blorp: leak check: 7 allocs, 6 releases, 0 leaked, 0 bytes\n" + PEAK,
+        "blorp: leak check: 7 allocs, 7 releases, 1 leaked, 8 bytes\n" + PEAK,
+        "blorp: leak check: 07 allocs, 07 releases, 0 leaked, 0 bytes\n" + PEAK,
+        "blorp: leak check: -1 allocs, -1 releases, 0 leaked, 0 bytes\n" + PEAK,
+        (
+            "blorp: leak check: 9223372036854775808 allocs, 9223372036854775808 releases, 0 leaked, 0 bytes\n"
+            + PEAK
+        ),
+        "blorp: leak check: x allocs, x releases, 0 leaked, 0 bytes\n" + PEAK,
+        "blorp: leak check: 1 allocs, 1 releases, 0 leaked, 0 bytes" + PEAK,
+        "extra\n" + SEVEN + PEAK,
+        SEVEN + "extra\n" + PEAK,
+        SEVEN + PEAK + "extra\n",
+        SEVEN + SEVEN + PEAK,
+        SEVEN,
+        PEAK + SEVEN,
+        SEVEN + PEAK + PEAK,
+        SEVEN + "blorp: peak heap: -1 bytes\n",
+        SEVEN + "blorp: peak heap: 064 bytes\n",
+        SEVEN + "blorp: peak heap: x bytes\n",
+        SEVEN + "blorp: peak heap:  bytes\n",
+        SEVEN + "blorp: peak heap: 64 bytes",
+        SEVEN + "blorp: peak heap: 64\n",
     ]
     reports.all(
         pure func(report: String): verify_accounting(report, False)
@@ -48,33 +68,66 @@ pure func test_malformed_unbalanced_and_extra_reports_fail() -> Bool:
 
 pure func test_a_balanced_report_names_its_allocation_count() -> Bool:
     zero = (
-        report_allocations("blorp: leak check: 0 allocs, 0 releases, 0 leaked, 0 bytes\n")
+        report_allocations(
+            "blorp: leak check: 0 allocs, 0 releases, 0 leaked, 0 bytes\nblorp: peak heap: 0 bytes\n",
+        )
         == Ok(0)
     )
     positive = (
-        report_allocations("blorp: leak check: 131100 allocs, 131100 releases, 0 leaked, 0 bytes\n")
+        report_allocations(
+            "blorp: leak check: 131100 allocs, 131100 releases, 0 leaked, 0 bytes\n" + PEAK,
+        )
         == Ok(131100)
     )
     zero.and(positive)
 
 
-pure func test_a_compile_report_must_show_positive_allocations() -> Bool:
-    positive = (
-        positive_allocations("blorp: leak check: 7 allocs, 7 releases, 0 leaked, 0 bytes\n")
-        == Ok(7)
+pure func test_a_program_report_must_show_positive_allocations() -> Bool:
+    positive = positive_allocations(SEVEN + PEAK) == Ok(7)
+    zero = positive_allocations(
+        "blorp: leak check: 0 allocs, 0 releases, 0 leaked, 0 bytes\n" + PEAK,
     )
-    zero = positive_allocations("blorp: leak check: 0 allocs, 0 releases, 0 leaked, 0 bytes\n")
         .is_ok()
         .not()
     positive.and(zero)
 
 
 pure func test_an_unbalanced_or_leaking_report_names_no_count() -> Bool:
-    report_allocations("blorp: leak check: 7 allocs, 6 releases, 0 leaked, 0 bytes\n")
+    report_allocations("blorp: leak check: 7 allocs, 6 releases, 0 leaked, 0 bytes\n" + PEAK)
         .is_ok()
         .not()
         .and(
-            report_allocations("blorp: leak check: 7 allocs, 7 releases, 1 leaked, 8 bytes\n")
+            report_allocations(
+                "blorp: leak check: 7 allocs, 7 releases, 1 leaked, 8 bytes\n" + PEAK,
+            )
+                .is_ok()
+                .not(),
+        )
+
+
+pure func test_the_peak_heap_line_is_split_from_what_came_before_it() -> Bool:
+    (without_peak_heap("out\n" + SEVEN + PEAK) == Ok("out\n" + SEVEN))
+        .and(without_peak_heap(PEAK) == Ok(""))
+        .and(
+            without_peak_heap("")
+                .is_ok()
+                .not(),
+        )
+
+
+-- A compiler runs on the pinned seed's runtime, which may predate the peak heap
+-- line, so a compile's report may end at the leak check line.
+pure func test_a_compile_report_counts_with_or_without_the_peak_heap_line() -> Bool:
+    (compile_allocations(SEVEN + PEAK) == Ok(7))
+        .and(compile_allocations(SEVEN) == Ok(7))
+        .and(
+            (
+                compile_allocations(SEVEN + "blorp: peak heap: x bytes\n")
+                == Err("expected the strict report to end with one peak heap line")
+            ),
+        )
+        .and(
+            compile_allocations("blorp: leak check: 0 allocs, 0 releases, 0 leaked, 0 bytes\n")
                 .is_ok()
                 .not(),
         )
@@ -137,12 +190,20 @@ TESTS: TestSuite = {
             test_a_balanced_report_names_its_allocation_count,
         ),
         (
-            "a compile report must show positive allocations",
-            test_a_compile_report_must_show_positive_allocations,
+            "a program report must show positive allocations",
+            test_a_program_report_must_show_positive_allocations,
         ),
         (
             "an unbalanced or leaking report names no count",
             test_an_unbalanced_or_leaking_report_names_no_count,
+        ),
+        (
+            "the peak heap line is split from what came before it",
+            test_the_peak_heap_line_is_split_from_what_came_before_it,
+        ),
+        (
+            "a compile report counts with or without the peak heap line",
+            test_a_compile_report_counts_with_or_without_the_peak_heap_line,
         ),
         (
             "the instruction counter is read from a timing report",

@@ -1,0 +1,125 @@
+import:
+    io/process: Captured
+    result: Result methods
+    string: String methods
+    test: TestSuite
+    ../../../../src/common/codegen/runtime/memory: MEMORY_RUNTIME
+    ../../../driver/file_access: write_file
+    ../../../driver/harness: isolated, run_expecting, strict_leak_check
+
+
+private COMPILE_TIMEOUT_MS: Int = 600000
+private CHILD_TIMEOUT_MS: Int = 10000
+
+
+private PROBE_SOURCE: String = "blorp/test/test_common/test_codegen/test_runtime/fixtures/peak_heap_test.c"
+
+
+-- The probe's "allocation" and "resize" modes each allocate twice and release
+-- both. The peak is the 100 and 200 bytes "allocation" holds at once, and the
+-- 400 bytes "resize" grows one allocation to.
+private TWO_BALANCED: String = "blorp: leak check: 2 allocs, 2 releases, 0 leaked, 0 bytes\n"
+private ALLOCATION_PEAK: String = "blorp: peak heap: 300 bytes\n"
+private RESIZE_PEAK: String = "blorp: peak heap: 400 bytes\n"
+
+
+private IDLE_REPORT: String =
+    |blorp: leak check: 0 allocs, 0 releases, 0 leaked, 0 bytes
+    |blorp: peak heap: 0 bytes
+    |
+
+
+private func ready(c_compiler: String, directory: String) -> Result[String, String]:
+    _ ?= write_file(directory + "/memory_runtime.c", MEMORY_RUNTIME)
+    executable = directory + "/peak_heap_probe"
+    build ?= isolated(
+        c_compiler,
+        [
+            "-std=c11",
+            "-O0",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            "-pedantic",
+            "-fsanitize=address,undefined",
+            "-fno-sanitize-recover=all",
+            "-DBLORP_MEMORY_DIAGNOSTICS=1",
+            "-I",
+            directory,
+            PROBE_SOURCE,
+            "-o",
+            executable,
+        ],
+        COMPILE_TIMEOUT_MS,
+    )
+    built ?= run_expecting("peak heap native build", build, 0)
+    if built.stderr == "":
+        Ok(executable)
+    else:
+        Err("peak heap native build: " + built.stderr)
+
+
+-- Runs the probe in `mode`, under the strict check when `strict`.
+private func run_probe(executable: String, mode: String, strict: Bool) -> Result[Captured, String]:
+    probe ?= isolated(executable, [mode], CHILD_TIMEOUT_MS)
+    if strict:
+        run_expecting("peak heap " + mode, { probe | environment = strict_leak_check() }, 0)
+    else:
+        run_expecting("peak heap " + mode, probe, 0)
+
+
+private func expect(label: String, actual: String, expected: String) -> Result[Void, String]:
+    if actual.equals(expected):
+        Ok(void)
+    else:
+        Err(label + ": expected [" + expected + "] got [" + actual + "]")
+
+
+private func outcome(executable: String, mode: String, strict: Bool, stderr: String) -> Bool:
+    checked: Result[Void, String] = match run_probe(executable, mode, strict):
+        Err(error):
+            Err(error)
+        Ok(run):
+            match expect(mode + " stdout", run.stdout, ""):
+                Err(error): Err(error)
+                Ok(_): expect(mode + " stderr", run.stderr, stderr)
+    match checked:
+        Ok(_):
+            True
+        Err(error):
+            print_error(error)
+            False
+
+
+func suite(c_compiler: String, directory: String) -> TestSuite:
+    match ready(c_compiler, directory):
+        Err(error):
+            print_error(error)
+            { description = "Peak heap setup", tests = [("native probe builds", func(): False)] }
+        Ok(executable):
+            {
+                description = "Peak heap",
+                tests = [
+                    (
+                        "an allocation that reaches the peak sets it",
+                        func(): outcome(
+                            executable,
+                            "allocation",
+                            True,
+                            TWO_BALANCED + ALLOCATION_PEAK,
+                        ),
+                    ),
+                    (
+                        "a resize that grows past the peak sets it",
+                        func(): outcome(executable, "resize", True, TWO_BALANCED + RESIZE_PEAK),
+                    ),
+                    (
+                        "a run that allocates nothing reports a zero peak",
+                        func(): outcome(executable, "idle", True, IDLE_REPORT),
+                    ),
+                    (
+                        "without the strict check the peak is not printed",
+                        func(): outcome(executable, "resize", False, ""),
+                    ),
+                ],
+            }

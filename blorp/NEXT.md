@@ -145,6 +145,17 @@ None of these is planned yet. Each wants its own short design or brief.
     role mandatory.** Its fixed-input workload compiles the base's library with
     the candidate compiler, which now rejects a base without the role. UInt8
     L3 took the fixed input from the candidate tree with an uncommitted copy.
+- **Peak heap rides the next seed rotation.** A diagnostic build's strict run
+  ends with `blorp: peak heap: N bytes`, but a compiler's own runtime comes
+  from the pinned seed, so `scripts/self-compile-cost` reports the compiler's
+  peak as `missing` until a seed built with the line is pinned. Whichever
+  workstream rotates next carries it, and its plan says so. After that
+  rotation, compiles in the e2e driver use `positive_allocations` and
+  `compile_allocations` goes, and plans check peak heap ceilings from the
+  script's table.
+- **`scripts/self-compile-cost` leaves its worktrees behind when killed.** The
+  next run with the same revisions then fails because
+  `build/self-compile-cost/<label>/worktree-*` already exists.
 - **No never-returning type.** `process.brp`'s `fault` calls the `process.fault`
   native, which aborts, and then a second function that is never reached, to
   give the call every type. A never-returning builtin result, or a bottom type,

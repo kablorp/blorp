@@ -1370,16 +1370,25 @@ clang -std=c11 -O0 -DBLORP_MEMORY_DIAGNOSTICS=1 -fsanitize=address,undefined pro
 BLORP_LEAK_CHECK=strict ./program
 ```
 
-With `BLORP_LEAK_CHECK=strict`, a diagnostic build prints one line to stderr as
-it exits, `blorp: leak check: N allocs, N releases, N leaked, N bytes`, and
-exits with status 99 unless allocations and releases balance and nothing is
-live. Any other value of `BLORP_LEAK_CHECK` is an error. Two immortal objects
-are checked too: every String literal must be back at its base reference
-count (else `blorp: leak check: unbalanced string literals: N`), and the
-shared empty List must have no owners left (else
+With `BLORP_LEAK_CHECK=strict`, a diagnostic build prints two lines to stderr
+as it exits, `blorp: leak check: N allocs, N releases, N leaked, N bytes` and
+then `blorp: peak heap: N bytes`, and exits with status 99 unless allocations
+and releases balance and nothing is live. Any other value of
+`BLORP_LEAK_CHECK` is an error. Two immortal objects are checked too: every
+String literal must be back at its base reference count (else
+`blorp: leak check: unbalanced string literals: N`), and the shared empty List
+must have no owners left (else
 `blorp: leak check: unbalanced empty list owners: N`). A diagnostic build
 frees each literal at exit, so the report counts every used literal as one
 allocation and one release.
+
+The peak heap is the most bytes the program had requested and not yet
+released at any one time, counted at each allocation and resize. It leaves out
+the runtime's header and the allocator's rounding, which differ between
+platforms and C libraries, so it depends only on what the program allocates
+and repeats exactly from run to run. Plans set peak heap ceilings on it, not
+on the process's peak memory footprint, which varies by a few percent between
+runs.
 
 ### Allocation sites
 
@@ -1419,10 +1428,13 @@ binaries at `--optimize`, default `-O2`), waiting while another session's
 compiler, fixpoint or test driver is running. For two workloads, the base's
 source compiled by both compilers (so only the compiler differs) and each
 revision's own source, it prints strict-leak-check allocations (a leak fails
-the run) and the median retired instructions of `--rounds` (default 11)
-alternating runs from `/usr/bin/time -l` or `perf stat`. It also says whether
-both compilers emit identical C for the fixed input. Raw samples stay under
-`--output`, by default `blorp/build/self-compile-cost/<base>-<candidate>/`.
+the run) and peak heap, and the median retired instructions of `--rounds`
+(default 11) alternating runs from `/usr/bin/time -l` or `perf stat`. It also
+says whether both compilers emit identical C for the fixed input. A compiler's
+own runtime comes from the pinned seed, so the peak heap reads `missing`, with
+a note, for a revision whose seed predates the peak heap line. Raw samples
+stay under `--output`, by default
+`blorp/build/self-compile-cost/<base>-<candidate>/`.
 
 ### Self-compile attribution
 

@@ -16,9 +16,12 @@ Two workloads are measured:
 
 Instructions are the median of --rounds normal runs per side, alternating which
 side goes first: "instructions retired" from /usr/bin/time -l on macOS, or
-perf stat on Linux. Allocations come from one BLORP_LEAK_CHECK=strict run of the
-diagnostic binary, which is deterministic; a leak fails the script. Raw samples
-are written under --output. Python 3 standard library only.
+perf stat on Linux. Allocations and peak heap (the most bytes the compiler had
+requested and not yet released at once) come from one BLORP_LEAK_CHECK=strict
+run of the diagnostic binary, which is deterministic; a leak fails the script.
+A compiler's runtime comes from the pinned seed, so the peak is reported as
+missing for a revision whose seed predates the peak heap line. Raw samples are
+written under --output. Python 3 standard library only.
 """
 
 import argparse
@@ -46,6 +49,11 @@ BINARY_DIRECTORY = "blorp/build/compiler-cost"
 MAIN_SOURCE = "blorp/src/main.brp"
 LIBRARY_ROOT = "blorp/standard_library"
 LEAK_LINE = re.compile(r"blorp: leak check: (\d+) allocs, (\d+) releases, (\d+) leaked, (\d+) bytes")
+PEAK_LINE = re.compile(r"^blorp: peak heap: (\d+) bytes$", re.MULTILINE)
+# argv[0] of both sides' strict runs, under BINARY_DIRECTORY so the busy check
+# still sees them.
+DIAGNOSTIC_PROGRAM_NAME = BINARY_DIRECTORY + "/compiler-diagnostic"
+MISSING = "missing"
 MACOS_INSTRUCTIONS = re.compile(r"^\s*(\d+)\s+instructions retired", re.MULTILINE)
 PERF_INSTRUCTIONS = re.compile(r"^(\d+),,instructions", re.MULTILINE)
 
@@ -118,10 +126,13 @@ def timed_run(counter, command, cwd, report):
     return int(found.group(1))
 
 
-def strict_allocations(command, cwd, report):
+def strict_accounting(binary, command, cwd, report):
+    """Runs `binary` as `command` and returns its allocations and peak heap; the
+    peak is None when the binary's runtime predates the peak heap line."""
     wait_until_idle()
     environment = dict(os.environ, BLORP_LEAK_CHECK="strict")
-    result = subprocess.run(command, cwd=cwd, capture_output=True, text=True, env=environment)
+    result = subprocess.run(command, executable=str(binary), cwd=cwd, capture_output=True,
+                            text=True, env=environment)
     report.write_text(result.stderr)
     found = LEAK_LINE.search(result.stderr)
     if result.returncode != 0 or not found:
@@ -129,11 +140,18 @@ def strict_allocations(command, cwd, report):
     allocations, _, leaked, _ = (int(group) for group in found.groups())
     if leaked != 0:
         fail("leak reported; see %s" % report)
-    return allocations
+    peak = PEAK_LINE.search(result.stderr)
+    return allocations, int(peak.group(1)) if peak else None
 
 
 def percent(base, candidate):
-    return "%+.4f%%" % ((candidate - base) * 100.0 / base) if base else "n/a"
+    if base is None or candidate is None or not base:
+        return "n/a"
+    return "%+.4f%%" % ((candidate - base) * 100.0 / base)
+
+
+def figure(value):
+    return MISSING if value is None else format(value, ",")
 
 
 def main():
@@ -179,15 +197,20 @@ def measure(counter, rounds, worktrees, output):
     rows, identity = [], {}
     for name, cwds in workloads:
         key = name.replace(" ", "-")
-        allocations, samples = {}, {side: [] for side in SIDES}
+        allocations, peaks, samples = {}, {}, {side: [] for side in SIDES}
+        # The compiler holds its arguments, argv[0] included, as Strings live at
+        # the peak, so both sides get the same argv and output path: a longer
+        # path on one side would read as a change in its peak heap. Each side's
+        # C is then kept under its own name.
+        emitted = output / ("%s-diagnostic.c" % key)
+        command = [DIAGNOSTIC_PROGRAM_NAME, "compile", MAIN_SOURCE, "--library-root", LIBRARY_ROOT,
+                   "-o", str(emitted)]
         for side in SIDES:
             diagnostic = worktrees[side] / BINARY_DIRECTORY / "compiler-diagnostic"
-            emitted = output / ("%s-%s-diagnostic.c" % (key, side))
-            command = [str(diagnostic), "compile", MAIN_SOURCE, "--library-root", LIBRARY_ROOT,
-                       "-o", str(emitted)]
-            allocations[side] = strict_allocations(command, cwds[side],
-                                                   output / ("%s-%s-strict.stderr" % (key, side)))
-            identity[(key, side)] = sha256(emitted)
+            allocations[side], peaks[side] = strict_accounting(
+                diagnostic, command, cwds[side], output / ("%s-%s-strict.stderr" % (key, side)))
+            kept = emitted.replace(output / ("%s-%s-diagnostic.c" % (key, side)))
+            identity[(key, side)] = sha256(kept)
         for round_number in range(rounds):
             order = SIDES if round_number % 2 == 0 else SIDES[::-1]
             for side in order:
@@ -198,11 +221,19 @@ def measure(counter, rounds, worktrees, output):
             "".join("%s %d\n" % (side, value) for side in SIDES for value in samples[side]))
         median = {side: int(statistics.median_low(samples[side])) for side in SIDES}
         rows.append((name + " allocations", allocations["base"], allocations["candidate"]))
+        rows.append((name + " peak heap, bytes", peaks["base"], peaks["candidate"]))
         rows.append((name + " instructions, median of %d" % rounds, median["base"], median["candidate"]))
     lines = ["%-36s %16s %16s %10s" % ("", "base", "candidate", "change")]
     for label, base, candidate in rows:
-        lines.append("%-36s %16s %16s %10s" % (label, format(base, ","), format(candidate, ","),
+        lines.append("%-36s %16s %16s %10s" % (label, figure(base), figure(candidate),
                                                percent(base, candidate)))
+    # Only a peak heap can be missing; a row's figures follow SIDES.
+    missing = [side for column, side in enumerate(SIDES, start=1)
+               if any(row[column] is None for row in rows)]
+    if missing:
+        lines.append("peak heap missing for %s: a compiler's own runtime comes from its pinned "
+                     "seed, which predates the peak heap line; a seed rotation brings it"
+                     % " and ".join(missing))
     same = identity[("fixed-input", "base")] == identity[("fixed-input", "candidate")]
     lines.append("fixed-input C: %s (base %s, candidate %s)" % (
         "identical" if same else "DIFFERENT", identity[("fixed-input", "base")][:16],

@@ -19,6 +19,9 @@ MEMORY_RUNTIME: String =
         |union blorp_memory_header {max_align_t alignment;size_t requested;};
         |struct blorp_memory_counts {size_t allocations,releases,live,bytes;};
         |static struct blorp_memory_counts blorp_memory_counts;
+        |/* The most requested bytes live at once, without the header or the allocator's rounding, which vary by platform. Guarded by the lock.
+        |   Not a fifth counts field: -O0 builds would then copy the counts through memcpy on every allocation and release. */
+        |static size_t blorp_memory_peak_bytes;
         |static atomic_flag blorp_memory_lock=ATOMIC_FLAG_INIT;
         |static int blorp_memory_strict;
         |static void blorp_memory_fail(const char *message){fputs(message,stderr);abort();}
@@ -131,6 +134,7 @@ MEMORY_RUNTIME: String =
         |if(header!=NULL){
         |header->requested=requested;
         |blorp_memory_counts=(struct blorp_memory_counts){allocations,blorp_memory_counts.releases,live,bytes};
+        |if(bytes>blorp_memory_peak_bytes)blorp_memory_peak_bytes=bytes;
         |}
         |blorp_memory_leave();
         |if(header!=NULL&&blorp_allocation_sites_output!=NULL)blorp_memory_record_site(requested,0);
@@ -144,7 +148,7 @@ MEMORY_RUNTIME: String =
         |blorp_memory_enter();
         |const size_t bytes=blorp_memory_add(blorp_memory_subtract(blorp_memory_counts.bytes,header->requested),requested);
         |union blorp_memory_header *grown=realloc(header,storage);
-        |if(grown!=NULL){grown->requested=requested;blorp_memory_counts.bytes=bytes;}
+        |if(grown!=NULL){grown->requested=requested;blorp_memory_counts.bytes=bytes;if(bytes>blorp_memory_peak_bytes)blorp_memory_peak_bytes=bytes;}
         |blorp_memory_leave();
         |if(grown!=NULL&&blorp_allocation_sites_output!=NULL)blorp_memory_record_site(requested,1);
         |return grown==NULL?NULL:grown+1;
@@ -217,8 +221,10 @@ MEMORY_RUNTIME: String =
         |if(!blorp_memory_strict)return report_status;
         |blorp_memory_enter();
         |const struct blorp_memory_counts counts=blorp_memory_counts;
+        |const size_t peak_bytes=blorp_memory_peak_bytes;
         |blorp_memory_leave();
         |fprintf(stderr,"blorp: leak check: %zu allocs, %zu releases, %zu leaked, %zu bytes\n",counts.allocations,counts.releases,counts.live,counts.bytes);
+        |fprintf(stderr,"blorp: peak heap: %zu bytes\n",peak_bytes);
         |return counts.allocations==counts.releases&&counts.live==0&&counts.bytes==0?report_status:BLORP_STRICT_LEAK_EXIT_STATUS;
         |}
         |#else
