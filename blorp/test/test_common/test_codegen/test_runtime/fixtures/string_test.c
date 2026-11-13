@@ -457,6 +457,37 @@ static void test_byte_at_values(void) {
     assert_byte_at(bytes, sizeof bytes, 3, 1, 122);
 }
 
+static void assert_byte_at_uint8(const char *bytes, int64_t length, int64_t index,
+                                 uint8_t status, uint8_t expected) {
+    struct blorp_string *value = blorp_string_from_bytes(bytes, length);
+    const size_t allocations_before = allocation_count;
+    const uint8_t unchanged = 71;
+    uint8_t result = unchanged;
+    assert(blorp_string_byte_at_uint8(value, index, &result) == status);
+    assert(result == (status ? expected : unchanged));
+    assert(atomic_load(&value->references) == 1);
+    assert(allocation_count == allocations_before);
+    assert_bytes(value, bytes, length);
+    blorp_string_release(value);
+}
+
+static void test_byte_at_uint8_bounds(void) {
+    assert_byte_at_uint8("", 0, 0, 0, 0);
+    assert_byte_at_uint8("a", 1, -1, 0, 0);
+    assert_byte_at_uint8("a", 1, 1, 0, 0);
+    assert_byte_at_uint8("a", 1, INT64_MIN, 0, 0);
+    assert_byte_at_uint8("a", 1, INT64_MAX, 0, 0);
+}
+
+static void test_byte_at_uint8_values(void) {
+    const char bytes[] = {(char)0xc3, (char)0xa9, '\0', 'z', (char)0xff};
+    assert_byte_at_uint8(bytes, sizeof bytes, 0, 1, 195);
+    assert_byte_at_uint8(bytes, sizeof bytes, 1, 1, 169);
+    assert_byte_at_uint8(bytes, sizeof bytes, 2, 1, 0);
+    assert_byte_at_uint8(bytes, sizeof bytes, 3, 1, 122);
+    assert_byte_at_uint8(bytes, sizeof bytes, 4, 1, 255);
+}
+
 static void test_from_codepoint_boundaries(void) {
     const struct {
         int64_t scalar;
@@ -602,6 +633,10 @@ int main(int argc, char **argv) {
         test_byte_at_bounds();
     } else if (strcmp(argv[1], "byte_at_values") == 0) {
         test_byte_at_values();
+    } else if (strcmp(argv[1], "byte_at_uint8_bounds") == 0) {
+        test_byte_at_uint8_bounds();
+    } else if (strcmp(argv[1], "byte_at_uint8_values") == 0) {
+        test_byte_at_uint8_values();
     } else if (strcmp(argv[1], "from_codepoint_boundaries") == 0) {
         test_from_codepoint_boundaries();
     } else if (strcmp(argv[1], "from_codepoint_invalid") == 0) {

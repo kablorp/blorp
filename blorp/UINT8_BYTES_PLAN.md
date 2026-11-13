@@ -455,7 +455,25 @@ keeps what a later landing needs. What it found:
      now rejects it. The figures above took the fixed input from the
      candidate tree with an uncommitted copy of the script.
 6. **L4, `byte_at`** (U9). Change its result to `Option[UInt8]` and update
-   its callers, including the compiler's lexer.
+   its callers, including the compiler's lexer. It splits around a rotation.
+   *Stage-A evidence:* with only `string.brp:54` changed to
+   `-> Option[UInt8]` (plus the `UInt8` import), `scripts/blorp-fixpoint
+   --prove` fails in stage A: the pinned seed `blorp-seed-15d8d1263e10`
+   reports `builtin declaration does not match its runtime contract` at the
+   label, help `... returning Option[Int]`. The label's contract is the
+   compiler's, not the declaration's, so no single commit satisfies both the
+   seed and the new compiler. Labels are never reused, so:
+   - **L4a, the label.** `string.byte_at_uint8`, contract `String, Int ->
+     Option[UInt8]`, with its own builtin variant, signature check, emission
+     (`uint8_t` scratch) and runtime function `blorp_string_byte_at_uint8`.
+     Nothing calls it yet; the old label, the library and every caller are
+     unchanged.
+   - **A seed rotation,** shared with `PROCESS_DECISIONS.md`'s L4 rotation for
+     `process.run` if both have landed by then.
+   - **L4b.** `String.byte_at` points at the new label, every caller
+     (about 49, the lexer included) is updated, and the old
+     `string.byte_at` label is deleted. No further rotation is needed for the
+     deletion: L4b's library no longer names the old label.
 
 ## Ceilings
 

@@ -17,7 +17,10 @@ done.
     `read_bytes`/`write_bytes` in `io/fs/`. `LSP_PLAN.md`'s landing 6 needs
     only L1; its console labels ride a later rotation. Its landing 8 can
     now proceed.
-  - **Next:** L4, `String.byte_at` returns `Option[UInt8]`.
+  - **Next:** L4 in two landings around a seed rotation: L4a adds the label
+    `string.byte_at_uint8` (compiler only, landed on its own); after the
+    rotation, L4b points `String.byte_at` at it (`Option[UInt8]`), updates
+    the callers and deletes the old label. See the plan's L4.
 - **Process API:** [`PROCESS_DECISIONS.md`](PROCESS_DECISIONS.md).
   - **Status:** L0 is implemented and independently reviewed; final combined
     landing gates and four-platform CI pass; L0 is published. Shared
