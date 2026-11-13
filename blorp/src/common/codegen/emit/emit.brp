@@ -792,29 +792,33 @@ private pure func c_parameters(
     if parameters.length() == 0:
         Ok("(void)")
     else:
-        var output: String = "("
+        var output: Result[String, Diagnostic] = Ok("(")
         var index: Int = 0
-        var invalid: Option[Diagnostic] = None
 
         for parameter in parameters:
-            -- `output` is one parameter list, so the copy its error path forces is small.
-            if index > 0:
-                output = output.concat(",")
-
-            match output.append_type_name(parameter, unions, compiler_span()):
+            output = match output:
+                Ok(written):
+                    separated = if index > 0:
+                        written.concat(",")
+                    else:
+                        written
+                    match separated.append_type_name(parameter, unions, compiler_span()):
+                        Ok(typed):
+                            Ok(
+                                typed
+                                    .concat(" ")
+                                    .append_parameter_name(index),
+                            )
+                        Err(error):
+                            Err(error)
                 Err(error):
-                    invalid = Some(error)
-                    break
-                Ok(typed):
-                    output = typed
-                        .concat(" ")
-                        .append_parameter_name(index)
+                    Err(error)
 
             index = index + 1
 
-        match invalid:
-            Some(error): Err(error)
-            None: Ok("${output})")
+        match output:
+            Ok(written): Ok("${written})")
+            Err(error): Err(error)
 
 
 -- Inline unions are read by value; boxed unions through their node pointer.
@@ -976,24 +980,20 @@ private pure func append_value_field_actions(
     unions: List[ConcreteUnion],
     action: OwnershipAction,
 ) -> Result[String, Diagnostic]:
-    var result = output
+    var result: Result[String, Diagnostic] = Ok(output)
     var position = 0
-    var invalid: Option[Diagnostic] = None
     for field in fields:
         selector = "value.blorp_rf_"
             .append_int(index)
             .concat("_")
             .append_int(position)
-        match result.append_storage_operation(field, action, selector, unions, compiler_span()):
-            Ok(updated):
-                result = updated
+        result = match result:
+            Ok(written):
+                written.append_storage_operation(field, action, selector, unions, compiler_span())
             Err(error):
-                invalid = Some(error)
-                break
+                Err(error)
         position = position + 1
-    match invalid:
-        Some(error): Err(error)
-        None: Ok(result)
+    result
 
 
 private pure func append_record_ownership(
@@ -2038,36 +2038,38 @@ private pure func append_union_action(
         DuplicateValue: "void blorp_union_dup_"
         DestroyValue: "void blorp_union_drop_"
 
-    var result = "${output}${prefix}${index}(struct blorp_u_${index} value){switch(value.tag){"
+    var result: Result[String, Diagnostic] = Ok(
+        "${output}${prefix}${index}(struct blorp_u_${index} value){switch(value.tag){",
+    )
     var position = 0
-    var failure: Option[Diagnostic] = None
 
     for fields in layout.union_variants():
-        result = "${result}case blorp_v_${index}_${position}:"
+        result = match result:
+            Ok(written): Ok("${written}case blorp_v_${index}_${position}:")
+            Err(error): Err(error)
         var field_position = 0
         for value_type in fields:
             path = "value.payload.blorp_up_${position}.blorp_uf_${field_position}"
-            match result.append_storage_operation(
-                value_type,
-                action,
-                path,
-                unions,
-                compiler_span(),
-            ):
-                Ok(updated):
-                    result = updated
+            result = match result:
+                Ok(written):
+                    written.append_storage_operation(
+                        value_type,
+                        action,
+                        path,
+                        unions,
+                        compiler_span(),
+                    )
                 Err(error):
-                    failure = Some(error)
-                    break
+                    Err(error)
             field_position = field_position + 1
-        if failure.is_some():
-            break
-        result = "${result}break;"
+        result = match result:
+            Ok(written): Ok("${written}break;")
+            Err(error): Err(error)
         position = position + 1
 
-    match failure:
-        Some(error): Err(error)
-        None: Ok("${result}}}")
+    match result:
+        Ok(written): Ok("${written}}}")
+        Err(error): Err(error)
 
 
 -- One counted node per constructed value: the compound literal's payload
@@ -2123,46 +2125,48 @@ private pure func append_boxed_union_release(
     unions: List[ConcreteUnion],
 ) -> Result[String, Diagnostic]:
     node = "".append_boxed_union_struct(index)
-    var result = "${output}void blorp_union_drop_${index}(${node}* value){${node}* node=value;while(node!=NULL){"
-        .concat(
-            "if(atomic_fetch_sub_explicit(&node->references,UINT64_C(1),memory_order_acq_rel)!=UINT64_C(1))return;",
-        )
-        .concat("${node}* child=NULL;switch(node->tag){")
+    var result: Result[String, Diagnostic] = Ok(
+        "${output}void blorp_union_drop_${index}(${node}* value){${node}* node=value;while(node!=NULL){"
+            .concat(
+                "if(atomic_fetch_sub_explicit(&node->references,UINT64_C(1),memory_order_acq_rel)!=UINT64_C(1))return;",
+            )
+            .concat("${node}* child=NULL;switch(node->tag){"),
+    )
     var position = 0
-    var failure: Option[Diagnostic] = None
 
     for fields in layout.union_variants():
-        result = "${result}case blorp_v_${index}_${position}:"
+        result = match result:
+            Ok(written): Ok("${written}case blorp_v_${index}_${position}:")
+            Err(error): Err(error)
         var field_position = 0
         for value_type in fields:
             path = "node->payload.blorp_up_${position}.blorp_uf_${field_position}"
             self_child = match value_type:
                 UnionType(id): id.union_number() == index
                 _: False
-            if self_child:
-                result = "${result}child=${path};"
-            else:
-                match result.append_storage_operation(
-                    value_type,
-                    DestroyValue,
-                    path,
-                    unions,
-                    compiler_span(),
-                ):
-                    Ok(updated):
-                        result = updated
-                    Err(error):
-                        failure = Some(error)
-                        break
+            result = match result:
+                Ok(written):
+                    if self_child:
+                        Ok("${written}child=${path};")
+                    else:
+                        written.append_storage_operation(
+                            value_type,
+                            DestroyValue,
+                            path,
+                            unions,
+                            compiler_span(),
+                        )
+                Err(error):
+                    Err(error)
             field_position = field_position + 1
-        if failure.is_some():
-            break
-        result = "${result}break;"
+        result = match result:
+            Ok(written): Ok("${written}break;")
+            Err(error): Err(error)
         position = position + 1
 
-    match failure:
-        Some(error): Err(error)
-        None: Ok("${result}}blorp_memory_release(node);node=child;}}")
+    match result:
+        Ok(written): Ok("${written}}blorp_memory_release(node);node=child;}}")
+        Err(error): Err(error)
 
 
 private pure func append_union_ownership(
@@ -2438,27 +2442,25 @@ private pure func append_input_owners(
     inputs: List[own.OwnedJoinParameter],
     unions: List[ConcreteUnion],
 ) -> Result[String, Diagnostic]:
-    var result = output
-    var failure: Option[Diagnostic] = None
+    var result: Result[String, Diagnostic] = Ok(output)
     for input in inputs:
         fact = input.join_parameter()
-        result = result
-            .concat("(void)")
-            .append_local_name(fact.id)
-            .concat(";")
-        match input:
-            UnmanagedJoinParameter(_):
-                void
-            ManagedJoinParameter(_, owner):
-                match owner.owner_alias(fact.id, fact.value_type, unions, fact.span):
-                    Ok(binding):
-                        result = "${result}${binding}"
-                    Err(error):
-                        failure = Some(error)
-                        break
-    match failure:
-        Some(error): Err(error)
-        None: Ok(result)
+        result = match result:
+            Ok(written):
+                declared = written
+                    .concat("(void)")
+                    .append_local_name(fact.id)
+                    .concat(";")
+                match input:
+                    UnmanagedJoinParameter(_):
+                        Ok(declared)
+                    ManagedJoinParameter(_, owner):
+                        match owner.owner_alias(fact.id, fact.value_type, unions, fact.span):
+                            Ok(binding): Ok("${declared}${binding}")
+                            Err(error): Err(error)
+            Err(error):
+                Err(error)
+    result
 
 
 private pure func append_selection_edge(
@@ -2980,26 +2982,9 @@ private pure func append_join(
         records,
         nearest,
     )
-    var joined = "${selected}${done}:;"
-    for output_parameter in parameters:
-        fact = output_parameter.join_parameter()
-        -- Include Void and unused outputs, exactly as for ordinary value locals.
-        joined = joined
-            .concat("(void)")
-            .append_local_name(fact.id)
-            .concat(";")
-        match output_parameter:
-            UnmanagedJoinParameter(_):
-                void
-            ManagedJoinParameter(_, owner):
-                match owner.owner_alias(fact.id, fact.value_type, unions, fact.span):
-                    Ok(binding): joined = "${joined}${binding}"
-                    Err(error): failure = Some(error)
-        if failure.is_some():
-            break
-    match failure:
-        Some(error): Err(error)
-        None: Ok(joined)
+    -- Every output is named, Void and unused ones included, exactly as an arm
+    -- input is.
+    "${selected}${done}:;".append_input_owners(parameters, unions)
 
 
 private pure func append_signature(

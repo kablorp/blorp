@@ -91,6 +91,11 @@ Found while landing; none is in this stack.
 - **A `while` condition's owners last until each arm's exit.** A loop match's
   prefix keeps every owner to its arms, so an update inside the condition,
   such as `[7].append(total)`, copies instead of consuming its operand.
+- **Two emit loops still keep a failure flag:**
+  - `append_record_ownership`'s field loop, which passes its accumulator to
+    `append_storage_operation`;
+  - `append_loop`'s header loop, which carries two accumulators under one
+    flag, so one `Result` would need a record or tuple.
 
 ## Measurements
 
@@ -176,3 +181,32 @@ Base `cost/l1-interpolation-chain`, candidate `cost/l2-loop-last-read`.
   12,250,684,522, 12,265,757,681, 12,254,329,814 and 12,252,504,057; L2
   12,256,785,788, 12,247,222,930, 12,234,189,345, 12,257,489,950 and
   12,244,823,714. The L2 stage-2 compiler reproduces its own C (`94bd3323…`).
+
+### Q2 (2026-11-13)
+
+Base `cost/l3-stale-notes`, candidate `cost/q2-result-loops`. The rewritten
+loops:
+- `c_parameters`;
+- `append_value_field_actions`;
+- `append_union_action`;
+- `append_boxed_union_release`;
+- the owner-alias loop of `append_input_owners`, which `append_join` now
+  calls for its outputs instead of repeating it.
+
+`blorp/scripts/self-compile-cost` was run with five rounds. Both sides are
+seed-built, which here is the point: the change is to the compiler's own
+loops.
+
+| | Base | Q2 | Change |
+|---|---:|---:|---:|
+| Fixed input allocations | 14,125,970 | 14,110,365 | −15,605 (−0.11%) |
+| Fixed input instructions, median of 5 | 12,357,727,702 | 12,339,989,924 | −0.14% |
+| Own source allocations | 14,125,970 | 14,115,792 | −0.07% |
+| Own source instructions, median of 5 | 12,346,174,608 | 12,322,892,348 | −0.19% |
+
+The fixed-input C is identical (`8a34d0bbce643bff`).
+
+The pilot estimated about 99,500 allocations from the site's allocation
+count. Most of those allocations are the first allocation of a String that
+starts from `""`, which no loop shape removes. Two loops of the same pattern
+remain (see Follow-ups).
