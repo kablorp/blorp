@@ -23,6 +23,12 @@ predictable for tools to generate and humans to debug.**
 
 All work on the compiler, standard library, and documentation should uphold these principles.
 
+These principles describe the language Blorp is growing into. Some of them name features the
+current compiler does not have yet: channels and structured concurrency (3, 15), SIMD (13),
+tensor dimensions and range types (14) and `foreign func` (13, 16). The lexer already reserves
+two of their keywords, `detach` and `foreign`. [`blorp/README.md`](blorp/README.md) defines the
+language as it is supported today.
+
 ### Safety
 
 **1. No runtime panics — operations succeed by design.**
