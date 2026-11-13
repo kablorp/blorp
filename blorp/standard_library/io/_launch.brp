@@ -1,0 +1,115 @@
+-- What io/process and io/terminal share to start a program: the native protocol's
+-- codes, the checks and encodings of a command's inputs, and the fault for a reply
+-- the natives never send. Internal by convention only, as io/_codes is: Blorp has no
+-- module-internal visibility, so these names are public.
+-- src/common/codegen/runtime/process.brp owns the C side.
+import:
+    _base: Int, String, Void, List, Bool, Option(Some, None), Result
+    bool: Bool methods
+    dict: Dict
+    list: List methods
+    option: Option methods
+    path: Path
+    string: String methods
+
+
+-- The codes of src/common/codegen/runtime/process.brp's PROCESS_HELPERS_RUNTIME enums,
+-- which agree with it only by the tests. An Exit is its kind times
+-- EXIT_KIND_SPAN plus its status or signal, always below the span. An error is
+-- its detail times ERROR_TAG_SPAN plus its tag: the detail is a file-protocol code
+-- (io/_codes), an Exit code for the UTF-8 kinds, or 0.
+EXIT_KIND_SPAN: Int = 256
+EXITED_KIND: Int = 0
+SIGNALED_KIND: Int = 1
+TIMED_OUT_KIND: Int = 2
+
+ERROR_TAG_SPAN: Int = 16
+LAUNCH_FAILED_TAG: Int = 1
+NOT_EXECUTABLE_TAG: Int = 2
+DIRECTORY_FAILED_TAG: Int = 3
+CONTAINS_NUL_TAG: Int = 4
+STDOUT_NOT_UTF8_TAG: Int = 5
+STDERR_NOT_UTF8_TAG: Int = 6
+NOT_ON_PATH_TAG: Int = 7
+
+private EQUALS_BYTE: Int = 61
+
+
+-- An Exit code as its kind and its status or signal; None for a negative code.
+pure func split_exit_code(code: Int) -> Option[(Int, Int)]:
+    if code < 0:
+        None
+    else:
+        Some((code / EXIT_KIND_SPAN, code % EXIT_KIND_SPAN))
+
+
+-- An error code as its tag and its detail. The tag is taken so that it is never
+-- negative, since file-protocol codes for an unnamed errno are, and then the rest
+-- divides exactly whichever way `/` rounds.
+pure func split_error_code(code: Int) -> (Int, Int):
+    tag = (code % ERROR_TAG_SPAN + ERROR_TAG_SPAN) % ERROR_TAG_SPAN
+    (tag, (code - tag) / ERROR_TAG_SPAN)
+
+
+private pure func is_variable_name(name: String) -> Bool:
+    var valid = name.length() > 0
+    for position in 0..name.length():
+        match name.byte_at(position):
+            Some(byte): valid = valid.and(byte != EQUALS_BYTE)
+            None: void
+    valid
+
+
+-- The first name that is empty or contains "=", in insertion order.
+pure func invalid_variable_name(environment: Dict[String, Option[String]]) -> Option[String]:
+    environment
+        .keys()
+        .find(
+            pure func(name: String) -> Bool: name
+                .is_variable_name()
+                .not(),
+        )
+
+
+private pure func environment_entry(entry: (String, Option[String])) -> String:
+    match entry:
+        (name, Some(value)): "${name}=${value}"
+        (name, None): name
+
+
+-- "NAME=value" to set and "NAME" to remove, in insertion order.
+pure func environment_entries(environment: Dict[String, Option[String]]) -> List[String]:
+    environment
+        .entries()
+        .map(environment_entry)
+
+
+pure func zero_or_one(value: Option[String]) -> List[String]:
+    match value:
+        Some(present): [present]
+        None: []
+
+
+-- The directory as the natives take it: a list of zero or one path.
+pure func directory_argument(directory: Option[Path]) -> List[String]:
+    directory
+        .map(pure func(place: Path) -> String: place.to_string())
+        .zero_or_one()
+
+
+-- Aborts with the message: a reply the natives never send is a runtime defect,
+-- not an error value (PROCESS_DECISIONS.md, P5).
+private func native_fault(message: String) -> Result[Void, Int]:
+    builtin("process.fault")
+
+
+-- Never returns. A workaround, not a pattern: Blorp has no type for a call that
+-- cannot return, so the call to fault_again, which never runs, gives fault every
+-- type; calling itself would fail C's -Winfinite-recursion.
+func fault[T](message: String) -> T:
+    ignored = native_fault(message)
+    fault_again(message)
+
+
+private func fault_again[T](message: String) -> T:
+    fault(message)

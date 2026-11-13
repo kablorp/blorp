@@ -30,7 +30,7 @@ PROCESS_POSIX_PRELUDE: String =
 -- Emitted once for the whole program, however many process operations it
 -- calls. No operation calls every function, so they have external linkage,
 -- as fs's helpers do. The codes are the private ABI between the
--- natives and standard_library/io/process.brp, which mirrors them: natives return
+-- natives and standard_library/io/_launch.brp, which mirrors them: natives return
 -- only Ints, Strings and Lists of them, so an Exit is its kind times
 -- BLORP_PROCESS_EXIT_SPAN plus its status or signal, and an error is its
 -- detail times BLORP_PROCESS_TAG_SPAN plus its tag. The detail is an fs error
@@ -191,14 +191,216 @@ PROCESS_HELPERS_RUNTIME: String =
         |
 
 
+-- What capture and run both need: the checks of their inputs, the child's argv and
+-- environment, the exec report's pipe and its decoding, and the end of the child.
+-- Emitted after the fs helpers, which it calls.
+PROCESS_LAUNCH_RUNTIME: String =
+    raw
+        |enum {
+        |    BLORP_PROCESS_STAGE_SETUP = 1,
+        |    BLORP_PROCESS_STAGE_DIRECTORY = 2,
+        |    BLORP_PROCESS_STAGE_EXEC = 3
+        |};
+        |/* The fs kinds SystemCallError names, which LaunchFailed and DirectoryFailed carry. */
+        |enum {
+        |    BLORP_PROCESS_SYSTEM_CALL_KINDS = BLORP_FS_KIND(NOT_FOUND) | BLORP_FS_KIND(PERMISSION_DENIED) | BLORP_FS_KIND(NOT_A_DIRECTORY)
+        |};
+        |/* The elements of a List[String], whatever its C type is called. */
+        |struct blorp_process_strings {
+        |    struct blorp_string *const *values;
+        |    int64_t length;
+        |};
+        |struct blorp_process_launch {
+        |    char **argv;
+        |    char **envp;
+        |};
+        |static int64_t blorp_process_launch_error(int number) {
+        |    return blorp_process_error(blorp_fs_errno_code_within(number, BLORP_PROCESS_SYSTEM_CALL_KINDS), BLORP_PROCESS_LAUNCH_FAILED);
+        |}
+        |/* A fresh pipe with both ends private. Returns 0 or the errno; either end may be
+        | * left open for the caller's cleanup. */
+        |static int blorp_process_pipe(int ends[2]) {
+        |    int made[2];
+        |    if (pipe(made) != 0) {
+        |        return errno;
+        |    }
+        |    ends[0] = blorp_process_private(made[0]);
+        |    const int first = ends[0] < 0 ? errno : 0;
+        |    ends[1] = blorp_process_private(made[1]);
+        |    if (first != 0) {
+        |        return first;
+        |    }
+        |    return ends[1] < 0 ? errno : 0;
+        |}
+        |static int blorp_process_nonblocking(int descriptor) {
+        |    const int flags = fcntl(descriptor, F_GETFL);
+        |    if (flags < 0 || fcntl(descriptor, F_SETFL, flags | O_NONBLOCK) != 0) {
+        |        return errno;
+        |    }
+        |    return 0;
+        |}
+        |/* Whether an inherited "NAME=value" entry has a name the command sets or removes. */
+        |static int blorp_process_overridden(const char *inherited, struct blorp_string *const changes[],
+        |                                    size_t count) {
+        |    const size_t length = strcspn(inherited, "=");
+        |    for (size_t index = 0; index < count; index++) {
+        |        const char *change = changes[index]->bytes;
+        |        if (strcspn(change, "=") == length && memcmp(change, inherited, length) == 0) {
+        |            return 1;
+        |        }
+        |    }
+        |    return 0;
+        |}
+        |static int64_t blorp_process_stage_error(int stage, int number) {
+        |    if (stage == BLORP_PROCESS_STAGE_DIRECTORY) {
+        |        return blorp_process_error(blorp_fs_errno_code_within(number, BLORP_PROCESS_SYSTEM_CALL_KINDS), BLORP_PROCESS_DIRECTORY_FAILED);
+        |    }
+        |    if (stage == BLORP_PROCESS_STAGE_EXEC && number == ENOEXEC) {
+        |        return blorp_process_error(0, BLORP_PROCESS_NOT_EXECUTABLE);
+        |    }
+        |    if (stage != BLORP_PROCESS_STAGE_SETUP && stage != BLORP_PROCESS_STAGE_EXEC) {
+        |        blorp_process_defect("an exec report with a stage the child never writes");
+        |    }
+        |    return blorp_process_launch_error(number);
+        |}
+        |/* Reads what the exec report holds now into `reported`, closing it at end of file.
+        | * Returns 0, or the errno of a failed read. */
+        |static int blorp_process_read_report(int *descriptor, int reported[2], size_t *received) {
+        |    const ssize_t amount = read(*descriptor, (unsigned char *)reported + *received,
+        |                                sizeof(int[2]) - *received);
+        |    if (amount > 0) {
+        |        *received += (size_t)amount;
+        |    } else if (amount == 0) {
+        |        (void)blorp_process_close(descriptor);
+        |    } else if (errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK) {
+        |        return errno;
+        |    }
+        |    return 0;
+        |}
+        |/* Rejects a NUL in the program, an argument, the environment or the directory before any
+        | * system call. Returns 0, or the error code; `place` is the directory, or NULL for none. */
+        |static int64_t blorp_process_check(const struct blorp_string *program,
+        |                                   struct blorp_process_strings arguments,
+        |                                   struct blorp_process_strings directory,
+        |                                   struct blorp_process_strings environment, const char **place) {
+        |    int nul = blorp_fs_has_nul(program);
+        |    for (int64_t index = 0; index < arguments.length; index++) {
+        |        nul = nul || blorp_fs_has_nul(arguments.values[index]);
+        |    }
+        |    for (int64_t index = 0; index < environment.length; index++) {
+        |        nul = nul || blorp_fs_has_nul(environment.values[index]);
+        |    }
+        |    if (nul) {
+        |        return blorp_process_error(0, BLORP_PROCESS_CONTAINS_NUL);
+        |    }
+        |    *place = NULL;
+        |    if (directory.length > 0) {
+        |        if (blorp_fs_has_nul(directory.values[0])) {
+        |            return blorp_process_error(BLORP_FS_PATH_CONTAINS_NUL, BLORP_PROCESS_DIRECTORY_FAILED);
+        |        }
+        |        *place = directory.values[0]->bytes;
+        |    }
+        |    return 0;
+        |}
+        |/* Builds argv and the environment. Returns 0, or the error code: with SIGCHLD ignored the
+        | * system would reap the child itself and the wait would report ECHILD, so that is reported
+        | * before anything starts. */
+        |static int64_t blorp_process_prepare(const struct blorp_string *program,
+        |                                     struct blorp_process_strings arguments,
+        |                                     struct blorp_process_strings environment,
+        |                                     struct blorp_process_launch *launch) {
+        |    struct sigaction disposition;
+        |    if (sigaction(SIGCHLD, NULL, &disposition) != 0) {
+        |        return blorp_process_launch_error(errno);
+        |    }
+        |    if (disposition.sa_handler != SIG_DFL || (disposition.sa_flags & SA_NOCLDWAIT) != 0) {
+        |        return blorp_process_launch_error(ECHILD);
+        |    }
+        |    if ((uintmax_t)arguments.length > (uintmax_t)(SIZE_MAX / sizeof(char *) - 2)) {
+        |        abort();
+        |    }
+        |    const size_t count = (size_t)arguments.length;
+        |    char **argv = blorp_memory_allocate((count + 2) * sizeof *argv);
+        |    if (argv == NULL) {
+        |        abort();
+        |    }
+        |    /* Strings already have a trailing NUL; their owners outlive this synchronous call. */
+        |    argv[0] = (char *)program->bytes;
+        |    for (size_t index = 0; index < count; index++) {
+        |        argv[index + 1] = arguments.values[index]->bytes;
+        |    }
+        |    argv[count + 1] = NULL;
+        |    /* The inherited environment, without every name the command sets or removes,
+        |     * then each "NAME=value" it sets. The changes have no NUL, so each is a C string. */
+        |    const size_t changes = (size_t)environment.length;
+        |    size_t inherited = 0;
+        |    while (environ[inherited] != NULL) {
+        |        inherited++;
+        |    }
+        |    char **envp = blorp_memory_allocate((inherited + changes + 1) * sizeof *envp);
+        |    if (envp == NULL) {
+        |        abort();
+        |    }
+        |    size_t kept = 0;
+        |    for (size_t index = 0; index < inherited; index++) {
+        |        if (!blorp_process_overridden(environ[index], environment.values, changes)) {
+        |            envp[kept++] = environ[index];
+        |        }
+        |    }
+        |    for (size_t index = 0; index < changes; index++) {
+        |        if (strchr(environment.values[index]->bytes, '=') != NULL) {
+        |            envp[kept++] = environment.values[index]->bytes;
+        |        }
+        |    }
+        |    envp[kept] = NULL;
+        |    launch->argv = argv;
+        |    launch->envp = envp;
+        |    return 0;
+        |}
+        |static void blorp_process_release_launch(struct blorp_process_launch *launch) {
+        |    blorp_memory_release(launch->argv);
+        |    blorp_memory_release(launch->envp);
+        |}
+        |/* The end of every child: only async-signal-safe operations execute between fork and
+        | * execve/_exit. `failure` is the errno of the setup the caller's child already did, or 0.
+        | * Enters the directory, so that a relative program is found from there, then execs. A
+        | * failure reports the stage and errno on `report`, then exits. */
+        |static void blorp_process_child_tail(int failure, int report, const char *directory,
+        |                                     char *const arguments[], char *const environment[]) {
+        |    int stage = BLORP_PROCESS_STAGE_SETUP;
+        |    if (failure == 0 && directory != NULL) {
+        |        stage = BLORP_PROCESS_STAGE_DIRECTORY;
+        |        failure = chdir(directory) == 0 ? 0 : errno;
+        |    }
+        |    if (failure == 0) {
+        |        stage = BLORP_PROCESS_STAGE_EXEC;
+        |        execve(arguments[0], arguments, environment);
+        |        failure = errno;
+        |    }
+        |    const int reported[2] = {stage, failure};
+        |    const unsigned char *bytes = (const unsigned char *)reported;
+        |    size_t remaining = sizeof reported;
+        |    while (remaining != 0) {
+        |        const ssize_t written = write(report, bytes, remaining);
+        |        if (written < 0 && errno == EINTR) {
+        |            continue;
+        |        }
+        |        if (written <= 0) {
+        |            break;
+        |        }
+        |        bytes += (size_t)written;
+        |        remaining -= (size_t)written;
+        |    }
+        |    _exit(BLORP_PROCESS_EXEC_FAILURE_EXIT);
+        |}
+        |
+
+
 -- What capture needs beside the shared helpers: the output and input
 -- buffers, the child, and the SIGPIPE guard. Only capture calls these.
 private CAPTURE_SUPPORT: String =
     raw
         |enum {
-        |    BLORP_PROCESS_STAGE_SETUP = 1,
-        |    BLORP_PROCESS_STAGE_DIRECTORY = 2,
-        |    BLORP_PROCESS_STAGE_EXEC = 3,
         |    BLORP_PROCESS_READ_CHUNK = 65536,
         |    /* The most the final drain takes from a stream: beyond any pipe's buffer, yet bounded. */
         |    BLORP_PROCESS_DRAIN_LIMIT = 16 * 1024 * 1024,
@@ -286,40 +488,6 @@ private CAPTURE_SUPPORT: String =
         |    }
         |    return 0;
         |}
-        |/* A fresh pipe with both ends private. Returns 0 or the errno; either end may be
-        | * left open for the caller's cleanup. */
-        |static int blorp_process_pipe(int ends[2]) {
-        |    int made[2];
-        |    if (pipe(made) != 0) {
-        |        return errno;
-        |    }
-        |    ends[0] = blorp_process_private(made[0]);
-        |    const int first = ends[0] < 0 ? errno : 0;
-        |    ends[1] = blorp_process_private(made[1]);
-        |    if (first != 0) {
-        |        return first;
-        |    }
-        |    return ends[1] < 0 ? errno : 0;
-        |}
-        |static int blorp_process_nonblocking(int descriptor) {
-        |    const int flags = fcntl(descriptor, F_GETFL);
-        |    if (flags < 0 || fcntl(descriptor, F_SETFL, flags | O_NONBLOCK) != 0) {
-        |        return errno;
-        |    }
-        |    return 0;
-        |}
-        |/* Whether an inherited "NAME=value" entry has a name the command sets or removes. */
-        |static int blorp_process_overridden(const char *inherited, struct blorp_string *const changes[],
-        |                                    size_t count) {
-        |    const size_t length = strcspn(inherited, "=");
-        |    for (size_t index = 0; index < count; index++) {
-        |        const char *change = changes[index]->bytes;
-        |        if (strcspn(change, "=") == length && memcmp(change, inherited, length) == 0) {
-        |            return 1;
-        |        }
-        |    }
-        |    return 0;
-        |}
         |/* The length without a character cut off at the end: up to three trailing bytes
         | * that begin a multi-byte character but do not finish it. UTF-8 validation judges
         | * what remains. */
@@ -365,79 +533,19 @@ private CAPTURE_SUPPORT: String =
         |    }
         |    (void)pthread_sigmask(SIG_SETMASK, &guard->original, NULL);
         |}
-        |/* Only async-signal-safe operations execute between fork and execve/_exit. The
-        | * child leads its own group, then enters the directory, so a relative program is
-        | * found from there. Only the child creates its group: when the parent also called
-        | * setpgid, Darwin returned EPERM to whichever call lost the race. Until the child's
-        | * call runs, a group signal finds no group and the direct signal kills it. A
-        | * failure reports the stage and errno, then exits. */
+        |/* The child leads its own group, then takes its streams. Only the child creates its
+        | * group: when the parent also called setpgid, Darwin returned EPERM to whichever call
+        | * lost the race. Until the child's call runs, a group signal finds no group and the
+        | * direct signal kills it. */
         |static void blorp_process_capture_child(int input, int output, int errors, int report,
         |                                        const char *directory, char *const arguments[],
         |                                        char *const environment[]) {
-        |    int stage = BLORP_PROCESS_STAGE_SETUP;
         |    int failure = setpgid(0, 0) == 0 ? 0 : errno;
-        |    if (failure == 0 && directory != NULL) {
-        |        stage = BLORP_PROCESS_STAGE_DIRECTORY;
-        |        failure = chdir(directory) == 0 ? 0 : errno;
-        |    }
-        |    if (failure == 0) {
-        |        stage = BLORP_PROCESS_STAGE_SETUP;
-        |        if (dup2(input, STDIN_FILENO) < 0 || dup2(output, STDOUT_FILENO) < 0 ||
-        |            dup2(errors, STDERR_FILENO) < 0) {
-        |            failure = errno;
-        |        }
-        |    }
-        |    if (failure == 0) {
-        |        stage = BLORP_PROCESS_STAGE_EXEC;
-        |        execve(arguments[0], arguments, environment);
+        |    if (failure == 0 && (dup2(input, STDIN_FILENO) < 0 || dup2(output, STDOUT_FILENO) < 0 ||
+        |                         dup2(errors, STDERR_FILENO) < 0)) {
         |        failure = errno;
         |    }
-        |    const int reported[2] = {stage, failure};
-        |    const unsigned char *bytes = (const unsigned char *)reported;
-        |    size_t remaining = sizeof reported;
-        |    while (remaining != 0) {
-        |        const ssize_t written = write(report, bytes, remaining);
-        |        if (written < 0 && errno == EINTR) {
-        |            continue;
-        |        }
-        |        if (written <= 0) {
-        |            break;
-        |        }
-        |        bytes += (size_t)written;
-        |        remaining -= (size_t)written;
-        |    }
-        |    _exit(BLORP_PROCESS_EXEC_FAILURE_EXIT);
-        |}
-        |/* The fs kinds SystemCallError names, which LaunchFailed and DirectoryFailed carry. */
-        |enum {
-        |    BLORP_PROCESS_SYSTEM_CALL_KINDS = BLORP_FS_KIND(NOT_FOUND) | BLORP_FS_KIND(PERMISSION_DENIED) | BLORP_FS_KIND(NOT_A_DIRECTORY)
-        |};
-        |/* The error code of a failed stage. */
-        |static int64_t blorp_process_stage_error(int stage, int number) {
-        |    if (stage == BLORP_PROCESS_STAGE_DIRECTORY) {
-        |        return blorp_process_error(blorp_fs_errno_code_within(number, BLORP_PROCESS_SYSTEM_CALL_KINDS), BLORP_PROCESS_DIRECTORY_FAILED);
-        |    }
-        |    if (stage == BLORP_PROCESS_STAGE_EXEC && number == ENOEXEC) {
-        |        return blorp_process_error(0, BLORP_PROCESS_NOT_EXECUTABLE);
-        |    }
-        |    if (stage != BLORP_PROCESS_STAGE_SETUP && stage != BLORP_PROCESS_STAGE_EXEC) {
-        |        blorp_process_defect("an exec report with a stage the child never writes");
-        |    }
-        |    return blorp_process_error(blorp_fs_errno_code_within(number, BLORP_PROCESS_SYSTEM_CALL_KINDS), BLORP_PROCESS_LAUNCH_FAILED);
-        |}
-        |/* Reads what the exec report holds now into `reported`, closing it at end of file.
-        | * Returns 0, or the errno of a failed read. */
-        |static int blorp_process_read_report(int *descriptor, int reported[2], size_t *received) {
-        |    const ssize_t amount = read(*descriptor, (unsigned char *)reported + *received,
-        |                                sizeof(int[2]) - *received);
-        |    if (amount > 0) {
-        |        *received += (size_t)amount;
-        |    } else if (amount == 0) {
-        |        (void)blorp_process_close(descriptor);
-        |    } else if (errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK) {
-        |        return errno;
-        |    }
-        |    return 0;
+        |    blorp_process_child_tail(failure, report, directory, arguments, environment);
         |}
         |
 
@@ -446,83 +554,32 @@ private CAPTURE_SUPPORT: String =
 -- times out at once, after validation and before anything starts.
 private CAPTURE_BODY: String =
     raw
-        |    int nul = blorp_fs_has_nul(program);
-        |    for (int64_t index = 0; index < arguments->length; index++) {
-        |        nul = nul || blorp_fs_has_nul(arguments->values[index]);
-        |    }
-        |    for (int64_t index = 0; index < environment->length; index++) {
-        |        nul = nul || blorp_fs_has_nul(environment->values[index]);
-        |    }
-        |    if (nul) {
-        |        *error = blorp_process_error(0, BLORP_PROCESS_CONTAINS_NUL);
-        |        return BLORP_PROCESS_ERROR;
-        |    }
+        |    const struct blorp_process_strings argument_strings = {arguments->values, arguments->length};
+        |    const struct blorp_process_strings directory_strings = {directory->values, directory->length};
+        |    const struct blorp_process_strings environment_strings = {environment->values, environment->length};
         |    const char *place = NULL;
-        |    if (directory->length > 0) {
-        |        if (blorp_fs_has_nul(directory->values[0])) {
-        |            *error = blorp_process_error(BLORP_FS_PATH_CONTAINS_NUL, BLORP_PROCESS_DIRECTORY_FAILED);
-        |            return BLORP_PROCESS_ERROR;
-        |        }
-        |        place = directory->values[0]->bytes;
+        |    int64_t failure = blorp_process_check(program, argument_strings, directory_strings,
+        |                                          environment_strings, &place);
+        |    if (failure != 0) {
+        |        *error = failure;
+        |        return BLORP_PROCESS_ERROR;
         |    }
         |    if (timeout_ms == 0) {
         |        return blorp_process_reply(captured, blorp_process_exit(BLORP_PROCESS_TIMED_OUT, 0), "", 0, "", 0);
         |    }
-        |    /* With SIGCHLD ignored the system would reap the child itself, and the wait
-        |     * would report ECHILD; report that before anything starts. */
-        |    struct sigaction disposition;
-        |    if (sigaction(SIGCHLD, NULL, &disposition) != 0) {
-        |        *error = blorp_process_error(blorp_fs_errno_code_within(errno, BLORP_PROCESS_SYSTEM_CALL_KINDS), BLORP_PROCESS_LAUNCH_FAILED);
+        |    struct blorp_process_launch launch;
+        |    failure = blorp_process_prepare(program, argument_strings, environment_strings, &launch);
+        |    if (failure != 0) {
+        |        *error = failure;
         |        return BLORP_PROCESS_ERROR;
         |    }
-        |    if (disposition.sa_handler != SIG_DFL || (disposition.sa_flags & SA_NOCLDWAIT) != 0) {
-        |        *error = blorp_process_error(blorp_fs_errno_code_within(ECHILD, BLORP_PROCESS_SYSTEM_CALL_KINDS), BLORP_PROCESS_LAUNCH_FAILED);
-        |        return BLORP_PROCESS_ERROR;
-        |    }
-        |    if ((uintmax_t)arguments->length > (uintmax_t)(SIZE_MAX / sizeof(char *) - 2)) {
-        |        abort();
-        |    }
-        |    const size_t count = (size_t)arguments->length;
-        |    char **argv = blorp_memory_allocate((count + 2) * sizeof *argv);
-        |    if (argv == NULL) {
-        |        abort();
-        |    }
-        |    /* Strings already have a trailing NUL; their owners outlive this synchronous call. */
-        |    argv[0] = (char *)program->bytes;
-        |    for (size_t index = 0; index < count; index++) {
-        |        argv[index + 1] = arguments->values[index]->bytes;
-        |    }
-        |    argv[count + 1] = NULL;
-        |    /* The inherited environment, without every name the command sets or removes,
-        |     * then each "NAME=value" it sets. The changes have no NUL, so each is a C string. */
-        |    const size_t changes = (size_t)environment->length;
-        |    size_t inherited = 0;
-        |    while (environ[inherited] != NULL) {
-        |        inherited++;
-        |    }
-        |    char **envp = blorp_memory_allocate((inherited + changes + 1) * sizeof *envp);
-        |    if (envp == NULL) {
-        |        abort();
-        |    }
-        |    size_t kept = 0;
-        |    for (size_t index = 0; index < inherited; index++) {
-        |        if (!blorp_process_overridden(environ[index], environment->values, changes)) {
-        |            envp[kept++] = environ[index];
-        |        }
-        |    }
-        |    for (size_t index = 0; index < changes; index++) {
-        |        if (strchr(environment->values[index]->bytes, '=') != NULL) {
-        |            envp[kept++] = environment->values[index]->bytes;
-        |        }
-        |    }
-        |    envp[kept] = NULL;
         |    struct blorp_process_output out = {-1, NULL, 0, 0}, err = {-1, NULL, 0, 0};
         |    struct blorp_process_input in = {-1, NULL, 0, 0, 0};
         |    int stdout_pipe[2] = {-1, -1}, stderr_pipe[2] = {-1, -1}, stdin_pipe[2] = {-1, -1};
         |    int report[2] = {-1, -1};
         |    struct blorp_process_pipe_guard guard;
         |    int guarded = 0, timed_out = 0, number = 0, status = 0;
-        |    int64_t failure = 0, now = 0, deadline = 0;
+        |    int64_t now = 0, deadline = 0;
         |    pid_t child = -1;
         |    out.bytes = blorp_memory_allocate(BLORP_PROCESS_READ_CHUNK);
         |    err.bytes = blorp_memory_allocate(BLORP_PROCESS_READ_CHUNK);
@@ -561,10 +618,10 @@ private CAPTURE_BODY: String =
         |    }
         |    if (child == 0) {
         |        blorp_process_capture_child(stdin_pipe[0], stdout_pipe[1], stderr_pipe[1], report[1],
-        |                                    place, argv, envp);
+        |                                    place, launch.argv, launch.envp);
         |    }
         |    if (number != 0) {
-        |        failure = blorp_process_error(blorp_fs_errno_code_within(number, BLORP_PROCESS_SYSTEM_CALL_KINDS), BLORP_PROCESS_LAUNCH_FAILED);
+        |        failure = blorp_process_launch_error(number);
         |        goto cleanup;
         |    }
         |    (void)blorp_process_close(&stdout_pipe[1]);
@@ -581,7 +638,7 @@ private CAPTURE_BODY: String =
         |        stdin_pipe[1] = -1;
         |        number = blorp_process_block_sigpipe(&guard);
         |        if (number != 0) {
-        |            failure = blorp_process_error(blorp_fs_errno_code_within(number, BLORP_PROCESS_SYSTEM_CALL_KINDS), BLORP_PROCESS_LAUNCH_FAILED);
+        |            failure = blorp_process_launch_error(number);
         |            goto cleanup;
         |        }
         |        guarded = 1;
@@ -656,7 +713,7 @@ private CAPTURE_BODY: String =
         |        }
         |    }
         |    if (number != 0 && failure == 0) {
-        |        failure = blorp_process_error(blorp_fs_errno_code_within(number, BLORP_PROCESS_SYSTEM_CALL_KINDS), BLORP_PROCESS_LAUNCH_FAILED);
+        |        failure = blorp_process_launch_error(number);
         |    }
         |cleanup:
         |    if (guarded) {
@@ -665,7 +722,7 @@ private CAPTURE_BODY: String =
         |    if (child > 0) {
         |        const int problem = blorp_process_reap(child, &status);
         |        if (problem != 0 && failure == 0) {
-        |            failure = blorp_process_error(blorp_fs_errno_code_within(problem, BLORP_PROCESS_SYSTEM_CALL_KINDS), BLORP_PROCESS_LAUNCH_FAILED);
+        |            failure = blorp_process_launch_error(problem);
         |        }
         |    }
         |    /* The group is gone, so only what is already buffered is read, up to a limit. */
@@ -675,7 +732,7 @@ private CAPTURE_BODY: String =
         |            number = blorp_process_read_available(&err, 1);
         |        }
         |        if (number != 0) {
-        |            failure = blorp_process_error(blorp_fs_errno_code_within(number, BLORP_PROCESS_SYSTEM_CALL_KINDS), BLORP_PROCESS_LAUNCH_FAILED);
+        |            failure = blorp_process_launch_error(number);
         |        }
         |    }
         |    int *descriptors[] = {&out.descriptor, &err.descriptor, &in.descriptor, &stdout_pipe[0],
@@ -684,8 +741,7 @@ private CAPTURE_BODY: String =
         |    for (size_t index = 0; index < sizeof descriptors / sizeof *descriptors; index++) {
         |        (void)blorp_process_close(descriptors[index]);
         |    }
-        |    blorp_memory_release(argv);
-        |    blorp_memory_release(envp);
+        |    blorp_process_release_launch(&launch);
         |    int64_t ended = 0;
         |    if (timed_out) {
         |        ended = blorp_process_exit(BLORP_PROCESS_TIMED_OUT, 0);

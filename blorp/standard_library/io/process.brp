@@ -24,6 +24,24 @@ import:
     result: Result methods
     string: String methods
     ./_codes: NOT_FOUND_CODE, PERMISSION_DENIED_CODE, NOT_A_DIRECTORY_CODE
+    ./_launch:
+        EXITED_KIND,
+        SIGNALED_KIND,
+        TIMED_OUT_KIND,
+        LAUNCH_FAILED_TAG,
+        NOT_EXECUTABLE_TAG,
+        DIRECTORY_FAILED_TAG,
+        CONTAINS_NUL_TAG,
+        STDOUT_NOT_UTF8_TAG,
+        STDERR_NOT_UTF8_TAG,
+        NOT_ON_PATH_TAG,
+        directory_argument,
+        environment_entries,
+        fault,
+        invalid_variable_name,
+        split_error_code,
+        split_exit_code,
+        zero_or_one,
 
 
 -- What to run. Build one with `command`, then change fields by record update.
@@ -98,29 +116,8 @@ union OutputError:
     Unsuccessful(Captured)
 
 
--- The codes of src/common/codegen/runtime/process.brp's PROCESS_HELPERS_RUNTIME enums,
--- which agree with it only by the tests. An Exit is its kind times
--- EXIT_KIND_SPAN plus its status or signal, always below the span. An error is
--- its detail times ERROR_TAG_SPAN plus its tag: the detail is a file-protocol code
--- (io/_codes), an Exit code for the UTF-8 kinds, or 0.
-private EXIT_KIND_SPAN: Int = 256
-private EXITED_KIND: Int = 0
-private SIGNALED_KIND: Int = 1
-private TIMED_OUT_KIND: Int = 2
-
-private ERROR_TAG_SPAN: Int = 16
-private LAUNCH_FAILED_TAG: Int = 1
-private NOT_EXECUTABLE_TAG: Int = 2
-private DIRECTORY_FAILED_TAG: Int = 3
-private CONTAINS_NUL_TAG: Int = 4
-private STDOUT_NOT_UTF8_TAG: Int = 5
-private STDERR_NOT_UTF8_TAG: Int = 6
-private NOT_ON_PATH_TAG: Int = 7
-
 -- The native's timeout when there is none; any other is at least 0.
 private NO_TIMEOUT: Int = -1
-
-private EQUALS_BYTE: Int = 61
 
 
 -- Program, arguments, then the directory and stdin as lists of zero or one
@@ -159,18 +156,18 @@ pure func succeeded(exit: Exit) -> Bool:
 
 
 private pure func decode_exit(code: Int) -> Option[Exit]:
-    kind = code / EXIT_KIND_SPAN
-    value = code % EXIT_KIND_SPAN
-    if code < 0:
-        None
-    else if kind == EXITED_KIND:
-        Some(Exited(value))
-    else if kind == SIGNALED_KIND:
-        Some(Signaled(value))
-    else if (kind == TIMED_OUT_KIND).and(value == 0):
-        Some(TimedOut)
-    else:
-        None
+    match code.split_exit_code():
+        Some((kind, value)):
+            if kind == EXITED_KIND:
+                Some(Exited(value))
+            else if kind == SIGNALED_KIND:
+                Some(Signaled(value))
+            else if (kind == TIMED_OUT_KIND).and(value == 0):
+                Some(TimedOut)
+            else:
+                None
+        None:
+            None
 
 
 -- The decoders below are public so that process_suite binds them to literal
@@ -190,12 +187,9 @@ pure func decode_system_call_error(code: Int) -> SystemCallError:
         OtherOs(0 - code)
 
 
--- What capture's native can send; None is anything else, which the caller faults. The tag
--- is taken so that it is never negative, since file-protocol codes for an unnamed errno are,
--- and then the rest divides exactly whichever way `/` rounds.
+-- What capture's native can send; None is anything else, which the caller faults.
 pure func decode_capture_error(code: Int) -> Option[CaptureError]:
-    tag = (code % ERROR_TAG_SPAN + ERROR_TAG_SPAN) % ERROR_TAG_SPAN
-    detail = (code - tag) / ERROR_TAG_SPAN
+    (tag, detail) = code.split_error_code()
     if tag == LAUNCH_FAILED_TAG:
         Some(LaunchFailed(detail.decode_system_call_error()))
     else if (tag == NOT_EXECUTABLE_TAG).and(detail == 0):
@@ -238,58 +232,6 @@ private pure func decode_captured(reply: List[String]) -> Option[Captured]:
             None
 
 
--- Aborts with the message: a reply the natives never send is a runtime defect,
--- not an error value (PROCESS_DECISIONS.md, P5).
-private func native_fault(message: String) -> Result[Void, Int]:
-    builtin("process.fault")
-
-
--- Never returns. A workaround, not a pattern: Blorp has no type for a call that
--- cannot return, so the call to fault_again, which never runs, gives fault every
--- type; calling itself would fail C's -Winfinite-recursion.
-private func fault[T](message: String) -> T:
-    ignored = native_fault(message)
-    fault_again(message)
-
-
-private func fault_again[T](message: String) -> T:
-    fault(message)
-
-
-private pure func is_variable_name(name: String) -> Bool:
-    var valid = name.length() > 0
-    for position in 0..name.length():
-        match name.byte_at(position):
-            Some(byte): valid = valid.and(byte != EQUALS_BYTE)
-            None: void
-    valid
-
-
--- The first name that is empty or contains "=", in insertion order.
-private pure func invalid_variable_name(
-    environment: Dict[String, Option[String]],
-) -> Option[String]:
-    environment
-        .keys()
-        .find(
-            pure func(name: String) -> Bool: name
-                .is_variable_name()
-                .not(),
-        )
-
-
-private pure func environment_entry(entry: (String, Option[String])) -> String:
-    match entry:
-        (name, Some(value)): "${name}=${value}"
-        (name, None): name
-
-
-private pure func zero_or_one(value: Option[String]) -> List[String]:
-    match value:
-        Some(present): [present]
-        None: []
-
-
 private pure func native_timeout(timeout_ms: Option[Int]) -> Int:
     timeout_ms
         .map(pure func(milliseconds: Int) -> Int: milliseconds.max(0))
@@ -314,12 +256,8 @@ func capture(invocation: Command) -> Result[Captured, CaptureError]:
             reply = native_capture(
                 "${invocation.program}",
                 invocation.arguments,
-                invocation.directory
-                    .map(pure func(directory: Path) -> String: directory.to_string())
-                    .zero_or_one(),
-                invocation.environment
-                    .entries()
-                    .map(environment_entry),
+                invocation.directory.directory_argument(),
+                invocation.environment.environment_entries(),
                 invocation.stdin.zero_or_one(),
                 invocation.timeout_ms.native_timeout(),
             )
