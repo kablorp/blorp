@@ -581,6 +581,43 @@ scaled that were measured stay as they are, because all pass the
 reproduction: `path_normalize/edges` sits 1.47% under its ceiling, `fs/write`
 3.6%, `string_slice/bounds` 9.7% and `uint8/values` 18.3%.
 
+**Checkout depth, resolved 2026-11-12.** Keith chose a fast path in
+`normalize` over a named allowance on allocation ceilings and over fixed-depth
+harness paths. An already normal spelling (nonempty, `/` alone or components
+that are nonempty and neither `.` nor `..`) comes back unchanged after a byte
+scan, so it costs no allocation. A test in `driver/harness.brp` compiles one
+program from two directories eight levels apart and expects equal strict
+allocations. Main gave 112,097 and 112,121; the change gives 112,044 at both.
+Keith accepted the cost, asked as "about +4.6k compile allocations for
+programs importing path": every program that imports `path` compiles the
+larger `path.brp`, so it pays about 4,650 more compile allocations. Programs
+that don't import it, such as hello world, do not. The brief capped
+production growth at +40 lines; the change is +58, about +51 before
+formatting. The coordinator accepted the overrun, since it is the scan Keith
+approved. Self-compile against `525b653c2`: fixed input -59 allocations and
+-0.007% instructions with identical C; own source +9,040 allocations
+(+0.064%) and +0.021% instructions. At runtime, the `path_normalize/edges`
+run pins for normal spellings fall to 3 allocations:
+- `/foo/bar` from 13;
+- `.../..x/x..` from 12;
+- `ab/leaf` and `é/leaf` from 11;
+- `ab` and `é` from 10;
+- `/` from 7.
+
+The surviving-aliases case falls from 34 to 30.
+
+The change moved these ceilings:
+- **Allocation ceilings, each raised by the measured increase** (same-depth
+  main against the change), so each keeps its headroom:
+  - fs/read 222,197 → 226,851 (+4,654);
+  - fs/write 234,300 → 238,950 (+4,650);
+  - fs/directories 420,003 → 424,653 (+4,650).
+- **Instruction ceilings, reset to the change's median of 3 plus 15%:**
+  - fs/lines 1,196,778,594 → 1,388,425,179 (main's median was 1,193,005,705,
+    0.3% under its old ceiling);
+  - fs/directories 1,347,097,145 → 1,557,742,393;
+  - `path_normalize/edges` 605,108,277 → 723,191,280.
+
 ## Landings
 
 1. **S0, a spike** that never lands (done). It measured the stored count's

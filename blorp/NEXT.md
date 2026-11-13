@@ -165,11 +165,6 @@ None of these is planned yet. Each wants its own short design or brief.
   `pgrep -f '^[^ ]*self-hosted-tests/driver/driver'` and
   `pgrep -f '^[^ ]*blorp/build/(blorp|compiler|fixpoint)'` to come back empty. The
   pattern is anchored so that a waiting shell never matches itself.
-- **e2e compile allocations grow with the checkout's depth,** by about four
-  per directory level: the compiler normalizes each absolute path it is
-  given, one String per component. A deep worktree can exceed an exact
-  ceiling that CI meets; compare with main at the same path before calling
-  it a regression.
 - **A subagent's commands move to the background after about 180 s.** Put the
   busy check inside your own scripts, start long scripts in the background,
   and wait for their exit notification rather than polling.
