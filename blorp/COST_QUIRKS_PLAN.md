@@ -53,9 +53,11 @@ documented quirks:
    read** (`own`). An owner a loop arm inherits from an enclosing block could
    be moved at its last read in the iteration but was otherwise dropped only
    at the back edge, so a record rebuilt each iteration stayed alive while its
-   fields were updated, and every update copied. These owners now end at
-   their last read, exactly as a yielding join arm's entering owners do. The
-   README states the cost rule in its Own section.
+   fields were updated, and every update copied. An owner the iteration
+   reads now ends at its last read there, as a yielding join arm's entering
+   owner does. One it inherits but never reads still ends at the back edge,
+   where a join arm would drop it on entry (see Follow-ups). The README states
+   the cost rule in its Own section.
 3. **L3, stale notes.** Comments that described copies of the retired host
    compiler.
 4. **Q2, loops that carry a `Result`** (`emit`). Each loop that passed its
@@ -71,6 +73,24 @@ heap-allocated even when the caller destructures it at once. The lexer's
 (`LSP_PLAN.md`, landing 2's measurement). Records are 56.5% of the
 self-compile's allocations (7.98 M of 14.13 M at `203541220`). Keith approved
 values by representation in principle; the records design pilot owns it.
+
+## Follow-ups
+
+Found while landing; none is in this stack.
+
+- **Drop unread inherited owners on entry.** An owner a loop iteration
+  inherits but never reads lasts until its back edge, where a yielding join
+  arm drops one on entry (`own.brp`, `loop_consumption_uses` against
+  `entering_discharges`). In
+  `while bag.items.length() < n: bag = { bag | items = bag.items.append(x) }`
+  the condition's projection is such an owner, so each append still copies.
+  `owned_parameters/loop_condition_projection` records today's count.
+- **`loop_uses` carries only held header rows,** and lowering never produces
+  a held header (`lower.brp:2190`, `2393`). Remove the parameter or give it a
+  producer.
+- **A `while` condition's owners last until each arm's exit.** A loop match's
+  prefix keeps every owner to its arms, so an update inside the condition,
+  such as `[7].append(total)`, copies instead of consuming its operand.
 
 ## Measurements
 
@@ -112,3 +132,47 @@ compiled the base's source.
 - The pilot's attribution of the self-compile at `203541220`: String update
   copies fall from 20.4 MB to 10.3 MB. The largest site,
   `emit.append_selection_body` (8.65 MB), no longer copies.
+
+### L2 (2026-11-12)
+
+Base `cost/l1-interpolation-chain`, candidate `cost/l2-loop-last-read`.
+
+- **Tests.**
+  - `test_own`: "an inherited record drops before its field grows", which
+    asserts that the record header's drop precedes the update, fails on L1
+    and passes with L2.
+  - `test_own` guards that pass on L1 too: "an inherited owner an update
+    takes is not dropped" and "an inherited owner the iteration never reads
+    retires at its edge".
+  - `test_verify` guards, which pass on L1 too because verify is unchanged:
+    "a back edge cannot retire an owner its iteration dropped", and "a back
+    edge cannot discharge an owner made before its loop", which pins the rule
+    (`verify.brp`, "loop edge discharges a captured owner") that keeps L2 from
+    dropping an owner made before the loop.
+- **Probes.** Seven fixtures under `owned_parameters/loop_*`. Each runs under
+  strict accounting and ASan and UBSan, and prints the same output under L1
+  and L2, which is the base compiler's output too.
+
+  | Fixture | L1 | L2 |
+  |---|---:|---:|
+  | `loop_record` | 304 | 106 |
+  | `loop_reads_every_iteration` | 18 | 18 |
+  | `loop_reads_after_loop` | 9 | 9 |
+  | `loop_one_branch` | 18 | 18 |
+  | `loop_nested` | 25 | 22 |
+  | `loop_exits` | 39 | 34 |
+  | `loop_projection` | 35 | 33 |
+
+  These are runtime allocations. Their compile ceilings are the L2 test
+  compiler's measured cost on `476ceef23` plus 15%.
+  `loop_condition_projection` (202 allocations) records the copy L2 leaves:
+  see "Drop unread inherited owners on entry" under Follow-ups.
+- **Lowered counts.** `record/update/field_accumulator` 57 to 53 and
+  `source_loops/managed_headers` 27 to 25. No count rose.
+- **Stage-2 self-compile** on L1's source: allocations 13,930,448 to
+  13,929,785 (−663), median instructions 12,254,329,814 to 12,247,222,930
+  (−0.06%, within noise). The compiler's own source avoids rebuilding a record
+  in a loop, so L2 serves user code. Samples: L1 12,268,706,372,
+  12,250,684,522, 12,265,757,681, 12,254,329,814 and 12,252,504,057; L2
+  12,256,785,788, 12,247,222,930, 12,234,189,345, 12,257,489,950 and
+  12,244,823,714. The L2 stage-2 compiler reproduces its own C (`94bd3323…`).

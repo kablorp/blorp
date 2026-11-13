@@ -1322,7 +1322,14 @@ the output may already be new.
    when its value can reach an in-place update (`append`, `set`, `concat`,
    String `+`, `append_int`) or another owned parameter, and a call moves the
    caller's owner there at its last use. These labels change where a program
-   copies, never what it computes.
+   copies, never what it computes. An obligation ends at its last use, where
+   a move takes it or a drop ends it, except one that a loop iteration
+   inherits but never reads, such as a field a `while` condition read: that
+   one ends at the back edge. So an update (`append`, `set`, `concat`, `+`)
+   reuses its operand when no later code can read the old value and no such
+   owner still holds it; otherwise it copies. A record or tuple holding a
+   String, List or record, and a lambda bound to a name, allocate each time
+   they are built.
 9. **Verify** ([`verify`](src/common/codegen/verify/verify.brp)) checks the ownership IR
    independently and alone produces a `VerifiedProgram`. It rejects dead or
    wrong owners, invalid borrows, undischarged obligations, calls that disagree

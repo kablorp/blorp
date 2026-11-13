@@ -1403,6 +1403,195 @@ pure func test_a_value_yielded_twice_moves_once_and_acquires_once() -> Bool:
                     False
 
 
+-- The recurring arm of `loop`: one iteration's operations and its back edge.
+private pure func iteration(loop: own.OwnedLoop) -> Option[own.OwnedLoopBlock]:
+    match loop.body.tail:
+        own.ExitLoop(_):
+            None
+        own.MatchLoop(matched):
+            matched.arms
+                .map(pure func(arm): arm.body)
+                .find(pure func(block):
+                    match block.tail:
+                        own.ExitLoop(own.Recur(_, _)): True
+                        _: False
+                )
+
+
+-- The position of the first operation `accepts` takes, among these operations
+-- and not their nested blocks.
+private pure func first_position(
+    operations: List[own.OwnershipOperation],
+    accepts: pure (own.OwnershipOperation) -> Bool,
+) -> Option[Int]:
+    var position = 0
+    var found: Option[Int] = None
+    for operation in operations:
+        if accepts(operation):
+            found = Some(position)
+            break
+        position = position + 1
+    found
+
+
+-- A call that consumes its first operand: an update in place.
+private pure func is_consuming_call(operation: own.OwnershipOperation) -> Bool:
+    match operation:
+        own.DefineValue(definition):
+            match definition.operation:
+                own.CallDefinition(_, arguments):
+                    match arguments.get(0):
+                        Some(own.ConsumedArgument(_, _)): True
+                        _: False
+                _:
+                    False
+        _:
+            False
+
+
+-- The one loop of `body`'s program and its iteration, once insertion and
+-- verification succeed.
+private pure func only_iteration(body: String) -> Option[own.OwnedLoopBlock]:
+    match transfer_facts(body):
+        None:
+            None
+        Some(program):
+            match loops(collect_operations(program)):
+                [loop]:
+                    if transfers_soundly(program):
+                        loop.iteration()
+                    else:
+                        None
+                _:
+                    None
+
+
+-- The record header the iteration inherits ends at its last read there: the
+-- update's projections. So the header's drop precedes the update, which finds
+-- the field unique.
+pure func test_an_inherited_record_drops_before_its_field_grows() -> Bool:
+    body: String =
+        |record Bag { items: List[Int], extra: List[Int] }
+        |pure func walk() -> Bag:
+        |    var bag: Bag = { items = [], extra = [] }
+        |    while less_than(length(bag.items), 12):
+        |        bag = { bag | items = append(bag.items, 7) }
+        |    bag
+        |func main() -> Int:
+        |    walked = walk()
+        |    0
+        |
+    match transfer_facts(body):
+        None:
+            False
+        Some(program):
+            match loops(collect_operations(program)):
+                [loop]:
+                    headers = header_owners(loop)
+                    match loop.iteration():
+                        None:
+                            False
+                        Some(block):
+                            dropped = block.operations.first_position(
+                                pure func(operation: own.OwnershipOperation) -> Bool:
+                                    match operation:
+                                        own.DropOwner(owner, _):
+                                            headers.contains(own.owner_number(owner))
+                                        _:
+                                            False
+                            )
+                            updated = block.operations.first_position(is_consuming_call)
+                            match dropped:
+                                None:
+                                    False
+                                Some(at):
+                                    match updated:
+                                        None: False
+                                        Some(update): (at < update).and(transfers_soundly(program))
+                _:
+                    False
+
+
+-- An inherited owner a slot takes at its last read is not also dropped there.
+pure func test_an_inherited_owner_an_update_takes_is_not_dropped() -> Bool:
+    body: String =
+        |pure func collect() -> List[Int]:
+        |    var values: List[Int] = []
+        |    while less_than(length(values), 12):
+        |        values = append(values, 7)
+        |    values
+        |func main() -> Int:
+        |    unused = collect()
+        |    0
+        |
+    match transfer_facts(body):
+        None:
+            False
+        Some(program):
+            match loops(collect_operations(program)):
+                [loop]:
+                    match loop.iteration():
+                        None:
+                            False
+                        Some(block):
+                            owners = header_owners(loop)
+                            owners
+                                .is_empty()
+                                .not()
+                                .and(
+                                    owners.all(
+                                        pure func(owner): drops_in(block.operations, owner).equals(
+                                            0,
+                                        ),
+                                    ),
+                                )
+                                .and(
+                                    owners.all(
+                                        pure func(owner): consumed_owners(block.operations).contains(
+                                            owner,
+                                        ),
+                                    ),
+                                )
+                                .and(transfers_soundly(program))
+                _:
+                    False
+
+
+-- Inherited owners the iteration never reads, here the condition's Lists, stay
+-- live to the back edge, which retires them after the iteration's definitions.
+pure func test_an_inherited_owner_the_iteration_never_reads_retires_at_its_edge() -> Bool:
+    body: String =
+        |pure func add(left: Int, right: Int) -> Int:
+        |    builtin("int.add")
+        |pure func count_up() -> Int:
+        |    var total: Int = 0
+        |    while less_than(length(append([7], total)), 4):
+        |        total = add(total, 1)
+        |    total
+        |func main() -> Int:
+        |    counted = count_up()
+        |    0
+        |
+    match only_iteration(body):
+        None:
+            False
+        Some(block):
+            var last_definition = -1
+            var drops: List[Int] = []
+            var position = 0
+            for operation in block.operations:
+                match operation:
+                    own.DefineValue(_): last_definition = position
+                    own.DropOwner(_, _): drops = drops.append(position)
+                    _: void
+                position = position + 1
+            final_definition = last_definition
+            drops
+                .is_empty()
+                .not()
+                .and(drops.all(pure func(dropped): dropped > final_definition))
+
+
 TESTS: TestSuite = {
     description = "Loop entry and join ownership transfer insertion",
     tests = [
@@ -1491,6 +1680,18 @@ TESTS: TestSuite = {
         (
             "a value yielded twice moves once and acquires once",
             test_a_value_yielded_twice_moves_once_and_acquires_once,
+        ),
+        (
+            "an inherited record drops before its field grows",
+            test_an_inherited_record_drops_before_its_field_grows,
+        ),
+        (
+            "an inherited owner an update takes is not dropped",
+            test_an_inherited_owner_an_update_takes_is_not_dropped,
+        ),
+        (
+            "an inherited owner the iteration never reads retires at its edge",
+            test_an_inherited_owner_the_iteration_never_reads_retires_at_its_edge,
         ),
     ],
 }

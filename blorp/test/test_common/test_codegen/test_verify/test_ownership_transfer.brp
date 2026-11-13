@@ -1018,6 +1018,197 @@ pure func test_a_break_cannot_move_an_enclosing_owner_it_dropped() -> Bool:
                     False
 
 
+-- A record each iteration rebuilds. Insertion drops the inherited record at
+-- its last read in the iteration, before the update, not at the back edge.
+private REBUILT_RECORD_SOURCE: String =
+    |record Bag { items: List[Int], extra: List[Int] }
+    |pure func walk() -> Bag:
+    |    var bag: Bag = { items = [], extra = [] }
+    |    while less_than(length(bag.items), 12):
+    |        bag = { bag | items = append(bag.items, 7) }
+    |    bag
+    |func main() -> Int:
+    |    walked = walk()
+    |    0
+    |
+
+
+-- Whether this loop block ends by recurring: an iteration of its loop.
+private pure func recurs(block: own.OwnedLoopBlock) -> Bool:
+    match block.tail:
+        own.ExitLoop(own.Recur(_, _)): True
+        _: False
+
+
+-- The first owner the iterations of these functions' loops drop.
+private pure func iteration_drop(functions: List[own.OwnedFunction]) -> Option[own.OwnerId]:
+    var found: Option[own.OwnerId] = None
+    for function in functions:
+        for operation in function.operations:
+            match operation:
+                own.ExecuteLoop(loop):
+                    match loop.body.tail:
+                        own.MatchLoop(matched):
+                            for arm in matched.arms:
+                                if recurs(arm.body).and(found.is_none()):
+                                    for nested in arm.body.operations:
+                                        match nested:
+                                            own.DropOwner(owner, _):
+                                                if found.is_none():
+                                                    found = Some(owner)
+                                            _:
+                                                void
+                        own.ExitLoop(_):
+                            void
+                _:
+                    void
+    found
+
+
+-- Every loop iteration in these operations with `extra` after its own
+-- operations, where its back edge retires owners.
+private pure func retire_at_each_back_edge(
+    operations: List[own.OwnershipOperation],
+    extra: own.OwnershipOperation,
+) -> List[own.OwnershipOperation]:
+    operations.map(pure func(operation):
+        match operation:
+            own.ExecuteLoop(loop):
+                match loop.body.tail:
+                    own.MatchLoop(matched):
+                        arms = matched.arms.map(
+                            pure func(arm: own.OwnedLoopArm) -> own.OwnedLoopArm:
+                                if recurs(arm.body):
+                                    { arm |
+                                        body = { arm.body |
+                                            operations = arm.body.operations.append(extra),
+                                        },
+                                    }
+                                else:
+                                    arm
+                        )
+                        own.ExecuteLoop(
+                            { loop |
+                                body = { loop.body |
+                                    tail = own.MatchLoop({ matched | arms = arms }),
+                                },
+                            },
+                        )
+                    own.ExitLoop(_):
+                        operation
+            _:
+                operation
+    )
+
+
+-- An owner the iteration dropped at its last read is discharged: its back
+-- edge may not retire it again.
+pure func test_a_back_edge_cannot_retire_an_owner_its_iteration_dropped() -> Bool:
+    match owned_source(REBUILT_RECORD_SOURCE):
+        Err(_):
+            False
+        Ok(program):
+            match iteration_drop(program.functions):
+                None:
+                    False
+                Some(owner):
+                    changed = program.functions.map(
+                        pure func(function): { function |
+                            operations = retire_at_each_back_edge(
+                                function.operations,
+                                own.DropOwner(owner, span(77)),
+                            ),
+                        },
+                    )
+                    verify(program)
+                        .is_ok()
+                        .and(
+                            rejects(
+                                { program | functions = changed },
+                                "owner ${own.owner_number(owner)} has already been discharged",
+                                77,
+                            ),
+                        )
+
+
+-- A List made before the loop and read in every iteration: only the code
+-- around the loop may discharge it, after the loop.
+private CAPTURED_OWNER_SOURCE: String =
+    |pure func collect() -> List[Int]:
+    |    kept: List[Int] = append([1], 7)
+    |    var values: List[Int] = []
+    |    while less_than(length(values), length(kept)):
+    |        values = append(values, length(kept))
+    |    values
+    |func main() -> Int:
+    |    unused = collect()
+    |    0
+    |
+
+
+-- An owner made before a loop belongs to the code around it. An iteration
+-- that discharged it would leave the next iteration, and the code after the
+-- loop, a released value, so its back edge is rejected.
+pure func test_a_back_edge_cannot_discharge_an_owner_made_before_its_loop() -> Bool:
+    match owned_source(CAPTURED_OWNER_SOURCE):
+        Err(_):
+            False
+        Ok(program):
+            var after_loop: List[own.OwnerId] = []
+            var edges: List[Span] = []
+            for function in program.functions:
+                var looped: Bool = False
+                for operation in function.operations:
+                    match operation:
+                        own.ExecuteLoop(loop):
+                            looped = True
+                            match loop.body.tail:
+                                own.MatchLoop(matched):
+                                    for arm in matched.arms:
+                                        match arm.body.tail:
+                                            own.ExitLoop(own.Recur(_, edge)):
+                                                edges = edges.append(edge)
+                                            _:
+                                                void
+                                own.ExitLoop(_):
+                                    void
+                        own.DropOwner(owner, _):
+                            if looped:
+                                after_loop = after_loop.append(owner)
+                        _:
+                            void
+            match after_loop:
+                [owner]:
+                    match edges:
+                        [edge]:
+                            changed = program.functions.map(
+                                pure func(function): { function |
+                                    operations = retire_at_each_back_edge(
+                                        function.operations,
+                                        own.DropOwner(owner, span(77)),
+                                    ),
+                                },
+                            )
+                            match verify({ program | functions = changed }):
+                                Ok(_):
+                                    False
+                                Err(error):
+                                    verify(program)
+                                        .is_ok()
+                                        .and(
+                                            error.message.equals(
+                                                "ownership verification failed: loop edge discharges a captured owner",
+                                            ),
+                                        )
+                                        .and(error.span.source == edge.source)
+                                        .and(error.span.start.equals(edge.start))
+                                        .and(error.span.end.equals(edge.end))
+                        _:
+                            False
+                _:
+                    False
+
+
 TESTS: TestSuite = {
     description = "Loop entry and join ownership transfer verification",
     tests = [
@@ -1109,6 +1300,14 @@ TESTS: TestSuite = {
         (
             "a break cannot move an enclosing owner it dropped",
             test_a_break_cannot_move_an_enclosing_owner_it_dropped,
+        ),
+        (
+            "a back edge cannot retire an owner its iteration dropped",
+            test_a_back_edge_cannot_retire_an_owner_its_iteration_dropped,
+        ),
+        (
+            "a back edge cannot discharge an owner made before its loop",
+            test_a_back_edge_cannot_discharge_an_owner_made_before_its_loop,
         ),
     ],
 }
