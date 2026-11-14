@@ -898,6 +898,105 @@ static int case_fifo(const char *directory) {
     return 0;
 }
 
+
+/* The reviewed chunk contract is 64 KiB, independent of its runtime constant. */
+enum { CHUNK_BYTES = 65536 };
+
+/* Byte chunks use the same recording read wrappers, with no text decoder. */
+static int case_chunks(const char *directory) {
+    char path[PATH_BYTES];
+    const size_t length = (size_t)CHUNK_BYTES * 2 + 1;
+    unsigned char *payload = malloc(length);
+    assert(payload != NULL);
+    for (size_t index = 0; index < length; index++) payload[index] = (unsigned char)index;
+    case_file(path, directory, "chunks", (const char *)payload, length);
+    const int free_before = lowest_free_descriptor();
+    begin();
+    const int64_t descriptor = open_existing(path);
+    const size_t limits[] = {3};
+    limit_reads(limits, 1);
+    inject(READ_CALL, 0, 1, EINTR);
+    size_t used = 0;
+    for (int chunk = 0; chunk < 5; chunk++) {
+        struct blorp_l_0_b *bytes = NULL;
+        int64_t error = 0;
+        assert(blorp_fs_read_chunk(descriptor, &bytes, &error) == BLORP_FS_SUCCEEDED && error == 0);
+        const size_t expected = chunk == 0 ? 3 : chunk == 1 ? CHUNK_BYTES : chunk == 2 ? CHUNK_BYTES - 2 : 0;
+        assert(bytes->length == (int64_t)expected);
+        assert(memcmp(bytes->values, payload + used, expected) == 0);
+        used += expected;
+        blorp_list_drop_0_b(bytes);
+        assert(count_events(READ_CALL) == chunk + 2);
+    }
+    assert(used == length);
+    for (int index = 0; index < count_events(READ_CALL); index++) assert(read_event(index)->requested <= CHUNK_BYTES);
+    assert(close_descriptor(descriptor) == 0);
+    expect_clean(free_before);
+    free(payload);
+    return 0;
+}
+
+static int case_chunk_sizes(const char *directory) {
+    char path[PATH_BYTES];
+    const size_t sizes[] = {0, 1, CHUNK_BYTES, CHUNK_BYTES + 1};
+    char *payload = malloc(CHUNK_BYTES + 1);
+    assert(payload != NULL);
+    memset(payload, 0xff, CHUNK_BYTES + 1);
+    const int free_before = lowest_free_descriptor();
+    for (size_t index = 0; index < sizeof sizes / sizeof sizes[0]; index++) {
+        case_file(path, directory, "chunk_sizes", payload, sizes[index]);
+        begin();
+        const int64_t descriptor = open_existing(path);
+        size_t used = 0;
+        int reads = 0;
+        for (;;) {
+            struct blorp_l_0_b *bytes = NULL;
+            int64_t error = 0;
+            assert(blorp_fs_read_chunk(descriptor, &bytes, &error) == BLORP_FS_SUCCEEDED && error == 0);
+            reads++;
+            assert(reads <= 3);
+            const size_t length = (size_t)bytes->length;
+            assert(length <= CHUNK_BYTES && used + length <= sizes[index]);
+            assert(memcmp(bytes->values, payload + used, length) == 0);
+            used += length;
+            blorp_list_drop_0_b(bytes);
+            if (length == 0) break;
+        }
+        assert(used == sizes[index]);
+        assert(reads == (int)((sizes[index] + CHUNK_BYTES - 1) / CHUNK_BYTES) + 1);
+        assert(close_descriptor(descriptor) == 0);
+        expect_clean(free_before);
+    }
+    free(payload);
+    return 0;
+}
+
+static int case_chunk_failures(const char *directory) {
+    char path[PATH_BYTES];
+    case_file(path, directory, "chunk_failures", "data", 4);
+    const int free_before = lowest_free_descriptor();
+    begin();
+    const int64_t descriptor = open_existing(path);
+    struct blorp_l_0_b *bytes = NULL;
+    int64_t error = 0;
+    inject(READ_CALL, 0, 1, EIO);
+    assert(blorp_fs_read_chunk(descriptor, &bytes, &error) == BLORP_FS_FAILED);
+    assert(error == -(int64_t)EIO && bytes == NULL);
+    assert(count_events(CLOSE_CALL) == 0);
+    assert(close_descriptor(descriptor) == 0);
+    expect_clean(free_before);
+    begin();
+    static const int64_t invalid[] = {-1, (int64_t)INT_MAX + 1};
+    for (size_t index = 0; index < sizeof invalid / sizeof invalid[0]; index++) {
+        error = 0;
+        assert(blorp_fs_read_chunk(invalid[index], &bytes, &error) == BLORP_FS_FAILED);
+        assert(error == -(int64_t)EBADF && bytes == NULL);
+    }
+    assert(count_events(READ_CALL) == 0);
+    expect_clean(free_before);
+    return 0;
+}
+
 static int child_case(int argc, char **argv) {
     if (argc != 3) return 2;
     const char *name = argv[1];
@@ -905,6 +1004,9 @@ static int child_case(int argc, char **argv) {
     /* One allocation outside the cases, so that the strict accounting always
      * has something to balance. */
     blorp_string_release(string_of(name));
+    if (strcmp(name, "chunk_sizes") == 0) return case_chunk_sizes(directory);
+    if (strcmp(name, "chunks") == 0) return case_chunks(directory);
+    if (strcmp(name, "chunk_failures") == 0) return case_chunk_failures(directory);
     if (strcmp(name, "batches") == 0) return case_batches(directory);
     if (strcmp(name, "invalid_tail") == 0) return case_invalid_tail(directory);
     if (strcmp(name, "blocks") == 0) return case_blocks(directory);

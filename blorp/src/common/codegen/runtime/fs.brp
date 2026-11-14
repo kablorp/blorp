@@ -156,7 +156,7 @@ FS_HELPERS_RUNTIME: String =
         |}
         |/* A descriptor arrives as an Int. One outside int's range names no open file, so
         | * it is refused as EBADF without a system call, and the cast never truncates.
-        | * Only next_lines and close call this. */
+        | * Chunk/line reads and close call this. */
         |int blorp_fs_is_descriptor(int64_t descriptor){
         |return descriptor>=0&&descriptor<=INT_MAX;
         |}
@@ -247,6 +247,27 @@ pure func fs_read_bytes_runtime(byte_list_type: String) -> String:
         .concat(list_root_allocation(byte_list_type, "result", "length"))
         .concat("\nmemcpy(result->values,contents,length);\nresult->length=(int64_t)length;\n")
         .concat("blorp_memory_release(contents);\n*bytes=result;\nreturn BLORP_FS_SUCCEEDED;\n}\n")
+
+
+-- One bounded read straight into the concrete byte List. A short read is a
+-- complete chunk; an empty List is returned only when read reports EOF.
+pure func fs_read_chunk_runtime(byte_list_type: String) -> String:
+    "enum {BLORP_FS_READ_CHUNK_MAXIMUM=1<<16};\nuint8_t blorp_fs_read_chunk(int64_t descriptor,${byte_list_type} *bytes,int64_t *error){\n"
+        .concat(
+            "if(!blorp_fs_is_descriptor(descriptor)){*error=blorp_fs_other_os_code(EBADF);return BLORP_FS_FAILED;}\n",
+        )
+        .concat(list_root_allocation(byte_list_type, "result", "BLORP_FS_READ_CHUNK_MAXIMUM"))
+        .concat(
+            "\nssize_t received;\nBLORP_FS_RETRY(received,read((int)descriptor,result->values,BLORP_FS_READ_CHUNK_MAXIMUM));\n",
+        )
+        .concat(
+            "if(received<0){const int64_t failure=blorp_fs_errno_code_within(errno,BLORP_FS_READ_KINDS);blorp_memory_release(result);*error=failure;return BLORP_FS_FAILED;}\n",
+        )
+        .concat("if(received==0){blorp_memory_release(result);\n")
+        .concat(list_root_allocation(byte_list_type, "empty", "0"))
+        .concat(
+            "\n*bytes=empty;return BLORP_FS_SUCCEEDED;}\nresult->length=(int64_t)received;*bytes=result;return BLORP_FS_SUCCEEDED;\n}\n",
+        )
 
 
 -- Replaces the file atomically: the text goes into a new file beside the
@@ -420,15 +441,6 @@ FS_WRITE_RUNTIME: String =
         |BLORP_FS_RETRY(flushed,fsync(descriptor));
         |return flushed;
         |}
-        |/* Everything between creating the new file and renaming it. Its descriptor is closed
-        | * exactly once, and a failed close fails the write. */
-        |static int64_t blorp_fs_fill_temporary(int descriptor,const struct blorp_fs_write_target *target,const char *bytes,size_t length){
-        |int64_t failure=target->replaces?blorp_fs_copy_owner_and_mode(descriptor,&target->status):0;
-        |if(failure==0){failure=blorp_fs_write_all(descriptor,bytes,length);}
-        |if(failure==0&&blorp_fs_flush_file(descriptor)<0){failure=blorp_fs_errno_code_within(errno,BLORP_FS_WRITE_KINDS);}
-        |if(close(descriptor)<0&&failure==0){failure=blorp_fs_errno_code_within(errno,BLORP_FS_WRITE_KINDS);}
-        |return failure;
-        |}
         |/* Orders the rename before later writes. A file system that cannot flush a directory
         | * (EINVAL, ENOTSUP) has nothing to order. Any other failure is reported, although the
         | * target already holds the new contents. */
@@ -442,36 +454,111 @@ FS_WRITE_RUNTIME: String =
         |(void)close(descriptor);
         |return failure;
         |}
-        |/* Creates, fills and renames the new file. Until the rename succeeds, a failure
-        | * removes it, ignoring the unlink's own error, and the target is unchanged. */
-        |static int64_t blorp_fs_replace(const struct blorp_fs_write_target *target,const char *bytes,size_t length){
-        |char *temporary=NULL;
-        |int descriptor=-1;
-        |int64_t failure=blorp_fs_create_temporary(target->directory,target->replaces?0600:0666,&temporary,&descriptor);
-        |if(failure!=0){return failure;}
-        |failure=blorp_fs_fill_temporary(descriptor,target,bytes,length);
-        |if(failure==0){
-        |int renamed;
-        |BLORP_FS_RETRY(renamed,rename(temporary,target->path));
-        |if(renamed<0){failure=blorp_fs_errno_code_within(errno,BLORP_FS_WRITE_KINDS);}
+        |/* Storage belongs to the caller: bulk writes use the stack, scoped writers the
+        | * heap. Only this core owns and releases the descriptor and allocated paths. */
+        |struct blorp_fs_writer{int descriptor;char *directory;char *target;char *temporary;int64_t first_failure;};
+        |static void blorp_fs_writer_release_paths(struct blorp_fs_writer *writer){
+        |blorp_memory_release(writer->temporary);
+        |blorp_memory_release(writer->directory);
+        |blorp_memory_release(writer->target);
         |}
-        |if(failure!=0){(void)unlink(temporary);}
-        |blorp_memory_release(temporary);
-        |return failure!=0?failure:blorp_fs_flush_directory(target->directory);
+        |/* Discard consumes the contents even when cleanup fails. The first write error
+        | * wins, then close, then unlink; the scope separately preserves its body error. */
+        |static int64_t blorp_fs_writer_discard_contents(struct blorp_fs_writer *writer){
+        |int64_t failure=writer->first_failure;
+        |if(writer->descriptor>=0&&close(writer->descriptor)<0&&failure==0){failure=blorp_fs_errno_code_within(errno,BLORP_FS_WRITE_KINDS);}
+        |if(writer->temporary!=NULL&&unlink(writer->temporary)<0&&failure==0){failure=blorp_fs_errno_code_within(errno,BLORP_FS_WRITE_KINDS);}
+        |blorp_fs_writer_release_paths(writer);
+        |return failure;
         |}
-        |/* Replaces the file at `path` with `length` bytes: 0, or the failure code. */
-        |static int64_t blorp_fs_write_path(const struct blorp_string *path,const char *bytes,size_t length){
+        |/* Resolve once and establish metadata before lending the writer. Paths transfer
+        | * only after resolution succeeds: resolve_target releases its own partial state. */
+        |static int64_t blorp_fs_writer_prepare(const struct blorp_string *path,struct blorp_fs_writer *writer){
+        |*writer=(struct blorp_fs_writer){.descriptor=-1};
         |if(blorp_fs_has_nul(path)){return BLORP_FS_PATH_CONTAINS_NUL;}
         |struct blorp_fs_write_target target={.directory=NULL,.path=NULL};
         |int64_t failure=blorp_fs_resolve_target(path->bytes,(size_t)path->length,&target);
-        |if(failure==0){
-        |failure=blorp_fs_replace(&target,bytes,length);
-        |blorp_memory_release(target.directory);
-        |blorp_memory_release(target.path);
-        |}
+        |if(failure!=0){return failure;}
+        |writer->directory=target.directory;
+        |writer->target=target.path;
+        |failure=blorp_fs_create_temporary(writer->directory,target.replaces?0600:0666,&writer->temporary,&writer->descriptor);
+        |if(failure==0&&target.replaces){failure=blorp_fs_copy_owner_and_mode(writer->descriptor,&target.status);}
+        |if(failure!=0){(void)blorp_fs_writer_discard_contents(writer);}
         |return failure;
         |}
+        |/* A partial failure poisons the transaction even if its borrower catches it.
+        | * Checking health before write_all also preserves the error on empty writes. */
+        |static int64_t blorp_fs_writer_write(struct blorp_fs_writer *writer,const char *bytes,size_t length){
+        |if(writer->first_failure==0){writer->first_failure=blorp_fs_write_all(writer->descriptor,bytes,length);}
+        |return writer->first_failure;
+        |}
+        |/* Finish consumes contents, closes once, and never publishes a failed write.
+        | * Only directory-flush failure can follow a successful rename. */
+        |static int64_t blorp_fs_writer_finish_contents(struct blorp_fs_writer *writer){
+        |int64_t failure=writer->first_failure;
+        |if(failure==0&&blorp_fs_flush_file(writer->descriptor)<0){failure=blorp_fs_errno_code_within(errno,BLORP_FS_WRITE_KINDS);}
+        |if(close(writer->descriptor)<0&&failure==0){failure=blorp_fs_errno_code_within(errno,BLORP_FS_WRITE_KINDS);}
+        |if(failure==0){
+        |int renamed;
+        |BLORP_FS_RETRY(renamed,rename(writer->temporary,writer->target));
+        |if(renamed<0){failure=blorp_fs_errno_code_within(errno,BLORP_FS_WRITE_KINDS);}
+        |}
+        |if(failure!=0){(void)unlink(writer->temporary);}
+        |else{failure=blorp_fs_flush_directory(writer->directory);}
+        |blorp_fs_writer_release_paths(writer);
+        |return failure;
+        |}
+        |/* External linkage follows the shared-helper convention: writer-only programs
+        | * include this core without a bulk operation, so a static entry would be unused. */
+        |int64_t blorp_fs_write_path(const struct blorp_string *path,const char *bytes,size_t length){
+        |struct blorp_fs_writer writer;
+        |const int64_t failure=blorp_fs_writer_prepare(path,&writer);
+        |if(failure!=0){return failure;}
+        |(void)blorp_fs_writer_write(&writer,bytes,length);
+        |return blorp_fs_writer_finish_contents(&writer);
+        |}
         |
+
+
+-- The library owns each carrier's synchronous loan and exactly one consuming
+-- finish/discard. Only this native family converts it back to a pointer.
+FS_WRITER_RUNTIME: String =
+    raw
+        |_Static_assert(INTPTR_MAX<=INT64_MAX,"Blorp file writer handles require pointers representable by Int64");
+        |uint8_t blorp_fs_writer_begin(const struct blorp_string *path,int64_t *handle,int64_t *error){
+        |struct blorp_fs_writer *writer=blorp_memory_allocate(sizeof *writer);
+        |if(writer==NULL){abort();}
+        |const int64_t failure=blorp_fs_writer_prepare(path,writer);
+        |if(failure!=0){blorp_memory_release(writer);*error=failure;return BLORP_FS_FAILED;}
+        |*handle=(int64_t)(intptr_t)writer;
+        |return BLORP_FS_SUCCEEDED;
+        |}
+        |uint8_t blorp_fs_writer_finish(int64_t handle,int64_t *error){
+        |struct blorp_fs_writer *writer=(struct blorp_fs_writer *)(intptr_t)handle;
+        |const int64_t failure=blorp_fs_writer_finish_contents(writer);
+        |blorp_memory_release(writer);
+        |if(failure!=0){*error=failure;return BLORP_FS_FAILED;}
+        |return BLORP_FS_SUCCEEDED;
+        |}
+        |uint8_t blorp_fs_writer_discard(int64_t handle,int64_t *error){
+        |struct blorp_fs_writer *writer=(struct blorp_fs_writer *)(intptr_t)handle;
+        |const int64_t failure=blorp_fs_writer_discard_contents(writer);
+        |blorp_memory_release(writer);
+        |if(failure!=0){*error=failure;return BLORP_FS_FAILED;}
+        |return BLORP_FS_SUCCEEDED;
+        |}
+        |
+
+
+pure func fs_writer_write_all_runtime(byte_list_type: String) -> String:
+    "uint8_t blorp_fs_writer_write_all(int64_t handle,${byte_list_type} data,int64_t *error){\n"
+        .concat("struct blorp_fs_writer *writer=(struct blorp_fs_writer *)(intptr_t)handle;\n")
+        .concat(
+            "const int64_t failure=blorp_fs_writer_write(writer,(const char *)data->values,(size_t)data->length);\n",
+        )
+        .concat(
+            "if(failure!=0){*error=failure;return BLORP_FS_FAILED;}\nreturn BLORP_FS_SUCCEEDED;\n}\n",
+        )
 
 
 FS_WRITE_TEXT_RUNTIME: String =

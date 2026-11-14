@@ -1237,6 +1237,23 @@ implement the traits and provide functions, some with `builtin("label")` bodies
 that name a compiler-known operation. The
 [standard library README](standard_library/README.md) owns every contract.
 
+Raw filesystem handle builtins are private library mechanisms: `fs.open_read`,
+`fs.next_lines`, `fs.close`, `fs.read_chunk`, `fs.writer_begin`,
+`fs.writer_write_all`, `fs.writer_finish` and `fs.writer_discard` may only be
+implemented by loader-designated library modules. Application declarations are
+rejected at the builtin label; use the `io/fs` operations instead. Selecting a
+custom `--library-root` explicitly trusts that library implementation.
+
+The native chunk contract is `Int -> Result[List[UInt8], Int]`: it returns at
+most 64 KiB, a short nonempty read immediately, and an empty list only at EOF.
+Writer begin takes a String path and returns `Result[Int, Int]`; write-all takes
+that private Int handle and a `List[UInt8]`, while finish/discard take only the
+handle. All three return `Result[Void, Int]`. These operations are impure,
+nongeneric, borrow their parameters, and produce fresh Result payloads. A
+writer remembers its first write error and cannot publish after that failure.
+Public reader/writer scopes are deferred until the bootstrap seed supports
+these compiler mechanisms.
+
 ## Compiler architecture
 
 [`src/main.brp`](src/main.brp) reads the command word and dispatches to

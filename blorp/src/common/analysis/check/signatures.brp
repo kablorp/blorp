@@ -11,9 +11,24 @@ import:
     option: Option methods
     result: Result methods
     ../../syntax/names: NameId, NameTable
-    ../../syntax/source: FunctionLabel, ModuleId, declared_label, root_module_id
+    ../../syntax/source:
+        FunctionLabel,
+        ModuleId,
+        ModuleKind(LibraryModule),
+        declared_label,
+        root_module_id,
     ../../syntax/syntax:
         IntegerFormat(Int64Format, UInt8Format),
+        SystemOperation(
+            FsOpenRead,
+            FsNextLines,
+            FsClose,
+            FsReadChunk,
+            FsWriterBegin,
+            FsWriterWriteAll,
+            FsWriterFinish,
+            FsWriterDiscard,
+        ),
         Purity(Pure),
         binder_span,
         TypeSyntax(CallableTypeSyntax, AtomicType, QualifiedType),
@@ -97,7 +112,7 @@ import:
             IndependentImplementationParameters,
         ),
         signature_error,
-        BuiltinError(BuiltinContractMismatch, BuiltinTailAnnotation),
+        BuiltinError(BuiltinContractMismatch, BuiltinTailAnnotation, BuiltinLibraryOnly),
         builtin_error,
     ./model:
         AcceptedTrait,
@@ -798,6 +813,25 @@ private pure func resolve_function(
     designated: DesignatedUnions,
 ) -> Result[AcceptedFunction, CheckError]:
     label ?= row.function_label(parsed)
+    -- The loader's module role is the sole authority for raw native handles.
+    -- Validate before dispatch so implementation and trait-default bodies have
+    -- the same admission rule as free functions; no permission survives Check.
+    _: Void ?= match row.declaration.body:
+        ParsedBuiltinBody(SystemBuiltin(operation), span):
+            match operation:
+                FsOpenRead | FsNextLines | FsClose | FsReadChunk | FsWriterBegin | FsWriterWriteAll | FsWriterFinish | FsWriterDiscard:
+                    match parsed.modules.get(row.declaration.module.module_number()):
+                        Some(module):
+                            if module.role == LibraryModule:
+                                Ok(void)
+                            else:
+                                Err(builtin_error(span, BuiltinLibraryOnly))
+                        None:
+                            Err(checker_invariant(span, InvalidResolvedFunction(row.id)))
+                _:
+                    Ok(void)
+        _:
+            Ok(void)
     match row.role:
         FreeFunctionBody:
             row.resolve_free_function(label, is_entry, scope, designated)

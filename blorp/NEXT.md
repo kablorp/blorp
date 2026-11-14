@@ -66,8 +66,11 @@ done.
     S1 implements resource/scoped checking using Check-local completed-body
     admission. Source review, full tests, fixpoint, bootstrap and matched cost
     qualification pass; no public streaming file handle is exposed yet.
-  - **Next:** native S2 with the
-    library-only writer-builtin boundary approved on 2026-11-14.
+  - **S2:** native chunk reads, shared atomic writer lifecycle and library-only
+    raw-handle builtins pass source review, full tests, fixpoint and matched
+    cost qualification, with no cost exception.
+  - **Next:** publish/pin the S2 seed, then the public streaming scopes and
+    normal-main examples in S3.
   - **Built:** D40, a pure `String.lines()` with `fold_lines`'s line rules, so
     `read_text(path).lines()` collects lines.
   - **Later:** the plan's "Later" list.

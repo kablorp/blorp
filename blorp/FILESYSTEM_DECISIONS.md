@@ -28,8 +28,8 @@ through phase 2c:
 | D18 | A `write_text` path ending in `/` | `b00632782`, `ef34d216b` |
 | 2c | Line natives and `fold_lines` | `6c973b3cd`, seed `073ad2a89`, `cc85d0506` |
 
-Part 2, lent resources, has completed its compiler milestone S1. Streaming
-copy is its consumer; native operations in S2 are next (see below).
+Part 2 has completed S1 checking and S2 natives. Streaming copy is its
+consumer; public scopes follow the qualified seed switch in S3.
 
 Two rules shaped every landing. The compiler imports `fs` and is built by a
 pinned earlier compiler, the seed, which rejects a builtin it does not know.
@@ -188,7 +188,7 @@ has risen by about 0.18%.
   `NotFound`, `PermissionDenied`, `NotADirectory`, `DirectoryNotEmpty`,
   `ReadOnlyFilesystem`, `NoSpace`, `CrossesDevices` and `OtherOs`.
 
-## Part 2: lent resources (S1 complete)
+## Part 2: lent resources (S2 complete)
 
 A library scope opens a resource, lends it to a callback and releases it
 when the callback returns, so users never open or close anything and a
@@ -245,8 +245,8 @@ an implementation budget or evidence.
 full, fixpoint, bootstrap and matched cost gates pass. No
 streaming filesystem API is exposed yet. S2's native trust decision was
 approved on 2026-11-14; its implementation follows S1.
-Baseline: `26a3a4fe06a3193ffb082ff75d06bbb29d51c1a6`. The first consumer is
-bounded-memory binary copy, including transformations and early termination.
+Baseline: `26a3a4fe06a3193ffb082ff75d06bbb29d51c1a6`. Consumer:
+bounded-memory binary copy, transformations and early termination.
 This activates Part 2. The smaller Part 1 producer APIs are not prerequisites.
 This brief owns the implementation, measurements and review record.
 Before final gates the branch was advanced to `678b1df3b` (explicit fixed
@@ -446,8 +446,9 @@ variants to declarations whose loader-owned `ParsedModuleRow.role` is
 `LibraryModule`. The configured library root is trusted compiler input;
 choosing a replacement library explicitly changes that trust. Check reads
 the sealed module role via the declaring ModuleId, never a path or spelling.
-Existing builtin declarations keep their policy. S1 does not depend on this
-rule. Acceptance must reject every restricted
+Other builtin declarations keep their policy; the S2 brief below extends the
+same boundary to raw reader-descriptor operations to honor the no-manual-close
+requirement. S1 does not depend on this rule. Acceptance must reject every restricted
 label from a user module with exact message/help/span, accept genuine library
 provenance, and preserve existing direct-native fixtures. A resource-typed
 argument alone is insufficient: an attacker can declare their own resource.
@@ -660,7 +661,7 @@ with zero blocking/high/medium findings. Reviewed document SHA256:
 (before this approval record was added). Keith approved S2's library-only
 writer-builtin boundary on 2026-11-14. Both reviewers rejected the unsafe
 unrestricted raw-Int boundary. S1 source, functional and matched cost reviews
-are approved; S2 is next.
+are approved; see S2 below.
 The parser/formatter/documentation slice subsequently received independent
 approval with zero remaining findings after fixing reserved-field names
 (`resource_type`, `scoped_qualifier`) and compact `scoped()` grammar parity.
@@ -745,6 +746,196 @@ amendment preserves them; reproduce using the published S1 revision with those
 subtrees in place of the pre-amendment measurement revision above.
 Final code-reviewer and independent test-runner qualification approvals both
 have zero remaining findings after correcting stale status text.
+
+## S2 native implementation brief
+
+**Status:** implementation, source review, functional and matched cost gates
+pass. Base is published
+S1, `2b36404cd3418d2f8a1072645afcffb5c3f3e73f`. The S1 lifetime rules and
+transaction/error contracts above remain authoritative. This increment adds
+native mechanisms; public library scopes wait for the S3 seed rotation.
+
+### Native declaration access
+
+Keith clarified that lending is synchronous, handles cannot escape, and
+application code has no manual close operation. The coordinator applies the
+approved library-only native rule to the complete raw-handle family: existing
+`fs.open_read`, `fs.next_lines`, `fs.close`, new `fs.read_chunk`, and the four
+new writer-context operations. Otherwise an ordinary user declaration of an
+old raw builtin bypasses the scoped interface. Other existing builtins retain
+their rules. This is the same module-role check, not a new authority mechanism.
+
+Check obtains the declaring function's existing loader-published ModuleKind
+by ModuleId. Only LibraryModule may declare these operations. Reject at the
+builtin occurrence with an exact message/help/span; never grant authority
+from a path, prefix, function name or opaque representation. The explicitly
+configured library root is trusted. Keep permission facts out of codegen.
+
+The primitive contracts are:
+
+```blorp
+-- Proposed private labels; S3 library wrappers, not application declarations.
+func native_read_chunk(descriptor: Int) -> Result[List[UInt8], Int]:
+    builtin("fs.read_chunk")
+func native_writer_begin(path: String) -> Result[Int, Int]:
+    builtin("fs.writer_begin")
+func native_writer_write_all(handle: Int, data: List[UInt8]) -> Result[Void, Int]:
+    builtin("fs.writer_write_all")
+func native_writer_finish(handle: Int) -> Result[Void, Int]:
+    builtin("fs.writer_finish")
+func native_writer_discard(handle: Int) -> Result[Void, Int]:
+    builtin("fs.writer_discard")
+```
+
+Names are represented by closed SystemOperation variants after parsing. All
+five use the current primitive SystemSignature algebra, impure borrowed
+parameters, and fresh success/error payloads. No native record ABI is added.
+
+### One writer lifecycle
+
+The current `runtime/fs.brp` has `blorp_fs_write_target`, prepare/metadata
+helpers, `blorp_fs_write_all`, `blorp_fs_fill_temporary`, `blorp_fs_replace`
+and `blorp_fs_write_path`. Extract one private transaction lifecycle instead
+of keeping a second full implementation for streaming.
+
+The transaction struct above owns its descriptor and allocated pathnames.
+Core preparation, writing, finish and discard operate on a pointer to that
+struct; consuming finish/discard release its contents. Storage ownership is
+separate: the existing whole-file C operation can keep the struct on its
+stack, while native writer-begin allocates it for a multi-call scope and the
+native finish/discard wrapper frees that allocation. Both use the same state
+transitions and error precedence. There is no registry or closed-state flag.
+Private discard reports the first sticky write error, otherwise the close
+error, otherwise the unlink error, and always frees state. The library ignores
+that private cleanup result when preserving the body's Err. Transfer resolved
+target paths only after successful resolution: the existing resolver releases
+its path on failure, so cleanup must not release that dangling value again.
+
+Use the existing allocator/release instrumentation for every owned allocation.
+Preserve old bulk write behavior with the existing syscall-fault suite before
+adding streaming cases. Reuse target resolution and mode/owner rules exactly;
+resolve once before lending, never again at finish. Sticky first write error
+blocks publication even if the body catches it; subsequent empty writes also
+return that error. Native wrappers expose no callable/cleanup representation.
+
+Byte reads request at most the named 64 KiB limit, retry EINTR, return a short
+nonempty success immediately, and return an empty List only at EOF. Fill a
+fresh concrete UInt8 List buffer directly where the existing allocation helpers
+permit; free it on EOF/error. Never decode UTF-8 here or accumulate input.
+
+### Work split, tests and acceptance
+
+Runtime worker owns `src/common/codegen/runtime/fs.brp` and direct-runtime C
+probes/Blorp test suite. Compiler worker owns closed operation names/signatures,
+module-role admission, emission requirements, native fragments wiring and
+language/API documentation. Agree on exported fragment/function names before
+editing. Both review this seam first; the coordinator authorizes implementation
+after two approvals. Compiled gates remain serialized under one lease.
+
+Add failing cases before code: genuine library declarations accept the exact
+contracts; user declarations of every raw-handle label reject even with valid
+types, harmless names or a fabricated resource type. Convert the old direct
+user raw-native positive fixtures to exact permission rejections; preserve
+positive runtime coverage through existing ordinary `fold_lines` execution
+and the approved direct-C exception, not a production privilege bypass.
+
+Native probes cover healthy/empty/short/EINTR reads and writes, zero progress,
+first-error persistence, metadata/begin failures, body discard, flush/close/
+rename/directory-flush failure, symlinks/modes, and balanced descriptors/memory.
+Test each operation's required fragment under strict C warnings; new writer
+operations must request the existing write prelude on macOS. Demonstrate a
+sticky-error mutation would publish or change the observed error, and that
+the test fails. No public Reader/Writer declarations or library use of new
+labels may land before the qualified seed knows them.
+
+Run focused native-contract/runtime suites, full tests and fixpoint, then the
+same matched cost tool and +3% allocation/instruction / +5% peak ceilings.
+Existing S2 line ceilings remain 600 added / +450 net production and 900 /
++800 tests, reported separately; warn the coordinator before exceeding them.
+Record corrections and measured costs here, without compressed formatting or
+deleted coverage. Two independent code/test reviews are required before commit.
+Return exact diff, gate counts, generated-C inspection, fault/oracle evidence,
+line counts, cost provenance and lease state. Stop for a new ABI, ownership
+representation, registry, permission authority or a lifecycle counterexample.
+
+Early approvals: `streaming_native_runtime` and `streaming_native_contracts`
+both approve the shared lifecycle, primitive ABI, role-based permission boundary
+and existing test seams, without a new ownership representation or registry.
+Exports agreed: FS_WRITE_RUNTIME, FS_WRITER_RUNTIME,
+fs_writer_write_all_runtime and fs_read_chunk_runtime. Permission is checked
+once before free/implementation/default-function dispatch in resolve_function,
+using the immutable module row; no role field is added to downstream products.
+The combined forecast was 325–430 added production lines and 730–960 test
+lines. A provisional 1,000 / +900 test allowance was unused and is withdrawn:
+actual production is 219 added / 37 deleted / +182 and tests 854 / 94 / +760,
+inside the original 600 / +450 and 900 / +800 limits. No scope or cost
+exception is needed.
+
+The independent code-reviewer reports zero findings. Fresh build and focused
+139 callbacks pass; full tests pass 1,801 component callbacks across 24
+programs and 1,073 native/runtime/e2e callbacks across 19 suites. Native probes
+pass 120/120 with strict C warnings, ASan/UBSan and strict zero-leak reports.
+The sticky-error source mutation fails exactly 1/120, and the permission
+mutation fails three authority callbacks; both sources were restored
+byte-for-byte and revalidated. Input path/byte storage is released before
+later writer operations in the native probes. Fixpoint proves a.c/b.c/c.c
+output identity, 742 A/B fixture comparisons, and the full component/native
+suites under B; seed.c is a distinct artifact, not a fourth equal generation.
+Bootstrap tooling passes 38/38. Independent functional review approves all
+1,330 frozen inputs. Logs live under `build/s2-native/` and
+`build/streaming-io-2026-11-13/{s2-contracts,s2-test-runner}/`.
+
+For S2 the fixed-input generated C is expected to change in the shared native
+filesystem helpers: bulk writes now use the common writer lifecycle. Inspect
+and bound that diff; do not apply S1's byte-identical-C criterion to an intended
+runtime change. The preserved bulk fault tests and new native probes own its
+behavioral equivalence. Allocation/instruction/peak ceilings stay unchanged.
+
+## S2 qualification: matched cost record, 2026-11-14
+
+Base `2b36404cd3418d2f8a1072645afcffb5c3f3e73f`; candidate
+`7261a269dfe85075bad1f216e25e9938620086e0`, before documentation-only
+qualification amendment. Same pinned seed, Darwin arm64 host and Apple clang
+21.0.0 as S1. Serial builds use `-O2`, normal binaries for three alternating
+`/usr/bin/time -l` samples and diagnostic binaries for strict allocation/peak
+runs. All four strict runs have equal allocations/releases and zero leaks.
+
+```sh
+blorp/scripts/self-compile-cost 2b36404cd3418d2f8a1072645afcffb5c3f3e73f \
+    7261a269dfe85075bad1f216e25e9938620086e0 --rounds 3 \
+    --output build/streaming-io-2026-11-13/s2-cost
+```
+
+| Metric | Base | Candidate | Change |
+| --- | ---: | ---: | ---: |
+| Fixed-input allocations | 14,047,729 | 14,047,729 | 0.0000% |
+| Fixed-input peak heap, bytes | 168,687,929 | 168,689,604 | +0.0010% |
+| Fixed-input instructions, median of 3 | 12,390,751,585 | 12,387,995,619 | -0.0222% |
+| Own-source allocations | 14,047,729 | 14,071,697 | +0.1706% |
+| Own-source peak heap, bytes | 168,687,928 | 169,026,667 | +0.2008% |
+| Own-source instructions, median of 3 | 12,377,529,499 | 12,397,596,954 | +0.1621% |
+
+All comparisons pass +3% allocation/instruction and +5% peak ceilings; no
+exception is needed. The small instruction decrease is not a speed claim.
+Fixed-input C differs in exactly three diff hunks: the descriptor-helper caller
+comment and replacement of the old atomic-write helpers by the common writer
+lifecycle. No other C differs. Base C SHA256 is
+`2ead6c8aca0ce5551e83cdafce7f6c5bc42cd81e8b56f91b89d6747b55019918`;
+candidate is `0249025ce6bf4d5df35dacf3dd8acd5337595de4dd45f29fae61e128a96427de`.
+The complete diff is retained as `fixed-input.diff` alongside all raw samples
+and `report.txt` under the ignored output directory. Native fault tests and
+sanitizers establish the intended runtime change's behavior.
+
+The measured `blorp/src` tree is
+`5b0c6e4ef58bbd43c266b7d2fe30d809ace7e4ef`; the standard-library and scripts
+trees are unchanged from S1's record. Final documentation amendments preserve
+these source inputs; reproduce with the published S2 revision sharing those
+trees. As in S1, the tool removes its temporary binaries; binary provenance is
+the frozen source/seed/toolchain/recipe, not a retained executable hash. Local
+qualification does not claim remote platform qualification or per-fixture
+retired-instruction gates, which remain disabled by default.
+Final code-reviewer and independent test-runner qualification approvals both
+report zero findings. Source inputs remain unchanged after qualification edits.
 
 ## Later
 

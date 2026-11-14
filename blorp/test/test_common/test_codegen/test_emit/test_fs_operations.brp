@@ -6,6 +6,7 @@ import:
     result: Result methods
     string: String methods
     test: TestSuite
+    ../../../../src/common/analysis/assemble: ParsedProgram
     ../../../../src/common/analysis/check/check: check
     ../../../../src/common/codegen/emit/emit: emit
     ../../../../src/common/codegen/lower/lower: lower
@@ -26,10 +27,18 @@ import:
         FS_OPEN_READ_RUNTIME,
         fs_next_lines_runtime,
         FS_CLOSE_RUNTIME,
+        FS_WRITE_RUNTIME,
+        FS_WRITER_RUNTIME,
+        fs_writer_write_all_runtime,
+        fs_read_chunk_runtime,
     ../../../../src/common/codegen/runtime/list: list_c_type, list_element_key
     ../../../../src/common/codegen/runtime/process: PROCESS_POSIX_PRELUDE
-    ../../../../src/common/codegen/specialize/specialize: specialize, TypeRef(StringType)
+    ../../../../src/common/codegen/specialize/specialize:
+        specialize,
+        TypeRef(StringType, IntegerType),
     ../../../../src/common/codegen/verify/verify: verify
+    ../../../../src/common/syntax/syntax: Diagnostic, IntegerFormat(UInt8Format)
+    ../../../support/fs_native_inputs: library_program
     ../../../support/module_input: parse_modules
     ../../../support/text_search: occurrences
 
@@ -56,7 +65,17 @@ private CLOSE_DECLARATION: String = "func close(descriptor: Int) -> Result[Void,
 
 
 private pure func emitted(source: String) -> Result[String, Int]:
-    match parse_modules([{ source = source, targets = [] }]):
+    emitted_program(parse_modules([{ source = source, targets = [] }]))
+
+
+private pure func emitted_library(source: String) -> Result[String, Int]:
+    emitted_program(library_program(source))
+
+
+private pure func emitted_program(
+    program: Result[ParsedProgram, Diagnostic],
+) -> Result[String, Int]:
+    match program:
         Err(_):
             Err(1)
         Ok(parsed):
@@ -317,7 +336,7 @@ private pure func lines_called() -> String:
 -- The buffer growth that read_text and next_lines share lives in the helper
 -- fragment, so a program calling both defines it once.
 pure func test_line_natives_share_the_helpers_with_read_text() -> Bool:
-    match emitted(lines_called()):
+    match emitted_library(lines_called()):
         Err(_):
             False
         Ok(code):
@@ -340,7 +359,7 @@ pure func test_line_natives_share_the_helpers_with_read_text() -> Bool:
 -- Void shapes; next_lines passes the descriptor by value, then the borrowed
 -- carried line, then its fresh List[String] and the code.
 pure func test_line_natives_pass_their_payloads() -> Bool:
-    match emitted(lines_called()):
+    match emitted_library(lines_called()):
         Err(_):
             False
         Ok(code):
@@ -375,7 +394,7 @@ pure func test_line_natives_pass_their_payloads() -> Bool:
 -- drops the whole Result, and with it every line.
 pure func test_next_lines_alone_takes_and_drops_its_batch() -> Bool:
     source = "${NEXT_LINES_DECLARATION}func main() -> Int:\n    first = next(3, \"\")\n    0\n"
-    match emitted(source):
+    match emitted_library(source):
         Err(_):
             False
         Ok(code):
@@ -387,9 +406,142 @@ pure func test_next_lines_alone_takes_and_drops_its_batch() -> Bool:
                 .and(occurrences(code, FS_CLOSE_RUNTIME).equals(0))
 
 
+private WRITER_BEGIN_SOURCE: String =
+    |func native(path: String) -> Result[Int, Int]:
+    |    builtin("fs.writer_begin")
+    |func main() -> Int:
+    |    result = native("x")
+    |    0
+    |
+
+
+private WRITER_FINISH_SOURCE: String =
+    |func native(handle: Int) -> Result[Void, Int]:
+    |    builtin("fs.writer_finish")
+    |func main() -> Int:
+    |    result = native(0)
+    |    0
+    |
+
+
+private WRITER_DISCARD_SOURCE: String =
+    |func native(handle: Int) -> Result[Void, Int]:
+    |    builtin("fs.writer_discard")
+    |func main() -> Int:
+    |    result = native(0)
+    |    0
+    |
+
+
+private WRITER_WRITE_SOURCE: String =
+    |func native(handle: Int, bytes: List[UInt8]) -> Result[Void, Int]:
+    |    builtin("fs.writer_write_all")
+    |func main() -> Int:
+    |    result = native(0, [])
+    |    0
+    |
+
+
+private READ_CHUNK_SOURCE: String =
+    |func native(handle: Int) -> Result[List[UInt8], Int]:
+    |    builtin("fs.read_chunk")
+    |func main() -> Int:
+    |    result = native(0)
+    |    0
+    |
+
+
+-- Every writer operation alone selects the shared context and write prelude.
+-- Only the byte operations request a concrete List[UInt8] layout.
+pure func test_streaming_operations_select_only_their_required_fragments() -> Bool:
+    byte_list = list_c_type(list_element_key(IntegerType(UInt8Format)))
+    declarations: List[String] = [
+        WRITER_BEGIN_SOURCE,
+        WRITER_FINISH_SOURCE,
+        WRITER_DISCARD_SOURCE,
+        WRITER_WRITE_SOURCE,
+    ]
+    writers = declarations.all(pure func(source: String) -> Bool:
+        match emitted_library(source):
+            Err(_):
+                False
+            Ok(code):
+                code
+                    .starts_with(PROCESS_POSIX_PRELUDE)
+                    .and(occurrences(code, FS_HELPERS_RUNTIME) == 1)
+                    .and(occurrences(code, "struct blorp_string {") == 1)
+                    .and(occurrences(code, FS_WRITE_RUNTIME) == 1)
+                    .and(occurrences(code, FS_WRITER_RUNTIME) == 1)
+                    .and(occurrences(code, fs_read_chunk_runtime(byte_list)) == 0)
+    )
+    read_chunk = READ_CHUNK_SOURCE
+    match emitted_library(read_chunk):
+        Err(_):
+            False
+        Ok(code):
+            writers
+                .and(code.starts_with(PROCESS_POSIX_PRELUDE))
+                .and(occurrences(code, FS_HELPERS_RUNTIME) == 1)
+                .and(occurrences(code, "struct blorp_string {") == 1)
+                .and(occurrences(code, FS_WRITE_RUNTIME) == 0)
+                .and(occurrences(code, FS_WRITER_RUNTIME) == 0)
+                .and(occurrences(code, fs_read_chunk_runtime(byte_list)) == 1)
+                .and(
+                    (
+                        occurrences(
+                            code,
+                            "${byte_list} blorp_runtime_1_value=NULL;int64_t blorp_runtime_1_error=0;",
+                        )
+                        > 0
+                    ),
+                )
+                .and(
+                    (
+                        occurrences(
+                            code,
+                            "blorp_fs_read_chunk(blorp_vl_0,&blorp_runtime_1_value,&blorp_runtime_1_error)",
+                        )
+                        > 0
+                    ),
+                )
+                .and(occurrences(code, "blorp_union_drop_") > 0)
+
+
+pure func test_writer_bytes_are_borrowed_and_void_has_only_an_error_payload() -> Bool:
+    source = WRITER_WRITE_SOURCE
+    match emitted_library(source):
+        Err(_):
+            False
+        Ok(code):
+            (occurrences(
+                code,
+                "blorp_fs_writer_write_all(blorp_vl_0,blorp_vl_1,&blorp_runtime_2_error)",
+            ) > 0)
+                .and(
+                    (
+                        occurrences(
+                            code,
+                            fs_writer_write_all_runtime(
+                                list_c_type(list_element_key(IntegerType(UInt8Format))),
+                            ),
+                        )
+                        == 1
+                    ),
+                )
+                .and(occurrences(code, "blorp_runtime_2_value=") == 0)
+
+
 TESTS: TestSuite = {
     description = "fs builtin C emission",
     tests = [
+        (
+            "streaming operations select exactly their required runtime fragments",
+            test_streaming_operations_select_only_their_required_fragments,
+        ),
+        (
+            "writer bytes are borrowed and Void success has no native payload",
+            test_writer_bytes_are_borrowed_and_void_has_only_an_error_payload,
+        ),
         (
             "two fs operations share one helper fragment",
             test_helpers_are_emitted_once_for_two_operations,

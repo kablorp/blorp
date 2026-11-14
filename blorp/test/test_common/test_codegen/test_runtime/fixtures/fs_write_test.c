@@ -142,6 +142,7 @@ enum { EVERY_CALL = INT_MAX };
 static struct injection injections[CALL_KINDS];
 /* How many writes still pass only half of their request through. */
 static int short_writes = 0;
+static int zero_writes = 0;
 
 static void copy_text(char *target, const char *text) {
     if (text == NULL) {
@@ -234,7 +235,7 @@ static ssize_t recording_write(int descriptor, const void *bytes, size_t count) 
         short_writes--;
         request = count / 2;
     }
-    const ssize_t result = injected != 0 ? -1 : write(descriptor, bytes, request);
+    const ssize_t result = injected != 0 ? -1 : zero_writes ? 0 : write(descriptor, bytes, request);
     const int error = outcome_error(injected, result < 0);
     record(WRITE_CALL, descriptor, flags, NULL, NULL, (long)result, error);
     if (result < 0) errno = error;
@@ -353,6 +354,7 @@ static void begin(void) {
     event_count = 0;
     memset(injections, 0, sizeof injections);
     short_writes = 0;
+    zero_writes = 0;
     stat_reported_mode = 0;
 }
 
@@ -1113,6 +1115,207 @@ static int case_symlinks(const char *root) {
     return 0;
 }
 
+
+/* The byte layout and native functions are the production fragments; this
+ * adapter creates only the ordinary borrowed input each operation takes. */
+static int64_t writer_begin(const char *path, int64_t *handle) {
+    struct blorp_string *name = string_of(path);
+    int64_t error = 0;
+    *handle = 0;
+    const uint8_t succeeded = blorp_fs_writer_begin(name, handle, &error);
+    /* Every later operation runs after the borrowed path has been released. */
+    blorp_string_release(name);
+    assert(succeeded == BLORP_FS_SUCCEEDED ? *handle != 0 && error == 0 : *handle == 0 && error != 0);
+    return error;
+}
+
+static int64_t writer_write_bytes(int64_t handle, const char *text, size_t length) {
+    struct blorp_l_0_b *data = blorp_memory_allocate(sizeof *data + length);
+    assert(data != NULL);
+    atomic_init(&data->references, 1);
+    data->length = (int64_t)length;
+    data->capacity = length;
+    memcpy(data->values, text, length);
+    int64_t error = 0;
+    const uint8_t succeeded = blorp_fs_writer_write_all(handle, data, &error);
+    blorp_list_drop_0_b(data);
+    assert(succeeded == BLORP_FS_SUCCEEDED ? error == 0 : error != 0);
+    return error;
+}
+
+static int64_t writer_write(int64_t handle, const char *text) {
+    return writer_write_bytes(handle, text, strlen(text));
+}
+
+static int64_t writer_end(int64_t handle, int discard) {
+    int64_t error = 0;
+    const uint8_t succeeded = discard ? blorp_fs_writer_discard(handle, &error) : blorp_fs_writer_finish(handle, &error);
+    assert(succeeded == BLORP_FS_SUCCEEDED ? error == 0 : error != 0);
+    return error;
+}
+
+static int case_writer_success(const char *root) {
+    char directory[PATH_BYTES], target[PATH_BYTES], link[PATH_BYTES];
+    case_directory(directory, root, "writer_success");
+    join(target, directory, "target");
+    join(link, directory, "link");
+    make_file(target, "old", 0600);
+    assert(symlink("target", link) == 0);
+    const int free_before = lowest_free_descriptor();
+    begin();
+    int64_t handle;
+    assert(writer_begin(link, &handle) == 0);
+    const int resolutions = count_events(REALPATH_CALL, 0) + count_events(LSTAT_CALL, 0);
+    assert(count_events(FCHMOD_CALL, O_EXCL) == 1);
+    assert(writer_write(handle, "") == 0 && count_events(WRITE_CALL, 0) == 0);
+    short_writes = 1;
+    inject(WRITE_CALL, O_EXCL, 0, 1, EINTR);
+    assert(writer_write(handle, "first") == 0);
+    assert(writer_write(handle, " second") == 0);
+    expect_contents(target, "old");
+    assert(count_events(RENAME_CALL, 0) == 0);
+    assert(writer_end(handle, 0) == 0);
+    assert(resolutions == count_events(REALPATH_CALL, 0) + count_events(LSTAT_CALL, 0));
+    expect_contents(target, "first second");
+    assert(mode_of(target) == 0600);
+    struct stat status;
+    assert(lstat(link, &status) == 0 && S_ISLNK(status.st_mode));
+    expect_clean(free_before, directory);
+    begin();
+    assert(writer_begin(target, &handle) == 0);
+    assert(writer_end(handle, 0) == 0);
+    expect_contents(target, "");
+    expect_clean(free_before, directory);
+    /* A new target obeys umask and preserves binary data, without UTF-8. */
+    join(target, directory, "binary");
+    const mode_t previous_mask = umask(0027);
+    begin();
+    assert(writer_begin(target, &handle) == 0);
+    static const char binary[] = {'a', 0, (char)0xff, 'b'};
+    assert(writer_write_bytes(handle, binary, sizeof binary) == 0);
+    assert(writer_end(handle, 0) == 0);
+    assert(umask(previous_mask) == 0027);
+    assert(mode_of(target) == 0640);
+    FILE *stream = fopen(target, "rb");
+    assert(stream != NULL);
+    char received[sizeof binary + 1];
+    assert(fread(received, 1, sizeof received, stream) == sizeof binary);
+    assert(memcmp(received, binary, sizeof binary) == 0 && fclose(stream) == 0);
+    expect_clean(free_before, directory);
+    return 0;
+}
+
+/* Catching a partial failure, then writing empty or nonempty data, cannot
+ * restore health or publish. A second cleanup error cannot replace it. */
+static int case_writer_sticky(const char *root) {
+    char directory[PATH_BYTES], target[PATH_BYTES];
+    case_directory(directory, root, "writer_sticky");
+    join(target, directory, "target");
+    make_file(target, "old", 0644);
+    const int free_before = lowest_free_descriptor();
+    for (int zero = 0; zero < 2; zero++) {
+        begin();
+        int64_t handle;
+        assert(writer_begin(target, &handle) == 0);
+        short_writes = 1;
+        zero_writes = zero;
+        inject(WRITE_CALL, O_EXCL, 1, 1, ENOSPC);
+        const int64_t expected = zero ? -(int64_t)EIO : BLORP_FS_NO_SPACE;
+        assert(writer_write(handle, "partially written") == expected);
+        const int writes = count_events(WRITE_CALL, 0);
+        assert(writer_write(handle, "") == expected);
+        assert(writer_write(handle, "later") == expected);
+        assert(count_events(WRITE_CALL, 0) == writes);
+        inject(CLOSE_CALL, O_EXCL, 0, 1, EINTR);
+        assert(writer_end(handle, 0) == expected);
+        assert(count_events(FLUSH_CALL, O_EXCL) == 0);
+        expect_unchanged(expected, expected, 0, target, "old");
+        expect_clean(free_before, directory);
+    }
+    return 0;
+}
+
+static int case_writer_begin_failures(const char *root) {
+    char directory[PATH_BYTES], target[PATH_BYTES];
+    case_directory(directory, root, "writer_begin_failures");
+    join(target, directory, "target");
+    make_file(target, "old", 0644);
+    const int free_before = lowest_free_descriptor();
+    static const enum call failures[] = {LSTAT_CALL, FSTAT_CALL, OPEN_CALL, FCHOWN_CALL, FCHMOD_CALL};
+    for (size_t index = 0; index < sizeof failures / sizeof failures[0]; index++) {
+        begin();
+        inject(failures[index], failures[index] == OPEN_CALL ? O_EXCL : 0, 0, 1, EIO);
+        if (failures[index] == FCHOWN_CALL || failures[index] == FCHMOD_CALL) inject(CLOSE_CALL, O_EXCL, 0, 1, ENOSPC);
+        int64_t handle;
+        assert(writer_begin(target, &handle) == -(int64_t)EIO && handle == 0);
+        assert(count_events(RENAME_CALL, 0) == 0);
+        expect_contents(target, "old");
+        expect_clean(free_before, directory);
+    }
+    begin();
+    int64_t handle;
+    assert(writer_begin("", &handle) == BLORP_FS_NOT_FOUND);
+    static const char nul_path[] = {'a', 0, 'b'};
+    struct blorp_string *name = blorp_string_from_bytes(nul_path, sizeof nul_path);
+    int64_t error = 0;
+    assert(blorp_fs_writer_begin(name, &handle, &error) == BLORP_FS_FAILED);
+    assert(handle == 0 && error == BLORP_FS_PATH_CONTAINS_NUL);
+    blorp_string_release(name);
+    expect_clean(free_before, directory);
+    return 0;
+}
+
+static int case_writer_finish_failures(const char *root) {
+    char directory[PATH_BYTES], target[PATH_BYTES];
+    case_directory(directory, root, "writer_finish_failures");
+    join(target, directory, "target");
+    const int free_before = lowest_free_descriptor();
+    static const struct step failures[] = {{FLUSH_CALL, O_EXCL}, {CLOSE_CALL, O_EXCL}, {RENAME_CALL, 0}, {FSYNC_CALL, O_DIRECTORY}};
+    for (size_t index = 0; index < sizeof failures / sizeof failures[0]; index++) {
+        make_file(target, "old", 0644);
+        begin();
+        int64_t handle;
+        assert(writer_begin(target, &handle) == 0);
+        assert(writer_write(handle, "new") == 0);
+        inject(failures[index].call, failures[index].required_flags, 0, 1, EIO);
+        if (index == 0) inject(CLOSE_CALL, O_EXCL, 0, 1, ENOSPC);
+        assert(writer_end(handle, 0) == -(int64_t)EIO);
+        assert(count_events(RENAME_CALL, 0) == (index >= 2 ? 1 : 0));
+        expect_contents(target, index == 3 ? "new" : "old");
+        expect_clean(free_before, directory);
+    }
+    return 0;
+}
+
+static int case_writer_discard(const char *root) {
+    char directory[PATH_BYTES], target[PATH_BYTES];
+    case_directory(directory, root, "writer_discard");
+    join(target, directory, "target");
+    make_file(target, "old", 0644);
+    const int free_before = lowest_free_descriptor();
+    for (int failure = 0; failure < 4; failure++) {
+        begin();
+        int64_t handle;
+        assert(writer_begin(target, &handle) == 0);
+        if (failure == 1) inject(WRITE_CALL, O_EXCL, 0, 1, ENOSPC);
+        assert(writer_write(handle, "discarded") == (failure == 1 ? BLORP_FS_NO_SPACE : 0));
+        if (failure == 1 || failure == 2) inject(CLOSE_CALL, O_EXCL, 0, 1, EIO);
+        if (failure != 0) inject(UNLINK_CALL, 0, 0, 1, EACCES);
+        const int64_t expected = failure == 0 ? 0 : failure == 1 ? BLORP_FS_NO_SPACE : failure == 2 ? -(int64_t)EIO : BLORP_FS_PERMISSION_DENIED;
+        assert(writer_end(handle, 1) == expected);
+        assert(count_events(RENAME_CALL, 0) == 0 && count_events(FLUSH_CALL, O_EXCL) == 0);
+        assert(count_events(UNLINK_CALL, 0) == 1);
+        expect_contents(target, "old");
+        /* Cleanup failures are observed, then the test removes the remaining
+         * temporary through the real syscall without changing the event log. */
+        for (int index = 0; index < event_count; index++) {
+            if (events[index].call == UNLINK_CALL && events[index].result < 0) assert(unlink(events[index].path) == 0);
+        }
+        expect_clean(free_before, directory);
+    }
+    return 0;
+}
+
 static int child_case(int argc, char **argv) {
     if (argc != 3) return 2;
     const char *name = argv[1];
@@ -1120,6 +1323,11 @@ static int child_case(int argc, char **argv) {
     /* One allocation outside the cases, so that the strict accounting always
      * has something to balance. */
     blorp_string_release(string_of(name));
+    if (strcmp(name, "writer_success") == 0) return case_writer_success(directory);
+    if (strcmp(name, "writer_sticky") == 0) return case_writer_sticky(directory);
+    if (strcmp(name, "writer_begin_failures") == 0) return case_writer_begin_failures(directory);
+    if (strcmp(name, "writer_finish_failures") == 0) return case_writer_finish_failures(directory);
+    if (strcmp(name, "writer_discard") == 0) return case_writer_discard(directory);
     if (strcmp(name, "order_replace") == 0) return case_order_replace(directory);
     if (strcmp(name, "order_new") == 0) return case_order_new(directory);
     if (strcmp(name, "empty_text") == 0) return case_empty_text(directory);
