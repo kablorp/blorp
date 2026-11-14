@@ -62,7 +62,12 @@ done.
   - **Next:** L3, the breaking switch, starting with its census.
 - **Filesystem:** [`FILESYSTEM_DECISIONS.md`](FILESYSTEM_DECISIONS.md).
   - **Status:** Part 1 has landed through `fold_lines`. Part 2, lent
-    resources, waits for a consumer.
+    resources, has a consumer: bounded-memory binary copy and streaming writes.
+    S1 implements resource/scoped checking using Check-local completed-body
+    admission. Source review, full tests, fixpoint, bootstrap and matched cost
+    qualification pass; no public streaming file handle is exposed yet.
+  - **Next:** native S2 with the
+    library-only writer-builtin boundary approved on 2026-11-14.
   - **Built:** D40, a pure `String.lines()` with `fold_lines`'s line rules, so
     `read_text(path).lines()` collects lines.
   - **Later:** the plan's "Later" list.

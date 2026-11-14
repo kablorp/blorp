@@ -103,6 +103,8 @@ import:
             BuiltinKeyword,
             AsKeyword,
             OpaqueKeyword,
+            ResourceKeyword,
+            ScopedKeyword,
             IntoOpaqueKeyword,
             FromOpaqueKeyword,
         ),
@@ -3340,9 +3342,21 @@ private pure func consume_parameter(
         "expected ':' after the parameter name",
         "write each parameter as name: Type",
     )
-    type_name ?= after_colon.consume_type("expected a parameter type")
+    scoped_qualifier: Option[Span] = if after_colon.at_keyword(ScopedKeyword):
+        Some(after_colon.parser_span())
+    else:
+        None
+    type_start = if after_colon.at_keyword(ScopedKeyword):
+        after_colon.shifted(1)
+    else:
+        after_colon
+    type_name ?= type_start.consume_type("expected a parameter type")
     Ok({
-        parameter = { binder = binder.binder, type_name = type_name.written },
+        parameter = {
+            binder = binder.binder,
+            scoped_qualifier = scoped_qualifier,
+            type_name = type_name.written,
+        },
         next = type_name.next,
     })
 
@@ -6602,30 +6616,37 @@ private record ParsedOpaqueResult {
 }
 
 
--- `opaque type Name[T] = Underlying` on one line.
+-- Opaque and resource declarations share nominal identity and conversions.
 private pure func consume_opaque(
     start: ParserState,
     declaration_start: Span,
     module: ModuleId,
     visibility: Visibility,
 ) -> Result[ParsedOpaqueResult, Diagnostic]:
+    resource_type = start.at_keyword(ResourceKeyword)
+    kind = if resource_type:
+        "resource"
+    else:
+        "opaque"
+    help = if resource_type:
+        "write resource type Name = Underlying"
+    else:
+        OPAQUE_DECLARATION_HELP
     after_opaque = start.shifted(1)
     type_word: ParserState ?= if after_opaque.at_type_keyword():
         Ok(after_opaque.shifted(1))
     else:
-        Err(
-            expected_syntax(
-                after_opaque,
-                "expected 'type' after 'opaque'",
-                OPAQUE_DECLARATION_HELP,
-            ),
-        )
-    name ?= type_word.consume_declared_name(DeclaredType, "expected an opaque type name")
+        Err(expected_syntax(after_opaque, "expected 'type' after '${kind}'", help))
+    name_message = if resource_type:
+        "expected a resource type name"
+    else:
+        "expected an opaque type name"
+    name ?= type_word.consume_declared_name(DeclaredType, name_message)
     type_parameters ?= name.next.consume_type_parameters()
     equals ?= type_parameters.next.expect(
         type_parameters.next.at_equals(),
-        "expected '=' after the opaque type name",
-        OPAQUE_DECLARATION_HELP,
+        "expected '=' after the ${kind} type name",
+        help,
     )
     underlying ?= equals.consume_type("expected the underlying type after '='")
     next ?= underlying.next.end_value_line()
@@ -6637,6 +6658,7 @@ private pure func consume_opaque(
             type_name = name.name,
             type_parameters = type_parameters.parameters,
             underlying = underlying.written,
+            resource_type = resource_type,
         },
         next = next,
     })
@@ -6776,7 +6798,11 @@ private pure func consume_visible_declaration(
                 Ok({ declaration = RecordDeclaration(parsed.declaration), next = parsed.next })
             Err(error):
                 Err(error)
-    else if state.at_keyword(OpaqueKeyword):
+    else if (
+        state
+            .at_keyword(OpaqueKeyword)
+            .or(state.at_keyword(ResourceKeyword))
+    ):
         match state.consume_opaque(declaration_start, module, visibility):
             Ok(parsed):
                 Ok({ declaration = OpaqueDeclaration(parsed.declaration), next = parsed.next })

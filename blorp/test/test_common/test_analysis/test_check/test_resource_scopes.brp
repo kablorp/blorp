@@ -1,0 +1,1228 @@
+import:
+    bool: and
+    int: Int methods
+    option: Option methods
+    result: Result methods
+    string: String methods
+    test: TestSuite
+    ../../../../src/common/analysis/check/check: CheckedProgram, check
+    ../../../../src/common/syntax/source: module_source, root_module_id
+    ../../../../src/common/syntax/syntax: Diagnostic
+    ../../../support/input: setup_diagnostic
+    ../../../support/module_input: parse_modules
+
+
+pure func test_resource_parameter_keeps_owner_only_opaque_representation() -> Bool:
+    source: String =
+        |resource type Token = Int
+        |func consume(token: Token) -> Int:
+        |    from_opaque Token(token)
+        |func main() -> Int:
+        |    consume(into_opaque Token(7))
+        |
+    checked_source(source).is_ok()
+
+
+pure func test_immutable_scoped_closure_forwards_synchronously() -> Bool:
+    source: String =
+        |resource type Token = Int
+        |func with_token[T](body: scoped (Token) -> T) -> T:
+        |    body(into_opaque Token(7))
+        |func consume(token: Token) -> Int:
+        |    from_opaque Token(token)
+        |func invoke(body: scoped () -> Int) -> Int:
+        |    body()
+        |func forward(body: scoped () -> Int) -> Int:
+        |    invoke(body)
+        |func during(token: Token) -> Int:
+        |    read_more = func() -> Int: consume(token)
+        |    forward(read_more)
+        |func main() -> Int:
+        |    with_token(during)
+        |
+    checked_source(source).is_ok()
+
+
+private pure func rejects_at(
+    before: String,
+    marked: String,
+    after: String,
+    message: String,
+    help: String,
+) -> Bool:
+    source = before + marked + after
+    match checked_source(source):
+        Ok(_):
+            False
+        Err(error):
+            (error.message == message)
+                .and(error.help == help)
+                .and(error.span.source == module_source(root_module_id()))
+                .and(error.span.start == before.length())
+                .and(error.span.end == before.length() + marked.length())
+                .and(error.note.is_none())
+
+
+pure func test_resource_result_is_rejected_at_its_annotation() -> Bool:
+    declaration: String =
+        |resource type Token = Int
+        |
+    before = declaration + "func escape(token: Token) -> "
+    after: String =
+        |:
+        |    token
+        |func main() -> Int:
+        |    0
+        |
+    rejects_at(
+        before,
+        "Token",
+        after,
+        "resource types cannot be returned",
+        "consume the resource inside its scope and return an ordinary value instead",
+    )
+
+
+pure func test_closure_result_cannot_hide_resource_capture() -> Bool:
+    declaration: String =
+        |resource type Token = Int
+        |func consume(token: Token) -> Void:
+        |    void
+        |func escape(token: Token) -> () -> Void:
+        |
+    before = declaration + "    "
+    after: String =
+        |
+        |func main() -> Int:
+        |    0
+        |
+    rejects_at(
+        before,
+        "func(): consume(token)",
+        after,
+        "scoped callables cannot be returned",
+        "invoke the callable during this call, or return a closure that captures only ordinary values",
+    )
+
+
+private pure func checked_source(source: String) -> Result[CheckedProgram, Diagnostic]:
+    parsed ?= parse_modules([{ source = source, targets = [] }])
+    check(parsed).map_err(setup_diagnostic)
+
+
+private RESOURCE: String =
+    |resource type Token = Int
+    |func consume(token: Token) -> Int:
+    |    from_opaque Token(token)
+    |
+
+
+private MAIN: String =
+    |func main() -> Int:
+    |    0
+    |
+
+
+private pure func rejects_loan(
+    before: String,
+    marked: String,
+    after: String,
+    message: String,
+    help: String,
+) -> Bool:
+    rejects_at(RESOURCE + before, marked, after + MAIN, message, help)
+
+
+pure func test_resource_local_alias() -> Bool:
+    opening: String =
+        |func during(token: Token) -> Int:
+        |
+    before = opening + "    copy = "
+    after: String =
+        |
+        |    0
+        |
+    marked: String = "token"
+    rejects_loan(
+        before,
+        marked,
+        after,
+        "resources cannot be stored",
+        "pass the resource directly to an impure function instead of binding or wrapping it",
+    )
+
+
+pure func test_resource_record_field() -> Bool:
+    opening: String =
+        |
+        |
+    before = opening + "record Stored { token: "
+    after: String =
+        | }
+        |
+    marked: String = "Token"
+    rejects_loan(
+        before,
+        marked,
+        after,
+        "resources cannot be stored",
+        "pass the resource directly to an impure function instead of binding or wrapping it",
+    )
+
+
+pure func test_resource_union_payload() -> Bool:
+    opening: String =
+        |union Stored:
+        |
+    before = opening + "    StoredToken("
+    after: String =
+        |)
+        |
+    marked: String = "Token"
+    rejects_loan(
+        before,
+        marked,
+        after,
+        "resources cannot be stored",
+        "pass the resource directly to an impure function instead of binding or wrapping it",
+    )
+
+
+pure func test_resource_opaque_representation() -> Bool:
+    opening: String =
+        |
+        |
+    before = opening + "opaque type Stored = "
+    after: String =
+        |
+        |
+    marked: String = "Token"
+    rejects_loan(
+        before,
+        marked,
+        after,
+        "resources cannot be stored",
+        "pass the resource directly to an impure function instead of binding or wrapping it",
+    )
+
+
+pure func test_resource_list_type() -> Bool:
+    opening: String =
+        |
+        |
+    before = opening + "func during(values: "
+    after: String =
+        |) -> Void:
+        |    void
+        |
+    marked: String = "List[Token]"
+    rejects_loan(
+        before,
+        marked,
+        after,
+        "resource types cannot be type arguments",
+        "use a whole resource parameter on an impure function instead",
+    )
+
+
+pure func test_resource_tuple_type() -> Bool:
+    opening: String =
+        |
+        |
+    before = opening + "func during(values: "
+    after: String =
+        |) -> Void:
+        |    void
+        |
+    marked: String = "(Token, Int)"
+    rejects_loan(
+        before,
+        marked,
+        after,
+        "resources cannot be stored",
+        "pass the resource directly to an impure function instead of binding or wrapping it",
+    )
+
+
+pure func test_resource_callable_in_aggregate() -> Bool:
+    opening: String =
+        |
+        |
+    before = opening + "record Stored { body: "
+    after: String =
+        | }
+        |
+    marked: String = "(Token) -> Void"
+    rejects_loan(
+        before,
+        marked,
+        after,
+        "resources cannot be stored",
+        "pass the resource directly to an impure function instead of binding or wrapping it",
+    )
+
+
+pure func test_resource_callable_type_argument() -> Bool:
+    opening: String =
+        |
+        |
+    before = opening + "func during(values: "
+    after: String =
+        |) -> Void:
+        |    void
+        |
+    marked: String = "List[(Token) -> Void]"
+    rejects_loan(
+        before,
+        marked,
+        after,
+        "resource types cannot be type arguments",
+        "use a whole resource parameter on an impure function instead",
+    )
+
+
+pure func test_resource_pure_parameter() -> Bool:
+    opening: String =
+        |
+        |
+    before = opening + "pure func during(token: "
+    after: String =
+        |) -> Int:
+        |    0
+        |
+    marked: String = "Token"
+    rejects_loan(
+        before,
+        marked,
+        after,
+        "pure functions cannot take resource parameters",
+        "remove pure and consume the resource synchronously",
+    )
+
+
+pure func test_scoped_non_callable() -> Bool:
+    opening: String =
+        |
+        |
+    before = opening + "func during(value: "
+    after: String =
+        | Int) -> Void:
+        |    void
+        |
+    marked: String = "scoped"
+    rejects_loan(
+        before,
+        marked,
+        after,
+        "scoped parameters must be callable",
+        "write name: scoped (Argument) -> Result for a synchronous callback",
+    )
+
+
+pure func test_scoped_parameter_result() -> Bool:
+    opening: String =
+        |func escape(body: scoped () -> Int) -> () -> Int:
+        |
+    before = opening + "    "
+    after: String =
+        |
+        |
+    marked: String = "body"
+    rejects_loan(
+        before,
+        marked,
+        after,
+        "scoped callables cannot be returned",
+        "invoke the callable during this call, or return a closure that captures only ordinary values",
+    )
+
+
+pure func test_scoped_closure_mutable_binding() -> Bool:
+    opening: String =
+        |func during(token: Token) -> Int:
+        |
+    before = opening + "    var body = "
+    after: String =
+        |
+        |    0
+        |
+    marked: String = "func() -> Int: consume(token)"
+    rejects_loan(
+        before,
+        marked,
+        after,
+        "scoped callables cannot be stored here",
+        "keep the callable in an immutable local binding and invoke or forward it synchronously",
+    )
+
+
+pure func test_scoped_closure_reassignment() -> Bool:
+    opening: String =
+        |func during(token: Token) -> Int:
+        |    var body = func() -> Int: 0
+        |
+    before = opening + "    body = "
+    after: String =
+        |
+        |    0
+        |
+    marked: String = "func() -> Int: consume(token)"
+    rejects_loan(
+        before,
+        marked,
+        after,
+        "scoped callables cannot be stored here",
+        "keep the callable in an immutable local binding and invoke or forward it synchronously",
+    )
+
+
+pure func test_scoped_closure_list() -> Bool:
+    opening: String =
+        |func during(token: Token) -> Int:
+        |
+    before = opening + "    bodies = ["
+    after: String =
+        |]
+        |    0
+        |
+    marked: String = "func() -> Int: consume(token)"
+    rejects_loan(
+        before,
+        marked,
+        after,
+        "scoped callables cannot be stored here",
+        "keep the callable in an immutable local binding and invoke or forward it synchronously",
+    )
+
+
+pure func test_scoped_closure_tuple() -> Bool:
+    opening: String =
+        |func during(token: Token) -> Int:
+        |
+    before = opening + "    bodies = ("
+    after: String =
+        |, 0)
+        |    0
+        |
+    marked: String = "func() -> Int: consume(token)"
+    rejects_loan(
+        before,
+        marked,
+        after,
+        "scoped callables cannot be stored here",
+        "keep the callable in an immutable local binding and invoke or forward it synchronously",
+    )
+
+
+pure func test_scoped_closure_record() -> Bool:
+    opening: String =
+        |record Stored { body: () -> Int }
+        |func during(token: Token) -> Int:
+        |
+    before = opening + "    stored: Stored = { body = "
+    after: String =
+        | }
+        |    0
+        |
+    marked: String = "func() -> Int: consume(token)"
+    rejects_loan(
+        before,
+        marked,
+        after,
+        "scoped callables cannot be stored here",
+        "keep the callable in an immutable local binding and invoke or forward it synchronously",
+    )
+
+
+pure func test_scoped_closure_opaque() -> Bool:
+    opening: String =
+        |opaque type Stored = () -> Int
+        |func during(token: Token) -> Int:
+        |
+    before = opening + "    stored = into_opaque Stored("
+    after: String =
+        |)
+        |    0
+        |
+    marked: String = "func() -> Int: consume(token)"
+    rejects_loan(
+        before,
+        marked,
+        after,
+        "scoped callables cannot be stored here",
+        "keep the callable in an immutable local binding and invoke or forward it synchronously",
+    )
+
+
+pure func test_scoped_closure_union() -> Bool:
+    opening: String =
+        |union Stored:
+        |    Body(() -> Int)
+        |func during(token: Token) -> Int:
+        |
+    before = opening + "    stored: Stored = Body("
+    after: String =
+        |)
+        |    0
+        |
+    marked: String = "func() -> Int: consume(token)"
+    rejects_loan(
+        before,
+        marked,
+        after,
+        "scoped callables cannot be stored here",
+        "keep the callable in an immutable local binding and invoke or forward it synchronously",
+    )
+
+
+pure func test_scoped_ordinary_direct_argument() -> Bool:
+    opening: String =
+        |func invoke(body: () -> Int) -> Int:
+        |    body()
+        |func during(token: Token) -> Int:
+        |
+    before = opening + "    invoke("
+    after: String =
+        |)
+        |
+    marked: String = "func() -> Int: consume(token)"
+    rejects_loan(
+        before,
+        marked,
+        after,
+        "scoped callables require a scoped parameter",
+        "declare the receiving callback parameter scoped and call the function directly",
+    )
+
+
+pure func test_scoped_indirect_erasure() -> Bool:
+    opening: String =
+        |func invoke(body: scoped () -> Int) -> Int:
+        |    body()
+        |func during(token: Token) -> Int:
+        |    saved = invoke
+        |
+    before = opening + "    saved("
+    after: String =
+        |)
+        |
+    marked: String = "func() -> Int: consume(token)"
+    rejects_loan(
+        before,
+        marked,
+        after,
+        "scoped callables require a scoped parameter",
+        "declare the receiving callback parameter scoped and call the function directly",
+    )
+
+
+pure func test_scoped_ufcs_ordinary_argument() -> Bool:
+    opening: String =
+        |func invoke(body: () -> Int) -> Int:
+        |    body()
+        |func during(token: Token) -> Int:
+        |    body = func() -> Int: consume(token)
+        |
+    before = opening + "    "
+    after: String =
+        |.invoke()
+        |
+    marked: String = "body"
+    rejects_loan(
+        before,
+        marked,
+        after,
+        "scoped callables require a scoped parameter",
+        "declare the receiving callback parameter scoped and call the function directly",
+    )
+
+
+pure func test_scoped_transitive_capture() -> Bool:
+    opening: String =
+        |func escape(token: Token) -> () -> Int:
+        |    body = func() -> Int: consume(token)
+        |
+    before = opening + "    "
+    after: String =
+        |
+        |
+    marked: String = "func() -> Int: body()"
+    rejects_loan(
+        before,
+        marked,
+        after,
+        "scoped callables cannot be returned",
+        "invoke the callable during this call, or return a closure that captures only ordinary values",
+    )
+
+
+pure func test_callable_match_cannot_bind_scoped_value() -> Bool:
+    opening: String =
+        |func escape(token: Token) -> () -> Int:
+        |    body = func() -> Int: consume(token)
+        |
+    before = opening + "    match "
+    after: String =
+        |:
+        |        bound:
+        |            bound
+        |
+    marked: String = "body"
+    rejects_loan(
+        before,
+        marked,
+        after,
+        "match requires a union, List, String, Int or tuple value",
+        "match one of those; use if for a Boolean condition",
+    )
+
+
+pure func test_scoped_if_join() -> Bool:
+    opening: String =
+        |func escape(token: Token) -> () -> Int:
+        |
+    before = opening + "    "
+    after: String =
+        |
+        |
+    marked: String = "if True:\n        func() -> Int: 0\n    else:\n        func() -> Int: consume(token)"
+    rejects_loan(
+        before,
+        marked,
+        after,
+        "scoped callables cannot be returned",
+        "invoke the callable during this call, or return a closure that captures only ordinary values",
+    )
+
+
+pure func test_resource_inferred_generic_identity() -> Bool:
+    opening: String =
+        |func identity[T](value: T) -> T:
+        |    value
+        |func during(token: Token) -> Int:
+        |
+    before = opening + "    consume("
+    after: String =
+        |(token))
+        |
+    marked: String = "identity"
+    rejects_loan(
+        before,
+        marked,
+        after,
+        "resource types cannot be type arguments",
+        "use a whole resource parameter on an impure function instead",
+    )
+
+
+pure func test_resource_pure_capture() -> Bool:
+    opening: String =
+        |func during(token: Token) -> Int:
+        |
+    before = opening + "    body = "
+    after: String =
+        |
+        |    0
+        |
+    marked: String = "pure func() -> Int: from_opaque Token(token)"
+    rejects_loan(
+        before,
+        marked,
+        after,
+        "pure closures cannot capture resources",
+        "remove pure and invoke the closure inside the resource scope",
+    )
+
+
+pure func test_resource_constant() -> Bool:
+    opening: String =
+        |
+        |
+    before = opening + "VALUE: "
+    after: String =
+        | = into_opaque Token(7)
+        |
+    marked: String = "Token"
+    rejects_loan(
+        before,
+        marked,
+        after,
+        "resources cannot be stored",
+        "pass the resource directly to an impure function instead of binding or wrapping it",
+    )
+
+
+pure func test_resource_generic_declaration() -> Bool:
+    opening: String =
+        |
+        |
+    before = opening + "resource type "
+    after: String =
+        |[T] = Int
+        |
+    marked: String = "Generic"
+    rejects_loan(
+        before,
+        marked,
+        after,
+        "resource types cannot be generic",
+        "declare a resource type without type parameters and with a resource-free representation",
+    )
+
+
+pure func test_pure_written_resource_lambda() -> Bool:
+    opening: String =
+        |func during() -> Int:
+        |
+    before = opening + "    body = pure func("
+    after: String =
+        |: Token) -> Int: 0
+        |    0
+        |
+    marked: String = "value"
+    rejects_loan(
+        before,
+        marked,
+        after,
+        "pure functions cannot take resource parameters",
+        "remove pure and consume the resource synchronously",
+    )
+
+
+pure func test_pure_inferred_resource_lambda() -> Bool:
+    opening: String =
+        |func during() -> Int:
+        |
+    before = opening + "    body: (Token) -> Int = pure func("
+    after: String =
+        |) -> Int: 0
+        |    0
+        |
+    marked: String = "value"
+    rejects_loan(
+        before,
+        marked,
+        after,
+        "pure functions cannot take resource parameters",
+        "remove pure and consume the resource synchronously",
+    )
+
+
+pure func test_trait_resource_parameter() -> Bool:
+    opening: String =
+        |trait Uses:
+        |
+    before = opening + "    pure func use(self: Self, token: "
+    after: String =
+        |) -> Int
+        |
+    marked: String = "Token"
+    rejects_loan(
+        before,
+        marked,
+        after,
+        "pure functions cannot take resource parameters",
+        "remove pure and consume the resource synchronously",
+    )
+
+
+pure func test_trait_resource_result() -> Bool:
+    opening: String =
+        |trait Uses:
+        |
+    before = opening + "    pure func use(self: Self) -> "
+    after: String =
+        |
+        |
+    marked: String = "Token"
+    rejects_loan(
+        before,
+        marked,
+        after,
+        "resource types cannot be returned",
+        "consume the resource inside its scope and return an ordinary value instead",
+    )
+
+
+pure func test_trait_scoped_parameter() -> Bool:
+    opening: String =
+        |trait Uses:
+        |
+    before = opening + "    pure func use(self: Self, body: "
+    after: String =
+        | () -> Int) -> Int
+        |
+    marked: String = "scoped"
+    rejects_loan(
+        before,
+        marked,
+        after,
+        "trait requirements cannot declare scoped parameters",
+        "declare the scoped callback on an ordinary function instead",
+    )
+
+
+pure func test_scoped_some_payload() -> Bool:
+    opening: String =
+        |func during(token: Token) -> Int:
+        |
+    before = opening + "    body: Option[() -> Int] = Some("
+    after: String =
+        |)
+        |    0
+        |
+    marked: String = "func() -> Int: consume(token)"
+    rejects_loan(
+        before,
+        marked,
+        after,
+        "scoped callables cannot be stored here",
+        "keep the callable in an immutable local binding and invoke or forward it synchronously",
+    )
+
+
+pure func test_scoped_ok_payload() -> Bool:
+    opening: String =
+        |func during(token: Token) -> Int:
+        |
+    before = opening + "    body: Result[() -> Int, String] = Ok("
+    after: String =
+        |)
+        |    0
+        |
+    marked: String = "func() -> Int: consume(token)"
+    rejects_loan(
+        before,
+        marked,
+        after,
+        "scoped callables cannot be stored here",
+        "keep the callable in an immutable local binding and invoke or forward it synchronously",
+    )
+
+
+pure func test_scoped_propagation_payload() -> Bool:
+    opening: String =
+        |func during(token: Token) -> Result[Int, String]:
+        |
+    before = opening + "    body: () -> Int ?= Ok("
+    after: String =
+        |)
+        |    Ok(body())
+        |
+    marked: String = "func() -> Int: consume(token)"
+    rejects_loan(
+        before,
+        marked,
+        after,
+        "scoped callables cannot be stored here",
+        "keep the callable in an immutable local binding and invoke or forward it synchronously",
+    )
+
+
+pure func test_resource_generic_callable_actual() -> Bool:
+    opening: String =
+        |func retain[T](body: T) -> Void:
+        |    void
+        |func during() -> Void:
+        |
+    before = opening + "    "
+    after: String =
+        |(consume)
+        |
+    marked: String = "retain"
+    rejects_loan(
+        before,
+        marked,
+        after,
+        "resource types cannot be type arguments",
+        "use a whole resource parameter on an impure function instead",
+    )
+
+
+pure func test_scoped_parameter_forward_alias() -> Bool:
+    source: String =
+        |func invoke(body: scoped () -> Int) -> Int:
+        |    body()
+        |func forward(body: scoped () -> Int) -> Int:
+        |    copy = body
+        |    invoke(copy)
+        |
+    checked_source(RESOURCE + source + MAIN).is_ok()
+
+
+pure func test_scoped_void_tail_discard() -> Bool:
+    source: String =
+        |func during(token: Token) -> Void:
+        |    func() -> Int: consume(token)
+        |
+    checked_source(RESOURCE + source + MAIN).is_ok()
+
+
+pure func test_scoped_discard_then_invoke() -> Bool:
+    source: String =
+        |func discard(body: scoped () -> Int) -> Void:
+        |    body
+        |func during(token: Token) -> Int:
+        |    body = func() -> Int: consume(token)
+        |    discard(body)
+        |    body()
+        |
+    checked_source(RESOURCE + source + MAIN).is_ok()
+
+
+pure func test_scoped_calls_in_match_branches() -> Bool:
+    source: String =
+        |func during(token: Token) -> Int:
+        |    body = func() -> Int: consume(token)
+        |    match 0:
+        |        0:
+        |            body()
+        |        _:
+        |            body()
+        |
+    checked_source(RESOURCE + source + MAIN).is_ok()
+
+
+pure func test_scoped_nested_capture_forward() -> Bool:
+    source: String =
+        |func invoke(body: scoped () -> Int) -> Int:
+        |    body()
+        |func during(token: Token) -> Int:
+        |    body = func() -> Int: consume(token)
+        |    outer = func() -> Int: invoke(func() -> Int: body())
+        |    invoke(outer)
+        |
+    checked_source(RESOURCE + source + MAIN).is_ok()
+
+
+pure func test_scoped_ufcs_direct() -> Bool:
+    source: String =
+        |func invoke(body: scoped () -> Int) -> Int:
+        |    body()
+        |func during(token: Token) -> Int:
+        |    body = func() -> Int: consume(token)
+        |    body.invoke()
+        |
+    checked_source(RESOURCE + source + MAIN).is_ok()
+
+
+pure func test_sequential_resource_alias_arguments() -> Bool:
+    source: String =
+        |func together(left: Token, right: Token) -> Int:
+        |    first = consume(left)
+        |    consume(right)
+        |func during(token: Token) -> Int:
+        |    together(token, token)
+        |
+    checked_source(RESOURCE + source + MAIN).is_ok()
+
+
+pure func test_pure_scoped_callback_capture() -> Bool:
+    source: String =
+        |pure func invoke(body: scoped pure () -> Int) -> Int:
+        |    body()
+        |pure func forward(body: scoped pure () -> Int) -> Int:
+        |    relay = pure func() -> Int: body()
+        |    invoke(relay)
+        |
+    checked_source(RESOURCE + source + MAIN).is_ok()
+
+
+pure func test_scoped_if_alias_invoke() -> Bool:
+    source: String =
+        |func during(token: Token) -> Int:
+        |    body = if True:
+        |        func() -> Int: 0
+        |    else:
+        |        func() -> Int: consume(token)
+        |    body()
+        |
+    checked_source(RESOURCE + source + MAIN).is_ok()
+
+
+private pure func checked_with_owner(
+    source: String,
+    owner: String,
+) -> Result[CheckedProgram, Diagnostic]:
+    parsed ?= parse_modules([{ source = source, targets = [1] }, { source = owner, targets = [] }])
+    check(parsed).map_err(setup_diagnostic)
+
+
+private pure func rejects_with_owner(
+    before: String,
+    marked: String,
+    after: String,
+    owner: String,
+    message: String,
+    help: String,
+) -> Bool:
+    match checked_with_owner(before + marked + after, owner):
+        Ok(_):
+            False
+        Err(error):
+            (error.message == message)
+                .and(error.help == help)
+                .and(error.span.source == module_source(root_module_id()))
+                .and(error.span.start == before.length())
+                .and(error.span.end == before.length() + marked.length())
+                .and(error.note.is_none())
+
+
+private OWNER: String =
+    |resource type Token = Int
+    |func consume(token: Token) -> Int:
+    |    from_opaque Token(token)
+    |func invoke(body: scoped () -> Int) -> Int:
+    |    body()
+    |
+
+
+pure func test_resource_projection_stays_in_owner_module() -> Bool:
+    prefix: String =
+        |import:
+        |    ./owner: Token
+        |func during(token: Token) -> Int:
+        |
+    before = prefix + "    from_opaque "
+    after: String =
+        |(token)
+        |func main() -> Int:
+        |    0
+        |
+    rejects_with_owner(
+        before,
+        "Token",
+        after,
+        OWNER,
+        "opaque values can be projected only in their declaring module",
+        "call a public accessor from the declaring module",
+    )
+
+
+pure func test_resource_construction_stays_in_owner_module() -> Bool:
+    prefix: String =
+        |import:
+        |    ./owner as owner: Token
+        |func main() -> Int:
+        |
+    before = prefix + "    owner.consume(into_opaque "
+    after: String =
+        |(7))
+        |
+    rejects_with_owner(
+        before,
+        "Token",
+        after,
+        OWNER,
+        "opaque values can be constructed only in their declaring module",
+        "call a public constructor from the declaring module",
+    )
+
+
+pure func test_scoped_qualified_direct_call() -> Bool:
+    source: String =
+        |import:
+        |    ./owner as owner: Token
+        |func during(token: Token) -> Int:
+        |    owner.invoke(func() -> Int: owner.consume(token))
+        |func main() -> Int:
+        |    0
+        |
+    checked_with_owner(source, OWNER).is_ok()
+
+
+pure func test_scoped_qualified_ordinary_argument() -> Bool:
+    owner: String =
+        |resource type Token = Int
+        |func consume(token: Token) -> Int:
+        |    from_opaque Token(token)
+        |func invoke(body: () -> Int) -> Int:
+        |    body()
+        |
+    prefix: String =
+        |import:
+        |    ./owner as owner: Token
+        |func during(token: Token) -> Int:
+        |
+    before = prefix + "    owner.invoke("
+    after: String =
+        |)
+        |func main() -> Int:
+        |    0
+        |
+    rejects_with_owner(
+        before,
+        "func() -> Int: owner.consume(token)",
+        after,
+        owner,
+        "scoped callables require a scoped parameter",
+        "declare the receiving callback parameter scoped and call the function directly",
+    )
+
+
+pure func test_trait_default_resource_parameter_rejected_before_body() -> Bool:
+    prefix: String =
+        |trait Uses:
+        |
+    before = prefix + "    pure func use(self: Self, token: "
+    after: String =
+        |) -> Int:
+        |        0
+        |
+    rejects_loan(
+        before,
+        "Token",
+        after,
+        "pure functions cannot take resource parameters",
+        "remove pure and consume the resource synchronously",
+    )
+
+
+pure func test_trait_default_resource_result_rejected_before_body() -> Bool:
+    prefix: String =
+        |trait Uses:
+        |
+    before = prefix + "    pure func use(self: Self) -> "
+    after: String =
+        |:
+        |        0
+        |
+    rejects_loan(
+        before,
+        "Token",
+        after,
+        "resource types cannot be returned",
+        "consume the resource inside its scope and return an ordinary value instead",
+    )
+
+
+pure func test_match_join_preserves_later_scoped_arm() -> Bool:
+    prefix: String =
+        |func ordinary(body: () -> Int) -> Int:
+        |    body()
+        |func during(token: Token) -> Int:
+        |    body = match 0:
+        |        0: func() -> Int: 0
+        |        _: func() -> Int: consume(token)
+        |
+    before = prefix + "    ordinary("
+    after: String =
+        |)
+        |
+    rejects_loan(
+        before,
+        "body",
+        after,
+        "scoped callables require a scoped parameter",
+        "declare the receiving callback parameter scoped and call the function directly",
+    )
+
+
+pure func test_inferred_list_cannot_store_resource_taking_callable() -> Bool:
+    prefix: String =
+        |func during() -> Int:
+        |
+    before = prefix + "    bodies = "
+    after: String =
+        |
+        |    0
+        |
+    rejects_loan(
+        before,
+        "[consume]",
+        after,
+        "resource types cannot be type arguments",
+        "use a whole resource parameter on an impure function instead",
+    )
+
+
+TESTS: TestSuite = {
+    description = "Synchronous resource loans",
+    tests = [
+        (
+            "inferred containers reject resource-taking callables",
+            test_inferred_list_cannot_store_resource_taking_callable,
+        ),
+        ("match joins preserve later scoped arms", test_match_join_preserves_later_scoped_arm),
+        ("resource projection remains owner only", test_resource_projection_stays_in_owner_module),
+        (
+            "resource construction remains owner only",
+            test_resource_construction_stays_in_owner_module,
+        ),
+        ("qualified direct call preserves scoped promise", test_scoped_qualified_direct_call),
+        ("qualified ordinary call rejects scoped actual", test_scoped_qualified_ordinary_argument),
+        (
+            "trait default rejects resource parameter before body",
+            test_trait_default_resource_parameter_rejected_before_body,
+        ),
+        (
+            "trait default rejects resource result before body",
+            test_trait_default_resource_result_rejected_before_body,
+        ),
+        (
+            "a resource result is rejected at its annotation",
+            test_resource_result_is_rejected_at_its_annotation,
+        ),
+        (
+            "a closure result cannot hide a resource capture",
+            test_closure_result_cannot_hide_resource_capture,
+        ),
+        (
+            "a resource uses owner-only opaque conversion",
+            test_resource_parameter_keeps_owner_only_opaque_representation,
+        ),
+        (
+            "an immutable scoped closure forwards synchronously",
+            test_immutable_scoped_closure_forwards_synchronously,
+        ),
+        ("resource local alias", test_resource_local_alias),
+        ("resource record field", test_resource_record_field),
+        ("resource union payload", test_resource_union_payload),
+        ("resource opaque representation", test_resource_opaque_representation),
+        ("resource list type", test_resource_list_type),
+        ("resource tuple type", test_resource_tuple_type),
+        ("resource callable in aggregate", test_resource_callable_in_aggregate),
+        ("resource callable type argument", test_resource_callable_type_argument),
+        ("resource pure parameter", test_resource_pure_parameter),
+        ("scoped non callable", test_scoped_non_callable),
+        ("scoped parameter result", test_scoped_parameter_result),
+        ("scoped closure mutable binding", test_scoped_closure_mutable_binding),
+        ("scoped closure reassignment", test_scoped_closure_reassignment),
+        ("scoped closure list", test_scoped_closure_list),
+        ("scoped closure tuple", test_scoped_closure_tuple),
+        ("scoped closure record", test_scoped_closure_record),
+        ("scoped closure opaque", test_scoped_closure_opaque),
+        ("scoped closure union", test_scoped_closure_union),
+        ("scoped ordinary direct argument", test_scoped_ordinary_direct_argument),
+        ("scoped indirect erasure", test_scoped_indirect_erasure),
+        ("scoped ufcs ordinary argument", test_scoped_ufcs_ordinary_argument),
+        ("scoped transitive capture", test_scoped_transitive_capture),
+        (
+            "callable match rejects binding a scoped value",
+            test_callable_match_cannot_bind_scoped_value,
+        ),
+        ("scoped if join", test_scoped_if_join),
+        ("resource inferred generic identity", test_resource_inferred_generic_identity),
+        ("resource pure capture", test_resource_pure_capture),
+        ("resource constant", test_resource_constant),
+        ("resource generic declaration", test_resource_generic_declaration),
+        ("pure written resource lambda", test_pure_written_resource_lambda),
+        ("pure inferred resource lambda", test_pure_inferred_resource_lambda),
+        ("trait resource parameter", test_trait_resource_parameter),
+        ("trait resource result", test_trait_resource_result),
+        ("trait scoped parameter", test_trait_scoped_parameter),
+        ("scoped some payload", test_scoped_some_payload),
+        ("scoped ok payload", test_scoped_ok_payload),
+        ("scoped propagation payload", test_scoped_propagation_payload),
+        ("resource generic callable actual", test_resource_generic_callable_actual),
+        ("scoped parameter forward alias", test_scoped_parameter_forward_alias),
+        ("scoped void tail discard", test_scoped_void_tail_discard),
+        ("scoped discard then invoke", test_scoped_discard_then_invoke),
+        ("scoped calls in match branches", test_scoped_calls_in_match_branches),
+        ("scoped nested capture forward", test_scoped_nested_capture_forward),
+        ("scoped ufcs direct", test_scoped_ufcs_direct),
+        ("sequential resource alias arguments", test_sequential_resource_alias_arguments),
+        ("pure scoped callback capture", test_pure_scoped_callback_capture),
+        ("scoped if alias invoke", test_scoped_if_alias_invoke),
+    ],
+}

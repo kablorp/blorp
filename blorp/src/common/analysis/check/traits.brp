@@ -51,7 +51,7 @@ import:
         Substitution,
         substitute_type,
     ./equality: equality_template
-    ./errors:
+    ./errors as resource_errors:
         CheckError,
         checker_invariant,
         or_checker_invariant,
@@ -123,6 +123,7 @@ import:
         TypeRef(ParameterType, VoidType, NominalType, StringType),
         TypeParameterOwner(TraitDeclaration),
         type_parameter_id,
+    ./resource_types: TypeRef methods
     ./signatures: AcceptedFunction
 
 
@@ -146,6 +147,14 @@ private pure func requirement(
     var parameters: List[TypeUse] = []
     var failure: Option[CheckError] = None
     for parameter in header.parameters:
+        match parameter.scoped_qualifier:
+            Some(span):
+                failure = Some(
+                    resource_errors.resource_error(span, resource_errors.ScopedTraitParameter),
+                )
+                break
+            None:
+                void
         resolved: Result[TypeRef, CheckError] = match parameter.type_name:
             CallableTypeSyntax(_, _, _, _):
                 Err(trait_error(parameter.type_name.type_span(), CallableFormalDeferred(row.id)))
@@ -153,6 +162,14 @@ private pure func requirement(
                 scope.resolve_type(parameter.type_name)
         match resolved:
             Ok(value_type):
+                if value_type.is_resource(scope.opaques):
+                    failure = Some(
+                        resource_errors.resource_error(
+                            parameter.type_name.type_span(),
+                            resource_errors.ResourcePureParameter,
+                        ),
+                    )
+                    break
                 parameters = parameters.append({
                     value_type = value_type,
                     span = parameter.type_name.type_span(),
@@ -178,6 +195,10 @@ private pure func requirement(
     result_span = match header.return_type:
         Some(written): written.type_span()
         None: header.function_name.span
+    _: Void ?= if result.is_resource(scope.opaques):
+        Err(resource_errors.resource_error(result_span, resource_errors.ResourceResult))
+    else:
+        Ok(void)
     unique ?= row.id.unique_requirement_parameters(header)
     default_body: Option[FunctionId] = match row.declaration:
         RequiredMethod(_): None
@@ -189,6 +210,7 @@ private pure func requirement(
             type_parameters = [self],
             requirements = [],
             purity = Pure,
+            scoped_parameters = [],
             parameters = parameters,
             return_type = { value_type = result, span = result_span },
         },
@@ -843,6 +865,7 @@ private pure func member_contract(
         type_parameters = function.signature.type_parameters,
         requirements = function.signature.requirements,
         purity = required.signature.purity,
+        scoped_parameters = [],
         parameters = parameters,
         return_type = { required.signature.return_type | value_type = result },
     }

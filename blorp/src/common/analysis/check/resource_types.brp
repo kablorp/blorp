@@ -1,0 +1,89 @@
+---
+Synchronous loans use the parsed opaque declaration as their resource authority.
+These checks publish no runtime or downstream lifetime representation.
+---
+import:
+    bool: Bool methods
+    int: Int methods
+    option: Option methods
+    result: Result methods
+    ../../syntax/syntax: Span, Purity(Pure)
+    ../ids: OpaqueRow, opaque_number
+    ./errors as errors: CheckError, resource_error
+    ./model:
+        TypeRef(NominalType, ListType, TupleType, CallableType),
+        NominalId(OpaqueNominal),
+        type_children,
+
+
+pure func is_resource(value_type: TypeRef, opaques: List[OpaqueRow]) -> Bool:
+    match value_type:
+        NominalType(OpaqueNominal(owner), _):
+            match opaques.get(owner.opaque_number()):
+                Some(row): row.declaration.resource_type
+                None: False
+        _:
+            False
+
+
+pure func mentions_resource(value_type: TypeRef, opaques: List[OpaqueRow]) -> Bool:
+    var found = value_type.is_resource(opaques)
+    for child in value_type.type_children():
+        if child.mentions_resource(opaques):
+            found = True
+            break
+    found
+
+
+pure func resource_free(
+    value_type: TypeRef,
+    opaques: List[OpaqueRow],
+    span: Span,
+) -> Result[Void, CheckError]:
+    if value_type.mentions_resource(opaques):
+        Err(resource_error(span, errors.ResourceStorage))
+    else:
+        Ok(void)
+
+
+-- A resource may appear as a whole impure callable input. Source containers
+-- and generic applications cannot contain even a resource-taking callable.
+pure func admit_resource_type(
+    value_type: TypeRef,
+    opaques: List[OpaqueRow],
+    span: Span,
+) -> Result[Void, CheckError]:
+    var failure: Option[CheckError] = None
+    match value_type:
+        CallableType(purity, parameters, result):
+            for parameter in parameters:
+                if (purity == Pure).and(parameter.is_resource(opaques)):
+                    failure = Some(resource_error(span, errors.ResourcePureParameter))
+                    break
+                match parameter.admit_resource_type(opaques, span):
+                    Err(error):
+                        failure = Some(error)
+                        break
+                    Ok(_):
+                        void
+            if failure.is_none():
+                if result.is_resource(opaques):
+                    failure = Some(resource_error(span, errors.ResourceResult))
+                else:
+                    match result.admit_resource_type(opaques, span):
+                        Err(error): failure = Some(error)
+                        Ok(_): void
+        ListType(_) | NominalType(_, _):
+            for argument in value_type.type_children():
+                if argument.mentions_resource(opaques):
+                    failure = Some(resource_error(span, errors.ResourceTypeArgument))
+                    break
+        TupleType(_):
+            match value_type.resource_free(opaques, span):
+                Err(error): failure = Some(error)
+                Ok(_): void
+        _:
+            void
+    match failure:
+        Some(error): Err(error)
+        None: Ok(void)

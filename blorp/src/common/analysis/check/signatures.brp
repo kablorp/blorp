@@ -14,6 +14,7 @@ import:
     ../../syntax/source: FunctionLabel, ModuleId, declared_label, root_module_id
     ../../syntax/syntax:
         IntegerFormat(Int64Format, UInt8Format),
+        Purity(Pure),
         binder_span,
         TypeSyntax(CallableTypeSyntax, AtomicType, QualifiedType),
         EntryResult(IntegerExitStatus, SuccessfulExit),
@@ -81,7 +82,7 @@ import:
         local_type_parameters,
         parameter_requirements,
         resolve_bounds,
-    ./errors:
+    ./errors as resource_errors:
         CheckError,
         CheckerInvariant(InvalidFunctionContract, InvalidResolvedFunction, RuntimeContractMismatch),
         SignatureError(GenericMain, MainHasParameters, MainParameterType, MainReturnType),
@@ -121,6 +122,7 @@ import:
         TypeUse,
         type_parameter_id,
         primitive_ref,
+    ./resource_types: TypeRef methods
 
 
 -- A function body after signature checking. A builtin body has been validated
@@ -302,11 +304,51 @@ private pure func resolve_signature(
         _:
             Ok(void)
 
+    _: Void ?= if return_type.is_resource(scope.opaques):
+        Err(resource_errors.resource_error(return_span, resource_errors.ResourceResult))
+    else:
+        Ok(void)
     formal_parameters ?= function.parameters.resolve_parameters(is_entry, scope, [])
+    var scoped_parameters: List[Int] = []
+    var parameter_position = 0
+    var loan_failure: Option[CheckError] = None
+    for parameter in function.parameters:
+        match formal_parameters.get(parameter_position):
+            Some(formal):
+                if (function.purity == Pure).and(formal.value_type.is_resource(scope.opaques)):
+                    loan_failure = Some(
+                        resource_errors.resource_error(
+                            formal.span,
+                            resource_errors.ResourcePureParameter,
+                        ),
+                    )
+                match parameter.scoped_qualifier:
+                    Some(span):
+                        match formal.value_type:
+                            CallableType(_, _, _):
+                                scoped_parameters = scoped_parameters.append(parameter_position)
+                            _:
+                                loan_failure = Some(
+                                    resource_errors.resource_error(
+                                        span,
+                                        resource_errors.ScopedNonCallable,
+                                    ),
+                                )
+                    None:
+                        void
+            None:
+                void
+        if loan_failure.is_some():
+            break
+        parameter_position = parameter_position + 1
+    _: Void ?= match loan_failure:
+        Some(error): Err(error)
+        None: Ok(void)
     signature: FunctionSignature = {
         type_parameters = parameters,
         requirements = requirements,
         purity = function.purity,
+        scoped_parameters = scoped_parameters,
         parameters = formal_parameters,
         return_type = { value_type = return_type, span = return_span },
     }
@@ -725,6 +767,7 @@ private pure func resolve_default_function(
         type_parameters = [self],
         requirements = [requirement],
         purity = method.signature.purity,
+        scoped_parameters = [],
         parameters = parameters,
         return_type = { method.signature.return_type | value_type = result },
     }

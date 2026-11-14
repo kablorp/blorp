@@ -40,7 +40,7 @@ import:
         NamedValue(NamedAlias),
         TypeHead(PrimitiveHead, ListHead, UnionHead, RecordHead, OpaqueHead),
         Origin(Declared),
-    ./errors:
+    ./errors as resource_errors:
         CheckError,
         CheckerInvariant(
             InvalidParameterDeclaration,
@@ -106,6 +106,7 @@ import:
         field_id,
         primitive_ref,
         type_parameter_id,
+    ./resource_types: TypeRef methods
 
 
 pure func previous_declaration(previous: List[WrittenName], name: NameId) -> Option[WrittenName]:
@@ -493,6 +494,15 @@ private pure func qualified_type_rejection(
 
 
 pure func resolve_type(scope: TypeScope, written: TypeSyntax) -> Result[TypeRef, CheckError]:
+    resolved ?= scope.resolve_written_type(written)
+    _: Void ?= resolved.admit_resource_type(scope.opaques, written.type_span())
+    Ok(resolved)
+
+
+private pure func resolve_written_type(
+    scope: TypeScope,
+    written: TypeSyntax,
+) -> Result[TypeRef, CheckError]:
     match written:
         TupleTypeSyntax(elements, _):
             scope
@@ -659,7 +669,21 @@ private pure func checked_opaque(
     owner: TypeParameterOwner = OpaqueDeclaration(row.id)
     scope ?= row.declaration.type_parameters.local_type_parameters(owner, module_scope)
     bounds ?= row.declaration.type_parameters.resolve_bounds(scope)
+    _: Void ?= if row.declaration.resource_type.and(
+        row.declaration.type_parameters
+            .is_empty()
+            .not(),
+    ):
+        Err(
+            resource_errors.resource_error(
+                row.declaration.type_name.span,
+                resource_errors.ResourceGenericDeclaration,
+            ),
+        )
+    else:
+        Ok(void)
     underlying ?= scope.resolve_type(row.declaration.underlying)
+    _: Void ?= underlying.resource_free(scope.opaques, row.declaration.underlying.type_span())
     Ok({
         id = row.id,
         type_parameters = scope.declared_parameters(),
@@ -705,7 +729,15 @@ private pure func declared_variant_fields(
     for annotation in written:
         match scope.resolve_type(annotation):
             Ok(value):
-                fields = fields.append({ value_type = value, span = annotation.type_span() })
+                match value.resource_free(scope.opaques, annotation.type_span()):
+                    Err(error):
+                        failure = Some(error)
+                        break
+                    Ok(_):
+                        fields = fields.append({
+                            value_type = value,
+                            span = annotation.type_span(),
+                        })
             Err(error):
                 failure = Some(error)
                 break
@@ -734,10 +766,16 @@ private pure func declared_fields(
                         ),
                     )
                 None:
-                    match scope.resolve_type(field.type_name):
+                    resolved = scope
+                        .resolve_type(field.type_name)
+                        .and_then(pure func(value_type) -> Result[TypeRef, CheckError]:
+                            value_type
+                                .resource_free(scope.opaques, field.type_name.type_span())
+                                .map(pure func(_): value_type)
+                        )
+                    match resolved:
                         Ok(value_type):
                             span = field.type_name.type_span()
-
                             declaration.declared_fields(
                                 owner,
                                 scope,

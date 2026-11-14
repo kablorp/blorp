@@ -6,6 +6,7 @@ type supply them.
 import:
     bool: and
     int: Int methods
+    list: List methods
     option: is_none
     string: String methods
     test: TestSuite
@@ -13,7 +14,8 @@ import:
     ../../../../src/common/syntax/names: name_spelling, program_names
     ../../../../src/common/syntax/parse: ParsedModule, module_contents, module_names, parse_module
     ../../../../src/common/syntax/source: module_source, root_module_id
-    ../../../../src/common/syntax/syntax: Diagnostic
+    ../../../../src/common/syntax/syntax: Diagnostic, Visibility(Public, Private)
+    ../../../support/parse_function_inputs: free_functions
 
 
 private pure func parsed(source: String) -> Result[ParsedModule, Diagnostic]:
@@ -72,7 +74,7 @@ pure func test_nongeneric_opaque_declaration_has_no_parameters() -> Bool:
             False
         Ok(module):
             match module_contents(module).opaques:
-                [name]: name.type_parameters.is_empty()
+                [name]: and(name.type_parameters.is_empty(), name.resource_type == False)
                 _: False
 
 
@@ -96,9 +98,118 @@ pure func test_written_conversion_arguments_get_a_targeted_hint() -> Bool:
     )
 
 
+pure func test_resource_and_private_resource_keep_nominal_declarations() -> Bool:
+    match parsed("resource type Reader = Int\nprivate resource type Writer = Int\n"):
+        Err(_):
+            False
+        Ok(module):
+            match module_contents(module).opaques:
+                [reader, writer]:
+                    match (reader.visibility, writer.visibility):
+                        (Public, Private(_)): and(reader.resource_type, writer.resource_type)
+                        _: False
+                _:
+                    False
+
+
+pure func test_scoped_parameter_retains_the_qualifier_span() -> Bool:
+    prefix = "func invoke(body: "
+    match parsed("${prefix}scoped() -> Void) -> Void:\n    body()\n"):
+        Err(_):
+            False
+        Ok(module):
+            match free_functions(module_contents(module).functions).get(0):
+                Some(function):
+                    match function.parameters:
+                        [body]:
+                            match body.scoped_qualifier:
+                                Some(span):
+                                    and(
+                                        span.start == prefix.length(),
+                                        span.end == prefix.length() + 6,
+                                    )
+                                None:
+                                    False
+                        _:
+                            False
+                None:
+                    False
+
+
+pure func test_resource_keyword_requires_type() -> Bool:
+    rejects(
+        "resource ",
+        "Reader",
+        " = Int\n",
+        "expected 'type' after 'resource'",
+        "write resource type Name = Underlying",
+    )
+
+
+pure func test_scoped_requires_a_type_after_the_qualifier() -> Bool:
+    rejects(
+        "func invoke(body: scoped ",
+        ")",
+        " -> Void:\n    void\n",
+        "expected a parameter type",
+        "use an ASCII identifier starting with a letter; keywords and lone '_' are reserved",
+    )
+
+
+pure func test_scoped_is_not_a_parameter_name_or_general_type_qualifier() -> Bool:
+    and(
+        rejects(
+            "func invoke(",
+            "scoped",
+            ": Int) -> Void:\n    void\n",
+            "`scoped` is a reserved keyword and cannot be used as a name",
+            "choose another identifier such as `scoped_name`",
+        ),
+        rejects(
+            "func invoke() -> ",
+            "scoped",
+            " () -> Void:\n    void\n",
+            "`scoped` is a reserved keyword and cannot be used as a name",
+            "choose another identifier such as `scoped_name`",
+        ),
+    )
+
+
+pure func test_ordinary_parameter_has_no_scoped_occurrence() -> Bool:
+    match parsed("func invoke(body: () -> Void) -> Void:\n    body()\n"):
+        Err(_):
+            False
+        Ok(module):
+            match free_functions(module_contents(module).functions).get(0):
+                Some(function):
+                    match function.parameters:
+                        [body]: body.scoped_qualifier.is_none()
+                        _: False
+                None:
+                    False
+
+
 TESTS: TestSuite = {
     description = "Generic opaque type syntax",
     tests = [
+        (
+            "scoped is not a name or general type qualifier",
+            test_scoped_is_not_a_parameter_name_or_general_type_qualifier,
+        ),
+        (
+            "ordinary parameters have no scoped occurrence",
+            test_ordinary_parameter_has_no_scoped_occurrence,
+        ),
+        (
+            "resource declarations retain visibility and nominal identity",
+            test_resource_and_private_resource_keep_nominal_declarations,
+        ),
+        (
+            "scoped parameters retain the qualifier span",
+            test_scoped_parameter_retains_the_qualifier_span,
+        ),
+        ("resource requires the type keyword", test_resource_keyword_requires_type),
+        ("scoped requires a following type", test_scoped_requires_a_type_after_the_qualifier),
         (
             "an opaque declaration names its type parameters",
             test_opaque_declaration_names_its_parameters,
