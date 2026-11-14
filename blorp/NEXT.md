@@ -17,10 +17,9 @@ done.
     `read_bytes`/`write_bytes` in `io/fs/`. `LSP_PLAN.md`'s landing 6 needs
     only L1; its console labels ride a later rotation. Its landing 8 can
     now proceed.
-  - **Next:** L4b. L4a's label `string.byte_at_uint8` has landed, and the
-    pinned seed knows it (`blorp-seed-d62b0aacb2f1`, shared with the
-    process plan's L4). L4b points `String.byte_at` at it (`Option[UInt8]`),
-    updates the callers and deletes the old label. See the plan's L4.
+  - **Landed:** L4b. `String.byte_at` returns `Option[UInt8]` through
+    `string.byte_at_uint8`; the callers are updated and the old label is
+    deleted. See the plan's L4.
 - **Process API:** [`PROCESS_DECISIONS.md`](PROCESS_DECISIONS.md).
   - **Status:** L0 is implemented and independently reviewed; final combined
     landing gates and four-platform CI pass; L0 is published. Shared

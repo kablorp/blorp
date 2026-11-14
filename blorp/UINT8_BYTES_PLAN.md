@@ -475,7 +475,10 @@ keeps what a later landing needs. What it found:
    - **L4b.** `String.byte_at` points at the new label, every caller
      (about 49, the lexer included) is updated, and the old
      `string.byte_at` label is deleted. No further rotation is needed for the
-     deletion: L4b's library no longer names the old label.
+     deletion: L4b's library no longer names the old label. **Done,
+     2026-11-13:** `byte_at` returns `Option[UInt8]`; every caller, the
+     lexer included, uses `UInt8` byte constants; the old label, its
+     variants, runtime function and tests are deleted.
 
 ## Ceilings
 

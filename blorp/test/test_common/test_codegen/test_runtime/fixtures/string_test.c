@@ -423,40 +423,6 @@ static void test_equals_bytes(void) {
     assert_equality(first, sizeof first, second, sizeof second, 0);
 }
 
-static void assert_byte_at(const char *bytes, int64_t length, int64_t index,
-                           uint8_t status, int64_t expected) {
-    struct blorp_string *value = blorp_string_from_bytes(bytes, length);
-    const size_t allocations_before = allocation_count;
-    const size_t destructions_before = destruction_count;
-    const int64_t unchanged = -71;
-    int64_t result = unchanged;
-    assert(blorp_string_byte_at(value, index, &result) == status);
-    assert(result == (status ? expected : unchanged));
-    assert(atomic_load(&value->references) == 1);
-    assert(allocation_count == allocations_before);
-    assert(destruction_count == destructions_before);
-    assert_bytes(value, bytes, length);
-    blorp_string_release(value);
-    assert(destruction_count == destructions_before + 1);
-}
-
-static void test_byte_at_bounds(void) {
-    assert_byte_at("", 0, 0, 0, 0);
-    assert_byte_at("a", 1, -1, 0, 0);
-    assert_byte_at("a", 1, 1, 0, 0);
-    assert_byte_at("a", 1, INT64_MIN, 0, 0);
-    assert_byte_at("a", 1, INT64_MAX, 0, 0);
-    assert_byte_at("a", 1, INT64_C(4294967296), 0, 0);
-}
-
-static void test_byte_at_values(void) {
-    const char bytes[] = {(char)0xc3, (char)0xa9, '\0', 'z'};
-    assert_byte_at(bytes, sizeof bytes, 0, 1, 195);
-    assert_byte_at(bytes, sizeof bytes, 1, 1, 169);
-    assert_byte_at(bytes, sizeof bytes, 2, 1, 0);
-    assert_byte_at(bytes, sizeof bytes, 3, 1, 122);
-}
-
 static void assert_byte_at_uint8(const char *bytes, int64_t length, int64_t index,
                                  uint8_t status, uint8_t expected) {
     struct blorp_string *value = blorp_string_from_bytes(bytes, length);
@@ -629,10 +595,6 @@ int main(int argc, char **argv) {
         test_slice_bounds();
     } else if (strcmp(argv[1], "slice_ownership") == 0) {
         test_slice_ownership();
-    } else if (strcmp(argv[1], "byte_at_bounds") == 0) {
-        test_byte_at_bounds();
-    } else if (strcmp(argv[1], "byte_at_values") == 0) {
-        test_byte_at_values();
     } else if (strcmp(argv[1], "byte_at_uint8_bounds") == 0) {
         test_byte_at_uint8_bounds();
     } else if (strcmp(argv[1], "byte_at_uint8_values") == 0) {

@@ -2,6 +2,7 @@
 import:
     _base:
         Int,
+        UInt8,
         String,
         List,
         Void,
@@ -16,6 +17,7 @@ import:
     option: Option methods
     order: max, min
     string: String methods, from_codepoint
+    uint8: UInt8 methods
 
 
 opaque type JsonNumber = String
@@ -84,10 +86,42 @@ private union ScanStatus:
     Failed(ParseError)
 
 
--- EOF cannot collide with a counted UTF-8 byte, including embedded NUL.
-private END_OF_INPUT: Int = -1
-private QUOTE: Int = 34
-private BACKSLASH: Int = 92
+-- The ASCII bytes JSON syntax is made of (RFC 8259). A read past the end of
+-- the text is `None`, so no byte value stands for end of input.
+-- A name in a pattern is a capture, so these constants cannot be `match` arms;
+-- byte comparisons are `if` chains instead.
+private BACKSPACE: UInt8 = 8
+private TAB: UInt8 = 9
+private LINE_FEED: UInt8 = 10
+private FORM_FEED: UInt8 = 12
+private CARRIAGE_RETURN: UInt8 = 13
+private SPACE: UInt8 = 32
+private QUOTE: UInt8 = 34
+private PLUS: UInt8 = 43
+private COMMA: UInt8 = 44
+private MINUS: UInt8 = 45
+private DECIMAL_POINT: UInt8 = 46
+private SLASH: UInt8 = 47
+private DIGIT_ZERO: UInt8 = 48
+private DIGIT_ONE: UInt8 = 49
+private DIGIT_NINE: UInt8 = 57
+private COLON: UInt8 = 58
+private UPPER_A: UInt8 = 65
+private UPPER_E: UInt8 = 69
+private UPPER_F: UInt8 = 70
+private OPEN_BRACKET: UInt8 = 91
+private BACKSLASH: UInt8 = 92
+private CLOSE_BRACKET: UInt8 = 93
+private LOWER_A: UInt8 = 97
+private LOWER_B: UInt8 = 98
+private LOWER_E: UInt8 = 101
+private LOWER_F: UInt8 = 102
+private LOWER_N: UInt8 = 110
+private LOWER_R: UInt8 = 114
+private LOWER_T: UInt8 = 116
+private LOWER_U: UInt8 = 117
+private OPEN_BRACE: UInt8 = 123
+private CLOSE_BRACE: UInt8 = 125
 private HIGH_SURROGATE_FIRST: Int = 55296
 private HIGH_SURROGATE_LAST: Int = 56319
 private LOW_SURROGATE_FIRST: Int = 56320
@@ -127,10 +161,22 @@ implements Stringable for ParseError:
         value.kind.to_string()
 
 
-private pure func byte(text: String, offset: Int) -> Int:
-    text
-        .byte_at(offset)
-        .get_or(END_OF_INPUT)
+private pure func within(value: UInt8, first: UInt8, last: UInt8) -> Bool:
+    (value >= first).and(value <= last)
+
+
+-- Whether the byte at `offset` is `expected`; past the end it is not.
+private pure func byte_is(text: String, offset: Int, expected: UInt8) -> Bool:
+    match text.byte_at(offset):
+        Some(byte): byte == expected
+        None: False
+
+
+-- Whether the byte at `offset` lies in first..last; past the end it does not.
+private pure func byte_within(text: String, offset: Int, first: UInt8, last: UInt8) -> Bool:
+    match text.byte_at(offset):
+        Some(byte): byte.within(first, last)
+        None: False
 
 
 private pure func reading(status: ScanStatus) -> Bool:
@@ -152,53 +198,65 @@ private pure func whitespace(text: String, start: Int) -> Int:
     var position = start
     while position < text.length():
         -- RFC 8259 permits exactly space, tab, LF and CR.
-        match byte(text, position):
-            32 | 9 | 10 | 13: position = position + 1
-            _: break
+        if (
+            text
+                .byte_is(position, SPACE)
+                .or(text.byte_is(position, TAB))
+                .or(text.byte_is(position, LINE_FEED))
+                .or(text.byte_is(position, CARRIAGE_RETURN))
+        ):
+            position = position + 1
+        else:
+            break
     position
 
 
 -- ASCII decimal digits, per RFC 8259 section 6.
-private pure func digit(value: Int) -> Bool:
-    (value >= 48).and(value <= 57)
+private pure func digit_at(text: String, offset: Int) -> Bool:
+    text.byte_within(offset, DIGIT_ZERO, DIGIT_NINE)
 
 
 private pure func digits_end(text: String, start: Int) -> Int:
     var position = start
-    while digit(byte(text, position)):
+    while text.digit_at(position):
         position = position + 1
     position
 
 
 private pure func parse_number(text: String, start: Int) -> Result[Parsed[JsonNumber], ParseError]:
-    beginning = if byte(text, start) == 45:
+    beginning = if text.byte_is(start, MINUS):
         start + 1
     else:
         start
-    first = byte(text, beginning)
-    integral: Result[Int, ParseError] = if first == 48:
+    integral: Result[Int, ParseError] = if text.byte_is(beginning, DIGIT_ZERO):
         Ok(beginning + 1)
-    else if (first >= 49).and(first <= 57):
+    else if text.byte_within(beginning, DIGIT_ONE, DIGIT_NINE):
         Ok(digits_end(text, beginning + 1))
     else:
         Err({ offset = beginning, kind = ExpectedNumberDigit })
     integer_end ?= integral
-    fractional: Result[Int, ParseError] = if byte(text, integer_end) == 46:
-        if digit(byte(text, integer_end + 1)):
+    fractional: Result[Int, ParseError] = if text.byte_is(integer_end, DECIMAL_POINT):
+        if text.digit_at(integer_end + 1):
             Ok(digits_end(text, integer_end + 2))
         else:
             Err({ offset = integer_end + 1, kind = ExpectedFractionDigit })
     else:
         Ok(integer_end)
     fraction_end ?= fractional
-    exponent_byte = byte(text, fraction_end)
-    exponential: Result[Int, ParseError] = if (exponent_byte == 101).or(exponent_byte == 69):
-        sign = byte(text, fraction_end + 1)
-        exponent_start = if (sign == 43).or(sign == 45):
+    exponential: Result[Int, ParseError] = if (
+        text
+            .byte_is(fraction_end, LOWER_E)
+            .or(text.byte_is(fraction_end, UPPER_E))
+    ):
+        exponent_start = if (
+            text
+                .byte_is(fraction_end + 1, PLUS)
+                .or(text.byte_is(fraction_end + 1, MINUS))
+        ):
             fraction_end + 2
         else:
             fraction_end + 1
-        if digit(byte(text, exponent_start)):
+        if text.digit_at(exponent_start):
             Ok(digits_end(text, exponent_start + 1))
         else:
             Err({ offset = exponent_start, kind = ExpectedExponentDigit })
@@ -234,23 +292,27 @@ pure func as_int(value: JsonNumber) -> Option[Int]:
         .parse_int()
 
 
-private pure func hex_value(current: Int) -> Option[Int]:
+private pure func hex_value(text: String, offset: Int) -> Option[Int]:
     -- ASCII hex digit ranges, accepting both letter cases.
-    if digit(current):
-        Some(current - 48)
-    else if (current >= 65).and(current <= 70):
-        Some(current - 65 + 10)
-    else if (current >= 97).and(current <= 102):
-        Some(current - 97 + 10)
-    else:
-        None
+    match text.byte_at(offset):
+        None:
+            None
+        Some(byte):
+            if byte.within(DIGIT_ZERO, DIGIT_NINE):
+                Some((byte - DIGIT_ZERO).to_int())
+            else if byte.within(UPPER_A, UPPER_F):
+                Some((byte - UPPER_A).to_int() + 10)
+            else if byte.within(LOWER_A, LOWER_F):
+                Some((byte - LOWER_A).to_int() + 10)
+            else:
+                None
 
 
 private pure func hex_quad(text: String, start: Int) -> Result[Int, ParseError]:
     var point = 0
     var failure: Option[ParseError] = None
     for position in start..(start + 4):
-        match hex_value(byte(text, position)):
+        match text.hex_value(position):
             Some(value):
                 point = point * 16 + value
             None:
@@ -266,7 +328,11 @@ private pure func unicode_escape(text: String, slash: Int) -> Result[Parsed[Stri
     scalar: Result[Parsed[Int], ParseError] = if (first >= HIGH_SURROGATE_FIRST).and(
         first <= HIGH_SURROGATE_LAST,
     ):
-        if (byte(text, slash + 6) == BACKSLASH).and(byte(text, slash + 7) == 117):
+        if (
+            text
+                .byte_is(slash + 6, BACKSLASH)
+                .and(text.byte_is(slash + 7, LOWER_U))
+        ):
             match hex_quad(text, slash + 8):
                 Err(error):
                     Err(error)
@@ -298,29 +364,36 @@ private pure func unicode_escape(text: String, slash: Int) -> Result[Parsed[Stri
 
 private pure func parse_escape(text: String, slash: Int) -> Result[Parsed[String], ParseError]:
     -- RFC 8259 section 7's short escapes; all other spellings reject.
-    escape_byte = byte(text, slash + 1)
-    escaped: Option[String] = match escape_byte:
-        34: Some("\"")
-        92: Some("\\")
-        47: Some("/")
-        98: Some("\u{8}")
-        102: Some("\u{C}")
-        110: Some("\n")
-        114: Some("\r")
-        116: Some("\t")
-        _: None
-    match escaped:
-        Some(value):
-            Ok({ value = value, next = slash + 2 })
+    match text.byte_at(slash + 1):
         None:
-            if escape_byte == 117:
-                unicode_escape(text, slash)
+            Err({ offset = text.length(), kind = ExpectedEscape })
+        Some(escape):
+            escaped: Option[String] = if escape == QUOTE:
+                Some("\"")
+            else if escape == BACKSLASH:
+                Some("\\")
+            else if escape == SLASH:
+                Some("/")
+            else if escape == LOWER_B:
+                Some("\u{8}")
+            else if escape == LOWER_F:
+                Some("\u{C}")
+            else if escape == LOWER_N:
+                Some("\n")
+            else if escape == LOWER_R:
+                Some("\r")
+            else if escape == LOWER_T:
+                Some("\t")
             else:
-                error_offset = if escape_byte == END_OF_INPUT:
-                    text.length()
-                else:
-                    slash
-                Err({ offset = error_offset, kind = ExpectedEscape })
+                None
+            match escaped:
+                Some(value):
+                    Ok({ value = value, next = slash + 2 })
+                None:
+                    if escape == LOWER_U:
+                        unicode_escape(text, slash)
+                    else:
+                        Err({ offset = slash, kind = ExpectedEscape })
 
 
 private pure func parse_string(text: String, start: Int) -> Result[Parsed[String], ParseError]:
@@ -328,25 +401,29 @@ private pure func parse_string(text: String, start: Int) -> Result[Parsed[String
     var literal_start = position
     var decoded = ""
     var status: ScanStatus = Reading
-    while reading(status).and(position < text.length()):
-        current = byte(text, position)
-        if current == QUOTE:
-            decoded = decoded + segment(text, literal_start, position)
-            position = position + 1
-            status = Complete
-        else if current == BACKSLASH:
-            decoded = decoded + segment(text, literal_start, position)
-            match parse_escape(text, position):
-                Err(error):
-                    status = Failed(error)
-                Ok(escaped):
-                    decoded = decoded + escaped.value
-                    position = escaped.next
-                    literal_start = position
-        else if current < 32:
-            status = Failed({ offset = position, kind = UnescapedControl })
-        else:
-            position = position + 1
+    while reading(status):
+        -- The end of the text ends the loop with the string still Reading.
+        match text.byte_at(position):
+            None:
+                break
+            Some(current):
+                if current == QUOTE:
+                    decoded = decoded + segment(text, literal_start, position)
+                    position = position + 1
+                    status = Complete
+                else if current == BACKSLASH:
+                    decoded = decoded + segment(text, literal_start, position)
+                    match parse_escape(text, position):
+                        Err(error):
+                            status = Failed(error)
+                        Ok(escaped):
+                            decoded = decoded + escaped.value
+                            position = escaped.next
+                            literal_start = position
+                else if current < SPACE:
+                    status = Failed({ offset = position, kind = UnescapedControl })
+                else:
+                    position = position + 1
     match status:
         Failed(error): Err(error)
         Reading: Err({ offset = text.length(), kind = UnclosedString })
@@ -362,7 +439,7 @@ private pure func parse_literal(
 ) -> Result[Parsed[Json], ParseError]:
     var offset = 0
     while offset < spelling.length():
-        if byte(text, start + offset) != byte(spelling, offset):
+        if text.byte_at(start + offset) != spelling.byte_at(offset):
             break
         offset = offset + 1
     if offset == spelling.length():
@@ -380,7 +457,7 @@ private pure func parse_array(
     var position = whitespace(text, start + 1)
     var values: List[Json] = []
     var status: ScanStatus = Reading
-    if byte(text, position) == 93:
+    if text.byte_is(position, CLOSE_BRACKET):
         position = position + 1
         status = Complete
     while reading(status).and(position < text.length()):
@@ -390,14 +467,13 @@ private pure func parse_array(
             Ok(parsed):
                 values = values.append(parsed.value)
                 position = whitespace(text, parsed.next)
-                match byte(text, position):
-                    93:
-                        position = position + 1
-                        status = Complete
-                    44:
-                        position = whitespace(text, position + 1)
-                    _:
-                        status = Failed({ offset = position, kind = ExpectedArrayDelimiter })
+                if text.byte_is(position, CLOSE_BRACKET):
+                    position = position + 1
+                    status = Complete
+                else if text.byte_is(position, COMMA):
+                    position = whitespace(text, position + 1)
+                else:
+                    status = Failed({ offset = position, kind = ExpectedArrayDelimiter })
     match status:
         Failed(error): Err(error)
         Reading: Err({ offset = position, kind = ExpectedValue })
@@ -413,11 +489,15 @@ private pure func parse_object(
     var position = whitespace(text, start + 1)
     var fields: Dict[String, Json] = empty()
     var status: ScanStatus = Reading
-    if byte(text, position) == 125:
+    if text.byte_is(position, CLOSE_BRACE):
         position = position + 1
         status = Complete
     while reading(status).and(position < text.length()):
-        if byte(text, position) != QUOTE:
+        if (
+            text
+                .byte_is(position, QUOTE)
+                .not()
+        ):
             status = Failed({ offset = position, kind = ExpectedObjectName })
         else:
             match parse_string(text, position):
@@ -428,7 +508,11 @@ private pure func parse_object(
                         status = Failed({ offset = position, kind = DuplicateName })
                     else:
                         position = whitespace(text, name.next)
-                        if byte(text, position) != 58:
+                        if (
+                            text
+                                .byte_is(position, COLON)
+                                .not()
+                        ):
                             status = Failed({ offset = position, kind = ExpectedColon })
                         else:
                             match parse_value(text, position + 1, depth + 1):
@@ -437,17 +521,16 @@ private pure func parse_object(
                                 Ok(parsed):
                                     fields = fields.set(name.value, parsed.value)
                                     position = whitespace(text, parsed.next)
-                                    match byte(text, position):
-                                        125:
-                                            position = position + 1
-                                            status = Complete
-                                        44:
-                                            position = whitespace(text, position + 1)
-                                        _:
-                                            status = Failed({
-                                                offset = position,
-                                                kind = ExpectedObjectDelimiter,
-                                            })
+                                    if text.byte_is(position, CLOSE_BRACE):
+                                        position = position + 1
+                                        status = Complete
+                                    else if text.byte_is(position, COMMA):
+                                        position = whitespace(text, position + 1)
+                                    else:
+                                        status = Failed({
+                                            offset = position,
+                                            kind = ExpectedObjectDelimiter,
+                                        })
     match status:
         Failed(error): Err(error)
         Reading: Err({ offset = position, kind = ExpectedObjectName })
@@ -462,35 +545,36 @@ private pure func parse_value(
     depth: Int,
 ) -> Result[Parsed[Json], ParseError]:
     position = whitespace(text, start)
-    current = byte(text, position)
-    match current:
-        34:
-            match parse_string(text, position):
-                Err(error): Err(error)
-                Ok(parsed): Ok({ value = Text(parsed.value), next = parsed.next })
-        91:
-            if depth >= MAX_NESTING_DEPTH:
-                Err({ offset = position, kind = TooDeep })
-            else:
-                parse_array(text, position, depth)
-        123:
-            if depth >= MAX_NESTING_DEPTH:
-                Err({ offset = position, kind = TooDeep })
-            else:
-                parse_object(text, position, depth)
-        110:
-            parse_literal(text, position, "null", Null, ExpectedNull)
-        116:
-            parse_literal(text, position, "true", Boolean(True), ExpectedTrue)
-        102:
-            parse_literal(text, position, "false", Boolean(False), ExpectedFalse)
-        _:
-            if (current == 45).or(digit(current)):
-                match parse_number(text, position):
-                    Err(error): Err(error)
-                    Ok(parsed): Ok({ value = Number(parsed.value), next = parsed.next })
-            else:
-                Err({ offset = position, kind = ExpectedValue })
+    if text.byte_is(position, QUOTE):
+        match parse_string(text, position):
+            Err(error): Err(error)
+            Ok(parsed): Ok({ value = Text(parsed.value), next = parsed.next })
+    else if text.byte_is(position, OPEN_BRACKET):
+        if depth >= MAX_NESTING_DEPTH:
+            Err({ offset = position, kind = TooDeep })
+        else:
+            parse_array(text, position, depth)
+    else if text.byte_is(position, OPEN_BRACE):
+        if depth >= MAX_NESTING_DEPTH:
+            Err({ offset = position, kind = TooDeep })
+        else:
+            parse_object(text, position, depth)
+    else if text.byte_is(position, LOWER_N):
+        parse_literal(text, position, "null", Null, ExpectedNull)
+    else if text.byte_is(position, LOWER_T):
+        parse_literal(text, position, "true", Boolean(True), ExpectedTrue)
+    else if text.byte_is(position, LOWER_F):
+        parse_literal(text, position, "false", Boolean(False), ExpectedFalse)
+    else if (
+        text
+            .byte_is(position, MINUS)
+            .or(text.digit_at(position))
+    ):
+        match parse_number(text, position):
+            Err(error): Err(error)
+            Ok(parsed): Ok({ value = Number(parsed.value), next = parsed.next })
+    else:
+        Err({ offset = position, kind = ExpectedValue })
 
 
 -- Offsets count UTF-8 bytes; EOF is the input byte length. Duplicate decoded
@@ -509,43 +593,47 @@ pure func parse(text: String) -> Result[Json, ParseError]:
 private pure func append_quoted(output: String, text: String) -> String:
     var rendered = output + "\""
     var literal_start = 0
-    for position in 0..text.length():
-        current = byte(text, position)
-        escaped: Option[String] = match current:
-            34:
-                Some("\\\"")
-            92:
-                Some("\\\\")
-            8:
-                Some("\\b")
-            12:
-                Some("\\f")
-            10:
-                Some("\\n")
-            13:
-                Some("\\r")
-            9:
-                Some("\\t")
-            _:
-                if current < 32:
+    var position = 0
+    while True:
+        match text.byte_at(position):
+            None:
+                break
+            Some(current):
+                escaped: Option[String] = if current == QUOTE:
+                    Some("\\\"")
+                else if current == BACKSLASH:
+                    Some("\\\\")
+                else if current == BACKSPACE:
+                    Some("\\b")
+                else if current == FORM_FEED:
+                    Some("\\f")
+                else if current == LINE_FEED:
+                    Some("\\n")
+                else if current == CARRIAGE_RETURN:
+                    Some("\\r")
+                else if current == TAB:
+                    Some("\\t")
+                else if current < SPACE:
                     -- A JSON control escape has exactly four hex digits.
+                    code = current.to_int()
                     hex = "0123456789abcdef"
                     Some(
                         (
                             "\\u00"
-                            + segment(hex, current / 16, current / 16 + 1)
-                            + segment(hex, current % 16, current % 16 + 1)
+                            + segment(hex, code / 16, code / 16 + 1)
+                            + segment(hex, code % 16, code % 16 + 1)
                         ),
                     )
                 else:
                     None
-        match escaped:
-            None:
-                void
-            Some(spelling):
-                rendered = rendered + segment(text, literal_start, position)
-                rendered = rendered + spelling
-                literal_start = position + 1
+                match escaped:
+                    None:
+                        void
+                    Some(spelling):
+                        rendered = rendered + segment(text, literal_start, position)
+                        rendered = rendered + spelling
+                        literal_start = position + 1
+        position = position + 1
     rendered + segment(text, literal_start, text.length()) + "\""
 
 

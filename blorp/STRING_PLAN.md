@@ -124,7 +124,7 @@ S1 and S2 are Keith's direction. Keith approved S3 to S9 as recommended on
   | `codepoint_at(text, index) -> Option[Int]` | code point index, scalar value | O(1) if ASCII, else O(n) |
   | `codepoints(text) -> List[Int]` | every scalar value, in order | O(n) |
   | `is_ascii(text) -> Bool` | | O(1) |
-  | `byte_at(text, index) -> Option[Int]` | bytes (unchanged) | O(1) |
+  | `byte_at(text, index) -> Option[UInt8]` | bytes (unchanged) | O(1) |
   | `byte_slice(text, start, end) -> Option[String]` | byte offsets (today's `slice`) | O(1) plus the copy |
 
   - **`slice` clamps and cannot fail.** Every code-point index is a character

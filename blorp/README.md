@@ -420,7 +420,7 @@ The `string` module works on byte offsets and never cuts a scalar:
   boundaries: `slice("éx", 0, 2)` is `Some("é")`, `slice("éx", 1, 2)` is `None`.
 - `starts_with(value, prefix) -> Bool` compares bytes; an empty prefix is
   `True`.
-- `byte_at(value, index) -> Option[Int]` reads one byte (`byte_at("é", 1)` is
+- `byte_at(value, index) -> Option[UInt8]` reads one byte (`byte_at("é", 1)` is
   `Some(169)`); an index out of range is `None`.
 - `from_codepoint(value) -> Option[String]` encodes one scalar, NUL included;
   negative values, surrogates and values above U+10FFFF are `None`.
