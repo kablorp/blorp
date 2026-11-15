@@ -178,7 +178,7 @@ waits. `flush` covers output that no read follows.
 
 **Rejected:** `print(text, ending = "")` (named optional arguments),
 dropping `print`'s newline (breaks every call), and `read_bytes(n)` and
-`write_bytes(data)`, which clash with `io/fs`'s.
+`write_bytes(data)`, which clash with `io/files`'s.
 
 ### The server
 
@@ -424,7 +424,7 @@ func write(data: Bytes) -> Void
 func write_error(data: Bytes) -> Void
 -- Sends buffered standard output now. Every read does this first.
 func flush() -> Void
--- Bytes, unlike `io/fs`'s String line functions: those before the next LF,
+-- Bytes, unlike `io/files`'s String line functions: those before the next LF,
 -- without it or a CR just before it (a lone CR stays). A last line with no
 -- LF comes as it is; None once input has ended.
 func read_line() -> Result[Option[Bytes], ReadLineError]
@@ -727,7 +727,7 @@ Each landing starts with a failing test.
 | 4 | Existing suites, unchanged. |
 | 5 | One case per `Referent` case, checking the use's span and, through `declaration_span`, its declaration's. Mutation proof: stop recording one case, and only its test fails. |
 | 6 | Direct C tests of the natives, under `test/test_common/test_codegen/test_runtime/`. |
-| 8 | e2e programs through `capture`: LF and CRLF, a last line without LF, header and body in one chunk, a short `read_exact`, a zero count at end of input, bytes that are not UTF-8 through each read, `write` output before a read, `print` and `write` output in order, a write after the reader closes, and `write` imported beside `io/fs/write`'s `write_text`. |
+| 8 | e2e programs through `capture`: LF and CRLF, a last line without LF, header and body in one chunk, a short `read_exact`, a zero count at end of input, bytes that are not UTF-8 through each read, `write` output before a read, `print` and `write` output in order, a write after the reader closes, and `write` imported beside `io/files/write`'s `write_text`. |
 | 9 | `test/test_lsp/`: framing; a body that is not UTF-8; positions for `é`, an astral emoji and `\r`; token splitting; a broken file's lexer tokens; lifecycle errors; staleness after a new import, a late open, a shared file's edit and a close; each request through `receive`. An e2e session in `cli.brp` runs `initialize` through `exit` and checks replies, a diagnostic and the status. |
 | 10 | A manual checklist in the plugin's README. |
 | 11 | `test/test_lsp/`: edit windows, with positions before, inside and after one, and two distant edits. |

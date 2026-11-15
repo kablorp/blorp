@@ -127,3 +127,58 @@ func write_bytes(path: Path, data: Bytes) -> Result[Void, WriteError]:
         .to_string()
         .native_write_bytes(data.to_list())
         .map_err(decode_write_error)
+
+
+-- A synchronous loan of an atomic replacement transaction. The native handle
+-- is private; only with_atomic_writer can finish or discard the transaction.
+resource type Writer = Int
+
+
+private func native_writer_begin(path: String) -> Result[Int, Int]:
+    builtin("fs.writer_begin")
+
+
+private func native_writer_write_all(handle: Int, data: List[UInt8]) -> Result[Void, Int]:
+    builtin("fs.writer_write_all")
+
+
+private func native_writer_finish(handle: Int) -> Result[Void, Int]:
+    builtin("fs.writer_finish")
+
+
+private func native_writer_discard(handle: Int) -> Result[Void, Int]:
+    builtin("fs.writer_discard")
+
+
+-- Opens an atomic replacement under write_text's path, mode and error rules.
+-- Body Ok publishes only if every write, file flush and close succeeded.
+-- A directory flush error can follow rename, after output was published.
+-- Body Err discards all output and wins over cleanup errors. A caught write failure is
+-- sticky: even a subsequent body Ok cannot publish. No application close is
+-- needed or available; cleanup runs once after the synchronous body returns.
+func with_atomic_writer[T, E](
+    path: Path,
+    body: scoped (Writer) -> Result[T, E],
+    on_error: pure (WriteError) -> E,
+) -> Result[T, E]:
+    handle ?= path
+        .to_string()
+        .native_writer_begin()
+        .map_err(decode_write_error)
+        .map_err(on_error)
+    outcome = body(into_opaque Writer(handle))
+    match outcome:
+        Ok(value):
+            match native_writer_finish(handle):
+                Ok(_): Ok(value)
+                Err(code): Err(on_error(decode_write_error(code)))
+        Err(error):
+            discarded = native_writer_discard(handle)
+            Err(error)
+
+
+-- Writes every byte before returning. Empty data succeeds on a healthy
+-- writer. The first write failure is remembered through the scope's end,
+-- including later empty writes, so catching it cannot publish partial output.
+func write_all(writer: Writer, data: Bytes) -> Result[Void, WriteError]:
+    native_writer_write_all(from_opaque Writer(writer), data.to_list()).map_err(decode_write_error)

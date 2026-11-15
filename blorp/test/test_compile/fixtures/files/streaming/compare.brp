@@ -1,0 +1,116 @@
+-- Logical windows differ deliberately; native tests own forced short reads.
+import:
+    bytes: Bytes, from_list, slice, length, equals
+    int: Int methods
+    io/files/read: Reader, ReadError, read_chunk, with_reader
+    list: get
+    path: Path, to_path
+    result: Result methods
+
+
+private LEFT_WINDOW: Int = 17
+
+private RIGHT_WINDOW: Int = 31
+
+
+-- Offsets retain unread bytes without copying the remaining chunk per window.
+record Window {
+    data: Bytes,
+    position: Int,
+    limit: Int,
+}
+
+
+pure func window_limit(position: Int, width: Int, size: Int) -> Int:
+    if position + width < size:
+        position + width
+    else:
+        size
+
+
+func window(reader: Reader, current: Window, width: Int) -> Result[Window, ReadError]:
+    if current.position == length(current.data):
+        match read_chunk(reader):
+            Err(error):
+                Err(error)
+            Ok(None):
+                Ok({ data = from_list([]), position = 0, limit = 0 })
+            Ok(Some(data)):
+                Ok({ data = data, position = 0, limit = window_limit(0, width, length(data)) })
+    else:
+        Ok({ current | limit = window_limit(current.position, width, length(current.data)) })
+
+
+func compare_readers(left: Reader, right: Reader) -> Result[Bool, ReadError]:
+    var left_window: Window = { data = from_list([]), position = 0, limit = 0 }
+    var right_window: Window = { data = from_list([]), position = 0, limit = 0 }
+    var outcome: Result[Bool, ReadError] = Ok(True)
+    while True:
+        if left_window.position == left_window.limit:
+            match window(left, left_window, LEFT_WINDOW):
+                Err(error):
+                    outcome = Err(error)
+                    break
+                Ok(next):
+                    left_window = next
+        if right_window.position == right_window.limit:
+            match window(right, right_window, RIGHT_WINDOW):
+                Err(error):
+                    outcome = Err(error)
+                    break
+                Ok(next):
+                    right_window = next
+        if left_window.position == left_window.limit:
+            outcome = Ok(right_window.position == right_window.limit)
+            break
+        if right_window.position == right_window.limit:
+            outcome = Ok(False)
+            break
+        left_remaining = left_window.limit - left_window.position
+        right_remaining = right_window.limit - right_window.position
+        count = if left_remaining < right_remaining:
+            left_remaining
+        else:
+            right_remaining
+        if (
+            equals(
+                slice(left_window.data, left_window.position, left_window.position + count),
+                slice(right_window.data, right_window.position, right_window.position + count),
+            )
+            == False
+        ):
+            outcome = Ok(False)
+            break
+        left_window = { left_window | position = left_window.position + count }
+        right_window = { right_window | position = right_window.position + count }
+    outcome
+
+
+func compare_files(left: Path, right: Path) -> Result[Bool, ReadError]:
+    with_reader(
+        left,
+        func(left_reader: Reader) -> Result[Bool, ReadError]: with_reader(
+            right,
+            func(right_reader: Reader) -> Result[Bool, ReadError]: compare_readers(
+                left_reader,
+                right_reader,
+            ),
+            pure func(error: ReadError) -> ReadError: error,
+        ),
+        pure func(error: ReadError) -> ReadError: error,
+    )
+
+
+func main(arguments: List[String]) -> Int:
+    match (get(arguments, 1), get(arguments, 2)):
+        (Some(left), Some(right)):
+            match (to_path(left), to_path(right)):
+                (Ok(first), Ok(second)):
+                    match compare_files(first, second):
+                        Ok(True): 0
+                        Ok(False): 3
+                        Err(_): 1
+                _:
+                    2
+        _:
+            2

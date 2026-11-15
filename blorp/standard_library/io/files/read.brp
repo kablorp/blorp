@@ -1,7 +1,16 @@
 -- Reading a file. A native reports a failure as an Int code, which the decoder
 -- below turns into the one error union this module's operations can produce.
 import:
-    _base: Int, UInt8, String, Void, List, Bool(True, False), Option, Result(Ok, Err), Stringable
+    _base:
+        Int,
+        UInt8,
+        String,
+        Void,
+        List,
+        Bool(True, False),
+        Option(Some, None),
+        Result(Ok, Err),
+        Stringable,
     bool: Bool methods
     bytes: Bytes, from_list
     int: Int methods
@@ -78,9 +87,9 @@ private func native_read_bytes(path: String) -> Result[List[UInt8], Int]:
     builtin("fs.read_bytes")
 
 
--- Private: no code outside this file can name or hold one, so no caller can
--- close one twice, read one after it is closed, or share its file offset.
-private opaque type Descriptor = Int
+-- A synchronous loan. Only this module constructs or projects a Reader;
+-- callers can read it during with_reader and cannot retain it afterward.
+resource type Reader = Int
 
 
 private func native_open_read(path: String) -> Result[Int, Int]:
@@ -119,11 +128,11 @@ func read_bytes(path: Path) -> Result[Bytes, ReadError]:
 
 -- The only place a descriptor is opened and closed. Once the open succeeds,
 -- nothing can leave before the close: Blorp has no return or exception, and
--- `use` cannot run this function's `?=`. A failed close is ignored (D38): the
+-- `body` cannot run this function's `?=`. A failed close is ignored (D38): the
 -- descriptor was only read, so nothing is lost.
-private func with_descriptor[T, E](
+func with_reader[T, E](
     path: Path,
-    use: (Descriptor) -> Result[T, E],
+    body: scoped (Reader) -> Result[T, E],
     on_error: pure (ReadError) -> E,
 ) -> Result[T, E]:
     opened ?= path
@@ -131,10 +140,24 @@ private func with_descriptor[T, E](
         .native_open_read()
         .map_err(decode_read_error)
         .map_err(on_error)
-    outcome = use(into_opaque Descriptor(opened))
+    outcome = body(into_opaque Reader(opened))
     -- Bound because only a Void call can stand alone as a statement.
     closed = native_close(opened)
     outcome
+
+
+private func native_read_chunk(descriptor: Int) -> Result[List[UInt8], Int]:
+    builtin("fs.read_chunk")
+
+
+-- None means EOF. Some contains a nonempty byte chunk of at most 64 KiB;
+-- chunks can be shorter and have no character or line boundaries.
+func read_chunk(reader: Reader) -> Result[Option[Bytes], ReadError]:
+    data ?= native_read_chunk(from_opaque Reader(reader)).map_err(decode_read_error)
+    if data.is_empty():
+        Ok(None)
+    else:
+        Ok(Some(from_list(data)))
 
 
 -- How many of a batch's elements are complete lines (D37): with two or more,
@@ -147,17 +170,17 @@ private pure func complete_lines(batch_length: Int) -> Int:
         batch_length
 
 
-private func fold_descriptor[T, E](
-    descriptor: Descriptor,
+private func fold_reader[T, E](
+    reader: Reader,
     initial: T,
-    step: (T, String) -> Result[T, E],
+    step: scoped (T, String) -> Result[T, E],
     on_error: pure (ReadError) -> E,
 ) -> Result[T, E]:
     var folded: Result[T, E] = Ok(initial)
     var carried = ""
     var reading: Bool = True
     while reading:
-        match native_next_lines(from_opaque Descriptor(descriptor), carried):
+        match native_next_lines(from_opaque Reader(reader), carried):
             Ok(batch):
                 batch_length = batch.length()
                 -- At end of file the last element is the last line, and the
@@ -202,14 +225,10 @@ private func fold_descriptor[T, E](
 func fold_lines[T, E](
     path: Path,
     initial: T,
-    step: (T, String) -> Result[T, E],
+    step: scoped (T, String) -> Result[T, E],
     on_error: pure (ReadError) -> E,
 ) -> Result[T, E]:
-    path.with_descriptor(
-        func(descriptor: Descriptor) -> Result[T, E]: descriptor.fold_descriptor(
-            initial,
-            step,
-            on_error,
-        ),
+    path.with_reader(
+        func(reader: Reader) -> Result[T, E]: reader.fold_reader(initial, step, on_error),
         on_error,
     )

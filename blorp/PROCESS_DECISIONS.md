@@ -505,7 +505,7 @@ What `blorp_process_run` shares with `capture`, and what is new:
   variant names, so inside the one module `io/process` the result could not
   be `Exited` and `Signaled`, nor the errors `ContainsNul` and
   `LaunchFailed`. The `Path` landing answered the same clash with a module
-  per operation (`io/fs/read`, `io/fs/write`; the library README's "The file
+  per operation (`io/files/read`, `io/files/write`; the library README's "The file
   modules"), and `io/process/run` cannot sit beside the file
   `io/process.brp`, so the module is named for what the child shares.
   `io/process` and its nine importers do not change, and `io/process`'s
@@ -513,7 +513,7 @@ What `blorp_process_run` shares with `capture`, and what is new:
   there to `io/terminal`. The alternative was splitting `io/process` into a
   folder (`capture`, `run`, and homes for `find_program` and
   `SystemCallError`): it puts `run` where Python, Go and Rust users look and
-  follows `io/fs/`, at the cost of moving nine importers and giving
+  follows `io/files/`, at the cost of moving nine importers and giving
   `SystemCallError` a public module of its own.
 
   What `capture` keeps private and `run` also needs (the code constants and
@@ -784,7 +784,7 @@ with the unmodified production fragments):
   `Signaled(15)`, and each `RunError` variant (a missing program, a plain
   file, a script without `#!`, a missing directory, a NUL, a bad variable
   name), with every `Stringable` text. The five phrases `RunError` shares
-  with `CaptureError` are written in both modules, as each `io/fs/` union
+  with `CaptureError` are written in both modules, as each `io/files/` union
   writes its own; the suite asserts both, so they cannot drift apart
   unnoticed.
 - **Native probes:**

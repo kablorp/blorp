@@ -14,7 +14,7 @@ done.
     deferred integer literals and the byte natives (`0bb93894d`), have
     landed. L2 pins the seed built from L1 (`blorp-seed-0bb93894dcf2`).
   - **Landed:** L3, the library: `_base`, `uint8.brp`, `bytes.brp`, and
-    `read_bytes`/`write_bytes` in `io/fs/`. `LSP_PLAN.md`'s landing 6 needs
+    `read_bytes`/`write_bytes` in `io/files/`. `LSP_PLAN.md`'s landing 6 needs
     only L1; its console labels ride a later rotation. Its landing 8 can
     now proceed.
   - **Landed:** L4b. `String.byte_at` returns `Option[UInt8]` through
@@ -65,12 +65,17 @@ done.
     resources, has a consumer: bounded-memory binary copy and streaming writes.
     S1 implements resource/scoped checking using Check-local completed-body
     admission. Source review, full tests, fixpoint, bootstrap and matched cost
-    qualification pass; no public streaming file handle is exposed yet.
+    qualification pass; S3 below exposes the public streaming scopes.
   - **S2:** native chunk reads, shared atomic writer lifecycle and library-only
     raw-handle builtins pass source review, full tests, fixpoint and matched
     cost qualification, with no cost exception.
-  - **Next:** publish/pin the S2 seed, then the public streaming scopes and
-    normal-main examples in S3.
+  - **S3:** qualified S2 seed published and pinned; public Reader/Writer
+    scopes and six normal-main byte-streaming families pass focused and full
+    ordinary and self-built tests. The user chose `io/files`; that rename
+    passes fresh build, full proof, bootstrap and matched cost checks.
+    Own-source costs are +0.56% allocations/+0.65% instructions, within limits.
+  - **Next:** the approved typed native-error protocol cleanup; S4 text
+    decoding/adapters follow as a separate reviewed increment.
   - **Built:** D40, a pure `String.lines()` with `fold_lines`'s line rules, so
     `read_text(path).lines()` collects lines.
   - **Later:** the plan's "Later" list.
@@ -125,7 +130,7 @@ None of these is planned yet. Each wants its own short design or brief.
     hold the checked type: measured at +120 to +170 production lines and not
     done. Revisit with the LSP plan's name identities.
   - **Embedded-library size.** A trivial compile costs about 9% more
-    instructions since `Path` and the `io/fs/` modules, because it follows
+    instructions since `Path` and the `io/files/` modules, because it follows
     the size of the embedded library text. `Path` stays an explicit import
     for the same reason (about +31,000 allocations and +26% instructions to
     compile an empty program as a prelude name); revisit once the checker

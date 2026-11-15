@@ -383,7 +383,7 @@ It borrows its input, writes counted bytes to stderr once, and attempts LF only
 following a full transfer; short writes (including EINTR) stop without retry.
 The host attempts LF after short writes as well. Neither API reports delivery.
 
-There is no shared file error type. Each `io/fs/` module owns the error union of
+There is no shared file error type. Each `io/files/` module owns the error union of
 its operations, and the error carries no path: the caller knows the path and
 words it as `"${path}: ${error}"`. `io/_codes.brp` holds the native error codes
 that each module's decoder names. `io/_codes` is internal by convention only:
@@ -391,7 +391,7 @@ Blorp has neither re-exports nor module-private imports, so its constants are
 public by necessity, but they are not part of the library's API. Programs should
 not import it, and it may change without notice. (`_base`, the foundation
 module, is the other underscore module, and any module may import it.) The
-decoders in the `io/fs/`, `io/environment`, `io/process` and `io/terminal` modules
+decoders in the `io/files/`, `io/environment`, `io/process` and `io/terminal` modules
 are public for the same reason: tests bind them to literal codes, and they are not API.
 `io/_launch`, which `io/process` and `io/terminal` share, is internal in the same way.
 
@@ -468,7 +468,7 @@ result, and parsing and rendering cost time linear in them.
 
 ### The file modules
 
-The filesystem library is one module per operation under `io/fs/`; import each
+The filesystem library is one module per operation under `io/files/`; import each
 explicitly. Every operation takes a `Path` and returns a union that holds only
 the failures that operation can cause (races count: another process can swap a
 directory in during the call). A union is the error: there is no separate kind
@@ -483,10 +483,10 @@ fits beside `print` and the other effects, and
 this way. The text of a variant is fixed (`"no such file"`, `"permission
 denied"`), never `strerror` text.
 
-| Module (`io/fs/…`) | Operations | Error | Variants |
+| Module (`io/files/…`) | Operations | Error | Variants |
 | --- | --- | --- | --- |
-| `read` | `read_text`, `read_bytes`, `fold_lines` | `ReadError` | `NotFound` `PermissionDenied` `NotADirectory` `IsADirectory` `FileTooLarge` `InvalidUtf8` `OtherOs` |
-| `write` | `write_text`, `write_bytes` | `WriteError` | `NotFound` `PermissionDenied` `AlreadyExists` `NotADirectory` `IsADirectory` `DirectoryNotEmpty` `NotARegularFile` `ReadOnlyFilesystem` `NoSpace` `FileTooLarge` `OtherOs` |
+| `read` | `read_text`, `read_bytes`, `fold_lines`, `with_reader`, `read_chunk` | `ReadError` | `NotFound` `PermissionDenied` `NotADirectory` `IsADirectory` `FileTooLarge` `InvalidUtf8` `OtherOs` |
+| `write` | `write_text`, `write_bytes`, `with_atomic_writer`, `write_all` | `WriteError` | `NotFound` `PermissionDenied` `AlreadyExists` `NotADirectory` `IsADirectory` `DirectoryNotEmpty` `NotARegularFile` `ReadOnlyFilesystem` `NoSpace` `FileTooLarge` `OtherOs` |
 | `entry` | `entry_kind`, `Entry`, `EntryKind` | `EntryError` | `PermissionDenied` `OtherOs` |
 | `list` | `list_directory` | `ListError` | `NotFound` `PermissionDenied` `NotADirectory` `InvalidUtf8` `OtherOs` |
 | `create_directory` | `create_directory`, `create_directories` | `CreateDirectoryError` | `NotFound` `PermissionDenied` `AlreadyExists` `NotADirectory` `ReadOnlyFilesystem` `NoSpace` `OtherOs` |
@@ -501,7 +501,7 @@ a `NotFound` can be imported together:
 
 ```blorp
 import:
-    io/fs/read: ReadError, read_text
+    io/files/read: ReadError, read_text
     path: Path
 
 -- A missing file is no failure here; any other result stays.
@@ -611,10 +611,36 @@ A caller that mixes operations writes its own error union and wraps with a
   removal. A failed removal does not name the directory; the body was given
   its path. A signal, `abort()` or a stack overflow can still leave the
   directory behind.
+- `with_reader(path, body, on_error)` opens a file under `read_bytes`'s rules,
+  lends a `Reader` synchronously to `body: scoped (Reader) -> Result[T, E]`,
+  closes it once and returns the body's result. The pure `on_error` converts
+  an open `ReadError` into `E`. Read-only close failures are ignored. No public
+  constructor, projection or close operation exists. Reader values cannot
+  escape through results, storage, generic arguments or retained callbacks;
+  owned data returned by the body remains valid after close.
+- `read_chunk(reader)` returns `Result[Option[Bytes], ReadError]`: `None` only
+  at EOF, otherwise a nonempty chunk of at most 64 KiB, possibly shorter.
+  Chunks have no character or line boundaries, and invalid UTF-8 is ordinary
+  byte data. EINTR retries; each short nonempty read is returned immediately.
+- `with_atomic_writer(path, body, on_error)` lends a `Writer` synchronously to
+  `body: scoped (Writer) -> Result[T, E]`, with the same path resolution,
+  symlink, mode, ownership, atomic replacement and durability limits as
+  `write_bytes`. The pure `on_error` converts begin or finish `WriteError`
+  into `E`. Body `Err` discards output and preserves the body error even if
+  cleanup fails. Body `Ok` publishes only after successful writes, file flush
+  and close, then returns the body's value. A directory flush error may occur
+  after the rename has published the replacement. Writer has the same loan
+  restrictions as Reader and no public close or commit operation.
+- `write_all(writer, data)` returns `Result[Void, WriteError]`, writing the
+  complete Bytes before returning. EINTR retries and short writes complete;
+  zero progress is an OS I/O error. Empty data on a healthy writer succeeds
+  without a system write. The first error is sticky: later writes, including
+  empty writes, return it without writing, and catching it cannot make the
+  scope publish a partial replacement.
 - `fold_lines(path, initial, step, on_error)` folds `step` over a file's lines
   in order, reading a block at a time, so memory follows the longest line and
   never the file. It is generic in the fold's accumulator `T` and error `E`:
-  `step: (T, String) -> Result[T, E]` takes the accumulator and the next line,
+  `step: scoped (T, String) -> Result[T, E]` takes the accumulator and the next line,
   and `on_error` converts this library's own `ReadError`, as in
   `with_temporary_directory`. A line ends at LF and one CR just before it is
   removed; a last line without LF counts and an empty file has no lines. The
@@ -630,7 +656,7 @@ A caller that mixes operations writes its own error union and wraps with a
 
   ```blorp
   import:
-      io/fs/read: ReadError, fold_lines
+      io/files/read: ReadError, fold_lines
       path: Path
       string: String methods
 
@@ -651,7 +677,7 @@ A caller that mixes operations writes its own error union and wraps with a
 
 The runtime C is tested by
 `test/test_common/test_codegen/test_runtime/fs_suite.brp`, and the examples
-`test/test_compile/fixtures/fs/read.brp`, `lines.brp`, `write.brp` and
+`test/test_compile/fixtures/files/read.brp`, `lines.brp`, `write.brp` and
 `directories.brp` run the library through ordinary mains. The harness runs `lines.brp` with at
 most 256 open descriptors, so a fold that left its file open would fail its
 1,000 early stops and 300 failed reads on every machine.
@@ -789,7 +815,7 @@ value, so the wrapping is a `match` or a lambda.
 - `exit.succeeded()` is `Exited(0)`. Every error union is `Stringable`
   with fixed text and no program or directory: `Unsuccessful` is "exited 2"
   followed by the child's stderr, and `DirectoryFailed(cause)` is "cannot
-  enter the directory: <cause>". A `SystemCallError` is worded like the `io/fs/` errors
+  enter the directory: <cause>". A `SystemCallError` is worded like the `io/files/` errors
   words the errno.
 
 ### Running a program on this terminal

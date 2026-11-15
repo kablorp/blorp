@@ -1145,7 +1145,7 @@ swapped arguments no longer type-check. Notes:
 - Equality is byte-wise on the spelling, so `a//b` differs from `a/b`, and the
   NFC and NFD spellings of one name are different paths.
 
-Each file operation lives in its own module under `io/fs/` (`read`, `write`,
+Each file operation lives in its own module under `io/files/` (`read`, `write`,
 `entry`, `list`, `create_directory`, `remove_file`, `remove_directory`,
 `remove_tree`, `rename`, `temporary_directory`), which also declares the error
 union of its operations. A union holds only the failures its operations can
@@ -1154,7 +1154,7 @@ variant, so a caller matches exactly:
 
 ```blorp
 import:
-    io/fs/read: ReadError, read_text
+    io/files/read: ReadError, read_text
     path: Path
 
 func settings(path: Path) -> Result[String, ReadError]:
@@ -1176,6 +1176,28 @@ over a file's lines a block at a time (`fold_lines`), and scopes a temporary
 directory to a callback (`with_temporary_directory`). The
 [library README](standard_library/README.md#the-file-modules) owns every
 operation's contract, edge cases and limits.
+
+For bounded binary I/O, `io/files/read` lends a `Reader` to
+`with_reader(path, body, on_error)`, and `read_chunk(reader)` returns
+`Result[Option[Bytes], ReadError]`. `None` means EOF; a nonempty `Some` holds
+at most 64 KiB and may be shorter, without character or line boundaries.
+`io/files/write` lends a `Writer` to
+`with_atomic_writer(path, body, on_error)`; `write_all(writer, data)` writes
+every byte of a `Bytes` value before returning. The scopes are generic in the
+body's success/error types, with a pure converter for their own open or finish
+errors, just as `with_temporary_directory` uses a pure error converter.
+
+Both bodies are synchronous `scoped` callbacks. Resources can be passed to
+helpers and captured by another scoped callback, but cannot be retained in
+locals, aggregates, results, generic arguments or an escaping callback.
+Ordinary owned data such as `Bytes` can be returned and used after the scope.
+There is no application close or commit operation. The reader closes before
+its scope returns, including when the body stops early. A writer body `Err`
+discards its output and wins over cleanup errors; body `Ok` finishes the
+replacement. A caught write error remains sticky and prevents publication.
+An error from the final directory flush can follow a successful rename, so
+that error does not mean the old target is still present. `fold_lines`'s step
+is also scoped, so it can capture a Writer while normalizing text lines.
 
 `io/process` runs a program and captures its output (`command`, `capture`,
 `output`, `find_program`); `io/terminal` runs one on this terminal (`terminal_command`,
@@ -1241,7 +1263,7 @@ Raw filesystem handle builtins are private library mechanisms: `fs.open_read`,
 `fs.next_lines`, `fs.close`, `fs.read_chunk`, `fs.writer_begin`,
 `fs.writer_write_all`, `fs.writer_finish` and `fs.writer_discard` may only be
 implemented by loader-designated library modules. Application declarations are
-rejected at the builtin label; use the `io/fs` operations instead. Selecting a
+rejected at the builtin label; use the `io/files` operations instead. Selecting a
 custom `--library-root` explicitly trusts that library implementation.
 
 The native chunk contract is `Int -> Result[List[UInt8], Int]`: it returns at
@@ -1536,7 +1558,7 @@ The embedded standard library is a generated module,
 imports. The seed builds [`scripts/embed_library.brp`](scripts/embed_library.brp),
 and `make -C blorp compiler` runs it whenever a library file, a library folder
 or the generator changes. It embeds every `.brp` file under the library at any
-depth, named by its path below the root, such as `io/fs/read.brp`. Anything that
+depth, named by its path below the root, such as `io/files/read.brp`. Anything that
 compiles `src/main.brp` directly (a benchmark recipe, a seed workflow) must run
 `make -C blorp build/generated/embedded_library.brp`
 first. The generated file is not formatted, and the repository formatting

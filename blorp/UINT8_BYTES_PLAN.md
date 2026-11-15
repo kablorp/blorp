@@ -222,10 +222,10 @@ How Int and Float are built in today:
   Binary process capture and `Path` (D13) follow in their own plans.
 
   **Since revision 3,** the `Path` work gave the library `Path` and exact
-  errors, and split `fs.brp` into `io/fs/` modules. So L3 adds
-  `read_bytes(path: Path) -> Result[Bytes, ReadError]` to `io/fs/read` and
+  errors, and split `fs.brp` into `io/files/` modules. So L3 adds
+  `read_bytes(path: Path) -> Result[Bytes, ReadError]` to `io/files/read` and
   `write_bytes(path: Path, data: Bytes) -> Result[Void, WriteError]` to
-  `io/fs/write`, beside `read_text` and `write_text`; L1's natives take the
+  `io/files/write`, beside `read_text` and `write_text`; L1's natives take the
   path's text.
 
 Two limits remain and are stated rather than fixed:
@@ -443,8 +443,8 @@ keeps what a later landing needs. What it found:
      ASan and the strict leak check.
    - **Execution, 2026-11-12.** Library +217 lines (`uint8.brp` 96,
      `bytes.brp` 84); compiler +5 −5 (the mandatory role and help text);
-     tests +397 −534. `read_bytes` and `write_bytes` are in `io/fs/read` and
-     `io/fs/write`. Self-compile against `af2f0909a`, 5 rounds: own-source
+     tests +397 −534. `read_bytes` and `write_bytes` are in `io/files/read` and
+     `io/files/write`. Self-compile against `af2f0909a`, 5 rounds: own-source
      allocations +0.13%, instructions +0.11%. Hello-world compile
      allocations 107,786 to 112,481 (+4.36%), instructions 445,960,042 to
      450,940,714 (+1.12%). Nine e2e ceilings were re-measured as old times

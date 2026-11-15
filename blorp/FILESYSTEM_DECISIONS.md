@@ -2,7 +2,7 @@
 
 `fs`, `io` and `system` became `io/fs`, `io/error` and `io/environment`
 (the modules landing). The `Path` landing then replaced `io/fs` and `io/error`
-with one module per operation under `io/fs/`, each owning an exact error union,
+with one module per operation under `io/files/`, each owning an exact error union,
 and made every operation take a `Path`. Names below are as written when each decision was made; the amendments say what
 changed. `IOError`, `IOErrorKind` and `default_if_not_found` no longer exist.
 
@@ -13,7 +13,9 @@ contract of each operation lives in the
 file says why it is that way and what is still open. Every decision below was
 approved by Keith on the date given, except those marked open or deferred.
 `io.describe` below is history: `IOError` and `IOErrorKind` implement
-`Stringable` instead.
+`Stringable` instead. On 2026-11-15, the public `io/fs/` directory became
+`io/files/` at Keith's request; private `fs.*` builtin labels and native
+operation identities retain their names.
 
 ## Where it stands
 
@@ -28,8 +30,9 @@ through phase 2c:
 | D18 | A `write_text` path ending in `/` | `b00632782`, `ef34d216b` |
 | 2c | Line natives and `fold_lines` | `6c973b3cd`, seed `073ad2a89`, `cc85d0506` |
 
-Part 2 has completed S1 checking and S2 natives. Streaming copy is its
-consumer; public scopes follow the qualified seed switch in S3.
+Part 2 has completed S1 checking, S2 natives and S3 public byte streaming.
+The qualified seed is pinned; Reader/Writer scopes and the public io/files
+namespace pass final proof and cost qualification. S4 text adapters are next.
 
 Two rules shaped every landing. The compiler imports `fs` and is built by a
 pinned earlier compiler, the seed, which rejects a builtin it does not know.
@@ -50,7 +53,7 @@ has risen by about 0.18%.
 - **R3.** Console output (`print`, `print_error`) is in the prelude; all other
   IO stays an explicit import. Amended 2026-11-10 from "IO stays an explicit
   import, and the prelude does not change". Amended 2026-11-11: each file
-  operation is an explicit import of its own `io/fs/` module, and `Path` stays
+  operation is an explicit import of its own `io/files/` module, and `Path` stays
   an explicit import too, because landing 8, which would have put `Path` and
   `to_path` in the prelude, was dropped.
 - **R4, from the roadmap.** Paths stay `String`. Errors carry fixed text, never `strerror` text.
@@ -188,7 +191,7 @@ has risen by about 0.18%.
   `NotFound`, `PermissionDenied`, `NotADirectory`, `DirectoryNotEmpty`,
   `ReadOnlyFilesystem`, `NoSpace`, `CrossesDevices` and `OtherOs`.
 
-## Part 2: lent resources (S2 complete)
+## Part 2: lent resources (S3 complete)
 
 A library scope opens a resource, lends it to a callback and releases it
 when the callback returns, so users never open or close anything and a
@@ -262,7 +265,7 @@ input, but cannot lend two file cursors or produce unbounded output. Its
 borrowed accumulator must not become the foundation of bulk collection:
 growing a List in it copies the accumulated prefix.
 
-Today `standard_library/io/fs/read.brp:124` keeps a private descriptor alive
+Today `standard_library/io/files/read.brp:124` keeps a private descriptor alive
 around an ordinary callback:
 
 ```blorp
@@ -285,13 +288,13 @@ before a public reader or writer is introduced.
 
 #### Public surface and syntax
 
-Keep the existing `io/fs/read` and `io/fs/write` modules and error unions.
+Keep the existing `io/files/read` and `io/files/write` modules and error unions.
 The first public surface is exactly these four operations and two resource
 declarations; signatures below are proposed syntax, not available today.
 The qualifier belongs after the parameter's colon, before its callable type.
 
 ```blorp
--- In io/fs/read. Construction/projection remain owner-module-only.
+-- In io/files/read. Construction/projection remain owner-module-only.
 resource type Reader = Int
 
 func with_reader[T, E](
@@ -306,7 +309,7 @@ func with_reader[T, E](
 func read_chunk(reader: Reader) -> Result[Option[Bytes], ReadError]:
     ...
 
--- In io/fs/write. The Int carries a private native transaction, not a file fd.
+-- In io/files/write. The Int carries a private native transaction, not a file fd.
 resource type Writer = Int
 
 func with_atomic_writer[T, E](
@@ -936,6 +939,267 @@ qualification does not claim remote platform qualification or per-fixture
 retired-instruction gates, which remain disabled by default.
 Final code-reviewer and independent test-runner qualification approvals both
 report zero findings. Source inputs remain unchanged after qualification edits.
+
+## S3 public API implementation brief
+
+**Status:** overlay prototype passes; qualified S2 release and pin verified;
+public integration and final qualification pass. Base is `93798484557cc60d060121f4e11763c4f453836d`. Source
+reviewers inspect the concrete overlay before porting; final integration still
+requires independent code/test approvals and the standard gates.
+
+The public surface is the four operations already specified above, in the
+existing read/write modules. Promote the read module's private Descriptor to
+resource Reader and with_descriptor to with_reader; fold_descriptor becomes
+fold_reader. The two line-fold step parameters become scoped so captured
+Writer/Reader callbacks compose. Preserve line batching, CRLF/error behavior
+and the borrowed-accumulator caveat. Do not retain parallel descriptor types
+or duplicate open/close scopes. Writer uses S2 begin/write/finish/discard with
+a private raw Int, directly wrapped only for its body argument. Capture the
+body result, then match it to exactly one consuming finish/discard; body Err
+prevails, and native sticky write errors still prevent publication after Ok.
+
+Port the two reviewed overlay modules; no compiler model changes or new
+library collection/text features. Publish and verify the three-platform S2
+seed first, then change its release tag, source commit and three digests
+together in bootstrap.env. Existing compiler sources and generated embedded
+library must build with that pin before the public APIs land. No hidden host
+override or fallback is introduced. Documentation describes all four APIs,
+generic error conversion, synchronous/no-escape semantics, byte chunk bounds,
+atomic publication and postrename directory-flush errors, plus no manual close.
+
+Retain six normal-main fixture families under the ordinary e2e harness:
+binary copy; chunk-independent transform/generated output; two-reader compare
+with 17/31 logical windows and offsets; early Ok/application Err under a low
+descriptor limit with target preservation; immutable scoped alias/forwarding
+with outer Reader captured by inner Writer. Share only the transfer helper
+actually used by several examples. Current supported annotations/control-flow
+syntax is sufficient. Also exercise returned chunk data after its Reader scope
+ends, since Bytes is owned data, not a loan.
+The sixth family folds lines into an outer Writer: success publishes normalized
+lines; a step Err stops further callbacks and discards output. Compare unequal
+lengths in both orders, including empty/nonempty, to protect EOF handling.
+
+Generate known bytes independently through existing prepare-script conventions
+and compare complete output; no compiler-internal entrypoint or rewritten C.
+The bounded-memory copy child only copies; verification runs outside that
+process. Measure a small multi-chunk file and a larger file to show peak does
+not scale with total size. Kernel short-read scheduling and sticky/fault
+injection remain owned by S2's native probes; the two-reader fixture does not
+claim to force kernel boundaries. Use independent expected exit/output/content
+oracles and retain both successful and failed-scope cleanup checks.
+
+The ignored prototype is at
+`build/streaming-io-2026-11-13/s3-draft/REPORT.md`, with formatted library
+overlay, normal-main examples, preparation scripts and a final source manifest.
+All six families passed sanitizers/strict leaks. A 16 MiB copy peaked at
+66,264 requested heap bytes versus 66,273 for a 327,681-byte copy. Library
+changes are 93 added / 19 deleted / +74 net; examples are 490 lines. These are
+prototype observations, not the final pinned-seed qualification.
+
+One exploratory activation pair saw +0.5505% allocations and +0.8310%
+instructions with identical compiler C; no model optimization is justified.
+The pair used different library argument lengths and did not freeze exact
+pre-format overlay hashes. Final measurements must use frozen matched
+revisions under one qualified new seed, with seed-only and library deltas
+distinguished, not reuse this prototype pair as acceptance evidence.
+
+Acceptance: fresh pinned build; existing fold_lines suites and all new fixtures
+under the ordinary driver; full tests, fixpoint and bootstrap shell checks;
+native sanitizer/strict accounting; emitted-C scope ordering/ownership review;
+matched allocations/instructions/peak within the existing +3%/+3%/+5% limits.
+S3 ceilings are 200 added / +180 net production and 900 added / +875 net
+tests/examples, documentation separate. The test ceiling corrects the initial
+700 / +650 forecast before porting: six complete fixture families, shared
+strict-report parsing and independent whole-file/peak oracles forecast
+802–827 added / +795–820 net lines. No coverage is removed to fit the estimate. After porting, the formatter
+expanded readable fixture registration beyond the forecast: tests/support
+measure 877 added / 12 deleted / +865 net, including the strict-path helper
+and report-parser tests. The routine net correction from +850 to +875
+accommodates that observed formatting; gross remains 900. No compressed
+formatting or production scope change is used to fit a line counter. No unrelated test deferral, std feature,
+scope inference redesign or collection refactor. Report an actual gap before
+expanding scope. Root serializes compiled gates and owns publication.
+
+Handback: exact source/pin provenance, diff, line counts, gate counts and
+failure table, complete-byte/peak-memory evidence, C inspection, problems not
+fixed, review verdicts and compiled-lease state. Keep draft artifacts ignored;
+carry this brief with reviewed implementation, not a planning-only commit.
+
+### S3 qualified seed
+
+Release `blorp-seed-93798484557c` binds source
+`93798484557cc60d060121f4e11763c4f453836d`. All four platform gates and
+three seed jobs succeeded in run `43682846127`. All three binaries and
+provenance archives match release SHA256SUMS; provenance source and compiler-b
+bindings match, with reproduced compiler C hash
+`83b6dde30aa6c2bc3f64bfb834028d69bdafb9ae85fe31c9fc840a1313d3e135`.
+The pin changes tag, source and all three binary digests together. A fresh
+pinned build and 38 bootstrap checks pass before changing the actual library.
+Independent API/code review approves the pin and port. Evidence is retained
+under `build/streaming-io-2026-11-13/s3-seed/`.
+
+
+## S3 integration qualification, 2026-11-15
+
+Reader replaces the private Descriptor scope; fold_lines uses that same scope
+with scoped step forwarding. Writer saves the callback result before choosing
+one consuming finish/discard operation. Application errors prevail over discard
+errors; native sticky write failures prevent publication after a caught error.
+No compiler source or downstream representation changes are needed.
+
+The fail-first normal copy compile, using the qualified S2 seed and unchanged
+library, rejected the missing public Reader import with its selection help.
+After integration, the ordinary filesystem suite passes 28/28 checks with
+instruction ceilings enabled, including all old fold_lines cases and six new
+normal-main streaming families. Report parsing passes 11/11. Every fixture
+uses the existing sanitizer/strict-accounting harness and independent complete
+byte comparisons; no alternate fixture entry or generated-C rewrite is used.
+
+The exact native allocation observations distinguish first-created targets
+from the ordinary harness's normal-then-strict sequence: normal creates the
+target, so strict replaces it and saves one allocation per target. Final exact
+expectations use that measured sequence. Both observations and argv are
+retained in s3-integration/measurements.json; no semantic or cost waiver was
+applied to those initial expectation failures.
+
+| Copy input | Requested managed-heap peak | Complete byte comparison |
+| --- | ---: | --- |
+| 327,681 bytes | 66,685 bytes | pass |
+| 16 MiB | 66,668 bytes | pass |
+
+Both post-rename final-source children use the same verified binary and generated C, have
+balanced allocations/releases and zero leaks, and stay below the 131,072-byte
+ceiling. Verification occurs in the parent. These are tracked requested-heap
+measurements, not process RSS. The input grows over 51-fold without growing
+peak storage. Exact argv, hashes and raw reports are retained in
+s3-integration/io-files-copy-peak.json; the earlier namespace observations
+remain labeled as pre-rename evidence.
+
+A temporary public-library mutation replaced discard with finish on the Writer
+body-Err branch. Exactly two cases failed at independent target-byte comparison:
+early scope termination and the failed line fold. Source was restored
+byte-for-byte, and the complete 28-case suite passed again. Generated C review
+confirms Reader closes after its callback and Writer chooses exactly one
+finish/discard after its callback, preserving the original application Err.
+
+Before the namespace rename, production library changes were 93 added /
+19 deleted / +74 net lines and tests/support were 877 / 12 / +865. The
+combined final rename-aware diff is 112 added / 38 deleted / +74 net
+production lines and 972 / 103 / +869 test/support lines. These complete
+counts include overlapping path replacements; subtraction does not measure
+independent rename churn. The qualified seed pin changes five configuration
+values. Documentation is separate. Code, API,
+documentation and artifact-manifest reviews report no actionable findings.
+Before the public namespace rename, the full ordinary gate passed 1,806
+component and 1,079 native callbacks (2,885 total). Fixpoint exited 0, with
+identical compiler C and all 749 A/B fixture outputs equal; B repeated all
+2,885 selected callbacks. Bootstrap passed 38/38. These are pre-rename
+results, retained with complete artifacts. The user-requested `io/files/`
+rename has now passed a fresh pinned build, 87 focused component checks,
+28 file integration callbacks with instruction ceilings enabled, complete
+selected suites under B and final matched cost qualification.
+The pre-rename component recount excludes the 24 outer directory summaries;
+S2's earlier 1,801 component total omitted an interleaved three-test ownership
+summary and should read 1,804. The raw passing results are unchanged.
+Evidence lives under build/streaming-io-2026-11-13/{s3-integration,s3-test-runner}/.
+
+
+### Public directory name, 2026-11-15
+
+Keith chose `files` over the abbreviated `fs`. Move the standard-library
+modules, mirrored library-test directory, public file e2e group and fixtures,
+imports, registries, diagnostic help/expectations and current documentation
+together. Keep private `fs.*` builtin labels, C symbols and compiler native
+operation identities: these are implementation contracts, not the directory
+name. Refresh the generated embedded-library inventory through the normal
+build. No loader alias, path-based trust exception or compatibility module is
+introduced. Historical references to the old monolithic io/fs.brp remain
+historical; no active import may resolve to the removed directory.
+
+The additional mechanical path replacements are reported in the complete
+production/test diff, separately from the original S3 feature-only count.
+Routine gross test ceiling correction: 900 to 1,000 added lines for the
+approved rename; +875 net stays fixed. Production and performance ceilings
+stay fixed. Retain readable formatting and every test. After focused A checks,
+one fresh full `--prove` run qualifies final-source selected components and
+native suites under B, source identity and all A/B fixture outputs; prior
+full A results remain explicitly pre-rename rather than being relabeled.
+That final proof exited 0: all 749 fixture comparisons match, 1,806 component
+and 1,079 native callbacks pass (2,885 total), and seed/a/b/c C share SHA256
+`49f9d2c4d538fb54015af2ff90f9172c227adddba0953ddbf4db49a03810ef53`.
+Bootstrap exits 0 with 38/38 checks. All 1,347 frozen semantic inputs remain
+unchanged; no tests or limits were weakened. The manifest SHA256 is
+`18699eda77af90be6befd2f2d0f05f66f8e1bad0956561f77093d25bdb2af810`.
+Code/docs review and independent test-runner review approve the final tree.
+Complete logs and fixpoint artifacts are retained under
+`build/streaming-io-2026-11-13/s3-files-test-runner/`.
+
+
+### S3 matched cost qualification, 2026-11-15
+
+The seed switch and feature are measured separately. Local pin-only baseline
+`402f04598a344cccfad7894feac142169dc0fbe1` is published S2
+`93798484557cc60d060121f4e11763c4f453836d` with only bootstrap.env replaced
+by the verified S2 seed pin. Its tree is
+`b27d3031627706b02fd2437b1cdf9f8e6a46fc10`. Recreate it from that published
+S2 source and the five pin fields in this landing; the local commit itself is
+not a separately published feature. This avoids attributing seed changes to
+the public library API.
+
+```sh
+blorp/scripts/self-compile-cost 93798484557cc60d060121f4e11763c4f453836d \
+    402f04598a344cccfad7894feac142169dc0fbe1 --rounds 3 \
+    --output build/streaming-io-2026-11-13/s3-seed-cost
+blorp/scripts/self-compile-cost 402f04598a344cccfad7894feac142169dc0fbe1 \
+    db01418361d3f35bbe45276d2b11887bd6fc83bf --rounds 3 \
+    --output build/streaming-io-2026-11-13/s3-cost
+```
+
+Matched host/toolchain: Darwin arm64, Apple clang 21.0.0, normal and diagnostic
+binaries built by the production recipes at -O2. Instructions are the median
+of three alternating normal /usr/bin/time -l samples; allocations/peak use
+strict diagnostic runs with identical argv lengths. All eight strict runs
+across the two comparisons balance allocations/releases with zero leaks.
+
+| Qualified seed change only | Old pin | New pin | Change |
+| --- | ---: | ---: | ---: |
+| Fixed allocations | 14,071,697 | 13,875,792 | -1.3922% |
+| Fixed requested-heap peak, bytes | 169,026,238 | 169,032,029 | +0.0034% |
+| Fixed instructions | 12,416,213,526 | 12,313,711,559 | -0.8255% |
+| Own-source allocations | 14,071,697 | 13,875,792 | -1.3922% |
+| Own-source requested-heap peak, bytes | 169,026,237 | 169,032,463 | +0.0037% |
+| Own-source instructions | 12,419,573,610 | 12,324,512,227 | -0.7654% |
+
+| API and namespace, same new pin | Baseline | Candidate | Change |
+| --- | ---: | ---: | ---: |
+| Fixed allocations | 13,875,792 | 13,875,792 | 0.0000% |
+| Fixed requested-heap peak, bytes | 169,032,024 | 169,032,024 | 0.0000% |
+| Fixed instructions | 12,325,778,676 | 12,340,099,260 | +0.1162% |
+| Own-source allocations | 13,875,792 | 13,953,461 | +0.5597% |
+| Own-source requested-heap peak, bytes | 169,032,023 | 169,066,908 | +0.0206% |
+| Own-source instructions | 12,327,107,753 | 12,407,543,563 | +0.6525% |
+
+Both comparisons stay within +3% allocation/instruction and +5% peak ceilings;
+no exception is needed. Small instruction differences are observations, not
+a general speed claim. Fixed-input generated C is identical in both comparisons,
+SHA256 `83b6dde30aa6c2bc3f64bfb834028d69bdafb9ae85fe31c9fc840a1313d3e135`.
+
+Measured feature source trees are src
+`40b37483446094a9de4622aa37015fe07e716d59` and standard_library
+`0d1247ef55cd994540e175ac040ad13542ab63b1`; baseline trees are src
+`5b0c6e4ef58bbd43c266b7d2fe30d809ace7e4ef` and library
+`73bcddd03cf0d94ee9c6c12ee329146f22812297`. Final owning-document/NEXT
+amendments preserve all compiled inputs. Raw samples, emitted C hashes and
+reports are retained in the two ignored output directories. The tool removes
+temporary binaries: seed-comparison executable hashes were observed before
+cleanup, but feature-comparison executable hashes were not retained; its
+binary provenance is the exact source, seed, flags, toolchain and build recipe,
+not an invented executable hash. Neither local result claims remote platform
+qualification; CI runs the platform gates after publication.
+
+Approved follow-up: replace io/_codes integer constants with a fixed union and
+shared protocol helpers, preserving precise public errors and wire behavior.
+It is a separate change after this landing, before the S4 text adapter work.
 
 ## Later
 
