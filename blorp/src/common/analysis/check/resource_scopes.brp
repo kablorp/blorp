@@ -18,6 +18,7 @@ import:
         binding_number,
         lambda_number,
         capture_number,
+        callable_owner,
         callable_position,
         method_receiver,
     ./resource_types: TypeRef methods, first_mentioned, refuse
@@ -35,49 +36,61 @@ private record Facts {
     bindings: List[Bool],
     definitions: List[model.BindingDefinition],
     captures: List[Bool],
-    scoped_parameters: List[Int],
 }
 
 
 pure func admit_resource_body(
     body: ResolvedBody,
-    signature: model.FunctionSignature,
+    return_type: TypeRef,
     functions: List[AcceptedFunction],
     opaques: List[OpaqueRow],
 ) -> Result[Void, CheckError]:
     admission: Admission = { opaques = opaques, functions = functions, lambdas = body.lambdas }
-    facts: Facts = {
-        bindings = repeat(False, body.bindings.length()),
-        definitions = body.bindings,
-        captures = [],
-        scoped_parameters = signature.scoped_parameters,
-    }
-    seeded = facts.seed_parameters()
-    admission
-        .admit_statements(body.statements, seeded)
-        .and_then(
-            pure func(completed): admission.admit_body(
-                body.body,
-                completed,
-                signature.return_type.value_type == model.VoidType,
-            ),
-        )
+    bindings ?= admission.seed_parameters(body.bindings)
+    facts: Facts = { bindings = bindings, definitions = body.bindings, captures = [] }
+    completed ?= admission.admit_statements(body.statements, facts)
+    admission.admit_body(body.body, completed, return_type == model.VoidType)
 
 
-private pure func seed_parameters(facts: Facts) -> Facts:
-    var bindings = facts.bindings
+-- A scoped parameter's binding starts scoped; every other binding starts unscoped.
+private pure func seed_parameters(
+    admission: Admission,
+    definitions: List[model.BindingDefinition],
+) -> Result[List[Bool], CheckError]:
+    var bindings: List[Bool] = repeat(False, definitions.length())
+    var failure: Option[CheckError] = None
     var position = 0
-    for definition in facts.definitions:
+    for definition in definitions:
         match definition.origin:
             model.CallableParameterBinding(parameter):
-                bindings = bindings.set(
-                    position,
-                    facts.scoped_parameters.contains(parameter.callable_position()),
-                )
-            _:
+                match admission.promised(parameter, definition.span):
+                    Ok(promise): bindings = bindings.set(position, promise)
+                    Err(error): failure = Some(error)
+            model.ParameterBinding(_) | model.BodyLocal | model.MatchCapture:
                 void
+        if failure.is_some():
+            break
         position = position + 1
-    { facts | bindings = bindings }
+    match failure:
+        Some(error): Err(error)
+        None: Ok(bindings)
+
+
+-- Signature acceptance admits `scoped` only on a declared function's callable
+-- parameter, so its parsed qualifier is the parameter's promise.
+private pure func promised(
+    admission: Admission,
+    parameter: model.CallableParameterId,
+    span: Span,
+) -> Result[Bool, CheckError]:
+    owner = parameter.callable_owner()
+    function ?= admission.functions
+        .get(owner.function_number())
+        .or_checker_invariant(span, errors.InvalidFunctionContract)
+    written ?= function.declaration.parameters
+        .get(parameter.callable_position())
+        .or_checker_invariant(span, errors.InvalidFunctionContract)
+    Ok(written.scoped_qualifier.is_some())
 
 
 private pure func admit_statements(
@@ -287,7 +300,7 @@ private pure func admit_choice(
         model.StoredCallable(value):
             admission.admit_expression(value, facts)
         model.ForwardedCallable(parameter):
-            Ok(facts.scoped_parameters.contains(parameter.callable_position()))
+            admission.promised(parameter, span)
         model.NamedCallable(_, arguments):
             admission
                 .admit_type_arguments(arguments, span)
@@ -358,7 +371,6 @@ private pure func admit_lambda(
         bindings = repeat(False, lambda.bindings.length()),
         definitions = lambda.bindings,
         captures = captures,
-        scoped_parameters = [],
     }
     completed ?= admission.admit_statements(lambda.statements, facts)
     admission.admit_body(lambda.body, completed, lambda.return_type.value_type == model.VoidType)
@@ -369,54 +381,54 @@ private pure func admit_call(
     call: model.CheckedCall,
     facts: Facts,
 ) -> Result[Bool, CheckError]:
-    promises: List[Int] ?= match call.target:
-        model.UserFunction(id, arguments):
-            admission
-                .admit_type_arguments(arguments, call.span)
-                .and_then(pure func(_) -> Result[List[Int], CheckError]:
-                    admission.functions
-                        .get(id.function_number())
-                        .or_checker_invariant(call.span, errors.InvalidFunctionContract)
-                        .map(pure func(function): function.signature.scoped_parameters)
-                )
+    var admitted: Result[Void, CheckError] = match call.target:
+        model.UserFunction(_, arguments):
+            admission.admit_type_arguments(arguments, call.span)
         model.TraitMethod(method):
-            admission
-                .admit_type_arguments([method.method_receiver()], call.span)
-                .map(pure func(_) -> List[Int]: [])
+            admission.admit_type_arguments([method.method_receiver()], call.span)
         model.ValueCall(value):
             admission
                 .admit_expression(value, facts)
-                .map(pure func(_) -> List[Int]: [])
+                .map(pure func(_): void)
         -- A callable type carries no promise, and a runtime operation takes
         -- only values; the loop below admits their operands.
         model.CallableParameter(_) | model.RuntimeFunction(_):
-            Ok([])
-    var position = 0
-    var failure: Option[CheckError] = None
+            Ok(void)
     for operand in call.operands:
-        checked: Result[Bool, CheckError] = match operand:
-            model.ValueOperand(value): admission.admit_expression(value, facts)
-            model.CallableOperand(_, choice, span): admission.admit_choice(choice, span, facts)
-        match checked:
-            Err(error):
-                failure = Some(error)
-            Ok(scoped_callable):
-                if scoped_callable.and(
-                    promises
-                        .contains(position)
-                        .not(),
-                ):
-                    span = match operand:
-                        model.ValueOperand(value): value.span
-                        model.CallableOperand(_, model.StoredCallable(value), _): value.span
-                        model.CallableOperand(_, _, span): span
-                    failure = Some(resource_error(span, errors.ScopedArgument))
-        if failure.is_some():
-            break
-        position = position + 1
-    match failure:
-        Some(error): Err(error)
-        None: Ok(False)
+        if admitted.is_ok():
+            admitted = admission.admit_operand(operand, facts)
+    admitted.map(pure func(_): False)
+
+
+-- Only a declared callee's scoped parameter may receive a scoped callable.
+private pure func admit_operand(
+    admission: Admission,
+    operand: model.CheckedCallOperand,
+    facts: Facts,
+) -> Result[Void, CheckError]:
+    match operand:
+        model.ValueOperand(value):
+            match admission.admit_expression(value, facts):
+                Ok(True): Err(resource_error(value.span, errors.ScopedArgument))
+                Ok(False): Ok(void)
+                Err(error): Err(error)
+        model.CallableOperand(parameter, choice, span):
+            -- A stored callable is reported where it is read.
+            culprit = match choice:
+                model.StoredCallable(value):
+                    value.span
+                model.MethodCallable(_) | model.NamedCallable(_, _) | model.ForwardedCallable(_) | model.LambdaCallable(_, _):
+                    span
+            match admission.admit_choice(choice, span, facts):
+                Ok(True):
+                    match admission.promised(parameter, span):
+                        Ok(True): Ok(void)
+                        Ok(False): Err(resource_error(culprit, errors.ScopedArgument))
+                        Err(error): Err(error)
+                Ok(False):
+                    Ok(void)
+                Err(error):
+                    Err(error)
 
 
 private pure func admit_expression(

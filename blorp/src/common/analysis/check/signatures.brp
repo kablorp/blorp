@@ -73,6 +73,7 @@ import:
         ImplId,
         ImplRow,
         FunctionRole(ImplementationBody, FreeFunctionBody, TraitDefaultBody),
+        OpaqueRow,
         VariantId,
     ../namespace/builtins as builtins:
         DesignatedUnions,
@@ -105,7 +106,12 @@ import:
         annotated_types,
     ./errors as resource_errors:
         CheckError,
-        CheckerInvariant(InvalidFunctionContract, InvalidResolvedFunction, RuntimeContractMismatch),
+        CheckerInvariant(
+            InvalidFunctionContract,
+            InvalidResolvedFunction,
+            InvalidResolvedParameter,
+            RuntimeContractMismatch,
+        ),
         SignatureError(GenericMain, MainHasParameters, MainParameterType, MainReturnType),
         checker_invariant,
         or_checker_invariant,
@@ -386,47 +392,27 @@ private pure func resolve_signature(
                 Ok(void)
         []:
             Ok(void)
-    var scoped_parameters: List[Int] = []
-    var parameter_position = 0
-    var loan_failure: Option[CheckError] = None
+    -- `scoped` is checked here and nowhere stored: the parsed qualifier is the promise.
+    var admitted: Result[Void, CheckError] = Ok(void)
+    var position = 0
     for parameter in function.parameters:
-        match formal_parameters.types.get(parameter_position):
-            Some(formal):
-                if function.purity == Pure:
-                    match formal.value_type.refuse_resource(
-                        scope.opaques,
-                        formal.span,
-                        resource_errors.ResourcePureParameter,
-                    ):
-                        Err(error): loan_failure = Some(error)
-                        Ok(_): void
-                match parameter.scoped_qualifier:
-                    Some(span):
-                        match formal.value_type:
-                            CallableType(_, _, _):
-                                scoped_parameters = scoped_parameters.append(parameter_position)
-                            _:
-                                loan_failure = Some(
-                                    resource_errors.resource_error(
-                                        span,
-                                        resource_errors.ScopedNonCallable,
-                                    ),
-                                )
-                    None:
-                        void
-            None:
-                void
-        if loan_failure.is_some():
-            break
-        parameter_position = parameter_position + 1
-    _: Void ?= match loan_failure:
-        Some(error): Err(error)
-        None: Ok(void)
+        if admitted.is_ok():
+            admitted = match formal_parameters.types.get(position):
+                Some(formal):
+                    formal.admit_parameter_loan(parameter, function.purity, scope.opaques)
+                None:
+                    Err(
+                        checker_invariant(
+                            parameter.binder.binder_span(),
+                            InvalidResolvedParameter(position),
+                        ),
+                    )
+        position = position + 1
+    _: Void ?= admitted
     signature: FunctionSignature = {
         type_parameters = parameters,
         requirements = requirements,
         purity = function.purity,
-        scoped_parameters = scoped_parameters,
         parameters = formal_parameters.types,
         return_type = { value_type = return_type, span = return_span },
     }
@@ -443,6 +429,28 @@ private pure func resolve_signature(
         },
         uses = formal_parameters.uses,
     })
+
+
+-- A pure function takes no resource, and `scoped` promises only a callable.
+private pure func admit_parameter_loan(
+    resolved: TypeUse,
+    parameter: ParsedParameter,
+    purity: Purity,
+    opaques: List[OpaqueRow],
+) -> Result[Void, CheckError]:
+    _: Void ?= if purity == Pure:
+        resolved.value_type.refuse_resource(
+            opaques,
+            resolved.span,
+            resource_errors.ResourcePureParameter,
+        )
+    else:
+        Ok(void)
+    match (parameter.scoped_qualifier, resolved.value_type):
+        (Some(_), CallableType(_, _, _)) | (None, _):
+            Ok(void)
+        (Some(qualifier), _):
+            Err(resource_errors.resource_error(qualifier, resource_errors.ScopedNonCallable))
 
 
 -- A builtin body is accepted once its runtime contract is validated; source
@@ -828,7 +836,6 @@ private pure func resolve_default_function(
         type_parameters = [self],
         requirements = [requirement],
         purity = method.signature.purity,
-        scoped_parameters = [],
         parameters = parameters,
         return_type = { method.signature.return_type | value_type = result },
     }
