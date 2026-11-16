@@ -245,7 +245,7 @@ private pure func render_context_error(
 ) -> Diagnostic:
     match error.kind:
         errors.ResourceRejection(rejection):
-            render_resource_error(error.span, rejection)
+            context.render_resource_error(error.span, rejection)
         errors.UnsupportedSyntax(form):
             render_unsupported_form(error.span, form)
         errors.QualifiedRejection(rejection):
@@ -2124,18 +2124,7 @@ private pure func type_spelling(
                         None:
                             Err(render_fault(span, errors.InvalidResolvedUnion(id)))
                 check.OpaqueNominal(id):
-                    match (
-                        context.parsed.declarations
-                            .inventory_opaques()
-                            .get(id.opaque_number())
-                    ):
-                        Some(declaration):
-                            declaration.declaration.type_name.id.parsed_spelling(
-                                context.parsed.names,
-                                span,
-                            )
-                        None:
-                            Err(render_fault(span, errors.InvalidOpaqueDeclaration(id)))
+                    id.opaque_spelling(context, span)
             match declared:
                 Err(error):
                     Err(error)
@@ -2163,6 +2152,19 @@ private pure func type_spelling(
                     Err(error)
         check.ParameterType(id):
             id.parameter_spelling(context, span)
+
+
+private pure func opaque_spelling(
+    id: OpaqueId,
+    context: RenderContext,
+    span: Span,
+) -> Result[String, Diagnostic]:
+    opaques = context.parsed.declarations.inventory_opaques()
+    match opaques.get(id.opaque_number()):
+        Some(declaration):
+            declaration.declaration.type_name.id.parsed_spelling(context.parsed.names, span)
+        None:
+            Err(render_fault(span, errors.InvalidOpaqueDeclaration(id)))
 
 
 -- The parts in order, separated by commas.
@@ -3015,49 +3017,70 @@ private pure func parameter_spelling(
             id.ordinary_parameter_spelling(context, span)
 
 
-private pure func render_resource_error(span: Span, rejection: errors.ResourceError) -> Diagnostic:
+private pure func render_resource_error(
+    context: RenderContext,
+    span: Span,
+    rejection: errors.ResourceError,
+) -> Diagnostic:
     match rejection:
-        errors.ResourceResult:
-            rendered(
-                span,
-                "resource types cannot be returned",
-                "consume the resource inside its scope and return an ordinary value instead",
-            )
-        errors.ResourceStorage:
-            rendered(
-                span,
-                "resources cannot be stored",
-                "pass the resource directly to an impure function instead of binding or wrapping it",
-            )
-        errors.ResourceTypeArgument:
-            rendered(
-                span,
-                "resource types cannot be type arguments",
-                "use a whole resource parameter on an impure function instead",
-            )
-        errors.ResourcePureParameter:
-            rendered(
-                span,
-                "pure functions cannot take resource parameters",
-                "remove pure and consume the resource synchronously",
-            )
-        errors.ResourcePureCapture:
-            rendered(
-                span,
-                "pure closures cannot capture resources",
-                "remove pure and invoke the closure inside the resource scope",
-            )
+        -- The resource `id` is the rejected type, or the type that holds it.
+        errors.MisusedResource(id, use):
+            match id.opaque_spelling(context, span):
+                Err(fault):
+                    fault
+                Ok(spelled):
+                    match use:
+                        errors.ResourceResult:
+                            rendered(
+                                span,
+                                "the resource type ${spelled} cannot be returned",
+                                "consume the resource inside its scope and return an ordinary value instead",
+                            )
+                        errors.ResourceStorage:
+                            rendered(
+                                span,
+                                "the resource type ${spelled} cannot be stored",
+                                "pass the resource directly to an impure function instead of binding or wrapping it",
+                            )
+                        errors.ResourceTypeArgument:
+                            rendered(
+                                span,
+                                "the resource type ${spelled} cannot be a type argument",
+                                "use a whole ${spelled} parameter on an impure function instead",
+                            )
+                        errors.ResourcePureParameter:
+                            rendered(
+                                span,
+                                "pure functions cannot take the resource type ${spelled}",
+                                "remove pure and consume the resource synchronously",
+                            )
+                        errors.ResourcePureCapture:
+                            rendered(
+                                span,
+                                "pure closures cannot capture the resource type ${spelled}",
+                                "remove pure and invoke the closure inside the resource scope",
+                            )
+                        errors.ResourceImplementation:
+                            rendered(
+                                span,
+                                "the resource type ${spelled} cannot implement a trait",
+                                "trait methods are pure, so they cannot take a ${spelled}; write an impure function that takes it instead",
+                            )
+                        errors.ResourceInferredType(inferred_type):
+                            match inferred_type.type_spelling(context, span):
+                                Err(fault):
+                                    fault
+                                Ok(inferred):
+                                    rendered(
+                                        span,
+                                        "generic parameters and containers cannot mention the resource type ${spelled}",
+                                        "the inferred type here is ${inferred}; call functions that take a ${spelled} directly instead",
+                                    )
         errors.ResourceGenericDeclaration:
             rendered(
                 span,
                 "resource types cannot be generic",
                 "declare a resource type without type parameters and with a resource-free representation",
-            )
-        errors.ResourceImplementation:
-            rendered(
-                span,
-                "resource types cannot implement traits",
-                "trait methods are pure, so they cannot take a resource; write an impure function that takes it instead",
             )
         errors.ScopedNonCallable:
             rendered(

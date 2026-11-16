@@ -9,8 +9,8 @@ import:
     list: List methods, repeat
     option: Option methods
     result: Result methods
-    ../../syntax/syntax: Span, Purity(Pure)
-    ../ids: OpaqueRow, function_number
+    ../../syntax/syntax: Span, Purity(Pure, Impure)
+    ../ids: OpaqueId, OpaqueRow, function_number
     ./errors as errors: CheckError, resource_error, Option methods
     ./expressions: ResolvedBody
     ./model as model:
@@ -285,9 +285,13 @@ private pure func admit_type_arguments(
     arguments: List[model.TypeRef],
     span: Span,
 ) -> Result[Void, CheckError]:
-    arguments
-        .first_mentioned(admission.opaques, span)
-        .refuse(span, errors.ResourceTypeArgument)
+    var admitted: Result[Void, CheckError] = Ok(void)
+    for argument in arguments:
+        if admitted.is_ok():
+            admitted = argument
+                .mentioned_resource(admission.opaques, span)
+                .refuse(span, errors.ResourceInferredType(argument))
+    admitted
 
 
 private pure func admit_choice(
@@ -322,7 +326,7 @@ private pure func admit_closure(
 ) -> Result[Bool, CheckError]:
     var captures: List[Bool] = []
     var scoped_capture: Bool = False
-    var captures_resource: Bool = False
+    var captured_resource: Option[OpaqueId] = None
     var failure: Option[CheckError] = None
     for value in environment:
         match admission.admit_expression(value, facts):
@@ -337,7 +341,8 @@ private pure func admit_closure(
                     Ok(held):
                         captures = captures.append(captured)
                         scoped_capture = scoped_capture.or(captured)
-                        captures_resource = captures_resource.or(held.is_some())
+                        if captured_resource.is_none():
+                            captured_resource = held
     _: Void ?= match failure:
         Some(error): Err(error)
         None: Ok(void)
@@ -349,12 +354,13 @@ private pure func admit_closure(
             Ok(value)
         model.CollectingLambda(_):
             Err(errors.checker_invariant(span, errors.InvalidInferenceWorklist))
-    _: Void ?= if captures_resource.and(lambda.purity == Pure):
-        Err(resource_error(span, errors.ResourcePureCapture))
-    else:
-        Ok(void)
+    _: Void ?= match (lambda.purity, captured_resource):
+        (Pure, Some(captured)):
+            Err(resource_error(span, errors.MisusedResource(captured, errors.ResourcePureCapture)))
+        (Impure, _) | (Pure, None):
+            Ok(void)
     _: Void ?= admission.admit_lambda(lambda, captures)
-    Ok(scoped_capture.or(captures_resource))
+    Ok(scoped_capture.or(captured_resource.is_some()))
 
 
 private pure func admit_lambda(
@@ -477,15 +483,18 @@ private pure func admit_expression(
             Ok(False)
 
 
--- Inferred container applications have no written type-use boundary:
--- `[consume]` would otherwise hide a resource-taking callable in a List.
--- A construction is never scoped, and none of its children may hold a loan.
+-- An inferred container type has no written type-use boundary: `[consume]`
+-- would otherwise hide a resource-taking callable in a List. A construction
+-- is never scoped, and none of its children may hold a loan.
 private pure func admit_construction(
     admission: Admission,
     value: model.CheckedExpr,
     children: List[model.CheckedExpr],
     facts: Facts,
 ) -> Result[Bool, CheckError]:
-    _: Void ?= value.value_type.admit_resource_type(admission.opaques, value.span)
+    _: Void ?= value.value_type
+        .type_children()
+        .first_mentioned(admission.opaques, value.span)
+        .refuse(value.span, errors.ResourceInferredType(value.value_type))
     _: Void ?= admission.admit_storage(children, facts)
     Ok(False)

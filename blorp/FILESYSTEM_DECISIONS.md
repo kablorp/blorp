@@ -265,8 +265,9 @@ input, but cannot lend two file cursors or produce unbounded output. Its
 borrowed accumulator must not become the foundation of bulk collection:
 growing a List in it copies the accumulated prefix.
 
-Today `standard_library/io/files/read.brp:124` keeps a private descriptor alive
-around an ordinary callback:
+Today `with_descriptor` in `standard_library/io/fs/read.brp` (now `with_reader`
+in `io/files/read.brp`) keeps a private descriptor alive around an ordinary
+callback:
 
 ```blorp
 private func with_descriptor[T, E](
@@ -391,16 +392,17 @@ occurrence without a separate Bool and span. Resource membership is read from
 the existing parsed opaque inventory by nominal identity; do not add a second
 resource flag to accepted opaque rows merely for convenience.
 
-Current source anchors: `src/common/syntax/syntax.brp:331,989`
-(`ParsedParameter`, `ParsedOpaque`), `src/common/analysis/check/model.brp:164,188`
-(`CheckedOpaque`, `FunctionSignature`) and `:938` (captures). Keep ordinary
+Current source anchors: `src/common/syntax/syntax.brp`
+(`ParsedParameter`, `ParsedOpaque`), `src/common/analysis/check/model.brp`
+(`CheckedOpaque`, `FunctionSignature`, `CheckedCapture`). Keep ordinary
 `CallableType(Purity, List[TypeRef], TypeRef)` unchanged.
 
 **Check representation:** `FunctionSignature` retains a sparse, ordered,
 unique `scoped_parameters: List[Int]`; signature construction validates that
 each position names a callable parameter. Ordinary indirect contracts always
 have an empty list, regardless of the eventual stored/specialized identity.
-Do not change `TypeUse` or `CallableType`.
+Do not change `TypeUse` or `CallableType`. Superseded 2026-11-16 by the
+hardening amendment: the parsed qualifier is the promise, and the list is gone.
 
 After `resolve_body` completes a declared function and its lambda rows, before
 `check_execution` rewrites self recursion or the checked function is published,
@@ -412,7 +414,8 @@ resource-valued or scoped; admit its completed body at construction with those
 capture facts and typed parameters. Match bindings receive facts through
 `EnterArm` / `CheckedPatternArgument` routes, including `BorrowPlace(MatchRoot)`;
 value joins combine every arm's scopedness. Do not flatten these contexts
-through `child_expressions`.
+through `child_expressions`. Superseded 2026-11-16 by the hardening amendment:
+match roots cannot carry a loan, so arm bindings get no `EnterArm` facts.
 
 Reject scoped mutable storage, source aggregates, results and arguments
 lacking the declared promise. Calling a scoped callee is legal; discarding
@@ -431,16 +434,17 @@ named callable choices as well as ordinary calls.
 
 Reuse `fs.open_read` and `fs.close`. Add one native chunk read returning
 `Result[List[UInt8], Int]`; empty success maps to public EOF. This uses the
-existing system signature algebra in `analysis/namespace/builtins.brp:487`.
+existing system signature algebra (`SystemParameter` in
+`analysis/namespace/builtins.brp`).
 Do not add Option/record native ABI support just for these operations.
 
 Atomic writes reuse target resolution, temporary creation, metadata copying,
-write-all, rename and directory flush in `codegen/runtime/fs.brp:268–490`.
+write-all, rename and directory flush in `codegen/runtime/fs.brp`.
 The private manually owned C context avoids a global registry. Arbitrary user
 modules may declare existing builtin labels
-(see `test/test_compile/fixtures/fs/natives_open_read.brp`). A private Blorp
+(see `test/test_compile/fixtures/files/natives_open_read.brp`). A private Blorp
 wrapper does not stop a user from declaring writer-discard with an Int
-parameter and passing a forged pointer. The native representation below is
+parameter and passing a forged pointer. The native representation below
 requires the explicit native declaration boundary approved below; never expose
 these pointer-consuming labels without enforcing it.
 
@@ -500,8 +504,8 @@ unit tests establish the trusted owner's cleanup and pointer-carrier ABI.
 
 #### Several normal-main e2e examples
 
-Add ordinary fixtures under `test/test_compile/fixtures/fs/`, registered by
-`test/test_compile/fs.brp`. Tests use the normal entry point and actual files;
+Add ordinary fixtures under `test/test_compile/fixtures/files/`, registered by
+`test/test_compile/files.brp`. Tests use the normal entry point and actual files;
 they do not call generated internal functions or rewrite emitted C.
 
 1. **Binary copy:** nested reader/writer scopes copy empty, one-byte,
@@ -749,6 +753,14 @@ amendment preserves them; reproduce using the published S1 revision with those
 subtrees in place of the pre-amendment measurement revision above.
 Final code-reviewer and independent test-runner qualification approvals both
 have zero remaining findings after correcting stale status text.
+
+Note, 2026-11-16: the commit's +0.03% allocation and +0.08% instruction
+headline is the fixed-input pair above. Neither that base source nor S1's own
+source declared a resource type, and none of their functions has a scoped
+parameter, so the admission pass never ran in either workload. Its real
+self-compile cost first appears in `ab0d04342`, whose `io/files` Reader and
+Writer give the compiler's own imports resource types: see the S3 matched
+cost qualification below and the hardening amendment at the end.
 
 ## S2 native implementation brief
 
@@ -1383,3 +1395,182 @@ directory; hashes were observed after both builds completed and before tool
 cleanup. Source/API and independent functional reviews approve the change.
 Local qualification does not claim that the post-publication platform jobs
 have run yet.
+
+
+## Resource loan hardening, 2026-11-16
+
+**Decision, 2026-11-16:** Keith keeps the landed loan design of S1
+(`2b36404cd`), which S3's `io/files` Reader and Writer use (`ab0d04342`).
+He accepts its size and the choices reviewers approved beyond the
+2026-11-04 record: one separate checking pass over each finished body, the
+`scoped` promise dropped when a function becomes a value, non-generic
+resource types, and D23's `rewrite_lines` and `write_lines` left unbuilt.
+He asked for cleanup, the missing tests and the fixes below, with size and
+complexity down where that comes naturally. The 2026-11-04 decisions are
+unchanged.
+
+An adversarial review of S1 found no way to make a loan escape, but found
+places where the check failed open, untested paths and unreachable code.
+Three commits address them; a second review found no escape in them either.
+They were ported onto `4d350add0` ("Record name uses during analysis"), whose
+`annotated_types` now resolves parameter types; the second commit adapts to
+it.
+
+1. **"Fail closed in resource admission".** A resource lookup that missed
+   its opaque row read as "not a resource", which turned the loan rules off.
+   It now reports the `InvalidOpaqueDeclaration` checker invariant, as the
+   declaration-arity lookup does, through one lookup by `OpaqueId`. No source
+   program reaches it: the inventory issues every `OpaqueId`, and Check
+   receives that same inventory. The admission walk lists every expression
+   form, call target, binding origin and type shape, so a new one does not
+   compile until someone decides how loans treat it. Listing them found no
+   form whose children went unwalked. Match arms no longer derive facts for
+   roots that cannot carry a loan: Check rejects matching a callable or an
+   opaque value, and admission rejects a construction holding a loan before
+   it reaches the root. One invariant, `LoanInMatchRoot`, stands there
+   instead, also unreachable from source. New Check tests cover loops, a
+   lambda returning a resource, a record update and trait implementations.
+2. **"Read scoped promises from the declared parameter".**
+   `FunctionSignature.scoped_parameters: List[Int]` is gone, with the seven
+   construction sites that set it to `[]` by hand. Once `annotated_types` has
+   resolved the parameter types, signature acceptance validates each
+   parameter's parsed `scoped_qualifier` against its type, and trait
+   requirements reject it, so the qualifier is the promise: admission reads
+   it through the `CallableParameterId` of a binding, a forwarded parameter
+   or a call operand. A misaligned parameter list is now a checker
+   invariant, and the first error stops the check, so `ScopedNonCallable`
+   can no longer overwrite `ResourcePureParameter`. Tests pin the promise to its
+   own position, including through UFCS and a discarded parameter.
+3. **"Name resources in loan diagnostics and scope temporary directories".**
+   Each resource rejection names the resource, as
+   `MisusedResource(OpaqueId, ResourceUse)`. Where the user wrote no type, at
+   a generic call, callable reference or construction, the message states the
+   rule (generic parameters and containers cannot mention a resource) and
+   names the inferred type, not a type argument. `scoped` anywhere but after
+   a declared parameter's colon is a parse error that says where it applies.
+   `with_temporary_directory`'s body is scoped, so it can capture a Reader.
+   The Check modules share one `errors` alias.
+
+**Interim: a resource type cannot implement a trait.** Check requires every
+trait method to be pure (`ImpureRequirement`) and to take `Self` first, and
+D35 bars a resource from a pure function's parameters, so today no trait
+method could take a resource receiver. Before this change an authored
+method was rejected with a "remove pure" help that could not be followed,
+and a default-only implementation was accepted although nothing could call
+it. Check now rejects the implementation at its receiver. This rule follows
+from today's purity requirement, not from the loan design.
+
+**Decision, 2026-11-16:** Keith: "A trait does not need to implement pure
+methods. But if `pure` is specified on a trait, it needs to be respected. I
+think we should probably have defaults re-checked for each resource
+receiver." A separate plan will allow impure trait methods, let a resource
+type implement a trait whose methods it receives are all impure, and
+recheck each inherited default body with `Self` as that resource. That
+change replaces the interim rejection.
+
+**Not done.** `resolve_type` admits each written type level as it builds it,
+so nested levels are walked again. Admitting only the outermost level would
+report a nested error at the whole annotation rather than the nested type,
+and carrying the fact upward would change what `resolve_type` returns. Neither
+is a simple change, so the walk stays. Three older helps still suggest an
+implementation for a resource receiver, which this rule now forbids:
+interpolating a resource ("implement Stringable for …"), comparing two
+("declare a matching implementation") and passing one to a bounded generic
+("provide an implementation for the concrete receiver"). Making them
+resource-aware is local to rendering, about 16 production lines; it is
+deferred to the planned trait purity change, which replaces the interim rule.
+
+### Hardening matched costs, 2026-11-16
+
+Ceilings set in the brief before implementation: whole-source allocations
+and instructions at most +0.2% each against `origin/main`, and production at
+most +40 net lines over the three commits; tests reported separately.
+
+Routine coordinator correction, 2026-11-16: the production ceiling changes
+from +40 to +70 net lines. `4d350add0` had already removed the old recursive
+`resolve_parameters` and its nested `main` check, about 32 net lines that
+the second commit was credited with deleting on the earlier base, so the
+same hardening code nets +28 more against the new base; none of it is new
+hardening logic. The cost ceilings are unchanged. The coordinator made this
+correction under the standing budget delegation.
+
+Commit hashes change when the branch lands, so the measured trees are named
+instead. Base `origin/main` `97ea3a279fa9ed2ca6309029ecab618c0a370e9f`, tree
+`444390bcf75cc0fb7008939a28956ac6f94889b6`. Measured trees: first commit
+`c9118add015f652ee4dbba71a027477495d39ac0`, second
+`1b2f7c4d86b0ae826303b05e37691e94a479e368` and third
+`f5c6c183af7fe600ecb2da3ff0f3322a3ca22529`; this amendment then changes only
+documents, so the third commit's `blorp/src`
+(`18a8db972b1e45dd6cdeb45a4e2f34c8822958b7`) and `blorp/standard_library`
+(`b950352fd8e5b0bde020194d1795fad26b348147`) subtrees are the ones measured.
+The branch was then rebased onto `c479a6903`, which changes only the
+fixpoint script and documents; every commit's `blorp/src`,
+`blorp/standard_library` and `blorp/test` subtrees are unchanged by it. All
+use seed `blorp-seed-93798484557c`. Host: Darwin 25.6.0 arm64, Apple clang
+21.0.0 (clang-2100.3.34.2), production recipes at -O2. Instructions are the
+median of five alternating normal runs; allocations and peak come from one
+strict diagnostic run per side, and all twelve strict runs balance with zero
+leaks.
+
+```sh
+blorp/scripts/self-compile-cost origin/main <first> --rounds 5 --output <dir>/cost-c1
+blorp/scripts/self-compile-cost <first> <second> --rounds 5 --output <dir>/cost-c2
+blorp/scripts/self-compile-cost origin/main <third> --rounds 5 --output <dir>/cost-final
+```
+
+| Fail closed, against `origin/main` | Base | First commit | Change |
+| --- | ---: | ---: | ---: |
+| Fixed-input allocations | 14,198,835 | 14,163,969 | -0.2456% |
+| Fixed-input peak heap, bytes | 170,304,941 | 170,304,941 | 0.0000% |
+| Fixed-input instructions | 12,684,945,678 | 12,669,966,134 | -0.1181% |
+| Own-source allocations | 14,198,835 | 14,164,046 | -0.2450% |
+| Own-source peak heap, bytes | 170,304,940 | 170,110,308 | -0.1143% |
+| Own-source instructions | 12,669,147,846 | 12,658,796,843 | -0.0817% |
+
+| Scoped promise refactor alone | First commit | Second commit | Change |
+| --- | ---: | ---: | ---: |
+| Fixed-input allocations | 14,164,046 | 14,168,440 | +0.0310% |
+| Fixed-input peak heap, bytes | 170,109,869 | 170,109,869 | 0.0000% |
+| Fixed-input instructions | 12,634,555,019 | 12,635,042,884 | +0.0039% |
+| Own-source allocations | 14,164,046 | 14,172,637 | +0.0607% |
+| Own-source peak heap, bytes | 170,109,868 | 170,157,101 | +0.0278% |
+| Own-source instructions | 12,631,346,490 | 12,634,835,381 | +0.0276% |
+
+| All three commits | `origin/main` | Hardened | Change |
+| --- | ---: | ---: | ---: |
+| Fixed-input allocations | 14,198,835 | 14,168,770 | -0.2117% |
+| Fixed-input peak heap, bytes | 170,304,944 | 170,304,944 | 0.0000% |
+| Fixed-input instructions | 12,653,621,277 | 12,630,154,762 | -0.1855% |
+| Own-source allocations | 14,198,835 | 14,176,929 | -0.1543% |
+| Own-source peak heap, bytes | 170,304,943 | 170,240,384 | -0.0379% |
+| Own-source instructions | 12,672,860,892 | 12,642,939,863 | -0.2361% |
+
+Instruction medians moved by up to 0.1% between runs of the same compiler
+while other sessions were gating, so the per-commit instruction deltas are
+less exact than the allocation counts, which are deterministic. The first
+run against the first commit stopped when its candidate build received a
+SIGTERM from outside the run; the rerun completed, and both logs are kept.
+
+Fixed-input C is identical in every comparison (SHA256 prefixes `8fd09726e84223d3` against `origin/main` and `02dddfed0011f720` for the first commit's source). The compiler's
+own imports declare Reader and Writer, so admission runs on every compiler
+function in both workloads. These are observations, not a speed claim. Raw
+samples, emitted C, each `report.txt` and the gate logs are kept in the
+main checkout's ignored `build/resource-loans-hardening/`: `port/` holds
+these runs, and `final/` and `first-round/` the runs on the earlier base.
+
+| Lines (added / deleted / net) | Production | Tests |
+| --- | ---: | ---: |
+| Fail closed | 323 / 297 / +26 | 153 / 0 / +153 |
+| Scoped promises | 132 / 121 / +11 | 41 / 0 / +41 |
+| Diagnostics, library, documents | 142 / 113 / +29 | 109 / 46 / +63 |
+| Total | 542 / 476 / +66 | 298 / 41 / +257 |
+
+Documents are counted separately. Production is inside the corrected +70
+ceiling and both cost ceilings hold. Gates on the third commit:
+`make -C blorp test` (2,968 callbacks), `make -C blorp test-e2e
+INSTRUCTION_CHECK=on` (1,079 callbacks), `scripts/blorp-fixpoint --prove`
+(seed, A, B and C emit identical C; 749/749 fixtures match), the bootstrap
+tests (38/38), `git diff --check` and `blorp format --check` on every
+changed `.brp` file all pass, and `make -C blorp test` passes on the first
+and second commits alone. Their logs are in `port/gates/` beside the
+samples.

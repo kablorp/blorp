@@ -629,20 +629,23 @@ func during_read(reader: Reader) -> Void:
     invoke(read_more)
 ```
 
-`scoped` belongs after a declared parameter's colon, before its callable type.
-It promises that the callable is used only during the call: it may be invoked
-or forwarded to another scoped parameter. A closure capturing a resource or a
-scoped callable is itself scoped; immutable local aliases preserve that fact.
-Scoped callables cannot be returned, stored in aggregates or mutable bindings,
-or passed to ordinary parameters. Pure functions and pure closures cannot receive
-or capture resources. These are synchronous loan restrictions, with no new
-runtime wrapper or automatic cleanup. The resource's owner must lend a valid
-value and close it correctly.
+`scoped` belongs after a declared function parameter's colon, before its
+callable type; on a result, field, lambda parameter or nested type it is a
+syntax error. It promises that the callable is used only during the call: it
+may be invoked or forwarded to another scoped parameter. A closure capturing
+a resource or a scoped callable is itself scoped; immutable local aliases
+preserve that fact. Scoped callables cannot be returned, stored in aggregates
+or mutable bindings, or passed to ordinary parameters. Pure functions and pure
+closures cannot receive or capture resources. These are synchronous loan
+restrictions, with no new runtime wrapper or automatic cleanup. The resource's
+owner must lend a valid value and close it correctly.
 
 The promise is on the declared parameter, not the general callable type.
 Saving `invoke` as an ordinary function value loses that promise, so an indirect
 call cannot pass a scoped closure. Trait requirements cannot declare scoped
-parameters. `private resource type` keeps the declaration inside its module.
+parameters. While every trait method must be pure, a resource type cannot
+implement a trait. `private resource type` keeps the declaration inside its
+module.
 
 `private` before a declaration keeps it inside its module: it cannot be
 imported or reached through an alias. A public function, field or payload

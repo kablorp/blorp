@@ -603,7 +603,8 @@ A caller that mixes operations writes its own error union and wraps with a
   unless it is empty.
 - `with_temporary_directory(parent, prefix, body, on_error)` makes a fresh
   directory (mode 0700) directly in `parent`, runs `body(directory)` with its
-  `Path` and removes the directory and its contents before returning. `prefix`
+  `Path` and removes the directory and its contents before returning. `body`
+  is `scoped`, so it may capture a lent `Reader` or `Writer`. `prefix`
   is a String; one that contains a NUL or a `/` is `InvalidPrefix`, and macOS
   replaces every trailing `X`. It is generic in the body's error type:
   `on_error` turns its own `TemporaryDirectoryError`, for creating and removing
