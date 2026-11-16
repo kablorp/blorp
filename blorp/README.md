@@ -572,18 +572,19 @@ may share a type's name; a type name is unique and cannot replace a base type.
 variants compiles to a C enum. Any other union is a tagged C struct stored
 inline that owns only its active variant's payload.
 
-A non-generic union may hold itself as one direct payload of a variant, at
-most one per variant, as in `Succ(Nat)`; that union is boxed. `Node(Tree, Tree)` or a generic `Next(Box[T])` reports
-"recursive aggregate types are not supported yet". It
-may also be recursive through records and Lists, as `Form` is through
-`Call(String, List[Expr])` in the
-[tree fixture](test/test_compile/fixtures/recursive/tree.brp). The rule is that values
-stored by value form no cycle: a union stores its payloads by value, while a
-record field, a List element and a union's one direct self payload are
-references a cycle may pass through. A cycle through unions alone (`A(B)` and
-`B(A)`, or `Node(Option[Node])`) and a generic declaration that applies itself
-to its own parameter (`Tree[T]: Node(List[Tree[T]])`) are rejected at the type
-that closes the cycle.
+A union may contain itself: directly, as in `Succ(Nat)`, `Node(Tree, Int,
+Tree)` or a generic `Link(T, Chain[T])`; through other unions, as `Even` and
+`Odd` do through `EvenNext(Odd)` and `OddNext(Even)`, or `Node` does through
+`Next(Option[Node])`; or through an opaque type. A union that contains itself
+is stored on the heap: each value is one reference-counted node, and the union
+is passed as a pointer to it. Every other union is stored inline, so
+`Option[Node]` above is an inline union holding a pointer. A union stores its
+payloads by value, while a record field, a List element and a callable are
+references, so a union that is recursive only through them, as `Form` is
+through `Call(String, List[Expr])` in the
+[tree fixture](test/test_compile/fixtures/recursive/tree.brp), is inline.
+Releasing a union value of any depth and shape uses bounded C stack, as a
+record's release does.
 
 `fixed union` is a union with the `fixed record` rules; its payloads may also
 be `Void`. `Bool` is declared this way.
@@ -865,7 +866,12 @@ arguments, then from a known expected result, and every parameter must be
 determined ("cannot infer the type parameter from the argument"). Each set of
 type arguments compiles to its own C function. A generic recursion that would
 need unboundedly many instances, by nesting a parameter inside a type
-application on each call, is rejected.
+application on each call, is rejected. The same holds for each record, union
+and opaque type, which compiles to one layout per set of type arguments: it
+may refer to itself, directly or through other types, with its parameters
+unchanged, permuted or replaced by concrete types, as in `Link(T, Chain[T])`,
+but `Nest(Nested[List[T]])` reports "recursive type grows its type arguments
+without bound".
 
 `[T: Orderable + Hashable]` bounds a parameter with traits joined by `+`. A
 record, union or opaque type may bound its parameters too, and the bound is

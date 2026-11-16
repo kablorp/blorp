@@ -771,7 +771,6 @@ private pure func variant_type(
 
 private pure func valid_union_layout(
     layout: ConcreteUnion,
-    position: Int,
     records: List[ConcreteRecord],
     unions: List[ConcreteUnion],
 ) -> Result[Void, Diagnostic]:
@@ -784,11 +783,8 @@ private pure func valid_union_layout(
     else:
         var invalid: Option[Diagnostic] = None
         var owning: Bool = False
-        var self_referencing: Bool = False
 
         for fields in variants:
-            var self_payloads = 0
-
             for value_type in fields:
                 valid: Bool = match value_type:
                     -- Every integer format is a plain scalar in a layout.
@@ -805,53 +801,25 @@ private pure func valid_union_layout(
                             None:
                                 False
                     UnionType(id):
-                        if id.union_number() == position:
-                            -- The unary recursive shape: a boxed node's pointer to
-                            -- at most one child of its own layout.
-                            self_referencing = True
-                            self_payloads = self_payloads + 1
+                        -- Any layout in range, this one included: a boxed child
+                        -- is a pointer edge, an inline child is stored by value,
+                        -- and the layout graph walk below proves the by-value
+                        -- edges acyclic. Definition order is the emitter's concern.
+                        match unions.get(id.union_number()):
+                            Some(child):
+                                match child:
+                                    OwningCases(_) | BoxedCases(_): owning = True
+                                    PlainCases(_): void
 
-                            match layout:
-                                BoxedCases(_):
-                                    if self_payloads > 1:
-                                        invalid = Some(
-                                            verification_error(
-                                                span,
-                                                "boxed union variant may store at most one self-reference",
-                                            ),
-                                        )
-                                PlainCases(_) | OwningCases(_):
-                                    invalid = Some(
-                                        verification_error(
-                                            span,
-                                            "recursive union payload requires the boxed representation",
-                                        ),
-                                    )
-
-                            True
-                        else:
-                            -- Any other layout in range: a boxed child is a pointer
-                            -- edge, an inline child is stored by value, and the
-                            -- layout graph walk below proves the by-value edges
-                            -- acyclic. Definition order is the emitter's concern.
-                            match unions.get(id.union_number()):
-                                Some(child):
-                                    match child:
-                                        OwningCases(_) | BoxedCases(_): owning = True
-                                        PlainCases(_): void
-
-                                    True
-                                None:
-                                    False
+                                True
+                            None:
+                                False
                     StringType:
                         owning = True
                         True
                     ListType(_) | CallableType(_, _):
                         owning = True
                         True
-
-                if invalid.is_some():
-                    break
 
                 if valid.not():
                     invalid = Some(
@@ -865,17 +833,11 @@ private pure func valid_union_layout(
             Some(error):
                 Err(error)
             None:
+                -- A boxed node owns its payloads whatever they are; an inline
+                -- union's summary must match them.
                 match layout:
                     BoxedCases(_):
-                        if self_referencing:
-                            Ok(void)
-                        else:
-                            Err(
-                                verification_error(
-                                    span,
-                                    "boxed union representation requires a self-referencing payload",
-                                ),
-                            )
+                        Ok(void)
                     PlainCases(_):
                         if owning:
                             Err(
@@ -4597,18 +4559,16 @@ pure func verify(program: OwnershipProgram) -> Result[VerifiedProgram, Diagnosti
                 invalid = Some(error)
                 break
 
-    var union_position = 0
-
     for layout in program.unions:
         if invalid.is_some():
             break
 
-        match layout.valid_union_layout(union_position, program.records, program.unions):
+        match layout.valid_union_layout(program.records, program.unions):
             Err(error):
                 invalid = Some(error)
                 break
             Ok(_):
-                union_position = union_position + 1
+                void
 
     layout_order: List[AggregateDefinition] ?= match invalid:
         Some(error): Err(error)

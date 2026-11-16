@@ -586,7 +586,6 @@ run_one() {
         done
         case "$name" in
             list_ops|compiler_emit) notes="${notes:+$notes }(provisional: current libraries)" ;;
-            compiler_ast|binary_trees) notes="${notes:+$notes }(provisional: representations differ)" ;;
         esac
         # A speedup is that language's elapsed time divided by Blorp's: a value
         # above 1.0x means Blorp was faster.

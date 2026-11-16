@@ -19,7 +19,13 @@ import:
         aggregate_order,
         verified_contents,
         verify,
-    ../../../support/aggregate_order_inputs: DIAMOND, EMPTY_CATALOGUES, MIXED, ROOTS, owned
+    ../../../support/aggregate_order_inputs:
+        DIAMOND,
+        EMPTY_CATALOGUES,
+        MIXED,
+        ROOTS,
+        SELF_CONTAINING,
+        owned,
 
 
 private pure func verified(source: String) -> Option[VerifiedProgram]:
@@ -211,11 +217,7 @@ pure func test_boxed_and_managed_layouts_are_still_listed() -> Bool:
             False
         Some(program):
             contents = verified_contents(program)
-            boxed = contents.unions.any(pure func(layout: specialized.ConcreteUnion) -> Bool:
-                match layout:
-                    specialized.BoxedCases(_): True
-                    _: False
-            )
+            boxed = contents.unions.any(is_boxed)
             managed = contents.records.any(pure func(layout: specialized.ConcreteRecord) -> Bool:
                 match layout:
                     specialized.CountedFields(_): True
@@ -224,6 +226,60 @@ pure func test_boxed_and_managed_layouts_are_still_listed() -> Bool:
             boxed
                 .and(managed)
                 .and(well_ordered(program))
+
+
+private pure func is_boxed(layout: specialized.ConcreteUnion) -> Bool:
+    match layout:
+        specialized.BoxedCases(_): True
+        _: False
+
+
+-- Tree, Even, Odd and Chain are boxed: Tree with two payloads of its own,
+-- Even and Odd with none, each reaching itself only through the other.
+-- Holder[Chain] stays inline and is defined before Chain's node.
+pure func test_unions_that_contain_themselves_are_boxed_and_ordered() -> Bool:
+    match verified(SELF_CONTAINING):
+        None:
+            False
+        Some(program):
+            unions = verified_contents(program).unions
+            boxed_count = unions
+                .filter(is_boxed)
+                .length()
+            (unions.length() == 5)
+                .and(boxed_count == 4)
+                .and(well_ordered(program))
+
+
+-- Laid out inline, the same unions are a by-value cycle: the cycle walk, not
+-- a rule about self payloads, is what rejects them.
+pure func test_unions_that_contain_themselves_are_rejected_inline() -> Bool:
+    rewritten: Option[own.OwnershipProgram] = match owned(SELF_CONTAINING):
+        Ok(program):
+            Some(
+                { program |
+                    unions = program.unions.map(
+                        pure func(layout: specialized.ConcreteUnion) -> specialized.ConcreteUnion:
+                            match layout:
+                                specialized.BoxedCases(variants): specialized.OwningCases(variants)
+                                _: layout
+                    ),
+                },
+            )
+        Err(_):
+            None
+    match rewritten:
+        None:
+            False
+        Some(program):
+            match verify(program):
+                Ok(_):
+                    False
+                Err(error):
+                    (
+                        error.message
+                        == "ownership verification failed: aggregate layouts form a by-value cycle"
+                    )
 
 
 -- Leaf is the diamond's only record of one Int, and Top its only record of
@@ -285,5 +341,13 @@ TESTS: TestSuite = {
             test_boxed_and_managed_layouts_are_still_listed,
         ),
         ("a by-value cycle is rejected", test_by_value_cycle_is_rejected),
+        (
+            "unions that contain themselves are boxed and ordered",
+            test_unions_that_contain_themselves_are_boxed_and_ordered,
+        ),
+        (
+            "unions that contain themselves are rejected inline",
+            test_unions_that_contain_themselves_are_rejected_inline,
+        ),
     ],
 }

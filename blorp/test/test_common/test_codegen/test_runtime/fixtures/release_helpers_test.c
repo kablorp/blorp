@@ -4,9 +4,10 @@
    the C names only after checking the program's typed catalogue: record 0 is
    `Node { value: Int, next: Option[Node] }`, record 1 is
    `Branch { value: Int, children: List[Branch] }`, union 0 is `Option[Node]`
-   stored inline (variant 0 `Some`, variant 1 `None`) and union 1 is the boxed
-   `Nat` (variant 0 `Zero`, variant 1 `Succ`). Each mode prints how many
-   values it built; the suite runs it under the strict leak check. */
+   stored inline (variant 0 `Some`, variant 1 `None`), union 1 is the boxed
+   `Nat` (variant 0 `Zero`, variant 1 `Succ`) and union 2 is the boxed `Tree`
+   (variant 0 `Leaf`, variant 1 `Fork(Tree, Int, Tree)`). Each mode prints how
+   many values it built; the suite runs it under the strict leak check. */
 #include "release_memory.c"
 #include "release_values.c"
 #include <pthread.h>
@@ -52,6 +53,21 @@ static void boxed_chain(void){
     blorp_union_drop_1(head);
 }
 
+/* A left spine of `Fork` nodes, each holding the spine so far on its left
+   and one shared `Leaf` on its right: both of a node's own payloads release. */
+static void tree_left_spine(void){
+    struct blorp_u_2 *leaf=blorp_union_make_2((struct blorp_u_2){.tag=blorp_v_2_0});
+    struct blorp_u_2 *head=blorp_union_make_2((struct blorp_u_2){.tag=blorp_v_2_0});
+    built++;
+    for(int64_t index=1;index<DEPTH;index++){
+        blorp_union_dup_2(leaf);
+        head=blorp_union_make_2((struct blorp_u_2){.tag=blorp_v_2_1,.payload.blorp_up_1={head,index,leaf}});
+        built++;
+    }
+    blorp_union_drop_2(leaf);
+    blorp_union_drop_2(head);
+}
+
 struct release_job {void (*release)(void);};
 
 static void *run(void *job){
@@ -80,6 +96,7 @@ int main(int argc,char **argv){
     if(strcmp(mode,"record-chain")==0)status=on_small_stack(record_chain);
     else if(strcmp(mode,"list-chain")==0)status=on_small_stack(list_chain);
     else if(strcmp(mode,"boxed-chain")==0)status=on_small_stack(boxed_chain);
+    else if(strcmp(mode,"tree-left-spine")==0)status=on_small_stack(tree_left_spine);
     else return 2;
     if(status!=0)return status;
     return blorp_memory_finish(0);

@@ -109,6 +109,13 @@ done.
   - **Next:** lifting the one-self-payload rule, which no longer protects
     release; it waits for the recursive-unions decision.
 
+- **Recursive unions:** [`RECURSIVE_UNIONS_PLAN.md`](RECURSIVE_UNIONS_PLAN.md).
+  - **Status:** approved by Keith on 2026-11-16 and landed, after deep
+    release: Check classifies each union that contains itself and
+    specialization stores it on the heap, and a generic type may recurse
+    unless its arguments grow.
+  - **Follow-ups:** records by value joins the same classification.
+
 ## Smaller follow-ups
 
 None of these is planned yet. Each wants its own short design or brief.

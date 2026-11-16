@@ -243,16 +243,17 @@ union TypeRef:
     UnionType(UnionInstanceId)
 
 
--- A union naming itself as a payload has no finite inline storage, so every
--- value of it is a counted heap node and the self payload is a pointer edge.
+-- A union declaration that contains itself has no finite inline storage, so
+-- every value of every instance of it is a counted heap node and every
+-- reference to it is a pointer edge.
 private fixed union UnionRepresentation:
     InlineUnmanaged
     InlineOwningPayload
     BoxedRecursive
 
 
--- Complete storage; the case is derived once from every child. A
--- BoxedCases layout's own instance appears among its payloads.
+-- Complete storage; the case is derived once from every child, except that
+-- every instance of a declaration that contains itself is BoxedCases.
 union ConcreteUnion:
     PlainCases(List[List[TypeRef]])
     OwningCases(List[List[TypeRef]])
@@ -1942,7 +1943,6 @@ private pure func prepare_union(
     )
     var variants: List[List[PartialType]] = []
     var owning: Bool = False
-    var self_referencing: Bool = False
     var failure: Option[Diagnostic] = None
 
     for variant in declaration.variants:
@@ -1964,13 +1964,6 @@ private pure func prepare_union(
                     record_dependencies = prepared.records
                     layouts = prepared.in_progress
                     fields = fields.append(prepared.value_type)
-                    -- The union's own direct payload is the boxed unary shape.
-                    match prepared.value_type:
-                        PendingUnionType(other):
-                            if other == key:
-                                self_referencing = True
-                        _:
-                            void
                     match prepared.value_type.payload_owns_children(
                         dependencies,
                         record_dependencies,
@@ -1989,9 +1982,10 @@ private pure func prepare_union(
         Some(error): Err(error)
         None: Ok(void)
 
-    -- A self-referencing union is boxed whatever else it stores; the
-    -- box owns every payload. Otherwise an owning child makes it owning.
-    representation: UnionRepresentation = if self_referencing:
+    -- An instance of a declaration that contains itself, as Check classified
+    -- it, is boxed whatever else it stores; the box owns every payload.
+    -- Otherwise an owning child makes it owning.
+    representation: UnionRepresentation = if declaration.contains_itself:
         BoxedRecursive
     else if owning:
         InlineOwningPayload
@@ -2010,7 +2004,7 @@ private pure func prepare_union(
 
     -- Children complete before their parent, so the parent takes the
     -- next identity; only references back to layouts still on the
-    -- path, including its own direct self payload, remain to fill.
+    -- path, including its own self payloads, remain to fill.
     id: UnionInstanceId = into_opaque UnionInstanceId(dependencies.entries.length())
     slot ?= settle_union({ key = key, variants = variants, representation = representation }, span)
     digest ?= key.slot_union_digest(dependencies, record_dependencies, span)

@@ -57,11 +57,9 @@ other language. The `vs C`, `vs Go`,
 `vs OCaml` and `vs Py` notes are that language's elapsed time divided by Blorp's,
 so a value above 1.0x means Blorp was faster.
 
-The tree and AST ports use a managed record containing an inline union, matching
-the supported recursive-data idiom. Every logical node, including a leaf, has
-one managed record root; there is no additional union box. The logical trees,
-construction counts and child evaluation order stay the same, but the storage
-representation differs. Their Blorp comparisons are marked provisional.
+The tree and AST ports declare their trees as unions that contain themselves,
+which Blorp stores on the heap, one counted node per tree node, leaves
+included.
 
 `list_ops` and `compiler_emit` compare the current libraries as well as code
 generation. Blorp List updates copy, its filter/reverse/sort helpers use

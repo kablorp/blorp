@@ -1,0 +1,202 @@
+---
+Specialization boxes exactly the unions Check classified as containing
+themselves, at every instance, and lays out every other union inline from
+its payloads, a carrier of a boxed union included.
+---
+import:
+    bool: and
+    result: map_err
+    test: TestSuite
+    ../../../../src/common/analysis/check/check: check
+    ../../../../src/common/codegen/specialize/specialize as specialized
+    ../../../../src/common/syntax/lex: lex
+    ../../../../src/common/syntax/names: program_names
+    ../../../../src/common/syntax/source: module_source, root_module_id
+    ../../../../src/common/syntax/syntax: Diagnostic, IntegerFormat(Int64Format)
+    ../../../support/input: parse, setup_diagnostic
+
+
+private pure func specialized_unions(source: String) -> Option[List[specialized.ConcreteUnion]]:
+    match lex(module_source(root_module_id()), source, program_names().names):
+        Err(_):
+            None
+        Ok(tokens):
+            match parse(tokens):
+                Err(_):
+                    None
+                Ok(parsed):
+                    match check(parsed).map_err(setup_diagnostic):
+                        Err(_):
+                            None
+                        Ok(checked):
+                            match specialized.specialize(checked):
+                                Err(_): None
+                                Ok(program): Some(specialized.specialized_contents(program).unions)
+
+
+private pure func boxed(layout: specialized.ConcreteUnion) -> Bool:
+    match layout:
+        specialized.BoxedCases(_): True
+        _: False
+
+
+-- A layout's payload that is a union, as that union's catalogue position.
+private pure func union_positions(fields: List[specialized.TypeRef]) -> List[Int]:
+    var positions: List[Int] = []
+    for field in fields:
+        match field:
+            specialized.UnionType(id): positions = positions.append(specialized.union_number(id))
+            _: void
+    positions
+
+
+pure func test_two_self_payloads_are_one_boxed_layout() -> Bool:
+    source: String =
+        |union Tree:
+        |	Leaf
+        |	Node(Tree, Int, Tree)
+        |pure func keep(tree: Tree) -> Int:
+        |	0
+        |func main() -> Int:
+        |	keep(Node(Leaf, 1, Leaf))
+        |
+
+    match specialized_unions(source):
+        Some([tree]):
+            match specialized.union_variants(tree):
+                [[], [specialized.UnionType(left), specialized.IntegerType(Int64Format), specialized.UnionType(right)]]:
+                    tree
+                        .boxed()
+                        .and(specialized.union_number(left) == 0)
+                        .and(specialized.union_number(right) == 0)
+                _:
+                    False
+        _:
+            False
+
+
+-- Node is boxed; Holder[Node] stays an inline union that owns a pointer to it.
+pure func test_a_generic_carrier_stays_inline_around_a_boxed_union() -> Bool:
+    source: String =
+        |union Holder[T]:
+        |	Held(T)
+        |	Empty
+        |union Node:
+        |	Stop(Int)
+        |	Next(Holder[Node])
+        |pure func keep(node: Node) -> Int:
+        |	0
+        |func main() -> Int:
+        |	keep(Next(Held(Stop(1))))
+        |
+
+    match specialized_unions(source):
+        Some([holder, node]):
+            match holder:
+                specialized.OwningCases(variants):
+                    match variants:
+                        [held, []]:
+                            node
+                                .boxed()
+                                .and(held.union_positions() == [1])
+                        _:
+                            False
+                _:
+                    False
+        _:
+            False
+
+
+pure func test_each_union_of_a_mutual_cycle_is_boxed() -> Bool:
+    source: String =
+        |union Even:
+        |	Zero
+        |	Next(Odd)
+        |union Odd:
+        |	Back(Even)
+        |pure func keep(value: Even) -> Int:
+        |	0
+        |func main() -> Int:
+        |	keep(Next(Back(Zero)))
+        |
+
+    match specialized_unions(source):
+        Some([first, second]):
+            first
+                .boxed()
+                .and(second.boxed())
+        _:
+            False
+
+
+pure func test_every_instance_of_a_generic_recursive_union_is_boxed() -> Bool:
+    source: String =
+        |union Chain[T]:
+        |	End
+        |	Link(T, Chain[T])
+        |pure func keep(numbers: Chain[Int], words: Chain[String]) -> Int:
+        |	0
+        |func main() -> Int:
+        |	keep(Link(1, End), Link("one", End))
+        |
+
+    match specialized_unions(source):
+        Some([numbers, words]):
+            match specialized.union_variants(numbers):
+                [[], [specialized.IntegerType(Int64Format), specialized.UnionType(own_number)]]:
+                    match specialized.union_variants(words):
+                        [[], [specialized.StringType, specialized.UnionType(own_word)]]:
+                            numbers
+                                .boxed()
+                                .and(words.boxed())
+                                .and(specialized.union_number(own_number) == 0)
+                                .and(specialized.union_number(own_word) == 1)
+                        _:
+                            False
+                _:
+                    False
+        _:
+            False
+
+
+pure func test_a_union_holding_a_boxed_union_stays_inline() -> Bool:
+    source: String =
+        |union Nat:
+        |	Zero
+        |	Succ(Nat)
+        |union Count:
+        |	Counted(Nat)
+        |pure func keep(count: Count) -> Int:
+        |	0
+        |func main() -> Int:
+        |	keep(Counted(Succ(Zero)))
+        |
+
+    match specialized_unions(source):
+        Some([nat, count]):
+            match count:
+                specialized.OwningCases(_): nat.boxed()
+                _: False
+        _:
+            False
+
+
+TESTS: TestSuite = {
+    description = "Specialized storage of unions that contain themselves",
+    tests = [
+        ("two self payloads are one boxed layout", test_two_self_payloads_are_one_boxed_layout),
+        (
+            "a generic carrier stays inline around a boxed union",
+            test_a_generic_carrier_stays_inline_around_a_boxed_union,
+        ),
+        ("each union of a mutual cycle is boxed", test_each_union_of_a_mutual_cycle_is_boxed),
+        (
+            "every instance of a generic recursive union is boxed",
+            test_every_instance_of_a_generic_recursive_union_is_boxed,
+        ),
+        (
+            "a union holding a boxed union stays inline",
+            test_a_union_holding_a_boxed_union_stays_inline,
+        ),
+    ],
+}

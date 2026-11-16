@@ -1,0 +1,145 @@
+---
+A boxed union's node may hold several payloads of its own layout. The C probe
+builds trees through the generated constructor, shares and retains subtrees
+through the generated acquire, and releases them through the generated drop,
+recording each allocation so that every node must be freed exactly once and
+only after its last owner.
+---
+import:
+    bool: and
+    result: Result methods
+    test: TestSuite
+    ../../../../src/common/codegen/emit/emit: aggregate_runtime
+    ../../../../src/common/codegen/own/own: own
+    ../../../../src/common/codegen/runtime/memory: MEMORY_RUNTIME
+    ../../../../src/common/codegen/runtime/string: string_runtime
+    ../../../../src/common/codegen/specialize/specialize as specialized
+    ../../../../src/common/codegen/verify/verify: verify, verified_contents, VerifiedProgram
+    ../../../../src/common/syntax/syntax: IntegerFormat(Int64Format)
+    ../../../driver/file_access: write_file
+    ../../../driver/harness: isolated, run_expecting, strict_leak_check
+    ../../../driver/reports: verify_accounting
+    ../../../support/list_update_inputs: lowered
+
+
+private BUILD_TIMEOUT_MS: Int = 600000
+private PROBE_TIMEOUT_MS: Int = 10000
+
+
+private PROBE_SOURCE: String = "blorp/test/test_common/test_codegen/test_runtime/fixtures/recursive_union_test.c"
+
+
+-- Only the public phases establish the boxed layout. The C probe includes its
+-- runtime fragment and never a generated language function.
+private SOURCE: String =
+    |union Tree:
+    |    Leaf
+    |    Node(Tree, Int, Tree)
+    |func main() -> Int:
+    |    tree: Tree = Node(Leaf, 1, Leaf)
+    |    0
+    |
+
+
+-- The probe's C names are admitted only after this typed catalogue: one boxed
+-- union whose node holds two payloads of its own layout.
+private pure func catalogue(program: VerifiedProgram) -> Bool:
+    match verified_contents(program).unions:
+        [tree]:
+            match tree:
+                specialized.BoxedCases([[], [specialized.UnionType(_), specialized.IntegerType(Int64Format), specialized.UnionType(_)]]):
+                    True
+                _:
+                    False
+        _:
+            False
+
+
+private func ready(c_compiler: String, directory: String) -> Result[String, String]:
+    program ?= lowered(SOURCE)
+        .and_then(own)
+        .and_then(verify)
+        .map_err(pure func(error): error.message + "; " + error.help)
+    _: Void ?= if catalogue(program):
+        Ok(void)
+    else:
+        Err("recursive union concrete catalogue differs")
+    aggregates ?= aggregate_runtime(program).map_err(
+        pure func(error): error.message + "; " + error.help,
+    )
+    _ ?= write_file(directory + "/tree_memory.c", MEMORY_RUNTIME)
+    _ ?= write_file(directory + "/tree_values.c", (string_runtime() + aggregates) + "\n")
+    executable = directory + "/recursive_union_probe"
+    build ?= isolated(
+        c_compiler,
+        [
+            "-std=c11",
+            "-O0",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            "-pedantic",
+            "-fsanitize=address,undefined",
+            "-fno-sanitize-recover=all",
+            "-DBLORP_MEMORY_DIAGNOSTICS=1",
+            "-I",
+            directory,
+            PROBE_SOURCE,
+            "-o",
+            executable,
+        ],
+        BUILD_TIMEOUT_MS,
+    )
+    built ?= run_expecting("recursive union native build", build, 0)
+    if and(built.stdout == "", built.stderr == ""):
+        Ok(executable)
+    else:
+        Err("recursive union native build: " + built.stderr)
+
+
+-- Runs the probe in `mode` with strict leak checking; it must exit 0, print
+-- nothing and report balanced allocations.
+private func probe(executable: String, mode: String) -> Result[Void, String]:
+    run ?= isolated(executable, [mode], PROBE_TIMEOUT_MS)
+    ran ?= run_expecting("recursive union " + mode, { run | environment = strict_leak_check() }, 0)
+    if ran.stdout == "":
+        verify_accounting(ran.stderr, False)
+    else:
+        Err("recursive union " + mode + " wrote stdout: " + ran.stdout)
+
+
+private func reported(result: Result[Void, String]) -> Bool:
+    match result:
+        Ok(_):
+            True
+        Err(error):
+            print_error(error)
+            False
+
+
+func suite(c_compiler: String, directory: String) -> TestSuite:
+    match ready(c_compiler, directory):
+        Err(error):
+            print_error(error)
+            {
+                description = "Recursive union release setup",
+                tests = [("native runtime probe builds", func(): False)],
+            }
+        Ok(executable):
+            {
+                description = "Recursive union release",
+                tests = [
+                    (
+                        "a subtree under both payloads is freed once, after its last owner",
+                        func(): reported(probe(executable, "shared")),
+                    ),
+                    (
+                        "a retained subtree outlives its released parent",
+                        func(): reported(probe(executable, "retained")),
+                    ),
+                    (
+                        "left and right spines free every node once",
+                        func(): reported(probe(executable, "spines")),
+                    ),
+                ],
+            }

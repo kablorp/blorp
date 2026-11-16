@@ -1,0 +1,208 @@
+---
+A union contains itself when its payloads, followed through the payloads of
+the unions and the underlying types of the opaque types it stores by value,
+reach it again; Check publishes that on every union, and specialization
+stores such a union on the heap. A record, a List or a callable is a pointer
+and makes no union contain itself. A generic declaration may reach itself
+with its type parameters unchanged, permuted or replaced by closed types; an
+argument that grows on the way is rejected.
+---
+import:
+    bool: and
+    option: Option methods
+    test: TestSuite
+    ../../../../src/common/analysis/check/check: check, checked_functions
+    ../../../../src/common/analysis/check/render: render_failure
+    ../../../../src/common/syntax/source: module_source, root_module_id
+    ../../../support/module_input: parse_modules
+
+
+private ENTRY: String = "func main() -> Int:\n    0\n"
+private GROWING: String = "recursive type grows its type arguments without bound"
+
+
+private GROWING_HELP: String = "refer to the type with its type parameters unchanged, permuted or replaced by concrete types, as in Link(T, Chain[T])"
+
+
+-- Whether each union the program declares contains itself, in declaration
+-- order, when the program is accepted; the foundation's unions are left out.
+private pure func containing(declarations: String) -> Option[List[Bool]]:
+    match parse_modules([{ source = declarations + ENTRY, targets = [] }]):
+        Err(_):
+            None
+        Ok(parsed):
+            match check(parsed):
+                Err(_):
+                    None
+                Ok(accepted):
+                    var flags: List[Bool] = []
+                    for declaration in checked_functions(accepted).unions:
+                        if declaration.name.span.source == module_source(root_module_id()):
+                            flags = flags.append(declaration.contains_itself)
+                    Some(flags)
+
+
+private pure func rejects_growth(declarations: String, start: Int, end: Int) -> Bool:
+    match parse_modules([{ source = declarations + ENTRY, targets = [] }]):
+        Err(_):
+            False
+        Ok(parsed):
+            match check(parsed):
+                Ok(_):
+                    False
+                Err(failure):
+                    rendered = render_failure(failure).first
+                    (rendered.span.source == module_source(root_module_id()))
+                        .and(rendered.span.start == start)
+                        .and(rendered.span.end == end)
+                        .and(rendered.message == GROWING)
+                        .and(rendered.help == GROWING_HELP)
+                        .and(rendered.note.is_none())
+
+
+pure func test_two_self_payloads_contain_their_union() -> Bool:
+    containing("union Tree:\n    Leaf\n    Node(Tree, Int, Tree)\n") == Some([True])
+
+
+pure func test_a_generic_self_payload_contains_its_union() -> Bool:
+    containing("union Chain[T]:\n    End\n    Link(T, Chain[T])\n") == Some([True])
+
+
+pure func test_each_union_of_a_mutual_cycle_contains_itself() -> Bool:
+    (
+        containing("union Even:\n    Zero\n    Next(Odd)\nunion Odd:\n    Back(Even)\n")
+        == Some([True, True])
+    )
+
+
+-- A cycle through three unions, with a fourth that only holds one of them.
+pure func test_each_union_of_a_three_union_cycle_contains_itself() -> Bool:
+    (
+        containing(
+            "union Red:\n    Stop\n    ToGreen(Green)\nunion Green:\n    ToBlue(Blue)\nunion Blue:\n    ToRed(Red)\nunion Lamp:\n    Lit(Green)\n",
+        )
+        == Some([True, True, True, False])
+    )
+
+
+-- The generic carrier holds its argument by value but never itself, so only
+-- the union that writes the cycle contains itself.
+pure func test_a_cycle_through_a_generic_carrier_contains_only_its_writer() -> Bool:
+    (
+        containing(
+            "union Holder[T]:\n    Held(T)\n    Empty\nunion Node:\n    Stop(Int)\n    Next(Holder[Node])\n",
+        )
+        == Some([False, True])
+    )
+
+
+pure func test_a_cycle_through_an_opaque_type_contains_its_union() -> Bool:
+    (
+        containing(
+            "opaque type Box[V] = V\nunion Wrapped:\n    Bare\n    Wrap(Box[Wrapped], Box[Wrapped])\n",
+        )
+        == Some([True])
+    )
+
+
+pure func test_records_lists_and_callables_are_pointers() -> Bool:
+    (
+        containing(
+            "union Form:\n    Leaf(Int)\n    Call(String, List[Form])\nunion Expr:\n    Lit(Int)\n    Neg(Holder)\nrecord Holder {\n    expr: Expr,\n}\nunion Step:\n    Done\n    Then((Int) -> Step)\n",
+        )
+        == Some([False, False, False])
+    )
+
+
+-- A phantom parameter stores nothing, and an opaque type over Int stores an Int.
+pure func test_phantom_and_erased_arguments_store_nothing() -> Bool:
+    (
+        containing(
+            "union Tag[T]:\n    Mark\nopaque type Id[T] = Int\nunion Node:\n    Tagged(Tag[Node])\n    Named(Id[Node])\n",
+        )
+        == Some([False, False])
+    )
+
+
+pure func test_a_union_holding_a_recursive_union_does_not_contain_itself() -> Bool:
+    (
+        containing("union Nat:\n    Zero\n    Succ(Nat)\nunion Count:\n    Counted(Nat)\n")
+        == Some([True, False])
+    )
+
+
+pure func test_constant_and_permuted_arguments_are_finite() -> Bool:
+    (
+        containing(
+            "union Constant[T]:\n    Value(T)\n    Reset(Constant[Int])\nunion Swap[A, B]:\n    Pair(A, B)\n    Swapped(Swap[B, A])\n",
+        )
+        == Some([True, True])
+    )
+
+
+pure func test_a_growing_self_application_is_rejected() -> Bool:
+    rejects_growth("union Nested[T]:\n    Flat(T)\n    Nest(Nested[List[T]])\n", 38, 53)
+
+
+pure func test_growth_around_a_mutual_cycle_is_rejected_where_it_grows() -> Bool:
+    rejects_growth(
+        "union Grows[T]:\n    Seed(T)\n    Deeper(Shrinks[List[T]])\nunion Shrinks[U]:\n    Back(Grows[U])\n",
+        39,
+        55,
+    )
+
+
+-- Growth behind a List still needs a layout per level, so a record field
+-- counts as much as a payload.
+pure func test_growth_through_a_list_field_is_rejected() -> Bool:
+    rejects_growth("record Grow[T] {\n    next: List[Grow[List[T]]],\n}\n", 27, 46)
+
+
+TESTS: TestSuite = {
+    description = "Unions that contain themselves and finite generic recursion",
+    tests = [
+        ("two self payloads contain their union", test_two_self_payloads_contain_their_union),
+        (
+            "a generic self payload contains its union",
+            test_a_generic_self_payload_contains_its_union,
+        ),
+        (
+            "each union of a mutual cycle contains itself",
+            test_each_union_of_a_mutual_cycle_contains_itself,
+        ),
+        (
+            "each union of a three-union cycle contains itself",
+            test_each_union_of_a_three_union_cycle_contains_itself,
+        ),
+        (
+            "a cycle through a generic carrier contains only the union that writes it",
+            test_a_cycle_through_a_generic_carrier_contains_only_its_writer,
+        ),
+        (
+            "a cycle through an opaque type contains its union",
+            test_a_cycle_through_an_opaque_type_contains_its_union,
+        ),
+        (
+            "records, Lists and callables are pointers",
+            test_records_lists_and_callables_are_pointers,
+        ),
+        (
+            "phantom and erased arguments store nothing",
+            test_phantom_and_erased_arguments_store_nothing,
+        ),
+        (
+            "a union holding a recursive union does not contain itself",
+            test_a_union_holding_a_recursive_union_does_not_contain_itself,
+        ),
+        (
+            "constant and permuted arguments are finite",
+            test_constant_and_permuted_arguments_are_finite,
+        ),
+        ("a growing self application is rejected", test_a_growing_self_application_is_rejected),
+        (
+            "growth around a mutual cycle is rejected where it grows",
+            test_growth_around_a_mutual_cycle_is_rejected_where_it_grows,
+        ),
+        ("growth through a List field is rejected", test_growth_through_a_list_field_is_rejected),
+    ],
+}

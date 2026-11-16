@@ -35,43 +35,60 @@ private HELPERS_PROBE_SOURCE: String = "blorp/test/test_common/test_codegen/test
 
 
 -- Every recursive shape the helpers probe builds: a record through an inline
--- union, a record through a List, and a boxed union.
+-- union, a record through a List, a boxed union, and a boxed union with two
+-- payloads of its own type.
 private HELPERS_SOURCE: String =
     |record Node { value: Int, next: Option[Node] }
     |record Branch { value: Int, children: List[Branch] }
     |union Nat:
     |    Zero
     |    Succ(Nat)
-    |pure func keep(value: Int, node: Node, branch: Branch, nat: Nat) -> Int:
+    |union Tree:
+    |    Leaf
+    |    Fork(Tree, Int, Tree)
+    |pure func keep(value: Int, node: Node, branch: Branch, nat: Nat, tree: Tree) -> Int:
     |    value
     |func main() -> Int:
     |    node: Node = { value = 1, next = None }
     |    branch: Branch = { value = 2, children = [] }
-    |    keep(0, node, branch, Succ(Zero))
+    |    keep(0, node, branch, Succ(Zero), Fork(Leaf, 3, Leaf))
     |
 
 
 -- The helpers probe's C names are admitted only after this typed catalogue:
--- record 0 is Node, record 1 Branch, union 0 the inline Option[Node] and
--- union 1 the boxed Nat.
+-- record 0 is Node, record 1 Branch, union 0 the inline Option[Node], union 1
+-- the boxed Nat and union 2 the boxed Tree.
 private pure func catalogue(program: VerifiedProgram) -> Bool:
     contents = verified_contents(program)
     match (contents.records, contents.unions):
-        ([specialized.CountedFields(node), specialized.CountedFields(branch)], [specialized.OwningCases(option), specialized.BoxedCases(nat)]):
+        ([specialized.CountedFields(node), specialized.CountedFields(branch)], [specialized.OwningCases(option), specialized.BoxedCases(nat), specialized.BoxedCases(tree)]):
             match (node, branch, option, nat):
                 ([specialized.IntegerType(Int64Format), specialized.UnionType(next)], [specialized.IntegerType(Int64Format), specialized.ListType(specialized.RecordType(child))], [[specialized.RecordType(some)], []], [[], [specialized.UnionType(succ)]]):
                     and(
                         and(
-                            specialized.union_number(next) == 0,
-                            specialized.record_number(child) == 1,
+                            and(
+                                specialized.union_number(next) == 0,
+                                specialized.record_number(child) == 1,
+                            ),
+                            and(
+                                specialized.record_number(some) == 0,
+                                specialized.union_number(succ) == 1,
+                            ),
                         ),
-                        and(
-                            specialized.record_number(some) == 0,
-                            specialized.union_number(succ) == 1,
-                        ),
+                        two_own_payloads(tree, 2),
                     )
                 _:
                     False
+        _:
+            False
+
+
+-- Whether `layout`'s variants are a bare one and one holding two payloads of
+-- union `itself` around an Int.
+private pure func two_own_payloads(layout: List[List[specialized.TypeRef]], itself: Int) -> Bool:
+    match layout:
+        [[], [specialized.UnionType(left), specialized.IntegerType(Int64Format), specialized.UnionType(right)]]:
+            and(specialized.union_number(left) == itself, specialized.union_number(right) == itself)
         _:
             False
 
@@ -219,6 +236,10 @@ func suite(c_compiler: String, directory: String) -> TestSuite:
                     (
                         "emitted helpers release a million boxed union nodes on a small stack",
                         func(): released(helpers, "boxed-chain", BUILT),
+                    ),
+                    (
+                        "emitted helpers release a million-deep left spine of a tree with two own payloads on a small stack",
+                        func(): released(helpers, "tree-left-spine", BUILT),
                     ),
                 ],
             }

@@ -5,7 +5,6 @@ against the frozen namespace, including declared type parameters.
 import:
     bool: Bool methods
     int: Int methods
-    list: repeat
     option: Option methods
     result: Result methods
     ../../syntax/names: NameId
@@ -20,7 +19,7 @@ import:
         TypeSyntax(TupleTypeSyntax, AtomicType, AppliedType, QualifiedType, CallableTypeSyntax),
         WrittenName,
         Visibility(Private, Public),
-    ../../utils/results: first_error
+    ../../utils/results: first_error, translated_list
     ../../utils/stack: push_at
     ../assemble: ParsedContents
     ../ids:
@@ -54,7 +53,7 @@ import:
             DuplicateRecordField,
             DuplicateTypeParameter,
             TypeParameterTypeNameConflict,
-            RecursiveAggregateType,
+            GrowingRecursiveType,
             RecursiveOpaqueRepresentation,
             NonFixedPayload,
             NonFixedField,
@@ -78,6 +77,7 @@ import:
         trait_error,
         type_declaration_error,
         type_term_error,
+    ./instantiation_paths: InstantiationPath, PathOperation(KeepPath), strong_components
     ./model:
         CheckedField,
         CheckedRecord,
@@ -87,7 +87,13 @@ import:
         LocatedTrait,
         TraitRequirement,
         TypeParameterId,
-        TypeParameterOwner(UnionDeclaration, RecordDeclaration, OpaqueDeclaration),
+        TypeParameterOwner(
+            TraitDeclaration,
+            FunctionDeclaration,
+            UnionDeclaration,
+            RecordDeclaration,
+            OpaqueDeclaration,
+        ),
         TypeRef(
             TupleType,
             CallableType,
@@ -103,7 +109,7 @@ import:
         NominalId(AggregateNominal, OpaqueNominal),
         TypeUse,
         UnionOccurrence,
-        contains_parameter,
+        aggregate_owner,
         field_id,
         primitive_ref,
         type_parameter_id,
@@ -674,6 +680,34 @@ record DeclaredTypes {
 }
 
 
+-- A union declaration with its annotations resolved, before
+-- validate_finite_declarations classifies its storage into a CheckedUnion.
+private record ResolvedUnion {
+    id: UnionId,
+    name: WrittenName,
+    type_parameters: List[TypeParameterId],
+    requirements: List[TraitRequirement],
+    variants: List[CheckedVariant],
+    fixed: Bool,
+}
+
+
+-- The nominal declarations with every annotation resolved, which the finite
+-- storage checks read before any is published.
+private record ResolvedDeclarations {
+    unions: List[ResolvedUnion],
+    records: List[CheckedRecord],
+    opaques: List[CheckedOpaque],
+}
+
+
+-- The resolved declarations, and the names their bounds and annotations use.
+private record ResolvedNominals {
+    declarations: ResolvedDeclarations,
+    uses: List[NameUse],
+}
+
+
 private pure func declared_module(declaration: NominalRow) -> ModuleId:
     match declaration:
         UnionDeclarationRow(parsed_union): parsed_union.module
@@ -681,26 +715,30 @@ private pure func declared_module(declaration: NominalRow) -> ModuleId:
         OpaqueDeclarationRow(parsed_opaque): parsed_opaque.declaration.module
 
 
+-- Every declaration resolved, proved finite and published with its storage
+-- classified.
 pure func validate_declarations(
     parsed: ParsedContents,
     namespace: Namespace,
 ) -> Result[DeclaredTypes, CheckError]:
-    parsed.declare_types(namespace, { unions = [], records = [], opaques = [] }, [])
+    resolved ?= parsed.declare_types(namespace, { unions = [], records = [], opaques = [] }, [])
+    declarations ?= resolved.declarations.validate_finite_declarations()
+    Ok({ declarations = declarations, uses = resolved.uses })
 
 
 private pure func declare_types(
     parsed: ParsedContents,
     namespace: Namespace,
-    checked: CheckedDeclarations,
+    resolved: ResolvedDeclarations,
     uses: List[NameUse],
-) -> Result[DeclaredTypes, CheckError]:
+) -> Result[ResolvedNominals, CheckError]:
     match parsed.declarations.next_nominal(
-        checked.records.length(),
-        checked.unions.length(),
-        checked.opaques.length(),
+        resolved.records.length(),
+        resolved.unions.length(),
+        resolved.opaques.length(),
     ):
         None:
-            Ok({ declarations = checked, uses = uses })
+            Ok({ declarations = resolved, uses = uses })
         Some(declaration):
             access = match declaration:
                 UnionDeclarationRow(row):
@@ -720,10 +758,10 @@ private pure func declare_types(
                 parameters = [],
             }
 
-            declared: Result[DeclaredTypes, CheckError] = match declaration:
-                UnionDeclarationRow(parsed_union): parsed_union.checked_union(scope, checked)
-                RecordDeclarationRow(parsed_record): parsed_record.checked_record(scope, checked)
-                OpaqueDeclarationRow(parsed_opaque): parsed_opaque.checked_opaque(scope, checked)
+            declared: Result[ResolvedNominals, CheckError] = match declaration:
+                UnionDeclarationRow(parsed_union): parsed_union.resolved_union(scope, resolved)
+                RecordDeclarationRow(parsed_record): parsed_record.checked_record(scope, resolved)
+                OpaqueDeclarationRow(parsed_opaque): parsed_opaque.checked_opaque(scope, resolved)
 
             match declared:
                 Ok(updated):
@@ -745,13 +783,13 @@ private pure func plain_annotation(
     Ok(resolved)
 
 
--- Each declaration below returns the checked declarations with itself added,
--- and its own uses.
-private pure func checked_union(
+-- Each declaration below returns the resolved declarations with itself
+-- added, and its own uses.
+private pure func resolved_union(
     row: UnionRow,
     module_scope: TypeScope,
-    checked: CheckedDeclarations,
-) -> Result[DeclaredTypes, CheckError]:
+    resolved: ResolvedDeclarations,
+) -> Result[ResolvedNominals, CheckError]:
     owner: TypeParameterOwner = UnionDeclaration(row.id)
     scope ?= row.type_parameters.local_type_parameters(owner, module_scope)
     bounds ?= row.type_parameters.resolve_bounds(scope)
@@ -782,7 +820,7 @@ private pure func checked_union(
         Some(error):
             Err(error)
         None:
-            declared: CheckedUnion = {
+            declared: ResolvedUnion = {
                 id = row.id,
                 name = row.type_name,
                 type_parameters = scope.declared_parameters(),
@@ -791,7 +829,7 @@ private pure func checked_union(
                 fixed = row.fixed,
             }
             Ok({
-                declarations = { checked | unions = checked.unions.append(declared) },
+                declarations = { resolved | unions = resolved.unions.append(declared) },
                 uses = bounds.uses.concat(uses),
             })
 
@@ -799,8 +837,8 @@ private pure func checked_union(
 private pure func checked_record(
     row: RecordRow,
     module_scope: TypeScope,
-    checked: CheckedDeclarations,
-) -> Result[DeclaredTypes, CheckError]:
+    resolved: ResolvedDeclarations,
+) -> Result[ResolvedNominals, CheckError]:
     owner: TypeParameterOwner = RecordDeclaration(row.id)
     scope ?= row.declaration.type_parameters.local_type_parameters(owner, module_scope)
     bounds ?= row.declaration.type_parameters.resolve_bounds(scope)
@@ -844,7 +882,7 @@ private pure func checked_record(
                 fixed = row.declaration.fixed,
             }
             Ok({
-                declarations = { checked | records = checked.records.append(declared) },
+                declarations = { resolved | records = resolved.records.append(declared) },
                 uses = bounds.uses.concat(uses),
             })
 
@@ -852,8 +890,8 @@ private pure func checked_record(
 private pure func checked_opaque(
     row: OpaqueRow,
     module_scope: TypeScope,
-    checked: CheckedDeclarations,
-) -> Result[DeclaredTypes, CheckError]:
+    resolved: ResolvedDeclarations,
+) -> Result[ResolvedNominals, CheckError]:
     owner: TypeParameterOwner = OpaqueDeclaration(row.id)
     scope ?= row.declaration.type_parameters.local_type_parameters(owner, module_scope)
     bounds ?= row.declaration.type_parameters.resolve_bounds(scope)
@@ -884,7 +922,7 @@ private pure func checked_opaque(
                 },
             }
             Ok({
-                declarations = { checked | opaques = checked.opaques.append(declared) },
+                declarations = { resolved | opaques = resolved.opaques.append(declared) },
                 uses = bounds.uses.concat(underlying_uses),
             })
 
@@ -1017,81 +1055,10 @@ private pure func substitute_types(
                     Err(error)
 
 
--- One instance on the by-value walk: a union declaration at the checked type
--- arguments its body is expanded with. Visiting is per instance, so
--- `Option[Option[Int]]` expands Option twice without closing a cycle.
-private record UnionInstanceVisit {
-    declaration: UnionId,
-    arguments: List[TypeRef],
-}
-
-
-private pure func contains_instance_visit(
-    visits: List[UnionInstanceVisit],
-    visit: UnionInstanceVisit,
-) -> Bool:
-    var found: Bool = False
-
-    for known in visits:
-        if known == visit:
-            found = True
-            break
-
-    found
-
-
-private pure func completed_instance(
-    completed: List[List[List[TypeRef]]],
-    instance: UnionInstanceVisit,
-) -> Bool:
-    var found: Bool = False
-
-    match completed.get(instance.declaration.union_number()):
-        Some(instances):
-            for arguments in instances:
-                if arguments == instance.arguments:
-                    found = True
-                    break
-        None:
-            void
-
-    found
-
-
-private union DeclarationVisitStep:
-    VisitDeclaredType(TypeUse)
-    -- A written payload field of the named union instance's own variant,
-    -- already substituted with the instance arguments: the one position
-    -- where a reference back to that union is a supported shape.
-    VisitVariantPayload(UnionId, TypeUse)
-    -- A union declaration walked at its own parameters (rigid for a
-    -- generic declaration, none otherwise).
-    VisitUnionRoot(UnionId)
-    FinishUnionInstance
-
-
--- Where a payload of an expanded union body is reported if it closes a
--- cycle: at its own written span inside the declaration, or at the written
--- application that entered the body.
-private fixed union PayloadSpan:
-    WrittenSpan
-    ApplicationSpan(Span)
-
-
--- The parameters of a declaration as the rigid arguments it is walked at.
-private pure func rigid_arguments(parameters: List[TypeParameterId]) -> List[TypeRef]:
-    var arguments: List[TypeRef] = []
-
-    for parameter in parameters:
-        arguments = arguments.append(ParameterType(parameter))
-
-    arguments
-
-
 -- The written field and payload types of a record or union, with their own spans.
 private pure func root_fields(
     root: AggregateId,
-    declarations: CheckedDeclarations,
+    declarations: ResolvedDeclarations,
 ) -> Result[List[TypeUse], CheckError]:
     origin: Span = compiler_span()
 
@@ -1128,223 +1095,181 @@ private pure func root_fields(
                     Err(error)
 
 
--- Every generic declaration, each the root of one reinstantiation walk.
-private pure func generic_roots(declarations: CheckedDeclarations) -> List[AggregateId]:
-    var roots: List[AggregateId] = []
+-- One place where a declaration passes one of its own type parameters to a
+-- type it applies, between the two parameters' controls: `Link(T, Chain[T])`
+-- passes Chain's T unchanged, and `Nest(Nested[List[T]])` passes it inside a
+-- List, which grows it. Reported at the written field or payload.
+private record ParameterFlow {
+    source: Int,
+    target: Int,
+    grows: Bool,
+    span: Span,
+}
+
+
+-- Each declaration's first control: one control per type parameter, unions
+-- first, then records, then opaque types, each in declaration order.
+private record ParameterControls {
+    unions: List[Int],
+    records: List[Int],
+    opaques: List[Int],
+    count: Int,
+}
+
+
+private pure func parameter_controls(declarations: ResolvedDeclarations) -> ParameterControls:
+    var next = 0
+    var unions: List[Int] = []
+    for declaration in declarations.unions:
+        unions = unions.append(next)
+        next = next + declaration.type_parameters.length()
+    var records: List[Int] = []
+    for declaration in declarations.records:
+        records = records.append(next)
+        next = next + declaration.type_parameters.length()
+    var opaques: List[Int] = []
+    for declaration in declarations.opaques:
+        opaques = opaques.append(next)
+        next = next + declaration.type_parameters.length()
+    { unions = unions, records = records, opaques = opaques, count = next }
+
+
+-- A type parameter's control. Only a type declaration owns the parameters a
+-- declaration body names or passes arguments to.
+private pure func parameter_control(
+    controls: ParameterControls,
+    parameter: TypeParameterId,
+    span: Span,
+) -> Result[Int, CheckError]:
+    first: Option[Int] = match parameter.parameter_owner():
+        UnionDeclaration(id): controls.unions.get(id.union_number())
+        RecordDeclaration(id): controls.records.get(id.record_number())
+        OpaqueDeclaration(id): controls.opaques.get(id.opaque_number())
+        TraitDeclaration(_) | FunctionDeclaration(_): None
+    first
+        .map(pure func(start): start + parameter.parameter_position())
+        .or_checker_invariant(span, InvalidParameterDeclaration(parameter))
+
+
+private pure func parameter_flow(
+    controls: ParameterControls,
+    source: TypeParameterId,
+    target: TypeParameterId,
+    grows: Bool,
+    span: Span,
+) -> Result[ParameterFlow, CheckError]:
+    start ?= controls.parameter_control(source, span)
+    end ?= controls.parameter_control(target, span)
+    Ok({ source = start, target = end, grows = grows, span = span })
+
+
+private pure func parameters_in(value_type: TypeRef) -> List[TypeParameterId]:
+    match value_type:
+        ParameterType(id):
+            [id]
+        _:
+            var found: List[TypeParameterId] = []
+            for child in value_type.type_children():
+                found = found.concat(child.parameters_in())
+            found
+
+
+-- `flows` with every flow of one written type of a declaration's body.
+private pure func written_flows(
+    written: TypeUse,
+    controls: ParameterControls,
+    flows: List[ParameterFlow],
+) -> Result[List[ParameterFlow], CheckError]:
+    var found: Result[List[ParameterFlow], CheckError] = Ok(flows)
+
+    match written.value_type:
+        NominalType(nominal, arguments):
+            owner: TypeParameterOwner = match nominal:
+                AggregateNominal(aggregate): aggregate.aggregate_owner()
+                OpaqueNominal(id): OpaqueDeclaration(id)
+            var position = 0
+            for argument in arguments:
+                target = type_parameter_id(owner, position)
+                for parameter in argument.parameters_in():
+                    grows = argument != ParameterType(parameter)
+                    found = match found:
+                        Ok(earlier):
+                            controls
+                                .parameter_flow(parameter, target, grows, written.span)
+                                .map(pure func(flow): earlier.append(flow))
+                        Err(error):
+                            Err(error)
+                position = position + 1
+        _:
+            void
+
+    for child in written.value_type.type_children():
+        inner: TypeUse = { written | value_type = child }
+        found = match found:
+            Ok(earlier): inner.written_flows(controls, earlier)
+            Err(error): Err(error)
+
+    found
+
+
+-- Specialization makes one layout per type argument list, so every
+-- declaration must reach finitely many applications of itself. That fails
+-- exactly when a flow that grows its argument lies on a cycle of flows,
+-- Kennedy and Pierce's expansive cycle: `Nested[T]: Nest(Nested[List[T]])`.
+-- Passing a parameter unchanged, permuted or replaced by a closed type stays
+-- finite, so `Chain[T]: Link(T, Chain[T])` is accepted. This is the rule
+-- recursion.brp applies to calls, decided by the same strong components.
+-- Every position counts, a List element and a record field included,
+-- because specialization lays out every type it meets.
+private pure func validate_type_growth(
+    declarations: ResolvedDeclarations,
+) -> Result[Void, CheckError]:
+    controls = declarations.parameter_controls()
+    var written: List[TypeUse] = []
 
     for declaration in declarations.unions:
-        if (
-            declaration.type_parameters
-                .is_empty()
-                .not()
-        ):
-            roots = roots.append(UnionAggregate(declaration.id))
+        for variant in declaration.variants:
+            written = written.concat(variant.fields)
 
     for declaration in declarations.records:
-        if (
-            declaration.type_parameters
-                .is_empty()
-                .not()
-        ):
-            roots = roots.append(RecordAggregate(declaration.id))
+        for field in declaration.fields:
+            written = written.append(field.value_type)
 
-    roots
+    for declaration in declarations.opaques:
+        written = written.append(declaration.underlying_type)
 
+    var collected: Result[List[ParameterFlow], CheckError] = Ok([])
 
--- Whether this written type applies the generic root to one of its own
--- parameters again: the recursion that could instantiate without bound.
-private pure func reinstantiates_root(value_type: TypeRef, root: AggregateId) -> Bool:
-    match value_type:
-        NominalType(owner, arguments):
-            if owner == AggregateNominal(root):
-                arguments.any(contains_parameter)
-            else:
-                False
-        _:
-            False
+    for field in written:
+        collected = match collected:
+            Ok(earlier): field.written_flows(controls, earlier)
+            Err(error): Err(error)
 
+    flows ?= collected
+    -- strong_components reads its transitions as a plain graph, so every
+    -- flow is passed as a kept path whatever it does to its argument.
+    components = strong_components(
+        controls.count,
+        flows.map(
+            pure func(flow) -> InstantiationPath: {
+                source = flow.source,
+                target = flow.target,
+                operation = KeepPath,
+            },
+        ),
+    )
+    var growing: Option[Span] = None
 
--- Walks every edge (payloads, fields, List elements, applied heads and
--- arguments) reachable from one generic declaration's body, expanding each
--- declaration once, and reports the written type that applies the root to a
--- parameter again. Pointer edges are followed: `Tree[T]` behind a List is
--- still unbounded.
-private pure func generic_reinstantiation_edge(
-    root: AggregateId,
-    declarations: CheckedDeclarations,
-) -> Result[Option[TypeUse], CheckError]:
-    var union_expanded: List[Bool] = repeat(False, declarations.unions.length())
-    var record_expanded: List[Bool] = repeat(False, declarations.records.length())
-    var pending: List[TypeUse] = []
-    var pending_count = 0
-    var closing: Option[TypeUse] = None
-    var failure: Option[CheckError] = None
-    origin: Span = compiler_span()
-
-    -- The root's own fields are the walk's seeds at their written spans; a
-    -- declaration reached from them is expanded by the shared step below at
-    -- the span of the root's written type that reached it.
-    match root:
-        UnionAggregate(id): union_expanded = union_expanded.set(id.union_number(), True)
-        RecordAggregate(id): record_expanded = record_expanded.set(id.record_number(), True)
-
-    fields ?= root.root_fields(declarations)
-    for field in fields:
-        pending = pending.push_at(pending_count, field)
-        pending_count = pending_count + 1
-
-    while (
-        (pending_count > 0)
-            .and(
-                failure
-                    .is_some()
-                    .not(),
-            )
-            .and(
-                closing
-                    .is_some()
-                    .not(),
-            )
-    ):
-        pending_count = pending_count - 1
-
-        match pending.get(pending_count):
-            None:
-                failure = Some(checker_invariant(origin, InvalidDeclarationVisit))
-            Some(annotation):
-                if annotation.value_type.reinstantiates_root(root):
-                    closing = Some(annotation)
-                else:
-                    for child in annotation.value_type.type_children():
-                        pending = pending.push_at(
-                            pending_count,
-                            { annotation | value_type = child },
-                        )
-                        pending_count = pending_count + 1
-
-                    match annotation.value_type:
-                        NominalType(AggregateNominal(RecordAggregate(id)), _):
-                            match record_expanded.get(id.record_number()):
-                                Some(False):
-                                    record_expanded = record_expanded.set(id.record_number(), True)
-                                    match declarations.records.get(id.record_number()):
-                                        None:
-                                            failure = Some(
-                                                checker_invariant(
-                                                    annotation.span,
-                                                    InvalidRecordDeclaration(id),
-                                                ),
-                                            )
-                                        Some(declaration):
-                                            for field in declaration.fields:
-                                                pending = pending.push_at(
-                                                    pending_count,
-                                                    { annotation |
-                                                        value_type = field.value_type.value_type,
-                                                    },
-                                                )
-                                                pending_count = pending_count + 1
-                                Some(True):
-                                    void
-                                None:
-                                    failure = Some(
-                                        checker_invariant(
-                                            annotation.span,
-                                            InvalidRecordDeclaration(id),
-                                        ),
-                                    )
-                        NominalType(AggregateNominal(UnionAggregate(id)), _):
-                            match union_expanded.get(id.union_number()):
-                                Some(False):
-                                    union_expanded = union_expanded.set(id.union_number(), True)
-                                    match declarations.unions.get(id.union_number()):
-                                        None:
-                                            failure = Some(
-                                                checker_invariant(
-                                                    annotation.span,
-                                                    InvalidUnionDeclaration(id),
-                                                ),
-                                            )
-                                        Some(declaration):
-                                            for variant in declaration.variants:
-                                                for field in variant.fields:
-                                                    pending = pending.push_at(
-                                                        pending_count,
-                                                        { annotation |
-                                                            value_type = field.value_type,
-                                                        },
-                                                    )
-                                                    pending_count = pending_count + 1
-                                Some(True):
-                                    void
-                                None:
-                                    failure = Some(
-                                        checker_invariant(
-                                            annotation.span,
-                                            InvalidUnionDeclaration(id),
-                                        ),
-                                    )
-                        _:
-                            void
-
-    match failure:
-        Some(error): Err(error)
-        None: Ok(closing)
-
-
--- A generic declaration whose body reaches an application of itself to one
--- of its parameters is not supported yet and is rejected at the written type
--- that closes that cycle. A generic declaration elsewhere on a
--- cycle, such as `Option` in `record Node { next: Option[Node] }`, is not on
--- that cycle through its own body and is admitted.
-private pure func validate_generic_cycles(
-    declarations: CheckedDeclarations,
-) -> Result[Void, CheckError]:
-    var failure: Option[CheckError] = None
-
-    for root in declarations.generic_roots():
-        match root.generic_reinstantiation_edge(declarations):
-            Err(error):
-                failure = Some(error)
-            Ok(Some(closing)):
-                failure = Some(
-                    type_declaration_error(
-                        closing.span,
-                        RecursiveAggregateType(closing.value_type),
-                    ),
-                )
-            Ok(None):
-                void
-
-        if failure.is_some():
+    for flow in flows:
+        -- parameter_control issued both ends below controls.count, and
+        -- strong_components names a component for every such control.
+        if flow.grows.and(components.get_or(flow.source, 0) == components.get_or(flow.target, 0)):
+            growing = Some(flow.span)
             break
 
-    match failure:
-        Some(error): Err(error)
+    match growing:
+        Some(span): Err(type_declaration_error(span, GrowingRecursiveType))
         None: Ok(void)
-
-
--- A unary recursive union stores at most one self-reference per variant.
--- Release no longer depends on it: any shape releases in bounded C stack
--- (RELEASE_PLAN.md). The second written self payload of one variant is the
--- rejected edge.
-private pure func repeated_self_payload(owner: UnionId, fields: List[TypeUse]) -> Option[TypeUse]:
-    var seen: Bool = False
-    var repeated: Option[TypeUse] = None
-
-    for field in fields:
-        match field.value_type:
-            NominalType(AggregateNominal(UnionAggregate(id)), []):
-                if id == owner:
-                    if seen:
-                        repeated = Some(field)
-                        break
-                    else:
-                        seen = True
-            _:
-                void
-
-    repeated
 
 
 -- An opaque type is stored as its underlying type at its arguments, as
@@ -1353,7 +1278,7 @@ private pure func repeated_self_payload(owner: UnionId, fields: List[TypeUse]) -
 private pure func stored_type(
     value_type: TypeRef,
     span: Span,
-    declarations: CheckedDeclarations,
+    declarations: ResolvedDeclarations,
 ) -> Result[TypeRef, CheckError]:
     match value_type:
         NominalType(OpaqueNominal(id), arguments):
@@ -1378,7 +1303,7 @@ private pure func stored_type(
 private pure func fixed_storage(
     stored: TypeRef,
     span: Span,
-    declarations: CheckedDeclarations,
+    declarations: ResolvedDeclarations,
 ) -> Result[Bool, CheckError]:
     match stored:
         IntegerType(format):
@@ -1388,7 +1313,7 @@ private pure func fixed_storage(
         NominalType(AggregateNominal(UnionAggregate(id)), _):
             declarations.unions
                 .get(id.union_number())
-                .map(pure func(declaration: CheckedUnion) -> Bool: declaration.fixed)
+                .map(pure func(declaration: ResolvedUnion) -> Bool: declaration.fixed)
                 .or_checker_invariant(span, InvalidUnionDeclaration(id))
         NominalType(AggregateNominal(RecordAggregate(id)), _):
             declarations.records
@@ -1400,7 +1325,7 @@ private pure func fixed_storage(
 
 
 -- Every fixed declaration, unions then records, each in declaration order.
-private pure func fixed_roots(declarations: CheckedDeclarations) -> List[AggregateId]:
+private pure func fixed_roots(declarations: ResolvedDeclarations) -> List[AggregateId]:
     var roots: List[AggregateId] = []
     for declaration in declarations.unions:
         if declaration.fixed:
@@ -1415,7 +1340,7 @@ private pure func fixed_roots(declarations: CheckedDeclarations) -> List[Aggrega
 -- inline, as its error.
 private pure func unfixed_field(
     root: AggregateId,
-    declarations: CheckedDeclarations,
+    declarations: ResolvedDeclarations,
 ) -> Result[Option[CheckError], CheckError]:
     fields ?= root.root_fields(declarations)
     -- A union payload may also be Void, which stores nothing.
@@ -1461,7 +1386,7 @@ private pure func walk_fixed_type(
     owner: AggregateId,
     path: List[AggregateId],
     finished: List[AggregateId],
-    declarations: CheckedDeclarations,
+    declarations: ResolvedDeclarations,
 ) -> Result[List[AggregateId], CheckError]:
     fields ?= owner.root_fields(declarations)
     var walked = finished
@@ -1499,13 +1424,12 @@ private pure func walk_fixed_type(
 -- A fixed record or fixed union promises the storage specialization gives a
 -- declaration whose fields are all unmanaged and none of which contains it:
 -- inline, with no counted child. Every field is checked before any cycle, so
--- a cycle can only pass through fixed declarations. The by-value walk below
--- rejects union-only cycles too, but only until mutual cycles and several
--- self payloads are supported, and it treats every record as a pointer edge;
--- containing itself stays wrong for a fixed type, so this check does not rely
--- on that walk.
+-- a cycle can only pass through fixed declarations. A union that contains
+-- itself is classified below and stored on the heap, which a fixed type
+-- promises never to be, so a fixed type that contains itself is rejected here
+-- rather than classified.
 private pure func validate_fixed_types(
-    declarations: CheckedDeclarations,
+    declarations: ResolvedDeclarations,
 ) -> Result[Void, CheckError]:
     roots = declarations.fixed_roots()
     var failure: Option[CheckError] = None
@@ -1533,227 +1457,104 @@ private pure func validate_fixed_types(
         None: Ok(void)
 
 
--- Every declared aggregate must have a finite layout: the by-value storage
--- graph must be acyclic. A union instance stores each direct payload by
--- value, including the payloads of an applied generic union's body at its
--- arguments; a record field, a List element and a non-generic union's one
--- direct self payload (stored boxed later) are pointer edges a cycle may pass
--- through. A record on a cycle is always managed, so records need no visit.
--- An opaque type is erased to its underlying type at its arguments, which is
--- stored where the opaque type is. A union-only cycle, two self payloads in
--- one variant, and a generic declaration reinstantiating itself are rejected.
--- Fixed types are checked before the by-value walk, so a fixed type that
--- contains itself is reported by its own rule.
-pure func validate_finite_declarations(
-    declarations: CheckedDeclarations,
-) -> Result[Void, CheckError]:
-    generic ?= declarations.validate_generic_cycles()
-    -- Expanding opaque types below terminates only once no opaque is on a cycle.
-    _: Void ?= declarations.validate_opaque_representations()
-    -- validate_fixed_types expands opaque types, which terminates once no
-    -- opaque is on a cycle.
-    _: Void ?= declarations.validate_fixed_types()
-    -- These vectors stay in one local builder. Passing them through a shared
-    -- record would retain their old roots and copy the entire vector on set.
-    var visiting: List[UnionInstanceVisit] = []
-    -- The instances already proven finite, as argument lists grouped by union
-    -- declaration, so a lookup compares only that declaration's instances.
-    var completed: List[List[List[TypeRef]]] = repeat([], declarations.unions.length())
-    var pending: List[DeclarationVisitStep] = []
-    var pending_count = 0
+-- Whether a declaration contains itself: its fields or payloads, followed
+-- through the payloads of the unions and the underlying types of the opaque
+-- types they store by value, at their substituted arguments, reach it again.
+-- Records, tuples, Lists, Strings and callables are stored behind a pointer
+-- and end the walk. Each union occurrence is expanded once, and there are
+-- finitely many because growing recursion is rejected first.
+private pure func contains_itself(
+    root: AggregateId,
+    declarations: ResolvedDeclarations,
+) -> Result[Bool, CheckError]:
+    fields ?= root.root_fields(declarations)
+    var pending = fields
+    var pending_count = fields.length()
+    var expanded: List[UnionOccurrence] = []
+    var found: Bool = False
     var failure: Option[CheckError] = None
-    origin: Span = compiler_span()
-    -- Roots are walked one at a time with an empty path, in declaration
-    -- order: every union at its own parameters (so a generic body's own
-    -- instances are checked whether or not another declaration applies it),
-    -- every record field, and every type found behind a pointer edge (a List
-    -- element, an applied record's arguments), which must itself be finite
-    -- but is not stored by value where it was found. The reinstantiation pass
-    -- ran first, so the instances a generic body reaches stay finite.
-    var roots: List[DeclarationVisitStep] = []
-
-    for declaration in declarations.unions:
-        roots = roots.append(VisitUnionRoot(declaration.id))
-
-    for declaration in declarations.records:
-        for field in declaration.fields:
-            roots = roots.append(VisitDeclaredType(field.value_type))
-
-    var next_root = 0
 
     while (
-        (next_root < roots.length())
-            .or(pending_count > 0)
-            .and(
-                failure
-                    .is_some()
-                    .not(),
-            )
+        (pending_count > 0)
+            .and(found.not())
+            .and(failure.is_none())
     ):
-        if pending_count == 0:
-            match roots.get(next_root):
-                None:
-                    failure = Some(checker_invariant(origin, InvalidDeclarationVisit))
-                Some(root):
-                    pending = pending.push_at(pending_count, root)
-                    pending_count = pending_count + 1
+        pending_count = pending_count - 1
 
-            next_root = next_root + 1
+        match pending.get(pending_count):
+            None:
+                failure = Some(checker_invariant(compiler_span(), InvalidDeclarationVisit))
+            Some(payload):
+                match payload.value_type.stored_type(payload.span, declarations):
+                    Err(error):
+                        failure = Some(error)
+                    Ok(NominalType(AggregateNominal(UnionAggregate(id)), arguments)):
+                        occurrence: UnionOccurrence = { owner = id, arguments = arguments }
 
-        while (pending_count > 0).and(
-            failure
-                .is_some()
-                .not(),
-        ):
-            pending_count = pending_count - 1
+                        if UnionAggregate(id) == root:
+                            found = True
+                        else if (
+                            expanded
+                                .contains(occurrence)
+                                .not()
+                        ):
+                            expanded = expanded.append(occurrence)
 
-            match pending.get(pending_count):
-                None:
-                    failure = Some(checker_invariant(origin, InvalidDeclarationVisit))
-                Some(step):
-                    match step:
-                        FinishUnionInstance:
-                            last = visiting.length() - 1
-                            match visiting.get(last):
-                                Some(instance):
-                                    number = instance.declaration.union_number()
-                                    match completed.get(number):
-                                        Some(instances):
-                                            completed = completed.set(
-                                                number,
-                                                instances.append(instance.arguments),
-                                            )
-                                        None:
-                                            failure = Some(
-                                                checker_invariant(
-                                                    origin,
-                                                    InvalidUnionDeclaration(instance.declaration),
-                                                ),
-                                            )
-                                    match visiting.remove(last):
-                                        Some(rest):
-                                            visiting = rest
-                                        None:
-                                            failure = Some(
-                                                checker_invariant(origin, InvalidDeclarationVisit),
-                                            )
-                                None:
-                                    failure = Some(
-                                        checker_invariant(origin, InvalidDeclarationVisit),
+                            match (
+                                UnionAggregate(id)
+                                    .root_fields(declarations)
+                                    .and_then(
+                                        pure func(written): written.occurrence_fields(occurrence),
                                     )
-                        VisitUnionRoot(id):
-                            -- The root starts an empty path, so its own annotation is never
-                            -- reported; its payloads are reported at their written spans.
-                            match declarations.unions.get(id.union_number()):
-                                None:
-                                    failure = Some(
-                                        checker_invariant(origin, InvalidUnionDeclaration(id)),
-                                    )
-                                Some(declaration):
-                                    instance: UnionInstanceVisit = {
-                                        declaration = id,
-                                        arguments = declaration.type_parameters.rigid_arguments(),
-                                    }
-                                    match instance.expand_union_instance(
-                                        {
-                                            value_type = NominalType(
-                                                AggregateNominal(UnionAggregate(id)),
-                                                instance.arguments,
-                                            ),
-                                            span = origin,
-                                        },
-                                        WrittenSpan,
-                                        declarations,
-                                        visiting,
-                                        completed,
-                                        pending,
-                                        pending_count,
-                                    ):
-                                        Err(error):
-                                            failure = Some(error)
-                                        Ok(expanded):
-                                            visiting = expanded.visiting
-                                            pending = expanded.pending
-                                            pending_count = expanded.pending_count
-                        VisitVariantPayload(owner, annotation):
-                            -- The admitted direct self-reference needs no visit; a bare
-                            -- union name resolves only for a non-generic declaration. An
-                            -- opaque type wrapping the owner is not admitted: it is expanded
-                            -- by value like any other payload.
-                            admitted = match annotation.value_type:
-                                NominalType(AggregateNominal(UnionAggregate(id)), []): id == owner
-                                _: False
-
-                            if admitted.not():
-                                pending = pending.push_at(
-                                    pending_count,
-                                    VisitDeclaredType(annotation),
-                                )
-                                pending_count = pending_count + 1
-                        VisitDeclaredType(annotation):
-                            match annotation.value_type:
-                                NominalType(AggregateNominal(UnionAggregate(id)), arguments):
-                                    -- A substituted body reports at the application that substituted it.
-                                    reported: PayloadSpan = if arguments.is_empty():
-                                        WrittenSpan
-                                    else:
-                                        ApplicationSpan(annotation.span)
-                                    match expand_union_instance(
-                                        { declaration = id, arguments = arguments },
-                                        annotation,
-                                        reported,
-                                        declarations,
-                                        visiting,
-                                        completed,
-                                        pending,
-                                        pending_count,
-                                    ):
-                                        Err(error):
-                                            failure = Some(error)
-                                        Ok(expanded):
-                                            visiting = expanded.visiting
-                                            pending = expanded.pending
-                                            pending_count = expanded.pending_count
-                                NominalType(OpaqueNominal(id), arguments):
-                                    match declarations.opaques.get(id.opaque_number()):
-                                        None:
-                                            failure = Some(
-                                                checker_invariant(
-                                                    annotation.span,
-                                                    InvalidOpaqueDeclaration(id),
-                                                ),
-                                            )
-                                        Some(declaration):
-                                            match declaration.underlying_type.value_type.substitute_type(
-                                                {
-                                                    owner = OpaqueDeclaration(id),
-                                                    values = arguments,
-                                                },
-                                                annotation.span,
-                                            ):
-                                                Err(error):
-                                                    failure = Some(error)
-                                                Ok(underlying):
-                                                    pending = pending.push_at(
-                                                        pending_count,
-                                                        VisitDeclaredType(
-                                                            { annotation |
-                                                                value_type = underlying,
-                                                            },
-                                                        ),
-                                                    )
-                                                    pending_count = pending_count + 1
-                                -- Every other type visits its parts as roots: a record stores
-                                -- its arguments, and a List its element, behind a pointer.
-                                _:
-                                    for child in annotation.value_type.type_children():
-                                        roots = roots.append(
-                                            VisitDeclaredType({ annotation | value_type = child }),
-                                        )
+                            ):
+                                Ok(payloads):
+                                    for stored in payloads:
+                                        pending = pending.push_at(pending_count, stored)
+                                        pending_count = pending_count + 1
+                                Err(error):
+                                    failure = Some(error)
+                    Ok(_):
+                        void
 
     match failure:
         Some(error): Err(error)
-        None: Ok(void)
+        None: Ok(found)
+
+
+-- Every declaration must have a finite layout. An opaque type must not
+-- contain itself, a fixed type must be stored inline, and a generic type
+-- must reach finitely many applications of itself. A union that contains
+-- itself is then the only by-value cycle left, and each union is published
+-- with that classification: specialization stores such a union's values in
+-- counted heap nodes, which breaks every such cycle. A record on a cycle is
+-- always managed today, so records are not classified. Fixed types are
+-- checked before growth, so a fixed type that contains itself is reported
+-- by its own rule.
+private pure func validate_finite_declarations(
+    declarations: ResolvedDeclarations,
+) -> Result[CheckedDeclarations, CheckError]:
+    -- Expanding opaque types below terminates only once no opaque is on a cycle.
+    _: Void ?= declarations.validate_opaque_representations()
+    _: Void ?= declarations.validate_fixed_types()
+    -- Substituting union bodies below terminates only once growth is rejected.
+    _: Void ?= declarations.validate_type_growth()
+    unions ?= declarations.unions.translated_list(
+        pure func(declaration: ResolvedUnion) -> Result[CheckedUnion, CheckError]:
+            UnionAggregate(declaration.id)
+                .contains_itself(declarations)
+                .map(
+                    pure func(found) -> CheckedUnion: {
+                        id = declaration.id,
+                        name = declaration.name,
+                        type_parameters = declaration.type_parameters,
+                        requirements = declaration.requirements,
+                        variants = declaration.variants,
+                        fixed = declaration.fixed,
+                        contains_itself = found,
+                    },
+                )
+    )
+    Ok({ unions = unions, records = declarations.records, opaques = declarations.opaques })
 
 
 -- Fixed-target reachability is fresh for every opaque. Mark a type only when
@@ -1762,7 +1563,7 @@ pure func validate_finite_declarations(
 -- opaque is walked as a target, so an opaque on any cycle is found by its own walk.
 private pure func validate_opaque_representation(
     root: CheckedOpaque,
-    declarations: CheckedDeclarations,
+    declarations: ResolvedDeclarations,
 ) -> Result[Void, CheckError]:
     var pending = [root.underlying_type]
     var depth = 1
@@ -1831,7 +1632,7 @@ private pure func validate_opaque_representation(
 
 
 private pure func validate_opaque_representations(
-    declarations: CheckedDeclarations,
+    declarations: ResolvedDeclarations,
 ) -> Result[Void, CheckError]:
     declarations.opaques.first_error(
         pure func(declaration: CheckedOpaque) -> Result[Void, CheckError]:
@@ -1846,7 +1647,7 @@ private pure func representation_children(
     owner: NominalId,
     arguments: List[TypeRef],
     span: Span,
-    declarations: CheckedDeclarations,
+    declarations: ResolvedDeclarations,
 ) -> Result[List[TypeUse], CheckError]:
     body: List[TypeUse] ?= match owner:
         AggregateNominal(aggregate):
@@ -1861,118 +1662,3 @@ private pure func representation_children(
             .map(pure func(argument): { value_type = argument, span = span })
             .concat(body),
     )
-
-
-private record ExpandedInstance {
-    visiting: List[UnionInstanceVisit],
-    pending: List[DeclarationVisitStep],
-    pending_count: Int,
-}
-
-
--- Enters one union instance on the by-value walk: a repeated instance on the
--- current path is a union-only cycle; a completed one needs no second walk.
-private pure func expand_union_instance(
-    instance: UnionInstanceVisit,
-    annotation: TypeUse,
-    reported: PayloadSpan,
-    declarations: CheckedDeclarations,
-    visiting: List[UnionInstanceVisit],
-    completed: List[List[List[TypeRef]]],
-    pending: List[DeclarationVisitStep],
-    pending_count: Int,
-) -> Result[ExpandedInstance, CheckError]:
-    if visiting.contains_instance_visit(instance):
-        Err(type_declaration_error(annotation.span, RecursiveAggregateType(annotation.value_type)))
-    else if completed.completed_instance(instance):
-        Ok({ visiting = visiting, pending = pending, pending_count = pending_count })
-    else:
-        match declarations.unions.get(instance.declaration.union_number()):
-            Some(declaration):
-                substitution: Substitution = {
-                    owner = UnionDeclaration(instance.declaration),
-                    values = instance.arguments,
-                }
-                var steps = pending.push_at(pending_count, FinishUnionInstance)
-                var count = pending_count + 1
-                var failure: Option[CheckError] = None
-                var index = declaration.variants.length()
-
-                while index > 0:
-                    index = index - 1
-
-                    match declaration.variants.get(index):
-                        Some(variant):
-                            match instance.declaration.repeated_self_payload(variant.fields):
-                                Some(repeated):
-                                    failure = Some(
-                                        type_declaration_error(
-                                            repeated.span,
-                                            RecursiveAggregateType(repeated.value_type),
-                                        ),
-                                    )
-                                    break
-                                None:
-                                    void
-
-                            var field_position = variant.fields.length()
-
-                            while field_position > 0:
-                                field_position = field_position - 1
-
-                                match variant.fields.get(field_position):
-                                    Some(field):
-                                        match field.value_type.substitute_type(
-                                            substitution,
-                                            field.span,
-                                        ):
-                                            Err(error):
-                                                failure = Some(error)
-                                                break
-                                            Ok(substituted):
-                                                payload: TypeUse = match reported:
-                                                    WrittenSpan:
-                                                        { field | value_type = substituted }
-                                                    ApplicationSpan(span):
-                                                        { value_type = substituted, span = span }
-                                                steps = steps.push_at(
-                                                    count,
-                                                    VisitVariantPayload(
-                                                        instance.declaration,
-                                                        payload,
-                                                    ),
-                                                )
-                                                count = count + 1
-                                    None:
-                                        failure = Some(
-                                            checker_invariant(
-                                                annotation.span,
-                                                InvalidDeclarationVisit,
-                                            ),
-                                        )
-                                        break
-                        None:
-                            failure = Some(
-                                checker_invariant(annotation.span, InvalidDeclarationVisit),
-                            )
-                            break
-
-                    if failure.is_some():
-                        break
-
-                match failure:
-                    Some(error):
-                        Err(error)
-                    None:
-                        Ok({
-                            visiting = visiting.append(instance),
-                            pending = steps,
-                            pending_count = count,
-                        })
-            None:
-                Err(
-                    checker_invariant(
-                        annotation.span,
-                        InvalidUnionDeclaration(instance.declaration),
-                    ),
-                )
