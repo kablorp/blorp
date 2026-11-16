@@ -1,0 +1,861 @@
+---
+Name uses: each name written in source resolves to one referent, recorded once
+at the name's own span, and `declaration_span` joins the referent to where it
+is declared. A declaration is not a use, and a name the source does not spell
+records nothing.
+
+Each use renders as `text@module:line:column kind -> declaration`, the
+declaration rendered the same way or as `none`; lines and columns count from 1.
+---
+import:
+    bool: Bool methods
+    int: Int methods
+    list: List methods
+    option: Option methods
+    string: String methods
+    test: TestSuite
+    ../../../../src/common/analysis/check/check:
+        Analysis,
+        analyze,
+        declaration_span,
+        declarations,
+        name_uses,
+    ../../../../src/common/analysis/check/name_uses:
+        NameUse,
+        Referent(
+            FunctionReferent,
+            TraitMethodReferent,
+            ConstantReferent,
+            TypeReferent,
+            TraitReferent,
+            FieldReferent,
+            VariantReferent,
+            TypeParameterReferent,
+            BindingReferent,
+            ModuleReferent,
+        ),
+    ../../../../src/common/syntax/source:
+        module_number,
+        module_source,
+        root_module_id,
+        source_module,
+    ../../../../src/common/syntax/syntax: Span
+    ../../../support/module_input:
+        FOUNDATION_TYPES,
+        ModuleInput,
+        parse_modules,
+        parse_test_suite,
+        prelude_source,
+        test_base,
+
+
+private LINE_FEED: UInt8 = 10
+
+
+private FUNCTION_SOURCE: String =
+    |pure func keep(value: Int) -> Int:
+    |    value
+    |pure func seven() -> Int:
+    |    keep(7)
+    |
+
+
+private TRAIT_METHOD_SOURCE: String =
+    |trait Measure:
+    |    pure func measure(value: Self) -> Int
+    |implements Measure for Int:
+    |    pure func measure(value: Self) -> Int:
+    |        value
+    |pure func three() -> Int:
+    |    measure(3)
+    |
+
+
+private CONSTANT_SOURCE: String =
+    |LIMIT: Int = 3
+    |pure func limit() -> Int:
+    |    LIMIT
+    |
+
+
+private TYPE_SOURCE: String =
+    |record Point {
+    |    x: Int,
+    |}
+    |pure func same(point: Point) -> Point:
+    |    point
+    |
+
+
+private TRAIT_SOURCE: String =
+    |trait Measure:
+    |    pure func measure(value: Self) -> Int
+    |pure func size[T: Measure](value: T) -> Int:
+    |    value.measure()
+    |
+
+
+private FIELD_ACCESS_SOURCE: String =
+    |record Point {
+    |    x: Int,
+    |}
+    |pure func horizontal(point: Point) -> Int:
+    |    point.x
+    |
+
+
+private FIELD_UPDATE_SOURCE: String =
+    |record Point {
+    |    x: Int,
+    |    y: Int,
+    |}
+    |pure func moved(point: Point) -> Point:
+    |    { point | y = 0 }
+    |
+
+
+private FIELD_CONSTRUCTION_SOURCE: String =
+    |record Point {
+    |    x: Int,
+    |    y: Int,
+    |}
+    |pure func origin() -> Point:
+    |    { x = 0, y = 0 }
+    |
+
+
+private VARIANT_SOURCE: String =
+    |union Switch:
+    |    Off
+    |    On
+    |pure func off() -> Switch:
+    |    Off
+    |
+
+
+private TYPE_PARAMETER_SOURCE: String =
+    |pure func same[T](value: T) -> T:
+    |    value
+    |
+
+
+-- One written receiver parameter, which each method of the implementation
+-- holds as its own type parameter.
+private RECEIVER_PARAMETER_SOURCE: String =
+    |trait Size:
+    |    pure func size(value: Self) -> Int
+    |    pure func twice(value: Self) -> Int
+    |record Box[T] {
+    |    item: T,
+    |}
+    |implements Size for Box[T]:
+    |    pure func size(value: Self) -> Int:
+    |        items: List[T] = []
+    |        0
+    |    pure func twice(value: Self) -> Int:
+    |        items: List[T] = []
+    |        0
+    |
+
+
+private BINDING_SOURCE: String =
+    |pure func copied(value: Int) -> Int:
+    |    copy = value
+    |    copy
+    |
+
+
+private UFCS_SOURCE: String =
+    |pure func keep(value: Int) -> Int:
+    |    value
+    |pure func seven() -> Int:
+    |    7.keep()
+    |
+
+
+private ALIAS_SOURCE: String =
+    |import:
+    |    helpers as tools
+    |pure func lucky() -> Int:
+    |    tools.seven()
+    |
+
+
+private SELECTION_SOURCE: String =
+    |import:
+    |    helpers: seven
+    |pure func lucky() -> Int:
+    |    seven()
+    |
+
+
+private HELPERS: String =
+    |pure func seven() -> Int:
+    |    7
+    |
+
+
+private METHODS_SELECTION_SOURCE: String =
+    |import:
+    |    shouting: String methods
+    |pure func loud(text: String) -> String:
+    |    text.shout()
+    |
+
+
+private SHOUTING: String =
+    |pure func shout(text: String) -> String:
+    |    text
+    |
+
+
+private INTERPOLATION_SOURCE: String =
+    raw
+        |pure func greet(name: String) -> String:
+        |    "hello ${name}"
+        |
+
+
+-- The plan's example, made self-contained: `check` uses six names, and its
+-- parameter, which it declares, is not one of them.
+private EXAMPLE_SOURCE: String =
+    |opaque type ParsedProgram = Int
+    |opaque type CheckedProgram = Int
+    |opaque type CheckFailure = Int
+    |pure func check_program(program: ParsedProgram) -> Result[CheckedProgram, CheckFailure]:
+    |    Err(into_opaque CheckFailure(0))
+    |pure func check(program: ParsedProgram) -> Result[CheckedProgram, CheckFailure]:
+    |    program.check_program()
+    |
+
+
+private DECLARATIONS_SOURCE: String =
+    |record Point {
+    |    x: Int,
+    |}
+    |pure func origin(start: Int) -> Point:
+    |    { x = start }
+    |
+
+
+-- A variant written bare, through a module alias and through its union.
+private PATTERN_VARIANT_SOURCE: String =
+    |import:
+    |    switches as power: Switch(Off, On)
+    |pure func level(state: Switch) -> Int:
+    |    match state:
+    |        Off: 0
+    |        power.On: 1
+    |pure func flipped(state: Switch) -> Int:
+    |    match state:
+    |        Switch.Off: 1
+    |        On: 0
+    |
+
+
+private SWITCHES: String =
+    |union Switch:
+    |    Off
+    |    On
+    |
+
+
+private QUALIFIED_VARIANT_SOURCE: String =
+    |union Switch:
+    |    Off
+    |    On
+    |pure func powered() -> Switch:
+    |    Switch.On
+    |
+
+
+private ALIASED_BOUND_SOURCE: String =
+    |import:
+    |    measures as sizes
+    |pure func size[T: sizes.Measure](value: T) -> Int:
+    |    0
+    |
+
+
+private MEASURES: String =
+    |trait Measure:
+    |    pure func measure(value: Self) -> Int
+    |
+
+
+private OPAQUE_CONVERSION_SOURCE: String =
+    |opaque type Meters = Int
+    |pure func meters(value: Int) -> Meters:
+    |    into_opaque Meters(value)
+    |pure func amount(length: Meters) -> Int:
+    |    from_opaque Meters(length)
+    |
+
+
+private LAMBDA_SOURCE: String =
+    |pure func twice() -> Int:
+    |    double = pure func(value: Int) -> Int: value
+    |    double(2)
+    |
+
+
+private CONSTANT_DECLARATION_SOURCE: String =
+    |record Point {
+    |    x: Int,
+    |}
+    |ORIGIN: Point = { x = 0 }
+    |
+
+
+private TYPE_DECLARATIONS_SOURCE: String =
+    |record Size {
+    |    value: Int,
+    |}
+    |union Shape:
+    |    Square(Size)
+    |record Box {
+    |    size: Size,
+    |}
+    |opaque type Wrapped = Size
+    |
+
+
+private IMPLEMENTATION_SELF_SOURCE: String =
+    |trait Measure:
+    |    pure func measure(value: Self) -> Int
+    |record Point {
+    |    x: Int,
+    |}
+    |implements Measure for Point:
+    |    pure func measure(value: Self) -> Int:
+    |        0
+    |
+
+
+-- A test suite root, and the smallest library its written entry can call.
+private SUITE_ROOT: String =
+    |import:
+    |    test: TestSuite
+    |TESTS: TestSuite = { description = "suite" }
+    |
+
+
+private SUITE_LIBRARY: String =
+    |import:
+    |    _base: Int, List, String
+    |record TestSuite {
+    |    description: String,
+    |}
+    |pure func run_suite_result(suite: TestSuite) -> Int:
+    |    0
+    |pure func suites_exit_status(results: List[Int]) -> Int:
+    |    0
+    |
+
+
+-- A root module alone, or a root that imports the helper module after it.
+private pure func alone(source: String) -> List[ModuleInput]:
+    [{ source = source, targets = [] }]
+
+
+private pure func importing(source: String, helper: String) -> List[ModuleInput]:
+    [{ source = source, targets = [1] }, { source = helper, targets = [] }]
+
+
+private pure func analysed(inputs: List[ModuleInput]) -> Option[Analysis]:
+    match parse_modules(inputs):
+        Err(_):
+            None
+        Ok(parsed):
+            match analyze(parsed):
+                Ok(analysis): Some(analysis)
+                Err(_): None
+
+
+-- Every module's source in module order: the inputs, then the base and the
+-- prelude that `parse_modules` appends after them.
+private pure func module_sources(inputs: List[ModuleInput]) -> List[String]:
+    inputs
+        .map(pure func(input: ModuleInput) -> String: input.source)
+        .append(FOUNDATION_TYPES)
+        .append(prelude_source(test_base()))
+
+
+private pure func rendered_span(sources: List[String], span: Span) -> String:
+    module = match source_module(span.source):
+        Some(id): id.module_number()
+        None: -1
+    text = sources.get_or(module, "")
+    var line = 1
+    var column = 1
+    for offset in 0..span.start:
+        if text.byte_at(offset) == Some(LINE_FEED):
+            line = line + 1
+            column = 1
+        else:
+            column = column + 1
+    written = text
+        .slice(span.start, span.end)
+        .get_or("?")
+    "${written}@${module}:${line}:${column}"
+
+
+private pure func kind(referent: Referent) -> String:
+    match referent:
+        FunctionReferent(_): "function"
+        TraitMethodReferent(_): "trait method"
+        ConstantReferent(_): "constant"
+        TypeReferent(_): "type"
+        TraitReferent(_): "trait"
+        FieldReferent(_): "field"
+        VariantReferent(_): "variant"
+        TypeParameterReferent(_): "type parameter"
+        BindingReferent(_): "binding"
+        ModuleReferent(_): "module"
+
+
+private pure func rendered_declaration(
+    analysis: Analysis,
+    sources: List[String],
+    referent: Referent,
+) -> String:
+    match analysis.declaration_span(referent):
+        Some(span): rendered_span(sources, span)
+        None: "none"
+
+
+private pure func in_root(span: Span) -> Bool:
+    span.source == module_source(root_module_id())
+
+
+-- The root module's uses of the `wanted` kinds, rendered, in source order.
+private pure func root_uses(inputs: List[ModuleInput], wanted: List[String]) -> List[String]:
+    match analysed(inputs):
+        None:
+            ["the program does not analyse"]
+        Some(analysis):
+            sources = module_sources(inputs)
+            analysis
+                .name_uses()
+                .filter(pure func(use: NameUse) -> Bool:
+                    in_root(use.span).and(wanted.contains(kind(use.referent)))
+                )
+                .sort_by(pure func(use: NameUse) -> Int: use.span.start)
+                .map(pure func(use: NameUse) -> String:
+                    declared = analysis.rendered_declaration(sources, use.referent)
+                    "${rendered_span(sources, use.span)} ${kind(use.referent)} -> ${declared}"
+                )
+
+
+private ALL_KINDS: List[String] = [
+    "function",
+    "trait method",
+    "constant",
+    "type",
+    "trait",
+    "field",
+    "variant",
+    "type parameter",
+    "binding",
+    "module",
+]
+
+
+pure func test_a_function_call_uses_the_function() -> Bool:
+    root_uses(alone(FUNCTION_SOURCE), ["function"]) == ["keep@0:4:5 function -> keep@0:1:11"]
+
+
+pure func test_a_trait_method_call_uses_the_trait_method() -> Bool:
+    (
+        root_uses(alone(TRAIT_METHOD_SOURCE), ["trait method"])
+        == ["measure@0:7:5 trait method -> measure@0:2:15"]
+    )
+
+
+pure func test_a_constant_read_uses_the_constant() -> Bool:
+    root_uses(alone(CONSTANT_SOURCE), ["constant"]) == ["LIMIT@0:3:5 constant -> LIMIT@0:1:1"]
+
+
+pure func test_a_type_annotation_uses_the_type() -> Bool:
+    (
+        root_uses(alone(TYPE_SOURCE), ["type"])
+        == [
+            "Int@0:2:8 type -> none",
+            "Point@0:4:23 type -> Point@0:1:8",
+            "Point@0:4:33 type -> Point@0:1:8",
+        ]
+    )
+
+
+pure func test_a_bound_uses_the_trait() -> Bool:
+    (
+        root_uses(alone(TRAIT_SOURCE), ["trait"])
+        == ["Self@0:2:30 trait -> Measure@0:1:7", "Measure@0:3:19 trait -> Measure@0:1:7"]
+    )
+
+
+pure func test_a_field_access_uses_the_field() -> Bool:
+    root_uses(alone(FIELD_ACCESS_SOURCE), ["field"]) == ["x@0:5:11 field -> x@0:2:5"]
+
+
+pure func test_a_field_update_uses_the_field() -> Bool:
+    root_uses(alone(FIELD_UPDATE_SOURCE), ["field"]) == ["y@0:6:15 field -> y@0:3:5"]
+
+
+pure func test_a_record_construction_uses_each_field() -> Bool:
+    (
+        root_uses(alone(FIELD_CONSTRUCTION_SOURCE), ["field"])
+        == ["x@0:6:7 field -> x@0:2:5", "y@0:6:14 field -> y@0:3:5"]
+    )
+
+
+pure func test_a_variant_construction_uses_the_variant() -> Bool:
+    root_uses(alone(VARIANT_SOURCE), ["variant"]) == ["Off@0:5:5 variant -> Off@0:2:5"]
+
+
+pure func test_a_type_parameter_annotation_uses_the_parameter() -> Bool:
+    (
+        root_uses(alone(TYPE_PARAMETER_SOURCE), ["type parameter"])
+        == ["T@0:1:26 type parameter -> T@0:1:16", "T@0:1:32 type parameter -> T@0:1:16"]
+    )
+
+
+-- Each method's `T` is its own referent, and both are declared by the header's.
+pure func test_methods_share_their_receiver_parameter_declaration() -> Bool:
+    (
+        root_uses(alone(RECEIVER_PARAMETER_SOURCE), ["type parameter"])
+        == [
+            "T@0:5:11 type parameter -> T@0:4:12",
+            "T@0:9:21 type parameter -> T@0:7:25",
+            "T@0:12:21 type parameter -> T@0:7:25",
+        ]
+    )
+
+
+pure func test_a_binding_read_uses_the_binding() -> Bool:
+    (
+        root_uses(alone(BINDING_SOURCE), ["binding"])
+        == ["value@0:2:12 binding -> value@0:1:18", "copy@0:3:5 binding -> copy@0:2:5"]
+    )
+
+
+-- A module's declaration is its first byte, which renders as empty text.
+pure func test_a_module_alias_uses_the_module_and_the_name() -> Bool:
+    (
+        root_uses(importing(ALIAS_SOURCE, HELPERS), ["module", "function"])
+        == ["tools@0:4:5 module -> @1:1:1", "seven@0:4:11 function -> seven@1:1:11"]
+    )
+
+
+pure func test_a_receiver_call_uses_the_function() -> Bool:
+    root_uses(alone(UFCS_SOURCE), ["function"]) == ["keep@0:4:7 function -> keep@0:1:11"]
+
+
+pure func test_an_import_selection_uses_the_selected_name() -> Bool:
+    (
+        root_uses(importing(SELECTION_SOURCE, HELPERS), ["function"])
+        == ["seven@0:2:14 function -> seven@1:1:11", "seven@0:4:5 function -> seven@1:1:11"]
+    )
+
+
+pure func test_a_methods_selection_uses_its_type() -> Bool:
+    (
+        root_uses(importing(METHODS_SELECTION_SOURCE, SHOUTING), ["type", "function"])
+        == [
+            "String@0:2:15 type -> none",
+            "String@0:3:22 type -> none",
+            "String@0:3:33 type -> none",
+            "shout@0:4:10 function -> shout@1:1:11",
+        ]
+    )
+
+
+pure func test_a_name_inside_interpolation_is_used() -> Bool:
+    root_uses(alone(INTERPOLATION_SOURCE), ["binding"]) == ["name@0:2:14 binding -> name@0:1:17"]
+
+
+pure func test_a_traits_self_resolves_to_the_trait() -> Bool:
+    (
+        root_uses(alone(TRAIT_METHOD_SOURCE), ["trait"])
+        == ["Self@0:2:30 trait -> Measure@0:1:7", "Measure@0:3:12 trait -> Measure@0:1:7"]
+    )
+
+
+pure func test_a_built_in_type_has_no_declaration_span() -> Bool:
+    (
+        root_uses(alone(FUNCTION_SOURCE), ["type"])
+        == ["Int@0:1:23 type -> none", "Int@0:1:31 type -> none", "Int@0:3:22 type -> none"]
+    )
+
+
+pure func test_every_use_is_recorded_once_and_no_declaration_is_a_use() -> Bool:
+    (
+        root_uses(alone(EXAMPLE_SOURCE), ALL_KINDS)
+        == [
+            "Int@0:1:29 type -> none",
+            "Int@0:2:30 type -> none",
+            "Int@0:3:28 type -> none",
+            "ParsedProgram@0:4:34 type -> ParsedProgram@0:1:13",
+            "Result@0:4:52 type -> Result@1:13:7",
+            "CheckedProgram@0:4:59 type -> CheckedProgram@0:2:13",
+            "CheckFailure@0:4:75 type -> CheckFailure@0:3:13",
+            "Err@0:5:5 variant -> Err@1:15:5",
+            "CheckFailure@0:5:21 type -> CheckFailure@0:3:13",
+            "ParsedProgram@0:6:26 type -> ParsedProgram@0:1:13",
+            "Result@0:6:44 type -> Result@1:13:7",
+            "CheckedProgram@0:6:51 type -> CheckedProgram@0:2:13",
+            "CheckFailure@0:6:67 type -> CheckFailure@0:3:13",
+            "program@0:7:5 binding -> program@0:6:17",
+            "check_program@0:7:13 function -> check_program@0:4:11",
+        ]
+    )
+
+
+pure func test_a_variant_in_a_pattern_uses_the_variant() -> Bool:
+    (
+        root_uses(importing(PATTERN_VARIANT_SOURCE, SWITCHES), ["type", "variant", "module"])
+        == [
+            "Switch@0:2:24 type -> Switch@1:1:7",
+            "Off@0:2:31 variant -> Off@1:2:5",
+            "On@0:2:36 variant -> On@1:3:5",
+            "Switch@0:3:24 type -> Switch@1:1:7",
+            "Int@0:3:35 type -> none",
+            "Off@0:5:9 variant -> Off@1:2:5",
+            "power@0:6:9 module -> @1:1:1",
+            "On@0:6:15 variant -> On@1:3:5",
+            "Switch@0:7:26 type -> Switch@1:1:7",
+            "Int@0:7:37 type -> none",
+            "Switch@0:9:9 type -> Switch@1:1:7",
+            "Off@0:9:16 variant -> Off@1:2:5",
+            "On@0:10:9 variant -> On@1:3:5",
+        ]
+    )
+
+
+pure func test_a_qualified_variant_uses_the_union_and_the_variant() -> Bool:
+    (
+        root_uses(alone(QUALIFIED_VARIANT_SOURCE), ["type", "variant"])
+        == [
+            "Switch@0:4:24 type -> Switch@0:1:7",
+            "Switch@0:5:5 type -> Switch@0:1:7",
+            "On@0:5:12 variant -> On@0:3:5",
+        ]
+    )
+
+
+pure func test_an_aliased_bound_uses_the_module_and_the_trait() -> Bool:
+    (
+        root_uses(importing(ALIASED_BOUND_SOURCE, MEASURES), ["module", "trait"])
+        == ["sizes@0:3:19 module -> @1:1:1", "Measure@0:3:25 trait -> Measure@1:1:7"]
+    )
+
+
+pure func test_an_opaque_conversion_uses_the_opaque_type() -> Bool:
+    (
+        root_uses(alone(OPAQUE_CONVERSION_SOURCE), ["type"])
+        == [
+            "Int@0:1:22 type -> none",
+            "Int@0:2:25 type -> none",
+            "Meters@0:2:33 type -> Meters@0:1:13",
+            "Meters@0:3:17 type -> Meters@0:1:13",
+            "Meters@0:4:26 type -> Meters@0:1:13",
+            "Int@0:4:37 type -> none",
+            "Meters@0:5:17 type -> Meters@0:1:13",
+        ]
+    )
+
+
+pure func test_a_lambda_parameter_annotation_uses_the_type() -> Bool:
+    (
+        root_uses(alone(LAMBDA_SOURCE), ["type"])
+        == ["Int@0:1:22 type -> none", "Int@0:2:31 type -> none", "Int@0:2:39 type -> none"]
+    )
+
+
+pure func test_a_lambda_binding_is_declared_by_its_parameter() -> Bool:
+    (
+        root_uses(alone(LAMBDA_SOURCE), ["binding"])
+        == ["value@0:2:44 binding -> value@0:2:24", "double@0:3:5 binding -> double@0:2:5"]
+    )
+
+
+pure func test_a_constant_annotation_and_initialiser_use_their_names() -> Bool:
+    (
+        root_uses(alone(CONSTANT_DECLARATION_SOURCE), ["type", "field"])
+        == [
+            "Int@0:2:8 type -> none",
+            "Point@0:4:9 type -> Point@0:1:8",
+            "x@0:4:19 field -> x@0:2:5",
+        ]
+    )
+
+
+pure func test_type_declarations_use_the_types_they_annotate() -> Bool:
+    (
+        root_uses(alone(TYPE_DECLARATIONS_SOURCE), ["type"])
+        == [
+            "Int@0:2:12 type -> none",
+            "Size@0:5:12 type -> Size@0:1:8",
+            "Size@0:7:11 type -> Size@0:1:8",
+            "Size@0:9:23 type -> Size@0:1:8",
+        ]
+    )
+
+
+pure func test_an_implementations_self_resolves_to_its_receiver_type() -> Bool:
+    (
+        root_uses(alone(IMPLEMENTATION_SELF_SOURCE), ["type"])
+        == [
+            "Int@0:2:39 type -> none",
+            "Int@0:4:8 type -> none",
+            "Point@0:6:24 type -> Point@0:3:8",
+            "Self@0:7:30 type -> Point@0:3:8",
+            "Int@0:7:39 type -> none",
+        ]
+    )
+
+
+-- The entry assembly writes calls the library at the root's end and names
+-- its own aliases at the compiler's span; none of those names is a use.
+pure func test_the_test_wrapper_records_no_uses() -> Bool:
+    sources = [SUITE_ROOT, SUITE_LIBRARY, FOUNDATION_TYPES, prelude_source(test_base())]
+    match parse_test_suite(SUITE_ROOT, SUITE_LIBRARY):
+        Err(_):
+            False
+        Ok(parsed):
+            match analyze(parsed):
+                Err(_):
+                    False
+                Ok(analysis):
+                    uses = analysis.name_uses()
+                    in_sources = uses.all(pure func(use: NameUse) -> Bool:
+                        source_module(use.span.source).is_some()
+                    )
+                    root: List[String] = uses
+                        .filter(pure func(use: NameUse) -> Bool: in_root(use.span))
+                        .sort_by(pure func(use: NameUse) -> Int: use.span.start)
+                        .map(pure func(use: NameUse) -> String:
+                            declared = analysis.rendered_declaration(sources, use.referent)
+                            "${rendered_span(sources, use.span)} ${kind(use.referent)} -> ${declared}"
+                        )
+                    expected = [
+                        "TestSuite@0:2:11 type -> TestSuite@1:3:8",
+                        "TestSuite@0:3:8 type -> TestSuite@1:3:8",
+                        "description@0:3:22 field -> description@1:4:5",
+                    ]
+                    in_sources.and(root == expected)
+
+
+-- The root's declared referents, as `kind declaration`, in source order.
+pure func test_declarations_lists_each_declared_referent() -> Bool:
+    inputs = alone(DECLARATIONS_SOURCE)
+    rendered: List[String] = match analysed(inputs):
+        None:
+            ["the program does not analyse"]
+        Some(analysis):
+            sources = module_sources(inputs)
+            analysis
+                .declarations()
+                .filter(pure func(referent: Referent) -> Bool:
+                    match analysis.declaration_span(referent):
+                        Some(span): in_root(span)
+                        None: False
+                )
+                .sort_by(pure func(referent: Referent) -> Int:
+                    match analysis.declaration_span(referent):
+                        Some(span): span.start
+                        None: -1
+                )
+                .map(pure func(referent: Referent) -> String:
+                    "${kind(referent)} ${analysis.rendered_declaration(sources, referent)}"
+                )
+    (
+        rendered
+        == ["type Point@0:1:8", "field x@0:2:5", "function origin@0:4:11", "binding start@0:4:18"]
+    )
+
+
+TESTS: TestSuite = {
+    description = "Name uses",
+    tests = [
+        ("a function call uses the function", test_a_function_call_uses_the_function),
+        (
+            "a trait method call uses the trait method",
+            test_a_trait_method_call_uses_the_trait_method,
+        ),
+        ("a constant read uses the constant", test_a_constant_read_uses_the_constant),
+        ("a type annotation uses the type", test_a_type_annotation_uses_the_type),
+        ("a bound uses the trait", test_a_bound_uses_the_trait),
+        ("a field access uses the field", test_a_field_access_uses_the_field),
+        ("a field update uses the field", test_a_field_update_uses_the_field),
+        ("a record construction uses each field", test_a_record_construction_uses_each_field),
+        ("a variant construction uses the variant", test_a_variant_construction_uses_the_variant),
+        (
+            "a type parameter annotation uses the parameter",
+            test_a_type_parameter_annotation_uses_the_parameter,
+        ),
+        (
+            "methods share their receiver parameter's declaration",
+            test_methods_share_their_receiver_parameter_declaration,
+        ),
+        ("a binding read uses the binding", test_a_binding_read_uses_the_binding),
+        (
+            "a module alias uses the module and the name",
+            test_a_module_alias_uses_the_module_and_the_name,
+        ),
+        ("a receiver call uses the function", test_a_receiver_call_uses_the_function),
+        (
+            "an import selection uses the selected name",
+            test_an_import_selection_uses_the_selected_name,
+        ),
+        ("a methods selection uses its type", test_a_methods_selection_uses_its_type),
+        ("a name inside interpolation is used", test_a_name_inside_interpolation_is_used),
+        ("a trait's Self resolves to the trait", test_a_traits_self_resolves_to_the_trait),
+        ("a built-in type has no declaration span", test_a_built_in_type_has_no_declaration_span),
+        (
+            "a variant in a pattern uses the variant, bare or qualified",
+            test_a_variant_in_a_pattern_uses_the_variant,
+        ),
+        (
+            "a qualified variant uses the union and the variant",
+            test_a_qualified_variant_uses_the_union_and_the_variant,
+        ),
+        (
+            "an aliased bound uses the module and the trait",
+            test_an_aliased_bound_uses_the_module_and_the_trait,
+        ),
+        (
+            "an opaque conversion uses the opaque type",
+            test_an_opaque_conversion_uses_the_opaque_type,
+        ),
+        (
+            "a lambda parameter annotation uses the type",
+            test_a_lambda_parameter_annotation_uses_the_type,
+        ),
+        (
+            "a lambda binding is declared by its parameter",
+            test_a_lambda_binding_is_declared_by_its_parameter,
+        ),
+        (
+            "a constant's annotation and initialiser use their names",
+            test_a_constant_annotation_and_initialiser_use_their_names,
+        ),
+        (
+            "type declarations use the types they annotate",
+            test_type_declarations_use_the_types_they_annotate,
+        ),
+        (
+            "an implementation's Self resolves to its receiver type",
+            test_an_implementations_self_resolves_to_its_receiver_type,
+        ),
+        ("the test wrapper records no uses", test_the_test_wrapper_records_no_uses),
+        (
+            "every use is recorded once and no declaration is a use",
+            test_every_use_is_recorded_once_and_no_declaration_is_a_use,
+        ),
+        (
+            "declarations lists each declared referent",
+            test_declarations_lists_each_declared_referent,
+        ),
+    ],
+}

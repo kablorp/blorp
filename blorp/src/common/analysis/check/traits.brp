@@ -42,9 +42,11 @@ import:
         Namespace,
         FunctionSource(DeclaredHere),
         NamedValue(NamedFunction),
+        TraitReference,
         TypeHead(PrimitiveHead, ListHead, RecordHead, UnionHead, OpaqueHead),
     ./declarations:
         CheckedDeclarations,
+        ResolvedType(ResolvedTypeTerm),
         TypeScope,
         type_access,
         previous_declaration,
@@ -123,8 +125,24 @@ import:
         TypeRef(ParameterType, VoidType, NominalType, StringType),
         TypeParameterOwner(TraitDeclaration),
         type_parameter_id,
+    ./name_uses: NameUse, Referent(TraitReferent), trait_uses
     ./resource_types: TypeRef methods
     ./signatures: AcceptedFunction
+
+
+-- One accepted trait method, and the uses so far with its signature's names.
+private record AcceptedRequirement {
+    method: AcceptedTraitMethod,
+    uses: List[NameUse],
+}
+
+
+-- One accepted trait, and the uses so far with the names its supertraits and
+-- method signatures use.
+private record AcceptedTraitNames {
+    accepted: AcceptedTrait,
+    uses: List[NameUse],
+}
 
 
 private pure func requirement(
@@ -132,7 +150,7 @@ private pure func requirement(
     scope: TypeScope,
     owner: TraitId,
     parsed: ParsedContents,
-) -> Result[AcceptedTraitMethod, CheckError]:
+) -> Result[AcceptedRequirement, CheckError]:
     header ?= row
         .trait_method_header(parsed.declarations)
         .or_checker_invariant(row.span, InvalidFunctionContract)
@@ -145,6 +163,7 @@ private pure func requirement(
     else:
         Err(trait_error(header.function_name.span, GenericRequirement(row.id)))
     var parameters: List[TypeUse] = []
+    var uses: List[NameUse] = []
     var failure: Option[CheckError] = None
     for parameter in header.parameters:
         match parameter.scoped_qualifier:
@@ -155,13 +174,13 @@ private pure func requirement(
                 break
             None:
                 void
-        resolved: Result[TypeRef, CheckError] = match parameter.type_name:
+        resolved: Result[ResolvedType, CheckError] = match parameter.type_name:
             CallableTypeSyntax(_, _, _, _):
                 Err(trait_error(parameter.type_name.type_span(), CallableFormalDeferred(row.id)))
             _:
-                scope.resolve_type(parameter.type_name)
+                scope.resolve_type(parameter.type_name, [])
         match resolved:
-            Ok(value_type):
+            Ok(ResolvedTypeTerm(value_type, parameter_uses)):
                 if value_type.is_resource(scope.opaques):
                     failure = Some(
                         resource_errors.resource_error(
@@ -174,6 +193,7 @@ private pure func requirement(
                     value_type = value_type,
                     span = parameter.type_name.type_span(),
                 })
+                uses = uses.concat(parameter_uses)
             Err(error):
                 failure = Some(error)
                 break
@@ -189,9 +209,10 @@ private pure func requirement(
                 Err(trait_error(value.span, FirstParameterMustBeSelf(row.id)))
         []:
             Err(trait_error(header.function_name.span, FirstParameterMustBeSelf(row.id)))
-    result ?= match header.return_type:
-        Some(written): scope.resolve_type(written)
-        None: Ok(VoidType)
+    resolved_result: ResolvedType ?= match header.return_type:
+        Some(written): scope.resolve_type(written, uses)
+        None: Ok(ResolvedTypeTerm(VoidType, uses))
+    result = resolved_result.resolved_value_type()
     result_span = match header.return_type:
         Some(written): written.type_span()
         None: header.function_name.span
@@ -204,16 +225,19 @@ private pure func requirement(
         RequiredMethod(_): None
         DefaultMethod(function): Some(function)
     Ok({
-        id = row.id,
-        default_body = default_body,
-        signature = {
-            type_parameters = [self],
-            requirements = [],
-            purity = Pure,
-            scoped_parameters = [],
-            parameters = parameters,
-            return_type = { value_type = result, span = result_span },
+        method = {
+            id = row.id,
+            default_body = default_body,
+            signature = {
+                type_parameters = [self],
+                requirements = [],
+                purity = Pure,
+                scoped_parameters = [],
+                parameters = parameters,
+                return_type = { value_type = result, span = result_span },
+            },
         },
+        uses = resolved_result.resolved_uses(),
     })
 
 
@@ -221,7 +245,7 @@ private pure func accept_trait(
     row: TraitRow,
     parsed: ParsedContents,
     namespace: Namespace,
-) -> Result[AcceptedTrait, CheckError]:
+) -> Result[AcceptedTraitNames, CheckError]:
     self = type_parameter_id(TraitDeclaration(row.id), 0)
     scope: TypeScope = {
         records = parsed.declarations.inventory_records(),
@@ -234,16 +258,20 @@ private pure func accept_trait(
         self_binding = Some({
             name = parsed.names.contextual_words().self_word,
             value_type = ParameterType(self),
+            referent = TraitReferent(row.id),
         }),
     }
     var supertraits: List[LocatedTrait] = []
+    var uses: List[NameUse] = []
     var failure: Option[CheckError] = None
     for written in row.supertraits:
         span = written.type_span()
         match namespace.resolve_trait(row.module, written):
             None:
                 failure = Some(trait_error(span, SupertraitUnknown))
-            Some(id):
+            Some(reference):
+                id = reference.referenced_trait()
+                uses = uses.concat(reference.trait_uses())
                 -- A public trait may not name a private supertrait, which code
                 -- outside its module could bound by but never implement.
                 hidden: Option[NameId] = match (
@@ -275,14 +303,15 @@ private pure func accept_trait(
         for method in row.methods:
             match method.requirement(scope, row.id, parsed):
                 Ok(accepted):
-                    methods = methods.append(accepted)
+                    methods = methods.append(accepted.method)
+                    uses = uses.concat(accepted.uses)
                 Err(error):
                     failure = Some(error)
                     break
     _: Void ?= match failure:
         Some(error): Err(error)
         None: Ok(void)
-    Ok({ id = row.id, supertraits = supertraits, methods = methods })
+    Ok({ accepted = { id = row.id, supertraits = supertraits, methods = methods }, uses = uses })
 
 
 -- Walks up from `root`; `walked` ends at `current`. An edge back to the root
@@ -967,13 +996,21 @@ private pure func designates(designated: Option[TraitId], row: TraitRow) -> Bool
         None: False
 
 
+-- The accepted trait contracts, and the names their supertraits and method
+-- signatures use.
+record AcceptedContractNames {
+    contracts: AcceptedTraitContracts,
+    uses: List[NameUse],
+}
+
+
 -- Each designated trait is admitted by its own contract. Once every trait is
 -- accepted, supertrait cycles are rejected, before any proof walks them.
 pure func accept_trait_contracts(
     parsed: ParsedContents,
     namespace: Namespace,
     boolean: DesignatedBoolean[VariantId],
-) -> Result[AcceptedTraitContracts, CheckError]:
+) -> Result[AcceptedContractNames, CheckError]:
     words = parsed.names.foundation_words()
     equality = parsed.designated_trait(namespace, words.equatable_word)
     ordering = parsed.designated_trait(namespace, words.orderable_word)
@@ -1023,10 +1060,13 @@ pure func accept_trait_contracts(
         dict_literal = parsed.dict_literal_functions(namespace),
     }
     var declarations: List[AcceptedTrait] = []
+    var uses: List[NameUse] = []
     var failure: Option[CheckError] = None
     for row in parsed.declarations.inventory_traits():
         match row.accept_trait(parsed, namespace):
-            Ok(accepted):
+            Ok(named):
+                accepted = named.accepted
+                uses = uses.concat(named.uses)
                 declarations = declarations.append(accepted)
                 if designates(equality, row):
                     match row.accept_equality(accepted, parsed, boolean):
@@ -1097,8 +1137,10 @@ pure func accept_trait_contracts(
                 Ok(_): void
                 Err(error): failure = Some(error)
     match failure:
-        Some(error): Err(error)
-        None: Ok({ declarations = declarations, canonical = canonical })
+        Some(error):
+            Err(error)
+        None:
+            Ok({ contracts = { declarations = declarations, canonical = canonical }, uses = uses })
 
 
 -- Accepted rows always satisfy the table's invariants; a rejection is a

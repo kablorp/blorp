@@ -74,6 +74,7 @@ import:
     ../ids: TraitMethodId, FunctionId, VariantId, OpaqueRow, TraitId, OpaqueId, RecordId
     ../namespace/builtins as builtins: RuntimeOperation, integer_fits
     ../namespace/namespace:
+        AliasedModule,
         NamedValue(NamedMethod, NamedFunction, NamedConstant, NamedConstructor, NamedAlias),
         OfferedValue(OfferedMethod, OfferedFunction, OfferedConstant, OfferedConstructor),
         TypeHead(OpaqueHead),
@@ -126,7 +127,7 @@ import:
         VariantId methods,
         InferenceType methods,
         WrittenName methods,
-    ./declarations: Namespace methods
+    ./declarations: Namespace methods, ResolvedType(ResolvedTypeTerm)
     ./errors as errors:
         CheckError,
         RecursionError(AnnotatedSelfCallback, GenericTailRecursionUnsupported),
@@ -186,6 +187,7 @@ import:
         checker_invariant,
         or_checker_invariant,
     ./inference:
+        SelectedReceiver,
         PendingBase(
             PendingContext,
             PendingInterpolatedString,
@@ -309,8 +311,6 @@ import:
         CheckedLambda,
         CheckedCapture,
         LambdaRow(CollectingLambda, CheckedLambdaRow),
-        CheckedValueResult,
-        ResolvedBody,
         LambdaId,
         lambda_id,
         CaptureId,
@@ -347,6 +347,20 @@ import:
         TypeParameterId,
         CanonicalEquality,
         CanonicalOperation,
+    ./name_uses:
+        NameUse,
+        Referent(
+            BindingReferent,
+            ConstantReferent,
+            FieldReferent,
+            FunctionReferent,
+            ModuleReferent,
+            TraitMethodReferent,
+            TypeReferent,
+        ),
+        WrittenUses(NoUses, OneUse, QualifiedUses),
+        name_use,
+        with_uses,
     ./resource_types: TypeRef methods
     ./scope:
         CallableBinding,
@@ -357,6 +371,25 @@ import:
     ./signatures: AcceptedFunction
     ./traits: TraitAvailability
     ./well_formed: TraitAvailability methods
+
+
+-- A checked value, the lambda rows so far, and the names the value uses. It and
+-- `ResolvedBody` live here, not in `model`, which cannot import `name_uses`.
+record CheckedValueResult {
+    value: CheckedExpr,
+    lambdas: List[LambdaRow],
+    uses: List[NameUse],
+}
+
+
+-- A checked block or function body, the lambda rows so far, and the names it uses.
+record ResolvedBody {
+    bindings: List[BindingDefinition],
+    statements: List[CheckedStatement],
+    body: CheckedBody,
+    lambdas: List[LambdaRow],
+    uses: List[NameUse],
+}
 
 
 private union ExpressionSite:
@@ -413,9 +446,11 @@ private union ResolvedPostfix:
     ReadField(WrittenName)
 
 
+-- A called name: a call with the use of its name, a stored callable read with
+-- that use, or a constructor, whose plan records its own use.
 private union ResolvedApplication:
-    FunctionApplication(FunctionContract)
-    StoredApplication(CheckedExpr, FunctionContract)
+    FunctionApplication(FunctionContract, NameUse)
+    StoredApplication(CheckedExpr, FunctionContract, NameUse)
     ConstructorApplication(VariantId, WrittenName)
 
 
@@ -600,6 +635,8 @@ private record AdmittedLambda {
     admission: LambdaAdmission,
     value_type: InferenceType,
     constraints: List[InferenceEquality],
+    -- The names the lambda's annotations use.
+    uses: List[NameUse],
 }
 
 
@@ -990,9 +1027,9 @@ private pure func plan_base(
         ListExpression(elements):
             elements.plan_list_literal(expectation, body.base_span)
         VoidExpression:
-            Ok(PlannedLeaf(AcceptedVoid, VoidType))
+            Ok(PlannedLeaf(AcceptedVoid, VoidType, NoUses))
         StringExpression(value):
-            Ok(PlannedLeaf(AcceptedString(value), StringType))
+            Ok(PlannedLeaf(AcceptedString(value), StringType, NoUses))
         InterpolatedString(parts):
             match site:
                 ConstantInitializer(_, _, _): Err(constant_error(body.span, NonClosedInitializer))
@@ -1000,7 +1037,7 @@ private pure func plan_base(
         IntegerExpression(value):
             value.plan_integer_literal(expectation, slots, body.base_span)
         FloatExpression(value):
-            Ok(PlannedLeaf(AcceptedFloat(value), FloatType))
+            Ok(PlannedLeaf(AcceptedFloat(value), FloatType, NoUses))
         TupleExpression(elements):
             match expectation.tuple_hints(slots, body.base_span):
                 Ok(hints): Ok(PlannedTuple(elements, hints))
@@ -1028,13 +1065,13 @@ private pure func plan_integer_literal(
                 Err(error):
                     Err(error)
                 Ok(AcceptedType(IntegerType(format))):
-                    Ok(PlannedLeaf(AcceptedInteger(value), IntegerType(format)))
+                    Ok(PlannedLeaf(AcceptedInteger(value), IntegerType(format), NoUses))
                 Ok(CallVariable(_)):
                     Ok(PlannedIntegerLiteral(value))
                 Ok(_):
-                    Ok(PlannedLeaf(AcceptedInteger(value), IntegerType(Int64Format)))
+                    Ok(PlannedLeaf(AcceptedInteger(value), IntegerType(Int64Format), NoUses))
         None:
-            Ok(PlannedLeaf(AcceptedInteger(value), IntegerType(Int64Format)))
+            Ok(PlannedLeaf(AcceptedInteger(value), IntegerType(Int64Format), NoUses))
 
 
 private pure func plan_closed_base(
@@ -1090,6 +1127,7 @@ private pure func plan_closed_qualified(
                 .variant_owner()
                 .plan_qualified_variant(
                     variant,
+                    qualified.module.name_use(ModuleReferent(aliased.target)),
                     qualified.name,
                     arguments,
                     called,
@@ -1217,7 +1255,7 @@ private pure func plan_dict_literal(
     else if expectation.is_none():
         Err(value_error(span, EmptyDictNeedsType))
     else:
-        Ok(PlannedCall(empty, [], ReturnPlacement(span, body.span), expectation))
+        Ok(PlannedCall(empty, [], ReturnPlacement(span, body.span), expectation, NoUses))
 
 
 private pure func plan_body_base(
@@ -1238,6 +1276,7 @@ private pure func plan_body_base(
                         [left, right],
                         ReturnPlacement(body.base_span, body.span),
                         expectation,
+                        NoUses,
                     ),
                 )
         ArithmeticExpression(operator, span, left, right):
@@ -1255,6 +1294,7 @@ private pure func plan_body_base(
                         [left, right],
                         ReturnPlacement(body.base_span, body.span),
                         expectation,
+                        NoUses,
                     ),
                 )
         NegationExpression(span, operand):
@@ -1264,6 +1304,7 @@ private pure func plan_body_base(
                     [operand],
                     ReturnPlacement(body.base_span, body.span),
                     expectation,
+                    NoUses,
                 ),
             )
         RecordUpdateExpression(base, fields):
@@ -1274,16 +1315,17 @@ private pure func plan_body_base(
             match name.classify_direct_call(arguments, scope, context):
                 Ok(classified):
                     match classified:
-                        FunctionApplication(contract):
+                        FunctionApplication(contract, called_name):
                             Ok(
                                 PlannedCall(
                                     contract,
                                     arguments,
                                     ReturnPlacement(body.base_span, body.span),
                                     expectation,
+                                    OneUse(called_name),
                                 ),
                             )
-                        StoredApplication(callee, contract):
+                        StoredApplication(callee, contract, called_name):
                             Ok(
                                 PlannedStoredCall(
                                     callee,
@@ -1291,6 +1333,7 @@ private pure func plan_body_base(
                                     arguments,
                                     ReturnPlacement(body.base_span, body.span),
                                     expectation,
+                                    OneUse(called_name),
                                 ),
                             )
                         ConstructorApplication(variant, constructor_name):
@@ -1307,6 +1350,9 @@ private pure func plan_body_base(
         NameExpression(name):
             match scope.lookup_binding(name.id):
                 Some(DataLocal(binding)):
+                    read: WrittenUses = OneUse(
+                        name.name_use(BindingReferent(binding.binding_site().binding)),
+                    )
                     if binding.binding_site().binding.owner == context.caller.body:
                         Ok(
                             PlannedLeaf(
@@ -1315,6 +1361,7 @@ private pure func plan_body_base(
                                     binding.literal_binding(),
                                 ),
                                 binding.binding_definition().value_type,
+                                read,
                             ),
                         )
                     else:
@@ -1330,6 +1377,7 @@ private pure func plan_body_base(
                                 PlannedLeaf(
                                     PendingCapture(binding.binding_site().binding),
                                     binding.binding_definition().value_type,
+                                    read,
                                 ),
                             )
                 Some(CallableLocal(binding)):
@@ -1341,7 +1389,13 @@ private pure func plan_body_base(
                         AcceptedBinding(local.local_binding_id(), None)
                     else:
                         PendingCapture(local.binding_site().binding)
-                    Ok(PlannedLeaf(base, local.binding_definition().value_type))
+                    Ok(
+                        PlannedLeaf(
+                            base,
+                            local.binding_definition().value_type,
+                            OneUse(name.name_use(BindingReferent(local.binding_site().binding))),
+                        ),
+                    )
                 None:
                     match context.namespace.named_value(context.module, name.id):
                         Some(NamedMethod(_)):
@@ -1349,15 +1403,21 @@ private pure func plan_body_base(
                         Some(NamedFunction(_, _)):
                             Ok(PlannedCallable(body, expectation))
                         Some(NamedConstant(id)):
-                            context.constants
-                                .constant_row(id)
-                                .or_checker_invariant(name.span, InvalidConstantDeclaration(id))
-                                .map(
-                                    pure func(row): PlannedLeaf(
-                                        AcceptedConstant(row.value),
-                                        row.value.value_type,
-                                    ),
-                                )
+                            match (
+                                context.constants
+                                    .constant_row(id)
+                                    .or_checker_invariant(name.span, InvalidConstantDeclaration(id))
+                            ):
+                                Ok(row):
+                                    Ok(
+                                        PlannedLeaf(
+                                            AcceptedConstant(row.value),
+                                            row.value.value_type,
+                                            OneUse(name.name_use(ConstantReferent(id))),
+                                        ),
+                                    )
+                                Err(error):
+                                    Err(error)
                         Some(NamedConstructor(variant)):
                             variant.plan_variant(name, [], False, expectation, slots, construction)
                         Some(NamedAlias(_)):
@@ -1397,7 +1457,13 @@ private pure func plan_body_base(
                                     ),
                                 )
                             Some(accepted):
-                                Ok(PlannedConstructOpaque(accepted, operand))
+                                Ok(
+                                    PlannedConstructOpaque(
+                                        accepted,
+                                        operand,
+                                        name.name_use(TypeReferent(OpaqueHead(declaration.id))),
+                                    ),
+                                )
         OpaqueUnwrap(name, operand):
             match name.conversion_declaration(context):
                 Err(error):
@@ -1415,7 +1481,13 @@ private pure func plan_body_base(
                                     ),
                                 )
                             Some(accepted):
-                                Ok(PlannedProjectOpaque(accepted, operand))
+                                Ok(
+                                    PlannedProjectOpaque(
+                                        accepted,
+                                        operand,
+                                        name.name_use(TypeReferent(OpaqueHead(declaration.id))),
+                                    ),
+                                )
         RangeExpression(_, _):
             Err(unsupported_form(body.base_span, RangeValue))
         IfExpression(_):
@@ -1446,6 +1518,8 @@ private pure func plan_qualified(
 ) -> Result[PlannedBase, CheckError]:
     aliased ?= context.namespace.aliased_module(context.module, qualified.module)
     name = qualified.name
+    -- A callable left uncalled resolves again as an operand, which records it.
+    alias_use = qualified.module.name_use(ModuleReferent(aliased.target))
     match context.namespace.offered_value(aliased.target, name.id):
         Ok(OfferedConstant(id)):
             match (
@@ -1465,7 +1539,7 @@ private pure func plan_qualified(
                         ):
                             Err(error):
                                 Err(error)
-                            Ok(StoredApplication(callee, contract)):
+                            Ok(StoredApplication(callee, contract, called_name)):
                                 Ok(
                                     PlannedStoredCall(
                                         callee,
@@ -1473,17 +1547,25 @@ private pure func plan_qualified(
                                         arguments,
                                         ReturnPlacement(body.base_span, body.span),
                                         expectation,
+                                        QualifiedUses(alias_use, called_name),
                                     ),
                                 )
                             Ok(_):
                                 Err(checker_invariant(name.span, InvalidFunctionContract))
                     else:
-                        Ok(PlannedLeaf(AcceptedConstant(row.value), row.value.value_type))
+                        Ok(
+                            PlannedLeaf(
+                                AcceptedConstant(row.value),
+                                row.value.value_type,
+                                QualifiedUses(alias_use, name.name_use(ConstantReferent(id))),
+                            ),
+                        )
         Ok(OfferedConstructor(variant)):
             variant
                 .variant_owner()
                 .plan_qualified_variant(
                     variant,
+                    alias_use,
                     name,
                     arguments,
                     called,
@@ -1506,6 +1588,10 @@ private pure func plan_qualified(
                                 arguments,
                                 ReturnPlacement(body.base_span, body.span),
                                 expectation,
+                                QualifiedUses(
+                                    alias_use,
+                                    name.name_use(TraitMethodReferent(method)),
+                                ),
                             ),
                         )
                     Err(error):
@@ -1528,6 +1614,7 @@ private pure func plan_qualified(
                                 arguments,
                                 ReturnPlacement(body.base_span, body.span),
                                 expectation,
+                                QualifiedUses(alias_use, name.name_use(FunctionReferent(function))),
                             ),
                         )
                     Err(error):
@@ -1692,7 +1779,7 @@ private pure func pending_receiver_contract(
     candidates: List[ReceiverFunction],
     site: ExpressionSite,
     slots: List[InferenceSlot],
-) -> Result[FunctionContract, CheckError]:
+) -> Result[SelectedReceiver, CheckError]:
     context ?= site.body_context(application.span)
     application.select_receiver_contract(
         candidates,
@@ -1800,6 +1887,23 @@ private pure func pending_field(
             ),
         },
     )
+
+
+-- `pending_field` links one step that reads the field `name` resolved to; that
+-- step's field is the name's use.
+private pure func field_access_use(
+    value: PendingValue,
+    name: WrittenName,
+) -> Result[NameUse, CheckError]:
+    match value.operations:
+        PendingOperationLink(step, _):
+            match step.operation:
+                AcceptedField(field):
+                    Ok(name.name_use(FieldReferent(field)))
+                AcceptedTupleElement(_) | PendingInvocation(_, _):
+                    Err(checker_invariant(name.span, InvalidInferenceWorklist))
+        NoPendingOperations:
+            Err(checker_invariant(name.span, InvalidInferenceWorklist))
 
 
 private pure func placed_arguments(
@@ -1938,6 +2042,8 @@ private pure func elaborate_value(
         ConstantInitializer(_, _, availability): availability.accepted_traits().canonical.addition
     var bindings: List[BindingDefinition] = []
     var lambdas = initial_lambdas
+    -- The names this expression and its lambdas use, recorded as plans settle.
+    var uses: List[NameUse] = []
     var lambda_work: List[LambdaWork] = []
     var context_work: List[ContextWork] = []
     var inference_revision = 0
@@ -1987,6 +2093,7 @@ private pure func elaborate_value(
                                             Err(error):
                                                 failure = Some(error)
                                             Ok(admitted):
+                                                uses = uses.concat(admitted.uses)
                                                 lambdas = lambdas.append(
                                                     CollectingLambda({
                                                         parent = context.caller.body,
@@ -2038,7 +2145,8 @@ private pure func elaborate_value(
                                             Some(EnterExpression(written, hint)),
                                         )
                                         work_count = work_count + 1
-                                    Ok(KnownCallableOperand(value)):
+                                    Ok(KnownCallableOperand(value, operand_uses)):
+                                        uses = uses.with_uses(operand_uses)
                                         match value.base:
                                             PendingNamedCallable(_, signature, _):
                                                 for parameter in signature.type_parameters:
@@ -2091,7 +2199,8 @@ private pure func elaborate_value(
                                                             candidates,
                                                         ),
                                                     )
-                                                UniqueReceiver(contract):
+                                                UniqueReceiver(contract, receiver_use):
+                                                    uses = uses.append(receiver_use)
                                                     match contract.static_pending_call(
                                                         slots.length(),
                                                     ):
@@ -2173,7 +2282,8 @@ private pure func elaborate_value(
                                                     Some(EnterCallable(value, callable_hint)),
                                                 )
                                                 work_count = work_count + 1
-                                            PlannedLeaf(base, value_type):
+                                            PlannedLeaf(base, value_type, leaf_uses):
+                                                uses = uses.with_uses(leaf_uses)
                                                 accepted_base: Result[PendingBase, CheckError] = match base:
                                                     PendingCapture(binding):
                                                         match site.body_context(written.span):
@@ -2251,7 +2361,8 @@ private pure func elaborate_value(
                                                     Some(value),
                                                 )
                                                 operand_count = operand_count + 1
-                                            PlannedConstructOpaque(declaration, operand):
+                                            PlannedConstructOpaque(declaration, operand, type_use):
+                                                uses = uses.append(type_use)
                                                 conversion = declaration.opaque_conversion(
                                                     slots.length(),
                                                 )
@@ -2282,7 +2393,8 @@ private pure func elaborate_value(
                                                     ),
                                                 )
                                                 work_count = work_count + 1
-                                            PlannedProjectOpaque(declaration, operand):
+                                            PlannedProjectOpaque(declaration, operand, type_use):
+                                                uses = uses.append(type_use)
                                                 conversion = declaration.opaque_conversion(
                                                     slots.length(),
                                                 )
@@ -2336,7 +2448,8 @@ private pure func elaborate_value(
                                                     Some(EnterExpression(base, update_hint)),
                                                 )
                                                 work_count = work_count + 1
-                                            PlannedVariant(contract, arguments):
+                                            PlannedVariant(contract, arguments, variant_uses):
+                                                uses = uses.with_uses(variant_uses)
                                                 work = work.push_at(
                                                     work_count,
                                                     Some(
@@ -2348,7 +2461,8 @@ private pure func elaborate_value(
                                                     ),
                                                 )
                                                 work_count = work_count + 1
-                                            PlannedStoredCall(callee, contract, arguments, placement, call_hint):
+                                            PlannedStoredCall(callee, contract, arguments, placement, call_hint, callee_uses):
+                                                uses = uses.with_uses(callee_uses)
                                                 call: PendingCall = {
                                                     target = PendingStored(callee),
                                                     signature = contract.signature,
@@ -2367,7 +2481,8 @@ private pure func elaborate_value(
                                                     ),
                                                 )
                                                 work_count = work_count + 1
-                                            PlannedCall(contract, arguments, placement, call_hint):
+                                            PlannedCall(contract, arguments, placement, call_hint, callee_uses):
+                                                uses = uses.with_uses(callee_uses)
                                                 work = work.push_at(
                                                     work_count,
                                                     Some(
@@ -2656,6 +2771,11 @@ private pure func elaborate_value(
                                         work = work.push_at(work_count, Some(ScheduleRecord(plan)))
                                         work_count = work_count + 1
                     ScheduleRecord(literal):
+                        -- Literal fields, resumed ones and update fields all schedule here once.
+                        for planned_field in literal.fields:
+                            uses = uses.append(
+                                planned_field.name.name_use(FieldReferent(planned_field.field)),
+                            )
                         work = work.push_at(
                             work_count,
                             Some(
@@ -3236,6 +3356,9 @@ private pure func elaborate_value(
                                                 Err(error):
                                                     failure = Some(error)
                                                 Ok(value):
+                                                    match value.field_access_use(name):
+                                                        Ok(field_use): uses = uses.append(field_use)
+                                                        Err(error): failure = Some(error)
                                                     operands = operands.push_at(
                                                         operand_count,
                                                         Some(value),
@@ -3269,12 +3392,13 @@ private pure func elaborate_value(
                                             ):
                                                 Err(error):
                                                     failure = Some(error)
-                                                Ok(contract):
+                                                Ok(selected):
+                                                    uses = uses.append(selected.use)
                                                     work = work.push_at(
                                                         work_count,
                                                         Some(
                                                             ScheduleCall(
-                                                                contract,
+                                                                selected.contract,
                                                                 application.arguments,
                                                                 ReceiverPlacement(current, {
                                                                     source = base_span.source,
@@ -3410,7 +3534,8 @@ private pure func elaborate_value(
                                                                     Some(ScheduleRecord(literal)),
                                                                 )
                                                                 work_count = work_count + 1
-                                                            PlannedVariant(contract, arguments):
+                                                            PlannedVariant(contract, arguments, variant_uses):
+                                                                uses = uses.with_uses(variant_uses)
                                                                 work = work.push_at(
                                                                     work_count,
                                                                     Some(
@@ -3596,6 +3721,9 @@ private pure func elaborate_value(
                                                                                         )
                                                                                     Ok(resolved):
                                                                                         lambdas = resolved.lambdas
+                                                                                        uses = uses.concat(
+                                                                                            resolved.uses,
+                                                                                        )
                                                                                         match admission.checked_lambda(
                                                                                             resolved.bindings,
                                                                                             resolved.statements,
@@ -3757,7 +3885,7 @@ private pure func elaborate_value(
             Err(error)
         None:
             match accepted:
-                Some(value): Ok({ value = value, lambdas = lambdas })
+                Some(value): Ok({ value = value, lambdas = lambdas, uses = uses })
                 None: Err(checker_invariant(body.span, InvalidInferenceWorklist))
 
 
@@ -4647,7 +4775,7 @@ pure func check_constant_initializer(
     construction: ConstructionContext,
     signatures: List[AcceptedFunction],
     traits: TraitAvailability,
-) -> Result[CheckedExpr, CheckError]:
+) -> Result[CheckedValueResult, CheckError]:
     obligation: ExpectedValue = {
         value_type = annotation.value_type,
         site = SourceAnnotation(annotation.span),
@@ -4662,7 +4790,7 @@ pure func check_constant_initializer(
     )
     -- The shared elaborator already publishes the receiving annotation's view.
     if checked.value.value_type == annotation.value_type:
-        Ok({ checked.value | span = body.span })
+        Ok({ checked | value = { checked.value | span = body.span } })
     else:
         Err(
             value_error(
@@ -4719,8 +4847,15 @@ private pure func data_callable_application(
                         ValueTarget(binding.binding_site().binding),
                         contract,
                     ):
-                        Ok(accepted): Ok(FunctionApplication(accepted))
-                        Err(error): Err(error)
+                        Ok(accepted):
+                            Ok(
+                                FunctionApplication(
+                                    accepted,
+                                    name.name_use(BindingReferent(binding.binding_site().binding)),
+                                ),
+                            )
+                        Err(error):
+                            Err(error)
         _:
             Err(binding.non_callable(name.span))
 
@@ -4750,6 +4885,7 @@ private pure func constant_application(
                     pure func(contract): StoredApplication(
                         { row.value | span = read_span },
                         contract,
+                        name.name_use(ConstantReferent(row.id)),
                     ),
                 )
         _:
@@ -4773,8 +4909,21 @@ private pure func classify_direct_call(
                 == context.caller.body
             ):
                 match context.caller.callable_contract(name, arguments, binding):
-                    Ok(contract): Ok(FunctionApplication(contract))
-                    Err(error): Err(error)
+                    Ok(contract):
+                        Ok(
+                            FunctionApplication(
+                                contract,
+                                name.name_use(
+                                    BindingReferent(
+                                        binding
+                                            .callable_local()
+                                            .binding_site().binding,
+                                    ),
+                                ),
+                            ),
+                        )
+                    Err(error):
+                        Err(error)
             else:
                 name.data_callable_application(arguments, binding.callable_local(), context)
         None:
@@ -4796,7 +4945,12 @@ private pure func classify_direct_call(
                             method,
                             context.traits.accepted_traits(),
                         )
-                        .map(pure func(contract): FunctionApplication(contract))
+                        .map(
+                            pure func(contract): FunctionApplication(
+                                contract,
+                                name.name_use(TraitMethodReferent(method)),
+                            ),
+                        )
                 Some(NamedFunction(target, _)):
                     match context.caller.function_contract(
                         name,
@@ -4805,8 +4959,15 @@ private pure func classify_direct_call(
                         target,
                         context.signatures,
                     ):
-                        Ok(contract): Ok(FunctionApplication(contract))
-                        Err(error): Err(error)
+                        Ok(contract):
+                            Ok(
+                                FunctionApplication(
+                                    contract,
+                                    name.name_use(FunctionReferent(target)),
+                                ),
+                            )
+                        Err(error):
+                            Err(error)
                 Some(NamedConstructor(variant)):
                     Ok(ConstructorApplication(variant, name))
                 _:
@@ -4912,9 +5073,20 @@ private pure func method_callable_operand(
     })
 
 
+-- A named callable operand with the use of its name, or a value the ordinary
+-- expression path reads and records.
 private union CallableInput:
-    KnownCallableOperand(PendingValue)
+    KnownCallableOperand(PendingValue, WrittenUses)
     StoredCallableOperand
+
+
+private pure func known_operand(
+    value: Result[PendingValue, CheckError],
+    uses: WrittenUses,
+) -> Result[CallableInput, CheckError]:
+    match value:
+        Ok(pending): Ok(KnownCallableOperand(pending, uses))
+        Err(error): Err(error)
 
 
 private pure func resolve_callable_operand(
@@ -4933,11 +5105,11 @@ private pure func resolve_callable_operand(
                         Some(NamedMethod(method)):
                             method
                                 .method_callable_operand(written, site, start)
-                                .map(pure func(value): KnownCallableOperand(value))
+                                .known_operand(OneUse(name.name_use(TraitMethodReferent(method))))
                         Some(NamedFunction(id, _)):
                             id
                                 .named_callable_operand(written, site, start)
-                                .map(pure func(value): KnownCallableOperand(value))
+                                .known_operand(OneUse(name.name_use(FunctionReferent(id))))
                         _:
                             Ok(StoredCallableOperand)
                 VariantName(_):
@@ -4957,11 +5129,18 @@ private pure func resolve_callable_operand(
                                 Ok(OfferedMethod(method)):
                                     method
                                         .method_callable_operand(written, site, start)
-                                        .map(pure func(value): KnownCallableOperand(value))
+                                        .known_operand(
+                                            qualified.qualified_uses(
+                                                aliased,
+                                                TraitMethodReferent(method),
+                                            ),
+                                        )
                                 Ok(OfferedFunction(id)):
                                     id
                                         .named_callable_operand(written, site, start)
-                                        .map(pure func(value): KnownCallableOperand(value))
+                                        .known_operand(
+                                            qualified.qualified_uses(aliased, FunctionReferent(id)),
+                                        )
                                 _:
                                     Ok(StoredCallableOperand)
                 _:
@@ -4996,19 +5175,26 @@ private pure func resolve_body_callable_operand(
                                 Err(error):
                                     Err(error)
                                 Ok(accepted):
+                                    local = binding.callable_local()
+                                    forwarded: PendingValue = {
+                                        span = written.span,
+                                        readiness = DeferredInference,
+                                        base = PendingForwardedCallable(accepted.parameter),
+                                        base_type = AcceptedType(
+                                            local.binding_definition().value_type,
+                                        ),
+                                        base_span = written.base_span,
+                                        operations = NoPendingOperations,
+                                    }
                                     Ok(
-                                        KnownCallableOperand({
-                                            span = written.span,
-                                            readiness = DeferredInference,
-                                            base = PendingForwardedCallable(accepted.parameter),
-                                            base_type = AcceptedType(
-                                                binding
-                                                    .callable_local()
-                                                    .binding_definition().value_type,
+                                        KnownCallableOperand(
+                                            forwarded,
+                                            OneUse(
+                                                name.name_use(
+                                                    BindingReferent(local.binding_site().binding),
+                                                ),
                                             ),
-                                            base_span = written.base_span,
-                                            operations = NoPendingOperations,
-                                        }),
+                                        ),
                                     )
                         else:
                             Ok(StoredCallableOperand)
@@ -5019,11 +5205,13 @@ private pure func resolve_body_callable_operand(
                             Some(NamedMethod(method)):
                                 method
                                     .method_callable_operand(written, site, start)
-                                    .map(pure func(value): KnownCallableOperand(value))
+                                    .known_operand(
+                                        OneUse(name.name_use(TraitMethodReferent(method))),
+                                    )
                             Some(NamedFunction(id, _)):
                                 id
                                     .named_callable_operand(written, site, start)
-                                    .map(pure func(value): KnownCallableOperand(value))
+                                    .known_operand(OneUse(name.name_use(FunctionReferent(id))))
                             Some(NamedAlias(_)):
                                 Err(qualified_error(name.span, BareModuleAlias(name.id)))
                             _:
@@ -5037,15 +5225,34 @@ private pure func resolve_body_callable_operand(
                             Ok(OfferedMethod(method)):
                                 method
                                     .method_callable_operand(written, site, start)
-                                    .map(pure func(value): KnownCallableOperand(value))
+                                    .known_operand(
+                                        qualified.qualified_uses(
+                                            aliased,
+                                            TraitMethodReferent(method),
+                                        ),
+                                    )
                             Ok(OfferedFunction(id)):
                                 id
                                     .named_callable_operand(written, site, start)
-                                    .map(pure func(value): KnownCallableOperand(value))
+                                    .known_operand(
+                                        qualified.qualified_uses(aliased, FunctionReferent(id)),
+                                    )
                             _:
                                 Ok(StoredCallableOperand)
             _:
                 Ok(StoredCallableOperand)
+
+
+-- `alias.name` resolved through `aliased` to `referent`.
+private pure func qualified_uses(
+    qualified: ParsedQualified,
+    aliased: AliasedModule,
+    referent: Referent,
+) -> WrittenUses:
+    QualifiedUses(
+        qualified.module.name_use(ModuleReferent(aliased.target)),
+        qualified.name.name_use(referent),
+    )
 
 
 -- Annotations constrain the existing caller terms; they introduce no slots.
@@ -5139,6 +5346,7 @@ private pure func admit_contextual_lambda(
             ),
         )
     var constraints: List[InferenceEquality] = []
+    var uses: List[NameUse] = []
     var position = 0
     var failure: Option[CheckError] = None
     for parameter in written.parameters:
@@ -5146,10 +5354,11 @@ private pure func admit_contextual_lambda(
             None:
                 void
             Some(annotation):
-                match context.resolve_body_type(annotation):
+                match context.resolve_body_type(annotation, []):
                     Err(error):
                         failure = Some(error)
-                    Ok(value_type):
+                    Ok(ResolvedTypeTerm(value_type, annotation_uses)):
+                        uses = uses.concat(annotation_uses)
                         match shape.parameters.get(position):
                             None:
                                 failure = Some(
@@ -5169,17 +5378,18 @@ private pure func admit_contextual_lambda(
     _: Void ?= match failure:
         Some(error): Err(error)
         None: Ok(void)
-    result_annotation: Option[TypeRef] ?= match written.return_type:
+    result_annotation: Option[ResolvedType] ?= match written.return_type:
         None:
             Ok(None)
         Some(annotation):
-            context
-                .resolve_body_type(annotation)
-                .map(pure func(value): Some(value))
-    match result_annotation:
+            match context.resolve_body_type(annotation, []):
+                Ok(resolved): Ok(Some(resolved))
+                Err(error): Err(error)
+    body_result: InferenceType = match result_annotation:
         None:
-            void
-        Some(value_type):
+            shape.result
+        Some(ResolvedTypeTerm(value_type, annotation_uses)):
+            uses = uses.concat(annotation_uses)
             constraints = constraints.append({
                 expected = shape.result,
                 actual = AcceptedType(value_type),
@@ -5187,13 +5397,12 @@ private pure func admit_contextual_lambda(
                 relation = RequireEquality,
                 parameter = None,
             })
-    body_result: InferenceType = match result_annotation:
-        None: shape.result
-        Some(value_type): AcceptedType(value_type)
+            AcceptedType(value_type)
     Ok({
         admission = { shape | result = body_result },
         value_type = expected,
         constraints = constraints,
+        uses = uses,
     })
 
 
@@ -5205,39 +5414,45 @@ private pure func admit_standalone_lambda(
     context: ResolutionContext,
 ) -> Result[AdmittedLambda, CheckError]:
     var parameters: List[InferenceType] = []
+    var uses: List[NameUse] = []
     var failure: Option[CheckError] = None
     for parameter in written.parameters:
         match parameter.annotation:
             None:
                 failure = Some(call_error(written.span, LambdaInputNeedsType))
             Some(annotation):
-                match context.resolve_body_type(annotation):
-                    Err(error): failure = Some(error)
-                    Ok(value): parameters = parameters.append(AcceptedType(value))
+                match context.resolve_body_type(annotation, []):
+                    Err(error):
+                        failure = Some(error)
+                    Ok(ResolvedTypeTerm(value_type, annotation_uses)):
+                        parameters = parameters.append(AcceptedType(value_type))
+                        uses = uses.concat(annotation_uses)
         if failure.is_some():
             break
     _: Void ?= match failure:
         Some(error): Err(error)
         None: Ok(void)
-    result: TypeRef ?= match written.return_type:
+    resolved_result: ResolvedType ?= match written.return_type:
         Some(annotation):
-            context.resolve_body_type(annotation)
+            context.resolve_body_type(annotation, uses)
         None:
-            missing: Result[TypeRef, CheckError] = match written.body:
+            missing: Result[ResolvedType, CheckError] = match written.body:
                 InlineBody(_): Err(call_error(written.span, LambdaResultNeedsType))
                 BlockBody(_): Err(call_error(written.span, LambdaBlockNeedsResult))
             missing
+    result: InferenceType = AcceptedType(resolved_result.resolved_value_type())
     Ok({
         admission = {
             id = id,
             written = written,
             parameters = parameters,
-            result = AcceptedType(result),
+            result = result,
             scope = scope,
             context = context,
         },
-        value_type = InferredCallable(written.purity, parameters, AcceptedType(result)),
+        value_type = InferredCallable(written.purity, parameters, result),
         constraints = [],
+        uses = resolved_result.resolved_uses(),
     })
 
 
@@ -5278,9 +5493,13 @@ private pure func lambda_scope(
                 ):
                     failure = Some(errors.resource_error(span, errors.ResourcePureParameter))
                     break
+                named: Bool = match parameter.binder:
+                    NamedBinder(_): True
+                    DiscardBinder(_): False
                 definition: BindingDefinition = {
                     origin = ParameterBinding(position),
                     mutable = False,
+                    named = named,
                     value_type = value_type,
                     span = span,
                 }

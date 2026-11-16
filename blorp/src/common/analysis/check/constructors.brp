@@ -21,6 +21,7 @@ import:
     ../../utils/results: first_error
     ../ids: RecordId, UnionId, VariantId
     ../namespace/namespace:
+        AliasedModule,
         Namespace,
         NamedValue(NamedConstant, NamedConstructor),
         OfferedValue(OfferedConstructor),
@@ -118,6 +119,12 @@ import:
         TypeUse,
         CheckedExpr,
         UnionOccurrence,
+    ./name_uses:
+        NameUse,
+        Referent(VariantReferent),
+        WrittenUses(OneUse, QualifiedUses),
+        name_use,
+        union_use,
 
 
 -- Construction reads declarations and module visibility, never a body owner.
@@ -232,9 +239,9 @@ pure func find_variant(
 pure func find_qualified_variant(
     context: ConstructionContext,
     occurrence: UnionOccurrence,
+    aliased: AliasedModule,
     qualified: ParsedQualified,
 ) -> Result[Option[VariantContract], CheckError]:
-    aliased ?= context.namespace.aliased_module(context.module, qualified.module)
     declared ?= match context.namespace.offered_value(aliased.target, qualified.name.id):
         Ok(OfferedConstructor(variant)):
             context.declared_variant_contract(occurrence.owner, variant, qualified.name.span)
@@ -371,6 +378,7 @@ pure func plan_union_variant(
         .variant_owner()
         .plan_qualified_variant(
             variant,
+            written.union_name.union_use(variant),
             written.variant,
             arguments,
             called,
@@ -426,8 +434,11 @@ pure func resolve_record_field(
         None: Err(record_error(name.span, UnknownRecordField(name.id, owner)))
 
 
+-- One written field of a record literal or update: the field its name
+-- resolved to, where that name is written, and its value.
 record PlannedRecordField {
     field: FieldId,
+    name: WrittenName,
     written: ValueExpression,
     expected: InferenceUse,
 }
@@ -697,6 +708,7 @@ private pure func plan_record_field(
         .or_checker_invariant(annotation.span, InvalidRecordField(field.field.id))
     Ok({
         field = field.field.id,
+        name = field.written.name,
         written = field.written.value,
         expected = { value_type = value_type, span = annotation.span, literal = None },
     })
@@ -921,6 +933,7 @@ private pure func pending_qualified_variant(
 pure func plan_qualified_variant(
     owner: UnionId,
     variant: VariantId,
+    qualifier: NameUse,
     name: WrittenName,
     arguments: List[ValueExpression],
     called: Bool,
@@ -943,29 +956,47 @@ pure func plan_qualified_variant(
             match term:
                 CallVariable(_):
                     if declared.parameters.is_empty():
-                        declared.plan_known_qualified_variant(name, arguments, called, head)
+                        declared.plan_known_qualified_variant(
+                            qualifier,
+                            name,
+                            arguments,
+                            called,
+                            head,
+                        )
                     else:
                         Ok(
                             PlannedContext(
-                                SuspendedQualifiedVariant(declared, name, arguments, called),
+                                SuspendedQualifiedVariant(
+                                    declared,
+                                    qualifier,
+                                    name,
+                                    arguments,
+                                    called,
+                                ),
                                 term,
                             ),
                         )
                 _:
-                    declared.plan_known_qualified_variant(name, arguments, called, head)
+                    declared.plan_known_qualified_variant(qualifier, name, arguments, called, head)
         _:
-            declared.plan_known_qualified_variant(name, arguments, called, head)
+            declared.plan_known_qualified_variant(qualifier, name, arguments, called, head)
 
 
 private pure func plan_known_qualified_variant(
     declared: DeclaredVariantContract,
+    qualifier: NameUse,
     name: WrittenName,
     arguments: List[ValueExpression],
     called: Bool,
     expected: Option[InferenceType],
 ) -> Result[PlannedBase, CheckError]:
     contract ?= declared.pending_qualified_variant(name, expected)
-    contract.plan_variant_arguments(name, arguments, called)
+    contract.plan_variant_arguments(
+        name,
+        arguments,
+        called,
+        QualifiedUses(qualifier, name.name_use(VariantReferent(declared.variant))),
+    )
 
 
 pure func plan_variant(
@@ -998,7 +1029,12 @@ private pure func plan_known_variant(
     context: ConstructionContext,
 ) -> Result[PlannedBase, CheckError]:
     contract ?= variant.pending_variant(name, Some(expected), slots, context)
-    contract.plan_variant_arguments(name, arguments, called)
+    contract.plan_variant_arguments(
+        name,
+        arguments,
+        called,
+        OneUse(name.name_use(VariantReferent(variant))),
+    )
 
 
 -- A payload-free variant takes no call, and a payload variant takes one
@@ -1008,6 +1044,7 @@ private pure func plan_variant_arguments(
     name: WrittenName,
     arguments: List[ValueExpression],
     called: Bool,
+    uses: WrittenUses,
 ) -> Result[PlannedBase, CheckError]:
     if (
         contract.fields
@@ -1027,7 +1064,7 @@ private pure func plan_variant_arguments(
             ),
         )
     else:
-        Ok(PlannedVariant(contract, arguments))
+        Ok(PlannedVariant(contract, arguments, uses))
 
 
 private pure func validate_variant_field(
@@ -1228,7 +1265,14 @@ union CallPlacement:
 union SuspendedConstruction:
     SuspendedRecord(List[ParsedRecordField], Span)
     SuspendedVariant(VariantId, WrittenName, List[ValueExpression], Bool)
-    SuspendedQualifiedVariant(DeclaredVariantContract, WrittenName, List[ValueExpression], Bool)
+    -- The qualifier's use (`alias` or `Union`) waits with the variant.
+    SuspendedQualifiedVariant(
+        DeclaredVariantContract,
+        NameUse,
+        WrittenName,
+        List[ValueExpression],
+        Bool,
+    )
 
 
 pure func resume_construction(
@@ -1242,8 +1286,8 @@ pure func resume_construction(
             fields.plan_known_record(span, head, context)
         SuspendedVariant(variant, name, arguments, called):
             variant.plan_known_variant(name, arguments, called, head, slots, context)
-        SuspendedQualifiedVariant(declared, name, arguments, called):
-            declared.plan_known_qualified_variant(name, arguments, called, Some(head))
+        SuspendedQualifiedVariant(declared, qualifier, name, arguments, called):
+            declared.plan_known_qualified_variant(qualifier, name, arguments, called, Some(head))
 
 
 pure func construction_context_error(written: SuspendedConstruction) -> CheckError:
@@ -1252,25 +1296,37 @@ pure func construction_context_error(written: SuspendedConstruction) -> CheckErr
             record_error(span, RecordNeedsExpectedType)
         SuspendedVariant(variant, name, _, _):
             constructor_error(name.span, ConstructorNeedsExpectedType(variant))
-        SuspendedQualifiedVariant(declared, name, _, _):
+        SuspendedQualifiedVariant(declared, _, name, _, _):
             constructor_error(name.span, ConstructorNeedsExpectedType(declared.variant))
 
 
+-- A plan carries the names its written base resolved, which the elaborator
+-- records when it takes the plan. A record's field names are recorded from its
+-- planned fields, and a callable's when its operand resolves.
 union PlannedBase:
     PlannedContext(SuspendedConstruction, InferenceType)
     PlannedCallable(ValueExpression, Option[InferenceType])
-    PlannedLeaf(PendingBase, TypeRef)
+    -- A literal, which names nothing, or a binding or constant read.
+    PlannedLeaf(PendingBase, TypeRef, WrittenUses)
     -- An integer literal whose expected type is an unsolved variable.
     PlannedIntegerLiteral(Int)
-    PlannedConstructOpaque(CheckedOpaque, ValueExpression)
-    PlannedProjectOpaque(CheckedOpaque, ValueExpression)
+    PlannedConstructOpaque(CheckedOpaque, ValueExpression, NameUse)
+    PlannedProjectOpaque(CheckedOpaque, ValueExpression, NameUse)
     PlannedRecord(PlannedRecordFields)
     PlannedUpdate(ValueExpression, List[ParsedRecordField], Option[InferenceType])
-    PlannedVariant(PendingVariantContract, List[ValueExpression])
+    -- The variant's name, and its qualifier when written `alias.V` or `Union.V`.
+    PlannedVariant(PendingVariantContract, List[ValueExpression], WrittenUses)
     PlannedTuple(List[ValueExpression], List[Option[InferenceType]])
     PlannedInterpolation(List[ValueExpression])
     PlannedList(List[ValueExpression], ListElementSource)
-    PlannedCall(FunctionContract, List[ValueExpression], CallPlacement, Option[InferenceType])
+    -- A named call, or an operator's, which names nothing.
+    PlannedCall(
+        FunctionContract,
+        List[ValueExpression],
+        CallPlacement,
+        Option[InferenceType],
+        WrittenUses,
+    )
     -- A populated Dict literal: the `dict` contract, then the `set`
     -- contract each entry calls.
     PlannedDict(FunctionContract, FunctionContract, List[ParsedDictEntry], Option[InferenceType])
@@ -1280,4 +1336,5 @@ union PlannedBase:
         List[ValueExpression],
         CallPlacement,
         Option[InferenceType],
+        WrittenUses,
     )

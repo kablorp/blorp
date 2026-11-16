@@ -5,12 +5,14 @@ CheckedProgram (an analysis whose root declares the entry function) or a
 CheckFailure carrying the first error.
 ---
 import:
+    list: List methods
+    option: Option methods
     result: Result methods
-    ../../syntax/syntax: Entrypoint
+    ../../syntax/syntax: Entrypoint, Span, entry_function
     ../assemble: ParsedProgram
     ../ids: FunctionId, RecordId, UnionId, DeclarationInventory
     ../namespace/builtins: CheckedFoundation, ParsedProgram methods
-    ../namespace/namespace: Namespace, NamespaceProblem, ParsedProgram methods
+    ../namespace/namespace: Namespace, NamespaceProblem, ParsedProgram methods, resolved_names
     ./bodies: resolve_functions
     ./constants: constant_annotations, validate_constants
     ./declarations: validate_declarations, CheckedDeclarations
@@ -30,6 +32,7 @@ import:
         CheckedOpaque,
         CheckedRecord,
         CheckedUnion,
+    ./name_uses: NameUse, Referent, declared_referents, referent_declaration, resolved_name_use
     ./receiver_clashes: Namespace methods
     ./recursion: validate_recursive_instantiation, finalize_trait_instances, FinalTraits
     ./signatures: AcceptedFunction, validate_signatures
@@ -90,6 +93,12 @@ private record AnalysisContents {
     functions: List[CheckedFunction],
     lambdas: List[CheckedLambda],
     entrypoint: Option[Entrypoint[FunctionId]],
+    -- Every name the program's source uses. `check` drops them: only an
+    -- analysis has them.
+    uses: List[NameUse],
+    -- The parsed program's own declaration inventory, shared rather than
+    -- copied, which joins a referent to its written name.
+    declarations: DeclarationInventory,
 }
 
 
@@ -108,18 +117,20 @@ private pure func analyze_program(program: ParsedProgram) -> Result[Analysis, Ch
         Ok(accepted): Ok(accepted)
         Err(problem): Err(namespace_rejection(problem.namespace_problem_span(), problem))
     namespace ?= namespace_result.map_err(pure func(error): failed(program, error, []))
-    declarations ?= parsed
+    declared_types ?= parsed
         .validate_declarations(namespace)
         .map_err(pure func(error): failed(program, error, []))
-    declarations_finite ?= declarations
+    type_declarations = declared_types.declarations
+    declarations_finite ?= type_declarations
         .validate_finite_declarations()
         .map_err(pure func(error): failed(program, error, []))
     annotations ?= parsed
         .constant_annotations(namespace)
         .map_err(pure func(error): failed(program, error, []))
-    contracts ?= parsed
+    trait_contracts ?= parsed
         .accept_trait_contracts(namespace, foundation.designated.boolean)
         .map_err(pure func(error): failed(program, error, []))
+    contracts = trait_contracts.contracts
     signatures ?= parsed
         .validate_signatures(namespace, foundation.designated, contracts.declarations)
         .map_err(pure func(error): failed(program, error, []))
@@ -132,15 +143,15 @@ private pure func analyze_program(program: ParsedProgram) -> Result[Analysis, Ch
         )
         .map_err(pure func(error): failed(program, error, signatures.functions))
     availability ?= parsed
-        .prepare_equality_availability(authored, declarations, foundation.designated.boolean)
+        .prepare_equality_availability(authored, type_declarations, foundation.designated.boolean)
         .map_err(pure func(error): failed(program, error, signatures.functions))
     _: Void ?= parsed
         .validate_written_bounds(
             availability,
-            declarations,
+            type_declarations,
             signatures.functions,
             signatures.implementation_headers,
-            annotations,
+            annotations.types,
         )
         .map_err(pure func(error): failed(program, error, signatures.functions))
     traits = availability.accepted_traits()
@@ -152,33 +163,40 @@ private pure func analyze_program(program: ParsedProgram) -> Result[Analysis, Ch
             traits,
         )
         .map_err(pure func(error): failed(program, error, signatures.functions))
-    constants ?= parsed
+    checked_constants ?= parsed
         .validate_constants(
             namespace,
-            annotations,
-            declarations.records,
-            declarations.unions,
+            annotations.types,
+            type_declarations.records,
+            type_declarations.unions,
             signatures.functions,
             availability,
         )
         .map_err(pure func(error): failed(program, error, signatures.functions))
+    -- Assembly wrote a test entry itself; no source spells its names. The flag and
+    -- this id agree by construction: assembly points `entrypoint` at that entry.
+    synthesized_entry: Option[FunctionId] = if parsed.synthesized_entry:
+        signatures.entrypoint.map(pure func(entry) -> FunctionId: entry.entry_function())
+    else:
+        None
     functions ?= signatures.functions
         .resolve_functions(
-            declarations,
+            type_declarations,
             parsed.declarations.inventory_opaques(),
             namespace,
             receivers,
-            constants,
+            checked_constants.constants,
             availability,
             foundation.designated.result,
             foundation.designated.boolean,
             foundation.designated.option,
+            synthesized_entry,
         )
         .map_err(pure func(error): failed(program, error, signatures.functions))
     unavailable ?= functions.functions
         .validate_recursive_instantiation(functions.lambdas, traits)
         .map_err(pure func(error): failed(program, error, signatures.functions))
-    final ?= constants
+    final ?= checked_constants.constants
         .finalize_trait_instances(functions.functions, functions.lambdas, traits, unavailable)
         .map_err(pure func(error): failed(program, error, signatures.functions))
     _: Void ?= parsed
@@ -192,12 +210,24 @@ private pure func analyze_program(program: ParsedProgram) -> Result[Analysis, Ch
     Ok(
         into_opaque Analysis({
             traits = final.final_traits(),
-            unions = declarations.unions,
-            records = declarations.records,
-            opaques = declarations.opaques,
+            unions = type_declarations.unions,
+            records = type_declarations.records,
+            opaques = type_declarations.opaques,
             functions = functions.functions,
             lambdas = functions.lambdas,
             entrypoint = signatures.entrypoint,
+            uses = functions.uses
+                .concat(
+                    namespace
+                        .resolved_names()
+                        .map(resolved_name_use),
+                )
+                .concat(declared_types.uses)
+                .concat(annotations.uses)
+                .concat(trait_contracts.uses)
+                .concat(signatures.uses)
+                .concat(checked_constants.uses),
+            declarations = parsed.declarations,
         }),
     )
 
@@ -216,6 +246,25 @@ private pure func failed(
 
 pure func analyze(program: ParsedProgram) -> Result[Analysis, CheckFailure]:
     program.analyze_program()
+
+
+-- Every name used in the analysed program's source, in no promised order.
+pure func name_uses(analysis: Analysis) -> List[NameUse]:
+    from_opaque Analysis(analysis).uses
+
+
+-- Where go-to lands: the referent's written name, a module's first byte, or
+-- None for a built-in type. Ids live for one analysis: a referent from another
+-- analysis names nothing here.
+pure func declaration_span(analysis: Analysis, referent: Referent) -> Option[Span]:
+    contents = from_opaque Analysis(analysis)
+    referent.referent_declaration(contents.declarations, contents.functions, contents.lambdas)
+
+
+-- Every referent the analysis declares, for colouring declarations.
+pure func declarations(analysis: Analysis) -> List[Referent]:
+    contents = from_opaque Analysis(analysis)
+    declared_referents(contents.declarations, contents.functions, contents.lambdas)
 
 
 -- What compilation needs: an analysis whose root declares the entry function.

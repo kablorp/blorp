@@ -48,10 +48,12 @@ done.
     and loader source snapshots (`load_program_with_sources`, in the README's
     Load phase).
   - **Landed:** landing 1, analysis without an entry point; landing 2,
-    comments as lexer output; landing 3, the lexer's prefix on failure; and
-    landing 4, fixed identities.
-  - **Next:** landing 5, name uses: analysis records one inline row per name
-    used in source, its span and the identity it resolves to.
+    comments as lexer output; landing 3, the lexer's prefix on failure;
+    landing 4, fixed identities; and landing 5, name uses: analysis records
+    one inline row per name used in source, its span and the identity it
+    resolves to.
+  - **Next:** landing 6, console labels: the byte console's builtin labels,
+    runtime and emission, with no library functions yet.
 - **String code points:** [`STRING_PLAN.md`](STRING_PLAN.md).
   - **Status:** approved on 2026-11-10: `length` counts code points, from a
     count stored in each String, and byte work uses `byte_*` functions. L1
@@ -167,6 +169,13 @@ None of these is planned yet. Each wants its own short design or brief.
     (`COST_QUIRKS_PLAN.md`, decision 3).
   - **`Orderable for String` is missing,** so `max` and `min`, which take any
     `Orderable`, do not take Strings.
+  - **Concatenating onto an empty list copies the other list,** as does
+    concatenating a list read out of a record that stays live. `LSP_PLAN.md`'s
+    landing 5 measured 12,523 such copies (8.0 MB) per self-compile. Returning
+    the other list shared when one side is empty would remove the first kind.
+  - **Namespace `ResolvedName` rows are heap records,** about 8.6k allocations
+    per self-compile, because `Entity.Alias` holds an `AliasedModule` with a
+    path, so they cannot be `fixed`.
   - **`scripts/self-compile-cost` cannot measure a change that makes a base
     role mandatory.** Its fixed-input workload compiles the base's library with
     the candidate compiler, which now rejects a base without the role. UInt8

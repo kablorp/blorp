@@ -31,7 +31,7 @@ import:
     ../namespace/builtins: integer_fits
     ./callables: ResolutionContext
     ./constructors: VariantContract, ConstructionContext, ResolutionContext methods
-    ./declarations: occurrence_fields
+    ./declarations: aliased_module, occurrence_fields
     ./errors:
         CheckError,
         match_error,
@@ -81,6 +81,7 @@ import:
         match_arm_id,
         decision_node_id,
         binding_id,
+    ./name_uses: NameUse, Referent(ModuleReferent, VariantReferent), name_use, union_use
     ./scope: ScopedValue, bind_local
 
 
@@ -125,6 +126,8 @@ private record AlternativeCheck {
 }
 
 
+-- `uses` is the arm's name uses so far: each pattern appends the names it
+-- resolved and passes the list on.
 private record ResolvedPattern {
     cases: List[PatternCase],
     scope: List[ScopedValue],
@@ -132,6 +135,7 @@ private record ResolvedPattern {
     checks: List[AlternativeCheck],
     next_alternative: Int,
     pending_failure: Option[CheckError],
+    uses: List[NameUse],
 }
 
 
@@ -140,7 +144,12 @@ private fixed union PatternPosition:
     Payload
 
 
-private pure func plain(pattern: Pattern, scope: List[ScopedValue], next: Int) -> ResolvedPattern:
+private pure func plain(
+    pattern: Pattern,
+    scope: List[ScopedValue],
+    next: Int,
+    uses: List[NameUse],
+) -> ResolvedPattern:
     {
         cases = [{ pattern = pattern, captures = [], alternatives = [] }],
         scope = scope,
@@ -148,6 +157,7 @@ private pure func plain(pattern: Pattern, scope: List[ScopedValue], next: Int) -
         checks = [],
         next_alternative = next,
         pending_failure = None,
+        uses = uses,
     }
 
 
@@ -159,10 +169,12 @@ private pure func capture(
     ordinal: Int,
     next: Int,
     context: ResolutionContext,
+    uses: List[NameUse],
 ) -> Result[ResolvedPattern, CheckError]:
     definition: BindingDefinition = {
         origin = MatchCapture,
         mutable = False,
+        named = True,
         value_type = value_type,
         span = name.span,
     }
@@ -188,6 +200,7 @@ private pure func capture(
         checks = [],
         next_alternative = next,
         pending_failure = None,
+        uses = uses,
     })
 
 
@@ -235,6 +248,13 @@ private pure func capture_agreement(
         Some(match_error(span, OrPatternBindingsDiffer))
 
 
+-- A constructor head's variant, and the uses so far with the head's names.
+private record HeadVariant {
+    contract: VariantContract,
+    uses: List[NameUse],
+}
+
+
 private record PatternParts {
     patterns: List[Pattern],
     captures: List[Capture],
@@ -249,6 +269,7 @@ private record ResolvedFields {
     checks: List[AlternativeCheck],
     next_alternative: Int,
     pending_failure: Option[CheckError],
+    uses: List[NameUse],
 }
 
 
@@ -259,9 +280,11 @@ private pure func resolve_fields(
     ordinal: Int,
     next: Int,
     context: ResolutionContext,
+    uses: List[NameUse],
 ) -> Result[ResolvedFields, CheckError]:
     var parts: List[PatternParts] = [{ patterns = [], captures = [], alternatives = [] }]
     var field_scope = scope
+    var recorded = uses
     var bindings: List[BindingDefinition] = []
     var checks: List[AlternativeCheck] = []
     var cursor = next
@@ -281,10 +304,16 @@ private pure func resolve_fields(
                     ordinal + bindings.length(),
                     cursor,
                     context,
+                    recorded,
                 ):
                     Err(error):
                         failure = Some(error)
+                        -- A failure here always fails the arm (`useful_cases` rejects
+                        -- any pending failure), and a failed analysis keeps no uses.
+                        -- Dropping the list lets the call above take it unshared.
+                        recorded = []
                     Ok(resolved):
+                        recorded = resolved.uses
                         var combined: List[PatternParts] = []
                         for prefix in parts:
                             for child in resolved.cases:
@@ -319,6 +348,7 @@ private pure func resolve_fields(
         checks = checks,
         next_alternative = cursor,
         pending_failure = failure,
+        uses = recorded,
     })
 
 
@@ -331,9 +361,10 @@ private pure func resolve_variant(
     ordinal: Int,
     next: Int,
     context: ResolutionContext,
+    uses: List[NameUse],
 ) -> Result[ResolvedPattern, CheckError]:
     if contract.fields.length() == fields.length():
-        contract.resolve_variant_fields(fields, place, scope, ordinal, next, context)
+        contract.resolve_variant_fields(fields, place, scope, ordinal, next, context, uses)
     else:
         Err(
             match_error(
@@ -355,6 +386,7 @@ private pure func resolve_variant_fields(
     ordinal: Int,
     next: Int,
     context: ResolutionContext,
+    uses: List[NameUse],
 ) -> Result[ResolvedPattern, CheckError]:
     var places: List[CheckedPatternPlace] = []
     var ordinal_field = 0
@@ -364,7 +396,7 @@ private pure func resolve_variant_fields(
             route = UnionField(place, contract.variant, ordinal_field),
         })
         ordinal_field = ordinal_field + 1
-    resolved ?= fields.resolve_fields(places, scope, ordinal, next, context)
+    resolved ?= fields.resolve_fields(places, scope, ordinal, next, context, uses)
     cases: List[PatternCase] = resolved.parts.map(
         pure func(part: PatternParts) -> PatternCase: {
             pattern = VariantPattern(contract.variant, part.patterns),
@@ -379,6 +411,7 @@ private pure func resolve_variant_fields(
         checks = resolved.checks,
         next_alternative = resolved.next_alternative,
         pending_failure = resolved.pending_failure,
+        uses = resolved.uses,
     })
 
 
@@ -390,6 +423,7 @@ private pure func resolve_tuple(
     ordinal: Int,
     next: Int,
     context: ResolutionContext,
+    uses: List[NameUse],
 ) -> Result[ResolvedPattern, CheckError]:
     selected: Result[List[TypeRef], CheckError] = match place.value_type:
         TupleType(elements): Ok(elements)
@@ -404,7 +438,7 @@ private pure func resolve_tuple(
     for value_type in types:
         places = places.append({ value_type = value_type, route = RecordField(place, position) })
         position = position + 1
-    resolved ?= fields.resolve_fields(places, scope, ordinal, next, context)
+    resolved ?= fields.resolve_fields(places, scope, ordinal, next, context, uses)
     cases: List[PatternCase] = resolved.parts.map(
         pure func(part: PatternParts) -> PatternCase: {
             pattern = TuplePattern(part.patterns),
@@ -419,6 +453,7 @@ private pure func resolve_tuple(
         checks = resolved.checks,
         next_alternative = resolved.next_alternative,
         pending_failure = resolved.pending_failure,
+        uses = resolved.uses,
     })
 
 
@@ -431,6 +466,7 @@ private pure func resolve_variant_name(
     ordinal: Int,
     next: Int,
     context: ResolutionContext,
+    uses: List[NameUse],
 ) -> Result[ResolvedPattern, CheckError]:
     occurrence: UnionOccurrence ?= match place.value_type.union_occurrence():
         Some(present): Ok(present)
@@ -440,7 +476,16 @@ private pure func resolve_variant_name(
         .find_variant(occurrence, name)
     match found:
         Some(contract):
-            contract.resolve_variant([], place, name.span, scope, ordinal, next, context)
+            contract.resolve_variant(
+                [],
+                place,
+                name.span,
+                scope,
+                ordinal,
+                next,
+                context,
+                uses.append(name.name_use(VariantReferent(contract.variant))),
+            )
         None:
             Err(match_error(name.span, UnknownConstructorPattern(name.id, place.value_type)))
 
@@ -453,10 +498,13 @@ private pure func resolve_capture_name(
     ordinal: Int,
     next: Int,
     context: ResolutionContext,
+    uses: List[NameUse],
 ) -> Result[ResolvedPattern, CheckError]:
     match position:
-        WholeArm: Err(match_error(name.span, BarePatternName(name.id, place.value_type)))
-        Payload: capture(name, place.value_type, BorrowPlace(place), scope, ordinal, next, context)
+        WholeArm:
+            Err(match_error(name.span, BarePatternName(name.id, place.value_type)))
+        Payload:
+            capture(name, place.value_type, BorrowPlace(place), scope, ordinal, next, context, uses)
 
 
 private pure func resolve_constructor(
@@ -468,27 +516,92 @@ private pure func resolve_constructor(
     ordinal: Int,
     next: Int,
     context: ResolutionContext,
+    uses: List[NameUse],
 ) -> Result[ResolvedPattern, CheckError]:
     occurrence: UnionOccurrence ?= match place.value_type.union_occurrence():
         Some(present): Ok(present)
         None: Err(match_error(span, PatternTypeMismatch(place.value_type)))
-    found: Result[Option[VariantContract], CheckError] = match head:
+    -- The head's uses, once its variant is found: a qualifier (an alias or the
+    -- union), then the variant's name.
+    found: Result[Option[HeadVariant], CheckError] = match head:
         BareHead(name):
-            context
-                .construction_context()
-                .find_variant(occurrence, name)
+            match (
+                context
+                    .construction_context()
+                    .find_variant(occurrence, name)
+            ):
+                Ok(Some(contract)):
+                    Ok(
+                        Some({
+                            contract = contract,
+                            uses = uses.append(name.name_use(VariantReferent(contract.variant))),
+                        }),
+                    )
+                Ok(None):
+                    Ok(None)
+                Err(error):
+                    Err(error)
         QualifiedHead(name):
-            context
-                .construction_context()
-                .find_qualified_variant(occurrence, name)
+            match context.namespace.aliased_module(context.module, name.module):
+                Err(error):
+                    Err(error)
+                Ok(aliased):
+                    match (
+                        context
+                            .construction_context()
+                            .find_qualified_variant(occurrence, aliased, name)
+                    ):
+                        Ok(Some(contract)):
+                            Ok(
+                                Some({
+                                    contract = contract,
+                                    uses = uses
+                                        .append(
+                                            name.module.name_use(ModuleReferent(aliased.target)),
+                                        )
+                                        .append(
+                                            name.name.name_use(VariantReferent(contract.variant)),
+                                        ),
+                                }),
+                            )
+                        Ok(None):
+                            Ok(None)
+                        Err(error):
+                            Err(error)
         UnionVariantHead(written):
-            context
-                .construction_context()
-                .find_union_variant(occurrence, written, span)
+            match (
+                context
+                    .construction_context()
+                    .find_union_variant(occurrence, written, span)
+            ):
+                Ok(Some(contract)):
+                    Ok(
+                        Some({
+                            contract = contract,
+                            uses = uses
+                                .append(written.union_name.union_use(contract.variant))
+                                .append(
+                                    written.variant.name_use(VariantReferent(contract.variant)),
+                                ),
+                        }),
+                    )
+                Ok(None):
+                    Ok(None)
+                Err(error):
+                    Err(error)
     contract ?= found
     match contract:
         Some(resolved):
-            resolved.resolve_variant(fields, place, span, scope, ordinal, next, context)
+            resolved.contract.resolve_variant(
+                fields,
+                place,
+                span,
+                scope,
+                ordinal,
+                next,
+                context,
+                resolved.uses,
+            )
         None:
             name = match head:
                 BareHead(written): written.id
@@ -505,18 +618,32 @@ private pure func resolve_alternatives(
     ordinal: Int,
     next: Int,
     context: ResolutionContext,
+    uses: List[NameUse],
 ) -> Result[ResolvedPattern, CheckError]:
     var first: Option[ResolvedPattern] = None
     var cases: List[PatternCase] = []
     var checks: List[AlternativeCheck] = []
     var cursor = next
+    var recorded = uses
     var failure: Option[CheckError] = None
     for alternative in alternatives:
         id = cursor
-        match alternative.resolve_pattern(place, position, scope, ordinal, cursor + 1, context):
+        match alternative.resolve_pattern(
+            place,
+            position,
+            scope,
+            ordinal,
+            cursor + 1,
+            context,
+            recorded,
+        ):
             Err(error):
                 failure = Some(error)
+                -- As in `resolve_fields`: this failure fails the arm, which then
+                -- keeps no uses, so the list is dropped rather than kept shared.
+                recorded = []
             Ok(resolved):
+                recorded = resolved.uses
                 match resolved.pending_failure:
                     None:
                         rejection: Option[CheckError] = match first:
@@ -556,6 +683,7 @@ private pure func resolve_alternatives(
         checks = checks,
         next_alternative = cursor,
         pending_failure = failure,
+        uses = recorded,
     })
 
 
@@ -597,10 +725,11 @@ private pure func resolve_list(
     ordinal: Int,
     next: Int,
     context: ResolutionContext,
+    uses: List[NameUse],
 ) -> Result[ResolvedPattern, CheckError]:
     match place.value_type:
         ListType(element):
-            fields.resolve_list_elements(rest, place, element, scope, ordinal, next, context)
+            fields.resolve_list_elements(rest, place, element, scope, ordinal, next, context, uses)
         _:
             Err(match_error(span, PatternTypeMismatch(place.value_type)))
 
@@ -614,13 +743,14 @@ private pure func resolve_list_elements(
     ordinal: Int,
     next: Int,
     context: ResolutionContext,
+    uses: List[NameUse],
 ) -> Result[ResolvedPattern, CheckError]:
     var places: List[CheckedPatternPlace] = []
     var index = 0
     for field in fields:
         places = places.append({ value_type = element, route = ListElement(place, index) })
         index = index + 1
-    resolved ?= fields.resolve_fields(places, scope, ordinal, next, context)
+    resolved ?= fields.resolve_fields(places, scope, ordinal, next, context, uses)
     tail ?= rest.resolve_list_tail(place, fields.length(), resolved, ordinal, context)
     var cases: List[PatternCase] = []
     for part in resolved.parts:
@@ -637,6 +767,7 @@ private pure func resolve_list_elements(
         checks = resolved.checks.concat(tail.checks),
         next_alternative = tail.next_alternative,
         pending_failure = tail.pending_failure,
+        uses = tail.uses,
     })
 
 
@@ -651,7 +782,7 @@ private pure func resolve_list_tail(
     shape: Pattern = match rest:
         None: EmptyListPattern
         Some(_): Anything
-    fallback = plain(shape, resolved.scope, resolved.next_alternative)
+    fallback = plain(shape, resolved.scope, resolved.next_alternative, resolved.uses)
     match resolved.pending_failure:
         Some(error):
             Ok({ fallback | pending_failure = Some(error) })
@@ -679,6 +810,7 @@ private pure func resolve_list_capture(
         ordinal + resolved.bindings.length(),
         resolved.next_alternative,
         context,
+        resolved.uses,
     ):
         Ok(tail): Ok(tail)
         Err(error): error.defer_list_capture(resolved)
@@ -689,7 +821,7 @@ private pure func defer_list_capture(
     resolved: ResolvedFields,
 ) -> Result[ResolvedPattern, CheckError]:
     ready ?= resolved.checks.earlier_alternatives(Some(error))
-    fallback = plain(Anything, resolved.scope, resolved.next_alternative)
+    fallback = plain(Anything, resolved.scope, resolved.next_alternative, resolved.uses)
     Ok({ fallback | pending_failure = Some(error) })
 
 
@@ -701,25 +833,26 @@ private pure func resolve_pattern(
     ordinal: Int,
     next: Int,
     context: ResolutionContext,
+    uses: List[NameUse],
 ) -> Result[ResolvedPattern, CheckError]:
     match pattern:
         PatternTuple(fields, span):
-            fields.resolve_tuple(span, place, scope, ordinal, next, context)
+            fields.resolve_tuple(span, place, scope, ordinal, next, context, uses)
         PatternWildcard(_):
-            Ok(plain(Anything, scope, next))
+            Ok(plain(Anything, scope, next, uses))
         PatternName(name):
-            name.resolve_capture_name(place, position, scope, ordinal, next, context)
+            name.resolve_capture_name(place, position, scope, ordinal, next, context, uses)
         PatternVariantName(name):
-            name.resolve_variant_name(place, scope, ordinal, next, context)
+            name.resolve_variant_name(place, scope, ordinal, next, context, uses)
         PatternConstructor(head, fields, span):
-            head.resolve_constructor(fields, span, place, scope, ordinal, next, context)
+            head.resolve_constructor(fields, span, place, scope, ordinal, next, context, uses)
         PatternOr(alternatives, _):
-            alternatives.resolve_alternatives(place, position, scope, ordinal, next, context)
+            alternatives.resolve_alternatives(place, position, scope, ordinal, next, context, uses)
         PatternList(fields, rest, span):
-            fields.resolve_list(rest, span, place, scope, ordinal, next, context)
+            fields.resolve_list(rest, span, place, scope, ordinal, next, context, uses)
         PatternLiteral(literal, span):
             if literal.fits(place.value_type):
-                Ok(plain(ExactPattern(literal), scope, next))
+                Ok(plain(ExactPattern(literal), scope, next, uses))
             else:
                 match (literal, place.value_type):
                     (ExactInt(value), IntegerType(format)):
@@ -1336,6 +1469,8 @@ record ResolvedArmPattern {
     scope: List[ScopedValue],
     bindings: List[BindingDefinition],
     inputs: List[BindingId],
+    -- The names the pattern uses: its variants and their qualifiers.
+    uses: List[NameUse],
 }
 
 
@@ -1356,6 +1491,7 @@ pure func resolve_arm(
         ordinal,
         0,
         context,
+        [],
     )
     accepted ?= resolved.useful_cases(previous, root, arm, context, pattern.pattern_span())
     var inputs: List[BindingId] = []
@@ -1363,7 +1499,13 @@ pure func resolve_arm(
     for definition in resolved.bindings:
         inputs = inputs.append(binding_id(position))
         position = position + 1
-    Ok({ rows = accepted, scope = resolved.scope, bindings = resolved.bindings, inputs = inputs })
+    Ok({
+        rows = accepted,
+        scope = resolved.scope,
+        bindings = resolved.bindings,
+        inputs = inputs,
+        uses = resolved.uses,
+    })
 
 
 private pure func useful_cases(

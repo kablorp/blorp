@@ -30,7 +30,7 @@ import:
         MethodImport,
         ValueBinding(MethodName),
         Entry,
-    ./declarations: TypeScope
+    ./declarations: ResolvedType, TypeScope
     ./errors:
         CallError(ArgumentCountMismatch, ImpureCall, ImpureCallableCall, UnknownFunction),
         CheckError,
@@ -64,6 +64,7 @@ import:
         canonical_operation_member,
         CheckedRecord,
         CheckedUnion,
+    ./name_uses: NameUse, Referent(FunctionReferent, TraitMethodReferent), name_use
     ./scope: CallableBinding
     ./signatures: AcceptedFunction, AcceptedBody(BuiltinBody)
     ./traits: TraitAvailability
@@ -202,21 +203,29 @@ record ResolutionContext {
 }
 
 
--- A type written in a body, proved under the enclosing function's bounds.
+-- A type written in a body, proved under the enclosing function's bounds, with
+-- the names it uses after `uses`.
 pure func resolve_body_type(
     context: ResolutionContext,
     written: TypeSyntax,
-) -> Result[TypeRef, CheckError]:
-    resolved ?= context.body_types.resolve_type(written)
+    uses: List[NameUse],
+) -> Result[ResolvedType, CheckError]:
+    resolved ?= context.body_types.resolve_type(written, uses)
     accepted ?= context.signatures
         .get(context.root_function.function_number())
         .or_checker_invariant(written.type_span(), InvalidFunctionContract)
-    _: Void ?= context.traits.prove_well_formed(written, resolved, accepted.signature.requirements)
+    _: Void ?= context.traits.prove_well_formed(
+        written,
+        resolved.resolved_value_type(),
+        accepted.signature.requirements,
+    )
     Ok(resolved)
 
 
+-- A receiver call whose name reaches one function or method, with that use, or
+-- several candidates that the receiver's inferred type chooses between.
 union ResolvedReceiver:
-    UniqueReceiver(FunctionContract)
+    UniqueReceiver(FunctionContract, NameUse)
     ReceiverCandidates(List[ReceiverFunction])
 
 
@@ -374,7 +383,7 @@ pure func classify_receiver(
                 id,
                 context.traits.accepted_traits(),
             ):
-                Ok(contract): Ok(UniqueReceiver(contract))
+                Ok(contract): Ok(UniqueReceiver(contract, name.name_use(TraitMethodReferent(id))))
                 Err(error): Err(error)
         Some(VisibleFunctions(candidates)):
             application.classify_function_receiver(context, candidates)
@@ -399,8 +408,10 @@ private pure func classify_function_receiver(
                 candidate.id,
                 context.signatures,
             ):
-                Ok(contract): Ok(UniqueReceiver(contract))
-                Err(error): Err(error)
+                Ok(contract):
+                    Ok(UniqueReceiver(contract, name.name_use(FunctionReferent(candidate.id))))
+                Err(error):
+                    Err(error)
         _:
             Ok(ReceiverCandidates(candidates))
 

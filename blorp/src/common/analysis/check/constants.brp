@@ -3,16 +3,18 @@ Accepts every constant annotation before signatures and closed construction temp
 The temporary headers disappear when the dense complete rows are published.
 ---
 import:
+    option: Option methods
     result: Result methods
     ../../syntax/syntax: TypeSyntax
     ../assemble: ParsedContents
     ../ids: ConstantId, DeclarationInventory
     ../namespace/namespace: Namespace
     ./constructors: ConstructionContext
-    ./declarations: TypeScope, type_access
+    ./declarations: AnnotatedTypes, ResolvedType(ResolvedTypeTerm), TypeScope, type_access
     ./errors: CheckError, CheckerInvariant(InvalidConstantDeclaration), checker_invariant
     ./expressions: check_constant_initializer
     ./model: CheckedConstant, CheckedRecord, CheckedUnion, TypeUse, TypeRef
+    ./name_uses: NameUse
     ./resource_types: TypeRef methods
     ./signatures: AcceptedFunction
     ./traits: TraitAvailability
@@ -21,8 +23,9 @@ import:
 pure func constant_annotations(
     parsed: ParsedContents,
     namespace: Namespace,
-) -> Result[List[TypeUse], CheckError]:
+) -> Result[AnnotatedTypes, CheckError]:
     var accepted: List[TypeUse] = []
+    var uses: List[NameUse] = []
     var failure: Option[CheckError] = None
     for row in parsed.declarations.inventory_constants():
         declaration = row.declaration
@@ -36,25 +39,30 @@ pure func constant_annotations(
             access = declaration.visibility.type_access(declaration.name.id),
             parameters = [],
         }
-        resolved = scope
-            .resolve_type(declaration.type_name)
-            .and_then(pure func(value_type) -> Result[TypeRef, CheckError]:
-                value_type
-                    .resource_free(scope.opaques, declaration.type_name.type_span())
-                    .map(pure func(_): value_type)
-            )
-        match resolved:
-            Ok(value_type):
-                accepted = accepted.append({
-                    value_type = value_type,
-                    span = declaration.type_name.type_span(),
-                })
+        span = declaration.type_name.type_span()
+        match scope.resolve_type(declaration.type_name, []):
+            Ok(ResolvedTypeTerm(value_type, annotation_uses)):
+                match value_type.resource_free(scope.opaques, span):
+                    Ok(_):
+                        accepted = accepted.append({ value_type = value_type, span = span })
+                        uses = uses.concat(annotation_uses)
+                    Err(error):
+                        failure = Some(error)
             Err(error):
                 failure = Some(error)
-                break
+        if failure.is_some():
+            break
     match failure:
         Some(error): Err(error)
-        None: Ok(accepted)
+        None: Ok({ types = accepted, uses = uses })
+
+
+-- Every constant's checked template in declaration order, and the names their
+-- initializers use.
+record CheckedConstants {
+    constants: List[CheckedConstant],
+    uses: List[NameUse],
+}
 
 
 pure func validate_constants(
@@ -65,11 +73,12 @@ pure func validate_constants(
     unions: List[CheckedUnion],
     signatures: List[AcceptedFunction],
     traits: TraitAvailability,
-) -> Result[List[CheckedConstant], CheckError]:
+) -> Result[CheckedConstants, CheckError]:
     var accepted: List[CheckedConstant] = []
+    var uses: List[NameUse] = []
     var failure: Option[CheckError] = None
     for row in parsed.declarations.inventory_constants():
-        result = match annotations.get(row.id.constant_number()):
+        match annotations.get(row.id.constant_number()):
             Some(annotation):
                 context: ConstructionContext = {
                     module = row.declaration.module,
@@ -78,28 +87,30 @@ pure func validate_constants(
                     unions = unions,
                     type_parameters = [],
                 }
-                row.declaration.value
-                    .check_constant_initializer(annotation, context, signatures, traits)
-                    .map(
-                        pure func(value) -> CheckedConstant: {
+                match row.declaration.value.check_constant_initializer(
+                    annotation,
+                    context,
+                    signatures,
+                    traits,
+                ):
+                    Ok(checked):
+                        accepted = accepted.append({
                             id = row.id,
                             annotation = annotation.span,
-                            value = value,
-                        },
-                    )
+                            value = checked.value,
+                        })
+                        uses = uses.concat(checked.uses)
+                    Err(error):
+                        failure = Some(error)
             None:
-                Err(
+                failure = Some(
                     checker_invariant(
                         row.declaration.name.span,
                         InvalidConstantDeclaration(row.id),
                     ),
                 )
-        match result:
-            Ok(constant):
-                accepted = accepted.append(constant)
-            Err(error):
-                failure = Some(error)
-                break
+        if failure.is_some():
+            break
     match failure:
         Some(error): Err(error)
-        None: Ok(accepted)
+        None: Ok({ constants = accepted, uses = uses })

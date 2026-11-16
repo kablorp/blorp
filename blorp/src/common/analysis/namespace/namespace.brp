@@ -27,6 +27,7 @@ import:
         ModuleKind(UserModule, LibraryModule, FoundationTypesModule, FoundationPreludeModule),
     ../../syntax/syntax:
         ParsedBuiltinType(IntegerBuiltin, FloatBuiltin, StringBuiltin, VoidBuiltin, ListBuiltin),
+        ParsedQualified,
         Span,
         TypeSyntax(AtomicType, QualifiedType),
         Visibility(Public, Private),
@@ -167,11 +168,34 @@ fixed record ResolvedImplementation {
 }
 
 
+-- A name the namespace resolved where the source writes it: an import
+-- selection, the type of `T methods`, or the trait an implementation names
+-- and that trait's module alias. Checking records each as a name use.
+record ResolvedName {
+    name: WrittenName,
+    entity: Entity,
+}
+
+
+-- A trait as written, `Trait` or `alias.Trait`, with what its names resolved
+-- to: the trait, and for `alias.Trait` the module the alias names.
+union TraitReference:
+    LocalTrait(WrittenName, TraitId)
+    QualifiedTrait(ParsedQualified, AliasedModule, TraitId)
+
+
+pure func referenced_trait(reference: TraitReference) -> TraitId:
+    match reference:
+        LocalTrait(_, id): id
+        QualifiedTrait(_, _, id): id
+
+
 -- One module's names, in the order they entered, keyed by `space_key`.
 private record ModuleScope {
     names: Dict[Int, Entry],
     methods: List[MethodImport],
     implementations: List[ResolvedImplementation],
+    resolved: List[ResolvedName],
 }
 
 
@@ -217,6 +241,7 @@ private record BuiltScope {
     names: Dict[Int, Entry],
     methods: List[MethodImport],
     implementations: List[ResolvedImplementation],
+    resolved: List[ResolvedName],
     problem: Option[NamespaceProblem],
 }
 
@@ -300,7 +325,7 @@ pure func builtin_head(declaration: ParsedBuiltinType) -> TypeHead:
 
 private pure func empty_scope() -> ModuleScope:
     none: List[MethodImport] = []
-    { names = {}, methods = none, implementations = [] }
+    { names = {}, methods = none, implementations = [], resolved = [] }
 
 
 -- A spelling's entry in each space has its own key: 2n for values and 2n + 1
@@ -707,6 +732,7 @@ private pure func build_module(
         names = dict_ops.dict(expected),
         methods = methods,
         implementations = [],
+        resolved = [],
         problem = None,
     }
     for entry in received:
@@ -724,10 +750,16 @@ private pure func trait_reference(
     names: Dict[Int, Entry],
     scopes: List[ModuleScope],
     written: TypeSyntax,
-) -> Option[TraitId]:
-    found: Option[Entry] = match written:
+) -> Option[TraitReference]:
+    match written:
         AtomicType(name):
-            names.holder(Types, name.id)
+            match names.holder(Types, name.id):
+                Some(entry):
+                    match entry.entity:
+                        Trait(id): Some(LocalTrait(name, id))
+                        _: None
+                None:
+                    None
         QualifiedType(qualified, [], _):
             match names.holder(Values, qualified.module.id):
                 Some(entry):
@@ -740,14 +772,8 @@ private pure func trait_reference(
                                             .holder(Types, qualified.name.id)
                                             .offer()
                                     ):
-                                        Ok(Trait(id)):
-                                            Some({
-                                                name = qualified.name,
-                                                entity = Trait(id),
-                                                origin = Imported,
-                                            })
-                                        _:
-                                            None
+                                        Ok(Trait(id)): Some(QualifiedTrait(qualified, aliased, id))
+                                        _: None
                                 None:
                                     None
                         _:
@@ -756,13 +782,19 @@ private pure func trait_reference(
                     None
         _:
             None
-    match found:
-        Some(entry):
-            match entry.entity:
-                Trait(id): Some(id)
-                _: None
-        None:
-            None
+
+
+-- The names a trait reference spells: the trait, and for `alias.Trait` the
+-- alias first.
+pure func trait_names(reference: TraitReference) -> List[ResolvedName]:
+    match reference:
+        LocalTrait(name, id):
+            [{ name = name, entity = Trait(id) }]
+        QualifiedTrait(qualified, aliased, id):
+            [
+                { name = qualified.module, entity = Alias(aliased) },
+                { name = qualified.name, entity = Trait(id) },
+            ]
 
 
 -- Bounds resolve through the same visible trait lookup as implementation heads.
@@ -770,7 +802,7 @@ pure func resolve_trait(
     namespace: Namespace,
     module: ModuleId,
     written: TypeSyntax,
-) -> Option[TraitId]:
+) -> Option[TraitReference]:
     scopes = from_opaque Namespace(namespace)
     match scopes.get(module.module_number()):
         Some(scope): scope.names.trait_reference(scopes, written)
@@ -795,9 +827,13 @@ private pure func publish_implementations(
                             InvalidImplementationTrait(implementation.header.trait_name),
                         ),
                     }
-                Some(id):
+                Some(reference):
+                    id = reference.referenced_trait()
                     resolved: ResolvedImplementation = { id = implementation.id, trait_id = id }
-                    next = { next | implementations = next.implementations.append(resolved) }
+                    next = { next |
+                        implementations = next.implementations.append(resolved),
+                        resolved = next.resolved.concat(reference.trait_names()),
+                    }
                     match (
                         parsed.declarations
                             .inventory_traits()
@@ -875,6 +911,7 @@ pure func build_namespace(program: ParsedProgram) -> Result[Namespace, Namespace
             names = built.names,
             methods = built.methods,
             implementations = built.implementations,
+            resolved = built.resolved,
         }
         scopes = scopes.set(number, scope)
         if row.module == parsed.foundation.prelude:
@@ -992,7 +1029,8 @@ private pure func bind(
     name: WrittenName,
     entity: Entity,
 ) -> BuiltScope:
-    entered = built.enter({ name = name, entity = entity, origin = Imported })
+    selected = { built | resolved = built.resolved.append({ name = name, entity = entity }) }
+    entered = selected.enter({ name = name, entity = entity, origin = Imported })
     match entity:
         Type(receiver):
             { entered |
@@ -1035,7 +1073,13 @@ private pure func select_union(
                                 ):
                                     Ok(Constructor(variant)):
                                         if variant.variant_owner() == owner:
-                                            next.enter({
+                                            listed_constructor: ResolvedName = {
+                                                name = constructor,
+                                                entity = Constructor(variant),
+                                            }
+                                            { next |
+                                                resolved = next.resolved.append(listed_constructor),
+                                            }.enter({
                                                 name = constructor,
                                                 entity = Constructor(variant),
                                                 origin = Imported,
@@ -1113,6 +1157,10 @@ private pure func select_methods(
                                     target = request.target,
                                     receiver = receiver,
                                     name = name,
+                                }),
+                                resolved = next.resolved.append({
+                                    name = name,
+                                    entity = Type(receiver),
                                 }),
                             }
                         else:
@@ -1272,6 +1320,14 @@ pure func method_imports(namespace: Namespace, module: ModuleId) -> List[MethodI
     match scopes.get(module.module_number()):
         Some(scope): scope.methods
         None: []
+
+
+-- Every name the namespace resolved where the source writes it, module by module.
+pure func resolved_names(namespace: Namespace) -> List[ResolvedName]:
+    var names: List[ResolvedName] = []
+    for scope in from_opaque Namespace(namespace):
+        names = names.concat(scope.resolved)
+    names
 
 
 -- The sealed scope's existing entries in namespace insertion order. The list

@@ -1,0 +1,458 @@
+---
+Name uses: what each name written in source resolved to. Checking records a
+use where it resolves the name; the analysis joins a referent to its
+declaration through the tables that already own it, so no row copies a span
+it can look up.
+---
+import:
+    bool: Bool methods
+    list: List methods
+    option: Option methods
+    ../../syntax/source: ModuleId, module_source
+    ../../syntax/syntax: Span, WrittenName
+    ../ids:
+        ConstantId,
+        DeclarationInventory,
+        FunctionId,
+        FunctionRole(FreeFunctionBody, ImplementationBody, TraitDefaultBody),
+        TraitId,
+        TraitMethodDeclaration(DefaultMethod),
+        TraitMethodId,
+        TraitRow,
+        UnionId,
+        RecordId,
+        OpaqueId,
+        VariantId,
+        inventory_constants,
+        inventory_functions,
+        inventory_implementations,
+        inventory_opaques,
+        inventory_records,
+        inventory_traits,
+        inventory_unions,
+        trait_method_header,
+    ../namespace/namespace:
+        Entity(Trait, Method, Function, Constant, Constructor, Type, Alias),
+        ResolvedName,
+        TraitReference,
+        TypeHead(PrimitiveHead, ListHead, UnionHead, RecordHead, OpaqueHead),
+        trait_names,
+    ./model:
+        BindingDefinition,
+        BindingId,
+        BodyOwner(DeclaredBody, LambdaBody, DerivedEqualityBody),
+        CheckedFunction,
+        CheckedLambda,
+        FieldId,
+        LambdaId,
+        ScopedBindingId,
+        TypeParameterId,
+        TypeParameterOwner(
+            TraitDeclaration,
+            FunctionDeclaration,
+            UnionDeclaration,
+            RecordDeclaration,
+            OpaqueDeclaration,
+        ),
+        binding_id,
+        field_id,
+        lambda_id,
+        type_parameter_id,
+
+
+-- What a name used in source resolved to: an identity the compiler already
+-- owns. `declaration_span` joins it to where it is declared.
+fixed union Referent:
+    FunctionReferent(FunctionId)
+    TraitMethodReferent(TraitMethodId)
+    ConstantReferent(ConstantId)
+    -- A record, union or opaque type, or a built-in one such as `Int`.
+    TypeReferent(TypeHead)
+    TraitReferent(TraitId)
+    FieldReferent(FieldId)
+    VariantReferent(VariantId)
+    TypeParameterReferent(TypeParameterId)
+    BindingReferent(ScopedBindingId)
+    ModuleReferent(ModuleId)
+
+
+-- One name used in source. Declarations are not uses: the declaration tables
+-- already hold them.
+fixed record NameUse {
+    span: Span,
+    referent: Referent,
+}
+
+
+-- The names one written form resolved, which a plan carries inline until the
+-- elaborator records them: none, one, or a qualifier and the name it qualifies
+-- (`alias.name`, `Union.Variant`).
+fixed union WrittenUses:
+    NoUses
+    OneUse(NameUse)
+    QualifiedUses(NameUse, NameUse)
+
+
+pure func name_use(name: WrittenName, referent: Referent) -> NameUse:
+    { span = name.span, referent = referent }
+
+
+-- The union written as a variant's qualifier: `Union` in `Union.Variant`.
+pure func union_use(name: WrittenName, variant: VariantId) -> NameUse:
+    name.name_use(TypeReferent(UnionHead(variant.variant_owner())))
+
+
+pure func with_uses(uses: List[NameUse], written: WrittenUses) -> List[NameUse]:
+    match written:
+        NoUses:
+            uses
+        OneUse(single):
+            uses.append(single)
+        QualifiedUses(qualifier, name):
+            uses
+                .append(qualifier)
+                .append(name)
+
+
+-- A name the namespace resolved where it is written. An alias names a module.
+pure func resolved_name_use(resolved: ResolvedName) -> NameUse:
+    referent: Referent = match resolved.entity:
+        Trait(id): TraitReferent(id)
+        Method(id): TraitMethodReferent(id)
+        Function(id): FunctionReferent(id)
+        Constant(id): ConstantReferent(id)
+        Constructor(id): VariantReferent(id)
+        Type(head): TypeReferent(head)
+        Alias(aliased): ModuleReferent(aliased.target)
+    resolved.name.name_use(referent)
+
+
+-- The names a trait reference spells, as uses.
+pure func trait_uses(reference: TraitReference) -> List[NameUse]:
+    reference
+        .trait_names()
+        .map(resolved_name_use)
+
+
+-- The trait that declares `body` as a method's default, by a linear scan of the
+-- traits: the language server must index them before asking per token.
+private pure func default_owner(
+    inventory: DeclarationInventory,
+    body: FunctionId,
+) -> Option[TraitRow]:
+    inventory
+        .inventory_traits()
+        .find(pure func(row: TraitRow) -> Bool:
+            row.methods.any(pure func(method) -> Bool:
+                match method.declaration:
+                    DefaultMethod(id): id == body
+                    _: False
+            )
+        )
+
+
+private pure func binding_span(
+    bindings: List[BindingDefinition],
+    id: ScopedBindingId,
+) -> Option[Span]:
+    bindings
+        .get(id.binding.binding_number())
+        .map(pure func(definition: BindingDefinition) -> Span: definition.span)
+
+
+-- Where a type parameter is written. A method's parameter is found by a linear
+-- scan of the implementations, a default's Self of the traits: index them
+-- before asking per token.
+private pure func type_parameter_span(
+    inventory: DeclarationInventory,
+    id: TypeParameterId,
+) -> Option[Span]:
+    position = id.parameter_position()
+    match id.parameter_owner():
+        -- A trait's only parameter is its implicit Self, which the trait's name declares.
+        TraitDeclaration(owner):
+            inventory
+                .inventory_traits()
+                .get(owner.trait_number())
+                .map(pure func(row) -> Span: row.type_name.span)
+        FunctionDeclaration(owner):
+            match (
+                inventory
+                    .inventory_functions()
+                    .get(owner.function_number())
+            ):
+                None:
+                    None
+                Some(row):
+                    match row.role:
+                        FreeFunctionBody:
+                            row.declaration.type_parameters
+                                .get(position)
+                                .map(pure func(parameter) -> Span: parameter.name.span)
+                        -- An implementation's methods share its header's receiver parameters.
+                        ImplementationBody:
+                            match (
+                                inventory
+                                    .inventory_implementations()
+                                    .find(pure func(implementation) -> Bool:
+                                        implementation.methods.any(pure func(method) -> Bool:
+                                            method == owner
+                                        )
+                                    )
+                            ):
+                                Some(implementation):
+                                    implementation.header.type_parameters
+                                        .get(position)
+                                        .map(pure func(parameter) -> Span: parameter.name.span)
+                                None:
+                                    None
+                        -- A default's only parameter is its trait's Self.
+                        TraitDefaultBody:
+                            inventory
+                                .default_owner(owner)
+                                .map(
+                                    pure func(trait_row: TraitRow) -> Span: trait_row.type_name.span,
+                                )
+        UnionDeclaration(owner):
+            match (
+                inventory
+                    .inventory_unions()
+                    .get(owner.union_number())
+            ):
+                Some(row):
+                    row.type_parameters
+                        .get(position)
+                        .map(pure func(parameter) -> Span: parameter.name.span)
+                None:
+                    None
+        RecordDeclaration(owner):
+            match (
+                inventory
+                    .inventory_records()
+                    .get(owner.record_number())
+            ):
+                Some(row):
+                    row.declaration.type_parameters
+                        .get(position)
+                        .map(pure func(parameter) -> Span: parameter.name.span)
+                None:
+                    None
+        OpaqueDeclaration(owner):
+            match (
+                inventory
+                    .inventory_opaques()
+                    .get(owner.opaque_number())
+            ):
+                Some(row):
+                    row.declaration.type_parameters
+                        .get(position)
+                        .map(pure func(parameter) -> Span: parameter.name.span)
+                None:
+                    None
+
+
+-- Where `referent` is declared: its written name, or a module's first byte.
+-- A built-in type's declaration is not in the inventory, and a derived
+-- equality's bindings have no source, so both have none.
+pure func referent_declaration(
+    referent: Referent,
+    inventory: DeclarationInventory,
+    functions: List[CheckedFunction],
+    lambdas: List[CheckedLambda],
+) -> Option[Span]:
+    match referent:
+        FunctionReferent(id):
+            inventory
+                .inventory_functions()
+                .get(id.function_number())
+                .map(pure func(row) -> Span: row.declaration.function_name.span)
+        TraitMethodReferent(id):
+            match (
+                inventory
+                    .inventory_traits()
+                    .get(
+                        id
+                            .trait_method_owner()
+                            .trait_number(),
+                    )
+            ):
+                Some(owner):
+                    match owner.methods.get(id.trait_method_number()):
+                        Some(method):
+                            method
+                                .trait_method_header(inventory)
+                                .map(pure func(header) -> Span: header.function_name.span)
+                        None:
+                            None
+                None:
+                    None
+        ConstantReferent(id):
+            inventory
+                .inventory_constants()
+                .get(id.constant_number())
+                .map(pure func(row) -> Span: row.declaration.name.span)
+        TypeReferent(head):
+            match head:
+                PrimitiveHead(_) | ListHead:
+                    None
+                UnionHead(id):
+                    inventory
+                        .inventory_unions()
+                        .get(id.union_number())
+                        .map(pure func(row) -> Span: row.type_name.span)
+                RecordHead(id):
+                    inventory
+                        .inventory_records()
+                        .get(id.record_number())
+                        .map(pure func(row) -> Span: row.declaration.type_name.span)
+                OpaqueHead(id):
+                    inventory
+                        .inventory_opaques()
+                        .get(id.opaque_number())
+                        .map(pure func(row) -> Span: row.declaration.type_name.span)
+        TraitReferent(id):
+            inventory
+                .inventory_traits()
+                .get(id.trait_number())
+                .map(pure func(row) -> Span: row.type_name.span)
+        FieldReferent(id):
+            match (
+                inventory
+                    .inventory_records()
+                    .get(
+                        id
+                            .field_owner()
+                            .record_number(),
+                    )
+            ):
+                Some(row):
+                    row.declaration.fields
+                        .get(id.field_number())
+                        .map(pure func(field) -> Span: field.name.span)
+                None:
+                    None
+        VariantReferent(id):
+            match (
+                inventory
+                    .inventory_unions()
+                    .get(
+                        id
+                            .variant_owner()
+                            .union_number(),
+                    )
+            ):
+                Some(row):
+                    row.variants
+                        .get(id.variant_number())
+                        .map(pure func(variant) -> Span: variant.declaration.name.span)
+                None:
+                    None
+        TypeParameterReferent(id):
+            inventory.type_parameter_span(id)
+        BindingReferent(id):
+            match id.owner:
+                DeclaredBody(owner):
+                    match functions.get(owner.function_number()):
+                        Some(function): function.bindings.binding_span(id)
+                        None: None
+                LambdaBody(owner):
+                    match lambdas.get(owner.lambda_number()):
+                        Some(lambda): lambda.bindings.binding_span(id)
+                        None: None
+                DerivedEqualityBody(_):
+                    None
+        ModuleReferent(id):
+            Some({ source = module_source(id), start = 0, end = 0 })
+
+
+-- The bindings of one body that a written name declares, in binding order.
+private pure func named_bindings(
+    owner: BodyOwner,
+    bindings: List[BindingDefinition],
+) -> List[Referent]:
+    var declared: List[Referent] = []
+    var ordinal = 0
+    for definition in bindings:
+        if definition.named:
+            declared = declared.append(
+                BindingReferent({ owner = owner, binding = binding_id(ordinal) }),
+            )
+        ordinal = ordinal + 1
+    declared
+
+
+-- `declared` followed by the first `count` type parameters of `owner`.
+private pure func with_type_parameters(
+    declared: List[Referent],
+    owner: TypeParameterOwner,
+    count: Int,
+) -> List[Referent]:
+    var extended = declared
+    for position in 0..count:
+        extended = extended.append(TypeParameterReferent(type_parameter_id(owner, position)))
+    extended
+
+
+-- Every referent a written name declares. Modules are left out: a module's
+-- declaration is its first byte, not a name. So are the implicit Self
+-- parameters of traits and defaults, which the trait's name declares, and a
+-- trait default's body, whose name declares its trait method.
+pure func declared_referents(
+    inventory: DeclarationInventory,
+    functions: List[CheckedFunction],
+    lambdas: List[CheckedLambda],
+) -> List[Referent]:
+    var declared: List[Referent] = []
+    for row in inventory.inventory_functions():
+        match row.role:
+            FreeFunctionBody:
+                declared = declared.append(FunctionReferent(row.id))
+                declared = declared.with_type_parameters(
+                    FunctionDeclaration(row.id),
+                    row.declaration.type_parameters.length(),
+                )
+            ImplementationBody:
+                declared = declared.append(FunctionReferent(row.id))
+            TraitDefaultBody:
+                void
+    for implementation in inventory.inventory_implementations():
+        for method in implementation.methods:
+            declared = declared.with_type_parameters(
+                FunctionDeclaration(method),
+                implementation.header.type_parameters.length(),
+            )
+    for row in inventory.inventory_traits():
+        declared = declared.append(TraitReferent(row.id))
+        for method in row.methods:
+            declared = declared.append(TraitMethodReferent(method.id))
+    for row in inventory.inventory_constants():
+        declared = declared.append(ConstantReferent(row.id))
+    for row in inventory.inventory_records():
+        declared = declared.append(TypeReferent(RecordHead(row.id)))
+        declared = declared.with_type_parameters(
+            RecordDeclaration(row.id),
+            row.declaration.type_parameters.length(),
+        )
+        var position = 0
+        for _ in row.declaration.fields:
+            declared = declared.append(FieldReferent(field_id(row.id, position)))
+            position = position + 1
+    for row in inventory.inventory_unions():
+        declared = declared
+            .append(TypeReferent(UnionHead(row.id)))
+            .with_type_parameters(UnionDeclaration(row.id), row.type_parameters.length())
+        for variant in row.variants:
+            declared = declared.append(VariantReferent(variant.id))
+    for row in inventory.inventory_opaques():
+        declared = declared.append(TypeReferent(OpaqueHead(row.id)))
+        declared = declared.with_type_parameters(
+            OpaqueDeclaration(row.id),
+            row.declaration.type_parameters.length(),
+        )
+    for function in functions:
+        declared = declared.concat(named_bindings(DeclaredBody(function.id), function.bindings))
+    var ordinal = 0
+    for lambda in lambdas:
+        declared = declared.concat(named_bindings(LambdaBody(lambda_id(ordinal)), lambda.bindings))
+        ordinal = ordinal + 1
+    declared

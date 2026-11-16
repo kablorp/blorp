@@ -50,12 +50,12 @@ import:
         ValueExpression,
         WrittenName,
         TypeSyntax,
-    ../ids: OpaqueRow, VariantId
+    ../ids: FunctionId, OpaqueRow, VariantId
     ../namespace/builtins: DesignatedResult, DesignatedBoolean, DesignatedOption, RuntimeOperation
     ../namespace/namespace: Namespace
     ./callables: ResolutionContext
     ./constructors: VariantContract, ConstructionContext
-    ./declarations: CheckedDeclarations
+    ./declarations: CheckedDeclarations, ResolvedType(ResolvedTypeTerm)
     ./errors:
         CheckError,
         RecursionError(
@@ -112,15 +112,12 @@ import:
         statement_error,
         UnsupportedForm(CharPattern, IfValue),
         unsupported_form,
-    ./expressions: check_value, synthesize_value
+    ./expressions: CheckedValueResult, ResolvedBody, check_value, synthesize_value
     ./model:
         BodyOwner(DeclaredBody),
         AdmittedReceiverScope,
-        CheckedBodies,
         CheckedLambda,
         LambdaRow(CollectingLambda, CheckedLambdaRow),
-        CheckedValueResult,
-        ResolvedBody,
         CheckedConstant,
         BindingDefinition,
         BindingId,
@@ -170,6 +167,7 @@ import:
         UnionOccurrence,
         callable_parameter,
         binding_id,
+    ./name_uses: NameUse, Referent(BindingReferent), name_use
     ./patterns as patterns: ParsedPattern methods, TypeRef methods
     ./recursion: check_execution
     ./resource_scopes: admit_resource_body
@@ -191,10 +189,13 @@ private record MatchContext {
 }
 
 
+-- Each `uses` below is the name uses of exactly the syntax its record covers;
+-- a parent appends a child's where the child's record dies.
 private record ResolvedMatch {
     lambdas: List[LambdaRow],
     body: CheckedJoin,
     bindings: List[BindingDefinition],
+    uses: List[NameUse],
 }
 
 
@@ -202,6 +203,7 @@ private record StartedMatch {
     lambdas: List[LambdaRow],
     scrutinee: CheckedExpr,
     match_context: MatchContext,
+    uses: List[NameUse],
 }
 
 
@@ -235,6 +237,7 @@ private pure func start_match(
         lambdas = scrutinee.lambdas,
         scrutinee = scrutinee.value,
         match_context = { subject = subject, scope = scope },
+        uses = scrutinee.uses,
     })
 
 
@@ -269,6 +272,7 @@ private pure func resolve_arm_prefix(
             scope = pattern.scope,
             statements = [],
             reassigned = [],
+            uses = pattern.uses,
         },
         context,
     )
@@ -294,6 +298,7 @@ private pure func resolve_match(
             bindings = bindings,
             expectation = return_type.return_expectation(),
             reassigned = [],
+            uses = started.uses,
         },
         context,
     )
@@ -313,6 +318,7 @@ private pure func resolve_match(
         },
         lambdas = resolved.lambdas,
         bindings = resolved.bindings,
+        uses = resolved.uses,
     })
 
 
@@ -348,6 +354,8 @@ private record ResolvedValue {
     value: CheckedExpr,
     bindings: List[BindingDefinition],
     reassigned: List[BindingId],
+    -- The value's uses alone, not those of the block it follows.
+    uses: List[NameUse],
 }
 
 
@@ -360,6 +368,8 @@ private record JoinProgress {
     bindings: List[BindingDefinition],
     expectation: ValueExpectation,
     reassigned: List[BindingId],
+    -- The scrutinee's and the arms' uses so far.
+    uses: List[NameUse],
 }
 
 
@@ -470,6 +480,7 @@ private pure func resolve_value(
                                 lambdas = value.lambdas,
                                 bindings = block.bindings,
                                 reassigned = block.reassigned,
+                                uses = value.uses,
                             })
                         Err(error):
                             Err(error)
@@ -528,6 +539,7 @@ private pure func resolve_join(
             bindings = block.bindings,
             expectation = arm_expectation,
             reassigned = [],
+            uses = started.uses,
         },
         context,
     )
@@ -562,6 +574,7 @@ private pure func resolve_join(
         lambdas = resolved.lambdas,
         bindings = resolved.bindings,
         reassigned = block.reassigned.concat(carried),
+        uses = resolved.uses,
     })
 
 
@@ -600,6 +613,7 @@ private pure func resolve_join_arms(
                                         lambdas = prefix.block.lambdas,
                                         bindings = prefix.block.bindings,
                                         reassigned = prefix.block.reassigned,
+                                        uses = [],
                                     })
                                 UntypedValue | ConditionValue(_) | CheckedAgainst(_, _) | VoidTail:
                                     Err(match_error(arm.span, ArmWithoutValue))
@@ -624,6 +638,9 @@ private pure func resolve_join_arms(
                                     bindings = value.bindings,
                                     expectation = expectation,
                                     reassigned = progress.reassigned.concat(value.reassigned),
+                                    uses = progress.uses
+                                        .concat(prefix.block.uses)
+                                        .concat(value.uses),
                                 },
                                 context,
                             )
@@ -677,6 +694,7 @@ private pure func parameter_scope(
                         definitions = definitions.append({
                             origin = origin,
                             mutable = False,
+                            named = False,
                             value_type = value_type.value_type,
                             span = span,
                         })
@@ -702,6 +720,7 @@ private pure func parameter_scope(
                                     {
                                         origin = ParameterBinding(data_ordinal),
                                         mutable = False,
+                                        named = True,
                                         value_type = value_type.value_type,
                                         span = name.span,
                                     },
@@ -735,6 +754,9 @@ private record ResolvedStatements {
     scope: List[ScopedValue],
     statements: List[CheckedStatement],
     reassigned: List[BindingId],
+    -- The uses of this block's statements so far. A nested block starts its
+    -- own list, so no two live blocks share one.
+    uses: List[NameUse],
 }
 
 
@@ -851,6 +873,7 @@ private pure func resolve_statement(
                             bindings = resolved.bindings,
                             statements = block.statements.append(DiscardExpression(resolved.value)),
                             reassigned = resolved.reassigned,
+                            uses = block.uses.concat(resolved.uses),
                         },
                     )
                 Err(error):
@@ -904,6 +927,7 @@ private pure func resolve_if_branch(
                 bindings = prefix.bindings,
                 lambdas = prefix.lambdas,
                 reassigned = prefix.reassigned,
+                uses = [],
             })
         _:
             match written.value:
@@ -921,6 +945,7 @@ private pure func resolve_if_branch(
                                 bindings = prefix.bindings,
                                 lambdas = prefix.lambdas,
                                 reassigned = prefix.reassigned,
+                                uses = [],
                             })
                         _:
                             Err(value_error(written.span, IfBranchWithoutValue))
@@ -929,6 +954,7 @@ private pure func resolve_if_branch(
             bindings = resolved.bindings,
             lambdas = resolved.lambdas,
             reassigned = resolved.reassigned,
+            uses = prefix.uses.concat(resolved.uses),
         },
         value = resolved.value,
     })
@@ -947,6 +973,7 @@ private pure func resolve_if(
         scope = block.scope,
         statements = [],
         reassigned = [],
+        uses = [],
     }
     arm_expectation = match written.else_branch:
         Some(_): expectation
@@ -976,6 +1003,7 @@ private pure func resolve_if(
                                     lambdas = resolved.lambdas,
                                     bindings = resolved.bindings,
                                     reassigned = resolved.reassigned,
+                                    uses = resolved.uses,
                                 },
                                 value = resolved.value,
                             })
@@ -1060,6 +1088,9 @@ private pure func resolve_if(
         lambdas = other.block.lambdas,
         bindings = other.block.bindings,
         reassigned = block.reassigned.concat(carried),
+        uses = condition.uses
+            .concat(selected.block.uses)
+            .concat(other.block.uses),
     })
 
 
@@ -1077,6 +1108,7 @@ private pure func resolve_while(
             scope = block.scope,
             statements = [],
             reassigned = [],
+            uses = [],
         },
         inside,
     )
@@ -1095,14 +1127,19 @@ private pure func resolve_while(
                 }),
             ),
             reassigned = block.reassigned.concat(carried),
+            uses = block.uses
+                .concat(condition.uses)
+                .concat(body.uses),
         },
     )
 
 
+-- The loop's entry block starts its own uses; `uses` are the iterable's.
 private record ResolvedIteration {
     iteration: CheckedIteration,
     element: TypeRef,
     block: ResolvedStatements,
+    uses: List[NameUse],
 }
 
 
@@ -1138,6 +1175,7 @@ private pure func resolve_range_iteration(
         lambdas = first.lambdas,
         bindings = first.bindings,
         reassigned = first.reassigned,
+        uses = [],
     }
     last ?= previous.resolve_value(
         end,
@@ -1152,6 +1190,7 @@ private pure func resolve_range_iteration(
             bindings = last.bindings,
             reassigned = last.reassigned,
         },
+        uses = first.uses.concat(last.uses),
     })
 
 
@@ -1170,7 +1209,9 @@ private pure func resolve_list_iteration(
                     lambdas = resolved.lambdas,
                     bindings = resolved.bindings,
                     reassigned = resolved.reassigned,
+                    uses = [],
                 },
+                uses = resolved.uses,
             })
         _:
             Err(statement_error(written.span, NonIterableFor(resolved.value.value_type)))
@@ -1196,6 +1237,7 @@ private pure func bind_for_item(
             definition: BindingDefinition = {
                 origin = BodyLocal,
                 mutable = False,
+                named = True,
                 value_type = element,
                 span = name.span,
             }
@@ -1261,6 +1303,7 @@ private pure func bind_tuple_elements(
                         definition: BindingDefinition = {
                             origin = BodyLocal,
                             mutable = False,
+                            named = True,
                             value_type = value_type,
                             span = name.span,
                         }
@@ -1308,6 +1351,7 @@ private pure func resolve_tuple_binding(
     definition: BindingDefinition = {
         origin = BodyLocal,
         mutable = False,
+        named = False,
         value_type = resolved.value.value_type,
         span = initializer.span,
     }
@@ -1325,6 +1369,7 @@ private pure func resolve_tuple_binding(
             scope = block.scope,
             statements = block.statements.append(InitializeBinding(id, resolved.value)),
             reassigned = resolved.reassigned,
+            uses = block.uses.concat(resolved.uses),
         },
         context,
     )
@@ -1353,6 +1398,7 @@ private pure func bind_tuple_for_item(
     definition: BindingDefinition = {
         origin = BodyLocal,
         mutable = False,
+        named = False,
         value_type = element,
         span = span,
     }
@@ -1393,6 +1439,9 @@ private pure func resolve_for(
                 }),
             ),
             reassigned = iterated.block.reassigned.concat(carried),
+            uses = block.uses
+                .concat(iterated.uses)
+                .concat(body.uses),
         },
     )
 
@@ -1404,16 +1453,21 @@ private pure func resolve_initializer(
     block: ResolvedStatements,
     context: ResolutionContext,
 ) -> Result[ResolvedValue, CheckError]:
-    expectation: ValueExpectation ?= match written.annotation:
+    match written.annotation:
         None:
-            Ok(UntypedValue)
+            block.resolve_value(written.initializer, UntypedValue, context)
         Some(annotation):
-            match context.resolve_body_type(annotation):
-                Ok(value_type):
-                    Ok(CheckedAgainst(value_type, SourceAnnotation(annotation.type_span())))
+            match context.resolve_body_type(annotation, []):
                 Err(error):
                     Err(error)
-    block.resolve_value(written.initializer, expectation, context)
+                Ok(ResolvedTypeTerm(annotated_type, annotation_uses)):
+                    match block.resolve_value(
+                        written.initializer,
+                        CheckedAgainst(annotated_type, SourceAnnotation(annotation.type_span())),
+                        context,
+                    ):
+                        Ok(value): Ok({ value | uses = annotation_uses.concat(value.uses) })
+                        Err(error): Err(error)
 
 
 private pure func resolve_assignment(
@@ -1482,6 +1536,13 @@ private pure func resolve_assignment(
                                 ReassignBinding(binding.local_binding_id(), resolved.value),
                             ),
                             reassigned = resolved.reassigned.append(binding.local_binding_id()),
+                            uses = block.uses
+                                .append(
+                                    written.name.name_use(
+                                        BindingReferent(binding.binding_site().binding),
+                                    ),
+                                )
+                                .concat(resolved.uses),
                         },
                     )
                 Err(error):
@@ -1494,6 +1555,7 @@ private pure func resolve_assignment(
                     definition: BindingDefinition = {
                         origin = BodyLocal,
                         mutable = written.mutable,
+                        named = True,
                         value_type = value.value_type,
                         span = written.name.span,
                     }
@@ -1524,6 +1586,7 @@ private pure func resolve_assignment(
                                 scope = [noted].concat(block.scope),
                                 statements = block.statements.append(InitializeBinding(id, value)),
                                 reassigned = resolved.reassigned,
+                                uses = block.uses.concat(resolved.uses),
                             })
                 Err(error):
                     Err(error)
@@ -1556,6 +1619,7 @@ private pure func resolve_body(
         scope = initial,
         statements = [],
         reassigned = [],
+        uses = [],
     }
     accepted.resolve_function_prefix(0, block, initial, result, context)
 
@@ -1609,6 +1673,7 @@ private pure func resolve_function_prefix(
                                         bindings = value.bindings,
                                         statements = value.statements,
                                         body = CheckedValueBody(ReturnExpression(value.value)),
+                                        uses = value.uses,
                                     })
                 _:
                     match statement.resolve_statement(block, context):
@@ -1641,6 +1706,7 @@ private pure func finish_body(
                 body = CheckedValueBody(
                     ReturnExpression(signature.builtin_value(prefix.bindings, operation, span)),
                 ),
+                uses = prefix.uses,
             })
         ValueBody(body):
             match prefix.resolve_value(body, signature.return_type.return_expectation(), context):
@@ -1650,6 +1716,7 @@ private pure func finish_body(
                         bindings = value.bindings,
                         statements = prefix.statements,
                         body = CheckedValueBody(ReturnExpression(value.value)),
+                        uses = prefix.uses.concat(value.uses),
                     })
                 Err(error):
                     Err(error)
@@ -1690,6 +1757,7 @@ private pure func finish_body(
                         bindings = matched.bindings,
                         statements = prefix.statements,
                         body = checked_body,
+                        uses = prefix.uses.concat(matched.uses),
                     })
                 Err(error):
                     Err(error)
@@ -1736,6 +1804,8 @@ private record ResolvedFunctionValue {
     bindings: List[BindingDefinition],
     statements: List[CheckedStatement],
     value: CheckedExpr,
+    -- Every use from the block it continues to the function's end.
+    uses: List[NameUse],
 }
 
 
@@ -1784,6 +1854,7 @@ private pure func resolve_result_prefix(
                         lambdas = block.lambdas,
                         bindings = block.bindings,
                         reassigned = block.reassigned,
+                        uses = [],
                     })
             match value:
                 Ok(resolved):
@@ -1792,6 +1863,7 @@ private pure func resolve_result_prefix(
                         statements = block.statements,
                         lambdas = resolved.lambdas,
                         value = resolved.value,
+                        uses = block.uses.concat(resolved.uses),
                     })
                 Err(error):
                     Err(error)
@@ -1831,24 +1903,25 @@ private pure func propagation_source(
     result: DesignatedResult[VariantId],
     context: ResolutionContext,
 ) -> Result[ResolvedValue, CheckError]:
-    expectation: ValueExpectation ?= match written.annotation:
+    match written.annotation:
         None:
-            Ok(UntypedValue)
+            block.resolve_value(written.value, UntypedValue, context)
         Some(annotation):
-            match context.resolve_body_type(annotation):
-                Ok(value):
-                    Ok(
-                        CheckedAgainst(
-                            NominalType(
-                                AggregateNominal(UnionAggregate(result.ok.variant_owner())),
-                                [value, error_type],
-                            ),
-                            SourceAnnotation(annotation.type_span()),
-                        ),
-                    )
+            match context.resolve_body_type(annotation, []):
                 Err(error):
                     Err(error)
-    block.resolve_value(written.value, expectation, context)
+                Ok(ResolvedTypeTerm(annotated_type, annotation_uses)):
+                    expected: TypeRef = NominalType(
+                        AggregateNominal(UnionAggregate(result.ok.variant_owner())),
+                        [annotated_type, error_type],
+                    )
+                    match block.resolve_value(
+                        written.value,
+                        CheckedAgainst(expected, SourceAnnotation(annotation.type_span())),
+                        context,
+                    ):
+                        Ok(value): Ok({ value | uses = annotation_uses.concat(value.uses) })
+                        Err(error): Err(error)
 
 
 private pure func resolve_propagation(
@@ -1899,14 +1972,19 @@ private pure func resolve_propagation(
     source_definition: BindingDefinition = {
         origin = BodyLocal,
         mutable = False,
+        named = False,
         value_type = source.value.value_type,
         span = written.value.span,
     }
     bindings = source.bindings.append(source_definition)
     success = binding_id(bindings.length())
+    named: Bool = match written.binder:
+        NamedBinder(_): True
+        DiscardBinder(_): False
     definition: BindingDefinition = {
         origin = MatchCapture,
         mutable = False,
+        named = named,
         value_type = success_type,
         span = written.binder.binder_span(),
     }
@@ -1933,6 +2011,7 @@ private pure func resolve_propagation(
             scope = scope,
             statements = [],
             reassigned = [],
+            uses = [],
         },
         initial,
         result,
@@ -1942,6 +2021,7 @@ private pure func resolve_propagation(
     error_definition: BindingDefinition = {
         origin = MatchCapture,
         mutable = False,
+        named = False,
         value_type = error_type,
         span = written.value.span,
     }
@@ -1986,6 +2066,9 @@ private pure func resolve_propagation(
         lambdas = continuation.lambdas,
         bindings = continuation.bindings.append(error_definition),
         statements = block.statements.append(InitializeBinding(source_id, source.value)),
+        uses = block.uses
+            .concat(source.uses)
+            .concat(continuation.uses),
         value = {
             form = Match({
                 scrutinee = {
@@ -2020,7 +2103,19 @@ private pure func resolve_propagation(
     })
 
 
+-- Every checked function body and lambda. It lives here, not in `model`, which
+-- cannot import `name_uses`.
+record CheckedBodies {
+    functions: List[CheckedFunction],
+    lambdas: List[CheckedLambda],
+    -- The names every body uses, except a synthesised entry's.
+    uses: List[NameUse],
+}
+
+
 -- Checks every function body in declaration order, including unreachable ones.
+-- `synthesized_entry` is the entry function assembly wrote, if it wrote one: no
+-- source spells its names, so its body records none.
 pure func resolve_functions(
     functions: List[AcceptedFunction],
     declarations: CheckedDeclarations,
@@ -2032,6 +2127,7 @@ pure func resolve_functions(
     result: DesignatedResult[VariantId],
     boolean: DesignatedBoolean[VariantId],
     option: DesignatedOption[VariantId],
+    synthesized_entry: Option[FunctionId],
 ) -> Result[CheckedBodies, CheckError]:
     var has_resources: Bool = False
     for row in opaque_declarations:
@@ -2040,6 +2136,7 @@ pure func resolve_functions(
             break
     var checked: List[CheckedFunction] = []
     var lambdas: List[LambdaRow] = []
+    var uses: List[NameUse] = []
     var failure: Option[CheckError] = None
     while failure.is_none():
         match functions.get(checked.length()):
@@ -2122,6 +2219,8 @@ pure func resolve_functions(
                                             body = published.body,
                                         })
                                         lambdas = published.lambdas
+                                        if synthesized_entry != Some(id):
+                                            uses = uses.concat(published.uses)
                                     Err(error):
                                         failure = Some(error)
                             Err(error):
@@ -2131,7 +2230,7 @@ pure func resolve_functions(
             Err(error)
         None:
             match lambdas.seal_lambda_rows():
-                Ok(rows): Ok({ functions = checked, lambdas = rows })
+                Ok(rows): Ok({ functions = checked, lambdas = rows, uses = uses })
                 Err(error): Err(error)
 
 
@@ -2242,6 +2341,7 @@ pure func resolve_lambda_block(
             statements = [],
             reassigned = [],
             lambdas = lambdas,
+            uses = [],
         },
         context,
     )
@@ -2258,6 +2358,7 @@ pure func resolve_lambda_block(
         statements = prefix.statements,
         body = CheckedValueBody(ReturnExpression(value.value)),
         lambdas = value.lambdas,
+        uses = prefix.uses.concat(value.uses),
     }
     if result.value_type == VoidType:
         Ok(resolved.normalize_void_body())

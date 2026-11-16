@@ -88,6 +88,7 @@ import:
         ParsedRuntimeOperation methods,
     ../namespace/namespace: Namespace, FunctionSource(DeclaredHere), NamedValue(NamedFunction)
     ./declarations:
+        ResolvedType(ResolvedTypeTerm),
         TypeScope,
         LocalTypeParameter,
         Substitution,
@@ -97,6 +98,7 @@ import:
         local_type_parameters,
         parameter_requirements,
         resolve_bounds,
+        annotated_types,
     ./errors as resource_errors:
         CheckError,
         CheckerInvariant(InvalidFunctionContract, InvalidResolvedFunction, RuntimeContractMismatch),
@@ -137,6 +139,7 @@ import:
         TypeUse,
         type_parameter_id,
         primitive_ref,
+    ./name_uses: NameUse, Referent(TraitReferent, TypeReferent)
     ./resource_types: TypeRef methods
 
 
@@ -183,6 +186,29 @@ record CheckedSignatures {
     -- None when the root module declares no entry function: a fact, not an
     -- error. `check` rejects it; an editor's analysis does not.
     entrypoint: Option[Entrypoint[FunctionId]],
+    -- The names the signatures and implementation headers use.
+    uses: List[NameUse],
+}
+
+
+-- One function's accepted signature, and the uses so far with its names.
+private record AcceptedSignature {
+    function: AcceptedFunction,
+    uses: List[NameUse],
+}
+
+
+-- One implementation header, and the uses so far with its names.
+private record AcceptedHeader {
+    header: ImplementationHeader,
+    uses: List[NameUse],
+}
+
+
+-- Every implementation header, and the names they use.
+private record AcceptedHeaders {
+    headers: List[ImplementationHeader],
+    uses: List[NameUse],
 }
 
 
@@ -201,12 +227,25 @@ pure func validate_signatures(
         Some(NamedFunction(id, DeclaredHere)): Some(id)
         _: None
     headers ?= parsed.implementation_headers(namespace)
-    functions ?= parsed.accept_functions(namespace, designated, entrypoint, headers, contracts, [])
+    functions ?= parsed.accept_functions(
+        namespace,
+        designated,
+        entrypoint,
+        headers.headers,
+        contracts,
+    )
     accepted: Option[Entrypoint[FunctionId]] ?= match entrypoint:
-        None: Ok(None)
-        Some(id): entry_shape(functions, id, parsed.end).map(pure func(entry): Some(entry))
+        None:
+            Ok(None)
+        Some(id):
+            entry_shape(functions.functions, id, parsed.end).map(pure func(entry): Some(entry))
 
-    Ok({ functions = functions, implementation_headers = headers, entrypoint = accepted })
+    Ok({
+        functions = functions.functions,
+        implementation_headers = headers.headers,
+        entrypoint = accepted,
+        uses = headers.uses.concat(functions.uses),
+    })
 
 
 -- The process-ABI shape of the validated entry function: its exit-status
@@ -230,6 +269,13 @@ private pure func entry_shape(
         _: Ok(WithArguments(id, result))
 
 
+-- Every function's signature in declaration order, and the names they use.
+private record AcceptedFunctions {
+    functions: List[AcceptedFunction],
+    uses: List[NameUse],
+}
+
+
 private pure func accept_functions(
     parsed: ParsedContents,
     namespace: Namespace,
@@ -237,46 +283,41 @@ private pure func accept_functions(
     entrypoint: Option[FunctionId],
     headers: List[ImplementationHeader],
     contracts: List[AcceptedTrait],
-    accepted: List[AcceptedFunction],
-) -> Result[List[AcceptedFunction], CheckError]:
-    match (
-        parsed.declarations
-            .inventory_functions()
-            .get(accepted.length())
-    ):
-        None:
-            Ok(accepted)
-        Some(row):
-            function = row.declaration
-
-            id = row.id
-
-            is_entry: Bool = match entrypoint:
-                Some(entry): id == entry
-                None: False
-
-            scope: TypeScope = {
-                self_binding = None,
-                records = parsed.declarations.inventory_records(),
-                unions = parsed.declarations.inventory_unions(),
-                opaques = parsed.declarations.inventory_opaques(),
-                namespace = namespace,
-                module = function.module,
-                access = type_access(function.visibility, function.function_name.id),
-                parameters = [],
-            }
-            match row.resolve_function(parsed, headers, contracts, is_entry, scope, designated):
-                Ok(signature):
-                    parsed.accept_functions(
-                        namespace,
-                        designated,
-                        entrypoint,
-                        headers,
-                        contracts,
-                        accepted.append(signature),
-                    )
-                Err(error):
-                    Err(error)
+) -> Result[AcceptedFunctions, CheckError]:
+    var accepted: List[AcceptedFunction] = []
+    var uses: List[NameUse] = []
+    var failure: Option[CheckError] = None
+    for row in parsed.declarations.inventory_functions():
+        function = row.declaration
+        is_entry: Bool = match entrypoint:
+            Some(entry): row.id == entry
+            None: False
+        scope: TypeScope = {
+            self_binding = None,
+            records = parsed.declarations.inventory_records(),
+            unions = parsed.declarations.inventory_unions(),
+            opaques = parsed.declarations.inventory_opaques(),
+            namespace = namespace,
+            module = function.module,
+            access = type_access(function.visibility, function.function_name.id),
+            parameters = [],
+        }
+        match row.resolve_function(parsed, headers, contracts, is_entry, scope, designated):
+            Ok(signature):
+                accepted = accepted.append(signature.function)
+                -- Assembly wrote a synthesised entry; no source spells its names.
+                if (
+                    is_entry
+                        .and(parsed.synthesized_entry)
+                        .not()
+                ):
+                    uses = uses.concat(signature.uses)
+            Err(error):
+                failure = Some(error)
+                break
+    match failure:
+        Some(error): Err(error)
+        None: Ok({ functions = accepted, uses = uses })
 
 
 private pure func resolve_signature(
@@ -288,11 +329,13 @@ private pure func resolve_signature(
     parameters: List[TypeParameterId],
     requirements: List[TraitRequirement],
     designated: DesignatedUnions,
-) -> Result[AcceptedFunction, CheckError]:
+    uses: List[NameUse],
+) -> Result[AcceptedSignature, CheckError]:
 
-    return_type ?= match function.return_type:
-        Some(written): scope.resolve_type(written)
-        None: Ok(VoidType)
+    resolved_return: ResolvedType ?= match function.return_type:
+        Some(written): scope.resolve_type(written, uses)
+        None: Ok(ResolvedTypeTerm(VoidType, uses))
+    return_type = resolved_return.resolved_value_type()
 
     return_span = match function.return_type:
         Some(written): written.type_span()
@@ -323,12 +366,26 @@ private pure func resolve_signature(
         Err(resource_errors.resource_error(return_span, resource_errors.ResourceResult))
     else:
         Ok(void)
-    formal_parameters ?= function.parameters.resolve_parameters(is_entry, scope, [])
+    formal_parameters ?= scope.annotated_types(
+        function.parameters.map(pure func(parameter) -> TypeSyntax: parameter.type_name),
+        [],
+        resolved_return.resolved_uses(),
+    )
+    -- The body scope validates every parameter name. Only an entry function's
+    -- single parameter, if any, has a required type.
+    _: Void ?= match formal_parameters.types:
+        [first, ..._]:
+            if is_entry.and(first.value_type != ListType(StringType)):
+                Err(signature_error(first.span, MainParameterType))
+            else:
+                Ok(void)
+        []:
+            Ok(void)
     var scoped_parameters: List[Int] = []
     var parameter_position = 0
     var loan_failure: Option[CheckError] = None
     for parameter in function.parameters:
-        match formal_parameters.get(parameter_position):
+        match formal_parameters.types.get(parameter_position):
             Some(formal):
                 if (function.purity == Pure).and(formal.value_type.is_resource(scope.opaques)):
                     loan_failure = Some(
@@ -364,56 +421,22 @@ private pure func resolve_signature(
         requirements = requirements,
         purity = function.purity,
         scoped_parameters = scoped_parameters,
-        parameters = formal_parameters,
+        parameters = formal_parameters.types,
         return_type = { value_type = return_type, span = return_span },
     }
     body ?= function.accept_body(signature, designated)
 
     Ok({
-        id = id,
-        label = label,
-        declaration = function,
-        signature = signature,
-        body_types = { scope | access = PrivateTypeUse },
-        body = body,
+        function = {
+            id = id,
+            label = label,
+            declaration = function,
+            signature = signature,
+            body_types = { scope | access = PrivateTypeUse },
+            body = body,
+        },
+        uses = formal_parameters.uses,
     })
-
-
--- Resolves parameter types; the body scope validates every parameter name.
-private pure func resolve_parameters(
-    parameters: List[ParsedParameter],
-    is_entry: Bool,
-    scope: TypeScope,
-    resolved: List[TypeUse],
-) -> Result[List[TypeUse], CheckError]:
-    position = resolved.length()
-
-    match parameters.get(position):
-        None:
-            Ok(resolved)
-        Some(parameter):
-            match scope.resolve_type(parameter.type_name):
-                Ok(value_type):
-                    span = parameter.type_name.type_span()
-
-                    entry_type_result: Result[Void, CheckError] = if is_entry.and(
-                        value_type != ListType(StringType),
-                    ):
-                        Err(signature_error(span, MainParameterType))
-                    else:
-                        Ok(void)
-
-                    match entry_type_result:
-                        Ok(_):
-                            parameters.resolve_parameters(
-                                is_entry,
-                                scope,
-                                resolved.append({ value_type = value_type, span = span }),
-                            )
-                        Err(error):
-                            Err(error)
-                Err(error):
-                    Err(error)
 
 
 -- A builtin body is accepted once its runtime contract is validated; source
@@ -650,8 +673,9 @@ private pure func implementation_header(
     row: ImplRow,
     scope: TypeScope,
     parsed: ParsedContents,
-) -> Result[ImplementationHeader, CheckError]:
-    head ?= scope.resolve_receiver_head(row.header.receiver)
+) -> Result[AcceptedHeader, CheckError]:
+    receiver ?= scope.resolve_receiver_head(row.header.receiver)
+    head = receiver.head
     arity ?= scope.receiver_arity(head, row.header.receiver.receiver_head_span())
     _: Void ?= if arity == row.header.type_parameters.length():
         Ok(void)
@@ -667,14 +691,18 @@ private pure func implementation_header(
         parsed.names.contextual_words().self_word,
     )
     bounds ?= row.header.type_parameters.resolve_bounds(scope)
-    Ok({ receiver_head = head, parameter_bounds = bounds })
+    Ok({
+        header = { receiver_head = head, parameter_bounds = bounds.bounds },
+        uses = receiver.uses.concat(bounds.uses),
+    })
 
 
 private pure func implementation_headers(
     parsed: ParsedContents,
     namespace: Namespace,
-) -> Result[List[ImplementationHeader], CheckError]:
+) -> Result[AcceptedHeaders, CheckError]:
     var headers: List[ImplementationHeader] = []
+    var uses: List[NameUse] = []
     var failure: Option[CheckError] = None
     for row in parsed.declarations.inventory_implementations():
         scope: TypeScope = {
@@ -688,14 +716,15 @@ private pure func implementation_headers(
             self_binding = None,
         }
         match row.implementation_header(scope, parsed):
-            Ok(header):
-                headers = headers.append(header)
+            Ok(accepted):
+                headers = headers.append(accepted.header)
+                uses = uses.concat(accepted.uses)
             Err(error):
                 failure = Some(error)
                 break
     match failure:
         Some(error): Err(error)
-        None: Ok(headers)
+        None: Ok({ headers = headers, uses = uses })
 
 
 private pure func resolve_implementation_function(
@@ -707,7 +736,7 @@ private pure func resolve_implementation_function(
     is_entry: Bool,
     scope: TypeScope,
     designated: DesignatedUnions,
-) -> Result[AcceptedFunction, CheckError]:
+) -> Result[AcceptedSignature, CheckError]:
     _: Void ?= match row.declaration.type_parameters:
         [first, ..._]: Err(trait_error(first.name.span, IndependentImplementationParameters))
         []: Ok(void)
@@ -727,6 +756,7 @@ private pure func resolve_implementation_function(
         self_binding = Some({
             name = parsed.names.contextual_words().self_word,
             value_type = receiver,
+            referent = TypeReferent(header.receiver_head),
         }),
     }
     row.declaration.resolve_signature(
@@ -737,6 +767,7 @@ private pure func resolve_implementation_function(
         identities,
         header.parameter_bounds.parameter_requirements(FunctionDeclaration(row.id)),
         designated,
+        [],
     )
 
 
@@ -751,7 +782,7 @@ private pure func resolve_default_function(
     parsed: ParsedContents,
     scope: TypeScope,
     designated: DesignatedUnions,
-) -> Result[AcceptedFunction, CheckError]:
+) -> Result[AcceptedSignature, CheckError]:
     self = type_parameter_id(FunctionDeclaration(row.id), 0)
     substitution: Substitution = {
         owner = TraitDeclaration(owner.id),
@@ -788,18 +819,22 @@ private pure func resolve_default_function(
     }
     body ?= row.declaration.accept_body(signature, designated)
     Ok({
-        id = row.id,
-        label = label,
-        declaration = row.declaration,
-        signature = signature,
-        body_types = { scope |
-            access = PrivateTypeUse,
-            self_binding = Some({
-                name = parsed.names.contextual_words().self_word,
-                value_type = ParameterType(self),
-            }),
+        function = {
+            id = row.id,
+            label = label,
+            declaration = row.declaration,
+            signature = signature,
+            body_types = { scope |
+                access = PrivateTypeUse,
+                self_binding = Some({
+                    name = parsed.names.contextual_words().self_word,
+                    value_type = ParameterType(self),
+                    referent = TraitReferent(owner.id),
+                }),
+            },
+            body = body,
         },
-        body = body,
+        uses = [],
     })
 
 
@@ -811,7 +846,7 @@ private pure func resolve_function(
     is_entry: Bool,
     scope: TypeScope,
     designated: DesignatedUnions,
-) -> Result[AcceptedFunction, CheckError]:
+) -> Result[AcceptedSignature, CheckError]:
     label ?= row.function_label(parsed)
     -- The loader's module role is the sole authority for raw native handles.
     -- Validate before dispatch so implementation and trait-default bodies have
@@ -836,7 +871,7 @@ private pure func resolve_function(
         FreeFunctionBody:
             row.resolve_free_function(label, is_entry, scope, designated)
         ImplementationBody:
-            var accepted: Result[AcceptedFunction, CheckError] = Err(
+            var accepted: Result[AcceptedSignature, CheckError] = Err(
                 checker_invariant(
                     row.declaration.function_name.span,
                     InvalidResolvedFunction(row.id),
@@ -860,7 +895,7 @@ private pure func resolve_function(
                                 void
             accepted
         TraitDefaultBody:
-            var accepted: Result[AcceptedFunction, CheckError] = Err(
+            var accepted: Result[AcceptedSignature, CheckError] = Err(
                 checker_invariant(
                     row.declaration.function_name.span,
                     InvalidResolvedFunction(row.id),
@@ -890,7 +925,7 @@ private pure func resolve_free_function(
     is_entry: Bool,
     scope: TypeScope,
     designated: DesignatedUnions,
-) -> Result[AcceptedFunction, CheckError]:
+) -> Result[AcceptedSignature, CheckError]:
     _: Void ?= match row.declaration.type_parameters.get(0):
         Some(name):
             if is_entry:
@@ -916,6 +951,7 @@ private pure func resolve_free_function(
         is_entry,
         parameters,
         parameters.declared_parameters(),
-        bounds.parameter_requirements(FunctionDeclaration(row.id)),
+        bounds.bounds.parameter_requirements(FunctionDeclaration(row.id)),
         designated,
+        bounds.uses,
     )

@@ -73,6 +73,9 @@ heap-allocated even when the caller destructures it at once. The lexer's
 (`LSP_PLAN.md`, landing 2's measurement). Records are 56.5% of the
 self-compile's allocations (7.98 M of 14.13 M at `203541220`). Keith approved
 values by representation in principle; the records design pilot owns it.
+`LSP_PLAN.md`'s landing 5 made `ResolvedType` a one-case union for this
+reason: as a record it cost 22,253 more allocations. It becomes a record
+when records are passed by value.
 
 ## Follow-ups
 

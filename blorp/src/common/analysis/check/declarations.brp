@@ -38,6 +38,7 @@ import:
         Unoffered,
         Namespace,
         NamedValue(NamedAlias),
+        TraitReference,
         TypeHead(PrimitiveHead, ListHead, UnionHead, RecordHead, OpaqueHead),
         Origin(Declared),
     ./errors as resource_errors:
@@ -106,6 +107,11 @@ import:
         field_id,
         primitive_ref,
         type_parameter_id,
+    ./name_uses:
+        NameUse,
+        Referent(TypeReferent, TypeParameterReferent, ModuleReferent),
+        name_use,
+        trait_uses,
     ./resource_types: TypeRef methods
 
 
@@ -120,9 +126,12 @@ pure func previous_declaration(previous: List[WrittenName], name: NameId) -> Opt
     found
 
 
+-- `Self` where a trait or an implementation is checked: the type it stands
+-- for, and what it names, the trait or the implementation's receiver type.
 record SelfBinding {
     name: NameId,
     value_type: TypeRef,
+    referent: Referent,
 }
 
 
@@ -227,20 +236,32 @@ pure func declared_parameters(scope: TypeScope) -> List[TypeParameterId]:
     scope.parameters.map(pure func(parameter: LocalTypeParameter): parameter.id)
 
 
+-- Each parameter's bounds, in order, and the names they use.
+record ResolvedBounds {
+    bounds: List[List[LocatedTrait]],
+    uses: List[NameUse],
+}
+
+
 -- Bounds are resolved once at their written declaration, one list per
 -- parameter in order.
 pure func resolve_bounds(
     parameters: List[ParsedTypeParameter],
     scope: TypeScope,
-) -> Result[List[List[LocatedTrait]], CheckError]:
+) -> Result[ResolvedBounds, CheckError]:
     var resolved: List[List[LocatedTrait]] = []
+    var uses: List[NameUse] = []
     var failure: Option[CheckError] = None
     for parameter in parameters:
         var bounds: List[LocatedTrait] = []
         for written in parameter.bounds:
             match scope.namespace.resolve_trait(scope.module, written):
-                Some(id):
-                    bounds = bounds.append({ required_trait = id, span = written.type_span() })
+                Some(reference):
+                    bounds = bounds.append({
+                        required_trait = reference.referenced_trait(),
+                        span = written.type_span(),
+                    })
+                    uses = uses.concat(reference.trait_uses())
                 None:
                     failure = Some(trait_error(written.type_span(), InvalidTraitBound))
                     break
@@ -249,7 +270,7 @@ pure func resolve_bounds(
             break
     match failure:
         Some(error): Err(error)
-        None: Ok(resolved)
+        None: Ok({ bounds = resolved, uses = uses })
 
 
 -- Attaches each parameter's resolved bounds to that parameter's identity in
@@ -312,16 +333,42 @@ private pure func resolve_nominal(
     owner: NominalId,
     arguments: List[TypeSyntax],
     span: Span,
-) -> Result[TypeRef, CheckError]:
+    uses: List[NameUse],
+) -> Result[ResolvedType, CheckError]:
     arity ?= scope.nominal_arity(owner, span)
     if arity == arguments.length():
-        match scope.resolve_types(arguments, []):
-            Ok(values): Ok(NominalType(owner, values))
-            Err(error): Err(error)
+        match scope.resolve_types(arguments, [], uses):
+            Ok(ResolvedTypeTerms(values, recorded)):
+                Ok(ResolvedTypeTerm(NominalType(owner, values), recorded))
+            Err(error):
+                Err(error)
     else if arity == 0:
         Err(type_term_error(span, OrdinaryTypeApplied(owner)))
     else:
         Err(type_term_error(span, TypeArgumentCountMismatch(owner, arity, arguments.length())))
+
+
+-- A resolved written type and the uses so far. A union, because a union is
+-- returned by value: as a plain record, a heap cell today, it cost 22,253 more
+-- allocations per self-compile (+0.16%). It becomes a record once records are
+-- passed by value.
+union ResolvedType:
+    ResolvedTypeTerm(TypeRef, List[NameUse])
+
+
+pure func resolved_value_type(resolved: ResolvedType) -> TypeRef:
+    match resolved:
+        ResolvedTypeTerm(value_type, _): value_type
+
+
+pure func resolved_uses(resolved: ResolvedType) -> List[NameUse]:
+    match resolved:
+        ResolvedTypeTerm(_, uses): uses
+
+
+-- Written types resolved in order, carried as `ResolvedType` is.
+private union ResolvedTypes:
+    ResolvedTypeTerms(List[TypeRef], List[NameUse])
 
 
 private pure func resolve_atomic_head(
@@ -365,11 +412,11 @@ private pure func resolve_head(
                     Ok(found.head)
 
 
-private pure func scoped_type(scope: TypeScope, name: WrittenName) -> Option[TypeRef]:
+private pure func scoped_type(scope: TypeScope, name: WrittenName) -> Option[SelfBinding]:
     match scope.self_binding:
         Some(binding):
             if binding.name == name.id:
-                Some(binding.value_type)
+                Some(binding)
             else:
                 None
         None:
@@ -379,18 +426,35 @@ private pure func scoped_type(scope: TypeScope, name: WrittenName) -> Option[Typ
 private pure func resolve_atomic_type(
     scope: TypeScope,
     name: WrittenName,
-) -> Result[TypeRef, CheckError]:
+    uses: List[NameUse],
+) -> Result[ResolvedType, CheckError]:
     match scope.scoped_type(name):
-        Some(value_type):
-            Ok(value_type)
+        Some(binding):
+            Ok(ResolvedTypeTerm(binding.value_type, uses.append(name.name_use(binding.referent))))
         None:
             match scope.parameters.lookup_type_parameter(name.id):
                 Some(parameter):
-                    Ok(ParameterType(parameter.id))
+                    Ok(
+                        ResolvedTypeTerm(
+                            ParameterType(parameter.id),
+                            uses.append(name.name_use(TypeParameterReferent(parameter.id))),
+                        ),
+                    )
                 None:
                     match scope.resolve_head(name, UnknownType(name.id)):
-                        Ok(head): scope.resolve_atomic_head(head, name)
-                        Err(error): Err(error)
+                        Ok(head):
+                            match scope.resolve_atomic_head(head, name):
+                                Ok(value_type):
+                                    Ok(
+                                        ResolvedTypeTerm(
+                                            value_type,
+                                            uses.append(name.name_use(TypeReferent(head))),
+                                        ),
+                                    )
+                                Err(error):
+                                    Err(error)
+                        Err(error):
+                            Err(error)
 
 
 -- A head applied to written arguments; the head's own arity rules.
@@ -400,42 +464,62 @@ private pure func resolve_applied_head(
     name: WrittenName,
     arguments: List[TypeSyntax],
     span: Span,
-) -> Result[TypeRef, CheckError]:
+    uses: List[NameUse],
+) -> Result[ResolvedType, CheckError]:
     match head:
         ListHead:
             match arguments:
                 [element]:
-                    match scope.resolve_type(element):
-                        Ok(value): Ok(ListType(value))
-                        Err(error): Err(error)
+                    match scope.resolve_type(element, uses):
+                        Ok(ResolvedTypeTerm(value, recorded)):
+                            Ok(ResolvedTypeTerm(ListType(value), recorded))
+                        Err(error):
+                            Err(error)
                 _:
                     Err(type_term_error(span, ListTypeArgumentCount))
         RecordHead(owner):
-            scope.resolve_nominal(AggregateNominal(RecordAggregate(owner)), arguments, span)
+            scope.resolve_nominal(AggregateNominal(RecordAggregate(owner)), arguments, span, uses)
         UnionHead(owner):
-            scope.resolve_nominal(AggregateNominal(UnionAggregate(owner)), arguments, span)
+            scope.resolve_nominal(AggregateNominal(UnionAggregate(owner)), arguments, span, uses)
         OpaqueHead(owner):
-            scope.resolve_nominal(OpaqueNominal(owner), arguments, span)
+            scope.resolve_nominal(OpaqueNominal(owner), arguments, span, uses)
         PrimitiveHead(_):
             Err(type_term_error(name.span, NonApplicableType(name.id)))
+
+
+-- An implementation's receiver head, and the names it was written with.
+record ResolvedReceiverHead {
+    head: TypeHead,
+    uses: List[NameUse],
+}
 
 
 -- Receiver families name one head; their binders are accepted separately.
 pure func resolve_receiver_head(
     scope: TypeScope,
     written: ParsedReceiverHead,
-) -> Result[TypeHead, CheckError]:
+) -> Result[ResolvedReceiverHead, CheckError]:
     match written:
         ReceiverName(name):
-            scope.resolve_head(name, UnknownType(name.id))
+            match scope.resolve_head(name, UnknownType(name.id)):
+                Ok(head): Ok({ head = head, uses = [name.name_use(TypeReferent(head))] })
+                Err(error): Err(error)
         QualifiedReceiverName(qualified):
             match scope.namespace.aliased_module(scope.module, qualified.module):
                 Err(error):
                     Err(error)
                 Ok(aliased):
                     match scope.namespace.offered_type(aliased.target, qualified.name.id):
-                        Ok(head): Ok(head)
-                        Err(reason): Err(scope.qualified_type_rejection(aliased, qualified, reason))
+                        Ok(head):
+                            Ok({
+                                head = head,
+                                uses = [
+                                    qualified.module.name_use(ModuleReferent(aliased.target)),
+                                    qualified.name.name_use(TypeReferent(head)),
+                                ],
+                            })
+                        Err(reason):
+                            Err(scope.qualified_type_rejection(aliased, qualified, reason))
 
 
 pure func receiver_arity(scope: TypeScope, head: TypeHead, span: Span) -> Result[Int, CheckError]:
@@ -464,15 +548,21 @@ private pure func resolve_qualified_type(
     qualified: ParsedQualified,
     arguments: List[TypeSyntax],
     span: Span,
-) -> Result[TypeRef, CheckError]:
+    uses: List[NameUse],
+) -> Result[ResolvedType, CheckError]:
     aliased ?= scope.namespace.aliased_module(scope.module, qualified.module)
     head: TypeHead ?= match scope.namespace.offered_type(aliased.target, qualified.name.id):
         Ok(head): Ok(head)
         Err(reason): Err(scope.qualified_type_rejection(aliased, qualified, reason))
+    named = uses
+        .append(qualified.module.name_use(ModuleReferent(aliased.target)))
+        .append(qualified.name.name_use(TypeReferent(head)))
     if arguments.is_empty():
-        scope.resolve_atomic_head(head, qualified.name)
+        match scope.resolve_atomic_head(head, qualified.name):
+            Ok(value_type): Ok(ResolvedTypeTerm(value_type, named))
+            Err(error): Err(error)
     else:
-        scope.resolve_applied_head(head, qualified.name, arguments, span)
+        scope.resolve_applied_head(head, qualified.name, arguments, span, named)
 
 
 -- Produce the rejection fact before wrapping it in the caller's Result. This
@@ -493,61 +583,94 @@ private pure func qualified_type_rejection(
             )
 
 
-pure func resolve_type(scope: TypeScope, written: TypeSyntax) -> Result[TypeRef, CheckError]:
-    resolved ?= scope.resolve_written_type(written)
-    _: Void ?= resolved.admit_resource_type(scope.opaques, written.type_span())
+-- `written` resolved in `scope`, with each name it uses appended to `uses`.
+pure func resolve_type(
+    scope: TypeScope,
+    written: TypeSyntax,
+    uses: List[NameUse],
+) -> Result[ResolvedType, CheckError]:
+    resolved ?= scope.resolve_written_type(written, uses)
+    _: Void ?= resolved
+        .resolved_value_type()
+        .admit_resource_type(scope.opaques, written.type_span())
     Ok(resolved)
 
 
 private pure func resolve_written_type(
     scope: TypeScope,
     written: TypeSyntax,
-) -> Result[TypeRef, CheckError]:
+    uses: List[NameUse],
+) -> Result[ResolvedType, CheckError]:
     match written:
         TupleTypeSyntax(elements, _):
-            scope
-                .resolve_types(elements, [])
-                .map(pure func(values): TupleType(values))
-        CallableTypeSyntax(purity, parameters, result, _):
-            match scope.resolve_types(parameters, []):
+            match scope.resolve_types(elements, [], uses):
+                Ok(ResolvedTypeTerms(values, recorded)):
+                    Ok(ResolvedTypeTerm(TupleType(values), recorded))
                 Err(error):
                     Err(error)
-                Ok(values):
-                    match scope.resolve_type(result):
-                        Err(error): Err(error)
-                        Ok(returned): Ok(CallableType(purity, values, returned))
+        CallableTypeSyntax(purity, parameters, result, _):
+            match scope.resolve_types(parameters, [], uses):
+                Err(error):
+                    Err(error)
+                Ok(ResolvedTypeTerms(values, recorded)):
+                    match scope.resolve_type(result, recorded):
+                        Err(error):
+                            Err(error)
+                        Ok(ResolvedTypeTerm(returned, all)):
+                            Ok(ResolvedTypeTerm(CallableType(purity, values, returned), all))
         QualifiedType(qualified, arguments, span):
-            scope.resolve_qualified_type(qualified, arguments, span)
+            scope.resolve_qualified_type(qualified, arguments, span, uses)
         AtomicType(name):
-            scope.resolve_atomic_type(name)
+            scope.resolve_atomic_type(name, uses)
         AppliedType(name, arguments, span):
             match scope.scoped_type(name):
                 Some(_):
                     Err(type_term_error(name.span, NonApplicableType(name.id)))
                 None:
                     match scope.resolve_head(name, NonApplicableType(name.id)):
-                        Ok(head): scope.resolve_applied_head(head, name, arguments, span)
-                        Err(error): Err(error)
+                        Ok(head):
+                            scope.resolve_applied_head(
+                                head,
+                                name,
+                                arguments,
+                                span,
+                                uses.append(name.name_use(TypeReferent(head))),
+                            )
+                        Err(error):
+                            Err(error)
 
 
+-- Each accumulator passes from one call to the next and is never held across
+-- one, so each append is in place.
 private pure func resolve_types(
     scope: TypeScope,
     written: List[TypeSyntax],
     resolved: List[TypeRef],
-) -> Result[List[TypeRef], CheckError]:
+    uses: List[NameUse],
+) -> Result[ResolvedTypes, CheckError]:
     match written.get(resolved.length()):
         None:
-            Ok(resolved)
+            Ok(ResolvedTypeTerms(resolved, uses))
         Some(argument):
-            match scope.resolve_type(argument):
-                Ok(value): scope.resolve_types(written, resolved.append(value))
-                Err(error): Err(error)
+            match scope.resolve_type(argument, uses):
+                Ok(ResolvedTypeTerm(value, recorded)):
+                    scope.resolve_types(written, resolved.append(value), recorded)
+                Err(error):
+                    Err(error)
 
 
 record CheckedDeclarations {
     unions: List[CheckedUnion],
     records: List[CheckedRecord],
     opaques: List[CheckedOpaque],
+}
+
+
+-- The checked nominal declarations, and the names their bounds and
+-- annotations use.
+record DeclaredTypes {
+    declarations: CheckedDeclarations,
+    uses: List[NameUse],
 }
 
 
@@ -561,22 +684,23 @@ private pure func declared_module(declaration: NominalRow) -> ModuleId:
 pure func validate_declarations(
     parsed: ParsedContents,
     namespace: Namespace,
-) -> Result[CheckedDeclarations, CheckError]:
-    parsed.declare_types(namespace, { unions = [], records = [], opaques = [] })
+) -> Result[DeclaredTypes, CheckError]:
+    parsed.declare_types(namespace, { unions = [], records = [], opaques = [] }, [])
 
 
 private pure func declare_types(
     parsed: ParsedContents,
     namespace: Namespace,
     checked: CheckedDeclarations,
-) -> Result[CheckedDeclarations, CheckError]:
+    uses: List[NameUse],
+) -> Result[DeclaredTypes, CheckError]:
     match parsed.declarations.next_nominal(
         checked.records.length(),
         checked.unions.length(),
         checked.opaques.length(),
     ):
         None:
-            Ok(checked)
+            Ok({ declarations = checked, uses = uses })
         Some(declaration):
             access = match declaration:
                 UnionDeclarationRow(row):
@@ -596,76 +720,140 @@ private pure func declare_types(
                 parameters = [],
             }
 
-            declared: Result[CheckedDeclarations, CheckError] = match declaration:
-                UnionDeclarationRow(parsed_union):
-                    parsed_union
-                        .checked_union(scope)
-                        .map(
-                            pure func(accepted): { checked |
-                                unions = checked.unions.append(accepted),
-                            },
-                        )
-                RecordDeclarationRow(parsed_record):
-                    parsed_record
-                        .checked_record(scope)
-                        .map(
-                            pure func(accepted): { checked |
-                                records = checked.records.append(accepted),
-                            },
-                        )
-                OpaqueDeclarationRow(parsed_opaque):
-                    parsed_opaque
-                        .checked_opaque(scope)
-                        .map(
-                            pure func(accepted): { checked |
-                                opaques = checked.opaques.append(accepted),
-                            },
-                        )
+            declared: Result[DeclaredTypes, CheckError] = match declaration:
+                UnionDeclarationRow(parsed_union): parsed_union.checked_union(scope, checked)
+                RecordDeclarationRow(parsed_record): parsed_record.checked_record(scope, checked)
+                OpaqueDeclarationRow(parsed_opaque): parsed_opaque.checked_opaque(scope, checked)
 
             match declared:
-                Ok(updated): parsed.declare_types(namespace, updated)
-                Err(error): Err(error)
+                Ok(updated):
+                    parsed.declare_types(namespace, updated.declarations, uses.concat(updated.uses))
+                Err(error):
+                    Err(error)
 
 
+-- An annotation in a declaration resolved and proved free of resource types,
+-- in that order, with the names it uses.
+private pure func plain_annotation(
+    scope: TypeScope,
+    written: TypeSyntax,
+) -> Result[ResolvedType, CheckError]:
+    resolved ?= scope.resolve_type(written, [])
+    _: Void ?= resolved
+        .resolved_value_type()
+        .resource_free(scope.opaques, written.type_span())
+    Ok(resolved)
+
+
+-- Each declaration below returns the checked declarations with itself added,
+-- and its own uses.
 private pure func checked_union(
     row: UnionRow,
     module_scope: TypeScope,
-) -> Result[CheckedUnion, CheckError]:
+    checked: CheckedDeclarations,
+) -> Result[DeclaredTypes, CheckError]:
     owner: TypeParameterOwner = UnionDeclaration(row.id)
     scope ?= row.type_parameters.local_type_parameters(owner, module_scope)
     bounds ?= row.type_parameters.resolve_bounds(scope)
-    variants ?= row.declared_variants(scope, [])
-    Ok({
-        id = row.id,
-        name = row.type_name,
-        type_parameters = scope.declared_parameters(),
-        requirements = bounds.parameter_requirements(owner),
-        variants = variants,
-        fixed = row.fixed,
-    })
+    var variants: List[CheckedVariant] = []
+    var uses: List[NameUse] = []
+    var failure: Option[CheckError] = None
+    for variant in row.variants:
+        var fields: List[TypeUse] = []
+        for annotation in variant.declaration.fields:
+            match scope.plain_annotation(annotation):
+                Ok(ResolvedTypeTerm(value_type, field_uses)):
+                    fields = fields.append({
+                        value_type = value_type,
+                        span = annotation.type_span(),
+                    })
+                    uses = uses.concat(field_uses)
+                Err(error):
+                    failure = Some(error)
+                    break
+        if failure.is_some():
+            break
+        variants = variants.append({
+            id = variant.id,
+            name = variant.declaration.name,
+            fields = fields,
+        })
+    match failure:
+        Some(error):
+            Err(error)
+        None:
+            declared: CheckedUnion = {
+                id = row.id,
+                name = row.type_name,
+                type_parameters = scope.declared_parameters(),
+                requirements = bounds.bounds.parameter_requirements(owner),
+                variants = variants,
+                fixed = row.fixed,
+            }
+            Ok({
+                declarations = { checked | unions = checked.unions.append(declared) },
+                uses = bounds.uses.concat(uses),
+            })
 
 
 private pure func checked_record(
     row: RecordRow,
     module_scope: TypeScope,
-) -> Result[CheckedRecord, CheckError]:
+    checked: CheckedDeclarations,
+) -> Result[DeclaredTypes, CheckError]:
     owner: TypeParameterOwner = RecordDeclaration(row.id)
     scope ?= row.declaration.type_parameters.local_type_parameters(owner, module_scope)
     bounds ?= row.declaration.type_parameters.resolve_bounds(scope)
-    fields ?= row.declaration.declared_fields(row.id, scope, [])
-    Ok({
-        id = row.id,
-        type_parameters = scope.declared_parameters(),
-        requirements = bounds.parameter_requirements(owner),
-        fields = fields,
-        fixed = row.declaration.fixed,
-    })
+    var fields: List[CheckedField] = []
+    var uses: List[NameUse] = []
+    var failure: Option[CheckError] = None
+    for field in row.declaration.fields:
+        match fields.find_field(field.name.id):
+            Some(first):
+                failure = Some(
+                    type_declaration_error(
+                        field.name.span,
+                        DuplicateRecordField(field.name.id, first.name.span),
+                    ),
+                )
+            None:
+                match scope.plain_annotation(field.type_name):
+                    Ok(ResolvedTypeTerm(value_type, field_uses)):
+                        fields = fields.append({
+                            id = field_id(row.id, fields.length()),
+                            name = field.name,
+                            value_type = {
+                                value_type = value_type,
+                                span = field.type_name.type_span(),
+                            },
+                        })
+                        uses = uses.concat(field_uses)
+                    Err(error):
+                        failure = Some(error)
+        if failure.is_some():
+            break
+    match failure:
+        Some(error):
+            Err(error)
+        None:
+            declared: CheckedRecord = {
+                id = row.id,
+                type_parameters = scope.declared_parameters(),
+                requirements = bounds.bounds.parameter_requirements(owner),
+                fields = fields,
+                fixed = row.declaration.fixed,
+            }
+            Ok({
+                declarations = { checked | records = checked.records.append(declared) },
+                uses = bounds.uses.concat(uses),
+            })
 
 
 private pure func checked_opaque(
     row: OpaqueRow,
     module_scope: TypeScope,
-) -> Result[CheckedOpaque, CheckError]:
+    checked: CheckedDeclarations,
+) -> Result[DeclaredTypes, CheckError]:
     owner: TypeParameterOwner = OpaqueDeclaration(row.id)
     scope ?= row.declaration.type_parameters.local_type_parameters(owner, module_scope)
     bounds ?= row.declaration.type_parameters.resolve_bounds(scope)
@@ -682,111 +870,54 @@ private pure func checked_opaque(
         )
     else:
         Ok(void)
-    underlying ?= scope.resolve_type(row.declaration.underlying)
-    _: Void ?= underlying.resource_free(scope.opaques, row.declaration.underlying.type_span())
-    Ok({
-        id = row.id,
-        type_parameters = scope.declared_parameters(),
-        requirements = bounds.parameter_requirements(owner),
-        underlying_type = {
-            value_type = underlying,
-            span = row.declaration.underlying.type_span(),
-        },
-    })
+    match scope.plain_annotation(row.declaration.underlying):
+        Err(error):
+            Err(error)
+        Ok(ResolvedTypeTerm(underlying, underlying_uses)):
+            declared: CheckedOpaque = {
+                id = row.id,
+                type_parameters = scope.declared_parameters(),
+                requirements = bounds.bounds.parameter_requirements(owner),
+                underlying_type = {
+                    value_type = underlying,
+                    span = row.declaration.underlying.type_span(),
+                },
+            }
+            Ok({
+                declarations = { checked | opaques = checked.opaques.append(declared) },
+                uses = bounds.uses.concat(underlying_uses),
+            })
 
 
--- Resolves each variant's payload annotation, in declaration order.
-private pure func declared_variants(
-    declaration: UnionRow,
+-- Annotations resolved in order, each with its written span, and the names
+-- they use.
+record AnnotatedTypes {
+    types: List[TypeUse],
+    uses: List[NameUse],
+}
+
+
+-- `written` resolved after `types`, each with its written span, and `uses`
+-- with the names they use. Each accumulator passes from one call to the next.
+pure func annotated_types(
     scope: TypeScope,
-    declared: List[CheckedVariant],
-) -> Result[List[CheckedVariant], CheckError]:
-    match declaration.variants.get(declared.length()):
+    written: List[TypeSyntax],
+    types: List[TypeUse],
+    uses: List[NameUse],
+) -> Result[AnnotatedTypes, CheckError]:
+    match written.get(types.length()):
         None:
-            Ok(declared)
-        Some(variant):
-            match scope.declared_variant_fields(variant.declaration.fields):
-                Ok(fields):
-
-                    declaration.declared_variants(
-                        scope,
-                        declared.append({
-                            id = variant.id,
-                            name = variant.declaration.name,
-                            fields = fields,
-                        }),
+            Ok({ types = types, uses = uses })
+        Some(annotation):
+            match scope.resolve_type(annotation, uses):
+                Ok(ResolvedTypeTerm(value_type, recorded)):
+                    scope.annotated_types(
+                        written,
+                        types.append({ value_type = value_type, span = annotation.type_span() }),
+                        recorded,
                     )
                 Err(error):
                     Err(error)
-
-
-private pure func declared_variant_fields(
-    scope: TypeScope,
-    written: List[TypeSyntax],
-) -> Result[List[TypeUse], CheckError]:
-    var fields: List[TypeUse] = []
-    var failure: Option[CheckError] = None
-    for annotation in written:
-        match scope.resolve_type(annotation):
-            Ok(value):
-                match value.resource_free(scope.opaques, annotation.type_span()):
-                    Err(error):
-                        failure = Some(error)
-                        break
-                    Ok(_):
-                        fields = fields.append({
-                            value_type = value,
-                            span = annotation.type_span(),
-                        })
-            Err(error):
-                failure = Some(error)
-                break
-    match failure:
-        Some(error): Err(error)
-        None: Ok(fields)
-
-
--- Resolves every field annotation in declaration order, retaining its identity and name.
-private pure func declared_fields(
-    declaration: ParsedRecord,
-    owner: RecordId,
-    scope: TypeScope,
-    declared: List[CheckedField],
-) -> Result[List[CheckedField], CheckError]:
-    match declaration.fields.get(declared.length()):
-        None:
-            Ok(declared)
-        Some(field):
-            match declared.find_field(field.name.id):
-                Some(first):
-                    Err(
-                        type_declaration_error(
-                            field.name.span,
-                            DuplicateRecordField(field.name.id, first.name.span),
-                        ),
-                    )
-                None:
-                    resolved = scope
-                        .resolve_type(field.type_name)
-                        .and_then(pure func(value_type) -> Result[TypeRef, CheckError]:
-                            value_type
-                                .resource_free(scope.opaques, field.type_name.type_span())
-                                .map(pure func(_): value_type)
-                        )
-                    match resolved:
-                        Ok(value_type):
-                            span = field.type_name.type_span()
-                            declaration.declared_fields(
-                                owner,
-                                scope,
-                                declared.append({
-                                    id = field_id(owner, declared.length()),
-                                    name = field.name,
-                                    value_type = { value_type = value_type, span = span },
-                                }),
-                            )
-                        Err(error):
-                            Err(error)
 
 
 pure func find_field(fields: List[CheckedField], name: NameId) -> Option[CheckedField]:
