@@ -100,6 +100,16 @@ done.
     Q2, emit's failure-flag loops carrying a `Result`.
   - **Next:** land them in order. Records by value moved here and wait for
     the records design pilot.
+- **Impure trait methods and resource receivers:**
+  [`IMPURE_TRAIT_METHODS_PLAN.md`](IMPURE_TRAIT_METHODS_PLAN.md).
+  - **Status:** Keith decided on 2026-11-16 that trait methods may be impure,
+    that `pure` on a trait is respected, and that a resource implementing a
+    trait has each inherited default checked again. The plan was written and
+    reviewed the same day, and Keith approved it with T1 to T4 as
+    recommended.
+  - **Next:** landing 1, impure trait methods; landing 2, resource receivers,
+    after the resource-loan hardening lands; landing 3, resource-aware
+    helps.
 
 ## Smaller follow-ups
 
