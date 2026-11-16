@@ -25,12 +25,12 @@ make -C blorp                  # build blorp/build/blorp and blorp/build/blorp-t
 make -C blorp example          # compile, build and run test/test_compile/fixtures/return/zero.brp
 ```
 
-The `blorp` command (`blorp/build/blorp`, also `bin/blorp`) has the commands
+The `blorp` command (`blorp/build/blorp`) has the commands
 `compile`, `format` and `help`. `compile` takes the input and where to write the
 C; the standard library is built into the binary:
 
 ```sh
-bin/blorp compile input.brp -o output.c
+blorp/build/blorp compile input.brp -o output.c
 clang -std=c11 -Wall -Wextra -Werror -pedantic -O0 output.c -o program -lm
 ./program
 ```
@@ -67,10 +67,10 @@ the test layout and gates; [Tests](#tests) describes `TestSuite`.
 `blorp format` puts source files in the one canonical layout:
 
 ```sh
-bin/blorp format                                  # every .brp file under the current directory
-bin/blorp format blorp/src blorp/src/main.brp     # directories and files, rewritten in place
-bin/blorp format --check blorp/src                # report, change nothing
-bin/blorp format --exclude blorp/test/test_format/fixtures blorp/test
+blorp/build/blorp format                               # every .brp file under the current directory
+blorp/build/blorp format blorp/src blorp/src/main.brp  # directories and files, rewritten in place
+blorp/build/blorp format --check blorp/src             # report, change nothing
+blorp/build/blorp format --exclude blorp/test/test_format/fixtures blorp/test
 ```
 
 Each `PATH` is a `.brp` file or a directory, which is walked recursively in byte
@@ -1223,7 +1223,7 @@ lambdas are rejected. A lowercase `tests` constant is a naming error that
 says to write `TESTS`. Compile one or more suite files into one program:
 
 ```sh
-bin/blorp compile --test-suite blorp/test/test_common/test_utils/test_text.brp \
+blorp/build/blorp compile --test-suite blorp/test/test_common/test_utils/test_text.brp \
   [MORE_SUITES.brp ...] --library-root blorp/standard_library -o blorp/build/test_text.c
 ```
 
@@ -1447,7 +1447,7 @@ allocation and release.
 ### Leak check
 
 ```sh
-bin/blorp compile program.brp --library-root blorp/standard_library -o program.c
+blorp/build/blorp compile program.brp --library-root blorp/standard_library -o program.c
 clang -std=c11 -O0 -DBLORP_MEMORY_DIAGNOSTICS=1 -fsanitize=address,undefined program.c -o program -lm -lpthread
 BLORP_LEAK_CHECK=strict ./program
 ```

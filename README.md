@@ -39,10 +39,9 @@ make -C blorp example     # compiles and runs a small program through the compil
 make -C blorp test        # self-hosted component suites and native end-to-end tests
 ```
 
-The command is `blorp/build/blorp`, linked as `bin/blorp`. `blorp compile
-INPUT.brp --library-root blorp/standard_library -o OUTPUT.c` writes C; compile it
-with your C compiler. `blorp format` formats source, and `blorp help` lists the
-commands.
+The command is `blorp/build/blorp`. `blorp compile INPUT.brp --library-root
+blorp/standard_library -o OUTPUT.c` writes C; compile it with your C compiler.
+`blorp format` formats source, and `blorp help` lists the commands.
 
 `scripts/blorp-fixpoint --prove` proves that the compiler reproduces its own C
 from its own source. `benchmarks/bench.sh` compares Blorp with C, Go, OCaml and
