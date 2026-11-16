@@ -99,7 +99,7 @@ Commands, from the repository root:
 make -C blorp compiler                  # build the compiler from the pinned seed
 make -C blorp test                      # components and native e2e
 make -C blorp test-target-components TARGET_COMPONENT_SOURCES=<paths>   # one suite
-scripts/blorp-fixpoint --prove          # A builds B, B builds C, B == C
+scripts/blorp-fixpoint --prove          # A builds B, B builds C; B == C, A and B agree on fixtures
 bash blorp/test/test_bootstrap/test_bootstrap.sh   # bootstrap resolver and Makefile recipes
 bash benchmarks/bench.sh <name>           # cross-language speed table (see benchmarks/README.md)
 ```
@@ -223,9 +223,33 @@ artifact's inputs and toolchain before reusing it, and run cheap publication
 checks early. Until self-compilation works, label owned-input measurements
 as proxies and say what they omit.
 
-Code-reviewer and test-runner review apply to every change. A docs-only
-change needs link and path checks and `git diff --check`, not a compiled
-gate.
+**Which gates a change runs.** This paragraph is the one statement of the rule;
+other documents point here.
+
+- `make -C blorp test` runs for every change under `blorp/`.
+- `scripts/blorp-fixpoint --prove` runs only when the change touches what the
+  compiler's C is built from: `blorp/src/`, `blorp/standard_library/`,
+  `blorp/scripts/embed_library.brp`, `blorp/Makefile`, `blorp/bootstrap.env`,
+  `scripts/blorp-compiler-bootstrap` or `scripts/blorp-fixpoint`. A seed
+  rotation changes `bootstrap.env`, so it runs all three gates.
+- `bash blorp/test/test_bootstrap/test_bootstrap.sh` runs when the change
+  touches `scripts/blorp-compiler-bootstrap`, `blorp/Makefile` or
+  `blorp/bootstrap.env`.
+- The component and native e2e suites run under compiler B only in
+  `.github/workflows/blorp-seed.yml`, after each push to main. A change to that
+  step also runs them locally with the fixpoint's B, as the script's `--help`
+  shows.
+- A docs-only change needs link and path checks and `git diff --check`, not a
+  compiled gate.
+
+While iterating, the implementer runs the narrow suites that own the change.
+The full gates run once, on the landing branch, and their logs are the evidence
+that review and landing cite. If main moves before the push, replay the
+commits. Re-run the gates only when main's new commits touch `blorp/src/`,
+`blorp/standard_library/` or a file this change also touches; otherwise
+`git diff <gated commit> HEAD -- blorp/src blorp/standard_library` showing no
+change is the evidence. Code-reviewer and test-runner review apply to every
+change.
 
 Archiving a chat can also archive its managed worktrees. Git snapshots exclude
 ignored build evidence. Before archiving, preserve and verify every artifact

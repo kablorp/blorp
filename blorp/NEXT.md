@@ -225,12 +225,13 @@ None of these is planned yet. Each wants its own short design or brief.
 - **A subagent's commands move to the background after about 180 s.** Put the
   busy check inside your own scripts, start long scripts in the background,
   and wait for their exit notification rather than polling.
-- **Landing.** Squash onto origin/main in a landing branch and re-run the
-  gates:
-  - `make -C blorp test`, `scripts/blorp-fixpoint --prove` and
-    `git diff --check`;
+- **Landing.** Squash onto origin/main in a landing branch and run the gates
+  there once:
+  - the gates `blorp/AGENTS.md` ("Which gates a change runs") names for the
+    change, and `git diff --check`;
   - branch CI for platform-sensitive changes:
     `gh workflow run blorp.yml --ref <branch>`.
 
   Confirm origin/main is an ancestor, then push `HEAD:main` as a separate
-  step. If main moves while the gates run, replay and re-gate.
+  step. If main moves while the gates run, replay, and re-gate only as that
+  rule says.

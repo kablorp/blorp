@@ -1567,13 +1567,14 @@ running `blorp format blorp`. The gate's roots are `blorp/scripts`, `blorp/src`,
 `blorp/standard_library` and `blorp/test`.
 
 `scripts/blorp-fixpoint --prove` checks that the compiler reproduces itself:
-the seed builds A, A builds B and B builds C. B and C must emit identical C, A
-and B must agree on every fixture, and B must pass the components and the e2e
-selection. Artifacts stay under `blorp/build/fixpoint/`.
+the seed builds A, A builds B and B builds C. B and C must emit identical C,
+and A and B must agree on every fixture. The seed workflow also runs the
+components and the e2e selection under B on every target after each push to
+main. Artifacts stay under `blorp/build/fixpoint/`.
 
 A seed rotation moves the pin forward. Once the seed workflow has published
 and qualified a release for every target, one change updates the tag, source
-commit and all three digests in `bootstrap.env` together, after
-`make -C blorp test`, the fixpoint and `bash blorp/test/test_bootstrap/test_bootstrap.sh`
-pass against the new pin. [scripts/README.md](../scripts/README.md#rotating-the-seed-pin)
+commit and all three digests in `bootstrap.env` together, after the gates
+[AGENTS.md](AGENTS.md) names for a pin change pass against the new pin.
+[scripts/README.md](../scripts/README.md#rotating-the-seed-pin)
 describes the resolver, its cache and the rotation in full.

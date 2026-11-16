@@ -10,11 +10,10 @@ This directory holds the shell entrypoints for building and proving Blorp:
 
 ## Validating a change
 
-Changes under `blorp/` are validated with `make -C blorp test`, plus
-`scripts/blorp-fixpoint --prove` when the change alters emitted C and
-`bash blorp/test/test_bootstrap/test_bootstrap.sh` when it touches the bootstrap
-resolver or the Makefile recipes. [`blorp/AGENTS.md`](../blorp/AGENTS.md)
-owns the rest of the validation rules.
+[`blorp/AGENTS.md`](../blorp/AGENTS.md), "Which gates a change runs", says
+which of `make -C blorp test`, `scripts/blorp-fixpoint --prove` and
+`bash blorp/test/test_bootstrap/test_bootstrap.sh` a change runs, and when the
+gates run again; it owns the rest of the validation rules too.
 
 The Blorp workflow (`.github/workflows/blorp.yml`) runs when `blorp/` or
 its bootstrap and fixpoint scripts change. It runs Linux x64 with Clang and
@@ -86,14 +85,16 @@ published seed assets.
 
 `scripts/blorp-fixpoint` builds **A** from the pinned seed, A builds **B**,
 B builds **C**, and C compiles the source again, all linked at `-O0` through
-`test-compiler`/`link-test-compiler`. `--prove` requires B/C source-C identity,
-A/B exit/stdout/stderr/emitted-C parity for every fixture, and B's explicit
-self-hosted components and native e2e selection. It exits 0 for that bounded
-proof, 1 at a failed stage, and 2 for setup failure. Full resource
-qualification is DEFERRED; a successful fixpoint result
-claims only the named selection.
-`--frontier` reports the first failed rung of the same source/component ladder
-and exits 0 except for setup failures. The old per-file parse inventory is
+`test-compiler`/`link-test-compiler`. `--prove` requires B/C source-C identity
+and A/B exit/stdout/stderr/emitted-C parity for every fixture. It exits 0 for
+that bounded proof, 1 at a failed stage, and 2 for setup failure. Full resource
+qualification is DEFERRED; a successful fixpoint result claims only the named
+stages. The component and native e2e suites do not run under B here:
+`make -C blorp test` runs them with A's test compiler, and `blorp-seed.yml`
+runs them with B on every target after each push to main. The script's
+`--help` shows how to run them with a local B.
+`--frontier` reports the first failed rung of the same ladder and exits 0
+except for setup failures. The old per-file parse inventory is
 DEFERRED because its filesystem driver is unported; the actual seed/A loader
 still parses the compiler source.
 Artifacts, hashes and explicit coverage status stay under
@@ -117,5 +118,5 @@ two seed argument lists). A change to the seed's command line moves those with t
 
 The seed workflow's fixture parity step deliberately accepts only exit 0 and 1
 for a fixture: an exit 4 (a fault in blorp) or 2 or 3 fails the step.
-Run `make -C blorp test`, the fixpoint and the bootstrap test against the new
-pin before landing it.
+A pin change runs all three gates against the new pin before it lands, as
+`blorp/AGENTS.md` ("Which gates a change runs") requires for `bootstrap.env`.
