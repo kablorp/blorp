@@ -385,9 +385,12 @@ The host attempts LF after short writes as well. Neither API reports delivery.
 
 There is no shared file error type. Each `io/files/` module owns the error union of
 its operations, and the error carries no path: the caller knows the path and
-words it as `"${path}: ${error}"`. `io/_codes.brp` holds the native error codes
-that each module's decoder names. `io/_codes` is internal by convention only:
-Blorp has neither re-exports nor module-private imports, so its constants are
+words it as `"${path}: ${error}"`. `io/_errors.brp` owns typed native error kinds
+and their explicit wire encoding. Its encoder is exhaustive; its decoder's
+inventory order and compiler variant tags do not determine wire values.
+Operation decoders preserve unsupported and unknown codes as `OtherOs` with the
+original code negated. `io/_errors` is internal by convention only: Blorp has
+neither re-exports nor module-private imports, so its types and helpers are
 public by necessity, but they are not part of the library's API. Programs should
 not import it, and it may change without notice. (`_base`, the foundation
 module, is the other underscore module, and any module may import it.) The

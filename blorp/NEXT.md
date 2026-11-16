@@ -74,8 +74,12 @@ done.
     ordinary and self-built tests. The user chose `io/files`; that rename
     passes fresh build, full proof, bootstrap and matched cost checks.
     Own-source costs are +0.56% allocations/+0.65% instructions, within limits.
-  - **Next:** the approved typed native-error protocol cleanup; S4 text
-    decoding/adapters follow as a separate reviewed increment.
+  - **Native error protocol:** fixed typed kinds and shared conversions are
+    implemented with precise operation errors preserved and 76 fewer
+    production lines. All 2,902 selected checks, fixpoint and bootstrap pass.
+    Matched own-source costs are +0.024% allocations/+0.068% instructions,
+    within the +1% ceilings; positive-error lookup debt is recorded.
+  - **Next:** S4 text decoding/adapters as a separate reviewed increment.
   - **Built:** D40, a pure `String.lines()` with `fold_lines`'s line rules, so
     `read_text(path).lines()` collects lines.
   - **Later:** the plan's "Later" list.
@@ -121,9 +125,13 @@ None of these is planned yet. Each wants its own short design or brief.
     same receiver" with the help "rename one of them" and the notes "String
     and String". It should say, as the `max` clash does, that the name is
     provided by the prelude, and its help should name only the user's function.
-  - **A test-visible form of `private`.** The decoders in `io/environment`,
-    `io/process` and `io/_codes` are public with a "not API" comment so that
-    tests can pass them literal codes.
+  - **A test-visible form of `private`.** Operation decoders and the native
+    protocol helpers in `io/_errors` are public for tests that pass literal
+    codes; they are internal APIs by convention.
+  - **List constants.** The compiler currently rebuilds a module List at each
+    use. The typed-error witness measures one temporary allocation per positive
+    error decode; see the accepted debt in FILESYSTEM_DECISIONS. No compiler
+    workaround or cache is part of the library refactor.
   - **An opaque `DeclaredName`,** so a declaring site cannot skip its naming
     check even by calling the token reader directly. It needs the syntax
     tree's declaration fields (about 12 in `syntax.brp`, read in 22 files) to

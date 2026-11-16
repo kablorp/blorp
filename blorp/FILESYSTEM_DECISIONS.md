@@ -1239,3 +1239,147 @@ retained under build/streaming-locale-2026-11-15/ in the main checkout.
   end.
 - Binding a lambda to a local before passing it costs an allocation that an
   inline lambda does not.
+
+
+## Typed native error kinds follow-up
+
+This separate change follows published S3/io/files, base
+`1fbdd721a9b394bf09fa0199199fe72c5eb5fda8`. Root and API/data review approved
+an exhaustive explicit-wire encoder, fixed NativeErrorKind, order-independent
+private typed inventory, plain-loop decoder and shared OtherOs conversion.
+Operation-specific public errors, native C enum/masks and builtin ABI stay
+unchanged. The temporary-directory success-path mismatch remains OtherOs(-12).
+No compatibility constants or sentinel reverse lookup are retained.
+
+Preimplementation ceilings: production 250 added and net <= 0; tests/support 200
+added/net +200; docs separate. Matched whole-source allocations/instructions
+and peak heap must each stay within +1%, with strict leaks zero. Final selected suites, fixpoint, bootstrap and matched cost qualification
+pass; their exact evidence is recorded below.
+
+
+### Narrow decoder measurement and accepted compiler debt
+
+The approved typed inventory remains in use. Generated C establishes that
+module List constants are materialized at each use today, so each positive
+native-code decode constructs and drops one 15-element List; negative/zero
+codes skip construction; there is no success-path global allocation.
+Fixed NativeErrorKind is a native C enum and
+Option[NativeErrorKind] is an unboxed stack struct. No cache, compiler rewrite,
+wire-tag coupling or fallback sentinel was introduced to hide this cost.
+
+One ordinary main repeats 4,096 checks of literal codes 2, 12, -37, verifying
+PermissionDenied, OtherOs(-12), OtherOs(37) and exact sum 106,496. The published
+ab0d0434 library snapshot (source-identical to the repaired current baseline)
+and candidate were compiled with one identical
+compiler. Strict O0/ASan/UBSan allocations rise 3 to 8,195 (exactly 8,192 positive
+calls), all released; peak heap is 195 bytes on both. A single normal O0 timing
+pair reports 15,778,042 to 32,175,170 retired instructions (+103.9%); elapsed 0.19s
+on both is not a speed claim. Complete commands, source/binary/C hashes and
+raw samples are in ignored build/native-errors-2026-11-15/decoder-measurements.json
+and the baseline/candidate strict/normal logs. This isolated error-heavy
+witness does not substitute for the unchanged +1% whole-source gates. Root and
+API review accepted retaining the sound typed model while recording this
+bounded constant-lowering debt; no performance improvement is claimed.
+
+
+### Focused fixture costs and bounded correction
+
+The first focused run preserved its exact failures: read native allocations
+162 to 171 (+9), fold_lines 6,135,863 to 6,136,168 (+305), and directory
+operations 484 to 507 (+23). A same-host baseline/candidate ordinary write
+fixture independently measured 164 to 176 native allocations (+12), with
+byte-identical stdout. Each increase is one materialized inventory List per
+positive-code decode. Exact expected native counts were updated; no native
+runtime/ABI or observable error outcome changed.
+
+The write fixture also initially exceeded its unchanged compile-allocation
+ceiling: 241,231 observed against 238,950. Same-host, same-output fixed-fixture
+measurement with archived source-identical baseline std versus candidate std
+reports 236,463 to 241,229 allocations (+2.0155%) and 756,518,657 to
+765,704,438 retired instructions (+1.2142%). The old allocation ceiling had
+only 1.05% headroom on the current baseline. Root approved the bounded
+allocation-cap correction 238,950 to 244,000 (+5,050), preserving the original
+failure and raw write-measurements.json under the ignored evidence directory.
+This is not a blanket 15% reset: the 844,075,447 instruction ceiling, all other
+fixture compile ceilings and all +1% whole-source ceilings remain unchanged.
+
+
+### Typed-error final functional qualification
+
+The final ordinary selected suites under self-built B pass 1,823 component
+callbacks across 24 programs and 1,079 native callbacks across 19 suites:
+2,902 total. Fixpoint and bootstrap both exit 0; all 749 A/B fixture outputs
+match and seed/a/b/c C share SHA256
+`2473ba89c7cce0c7c3e19f658f3d1cbeef3c55c6b98397c69540a1308878654e`.
+Bootstrap passes 38/38. All 1,348 final frozen semantic inputs remain unchanged.
+The script's legacy “first native”/“broader deferred” wording is retained in
+raw logs; its actual test-e2e invocation runs all 19 selected native suites.
+No standalone per-file source parse inventory is claimed.
+
+The initial A full run found two further exact native expectations attributable
+to the measured positive-code lookup: user read-module coexistence makes one
+NotFound decode (1 to 2 allocations), and the binary round trip checks missing
+files/directories with both read APIs (44 to 48). Only those two expectation
+fields changed. Their compiler ceilings and outputs are unchanged; final B
+passes both. Test/support totals are now 142 added / 7 deleted / +135 net;
+production remains 214 added / 290 deleted / -76 net, within preset ceilings.
+
+A focused 253-case repeat passed the corrected I/O cases but one unrelated
+Void/String projection fixture received SIGKILL without stderr. Its exact
+unchanged strict binary/argv/environment replay exited 0 in 0.208 seconds,
+with 3 balanced allocations and the same binary hash. Code signing verified;
+no cause was established. The initial A run and final full B run both pass
+that case, with no repeated kill. No timeout/signing/source workaround or
+expected-outcome waiver was applied. Original failures, system logs, replay
+and complete final artifacts remain under
+build/native-errors-2026-11-15/test-runner/.
+
+Code/API/docs review and independent functional review approve the source.
+The unchanged +1% whole-source allocation/instruction/peak gates pass in the
+matched measurements below.
+
+
+### Typed-error matched cost qualification, 2026-11-15
+
+Baseline is the published repaired streaming tree
+`1fbdd721a9b394bf09fa0199199fe72c5eb5fda8`; measured candidate is
+`f2929f83167a62b2718ce6d77c89cb07ab4f63d0`, before this documentation-only
+qualification amendment. Both use qualified seed blorp-seed-93798484557c.
+Darwin arm64, Apple clang 21.0.0 and production build recipes at -O2 are
+matched. Normal instructions use three alternating /usr/bin/time -l samples;
+strict diagnostic runs supply allocations and requested managed-heap peak.
+All four strict runs balance allocations/releases with zero leaks.
+
+```sh
+blorp/scripts/self-compile-cost 1fbdd721a9b394bf09fa0199199fe72c5eb5fda8 \
+    f2929f83167a62b2718ce6d77c89cb07ab4f63d0 --rounds 3 \
+    --output build/native-errors-2026-11-15/cost
+```
+
+| Metric | Baseline | Candidate | Change |
+| --- | ---: | ---: | ---: |
+| Fixed-input allocations | 13,953,461 | 13,953,461 | 0.0000% |
+| Fixed-input requested-heap peak, bytes | 169,066,472 | 169,066,472 | 0.0000% |
+| Fixed-input instructions | 12,390,995,249 | 12,392,064,932 | +0.0086% |
+| Own-source allocations | 13,953,461 | 13,956,806 | +0.0240% |
+| Own-source requested-heap peak, bytes | 169,066,471 | 169,099,499 | +0.0195% |
+| Own-source instructions | 12,384,731,609 | 12,393,105,586 | +0.0676% |
+
+All comparisons pass the preset +1% ceilings without an exception. These small
+instruction differences are observations, not a speed claim. Fixed-input C is
+byte-identical, SHA256
+`49f9d2c4d538fb54015af2ff90f9172c227adddba0953ddbf4db49a03810ef53`.
+The isolated positive-error-path regression remains explicitly recorded above;
+whole-source success does not erase it.
+
+Baseline source/library tree hashes are
+`40b37483446094a9de4622aa37015fe07e716d59` /
+`0d1247ef55cd994540e175ac040ad13542ab63b1`; candidate hashes are
+`7089f81c4f10ec1ee8f60efdd4db749204ddd7c0` /
+`6ff24022d2b96b491f80c38d79ded6a3a23d65d5`. Final owning-document/NEXT
+amendments preserve every compiled input. Raw samples, emitted C, reports and
+all six completed build artifact hashes are retained under the ignored output
+directory; hashes were observed after both builds completed and before tool
+cleanup. Source/API and independent functional reviews approve the change.
+Local qualification does not claim that the post-publication platform jobs
+have run yet.
