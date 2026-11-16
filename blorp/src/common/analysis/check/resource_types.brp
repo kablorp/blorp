@@ -4,35 +4,96 @@ These checks publish no runtime or downstream lifetime representation.
 ---
 import:
     bool: Bool methods
-    int: Int methods
-    option: Option methods
     result: Result methods
     ../../syntax/syntax: Span, Purity(Pure)
-    ../ids: OpaqueRow, opaque_number
-    ./errors as errors: CheckError, resource_error
-    ./model:
-        TypeRef(NominalType, ListType, TupleType, CallableType),
-        NominalId(OpaqueNominal),
-        type_children,
+    ../ids: OpaqueId, OpaqueRow, opaque_number
+    ./errors as errors: CheckError, ResourceError, checker_invariant, resource_error
+    ./model as model: TypeRef, type_children
 
 
-pure func is_resource(value_type: TypeRef, opaques: List[OpaqueRow]) -> Bool:
+-- `id` when it declares a resource type. The inventory issued every OpaqueId,
+-- so a miss is a checker defect: it stops the check instead of reading as
+-- "not a resource", which would turn the loan rules off.
+pure func declared_resource(
+    id: OpaqueId,
+    opaques: List[OpaqueRow],
+    span: Span,
+) -> Result[Option[OpaqueId], CheckError]:
+    match opaques.get(id.opaque_number()):
+        Some(row):
+            if row.declaration.resource_type:
+                Ok(Some(id))
+            else:
+                Ok(None)
+        None:
+            Err(checker_invariant(span, errors.InvalidOpaqueDeclaration(id)))
+
+
+-- The resource the whole type is, if it is one.
+pure func as_resource(
+    value_type: TypeRef,
+    opaques: List[OpaqueRow],
+    span: Span,
+) -> Result[Option[OpaqueId], CheckError]:
     match value_type:
-        NominalType(OpaqueNominal(owner), _):
-            match opaques.get(owner.opaque_number()):
-                Some(row): row.declaration.resource_type
-                None: False
-        _:
-            False
+        model.NominalType(model.OpaqueNominal(id), _):
+            id.declared_resource(opaques, span)
+        model.NominalType(model.AggregateNominal(_), _) | model.ListType(_) | model.TupleType(_) | model.CallableType(_, _, _) | model.VoidType | model.IntegerType(_) | model.FloatType | model.StringType | model.ParameterType(_):
+            Ok(None)
 
 
-pure func mentions_resource(value_type: TypeRef, opaques: List[OpaqueRow]) -> Bool:
-    var found = value_type.is_resource(opaques)
-    for child in value_type.type_children():
-        if child.mentions_resource(opaques):
-            found = True
-            break
+-- The first resource the type mentions, the type itself first.
+pure func mentioned_resource(
+    value_type: TypeRef,
+    opaques: List[OpaqueRow],
+    span: Span,
+) -> Result[Option[OpaqueId], CheckError]:
+    found = value_type.as_resource(opaques, span)
+    match found:
+        Ok(None):
+            value_type
+                .type_children()
+                .first_mentioned(opaques, span)
+        Ok(Some(_)) | Err(_):
+            found
+
+
+-- The first resource any of the types mentions.
+pure func first_mentioned(
+    types: List[TypeRef],
+    opaques: List[OpaqueRow],
+    span: Span,
+) -> Result[Option[OpaqueId], CheckError]:
+    var found: Result[Option[OpaqueId], CheckError] = Ok(None)
+    for value_type in types:
+        match found:
+            Ok(None): found = value_type.mentioned_resource(opaques, span)
+            Ok(Some(_)) | Err(_): break
     found
+
+
+-- Rejects with `rejection` when the search found a resource.
+pure func refuse(
+    found: Result[Option[OpaqueId], CheckError],
+    span: Span,
+    rejection: ResourceError,
+) -> Result[Void, CheckError]:
+    held ?= found
+    match held:
+        Some(_): Err(resource_error(span, rejection))
+        None: Ok(void)
+
+
+-- Rejects the type with `rejection` when it is a resource.
+pure func refuse_resource(
+    value_type: TypeRef,
+    opaques: List[OpaqueRow],
+    span: Span,
+    rejection: ResourceError,
+) -> Result[Void, CheckError]:
+    value_type
+        .as_resource(opaques, span)
+        .refuse(span, rejection)
 
 
 pure func resource_free(
@@ -40,10 +101,9 @@ pure func resource_free(
     opaques: List[OpaqueRow],
     span: Span,
 ) -> Result[Void, CheckError]:
-    if value_type.mentions_resource(opaques):
-        Err(resource_error(span, errors.ResourceStorage))
-    else:
-        Ok(void)
+    value_type
+        .mentioned_resource(opaques, span)
+        .refuse(span, errors.ResourceStorage)
 
 
 -- A resource may appear as a whole impure callable input. Source containers
@@ -53,37 +113,29 @@ pure func admit_resource_type(
     opaques: List[OpaqueRow],
     span: Span,
 ) -> Result[Void, CheckError]:
-    var failure: Option[CheckError] = None
     match value_type:
-        CallableType(purity, parameters, result):
+        model.CallableType(purity, parameters, result):
+            var admitted: Result[Void, CheckError] = Ok(void)
             for parameter in parameters:
-                if (purity == Pure).and(parameter.is_resource(opaques)):
-                    failure = Some(resource_error(span, errors.ResourcePureParameter))
-                    break
-                match parameter.admit_resource_type(opaques, span):
-                    Err(error):
-                        failure = Some(error)
-                        break
-                    Ok(_):
-                        void
-            if failure.is_none():
-                if result.is_resource(opaques):
-                    failure = Some(resource_error(span, errors.ResourceResult))
-                else:
-                    match result.admit_resource_type(opaques, span):
-                        Err(error): failure = Some(error)
-                        Ok(_): void
-        ListType(_) | NominalType(_, _):
-            for argument in value_type.type_children():
-                if argument.mentions_resource(opaques):
-                    failure = Some(resource_error(span, errors.ResourceTypeArgument))
-                    break
-        TupleType(_):
-            match value_type.resource_free(opaques, span):
-                Err(error): failure = Some(error)
-                Ok(_): void
-        _:
-            void
-    match failure:
-        Some(error): Err(error)
-        None: Ok(void)
+                if (purity == Pure).and(admitted.is_ok()):
+                    admitted = parameter.refuse_resource(
+                        opaques,
+                        span,
+                        errors.ResourcePureParameter,
+                    )
+                if admitted.is_ok():
+                    admitted = parameter.admit_resource_type(opaques, span)
+            if admitted.is_ok():
+                admitted = result.refuse_resource(opaques, span, errors.ResourceResult)
+            if admitted.is_ok():
+                admitted = result.admit_resource_type(opaques, span)
+            admitted
+        model.ListType(_) | model.NominalType(_, _):
+            value_type
+                .type_children()
+                .first_mentioned(opaques, span)
+                .refuse(span, errors.ResourceTypeArgument)
+        model.TupleType(_):
+            value_type.resource_free(opaques, span)
+        model.VoidType | model.IntegerType(_) | model.FloatType | model.StringType | model.ParameterType(_):
+            Ok(void)

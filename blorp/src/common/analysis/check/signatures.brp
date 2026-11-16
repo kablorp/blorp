@@ -86,7 +86,11 @@ import:
         ),
         RuntimeResult(ValueResult, OptionalResult, ResultResult, BooleanResult),
         ParsedRuntimeOperation methods,
-    ../namespace/namespace: Namespace, FunctionSource(DeclaredHere), NamedValue(NamedFunction)
+    ../namespace/namespace:
+        Namespace,
+        FunctionSource(DeclaredHere),
+        NamedValue(NamedFunction),
+        TypeHead(PrimitiveHead, ListHead, UnionHead, RecordHead, OpaqueHead),
     ./declarations:
         ResolvedType(ResolvedTypeTerm),
         TypeScope,
@@ -140,7 +144,7 @@ import:
         type_parameter_id,
         primitive_ref,
     ./name_uses: NameUse, Referent(TraitReferent, TypeReferent)
-    ./resource_types: TypeRef methods
+    ./resource_types: TypeRef methods, declared_resource, refuse
 
 
 -- A function body after signature checking. A builtin body has been validated
@@ -362,10 +366,11 @@ private pure func resolve_signature(
         _:
             Ok(void)
 
-    _: Void ?= if return_type.is_resource(scope.opaques):
-        Err(resource_errors.resource_error(return_span, resource_errors.ResourceResult))
-    else:
-        Ok(void)
+    _: Void ?= return_type.refuse_resource(
+        scope.opaques,
+        return_span,
+        resource_errors.ResourceResult,
+    )
     formal_parameters ?= scope.annotated_types(
         function.parameters.map(pure func(parameter) -> TypeSyntax: parameter.type_name),
         [],
@@ -387,13 +392,14 @@ private pure func resolve_signature(
     for parameter in function.parameters:
         match formal_parameters.types.get(parameter_position):
             Some(formal):
-                if (function.purity == Pure).and(formal.value_type.is_resource(scope.opaques)):
-                    loan_failure = Some(
-                        resource_errors.resource_error(
-                            formal.span,
-                            resource_errors.ResourcePureParameter,
-                        ),
-                    )
+                if function.purity == Pure:
+                    match formal.value_type.refuse_resource(
+                        scope.opaques,
+                        formal.span,
+                        resource_errors.ResourcePureParameter,
+                    ):
+                        Err(error): loan_failure = Some(error)
+                        Ok(_): void
                 match parameter.scoped_qualifier:
                     Some(span):
                         match formal.value_type:
@@ -676,13 +682,22 @@ private pure func implementation_header(
 ) -> Result[AcceptedHeader, CheckError]:
     receiver ?= scope.resolve_receiver_head(row.header.receiver)
     head = receiver.head
-    arity ?= scope.receiver_arity(head, row.header.receiver.receiver_head_span())
+    receiver_span = row.header.receiver.receiver_head_span()
+    -- Trait methods are pure, so none could take a resource receiver.
+    _: Void ?= match head:
+        OpaqueHead(id):
+            id
+                .declared_resource(scope.opaques, receiver_span)
+                .refuse(receiver_span, resource_errors.ResourceImplementation)
+        PrimitiveHead(_) | ListHead | UnionHead(_) | RecordHead(_):
+            Ok(void)
+    arity ?= scope.receiver_arity(head, receiver_span)
     _: Void ?= if arity == row.header.type_parameters.length():
         Ok(void)
     else:
         Err(
             trait_error(
-                row.header.receiver.receiver_head_span(),
+                receiver_span,
                 ReceiverParameterCount(arity, row.header.type_parameters.length()),
             ),
         )

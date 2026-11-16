@@ -20,7 +20,7 @@ import:
         capture_number,
         callable_position,
         method_receiver,
-    ./resource_types: TypeRef methods
+    ./resource_types: TypeRef methods, first_mentioned, refuse
     ./signatures: AcceptedFunction
 
 
@@ -83,20 +83,14 @@ private pure func seed_parameters(facts: Facts) -> Facts:
 private pure func admit_statements(
     admission: Admission,
     statements: List[model.CheckedStatement],
-    initial: Facts,
+    facts: Facts,
 ) -> Result[Facts, CheckError]:
-    var facts = initial
-    var failure: Option[CheckError] = None
+    var admitted: Result[Facts, CheckError] = Ok(facts)
     for statement in statements:
-        match admission.admit_statement(statement, facts):
-            Ok(next):
-                facts = next
-            Err(error):
-                failure = Some(error)
-                break
-    match failure:
-        Some(error): Err(error)
-        None: Ok(facts)
+        match admitted:
+            Ok(current): admitted = admission.admit_statement(statement, current)
+            Err(_): break
+    admitted
 
 
 private pure func admit_statement(
@@ -106,27 +100,7 @@ private pure func admit_statement(
 ) -> Result[Facts, CheckError]:
     match statement:
         model.InitializeBinding(id, value) | model.ReassignBinding(id, value):
-            admission
-                .admit_expression(value, facts)
-                .and_then(pure func(scoped_callable) -> Result[Facts, CheckError]:
-                    definition = facts.definitions.get(id.binding_number())
-                    if definition.is_none():
-                        Err(errors.checker_invariant(value.span, errors.InvalidInferenceWorklist))
-                    else if value.value_type.is_resource(admission.opaques):
-                        Err(resource_error(value.span, errors.ResourceStorage))
-                    else if scoped_callable.and(
-                        definition
-                            .map(pure func(entry): entry.mutable)
-                            .get_or(False),
-                    ):
-                        Err(resource_error(value.span, errors.ScopedStorage))
-                    else:
-                        Ok(
-                            { facts |
-                                bindings = facts.bindings.set(id.binding_number(), scoped_callable),
-                            },
-                        )
-                )
+            admission.admit_binding(id, value, facts)
         model.DiscardExpression(value):
             admission
                 .admit_expression(value, facts)
@@ -148,6 +122,28 @@ private pure func admit_statement(
             Ok(facts)
 
 
+-- No binding holds a resource, and only an immutable one holds a scoped callable.
+private pure func admit_binding(
+    admission: Admission,
+    id: model.BindingId,
+    value: model.CheckedExpr,
+    facts: Facts,
+) -> Result[Facts, CheckError]:
+    scoped_callable ?= admission.admit_expression(value, facts)
+    definition ?= facts.definitions
+        .get(id.binding_number())
+        .or_checker_invariant(value.span, errors.InvalidInferenceWorklist)
+    _: Void ?= value.value_type.refuse_resource(
+        admission.opaques,
+        value.span,
+        errors.ResourceStorage,
+    )
+    if scoped_callable.and(definition.mutable):
+        Err(resource_error(value.span, errors.ScopedStorage))
+    else:
+        Ok({ facts | bindings = facts.bindings.set(id.binding_number(), scoped_callable) })
+
+
 private pure func admit_body(
     admission: Admission,
     body: model.CheckedBody,
@@ -158,43 +154,19 @@ private pure func admit_body(
         model.CheckedValueBody(exit):
             admission.admit_exit(exit, facts, discard)
         model.CheckedMatchBody(matched):
-            admission
-                .admit_expression(matched.scrutinee, facts)
-                .and_then(pure func(root) -> Result[Void, CheckError]:
-                    var failure: Option[CheckError] = None
-                    for arm in matched.arms:
-                        outcome = admission
-                            .arm_facts(
-                                arm.id,
-                                arm.inputs,
-                                matched.selection,
-                                matched.scrutinee,
-                                root,
-                                facts,
-                            )
-                            .and_then(
-                                pure func(seeded): admission.admit_statements(
-                                    arm.statements,
-                                    seeded,
-                                ),
-                            )
-                            .and_then(
-                                pure func(completed): admission.admit_exit(
-                                    arm.body,
-                                    completed,
-                                    discard,
-                                ),
-                            )
-                        match outcome:
-                            Err(error):
-                                failure = Some(error)
-                                break
-                            Ok(_):
-                                void
-                    match failure:
-                        Some(error): Err(error)
-                        None: Ok(void)
-                )
+            var admitted = admission.admit_match_root(matched.scrutinee, facts)
+            for arm in matched.arms:
+                if admitted.is_ok():
+                    admitted = admission
+                        .admit_statements(arm.statements, facts)
+                        .and_then(
+                            pure func(completed): admission.admit_exit(
+                                arm.body,
+                                completed,
+                                discard,
+                            ),
+                        )
+            admitted
 
 
 private pure func admit_exit(
@@ -205,70 +177,42 @@ private pure func admit_exit(
 ) -> Result[Void, CheckError]:
     match exit:
         model.ReturnExpression(value):
-            admission
-                .admit_expression(value, facts)
-                .and_then(pure func(scoped_callable) -> Result[Void, CheckError]:
-                    -- Root Void normalization runs after admission. Its tail expression
-                    -- is a discard, while constructions within it still cannot store loans.
-                    if discard:
-                        Ok(void)
-                    else if value.value_type.is_resource(admission.opaques):
-                        Err(resource_error(value.span, errors.ResourceResult))
-                    else if scoped_callable:
-                        Err(resource_error(value.span, errors.ScopedResult))
-                    else:
-                        Ok(void)
-                )
+            admission.admit_return(value, facts, discard)
         model.RecurWith(_, span):
             Err(errors.checker_invariant(span, errors.InvalidInferenceWorklist))
 
 
-private pure func arm_facts(
+-- Root Void normalization runs after admission. Its tail expression is a
+-- discard, while constructions within it still cannot store loans.
+private pure func admit_return(
     admission: Admission,
-    id: model.MatchArmId,
-    inputs: List[model.BindingId],
-    selection: model.CheckedSelection,
-    scrutinee: model.CheckedExpr,
-    root: Bool,
+    value: model.CheckedExpr,
     facts: Facts,
-) -> Result[Facts, CheckError]:
-    var bindings = facts.bindings
-    var failure: Option[CheckError] = None
-    for node in selection.nodes:
-        match node:
-            model.EnterArm(arm, arguments):
-                if arm == id:
-                    var position = 0
-                    for argument in arguments:
-                        match inputs.get(position):
-                            Some(binding):
-                                place = match argument:
-                                    model.BorrowPlace(place) | model.CopyListSuffix(place, _): place
-                                if place.value_type.is_resource(admission.opaques):
-                                    failure = Some(
-                                        resource_error(scrutinee.span, errors.ResourceStorage),
-                                    )
-                                    break
-                                scoped_callable = match (argument, place.route):
-                                    (model.BorrowPlace(_), model.MatchRoot): root
-                                    _: False
-                                bindings = bindings.set(binding.binding_number(), scoped_callable)
-                            None:
-                                failure = Some(
-                                    errors.checker_invariant(
-                                        scrutinee.span,
-                                        errors.InvalidInferenceWorklist,
-                                    ),
-                                )
-                                break
-                        position = position + 1
-            _:
-                void
-        if failure.is_some():
-            break
-    match failure:
-        Some(error): Err(error)
-        None: Ok({ facts | bindings = bindings })
+    discard: Bool,
+) -> Result[Void, CheckError]:
+    scoped_callable ?= admission.admit_expression(value, facts)
+    if discard:
+        Ok(void)
+    else if scoped_callable:
+        Err(resource_error(value.span, errors.ScopedResult))
+    else:
+        value.value_type.refuse_resource(admission.opaques, value.span, errors.ResourceResult)
+
+
+-- Check rejects matching a callable or an opaque value, and admission
+-- rejects a construction that could hold a loan before it reaches the root,
+-- so no root carries one and every pattern binding keeps its unscoped fact.
+private pure func admit_match_root(
+    admission: Admission,
+    scrutinee: model.CheckedExpr,
+    facts: Facts,
+) -> Result[Void, CheckError]:
+    scoped_callable ?= admission.admit_expression(scrutinee, facts)
+    held ?= scrutinee.value_type.mentioned_resource(admission.opaques, scrutinee.span)
+    if scoped_callable.or(held.is_some()):
+        Err(errors.checker_invariant(scrutinee.span, errors.LoanInMatchRoot))
+    else:
+        Ok(void)
 
 
 private pure func admit_join(
@@ -276,23 +220,20 @@ private pure func admit_join(
     joined: model.CheckedJoin,
     facts: Facts,
 ) -> Result[Bool, CheckError]:
-    root ?= admission.admit_expression(joined.scrutinee, facts)
-    var scoped_callable: Bool = False
-    var failure: Option[CheckError] = None
+    _: Void ?= admission.admit_match_root(joined.scrutinee, facts)
+    var admitted: Result[Bool, CheckError] = Ok(False)
     for arm in joined.arms:
-        outcome = admission
-            .arm_facts(arm.id, arm.inputs, joined.selection, joined.scrutinee, root, facts)
-            .and_then(pure func(seeded): admission.admit_statements(arm.statements, seeded))
-            .and_then(pure func(completed): admission.admit_expression(arm.value, completed))
-        match outcome:
-            Err(error):
-                failure = Some(error)
+        match admitted:
+            Ok(scoped_callable):
+                admitted = admission
+                    .admit_statements(arm.statements, facts)
+                    .and_then(
+                        pure func(completed): admission.admit_expression(arm.value, completed),
+                    )
+                    .map(pure func(value): scoped_callable.or(value))
+            Err(_):
                 break
-            Ok(value):
-                scoped_callable = scoped_callable.or(value)
-    match failure:
-        Some(error): Err(error)
-        None: Ok(scoped_callable)
+    admitted
 
 
 private pure func admit_storage(
@@ -300,21 +241,28 @@ private pure func admit_storage(
     values: List[model.CheckedExpr],
     facts: Facts,
 ) -> Result[Void, CheckError]:
-    var failure: Option[CheckError] = None
+    var admitted: Result[Void, CheckError] = Ok(void)
     for value in values:
-        match admission.admit_expression(value, facts):
-            Err(error):
-                failure = Some(error)
-            Ok(scoped_callable):
-                if value.value_type.is_resource(admission.opaques):
-                    failure = Some(resource_error(value.span, errors.ResourceStorage))
-                else if scoped_callable:
-                    failure = Some(resource_error(value.span, errors.ScopedStorage))
-        if failure.is_some():
-            break
-    match failure:
-        Some(error): Err(error)
-        None: Ok(void)
+        if admitted.is_ok():
+            admitted = admission.admit_stored(value, facts)
+    admitted
+
+
+private pure func admit_stored(
+    admission: Admission,
+    value: model.CheckedExpr,
+    facts: Facts,
+) -> Result[Void, CheckError]:
+    scoped_callable ?= admission.admit_expression(value, facts)
+    _: Void ?= value.value_type.refuse_resource(
+        admission.opaques,
+        value.span,
+        errors.ResourceStorage,
+    )
+    if scoped_callable:
+        Err(resource_error(value.span, errors.ScopedStorage))
+    else:
+        Ok(void)
 
 
 -- Final generic actuals and resource identities first coexist here without
@@ -324,14 +272,9 @@ private pure func admit_type_arguments(
     arguments: List[model.TypeRef],
     span: Span,
 ) -> Result[Void, CheckError]:
-    var failure: Option[CheckError] = None
-    for argument in arguments:
-        if argument.mentions_resource(admission.opaques):
-            failure = Some(resource_error(span, errors.ResourceTypeArgument))
-            break
-    match failure:
-        Some(error): Err(error)
-        None: Ok(void)
+    arguments
+        .first_mentioned(admission.opaques, span)
+        .refuse(span, errors.ResourceTypeArgument)
 
 
 private pure func admit_choice(
@@ -365,7 +308,7 @@ private pure func admit_closure(
     facts: Facts,
 ) -> Result[Bool, CheckError]:
     var captures: List[Bool] = []
-    var scoped_callable: Bool = False
+    var scoped_capture: Bool = False
     var captures_resource: Bool = False
     var failure: Option[CheckError] = None
     for value in environment:
@@ -374,12 +317,14 @@ private pure func admit_closure(
                 failure = Some(error)
                 break
             Ok(captured):
-                resource_capture = value.value_type.is_resource(admission.opaques)
-                captures = captures.append(captured)
-                captures_resource = captures_resource.or(resource_capture)
-                scoped_callable = scoped_callable
-                    .or(captured)
-                    .or(resource_capture)
+                match value.value_type.as_resource(admission.opaques, value.span):
+                    Err(error):
+                        failure = Some(error)
+                        break
+                    Ok(held):
+                        captures = captures.append(captured)
+                        scoped_capture = scoped_capture.or(captured)
+                        captures_resource = captures_resource.or(held.is_some())
     _: Void ?= match failure:
         Some(error): Err(error)
         None: Ok(void)
@@ -396,7 +341,7 @@ private pure func admit_closure(
     else:
         Ok(void)
     _: Void ?= admission.admit_lambda(lambda, captures)
-    Ok(scoped_callable)
+    Ok(scoped_capture.or(captures_resource))
 
 
 private pure func admit_lambda(
@@ -404,10 +349,11 @@ private pure func admit_lambda(
     lambda: model.CheckedLambda,
     captures: List[Bool],
 ) -> Result[Void, CheckError]:
-    _: Void ?= if lambda.return_type.value_type.is_resource(admission.opaques):
-        Err(resource_error(lambda.return_type.span, errors.ResourceResult))
-    else:
-        Ok(void)
+    _: Void ?= lambda.return_type.value_type.refuse_resource(
+        admission.opaques,
+        lambda.return_type.span,
+        errors.ResourceResult,
+    )
     facts: Facts = {
         bindings = repeat(False, lambda.bindings.length()),
         definitions = lambda.bindings,
@@ -441,7 +387,9 @@ private pure func admit_call(
             admission
                 .admit_expression(value, facts)
                 .map(pure func(_) -> List[Int]: [])
-        _:
+        -- A callable type carries no promise, and a runtime operation takes
+        -- only values; the loop below admits their operands.
+        model.CallableParameter(_) | model.RuntimeFunction(_):
             Ok([])
     var position = 0
     var failure: Option[CheckError] = None
@@ -476,14 +424,6 @@ private pure func admit_expression(
     value: model.CheckedExpr,
     facts: Facts,
 ) -> Result[Bool, CheckError]:
-    -- Inferred container applications have no written type-use boundary:
-    -- `[consume]` would otherwise hide a resource-taking callable in a List.
-    -- Reads, calls and lambda signatures use their producers' established facts.
-    _: Void ?= match value.form:
-        model.ConstructVariant(_, _) | model.ConstructRecord(_, _) | model.ConstructList(_) | model.ConstructTuple(_) | model.ConstructOpaque(_, _) | model.UpdateRecord(_, _):
-            value.value_type.admit_resource_type(admission.opaques, value.span)
-        _:
-            Ok(void)
     match value.form:
         model.ReadBinding(id):
             facts.bindings
@@ -506,27 +446,34 @@ private pure func admit_expression(
                     ),
                 )
         model.ConstructVariant(_, children) | model.ConstructList(children) | model.ConstructTuple(children):
-            admission
-                .admit_storage(children, facts)
-                .map(pure func(_): False)
+            admission.admit_construction(value, children, facts)
         model.ConstructRecord(_, fields):
-            admission
-                .admit_storage(fields.map(pure func(field): field.value), facts)
-                .map(pure func(_): False)
+            admission.admit_construction(value, fields.map(pure func(field): field.value), facts)
         model.UpdateRecord(_, update):
-            admission
-                .admit_storage(
-                    [update.base].concat(update.replacements.map(pure func(field): field.value)),
-                    facts,
-                )
-                .map(pure func(_): False)
+            admission.admit_construction(
+                value,
+                [update.base].concat(update.replacements.map(pure func(field): field.value)),
+                facts,
+            )
         model.ConstructOpaque(_, child):
-            admission
-                .admit_storage([child], facts)
-                .map(pure func(_): False)
+            admission.admit_construction(value, [child], facts)
         model.ProjectOpaque(_, child) | model.ReadRecordField(child, _) | model.ReadTupleElement(child, _):
             admission
                 .admit_expression(child, facts)
                 .map(pure func(_): False)
-        _:
+        model.LiteralVoid | model.LiteralInteger(_) | model.LiteralFloat(_) | model.LiteralString(_):
             Ok(False)
+
+
+-- Inferred container applications have no written type-use boundary:
+-- `[consume]` would otherwise hide a resource-taking callable in a List.
+-- A construction is never scoped, and none of its children may hold a loan.
+private pure func admit_construction(
+    admission: Admission,
+    value: model.CheckedExpr,
+    children: List[model.CheckedExpr],
+    facts: Facts,
+) -> Result[Bool, CheckError]:
+    _: Void ?= value.value_type.admit_resource_type(admission.opaques, value.span)
+    _: Void ?= admission.admit_storage(children, facts)
+    Ok(False)
