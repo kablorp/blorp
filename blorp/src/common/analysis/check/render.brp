@@ -1071,6 +1071,93 @@ private pure func render_builtin_error(span: Span, rejection: errors.BuiltinErro
             )
 
 
+-- The resource's spelling when the type is one; a missing row is a render fault.
+private pure func resource_name(
+    value: check.TypeRef,
+    context: RenderContext,
+    span: Span,
+) -> Result[Option[String], Diagnostic]:
+    match value:
+        check.NominalType(check.OpaqueNominal(id), _):
+            match (
+                context.parsed.declarations
+                    .inventory_opaques()
+                    .get(id.opaque_number())
+            ):
+                None:
+                    Err(render_fault(span, errors.InvalidOpaqueDeclaration(id)))
+                Some(row):
+                    if row.declaration.resource_type:
+                        id
+                            .opaque_spelling(context, span)
+                            .map(pure func(name): Some(name))
+                    else:
+                        Ok(None)
+        _:
+            Ok(None)
+
+
+-- The first method the trait declares pure, spelled `Trait.method`.
+private pure func first_pure_method(
+    methods: List[TraitMethodRow],
+    context: RenderContext,
+    span: Span,
+) -> Result[Option[String], Diagnostic]:
+    match methods:
+        []:
+            Ok(None)
+        [method, ...rest]:
+            match method.id.method_spelling(context, span):
+                Err(fault):
+                    Err(fault)
+                Ok(spelling):
+                    if spelling.purity == Pure:
+                        Ok(Some("${spelling.trait_name}.${spelling.method_name}"))
+                    else:
+                        rest.first_pure_method(context, span)
+
+
+-- A resource cannot implement a trait with a pure method (D35), so for one
+-- the help names that method. A pure method only in a supertrait is not seen
+-- here: implementing the trait then reports `ResourceContract`.
+private pure func missing_implementation(
+    context: RenderContext,
+    span: Span,
+    method: TraitMethodId,
+    receiver: check.TypeRef,
+) -> Result[Diagnostic, Diagnostic]:
+    owner ?= context.parsed.declarations
+        .inventory_traits()
+        .get(
+            method
+                .trait_method_owner()
+                .trait_number(),
+        )
+        .or_render_fault(span, errors.InvalidFunctionContract)
+    name ?= owner.type_name.id.parsed_spelling(context.parsed.names, span)
+    held ?= receiver.resource_name(context, span)
+    pure_method ?= owner.methods.first_pure_method(context, span)
+    help = match (held, pure_method):
+        (Some(spelled), Some(label)):
+            "${label} is pure, so a ${spelled} cannot implement ${name}; call a function that takes the ${spelled} instead"
+        _:
+            "declare a matching implementation; generic functions must declare their required trait bounds"
+    Ok(rendered(span, "receiver does not implement ${name}", help))
+
+
+-- A constant, a return or a field also holds a pure callable type.
+private PURE_CALLABLE_HELP: String = "pass a pure function, or make the expected callable type impure"
+
+
+-- A member is pure because its trait's method is, which only that trait's author can change.
+private REMOVE_PURE_HELP: String = "remove pure from the caller (and from the trait method it implements, if the trait is yours)"
+
+
+-- The sole abstract member must itself be written pure.
+private pure func canonical_abstract_help(member: String) -> String:
+    "write pure func ${member} without a body; every other method needs a default body"
+
+
 private pure func render_call_error(
     span: Span,
     rejection: errors.CallError,
@@ -1111,7 +1198,7 @@ private pure func render_call_error(
             rendered(
                 span,
                 "pure functions cannot call impure functions",
-                "mark the callee pure or remove pure from the caller",
+                "mark the callee pure, or ${REMOVE_PURE_HELP}",
             )
         errors.ImpureCall(_, errors.CalledMethod(method)):
             match method.method_label(context, span):
@@ -1119,7 +1206,7 @@ private pure func render_call_error(
                     rendered(
                         span,
                         "pure functions cannot call the impure method ${label}",
-                        "remove pure from the caller, or call a pure method instead",
+                        "${REMOVE_PURE_HELP}, or call a pure method instead",
                     )
                 Err(fault):
                     fault
@@ -1136,18 +1223,14 @@ private pure func render_call_error(
                 "use a pure callable type, or remove pure from the calling function",
             )
         errors.ImpureCallback(errors.CalledFunction(_)):
-            rendered(
-                span,
-                "pure callback requires a pure function",
-                "pass a pure named function; impure functions cannot satisfy a pure callable parameter",
-            )
+            rendered(span, "a pure callable type requires a pure function", PURE_CALLABLE_HELP)
         errors.ImpureCallback(errors.CalledMethod(method)):
             match method.method_label(context, span):
                 Ok(label):
                     rendered(
                         span,
-                        "pure callback requires a pure method, and ${label} is impure",
-                        "pass a pure function, or make the callback's type impure",
+                        "a pure callable type requires a pure method, and ${label} is impure",
+                        PURE_CALLABLE_HELP,
                     )
                 Err(fault):
                     fault
@@ -1706,11 +1789,20 @@ private pure func render_value_error(
                 Err(error):
                     error
                 Ok(spelling):
-                    rendered(
-                        span,
-                        "interpolation hole has type ${spelling}, which does not implement Stringable",
-                        "implement Stringable for ${spelling}, or interpolate a value that implements it",
-                    )
+                    match actual.resource_name(context, span):
+                        Err(error):
+                            error
+                        Ok(held):
+                            help = match held:
+                                Some(name):
+                                    "Stringable.to_string is pure, so a ${name} cannot implement Stringable; interpolate a value read from the ${name} instead"
+                                None:
+                                    "implement Stringable for ${spelling}, or interpolate a value that implements it"
+                            rendered(
+                                span,
+                                "interpolation hole has type ${spelling}, which does not implement Stringable",
+                                help,
+                            )
         errors.EmptyListNeedsElementType:
             rendered(
                 span,
@@ -2593,12 +2685,17 @@ private pure func render_trait_error(
                 "implementation receiver must introduce its complete type parameter family",
                 "write one distinct fresh parameter for every receiver argument; specialized or nested receiver patterns are not supported",
             )
-        errors.MissingTraitBound(_, _):
-            rendered(
-                span,
-                "type does not satisfy the required trait bound",
-                "add the required trait to this function's type parameter bounds, or provide an implementation for the concrete receiver",
-            )
+        errors.MissingTraitBound(_, receiver):
+            match receiver.resource_name(context, span):
+                Err(fault):
+                    fault
+                Ok(held):
+                    help = match held:
+                        Some(name):
+                            "generic functions cannot take a ${name}; call functions or methods on the ${name} directly instead"
+                        None:
+                            "add the required trait to this function's type parameter bounds, or provide an implementation for the concrete receiver"
+                    rendered(span, "type does not satisfy the required trait bound", help)
         errors.OrphanImplementation(_, _):
             rendered(
                 span,
@@ -2691,26 +2788,26 @@ private pure func render_trait_error(
             rendered(
                 span,
                 "canonical Equatable requires pure equals(Self, Self) -> Bool as its sole abstract method",
-                "keep equals abstract; additional pure methods require default bodies",
+                canonical_abstract_help("equals"),
             )
         errors.MalformedCanonicalTrait(errors.ComparisonFamily(errors.OrderableTrait), _):
             rendered(
                 span,
                 "canonical Orderable requires pure less_than(Self, Self) -> Bool as its sole abstract method",
-                "keep less_than abstract; other pure methods require default bodies",
+                canonical_abstract_help("less_than"),
             )
         errors.MalformedCanonicalTrait(errors.ArithmeticFamily(arithmetic), _):
             spelled = arithmetic.arithmetic_spelling()
             rendered(
                 span,
                 "canonical ${spelled.trait_name} requires pure ${spelled.member}(${spelled.parameters}) -> Self as its sole abstract method",
-                "keep ${spelled.member} abstract; other pure methods require default bodies",
+                canonical_abstract_help(spelled.member),
             )
         errors.MalformedCanonicalTrait(errors.StringableFamily, _):
             rendered(
                 span,
                 "canonical Stringable requires pure to_string(Self) -> String as its sole abstract method",
-                "keep to_string abstract; other pure methods require default bodies",
+                canonical_abstract_help("to_string"),
             )
         errors.IntegerWithoutNegation(format):
             rendered(
@@ -2718,28 +2815,10 @@ private pure func render_trait_error(
                 "${format.integer_spelling()} has no negation",
                 "write 0 - value for the wrapping result",
             )
-        errors.MissingImplementation(method, _):
-            match (
-                context.parsed.declarations
-                    .inventory_traits()
-                    .get(
-                        method
-                            .trait_method_owner()
-                            .trait_number(),
-                    )
-            ):
-                None:
-                    render_fault(span, errors.InvalidFunctionContract)
-                Some(owner):
-                    match owner.type_name.id.parsed_spelling(context.parsed.names, span):
-                        Err(fault):
-                            fault
-                        Ok(name):
-                            rendered(
-                                span,
-                                "receiver does not implement ${name}",
-                                "declare a matching implementation; generic functions must declare their required trait bounds",
-                            )
+        errors.MissingImplementation(method, receiver):
+            match context.missing_implementation(span, method, receiver):
+                Ok(diagnostic): diagnostic
+                Err(fault): fault
         errors.EqualityMemberUnsupported(_, _, member):
             equality_member_diagnostic(
                 span,
@@ -3137,6 +3216,17 @@ private pure func misused_resource(
     Ok(rendered(span, use.misuse_message(spelled), help))
 
 
+-- What an impure method's signature must stop doing for the resource.
+private pure func lent_fix(use: errors.ResourceUse, spelled: String) -> String:
+    match use:
+        errors.ResourceResult:
+            "the ${spelled} is not its result"
+        errors.ResourceStorage | errors.ResourceTypeArgument | errors.ResourceInferredType(_):
+            "the ${spelled} is not part of a List, tuple, record or generic type"
+        errors.ResourcePureParameter | errors.ResourcePureCapture:
+            "no pure callable in its signature takes or captures the ${spelled}"
+
+
 -- At the receiver, noted at the type in the trait's signature. A library
 -- trait cannot be changed, so its help offers only the impure function.
 private pure func resource_contract(
@@ -3154,7 +3244,7 @@ private pure func resource_contract(
     else if method.purity == Pure:
         "declare ${method.method_name} without pure in ${method.trait_name}, or ${instead}"
     else:
-        "change ${method.method_name} in ${method.trait_name} so that the ${spelled} is not its result or part of a List, tuple or record, or ${instead}"
+        "change ${method.method_name} in ${method.trait_name} so that ${contract.use.lent_fix(spelled)}, or ${instead}"
     place = if contract.method.trait_method_owner() == contract.implemented:
         "${method.trait_name}.${method.method_name}"
     else:

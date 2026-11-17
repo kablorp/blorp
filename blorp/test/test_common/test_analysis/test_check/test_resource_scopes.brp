@@ -1294,7 +1294,7 @@ private pure func rejects_contract(
     )
 
 
-private CHANGE_HELP: String = "so that the Token is not its result or part of a List, tuple or record, or write an impure function that takes the Token instead"
+private INSTEAD: String = ", or write an impure function that takes the Token instead"
 
 
 private PURE_PARAMETER: String = "pure functions cannot take the resource type Token"
@@ -1352,7 +1352,7 @@ pure func test_resource_cannot_be_returned_by_its_method() -> Bool:
         "    func copy(self: Self) -> ",
         "Self",
         "",
-        "change copy in Marked " + CHANGE_HELP,
+        "change copy in Marked so that the Token is not its result" + INSTEAD,
         "in Marked.copy: the resource type Token cannot be returned",
     )
 
@@ -1363,7 +1363,10 @@ pure func test_resource_cannot_be_taken_by_a_pure_callable_result() -> Bool:
         "    func handler(self: Self) -> ",
         "pure (Self) -> Int",
         "",
-        "change handler in Marked " + CHANGE_HELP,
+        (
+            "change handler in Marked so that no pure callable in its signature takes or captures the Token"
+            + INSTEAD
+        ),
         "in Marked.handler: " + PURE_PARAMETER,
     )
 
@@ -1373,7 +1376,10 @@ pure func test_resource_cannot_be_held_by_its_method_result() -> Bool:
         "    func all(self: Self) -> ",
         "List[Self]",
         "",
-        "change all in Marked " + CHANGE_HELP,
+        (
+            "change all in Marked so that the Token is not part of a List, tuple, record or generic type"
+            + INSTEAD
+        ),
         "in Marked.all: the resource type Token cannot be a type argument",
     )
 
@@ -1665,6 +1671,114 @@ pure func test_bounded_generic_cannot_take_a_resource() -> Bool:
     )
 
 
+-- Each trait below is called on a Token that does not implement it. Where the
+-- trait declares a pure method, D35 means no implementation could exist.
+private MISSING_IMPLEMENTATION_HELP: String = "declare a matching implementation; generic functions must declare their required trait bounds"
+
+
+private PURE_MARKED: String =
+    |trait Marked:
+    |    pure func mark(self: Self) -> Int
+    |func during(token: Token) -> Int:
+    |    token.
+
+
+pure func test_missing_implementation_of_pure_trait_for_resource() -> Bool:
+    rejects_loan(
+        PURE_MARKED,
+        "mark",
+        "()\n",
+        "receiver does not implement Marked",
+        "Marked.mark is pure, so a Token cannot implement Marked; call a function that takes the Token instead",
+    )
+
+
+pure func test_missing_implementation_of_pure_trait_for_ordinary_type() -> Bool:
+    source: String =
+        |trait Marked:
+        |    pure func mark(self: Self) -> Int
+        |record Point { x: Int }
+        |func during(point: Point) -> Int:
+        |    point.
+    rejects_at(
+        source,
+        "mark",
+        "()\n" + MAIN,
+        "receiver does not implement Marked",
+        MISSING_IMPLEMENTATION_HELP,
+    )
+
+
+pure func test_missing_implementation_of_impure_trait_for_resource() -> Bool:
+    source: String =
+        |trait Marked:
+        |    func mark(self: Self) -> Int
+        |func during(token: Token) -> Int:
+        |    token.
+    rejects_loan(
+        source,
+        "mark",
+        "()\n",
+        "receiver does not implement Marked",
+        MISSING_IMPLEMENTATION_HELP,
+    )
+
+
+-- RenderContext holds no accepted traits, so a pure method that is only in a
+-- supertrait is not named; implementing Marked reports `ResourceContract`
+-- (test_resource_cannot_implement_a_trait_above_a_pure_method).
+pure func test_missing_implementation_with_supertrait_pure_method() -> Bool:
+    source: String =
+        |trait Described:
+        |    pure func describe(self: Self) -> String
+        |trait Marked: Described:
+        |    func mark(self: Self) -> Int
+        |func during(token: Token) -> Int:
+        |    token.
+    rejects_loan(
+        source,
+        "mark",
+        "()\n",
+        "receiver does not implement Marked",
+        MISSING_IMPLEMENTATION_HELP,
+    )
+
+
+pure func test_generic_bound_given_a_resource_names_generics() -> Bool:
+    source: String =
+        |trait Marked:
+        |    func mark(self: Self) -> Int
+        |func announce[T: Marked](value: T) -> Int:
+        |    value.mark()
+        |func during(token: Token) -> Int:
+        |
+    rejects_loan(
+        source + "    ",
+        "announce",
+        "(token)\n",
+        "type does not satisfy the required trait bound",
+        "generic functions cannot take a Token; call functions or methods on the Token directly instead",
+    )
+
+
+pure func test_generic_bound_given_an_ordinary_type_asks_for_implementation() -> Bool:
+    source: String =
+        |trait Marked:
+        |    func mark(self: Self) -> Int
+        |record Point { x: Int }
+        |func announce[T: Marked](value: T) -> Int:
+        |    value.mark()
+        |func during(point: Point) -> Int:
+        |
+    rejects_at(
+        source + "    ",
+        "announce",
+        "(point)\n" + MAIN,
+        "type does not satisfy the required trait bound",
+        "add the required trait to this function's type parameter bounds, or provide an implementation for the concrete receiver",
+    )
+
+
 pure func test_scoped_promise_belongs_to_its_own_parameter() -> Bool:
     opening: String =
         |func run(count: Int, first: scoped () -> Int, second: () -> Int) -> Int:
@@ -1764,6 +1878,34 @@ func test_resource_cannot_implement_a_library_trait() -> Bool:
                                 )
                         _:
                             False
+
+
+-- Interpolation needs the library's Stringable, so this loads a fixture.
+func test_interpolating_a_resource_names_pure_to_string() -> Bool:
+    before = "resource type Token = Int\n\n\nfunc show(token: Token) -> String:\n    \"" + "$" + "{"
+    match load_program(
+        FIXTURES + "interpolated_token.brp",
+        LibraryDirectory("blorp/standard_library"),
+    ):
+        Err(_):
+            False
+        Ok(loaded):
+            match check(loaded.program):
+                Ok(_):
+                    False
+                Err(failure):
+                    error = setup_diagnostic(failure)
+                    (error.message == "interpolation hole has type Token, which does not implement Stringable")
+                        .and(
+                            (
+                                error.help
+                                == "Stringable.to_string is pure, so a Token cannot implement Stringable; interpolate a value read from the Token instead"
+                            ),
+                        )
+                        .and(error.span.source == module_source(root_module_id()))
+                        .and(error.span.start == before.length())
+                        .and(error.span.end == before.length() + "token".length())
+                        .and(error.note.is_none())
 
 
 -- A default declared in another module is walked again for Token.
@@ -1989,5 +2131,27 @@ TESTS: TestSuite = {
         ("sequential resource alias arguments", test_sequential_resource_alias_arguments),
         ("pure scoped callback capture", test_pure_scoped_callback_capture),
         ("scoped if alias invoke", test_scoped_if_alias_invoke),
+        (
+            "missing pure trait for a resource",
+            test_missing_implementation_of_pure_trait_for_resource,
+        ),
+        (
+            "missing pure trait for an ordinary type",
+            test_missing_implementation_of_pure_trait_for_ordinary_type,
+        ),
+        (
+            "missing impure trait for a resource",
+            test_missing_implementation_of_impure_trait_for_resource,
+        ),
+        (
+            "missing trait with a supertrait pure method",
+            test_missing_implementation_with_supertrait_pure_method,
+        ),
+        ("interpolating a resource", test_interpolating_a_resource_names_pure_to_string),
+        ("generic bound given a resource", test_generic_bound_given_a_resource_names_generics),
+        (
+            "generic bound given an ordinary type",
+            test_generic_bound_given_an_ordinary_type_asks_for_implementation,
+        ),
     ],
 }

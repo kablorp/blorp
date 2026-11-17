@@ -102,19 +102,6 @@ done.
     Q2, emit's failure-flag loops carrying a `Result`.
   - **Next:** land them in order. Records by value moved here and wait for
     the records design pilot.
-- **Impure trait methods and resource receivers:**
-  [`IMPURE_TRAIT_METHODS_PLAN.md`](IMPURE_TRAIT_METHODS_PLAN.md).
-  - **Status:** Keith decided on 2026-11-16 that trait methods may be impure,
-    that `pure` on a trait is respected, and that a resource implementing a
-    trait has each inherited default checked again. The plan was written and
-    reviewed the same day, and Keith approved it with T1 to T4 as
-    recommended.
-  - **Landed:** landing 1, impure trait methods; landing 2, resource
-    receivers (D41 in `FILESYSTEM_DECISIONS.md`). The pinned seed
-    (`blorp-seed-4fee244ad96f`) carries landing 1, so seed-built code may
-    declare impure trait methods.
-  - **Next:** landing 3, resource-aware helps. Landing 2 must not reach a
-    release without it.
 
 ## Smaller follow-ups
 
