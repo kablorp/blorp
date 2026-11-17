@@ -214,7 +214,7 @@ sanitizers, balanced counts and coverage do not replace them.
 change a ceiling only with measured evidence stated in its commit message, and
 do not special-case code for a small allocation change. Every cost claim follows
 the parent's measurement rules: matched, serial baseline and candidate runs
-against one frozen baseline on a quiet machine, covering the targeted boundary
+against one frozen baseline, covering the targeted boundary
 and the whole compilation, with source, binary, flags, inputs and output
 identity. The full record goes in the owning plan and raw samples under
 `build/`; the commit message carries only the headline numbers.

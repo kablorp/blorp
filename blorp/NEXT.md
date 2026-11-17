@@ -219,14 +219,9 @@ None of these is planned yet. Each wants its own short design or brief.
 
 ## Working notes for agents
 
-- **Never run compiled binaries in parallel with another session's** on macOS.
-  Before each build, gate or measurement, wait for
-  `pgrep -f '^[^ ]*self-hosted-tests/driver/driver'` and
-  `pgrep -f '^[^ ]*blorp/build/(blorp|compiler|fixpoint)'` to come back empty. The
-  pattern is anchored so that a waiting shell never matches itself.
-- **A subagent's commands move to the background after about 180 s.** Put the
-  busy check inside your own scripts, start long scripts in the background,
-  and wait for their exit notification rather than polling.
+- **A subagent's commands move to the background after about 180 s.** Start
+  long scripts in the background and wait for their exit notification rather
+  than polling.
 - **Landing.** Squash onto origin/main in a landing branch and run the gates
   there once:
   - the gates `blorp/AGENTS.md` ("Which gates a change runs") names for the

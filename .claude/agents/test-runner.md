@@ -18,8 +18,6 @@ need. You report results; you do not fix anything.
 - Never override a gate's timeouts, thresholds or environment to make it pass.
 - Run commands in the foreground and wait for them. Do not start background
   monitors.
-- Follow any constraints the repository documents about running things
-  concurrently on this machine.
 
 ## Choose the gates from the repository
 

@@ -1532,8 +1532,7 @@ blorp/scripts/self-compile-cost BASE CANDIDATE [--rounds N] [--optimize LEVEL] [
 
 Compares two git revisions' cost compiling Blorp. It builds each from the
 pinned seed in a detached worktree (normal and `-DBLORP_MEMORY_DIAGNOSTICS=1`
-binaries at `--optimize`, default `-O2`), waiting while another session's
-compiler, fixpoint or test driver is running. For two workloads, the base's
+binaries at `--optimize`, default `-O2`). For two workloads, the base's
 source compiled by both compilers (so only the compiler differs) and each
 revision's own source, it prints strict-leak-check allocations (a leak fails
 the run) and peak heap, and the median retired instructions of `--rounds`
