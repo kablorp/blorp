@@ -235,3 +235,75 @@ MEMORY_RUNTIME: String =
         |#define blorp_memory_finish(requested_exit_status) (requested_exit_status)
         |#endif
         |
+
+
+-- Final release in constant C stack and without allocation. Every drop helper
+-- has a nested form, `drop_at(value, depth)`, where `depth` counts the counted
+-- releases running below it; a top-level drop is its nested form at depth 0.
+-- A counted layout whose release may release a child that owns children
+-- joins the scheduler. Below BLORP_RELEASE_DEPTH_LIMIT it releases a dead
+-- object directly at `depth + 1`, so ordinary values never reach this code;
+-- past the limit it hands the object to blorp_release_deep. The first such
+-- object on a thread starts a run there; while it runs, later ones are parked
+-- on their kind's stack, linked through the dead count word at offset 0 of
+-- every counted layout, so the stack an object waits on is the only type
+-- information parking needs. The run releases each object at depth 1, so C
+-- stack use is at most two limits of nested releases. Emission declares
+-- `enum blorp_release_kind`, one enumerator per joined layout ending in
+-- `blorp_release_kinds`, and defines `blorp_release_dispatch` after every
+-- release body. A kind waits at most once, so `waiting` cannot overflow. The
+-- deep path is out of line and cold, so each drop carries only a compare.
+RELEASE_RUNTIME: String =
+    raw
+        |_Static_assert(sizeof(atomic_size_t)>=sizeof(void *)&&sizeof(_Atomic uint64_t)>=sizeof(void *),"a dead count word holds a link");
+        |enum {BLORP_RELEASE_DEPTH_LIMIT=128};
+        |#if defined(__GNUC__)
+        |#define BLORP_RELEASE_COLD __attribute__((noinline,cold))
+        |#else
+        |#define BLORP_RELEASE_COLD
+        |#endif
+        |struct blorp_release_state{void *parked[blorp_release_kinds];enum blorp_release_kind waiting[blorp_release_kinds];size_t waiting_count;int running;};
+        |static _Thread_local struct blorp_release_state blorp_release_state;
+        |static void blorp_release_dispatch(enum blorp_release_kind kind,void *dead);
+        |static BLORP_RELEASE_COLD void blorp_release_deep(enum blorp_release_kind kind,void *dead){
+        |struct blorp_release_state *const state=&blorp_release_state;
+        |if(state->running){
+        |void *const next=state->parked[kind];
+        |memcpy(dead,&next,sizeof next);
+        |if(next==NULL)state->waiting[state->waiting_count++]=kind;
+        |state->parked[kind]=dead;
+        |return;
+        |}
+        |state->running=1;
+        |for(;;){
+        |blorp_release_dispatch(kind,dead);
+        |if(state->waiting_count==0)break;
+        |kind=state->waiting[state->waiting_count-1];
+        |dead=state->parked[kind];
+        |void *next;
+        |memcpy(&next,dead,sizeof next);
+        |state->parked[kind]=next;
+        |if(next==NULL)state->waiting_count--;
+        |}
+        |state->running=0;
+        |}
+        |
+
+
+-- The kind enumerator of the joined layout whose release body is `release`.
+pure func release_kind(release: String) -> String:
+    "${release}_kind"
+
+
+-- The end of a joined layout's nested drop, once its count reached zero:
+-- release it one level deeper, or past the limit hand it to the scheduler.
+-- `release` names the layout's release body, which drops each child at the
+-- depth it is given and frees `value`.
+pure func depth_checked_release(release: String) -> String:
+    within = "if(depth<BLORP_RELEASE_DEPTH_LIMIT){${release}(value,depth+1);return;}"
+    "${within}blorp_release_deep(${release_kind(release)},value);}"
+
+
+-- A drop called outside any release: its nested form at depth 0.
+pure func top_level_drop(signature: String, nested: String) -> String:
+    "${signature}{${nested}(value,0);}"

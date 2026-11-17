@@ -113,3 +113,93 @@ Medians of 7, alternating.
 - Raw samples: the main checkout's
   `build/pilots/2026-11-12/deep-release/landing/l1-main/`, and `landing/l1/`
   for the runs on `4d350add0`.
+
+### L2 (2026-11-17)
+
+Base `release/cold-split`, candidate `release/depth-budget`.
+
+- **Deep fixtures.** Seven e2e cases in `test_compile/data.brp`, one per
+  shape in the Problem table and a boxed union, each a million levels deep.
+  Built as the harness builds them (`-O0`, ASan and UBSan, strict
+  accounting), the first six abort with a stack overflow under `4d8b381f0`'s
+  compiler, and every one exits normally with a balanced report under L2's:
+
+  | Fixture | Status | Runtime allocations |
+  |---|---:|---:|
+  | `recursive/deep_record_chain` | 49 | 1,000,000 |
+  | `recursive/deep_record_tree` | 49 | 2,000,000 |
+  | `recursive/deep_union_chain` | 4 | 1,000,001 |
+  | `recursive/deep_list_chain` | 49 | 1,999,999 |
+  | `recursive/deep_nested_list` | 1 | 1,000,000 |
+  | `recursive/deep_boxed_chain` | 3 | 1,000,001 |
+  | `recursive/deep_closure_chain` | 7 | 1,000,000 |
+
+  The boxed chain passed at the base through the one-child walk L2 deletes;
+  it guards that deletion. The compile ceilings are L2's test compiler's
+  measured cost plus 15%. With `BLORP_RELEASE_DEPTH_LIMIT` raised to
+  1,000,000,000, so that nothing parks, all seven abort with a stack
+  overflow, so these cases catch a disabled budget.
+- **Runtime suite.** `test_runtime/release_suite.brp` runs two C probes under
+  the strict check.
+  - The scheduler probe drives `RELEASE_RUNTIME` through two counted layouts
+    written to the emitted protocol: a 128-node chain releases without
+    parking; a 129-node chain parks once; a 1,000,000-node chain parks every
+    128th node (7,812 dispatches) and no release runs deeper than 128; a
+    spine of pairs mixes parked nodes and pairs in one run (1,007
+    dispatches); a shared chain parks only when its last owner releases it.
+    Every mode allocates nothing while releasing and leaves no run open.
+  - The emitted-helpers probe takes the helpers `aggregate_runtime` emits
+    for a fixed program, admitted by a typed catalogue check, builds a
+    million records chained through `Option`, a million chained through
+    Lists and a million boxed `Succ` nodes, and releases each on a thread
+    with a 512 KB stack.
+
+  With `BLORP_RELEASE_DEPTH_LIMIT` raised to 100,000,000 in the runtime
+  text, all eight cases fail, and the three emitted-helper cases are killed
+  by ASan's stack-overflow abort.
+- **Existing tests.** L1's `test_emit/test_release.brp`, which compared
+  helper text, is removed; the probes above check what the helpers do. The
+  pinned text in `test_managed_union` (11 cases) and
+  `test_static_environments` (1 case) and the callable ops in
+  `list_reuse_test.c` follow the new helpers.
+- **Stage-2 self-compile.** Base `4d8b381f0`, L1 and L2 measured together on
+  the base's source; medians of 7, rotating order.
+
+  | | Base | L1 | L2 | L2 against base |
+  |---|---:|---:|---:|---:|
+  | Allocations (strict) | 14,315,637 | 14,318,707 | 14,334,215 | +18,578 (+0.13%) |
+  | Peak heap (bytes) | 171,306,620 | 171,307,662 | 172,379,170 | +1,072,550 (+0.63%) |
+  | Instructions | 12,750,805,908 | 12,461,711,725 | 12,678,035,368 | −0.57% |
+  | Cycles | 3,086,618,597 | 3,029,058,103 | 3,050,387,936 | −1.17% |
+  | Peak RSS (bytes) | 252,248,064 | 251,576,320 | 251,625,472 | −0.25% |
+  | `__text` (bytes) | 3,489,576 | 3,645,924 | 3,933,476 | +12.7% |
+  | C for the base's source (bytes) | 27,130,738 | 27,202,419 | 27,701,332 | +2.10% |
+
+  Against L1, L2 costs 1.74% of instructions and 0.70% of cycles: the depth
+  argument every nested drop passes, and the larger code. The allocations and
+  the peak heap rise with the emitted C (742 kinds, and a nested drop beside
+  every drop); the peak heap is the output join. Release itself allocates
+  nothing.
+- **Final gates.** Both branches rebased onto `f95a8204d`; `make -C blorp
+  test INSTRUCTION_CHECK=on` on each final commit. L1: 3,055 passed; the only
+  failures are two compile instruction ceilings, 34,464,057 against
+  34,081,067 and 34,876,490 against 34,660,030. L2: 3,068 passed, nothing
+  failed and no ceiling was exceeded.
+- **Ceilings.** Those two ceilings, `derived_accepted_generic_head` and
+  `derived_accepted_nested_generic_head`, are stale on main itself: the same
+  harness with `4d8b381f0`'s own test compiler exceeds them.
+
+  | Case | Ceiling | Main in the harness | L2 in the harness (gates) |
+  |---|---:|---:|---:|
+  | `derived_accepted_generic_head` | 34,081,067 | 34,371,861 | 34,284,483 and 34,275,457 |
+  | `derived_accepted_nested_generic_head` | 34,660,030 | 34,778,323 | 34,692,732 and 34,785,509 |
+
+  Medians of 7 outside the harness agree that L2 does not raise them: main
+  33,103,501 and 33,407,463, L2 33,100,936 and 33,545,172. The coordinator
+  owns their correction. The two ceilings the pilot exceeded no longer bind:
+  `files/write` compiles in 244,460 allocations at the base and 244,553 with
+  L2, under its 247,760 ceiling (main had reset it from the pilot's 234,300),
+  and `derived/accepted_generic_head` allocates within its 4,719 ceiling.
+- **Size.** Production lines: L1 +40 −20, L2 +390 −130.
+- Raw samples: the main checkout's
+  `build/pilots/2026-11-12/deep-release/landing/l2/`.

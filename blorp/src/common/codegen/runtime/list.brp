@@ -18,6 +18,7 @@ import:
         ),
         UnionInstanceId,
         VariantInstanceId,
+    ./memory: depth_checked_release, top_level_drop
 
 
 private union ElementTerminal:
@@ -336,40 +337,51 @@ private pure func reserve_unique(type_name: String, required: String, maximum: S
         .concat("values=grown;values->capacity=capacity;}")
 
 
+-- The release body of a List layout, which drops each element and frees the root.
+pure func list_release_name(key: ListElementKey) -> String:
+    "blorp_list_release_${key.list_suffix()}"
+
+
 -- The supplied element ABI and dup/drop fragments come from accepted concrete
 -- layouts. A root owns every initialized slot, including equal occurrences.
 -- The drop only decrements and calls the release body, so the C compiler can
 -- inline the decrement where a List is dropped and keep the release apart.
+-- A layout whose elements may own children joins the release scheduler, and
+-- `release` is then its element's nested destroy fragment, which uses `depth`.
 pure func list_runtime(
     key: ListElementKey,
     element_type: String,
     acquire: String,
     destroy: String,
+    release: Option[String],
 ) -> String:
     suffix = key.list_suffix()
     type_name = key.list_c_type()
     empty = suffix.empty_root_name()
+    body = key.list_release_name()
+    drop = "void blorp_list_drop_${suffix}(${type_name} value)"
+    nested = "void blorp_list_drop_at_${suffix}(${type_name} value,unsigned depth){"
+    dead = "if(value==&${empty}){blorp_list_empty_release();return;}".concat(
+        "if(atomic_fetch_sub_explicit(&value->references,1,memory_order_acq_rel)!=1)return;",
+    )
+    each = "for(int64_t index=0;index<value->length;index++){${element_type} element=value->values[index];(void)element;"
+    released = match release:
+        Some(nested_destroy):
+            "void ${body}(${type_name} value,unsigned depth){${each}${nested_destroy}}blorp_memory_release(value);}"
+                .concat("${nested}${dead}${depth_checked_release(body)}")
+                .concat(top_level_drop(drop, "blorp_list_drop_at_${suffix}"))
+        None:
+            "void ${body}(${type_name} value){${each}${destroy}}blorp_memory_release(value);}"
+                .concat("${drop}{${dead}${body}(value);}")
+                .concat("${nested}(void)depth;blorp_list_drop_${suffix}(value);}")
     "struct blorp_l_${suffix}{atomic_size_t references;int64_t length;size_t capacity;${element_type} values[];};"
         .concat("static const struct blorp_l_${suffix} ${empty}={.length=0,.capacity=0};")
         .concat(
             "void blorp_list_dup_${suffix}(${type_name} value){if(value==&${empty})(void)blorp_list_empty_acquire(value);",
         )
         .concat("else atomic_fetch_add_explicit(&value->references,1,memory_order_relaxed);}")
-        .concat(
-            "void blorp_list_release_${suffix}(${type_name} value){for(int64_t index=0;index<value->length;index++){",
-        )
-        .concat(
-            "${element_type} element=value->values[index];(void)element;${destroy}}blorp_memory_release(value);}",
-        )
-        .concat(
-            "void blorp_list_drop_${suffix}(${type_name} value){if(value==&${empty}){blorp_list_empty_release();return;}",
-        )
-        .concat(
-            "if(atomic_fetch_sub_explicit(&value->references,1,memory_order_acq_rel)!=1)return;",
-        )
-        .concat(
-            "blorp_list_release_${suffix}(value);}${type_name} blorp_list_repeat_${suffix}(${element_type} element,int64_t count){",
-        )
+        .concat(released)
+        .concat("${type_name} blorp_list_repeat_${suffix}(${element_type} element,int64_t count){")
         .concat("const uint64_t requested=count<=0?UINT64_C(0):(uint64_t)count;")
         .concat(
             "if(requested>(SIZE_MAX-sizeof(struct blorp_l_${suffix}))/sizeof(${element_type}))abort();",

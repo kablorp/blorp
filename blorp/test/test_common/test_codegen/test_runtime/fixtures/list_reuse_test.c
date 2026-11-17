@@ -180,7 +180,7 @@ static void managed(void) {
 static size_t callable_references, callable_retains, callable_drops;
 static int64_t invoke(void *environment) { (void)environment; return 5; }
 static void retain(void *environment) { assert(environment == &callable_references); callable_references++; callable_retains++; }
-static void drop(void *environment) { assert(environment == &callable_references); assert(callable_references > 0); callable_references--; callable_drops++; }
+static void drop(void *environment, unsigned depth) { (void)depth; assert(environment == &callable_references); assert(callable_references > 0); callable_references--; callable_drops++; }
 static void callable(void) {
     const struct blorp_co_p0_r_i_e ops = {invoke, retain, drop};
     struct blorp_c_p0_r_i_e value = {&ops, &callable_references};

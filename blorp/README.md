@@ -502,9 +502,10 @@ never contains itself. An ordinary record is not accepted as a fixed field
 even when it happens to be inline.
 
 Records may be recursive, as in `record Node { value: Int, next: Option[Node] }`.
-Values never form cycles, so reference counting frees them. Releasing a
-recursive value recurses through its structure, so a very long chain can
-exhaust the C stack.
+Values never form cycles, so reference counting frees them. Releasing a value
+of any depth uses bounded C stack: up to 128 nested releases run directly, and
+deeper ones wait on a per-thread list that one loop releases, with no
+allocation.
 
 ### Tuples
 
@@ -572,8 +573,7 @@ variants compiles to a C enum. Any other union is a tagged C struct stored
 inline that owns only its active variant's payload.
 
 A non-generic union may hold itself as one direct payload of a variant, at
-most one per variant, as in `Succ(Nat)`; that union is boxed, and releasing a
-long chain is iterative. `Node(Tree, Tree)` or a generic `Next(Box[T])` reports
+most one per variant, as in `Succ(Nat)`; that union is boxed. `Node(Tree, Tree)` or a generic `Next(Box[T])` reports
 "recursive aggregate types are not supported yet". It
 may also be recursive through records and Lists, as `Form` is through
 `Call(String, List[Expr])` in the

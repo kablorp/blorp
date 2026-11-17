@@ -1,0 +1,237 @@
+---
+Release in constant C stack. Two C probes run under the strict leak check,
+which must balance. The first drives RELEASE_RUNTIME's scheduler through two
+counted layouts written to the emitted drop protocol, and prints what each
+release did. The second builds million-deep values with the helpers emitted
+for HELPERS_SOURCE and releases them on a thread with a small stack.
+---
+import:
+    bool: and
+    io/process: Captured
+    result: Result methods
+    string: String methods
+    test: TestSuite
+    ../../../../src/common/codegen/emit/emit: aggregate_runtime
+    ../../../../src/common/codegen/own/own: own
+    ../../../../src/common/codegen/runtime/memory: MEMORY_RUNTIME, RELEASE_RUNTIME
+    ../../../../src/common/codegen/runtime/string: string_runtime
+    ../../../../src/common/codegen/specialize/specialize as specialized
+    ../../../../src/common/codegen/verify/verify: verify, verified_contents, VerifiedProgram
+    ../../../../src/common/syntax/syntax: IntegerFormat(Int64Format)
+    ../../../driver/file_access: write_file
+    ../../../driver/harness: isolated, run_expecting, strict_leak_check
+    ../../../driver/reports: verify_accounting
+    ../../../support/list_update_inputs: lowered
+
+
+private COMPILE_TIMEOUT_MS: Int = 600000
+private CHILD_TIMEOUT_MS: Int = 60000
+
+
+private PROBE_SOURCE: String = "blorp/test/test_common/test_codegen/test_runtime/fixtures/release_test.c"
+
+
+private HELPERS_PROBE_SOURCE: String = "blorp/test/test_common/test_codegen/test_runtime/fixtures/release_helpers_test.c"
+
+
+-- Every recursive shape the helpers probe builds: a record through an inline
+-- union, a record through a List, and a boxed union.
+private HELPERS_SOURCE: String =
+    |record Node { value: Int, next: Option[Node] }
+    |record Branch { value: Int, children: List[Branch] }
+    |union Nat:
+    |    Zero
+    |    Succ(Nat)
+    |pure func keep(value: Int, node: Node, branch: Branch, nat: Nat) -> Int:
+    |    value
+    |func main() -> Int:
+    |    node: Node = { value = 1, next = None }
+    |    branch: Branch = { value = 2, children = [] }
+    |    keep(0, node, branch, Succ(Zero))
+    |
+
+
+-- The helpers probe's C names are admitted only after this typed catalogue:
+-- record 0 is Node, record 1 Branch, union 0 the inline Option[Node] and
+-- union 1 the boxed Nat.
+private pure func catalogue(program: VerifiedProgram) -> Bool:
+    contents = verified_contents(program)
+    match (contents.records, contents.unions):
+        ([specialized.CountedFields(node), specialized.CountedFields(branch)], [specialized.OwningCases(option), specialized.BoxedCases(nat)]):
+            match (node, branch, option, nat):
+                ([specialized.IntegerType(Int64Format), specialized.UnionType(next)], [specialized.IntegerType(Int64Format), specialized.ListType(specialized.RecordType(child))], [[specialized.RecordType(some)], []], [[], [specialized.UnionType(succ)]]):
+                    and(
+                        and(
+                            specialized.union_number(next) == 0,
+                            specialized.record_number(child) == 1,
+                        ),
+                        and(
+                            specialized.record_number(some) == 0,
+                            specialized.union_number(succ) == 1,
+                        ),
+                    )
+                _:
+                    False
+        _:
+            False
+
+
+-- Builds `source` against the runtime files in `directory`.
+private func build_probe(
+    c_compiler: String,
+    directory: String,
+    source: String,
+    executable: String,
+) -> Result[String, String]:
+    build ?= isolated(
+        c_compiler,
+        [
+            "-std=c11",
+            "-O0",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            "-pedantic",
+            "-fsanitize=address,undefined",
+            "-fno-sanitize-recover=all",
+            "-DBLORP_MEMORY_DIAGNOSTICS=1",
+            "-I",
+            directory,
+            source,
+            "-o",
+            executable,
+        ],
+        COMPILE_TIMEOUT_MS,
+    )
+    built ?= run_expecting("release native build", build, 0)
+    if built.stderr == "":
+        Ok(executable)
+    else:
+        Err("release native build: " + built.stderr)
+
+
+private func ready(c_compiler: String, directory: String) -> Result[String, String]:
+    _ ?= write_file(directory + "/memory_runtime.c", MEMORY_RUNTIME)
+    _ ?= write_file(directory + "/release_runtime.c", RELEASE_RUNTIME)
+    build_probe(c_compiler, directory, PROBE_SOURCE, directory + "/release_probe")
+
+
+private func helpers_ready(c_compiler: String, directory: String) -> Result[String, String]:
+    program ?= lowered(HELPERS_SOURCE)
+        .and_then(own)
+        .and_then(verify)
+        .map_err(pure func(error): error.message + "; " + error.help)
+    _: Void ?= if catalogue(program):
+        Ok(void)
+    else:
+        Err("release helpers concrete catalogue differs")
+    aggregates ?= aggregate_runtime(program).map_err(
+        pure func(error): error.message + "; " + error.help,
+    )
+    _ ?= write_file(directory + "/release_memory.c", MEMORY_RUNTIME)
+    _ ?= write_file(directory + "/release_values.c", (string_runtime() + aggregates) + "\n")
+    build_probe(c_compiler, directory, HELPERS_PROBE_SOURCE, directory + "/release_helpers_probe")
+
+
+-- Runs `mode` under the strict leak check; its stdout must be `expected` and
+-- its allocation report must balance.
+private func released(executable: String, mode: String, expected: String) -> Bool:
+    checked: Result[Void, String] = match isolated(executable, [mode], CHILD_TIMEOUT_MS):
+        Err(error):
+            Err(error)
+        Ok(probe):
+            match run_expecting(
+                "release " + mode,
+                { probe | environment = strict_leak_check() },
+                0,
+            ):
+                Err(error):
+                    Err(error)
+                Ok(run):
+                    if run.stdout == expected:
+                        verify_accounting(run.stderr, True)
+                    else:
+                        Err("release ${mode}: expected [${expected}] got [${run.stdout}]")
+    match checked:
+        Ok(_):
+            True
+        Err(error):
+            print_error(error)
+            False
+
+
+-- The scheduler probe and the emitted-helpers probe.
+private func probes(c_compiler: String, directory: String) -> Result[(String, String), String]:
+    scheduler ?= ready(c_compiler, directory)
+    helpers ?= helpers_ready(c_compiler, directory)
+    Ok((scheduler, helpers))
+
+
+func suite(c_compiler: String, directory: String) -> TestSuite:
+    match probes(c_compiler, directory):
+        Err(error):
+            print_error(error)
+            { description = "Release setup", tests = [("native probes build", func(): False)] }
+        Ok((executable, helpers)):
+            {
+                description = "Release in constant C stack",
+                tests = [
+                    (
+                        "a chain as deep as the limit releases without parking",
+                        func(): released(
+                            executable,
+                            "under-limit",
+                            "released 128 dispatched 0 deepest 128 allocated 0 running 0\n",
+                        ),
+                    ),
+                    (
+                        "one node past the limit starts a run that releases it",
+                        func(): released(
+                            executable,
+                            "at-limit",
+                            "released 129 dispatched 1 deepest 128 allocated 0 running 0\n",
+                        ),
+                    ),
+                    (
+                        "a million-node chain parks every 128th node and never nests deeper",
+                        func(): released(
+                            executable,
+                            "deep",
+                            "released 1000000 dispatched 7812 deepest 128 allocated 0 running 0\n",
+                        ),
+                    ),
+                    (
+                        "parked nodes and pairs wait in one run",
+                        func(): released(executable, "mixed", MIXED),
+                    ),
+                    (
+                        "a shared child parks only when its last owner releases it",
+                        func(): released(executable, "shared", SHARED),
+                    ),
+                    (
+                        "emitted helpers release a million records chained through an inline union on a small stack",
+                        func(): released(helpers, "record-chain", BUILT),
+                    ),
+                    (
+                        "emitted helpers release a million records chained through Lists on a small stack",
+                        func(): released(helpers, "list-chain", BUILT),
+                    ),
+                    (
+                        "emitted helpers release a million boxed union nodes on a small stack",
+                        func(): released(helpers, "boxed-chain", BUILT),
+                    ),
+                ],
+            }
+
+
+-- A spine of 1,000 pairs, each holding a 128-node chain: every pair parks
+-- one node of its chain, and every 128th pair past the first 128 parks itself.
+private MIXED: String = "released 129000 dispatched 1007 deepest 128 allocated 0 running 0\n"
+
+
+-- The shared chain of 384 nodes parks its 128th, 256th and 384th nodes.
+private SHARED: String = "after first released 1\nafter second released 386 dispatched 3 running 0\n"
+
+
+-- Every helpers mode builds a million-deep value before releasing it.
+private BUILT: String = "built 1000000\n"

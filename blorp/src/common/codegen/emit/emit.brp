@@ -115,10 +115,16 @@ import:
         callable_suffix,
         consuming_helper_name,
         list_element_key,
+        list_release_name,
         list_root_allocation,
         list_slot_store,
         LIST_SHARED_RUNTIME,
-    ../runtime/memory: MEMORY_RUNTIME
+    ../runtime/memory:
+        depth_checked_release,
+        MEMORY_RUNTIME,
+        release_kind,
+        RELEASE_RUNTIME,
+        top_level_drop,
     ../runtime/process: PROCESS_POSIX_PRELUDE
     ../runtime/string:
         string_equals_runtime,
@@ -617,7 +623,9 @@ private pure func callable_declarations(types: List[TypeRef]) -> String:
                 ops_forward = "struct blorp_co_${suffix};"
                 pair_definition = "${name}{const struct blorp_co_${suffix}* ops;void* environment;};"
                 retain_declaration = "void blorp_callable_dup_${suffix}(${name});"
-                drop_declaration = "void blorp_callable_drop_${suffix}(${name});\n"
+                drop_declaration = "void blorp_callable_drop_${suffix}(${name});".concat(
+                    "void blorp_callable_drop_at_${suffix}(${name},unsigned);\n",
+                )
                 fragments = fragments.append(
                     ops_forward
                         .concat(pair_definition)
@@ -646,12 +654,19 @@ private pure func callable_ops(
                             .map(pure func(arguments):
                                 suffix = parameters.callable_suffix(result)
                                 name = "".append_callable_type_name(parameters, result)
-                                ops_definition = "struct blorp_co_${suffix}{${returned} (*invoke)${arguments};void (*retain)(void*);void (*drop)(void*);};"
+                                ops_definition = "struct blorp_co_${suffix}{${returned} (*invoke)${arguments};void (*retain)(void*);void (*drop)(void*,unsigned);};"
                                 retain_definition = "void blorp_callable_dup_${suffix}(${name} value){value.ops->retain(value.environment);}"
-                                drop_definition = "void blorp_callable_drop_${suffix}(${name} value){value.ops->drop(value.environment);}\n"
+                                nested_definition = "void blorp_callable_drop_at_${suffix}(${name} value,unsigned depth){".concat(
+                                    "value.ops->drop(value.environment,depth);}",
+                                )
+                                drop_definition = top_level_drop(
+                                    "void blorp_callable_drop_${suffix}(${name} value)",
+                                    "blorp_callable_drop_at_${suffix}",
+                                )
                                 ops_definition
                                     .concat(retain_definition)
-                                    .concat(drop_definition)
+                                    .concat(nested_definition)
+                                    .concat("${drop_definition}\n")
                             )
                     )
                 match signature:
@@ -691,7 +706,7 @@ private pure func append_callable_entry(
                         Ok(arguments):
                             var invocation = "${body.function_number().c_name()}("
                             var retain = "(void)environment;"
-                            var drop = retain
+                            var drop = "(void)environment;(void)depth;"
                             var prefix = "(void)environment;"
                             match definition.operation:
                                 CapturedCallableDefinition(_, _):
@@ -707,7 +722,7 @@ private pure func append_callable_entry(
                                                 .concat(")environment")
                                             invocation = invocation.concat(cast)
                                             retain = "blorp_record_dup_${owner.record_number()}(${cast});"
-                                            drop = "blorp_record_drop_${owner.record_number()}(${cast});"
+                                            drop = "blorp_record_drop_at_${owner.record_number()}(${cast},depth);"
                                             prefix = ""
                                         _:
                                             void
@@ -725,7 +740,7 @@ private pure func append_callable_entry(
                                 ordinal = ordinal + 1
                             invoke_adapter = "${returned} ${name}_invoke${arguments}{${prefix}return ${invocation});}"
                             retain_adapter = "void ${name}_retain(void* environment){${retain}}"
-                            drop_adapter = "void ${name}_drop(void* environment){${drop}}"
+                            drop_adapter = "void ${name}_drop(void* environment,unsigned depth){${drop}}"
                             ops_type = "const struct blorp_co_${parameters.callable_suffix(result)} ${name}"
                             ops_initializer = "${ops_type}={${name}_invoke,${name}_retain,${name}_drop};\n"
                             Ok(
@@ -946,7 +961,7 @@ private pure func append_aggregate_definitions(
 
 private pure func append_record_prototypes(output: String, index: Int) -> String:
     "${output}void blorp_record_dup_${index}(blorp_r_${index});".concat(
-        "void blorp_record_drop_${index}(blorp_r_${index});",
+        "void blorp_record_drop_${index}(blorp_r_${index});void blorp_record_drop_at_${index}(blorp_r_${index},unsigned);",
     )
 
 
@@ -961,13 +976,17 @@ private pure func append_value_record_ownership(
         .concat("(void)value;")
         .append_value_field_actions(fields, index, unions, DuplicateValue)
     destroyed ?= duplicated
-        .concat("}void blorp_record_drop_")
+        .concat("}void blorp_record_drop_at_")
         .append_int(index)
         .concat("(blorp_r_")
         .append_int(index)
-        .concat(" value){(void)value;")
-        .append_value_field_actions(fields, index, unions, DestroyValue)
-    Ok(destroyed.concat("}"))
+        .concat(" value,unsigned depth){(void)value;(void)depth;")
+        .append_value_field_actions(fields, index, unions, DestroyNested)
+    drop = top_level_drop(
+        "void blorp_record_drop_${index}(blorp_r_${index} value)",
+        "blorp_record_drop_at_${index}",
+    )
+    Ok("${destroyed}}${drop}")
 
 
 -- Each field's ownership action on a by-value record named `value`.
@@ -997,34 +1016,46 @@ private pure func append_value_field_actions(
 -- A counted record's drop only decrements and calls its release body, so the
 -- C compiler can inline the decrement where a record is dropped and keep the
 -- release out of line; a drop with the release inside is too large to inline.
+-- A record that joins the release scheduler releases its fields at the depth
+-- its nested drop passes; one whose managed fields are all Strings cannot
+-- cascade, so its nested drop ignores the depth.
 private pure func append_record_ownership(
     output: String,
     layout: ConcreteRecord,
     index: Int,
     unions: List[ConcreteUnion],
+    records: List[ConcreteRecord],
 ) -> Result[String, Diagnostic]:
     prefix = "${output}void blorp_record_dup_${index}(blorp_r_${index} value){"
+    joins ?= layout.record_joins_release(unions, records)
 
     match layout:
         InlineFields(_):
             Ok(
                 "${prefix}(void)value;}void blorp_record_drop_${index}(blorp_r_${index} value){".concat(
-                    "(void)value;}",
+                    "(void)value;}void blorp_record_drop_at_${index}(blorp_r_${index} value,unsigned depth){(void)value;(void)depth;}",
                 ),
             )
         ValueFields(fields):
             prefix.append_value_record_ownership(fields, index, unions)
         CountedFields(fields):
-            var result = "${prefix}(void)atomic_fetch_add_explicit(&value->references,UINT64_C(1),memory_order_relaxed);}".concat(
-                "void blorp_record_release_${index}(blorp_r_${index} value){",
-            )
+            release = record_release_name(index)
+            body: String = if joins:
+                "void ${release}(blorp_r_${index} value,unsigned depth){"
+            else:
+                "void ${release}(blorp_r_${index} value){"
+            action: OwnershipAction = if joins:
+                DestroyNested
+            else:
+                DestroyValue
+            var result = "${prefix}(void)atomic_fetch_add_explicit(&value->references,UINT64_C(1),memory_order_relaxed);}${body}"
             var position = 0
             var invalid: Option[Diagnostic] = None
 
             for field in fields:
                 match (result.append_storage_operation(
                     field,
-                    DestroyValue,
+                    action,
                     "value->blorp_rf_${index}_${position}",
                     unions,
                     compiler_span(),
@@ -1041,12 +1072,16 @@ private pure func append_record_ownership(
                 Some(error):
                     Err(error)
                 None:
-                    result = "${result}blorp_memory_release(value);}"
-                        .concat("void blorp_record_drop_${index}(blorp_r_${index} value){")
-                        .concat(
-                            "if(atomic_fetch_sub_explicit(&value->references,UINT64_C(1),memory_order_acq_rel)!=UINT64_C(1))return;",
+                    decrement = "if(atomic_fetch_sub_explicit(&value->references,UINT64_C(1),memory_order_acq_rel)!=UINT64_C(1))return;"
+                    drop = "void blorp_record_drop_${index}(blorp_r_${index} value)"
+                    nested = "void blorp_record_drop_at_${index}(blorp_r_${index} value,unsigned depth){"
+                    released = if joins:
+                        "${nested}${decrement}${depth_checked_release(release)}".concat(
+                            top_level_drop(drop, "blorp_record_drop_at_${index}"),
                         )
-                        .concat("blorp_record_release_${index}(value);}")
+                    else:
+                        "${drop}{${decrement}${release}(value);}${nested}(void)depth;blorp_record_drop_${index}(value);}"
+                    result = "${result}blorp_memory_release(value);}${released}"
                         .concat(
                             "blorp_r_${index} blorp_record_make_${index}(struct blorp_r_${index} fields){",
                         )
@@ -1953,9 +1988,12 @@ private pure func owner_types(function: OwnedFunction) -> Result[List[TypeRef], 
         None: Ok(owners)
 
 
+-- DestroyNested drops a child inside a drop helper, whose C parameter `depth`
+-- counts the counted releases running below it (RELEASE_RUNTIME).
 private fixed union OwnershipAction:
     DuplicateValue
     DestroyValue
+    DestroyNested
 
 
 private pure func append_storage_operation(
@@ -1966,48 +2004,53 @@ private pure func append_storage_operation(
     unions: List[ConcreteUnion],
     span: Span,
 ) -> Result[String, Diagnostic]:
-    name_result: Result[Option[String], Diagnostic] = match value_type:
+    -- A nested destroy passes the release depth to the child's helper.
+    depth = match action:
+        DestroyNested: ",depth"
+        DuplicateValue | DestroyValue: ""
+    -- The helper and the arguments after the value. A String owns no
+    -- children, so its release never takes the depth.
+    name_result: Result[Option[(String, String)], Diagnostic] = match value_type:
         CallableType(parameters, result):
             prefix = match action:
                 DuplicateValue: "blorp_callable_dup_"
                 DestroyValue: "blorp_callable_drop_"
-            Ok(Some(prefix.concat(parameters.callable_suffix(result))))
+                DestroyNested: "blorp_callable_drop_at_"
+            Ok(Some((prefix.concat(parameters.callable_suffix(result)), depth)))
         RecordType(id):
             prefix = match action:
                 DuplicateValue: "blorp_record_dup_"
                 DestroyValue: "blorp_record_drop_"
+                DestroyNested: "blorp_record_drop_at_"
 
-            Ok(Some(prefix.append_int(id.record_number())))
+            Ok(Some((prefix.append_int(id.record_number()), depth)))
         ListType(element):
             prefix = match action:
                 DuplicateValue: "blorp_list_dup_"
                 DestroyValue: "blorp_list_drop_"
-            Ok(
-                Some(
-                    prefix.concat(
-                        element
-                            .list_element_key()
-                            .list_suffix(),
-                    ),
-                ),
-            )
+                DestroyNested: "blorp_list_drop_at_"
+            suffix = element
+                .list_element_key()
+                .list_suffix()
+            Ok(Some((prefix.concat(suffix), depth)))
         StringType:
             storage_helper: String = match action:
                 DuplicateValue: "blorp_string_retain"
-                DestroyValue: "blorp_string_release"
-            Ok(Some(storage_helper))
+                DestroyValue | DestroyNested: "blorp_string_release"
+            Ok(Some((storage_helper, "")))
         UnionType(id):
             match unions.get(id.union_number()):
                 Some(layout):
-                    union_helper: Option[String] = match layout:
+                    union_helper: Option[(String, String)] = match layout:
                         PlainCases(_):
                             None
                         OwningCases(_) | BoxedCases(_):
                             prefix = match action:
                                 DuplicateValue: "blorp_union_dup_"
                                 DestroyValue: "blorp_union_drop_"
+                                DestroyNested: "blorp_union_drop_at_"
 
-                            Some(prefix.append_int(id.union_number()))
+                            Some((prefix.append_int(id.union_number()), depth))
                     Ok(union_helper)
                 None:
                     Err(render(span, MissingUnionLayout(id)))
@@ -2016,25 +2059,51 @@ private pure func append_storage_operation(
 
     found_name ?= name_result
     operation: String = match found_name:
-        Some(name): "${output}${name}(${expression});"
+        Some((name, arguments)): "${output}${name}(${expression}${arguments});"
         None: output
     Ok(operation)
 
 
-private pure func append_union_action(
+-- An inline union's dup, its nested drop, and its drop at depth 0.
+private pure func append_owning_union_ownership(
+    output: String,
+    layout: ConcreteUnion,
+    index: Int,
+    unions: List[ConcreteUnion],
+) -> Result[String, Diagnostic]:
+    value = "struct blorp_u_${index} value"
+    duplicated ?= "${output}void blorp_union_dup_${index}(${value}){".append_variant_actions(
+        layout,
+        index,
+        unions,
+        DuplicateValue,
+        "value.",
+    )
+    nested ?= "${duplicated}}void blorp_union_drop_at_${index}(${value},unsigned depth){(void)depth;".append_variant_actions(
+        layout,
+        index,
+        unions,
+        DestroyNested,
+        "value.",
+    )
+    drop = top_level_drop(
+        "void blorp_union_drop_${index}(${value})",
+        "blorp_union_drop_at_${index}",
+    )
+    Ok("${nested}}${drop}")
+
+
+-- Each variant's ownership action on its payload fields, for the union whose
+-- members `place` reaches: `value.` for an inline union, `value->` for a node.
+private pure func append_variant_actions(
     output: String,
     layout: ConcreteUnion,
     index: Int,
     unions: List[ConcreteUnion],
     action: OwnershipAction,
+    place: String,
 ) -> Result[String, Diagnostic]:
-    prefix = match action:
-        DuplicateValue: "void blorp_union_dup_"
-        DestroyValue: "void blorp_union_drop_"
-
-    var result: Result[String, Diagnostic] = Ok(
-        "${output}${prefix}${index}(struct blorp_u_${index} value){switch(value.tag){",
-    )
+    var result: Result[String, Diagnostic] = Ok("${output}switch(${place}tag){")
     var position = 0
 
     for fields in layout.union_variants():
@@ -2043,7 +2112,7 @@ private pure func append_union_action(
             Err(error): Err(error)
         var field_position = 0
         for value_type in fields:
-            path = "value.payload.blorp_up_${position}.blorp_uf_${field_position}"
+            path = "${place}payload.blorp_up_${position}.blorp_uf_${field_position}"
             result = match result:
                 Ok(written):
                     written.append_storage_operation(
@@ -2062,7 +2131,7 @@ private pure func append_union_action(
         position = position + 1
 
     match result:
-        Ok(written): Ok("${written}}}")
+        Ok(written): Ok("${written}}")
         Err(error): Err(error)
 
 
@@ -2099,7 +2168,7 @@ private pure func append_boxed_union_prototypes(
             node = "".append_boxed_union_struct(index)
             fragments = fragments.append(
                 "${node};void blorp_union_dup_${index}(${node}*);".concat(
-                    "void blorp_union_drop_${index}(${node}*);",
+                    "void blorp_union_drop_${index}(${node}*);void blorp_union_drop_at_${index}(${node}*,unsigned);",
                 ),
             )
 
@@ -2108,11 +2177,9 @@ private pure func append_boxed_union_prototypes(
     fragments.join("")
 
 
--- Final release walks the chain instead of recursing: a dead node releases
--- its other payloads, saves its one self child, is freed, and the walk
--- continues with that child while it also dies. C stack use is therefore
--- constant however deep the chain is. The drop only decrements and calls the
--- release, like every counted layout's.
+-- A node owns a node of its own layout, so every boxed union joins the release
+-- scheduler: its release body drops each payload, self children included, at
+-- the depth its nested drop passes.
 private pure func append_boxed_union_release(
     output: String,
     layout: ConcreteUnion,
@@ -2120,56 +2187,22 @@ private pure func append_boxed_union_release(
     unions: List[ConcreteUnion],
 ) -> Result[String, Diagnostic]:
     node = "".append_boxed_union_struct(index)
-    var result: Result[String, Diagnostic] = Ok(
-        "${output}void blorp_union_release_${index}(${node}* value){${node}* node=value;for(;;){".concat(
-            "${node}* child=NULL;switch(node->tag){",
-        ),
+    release = union_release_name(index)
+    body ?= "${output}void ${release}(${node}* value,unsigned depth){".append_variant_actions(
+        layout,
+        index,
+        unions,
+        DestroyNested,
+        "value->",
     )
-    var position = 0
-
-    for fields in layout.union_variants():
-        result = match result:
-            Ok(written): Ok("${written}case blorp_v_${index}_${position}:")
-            Err(error): Err(error)
-        var field_position = 0
-        for value_type in fields:
-            path = "node->payload.blorp_up_${position}.blorp_uf_${field_position}"
-            self_child = match value_type:
-                UnionType(id): id.union_number() == index
-                _: False
-            result = match result:
-                Ok(written):
-                    if self_child:
-                        Ok("${written}child=${path};")
-                    else:
-                        written.append_storage_operation(
-                            value_type,
-                            DestroyValue,
-                            path,
-                            unions,
-                            compiler_span(),
-                        )
-                Err(error):
-                    Err(error)
-            field_position = field_position + 1
-        result = match result:
-            Ok(written): Ok("${written}break;")
-            Err(error): Err(error)
-        position = position + 1
-
-    decrement = "atomic_fetch_sub_explicit(&child->references,UINT64_C(1),memory_order_acq_rel)!=UINT64_C(1)"
-    drop = "void blorp_union_drop_${index}(${node}* value){".concat(
+    nested = "void blorp_union_drop_at_${index}(${node}* value,unsigned depth){".concat(
         "if(atomic_fetch_sub_explicit(&value->references,UINT64_C(1),memory_order_acq_rel)!=UINT64_C(1))return;",
     )
-    match result:
-        Ok(written):
-            Ok(
-                "${written}}blorp_memory_release(node);if(child==NULL||${decrement})return;node=child;}}".concat(
-                    "${drop}blorp_union_release_${index}(value);}",
-                ),
-            )
-        Err(error):
-            Err(error)
+    drop = top_level_drop(
+        "void blorp_union_drop_${index}(${node}* value)",
+        "blorp_union_drop_at_${index}",
+    )
+    Ok("${body}blorp_memory_release(value);}${nested}${depth_checked_release(release)}${drop}")
 
 
 private pure func append_union_ownership(
@@ -2182,9 +2215,7 @@ private pure func append_union_ownership(
         PlainCases(_):
             Ok(output)
         OwningCases(_):
-            match output.append_union_action(layout, index, unions, DuplicateValue):
-                Ok(duplicated): duplicated.append_union_action(layout, index, unions, DestroyValue)
-                Err(error): Err(error)
+            output.append_owning_union_ownership(layout, index, unions)
         BoxedCases(_):
             constructed = output.append_boxed_union_constructor(index)
             constructed
@@ -3524,17 +3555,21 @@ private pure func append_list_prototypes(output: String, layouts: List[ListLayou
         for layout in layouts:
             suffix = layout.key.list_suffix()
             type_name = layout.key.list_c_type()
-            fragment = "struct blorp_l_${suffix};void blorp_list_dup_${suffix}(${type_name});void blorp_list_drop_${suffix}(${type_name});"
+            fragment = "struct blorp_l_${suffix};void blorp_list_dup_${suffix}(${type_name});void blorp_list_drop_${suffix}(${type_name});".concat(
+                "void blorp_list_drop_at_${suffix}(${type_name},unsigned);",
+            )
             fragments = fragments.append(fragment)
         fragments.join("")
 
 
 -- The element C type and the stored-occurrence fragments every helper of one
--- List layout stores and destroys through.
+-- List layout stores and destroys through; `nested_destroy` destroys an
+-- element inside the layout's release body, at its `depth`.
 private record ElementFragments {
     type_name: String,
     acquire: String,
     destroy: String,
+    nested_destroy: String,
 }
 
 
@@ -3552,6 +3587,7 @@ private pure func element_fragments(
             type_name = child.list_c_type(),
             acquire = "blorp_list_dup_${suffix}(element);",
             destroy = "blorp_list_drop_${suffix}(element);",
+            nested_destroy = "blorp_list_drop_at_${suffix}(element,depth);",
         })
     else:
         layout.element.terminal_element_fragments(unions, records)
@@ -3572,7 +3608,17 @@ private pure func terminal_element_fragments(
     destroy: String ?= match needs_owner:
         False: Ok("")
         True: "".append_storage_operation(element, DestroyValue, "element", unions, compiler_span())
-    Ok({ type_name = type_name, acquire = acquire, destroy = destroy })
+    nested_destroy: String ?= match needs_owner:
+        False:
+            Ok("")
+        True:
+            "".append_storage_operation(element, DestroyNested, "element", unions, compiler_span())
+    Ok({
+        type_name = type_name,
+        acquire = acquire,
+        destroy = destroy,
+        nested_destroy = nested_destroy,
+    })
 
 
 private pure func list_runtime_fragment(
@@ -3581,7 +3627,12 @@ private pure func list_runtime_fragment(
     records: List[ConcreteRecord],
 ) -> Result[String, Diagnostic]:
     element ?= layout.element_fragments(unions, records)
-    Ok(layout.key.list_runtime(element.type_name, element.acquire, element.destroy))
+    joins ?= layout.list_joins_release(unions, records)
+    release: Option[String] = if joins:
+        Some(element.nested_destroy)
+    else:
+        None
+    Ok(layout.key.list_runtime(element.type_name, element.acquire, element.destroy, release))
 
 
 private pure func append_list_updates(
@@ -3640,6 +3691,120 @@ private pure func append_list_runtime(
             None: Ok(fragments.join("\n"))
 
 
+-- Whether releasing a value of this type may release a counted object that
+-- owns children. A String owns none, so a layout whose managed children are
+-- all Strings keeps a release that ignores the depth; every layout on a cycle
+-- has a child that is not a String, and joins the release scheduler.
+private pure func may_release_owner(
+    value_type: TypeRef,
+    unions: List[ConcreteUnion],
+    records: List[ConcreteRecord],
+) -> Result[Bool, Diagnostic]:
+    match value_type:
+        StringType: Ok(False)
+        _: value_type.value_needs_ownership(unions, records)
+
+
+private pure func any_may_release_owner(
+    fields: List[TypeRef],
+    unions: List[ConcreteUnion],
+    records: List[ConcreteRecord],
+) -> Result[Bool, Diagnostic]:
+    var found: Result[Bool, Diagnostic] = Ok(False)
+    for field in fields:
+        found = match found:
+            Ok(False): field.may_release_owner(unions, records)
+            _: found
+    found
+
+
+-- Whether a record joins the release scheduler: a counted record whose
+-- release may release a child that owns children.
+private pure func record_joins_release(
+    layout: ConcreteRecord,
+    unions: List[ConcreteUnion],
+    records: List[ConcreteRecord],
+) -> Result[Bool, Diagnostic]:
+    match layout:
+        CountedFields(fields): fields.any_may_release_owner(unions, records)
+        InlineFields(_) | ValueFields(_): Ok(False)
+
+
+-- Whether a List layout joins the release scheduler: its elements may own children.
+private pure func list_joins_release(
+    layout: ListLayout,
+    unions: List[ConcreteUnion],
+    records: List[ConcreteRecord],
+) -> Result[Bool, Diagnostic]:
+    layout.element.may_release_owner(unions, records)
+
+
+private pure func record_release_name(index: Int) -> String:
+    "blorp_record_release_${index}"
+
+
+private pure func union_release_name(index: Int) -> String:
+    "blorp_union_release_${index}"
+
+
+-- The release body of every layout that joins the release scheduler, in
+-- record, union and List order; each also names its kind.
+private pure func release_bodies(
+    records: List[ConcreteRecord],
+    unions: List[ConcreteUnion],
+    lists: List[ListLayout],
+) -> Result[List[String], Diagnostic]:
+    var bodies: List[String] = []
+    var failure: Option[Diagnostic] = None
+    var index = 0
+    for layout in records:
+        match layout.record_joins_release(unions, records):
+            Ok(True):
+                bodies = bodies.append(record_release_name(index))
+            Ok(False):
+                void
+            Err(error):
+                failure = Some(error)
+                break
+        index = index + 1
+    index = 0
+    for layout in unions:
+        if layout.union_is_boxed():
+            bodies = bodies.append(union_release_name(index))
+        index = index + 1
+    for layout in lists:
+        match layout.list_joins_release(unions, records):
+            Ok(True):
+                bodies = bodies.append(layout.key.list_release_name())
+            Ok(False):
+                void
+            Err(error):
+                failure = Some(error)
+                break
+    match failure:
+        Some(error): Err(error)
+        None: Ok(bodies)
+
+
+-- The scheduler's kinds and state, before the first drop that parks.
+private pure func release_scheduler(bodies: List[String]) -> String:
+    kinds = bodies
+        .map(pure func(body): "${release_kind(body)},")
+        .join("")
+    "enum blorp_release_kind{${kinds}blorp_release_kinds};\n${RELEASE_RUNTIME}"
+
+
+-- Releases a parked object with its kind's release body at depth 1; emitted
+-- after every release body.
+private pure func release_dispatch(bodies: List[String]) -> String:
+    cases = bodies
+        .map(pure func(body): "case ${release_kind(body)}:${body}(dead,1);break;")
+        .join("")
+    "static void blorp_release_dispatch(enum blorp_release_kind kind,void *dead){switch(kind){${cases}".concat(
+        "case blorp_release_kinds:abort();}}\n",
+    )
+
+
 private pure func aggregate_runtime_contents(
     program: VerifiedProgram,
     lists: List[ListLayout],
@@ -3651,6 +3816,15 @@ private pure func aggregate_runtime_contents(
     completed ?= "".append_list_runtime(lists, checked.unions, checked.records)
     updates ?= "".append_list_updates(helpers, checked.unions, checked.records)
     ops ?= callables.callable_ops(checked.unions)
+    bodies ?= release_bodies(checked.records, checked.unions, lists)
+    scheduler = if bodies.is_empty():
+        ""
+    else:
+        bodies.release_scheduler()
+    dispatch = if bodies.is_empty():
+        ""
+    else:
+        bodies.release_dispatch()
     var fragments: List[String] = [
         callables.callable_declarations(),
         "".append_list_prototypes(lists),
@@ -3674,12 +3848,13 @@ private pure func aggregate_runtime_contents(
         index = index + 1
 
     fragments = fragments.append("".append_boxed_union_prototypes(checked.unions))
+    fragments = fragments.append(scheduler)
     fragments = fragments.append(ordered)
     index = 0
     var failure: Option[Diagnostic] = None
 
     for layout in checked.records:
-        match "".append_record_ownership(layout, index, checked.unions):
+        match "".append_record_ownership(layout, index, checked.unions, checked.records):
             Ok(ownership):
                 fragments = fragments.append("${ownership}\n")
             Err(error):
@@ -3699,7 +3874,7 @@ private pure func aggregate_runtime_contents(
                 .arguments_runtime()
         NoArguments(_, _):
             ""
-    fragments = fragments.concat([completed, updates, arguments, ops])
+    fragments = fragments.concat([completed, updates, arguments, ops, dispatch])
     Ok(fragments.join(""))
 
 

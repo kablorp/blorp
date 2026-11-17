@@ -106,8 +106,8 @@ done.
     cold split (a drop only decrements and calls an out-of-line release
     body), and L2, the depth budget (releasing any value uses bounded C
     stack). The plan's measurements record each landing.
-  - **Next:** L2. Lifting the one-self-payload rule waits for the
-    recursive-unions decision.
+  - **Next:** lifting the one-self-payload rule, which no longer protects
+    release; it waits for the recursive-unions decision.
 
 ## Smaller follow-ups
 
