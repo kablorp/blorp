@@ -994,6 +994,9 @@ private pure func append_value_field_actions(
     result
 
 
+-- A counted record's drop only decrements and calls its release body, so the
+-- C compiler can inline the decrement where a record is dropped and keep the
+-- release out of line; a drop with the release inside is too large to inline.
 private pure func append_record_ownership(
     output: String,
     layout: ConcreteRecord,
@@ -1012,11 +1015,9 @@ private pure func append_record_ownership(
         ValueFields(fields):
             prefix.append_value_record_ownership(fields, index, unions)
         CountedFields(fields):
-            var result = "${prefix}(void)atomic_fetch_add_explicit(&value->references,UINT64_C(1),memory_order_relaxed);}"
-                .concat("void blorp_record_drop_${index}(blorp_r_${index} value){")
-                .concat(
-                    "if(atomic_fetch_sub_explicit(&value->references,UINT64_C(1),memory_order_acq_rel)!=UINT64_C(1))return;",
-                )
+            var result = "${prefix}(void)atomic_fetch_add_explicit(&value->references,UINT64_C(1),memory_order_relaxed);}".concat(
+                "void blorp_record_release_${index}(blorp_r_${index} value){",
+            )
             var position = 0
             var invalid: Option[Diagnostic] = None
 
@@ -1041,6 +1042,11 @@ private pure func append_record_ownership(
                     Err(error)
                 None:
                     result = "${result}blorp_memory_release(value);}"
+                        .concat("void blorp_record_drop_${index}(blorp_r_${index} value){")
+                        .concat(
+                            "if(atomic_fetch_sub_explicit(&value->references,UINT64_C(1),memory_order_acq_rel)!=UINT64_C(1))return;",
+                        )
+                        .concat("blorp_record_release_${index}(value);}")
                         .concat(
                             "blorp_r_${index} blorp_record_make_${index}(struct blorp_r_${index} fields){",
                         )
@@ -2102,10 +2108,11 @@ private pure func append_boxed_union_prototypes(
     fragments.join("")
 
 
--- Final release walks the chain instead of recursing: a node whose count
--- reaches zero releases its other payloads, saves its one self child, is
--- freed, and the walk continues with that child while it also dies. C stack
--- use is therefore constant however deep the chain is.
+-- Final release walks the chain instead of recursing: a dead node releases
+-- its other payloads, saves its one self child, is freed, and the walk
+-- continues with that child while it also dies. C stack use is therefore
+-- constant however deep the chain is. The drop only decrements and calls the
+-- release, like every counted layout's.
 private pure func append_boxed_union_release(
     output: String,
     layout: ConcreteUnion,
@@ -2114,11 +2121,9 @@ private pure func append_boxed_union_release(
 ) -> Result[String, Diagnostic]:
     node = "".append_boxed_union_struct(index)
     var result: Result[String, Diagnostic] = Ok(
-        "${output}void blorp_union_drop_${index}(${node}* value){${node}* node=value;while(node!=NULL){"
-            .concat(
-                "if(atomic_fetch_sub_explicit(&node->references,UINT64_C(1),memory_order_acq_rel)!=UINT64_C(1))return;",
-            )
-            .concat("${node}* child=NULL;switch(node->tag){"),
+        "${output}void blorp_union_release_${index}(${node}* value){${node}* node=value;for(;;){".concat(
+            "${node}* child=NULL;switch(node->tag){",
+        ),
     )
     var position = 0
 
@@ -2152,9 +2157,19 @@ private pure func append_boxed_union_release(
             Err(error): Err(error)
         position = position + 1
 
+    decrement = "atomic_fetch_sub_explicit(&child->references,UINT64_C(1),memory_order_acq_rel)!=UINT64_C(1)"
+    drop = "void blorp_union_drop_${index}(${node}* value){".concat(
+        "if(atomic_fetch_sub_explicit(&value->references,UINT64_C(1),memory_order_acq_rel)!=UINT64_C(1))return;",
+    )
     match result:
-        Ok(written): Ok("${written}}blorp_memory_release(node);node=child;}}")
-        Err(error): Err(error)
+        Ok(written):
+            Ok(
+                "${written}}blorp_memory_release(node);if(child==NULL||${decrement})return;node=child;}}".concat(
+                    "${drop}blorp_union_release_${index}(value);}",
+                ),
+            )
+        Err(error):
+            Err(error)
 
 
 private pure func append_union_ownership(

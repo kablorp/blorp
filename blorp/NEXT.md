@@ -101,6 +101,13 @@ done.
     Q2, emit's failure-flag loops carrying a `Result`.
   - **Next:** land them in order. Records by value moved here and wait for
     the records design pilot.
+- **Release in constant C stack:** [`RELEASE_PLAN.md`](RELEASE_PLAN.md).
+  - **Status:** Keith approved two stacked landings on 2026-11-16: L1, the
+    cold split (a drop only decrements and calls an out-of-line release
+    body), and L2, the depth budget (releasing any value uses bounded C
+    stack). The plan's measurements record each landing.
+  - **Next:** L2. Lifting the one-self-payload rule waits for the
+    recursive-unions decision.
 
 ## Smaller follow-ups
 
