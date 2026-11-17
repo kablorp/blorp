@@ -1,7 +1,7 @@
 # Language server: `blorp lsp`
 
 **Status: plan, 2026-11-10; Keith settled its decisions and asked for a byte
-console on 2026-11-11. Landings 1–6 have landed; 7 is next.**
+console on 2026-11-11. Landings 1–7 have landed; 8 is next.**
 
 ## Problem
 
@@ -564,7 +564,7 @@ backs it out; for landing 7, re-pinning the previous seed does.
 4. **Fixed identities:** the seven types become `fixed`.
 5. **Name uses**, always recorded.
 6. **Console labels:** builtin labels, runtime and emission, no library.
-7. **Seed rotation**, a plain one (the `Path` landing's was `c0512c385`).
+7. **Seed rotation**, pinning `blorp-seed-4fee244ad96f`.
 8. **The `io/console` functions.**
 9. **`blorp lsp`:** the `src/lsp/` modules, the transport, and the README's
    v1 limitation.
@@ -859,13 +859,25 @@ onto `07ff200b4`, whose new commits touch none of its compiler files;
   review fix. The check test asserts the mismatch message and its help; the
   emission tests assert the guard and helpers appear once when `capture`
   and every console operation are used together.
+- **Linux.** Main's CI failed two closed-reader cases on Linux x64 GCC
+  alone: each passed `error` beside the call that sets it, and GCC on x86_64
+  evaluates arguments right to left, so the test read -1. `4fee244ad` stores
+  each result first; all 25 cases, the directory on stdin among them, now
+  pass on Linux x64 and ARM64 with GCC and Clang.
 - **Found, not fixed.**
   - `capture` and `exit_interrupted` call `fflush(stdout)` without the guard.
-  - `EISDIR` from a directory on stdin is tested on macOS only.
   - A small write to a closed reader reports EPIPE at the next flush, or not
     at all if the program exits first.
   - `console_suite.brp` repeats about 40 lines of `fs_suite.brp`'s helpers,
     and five tests repeat the label list in their help text.
+
+**Landing 7** (a plain rotation). The pin names `blorp-seed-4fee244ad96f`,
+which main's CI built from `4fee244ad`: landing 6 with its test fix. The
+seed also carries the impure trait methods plan's landing 1 (`07ff200b4`).
+A program that declares and calls the five console labels fails under the
+old seed with "unknown builtin operation" and compiles under the new one.
+The compiler build, `test_bootstrap.sh`, `make test`, the fixpoint and
+`make -C blorp test-e2e INSTRUCTION_CHECK=on` pass with no ceiling raised.
 
 ## Testing
 

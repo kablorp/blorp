@@ -51,11 +51,11 @@ done.
     comments as lexer output; landing 3, the lexer's prefix on failure;
     landing 4, fixed identities; landing 5, name uses: analysis records
     one inline row per name used in source, its span and the identity it
-    resolves to; and landing 6, console labels: `console.write`,
+    resolves to; landing 6, console labels: `console.write`,
     `write_error`, `flush`, `read_line` and `read_exact`, with their runtime
-    and emission and no library functions yet.
-  - **Next:** landing 7, a plain seed rotation so the seed knows the console
-    labels; then landing 8, the `io/console` functions.
+    and emission and no library functions yet; and landing 7, a seed
+    rotation to `blorp-seed-4fee244ad96f`, which knows those labels.
+  - **Next:** landing 8, the `io/console` functions.
 - **String code points:** [`STRING_PLAN.md`](STRING_PLAN.md).
   - **Status:** approved on 2026-11-10: `length` counts code points, from a
     count stored in each String, and byte work uses `byte_*` functions. L1
@@ -110,7 +110,9 @@ done.
     reviewed the same day, and Keith approved it with T1 to T4 as
     recommended.
   - **Landed:** landing 1, impure trait methods; landing 2, resource
-    receivers (D41 in `FILESYSTEM_DECISIONS.md`).
+    receivers (D41 in `FILESYSTEM_DECISIONS.md`). The pinned seed
+    (`blorp-seed-4fee244ad96f`) carries landing 1, so seed-built code may
+    declare impure trait methods.
   - **Next:** landing 3, resource-aware helps. Landing 2 must not reach a
     release without it.
 
