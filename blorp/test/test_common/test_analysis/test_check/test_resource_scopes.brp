@@ -7,8 +7,13 @@ import:
     test: TestSuite
     ../../../../src/common/analysis/check/check: CheckedProgram, check
     ../../../../src/common/analysis/load/load: LibrarySource(LibraryDirectory), load_program
-    ../../../../src/common/syntax/source: module_source, root_module_id
-    ../../../../src/common/syntax/syntax: Diagnostic
+    ../../../../src/common/syntax/source:
+        SourceInputs,
+        module_number,
+        module_source,
+        root_module_id,
+        source_module,
+    ../../../../src/common/syntax/syntax: Diagnostic, DiagnosticNote(NoteLines), NoteLine, Span
     ../../../support/input: setup_diagnostic
     ../../../support/module_input: parse_modules
 
@@ -1235,42 +1240,428 @@ pure func test_record_update_cannot_store_scoped_closure() -> Bool:
     )
 
 
-pure func test_resource_type_cannot_implement_a_trait() -> Bool:
-    opening: String =
-        |trait Described:
-        |    pure func describe(self: Self) -> String
-        |
-    before = opening + "implements Described for "
-    after: String =
-        |:
-        |    pure func describe(self: Self) -> String:
-        |        "token"
-        |
-    rejects_loan(
-        before,
+-- What a rejection with one note says: its message, its help and the note.
+private record NotedRejection {
+    message: String,
+    help: String,
+    note: String,
+}
+
+
+-- The single rejection, at `marked`, with one note at `noted`, which the
+-- source writes first: `before + noted + between + marked + after`.
+private pure func rejects_noted(
+    before: String,
+    noted: String,
+    between: String,
+    marked: String,
+    after: String,
+    expected: NotedRejection,
+) -> Bool:
+    root = module_source(root_module_id())
+    start = before.length() + noted.length() + between.length()
+    span: Span = { source = root, start = start, end = start + marked.length() }
+    note: NoteLine = {
+        span = { source = root, start = before.length(), end = before.length() + noted.length() },
+        text = expected.note,
+    }
+    match checked_source(before + noted + between + marked + after):
+        Ok(_):
+            False
+        Err(error):
+            (error.message == expected.message)
+                .and(error.help == expected.help)
+                .and(error.span == span)
+                .and(error.note == Some(NoteLines([note])))
+
+
+-- Token implements Marked, whose `head + noted + between` declares the
+-- rejected method; the rejection is at Token and the note at `noted`.
+private pure func rejects_contract(
+    head: String,
+    noted: String,
+    between: String,
+    help: String,
+    note: String,
+) -> Bool:
+    rejects_noted(
+        RESOURCE + "trait Marked:\n" + head,
+        noted,
+        between + "\nimplements Marked for ",
         "Token",
-        after,
-        "the resource type Token cannot implement a trait",
-        "resource types cannot implement traits yet; write an impure function that takes a Token instead",
+        "\n" + MAIN,
+        { message = "the resource type Token cannot implement Marked", help = help, note = note },
     )
 
 
-pure func test_resource_type_cannot_take_a_default_implementation() -> Bool:
-    opening: String =
-        |trait Marked:
-        |    pure func mark(self: Self) -> Int:
-        |        0
-        |
-    before = opening + "implements Marked for "
+private CHANGE_HELP: String = "so that the Token is not its result or part of a List, tuple or record, or write an impure function that takes the Token instead"
+
+
+private PURE_PARAMETER: String = "pure functions cannot take the resource type Token"
+
+
+-- The two interim tests: each trait has a pure method that Token would be
+-- Self of, the first authored and the second inherited.
+pure func test_resource_cannot_be_self_of_a_pure_method() -> Bool:
     after: String =
         |
+        |    pure func describe(self: Self) -> String:
+        |        "token"
+        |
+    rejects_noted(
+        RESOURCE + "trait Described:\n    pure func describe(self: ",
+        "Self",
+        ") -> String\nimplements Described for ",
+        "Token",
+        ":" + after + MAIN,
+        {
+            message = "the resource type Token cannot implement Described",
+            help = "declare describe without pure in Described, or write an impure function that takes the Token instead",
+            note = "in Described.describe: " + PURE_PARAMETER,
+        },
+    )
+
+
+pure func test_resource_cannot_inherit_a_pure_default() -> Bool:
+    rejects_contract(
+        "    pure func mark(self: ",
+        "Self",
+        ") -> Int:\n        0",
+        "declare mark without pure in Marked, or write an impure function that takes the Token instead",
+        "in Marked.mark: " + PURE_PARAMETER,
+    )
+
+
+pure func test_resource_cannot_implement_a_trait_above_a_pure_method() -> Bool:
+    rejects_noted(
+        RESOURCE + "trait Described:\n    pure func describe(self: ",
+        "Self",
+        ") -> String\ntrait Marked: Described:\n    func mark(self: Self) -> Int\nimplements Marked for ",
+        "Token",
+        ":\n    func mark(self: Self) -> Int:\n        0\n" + MAIN,
+        {
+            message = "the resource type Token cannot implement Marked",
+            help = "declare describe without pure in Described, or write an impure function that takes the Token instead",
+            note = "in describe, inherited from Described via Marked: " + PURE_PARAMETER,
+        },
+    )
+
+
+pure func test_resource_cannot_be_returned_by_its_method() -> Bool:
+    rejects_contract(
+        "    func copy(self: Self) -> ",
+        "Self",
+        "",
+        "change copy in Marked " + CHANGE_HELP,
+        "in Marked.copy: the resource type Token cannot be returned",
+    )
+
+
+-- The method is impure, so the help does not suggest dropping pure from it.
+pure func test_resource_cannot_be_taken_by_a_pure_callable_result() -> Bool:
+    rejects_contract(
+        "    func handler(self: Self) -> ",
+        "pure (Self) -> Int",
+        "",
+        "change handler in Marked " + CHANGE_HELP,
+        "in Marked.handler: " + PURE_PARAMETER,
+    )
+
+
+pure func test_resource_cannot_be_held_by_its_method_result() -> Bool:
+    rejects_contract(
+        "    func all(self: Self) -> ",
+        "List[Self]",
+        "",
+        "change all in Marked " + CHANGE_HELP,
+        "in Marked.all: the resource type Token cannot be a type argument",
+    )
+
+
+-- Marked's default `mark`, which Token inherits, is written by each test
+-- after these declarations.
+private MARKED: String =
+    |pure func measure[T](value: T) -> Int:
+    |    0
+    |func run(body: () -> Int) -> Int:
+    |    body()
+    |trait Marked:
+    |    func size(self: Self) -> Int
+    |
+
+
+-- Token inherits `mark`, written `head + noted + tail`, which misuses Self
+-- at `noted` once Self is read as Token.
+private pure func rejects_default(
+    head: String,
+    noted: String,
+    tail: String,
+    misuse: String,
+    fix: String,
+) -> Bool:
+    implemented: String =
+        |
+        |    func size(self: Self) -> Int:
+        |        consume(self)
+        |
+    rejects_noted(
+        RESOURCE + MARKED + head,
+        noted,
+        tail + "\n",
+        "implements Marked for Token:",
+        implemented + MAIN,
+        {
+            message = "the resource type Token cannot use Marked's default mark",
+            help = "write mark in this implementation ${fix}, or do not implement Marked for Token",
+            note = "in Marked's default, with Self as Token: ${misuse}",
+        },
+    )
+
+
+private VOID_MARK: String = "    func mark(self: Self) -> Void:\n        "
+
+
+private STORED: String = "without returning or storing the Token"
+
+
+private CAPTURED: String = "without a closure that captures the Token"
+
+
+private PASSED: String = "and pass the Token only to functions that take a Token"
+
+
+private MENTIONED: String = "generic parameters and containers cannot mention the resource type Token"
+
+
+private CLOSURE: String = "func() -> Int: self.size()"
+
+
+pure func test_inherited_default_cannot_bind_self() -> Bool:
+    rejects_default(
+        VOID_MARK + "kept = ",
+        "self",
+        "\n        void",
+        "the resource type Token cannot be stored",
+        STORED,
+    )
+
+
+pure func test_inherited_default_cannot_put_self_in_a_list() -> Bool:
+    rejects_default(VOID_MARK, "[self]", "", MENTIONED, PASSED)
+
+
+pure func test_inherited_default_cannot_give_self_to_a_generic_function() -> Bool:
+    rejects_default(VOID_MARK, "measure", "(self)", MENTIONED, PASSED)
+
+
+pure func test_inherited_default_cannot_take_a_generic_function_value() -> Bool:
+    rejects_default(
+        VOID_MARK + "measured: (Self) -> Int = ",
+        "measure",
+        "\n        void",
+        MENTIONED,
+        PASSED,
+    )
+
+
+pure func test_inherited_default_cannot_return_a_capturing_closure() -> Bool:
+    rejects_default(
+        "    func mark(self: Self) -> () -> Int:\n        ",
+        CLOSURE,
+        "",
+        "scoped callables cannot be returned",
+        CAPTURED,
+    )
+
+
+pure func test_inherited_default_cannot_return_a_capturing_closure_from_a_match() -> Bool:
+    rejects_default(
+        "    func mark(self: Self) -> () -> Int:\n        ",
+        "match self.size():\n            0: " + CLOSURE + "\n            _: func() -> Int: 0",
+        "",
+        "scoped callables cannot be returned",
+        CAPTURED,
+    )
+
+
+pure func test_inherited_default_cannot_store_a_capturing_closure() -> Bool:
+    rejects_default(
+        VOID_MARK + "later = [",
+        CLOSURE,
+        "]\n        void",
+        "scoped callables cannot be stored here",
+        CAPTURED,
+    )
+
+
+pure func test_inherited_default_cannot_pass_a_capturing_closure_unscoped() -> Bool:
+    rejects_default(
+        VOID_MARK + "run(",
+        CLOSURE,
+        ")",
+        "scoped callables require a scoped parameter",
+        CAPTURED,
+    )
+
+
+pure func test_inherited_default_cannot_capture_self_in_a_pure_closure() -> Bool:
+    rejects_default(
+        VOID_MARK,
+        "pure func() -> Int: measure(self)",
+        "",
+        "pure closures cannot capture the resource type Token",
+        CAPTURED,
+    )
+
+
+pure func test_inherited_default_cannot_return_self_from_a_lambda() -> Bool:
+    rejects_default(
+        VOID_MARK,
+        "func() -> Self: self",
+        "",
+        "the resource type Token cannot be returned",
+        STORED,
+    )
+
+
+pure func test_inherited_default_cannot_propagate_through_a_generic_function() -> Bool:
+    rejects_default(
+        "    func mark(self: Self) -> Result[Int, String]:\n        count: Int ?= Ok(",
+        "measure",
+        "(self))\n        Ok(count)",
+        MENTIONED,
+        PASSED,
+    )
+
+
+-- Elaboration admits written types and a pure lambda's parameters with Self
+-- rigid; read as Token, each binding type, lambda result and pure lambda
+-- parameter is admitted again.
+pure func test_inherited_default_binding_type_is_admitted_as_written() -> Bool:
+    rejects_default(
+        VOID_MARK,
+        "kept",
+        ": pure (Self) -> Int = pure func(value: Self) -> Int: 0\n        void",
+        PURE_PARAMETER,
+        "without a pure lambda that takes the Token",
+    )
+
+
+pure func test_inherited_default_lambda_binding_type_is_admitted_as_written() -> Bool:
+    rejects_default(
+        VOID_MARK + "func() -> Int:\n            ",
+        "kept",
+        ": List[Self] = []\n            0",
+        "the resource type Token cannot be a type argument",
+        PASSED,
+    )
+
+
+pure func test_inherited_default_lambda_result_is_admitted_as_written() -> Bool:
+    rejects_default(
+        VOID_MARK,
+        "func() -> Option[Self]: None",
+        "",
+        "the resource type Token cannot be a type argument",
+        PASSED,
+    )
+
+
+pure func test_inherited_default_pure_lambda_cannot_take_self() -> Bool:
+    rejects_default(
+        VOID_MARK + "pure func(",
+        "value",
+        ": Self) -> Int: 0",
+        PURE_PARAMETER,
+        "without a pure lambda that takes the Token",
+    )
+
+
+-- A receiver that is a whole resource is Self of a body walked with it in
+-- view: an authored method, a default walked again, or a defaults-only
+-- implementation. A method value takes the receiver the same way.
+pure func test_resource_receives_impure_trait_methods() -> Bool:
+    source: String =
+        |trait Sized:
+        |    func size(self: Self) -> Int
+        |trait Marked: Sized:
+        |    func mark(self: Self) -> Int
+        |    func doubled(self: Self) -> Int:
+        |        marked = self.mark()
+        |        self.size()
+        |trait Counted:
+        |    func count(self: Self) -> Int:
+        |        0
+        |implements Sized for Token:
+        |    func size(self: Self) -> Int:
+        |        consume(self)
+        |implements Marked for Token:
+        |    func mark(self: Self) -> Int:
+        |        self.size()
+        |implements Counted for Token
+        |func apply(token: Token, measure: (Token) -> Int) -> Int:
+        |    measure(token)
+        |func during(token: Token) -> Int:
+        |    twice = token.doubled()
+        |    none = token.count()
+        |    apply(token, mark)
+        |
+    checked_source(RESOURCE + source + MAIN).is_ok()
+
+
+-- The walk again views only the default's own Self: nested lambdas, a method
+-- value and a generic call at another type each read every type it tests.
+pure func test_inherited_default_views_only_its_own_self() -> Bool:
+    source: String =
+        |    func mark(self: Self) -> Int:
+        |        outer = func(count: Int) -> Int:
+        |            inner = func() -> Int: self.size()
+        |            measured = measure(count)
+        |            inner()
+        |        sized: (Self) -> Int = size
+        |        text = measure("text")
+        |        outer(sized(self))
+        |implements Marked for Token:
+        |    func size(self: Self) -> Int:
+        |        consume(self)
+        |
+    checked_source(RESOURCE + MARKED + source + MAIN).is_ok()
+
+
+-- One default, inherited by two resources, is walked once for each.
+pure func test_inherited_default_is_walked_for_each_resource() -> Bool:
+    source: String =
+        |    func mark(self: Self) -> Int:
+        |        self.size()
+        |implements Marked for Token:
+        |    func size(self: Self) -> Int:
+        |        consume(self)
+        |resource type Ticket = Int
+        |implements Marked for Ticket:
+        |    func size(self: Self) -> Int:
+        |        from_opaque Ticket(self)
+        |
+    checked_source(RESOURCE + MARKED + source + MAIN).is_ok()
+
+
+-- A generic function still never takes a resource, bounded or not.
+pure func test_bounded_generic_cannot_take_a_resource() -> Bool:
+    opening: String =
+        |trait Marked:
+        |    func mark(self: Self) -> Int
+        |implements Marked for Token:
+        |    func mark(self: Self) -> Int:
+        |        consume(self)
+        |func announce[T: Marked](value: T) -> Int:
+        |    value.mark()
+        |func during(token: Token) -> Int:
         |
     rejects_loan(
-        before,
-        "Token",
-        after,
-        "the resource type Token cannot implement a trait",
-        "resource types cannot implement traits yet; write an impure function that takes a Token instead",
+        opening + "    ",
+        "announce",
+        "(token)\n",
+        MENTIONED,
+        "the inferred type here is Token; call functions that take a Token directly instead",
     )
 
 
@@ -1317,6 +1708,82 @@ func test_temporary_directory_body_may_capture_a_reader() -> Bool:
         Ok(loaded): check(loaded.program).is_ok()
 
 
+-- The library's Writer implements an impure trait, inheriting a default.
+func test_writer_implements_an_impure_trait() -> Bool:
+    match load_program(FIXTURES + "writer_sink.brp", LibraryDirectory("blorp/standard_library")):
+        Err(_): False
+        Ok(loaded): check(loaded.program).is_ok()
+
+
+-- The text `span` covers in its module, with `before` bytes ahead of it.
+private pure func spanned(sources: SourceInputs, span: Span, before: Int) -> Option[String]:
+    match span.source.source_module():
+        Some(module):
+            match sources.modules.get(module.module_number()):
+                Some(file): file.contents.slice(span.start - before, span.end)
+                None: None
+        None:
+            None
+
+
+-- A library trait cannot drop pure, so the help offers only an impure
+-- function; the note is at Self in the library's Stringable.
+func test_resource_cannot_implement_a_library_trait() -> Bool:
+    before = "resource type Token = Int\n\n\nimplements Stringable for "
+    signature = "pure func to_string(value: "
+    match load_program(
+        FIXTURES + "stringable_token.brp",
+        LibraryDirectory("blorp/standard_library"),
+    ):
+        Err(_):
+            False
+        Ok(loaded):
+            match check(loaded.program):
+                Ok(_):
+                    False
+                Err(failure):
+                    error = setup_diagnostic(failure)
+                    match error.note:
+                        Some(NoteLines([note])):
+                            (error.message == "the resource type Token cannot implement Stringable")
+                                .and(
+                                    (
+                                        error.help
+                                        == "write an impure function that takes the Token instead"
+                                    ),
+                                )
+                                .and(error.span.source == module_source(root_module_id()))
+                                .and(error.span.start == before.length())
+                                .and(error.span.end == before.length() + "Token".length())
+                                .and(note.text == "in Stringable.to_string: " + PURE_PARAMETER)
+                                .and(
+                                    (
+                                        loaded.sources.spanned(note.span, signature.length())
+                                        == Some(signature + "Self")
+                                    ),
+                                )
+                        _:
+                            False
+
+
+-- A default declared in another module is walked again for Token.
+pure func test_inherited_default_from_another_module() -> Bool:
+    owner: String =
+        |trait Marked:
+        |    func size(self: Self) -> Int
+        |    func mark(self: Self) -> Int:
+        |        self.size()
+        |
+    source: String =
+        |import:
+        |    ./owner: Marked
+        |implements Marked for Token:
+        |    func size(self: Self) -> Int:
+        |        consume(self)
+        |
+    checked_with_owner(source + RESOURCE + MAIN, owner).is_ok()
+
+
 TESTS: TestSuite = {
     description = "Synchronous resource loans",
     tests = [
@@ -1343,10 +1810,99 @@ TESTS: TestSuite = {
             "a record update cannot store a scoped closure",
             test_record_update_cannot_store_scoped_closure,
         ),
-        ("a resource type cannot implement a trait", test_resource_type_cannot_implement_a_trait),
         (
-            "a resource type cannot take a default implementation",
-            test_resource_type_cannot_take_a_default_implementation,
+            "a resource cannot be Self of a pure method",
+            test_resource_cannot_be_self_of_a_pure_method,
+        ),
+        ("a resource cannot inherit a pure default", test_resource_cannot_inherit_a_pure_default),
+        (
+            "a resource cannot implement a trait above a pure method",
+            test_resource_cannot_implement_a_trait_above_a_pure_method,
+        ),
+        (
+            "a resource cannot implement a library trait",
+            test_resource_cannot_implement_a_library_trait,
+        ),
+        (
+            "a resource cannot be returned by its method",
+            test_resource_cannot_be_returned_by_its_method,
+        ),
+        (
+            "a resource cannot be taken by a pure callable result",
+            test_resource_cannot_be_taken_by_a_pure_callable_result,
+        ),
+        (
+            "a resource cannot be held by its method's result",
+            test_resource_cannot_be_held_by_its_method_result,
+        ),
+        ("a resource receives impure trait methods", test_resource_receives_impure_trait_methods),
+        ("a writer implements an impure trait", test_writer_implements_an_impure_trait),
+        ("a bounded generic cannot take a resource", test_bounded_generic_cannot_take_a_resource),
+        (
+            "an inherited default views only its own Self",
+            test_inherited_default_views_only_its_own_self,
+        ),
+        (
+            "an inherited default is walked for each resource",
+            test_inherited_default_is_walked_for_each_resource,
+        ),
+        ("an inherited default from another module", test_inherited_default_from_another_module),
+        ("an inherited default cannot bind Self", test_inherited_default_cannot_bind_self),
+        (
+            "an inherited default cannot put Self in a List",
+            test_inherited_default_cannot_put_self_in_a_list,
+        ),
+        (
+            "an inherited default cannot give Self to a generic function",
+            test_inherited_default_cannot_give_self_to_a_generic_function,
+        ),
+        (
+            "an inherited default cannot take a generic function value",
+            test_inherited_default_cannot_take_a_generic_function_value,
+        ),
+        (
+            "an inherited default cannot return a capturing closure",
+            test_inherited_default_cannot_return_a_capturing_closure,
+        ),
+        (
+            "an inherited default cannot return a capturing closure from a match",
+            test_inherited_default_cannot_return_a_capturing_closure_from_a_match,
+        ),
+        (
+            "an inherited default cannot store a capturing closure",
+            test_inherited_default_cannot_store_a_capturing_closure,
+        ),
+        (
+            "an inherited default cannot pass a capturing closure unscoped",
+            test_inherited_default_cannot_pass_a_capturing_closure_unscoped,
+        ),
+        (
+            "an inherited default cannot capture Self in a pure closure",
+            test_inherited_default_cannot_capture_self_in_a_pure_closure,
+        ),
+        (
+            "an inherited default cannot return Self from a lambda",
+            test_inherited_default_cannot_return_self_from_a_lambda,
+        ),
+        (
+            "an inherited default cannot propagate Self through a generic function",
+            test_inherited_default_cannot_propagate_through_a_generic_function,
+        ),
+        (
+            "an inherited default's binding type is admitted as written",
+            test_inherited_default_binding_type_is_admitted_as_written,
+        ),
+        (
+            "an inherited default's lambda binding type is admitted as written",
+            test_inherited_default_lambda_binding_type_is_admitted_as_written,
+        ),
+        (
+            "an inherited default's lambda result is admitted as written",
+            test_inherited_default_lambda_result_is_admitted_as_written,
+        ),
+        (
+            "an inherited default's pure lambda cannot take Self",
+            test_inherited_default_pure_lambda_cannot_take_self,
         ),
         (
             "inferred containers reject resource-taking callables",

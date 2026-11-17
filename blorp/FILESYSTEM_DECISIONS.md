@@ -1574,3 +1574,32 @@ tests (38/38), `git diff --check` and `blorp format --check` on every
 changed `.brp` file all pass, and `make -C blorp test` passes on the first
 and second commits alone. Their logs are in `port/gates/` beside the
 samples.
+
+## Resource types and traits, 2026-11-16
+
+Keith, 2026-11-16: "A trait does not need to implement pure methods. But if
+`pure` is specified on a trait, it needs to be respected. I think we should
+probably have defaults re-checked for each resource receiver."
+[`IMPURE_TRAIT_METHODS_PLAN.md`](IMPURE_TRAIT_METHODS_PLAN.md), which Keith
+approved the same day, carries this out: its landing 1 lets trait methods be
+impure, and its landing 2 adds the rule below.
+
+- **D41, resource receivers.** A resource type may implement a trait. It is
+  `Self` of every method of the trait and of each trait above it, and each of
+  those signatures, read with `Self` as the resource, must pass a declared
+  function's rules: D35 for a pure method, and no other parameter or result
+  may hold the resource. Check rejects an implementation that breaks this at
+  its receiver, before any signature or body takes the resource as `Self`. A
+  trait method called on a whole resource, or used as a function value with
+  one, is admitted; a generic function, bounded or not, still never takes a
+  resource. Each default the type inherits is walked again with its `Self`
+  read as the resource, so it cannot return or store the loan, let a closure
+  capturing it escape or be pure, or give it to a generic function; a misuse
+  is reported at the implementation.
+  D41 supersedes the hardening's interim rule that a resource type cannot
+  implement a trait.
+
+Costs, measured against `4fee244ad` with `blorp/scripts/self-compile-cost`
+(the plan's "Landing 2 results" has the full record): compiling the base's
+source, allocations and peak heap are unchanged and instructions rise
+0.047%; the emitted C is identical.

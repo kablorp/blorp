@@ -1,7 +1,9 @@
 ---
 One completed-body admission validates synchronous loans before Check publishes
 its products. Binding/capture facts live only for this lexical walk; ordinary
-callable types and all downstream representations remain unchanged.
+callable types and all downstream representations remain unchanged. A default
+that a resource type inherits is walked again with its Self read as that
+resource.
 ---
 import:
     bool: Bool methods
@@ -10,18 +12,23 @@ import:
     option: Option methods
     result: Result methods
     ../../syntax/syntax: Span, Purity(Pure, Impure)
-    ../ids: OpaqueId, OpaqueRow, function_number
-    ./errors as errors: CheckError, resource_error, Option methods
+    ../ids: FunctionId, OpaqueId, OpaqueRow, TraitMethodId, function_number
+    ../namespace/namespace: TypeHead(PrimitiveHead, ListHead, UnionHead, RecordHead, OpaqueHead)
+    ./declarations: Substitution, TypeRef methods
+    ./errors as errors: CheckError, ResourceUse, resource_error, scoped_error, Option methods
     ./expressions: ResolvedBody
     ./model as model:
+        AcceptedImplementation,
+        FunctionSignature,
         TypeRef,
+        TypeUse,
         binding_number,
         lambda_number,
         capture_number,
         callable_owner,
         callable_position,
         method_receiver,
-    ./resource_types: TypeRef methods, first_mentioned, refuse
+    ./resource_types: TypeRef methods, declared_resource, first_mentioned, refuse
     ./signatures: AcceptedFunction
 
 
@@ -29,6 +36,8 @@ private record Admission {
     opaques: List[OpaqueRow],
     functions: List[AcceptedFunction],
     lambdas: List[model.LambdaRow],
+    -- Set while an inherited default is walked again: its Self, as the resource.
+    lent_self: Option[Substitution],
 }
 
 
@@ -39,17 +48,161 @@ private record Facts {
 }
 
 
+-- A default that an implementation for a resource inherits, read from its
+-- `TraitDefault` member: the method, the body it names, and the
+-- implementation that reports a misuse.
+record ResourceDefault {
+    resource_type: OpaqueId,
+    method: TraitMethodId,
+    default_body: FunctionId,
+    implementation: Span,
+}
+
+
+-- Derived once from the accepted implementations: each default one for a
+-- resource inherits.
+pure func resource_defaults(
+    implementations: List[AcceptedImplementation],
+    opaques: List[OpaqueRow],
+) -> Result[List[ResourceDefault], CheckError]:
+    var rows: List[ResourceDefault] = []
+    var failure: Option[CheckError] = None
+    for implementation in implementations:
+        lent: Result[Option[OpaqueId], CheckError] = match implementation.receiver_head:
+            OpaqueHead(id): id.declared_resource(opaques, implementation.span)
+            PrimitiveHead(_) | ListHead | UnionHead(_) | RecordHead(_): Ok(None)
+        match lent:
+            Ok(Some(resource_type)):
+                for member in implementation.methods:
+                    match member.body:
+                        model.TraitDefault(function):
+                            rows = rows.append({
+                                resource_type = resource_type,
+                                method = member.method,
+                                default_body = function,
+                                implementation = implementation.span,
+                            })
+                        model.AuthoredMethod(_) | model.StructuralEquality(_, _):
+                            void
+            Ok(None):
+                void
+            Err(error):
+                failure = Some(error)
+                break
+    match failure:
+        Some(error): Err(error)
+        None: Ok(rows)
+
+
+-- Admits a completed body's loans, then walks it again for each resource that
+-- inherits it as a default, reading its Self as that resource: the first walk
+-- saw Self rigid, so it could not see the loan.
 pure func admit_resource_body(
     body: ResolvedBody,
-    return_type: TypeRef,
+    id: FunctionId,
+    signature: FunctionSignature,
     functions: List[AcceptedFunction],
     opaques: List[OpaqueRow],
+    inherited: List[ResourceDefault],
 ) -> Result[Void, CheckError]:
-    admission: Admission = { opaques = opaques, functions = functions, lambdas = body.lambdas }
+    var admitted = body.admit_body_loans(signature, functions, opaques, None)
+    for row in inherited:
+        if (
+            admitted
+                .is_ok()
+                .and(row.default_body == id)
+        ):
+            lent: Substitution = {
+                owner = model.FunctionDeclaration(id),
+                values = [model.NominalType(model.OpaqueNominal(row.resource_type), [])],
+            }
+            admitted = match body.admit_body_loans(signature, functions, opaques, Some(lent)):
+                Ok(_): Ok(void)
+                Err(error): Err(error.as_lent_default(row))
+    admitted
+
+
+-- A loan rule the second walk broke is reported at the implementation.
+private pure func as_lent_default(error: CheckError, row: ResourceDefault) -> CheckError:
+    match error.lent_misuse(row.resource_type):
+        Ok(misuse):
+            resource_error(
+                row.implementation,
+                errors.InheritedDefault({
+                    resource_type = row.resource_type,
+                    method = row.method,
+                    misuse = misuse,
+                    at = error.span,
+                }),
+            )
+        Err(passed):
+            passed
+
+
+private pure func admit_body_loans(
+    body: ResolvedBody,
+    signature: FunctionSignature,
+    functions: List[AcceptedFunction],
+    opaques: List[OpaqueRow],
+    lent_self: Option[Substitution],
+) -> Result[Void, CheckError]:
+    admission: Admission = {
+        opaques = opaques,
+        functions = functions,
+        lambdas = body.lambdas,
+        lent_self = lent_self,
+    }
+    _: Void ?= admission.admit_lent_types(body.bindings, signature.purity, signature.return_type)
     bindings ?= admission.seed_parameters(body.bindings)
     facts: Facts = { bindings = bindings, definitions = body.bindings, captures = [] }
     completed ?= admission.admit_statements(body.statements, facts)
-    admission.admit_body(body.body, completed, return_type == model.VoidType)
+    admission.admit_body(body.body, completed, signature.return_type.value_type == model.VoidType)
+
+
+-- The type as this walk reads it: in a second walk, with Self as the resource.
+private pure func viewed(
+    admission: Admission,
+    value_type: TypeRef,
+    span: Span,
+) -> Result[TypeRef, CheckError]:
+    match admission.lent_self:
+        None: Ok(value_type)
+        Some(lent): value_type.substitute_type(lent, span)
+
+
+-- Elaboration admitted written types (`resolve_type`) and refused a pure
+-- lambda's resource parameter (`lambda_scope`) with Self rigid. In a second
+-- walk each binding's type and the result are admitted again as if written,
+-- and a pure body's parameters again cannot be the resource.
+private pure func admit_lent_types(
+    admission: Admission,
+    bindings: List[model.BindingDefinition],
+    purity: Purity,
+    result: TypeUse,
+) -> Result[Void, CheckError]:
+    var admitted: Result[Void, CheckError] = Ok(void)
+    if admission.lent_self.is_some():
+        admitted = admission.admit_written(result.value_type, result.span, None)
+        pure_parameter: Option[ResourceUse] = match purity:
+            Pure: Some(errors.ResourcePureParameter)
+            Impure: None
+        for definition in bindings:
+            whole: Option[ResourceUse] = match definition.origin:
+                model.ParameterBinding(_) | model.CallableParameterBinding(_): pure_parameter
+                model.BodyLocal | model.MatchCapture: None
+            if admitted.is_ok():
+                admitted = admission.admit_written(definition.value_type, definition.span, whole)
+    admitted
+
+
+private pure func admit_written(
+    admission: Admission,
+    value_type: TypeRef,
+    span: Span,
+    whole: Option[ResourceUse],
+) -> Result[Void, CheckError]:
+    seen ?= admission.viewed(value_type, span)
+    seen.admit_as_written(admission.opaques, span, whole)
 
 
 -- A scoped parameter's binding starts scoped; every other binding starts unscoped.
@@ -146,13 +299,10 @@ private pure func admit_binding(
     definition ?= facts.definitions
         .get(id.binding_number())
         .or_checker_invariant(value.span, errors.InvalidInferenceWorklist)
-    _: Void ?= value.value_type.refuse_resource(
-        admission.opaques,
-        value.span,
-        errors.ResourceStorage,
-    )
+    stored ?= admission.viewed(value.value_type, value.span)
+    _: Void ?= stored.refuse_resource(admission.opaques, value.span, errors.ResourceStorage)
     if scoped_callable.and(definition.mutable):
-        Err(resource_error(value.span, errors.ScopedStorage))
+        Err(scoped_error(value.span, errors.ScopedStorage))
     else:
         Ok({ facts | bindings = facts.bindings.set(id.binding_number(), scoped_callable) })
 
@@ -204,12 +354,13 @@ private pure func admit_return(
     discard: Bool,
 ) -> Result[Void, CheckError]:
     scoped_callable ?= admission.admit_expression(value, facts)
+    returned ?= admission.viewed(value.value_type, value.span)
     if discard:
         Ok(void)
     else if scoped_callable:
-        Err(resource_error(value.span, errors.ScopedResult))
+        Err(scoped_error(value.span, errors.ScopedResult))
     else:
-        value.value_type.refuse_resource(admission.opaques, value.span, errors.ResourceResult)
+        returned.refuse_resource(admission.opaques, value.span, errors.ResourceResult)
 
 
 -- Check rejects matching a callable or an opaque value, and admission
@@ -221,7 +372,8 @@ private pure func admit_match_root(
     facts: Facts,
 ) -> Result[Void, CheckError]:
     scoped_callable ?= admission.admit_expression(scrutinee, facts)
-    held ?= scrutinee.value_type.mentioned_resource(admission.opaques, scrutinee.span)
+    matched ?= admission.viewed(scrutinee.value_type, scrutinee.span)
+    held ?= matched.mentioned_resource(admission.opaques, scrutinee.span)
     if scoped_callable.or(held.is_some()):
         Err(errors.checker_invariant(scrutinee.span, errors.LoanInMatchRoot))
     else:
@@ -267,13 +419,10 @@ private pure func admit_stored(
     facts: Facts,
 ) -> Result[Void, CheckError]:
     scoped_callable ?= admission.admit_expression(value, facts)
-    _: Void ?= value.value_type.refuse_resource(
-        admission.opaques,
-        value.span,
-        errors.ResourceStorage,
-    )
+    stored ?= admission.viewed(value.value_type, value.span)
+    _: Void ?= stored.refuse_resource(admission.opaques, value.span, errors.ResourceStorage)
     if scoped_callable:
-        Err(resource_error(value.span, errors.ScopedStorage))
+        Err(scoped_error(value.span, errors.ScopedStorage))
     else:
         Ok(void)
 
@@ -288,10 +437,28 @@ private pure func admit_type_arguments(
     var admitted: Result[Void, CheckError] = Ok(void)
     for argument in arguments:
         if admitted.is_ok():
-            admitted = argument
-                .mentioned_resource(admission.opaques, span)
-                .refuse(span, errors.ResourceInferredType(argument))
+            admitted = admission
+                .viewed(argument, span)
+                .and_then(
+                    pure func(seen): seen
+                        .mentioned_resource(admission.opaques, span)
+                        .refuse(span, errors.ResourceInferredType(seen)),
+                )
     admitted
+
+
+-- A method's receiver is Self, not a type argument a generic body could keep:
+-- every body that receives a resource as Self is walked with it in view.
+private pure func admit_receiver(
+    admission: Admission,
+    receiver: TypeRef,
+    span: Span,
+) -> Result[Void, CheckError]:
+    seen ?= admission.viewed(receiver, span)
+    whole ?= seen.as_resource(admission.opaques, span)
+    match whole:
+        Some(_): Ok(void)
+        None: admission.admit_type_arguments([receiver], span)
 
 
 private pure func admit_choice(
@@ -311,7 +478,7 @@ private pure func admit_choice(
                 .map(pure func(_): False)
         model.MethodCallable(method):
             admission
-                .admit_type_arguments([method.method_receiver()], span)
+                .admit_receiver(method.method_receiver(), span)
                 .map(pure func(_): False)
         model.LambdaCallable(id, environment):
             admission.admit_closure(id, environment, span, facts)
@@ -334,7 +501,10 @@ private pure func admit_closure(
                 failure = Some(error)
                 break
             Ok(captured):
-                match value.value_type.as_resource(admission.opaques, value.span):
+                whole = admission
+                    .viewed(value.value_type, value.span)
+                    .and_then(pure func(seen): seen.as_resource(admission.opaques, value.span))
+                match whole:
                     Err(error):
                         failure = Some(error)
                         break
@@ -368,11 +538,10 @@ private pure func admit_lambda(
     lambda: model.CheckedLambda,
     captures: List[Bool],
 ) -> Result[Void, CheckError]:
-    _: Void ?= lambda.return_type.value_type.refuse_resource(
-        admission.opaques,
-        lambda.return_type.span,
-        errors.ResourceResult,
-    )
+    result = lambda.return_type
+    returned ?= admission.viewed(result.value_type, result.span)
+    _: Void ?= returned.refuse_resource(admission.opaques, result.span, errors.ResourceResult)
+    _: Void ?= admission.admit_lent_types(lambda.bindings, lambda.purity, result)
     facts: Facts = {
         bindings = repeat(False, lambda.bindings.length()),
         definitions = lambda.bindings,
@@ -391,7 +560,7 @@ private pure func admit_call(
         model.UserFunction(_, arguments):
             admission.admit_type_arguments(arguments, call.span)
         model.TraitMethod(method):
-            admission.admit_type_arguments([method.method_receiver()], call.span)
+            admission.admit_receiver(method.method_receiver(), call.span)
         model.ValueCall(value):
             admission
                 .admit_expression(value, facts)
@@ -415,7 +584,7 @@ private pure func admit_operand(
     match operand:
         model.ValueOperand(value):
             match admission.admit_expression(value, facts):
-                Ok(True): Err(resource_error(value.span, errors.ScopedArgument))
+                Ok(True): Err(scoped_error(value.span, errors.ScopedArgument))
                 Ok(False): Ok(void)
                 Err(error): Err(error)
         model.CallableOperand(parameter, choice, span):
@@ -429,7 +598,7 @@ private pure func admit_operand(
                 Ok(True):
                     match admission.promised(parameter, span):
                         Ok(True): Ok(void)
-                        Ok(False): Err(resource_error(culprit, errors.ScopedArgument))
+                        Ok(False): Err(scoped_error(culprit, errors.ScopedArgument))
                         Err(error): Err(error)
                 Ok(False):
                     Ok(void)
@@ -492,9 +661,10 @@ private pure func admit_construction(
     children: List[model.CheckedExpr],
     facts: Facts,
 ) -> Result[Bool, CheckError]:
-    _: Void ?= value.value_type
+    constructed ?= admission.viewed(value.value_type, value.span)
+    _: Void ?= constructed
         .type_children()
         .first_mentioned(admission.opaques, value.span)
-        .refuse(value.span, errors.ResourceInferredType(value.value_type))
+        .refuse(value.span, errors.ResourceInferredType(constructed))
     _: Void ?= admission.admit_storage(children, facts)
     Ok(False)

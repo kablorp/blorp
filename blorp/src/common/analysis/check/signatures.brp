@@ -29,7 +29,7 @@ import:
             FsWriterFinish,
             FsWriterDiscard,
         ),
-        Purity(Pure),
+        Purity(Pure, Impure),
         binder_span,
         TypeSyntax(CallableTypeSyntax, AtomicType, QualifiedType),
         EntryResult(IntegerExitStatus, SuccessfulExit),
@@ -73,7 +73,10 @@ import:
         ImplId,
         ImplRow,
         FunctionRole(ImplementationBody, FreeFunctionBody, TraitDefaultBody),
+        OpaqueId,
         OpaqueRow,
+        TraitId,
+        TraitMethodId,
         VariantId,
     ../namespace/builtins as builtins:
         DesignatedUnions,
@@ -111,6 +114,7 @@ import:
             InvalidResolvedFunction,
             InvalidResolvedParameter,
             RuntimeContractMismatch,
+            UnlentRejection,
         ),
         SignatureError(GenericMain, MainHasParameters, MainParameterType, MainReturnType),
         checker_invariant,
@@ -145,12 +149,13 @@ import:
             NominalType,
         ),
         AggregateId(UnionAggregate),
-        NominalId(AggregateNominal),
+        NominalId(AggregateNominal, OpaqueNominal),
         TypeUse,
         type_parameter_id,
         primitive_ref,
+        entails,
     ./name_uses: NameUse, Referent(TraitReferent, TypeReferent)
-    ./resource_types: TypeRef methods, declared_resource, refuse
+    ./resource_types: TypeRef methods, declared_resource
 
 
 -- A function body after signature checking. A builtin body has been validated
@@ -236,7 +241,7 @@ pure func validate_signatures(
     ):
         Some(NamedFunction(id, DeclaredHere)): Some(id)
         _: None
-    headers ?= parsed.implementation_headers(namespace)
+    headers ?= parsed.implementation_headers(namespace, contracts)
     functions ?= parsed.accept_functions(
         namespace,
         designated,
@@ -677,18 +682,21 @@ private pure func implementation_header(
     row: ImplRow,
     scope: TypeScope,
     parsed: ParsedContents,
+    traits: List[AcceptedTrait],
 ) -> Result[AcceptedHeader, CheckError]:
     receiver ?= scope.resolve_receiver_head(row.header.receiver)
     head = receiver.head
     receiver_span = row.header.receiver.receiver_head_span()
-    -- Trait methods are pure, so none could take a resource receiver.
-    _: Void ?= match head:
-        OpaqueHead(id):
-            id
-                .declared_resource(scope.opaques, receiver_span)
-                .refuse(receiver_span, errors.ResourceImplementation)
-        PrimitiveHead(_) | ListHead | UnionHead(_) | RecordHead(_):
-            Ok(void)
+    lent_receiver: Option[OpaqueId] ?= match head:
+        OpaqueHead(id): id.declared_resource(scope.opaques, receiver_span)
+        PrimitiveHead(_) | ListHead | UnionHead(_) | RecordHead(_): Ok(None)
+    implemented ?= scope.namespace
+        .implementation_trait(row.header.module, row.id)
+        .or_checker_invariant(receiver_span, InvalidFunctionContract)
+    -- Before any signature or body that takes the resource as Self.
+    _: Void ?= match lent_receiver:
+        Some(lent): traits.admit_lent_methods(lent, implemented, scope.opaques, receiver_span)
+        None: Ok(void)
     arity ?= scope.receiver_arity(head, receiver_span)
     _: Void ?= if arity == row.header.type_parameters.length():
         Ok(void)
@@ -710,9 +718,96 @@ private pure func implementation_header(
     })
 
 
+-- A resource is Self of every method of its trait and of each trait above it.
+-- Read with Self as the resource, each signature must pass a declared
+-- function's rules: D35 keeps it out of a pure method's parameters, and no
+-- other parameter or result may hold it.
+private pure func admit_lent_methods(
+    traits: List[AcceptedTrait],
+    resource_type: OpaqueId,
+    implemented: TraitId,
+    opaques: List[OpaqueRow],
+    receiver: Span,
+) -> Result[Void, CheckError]:
+    var admitted: Result[Void, CheckError] = Ok(void)
+    for candidate in traits:
+        if (
+            admitted
+                .is_ok()
+                .and(traits.entails(implemented, candidate.id))
+        ):
+            lent: Substitution = {
+                owner = TraitDeclaration(candidate.id),
+                values = [NominalType(OpaqueNominal(resource_type), [])],
+            }
+            for method in candidate.methods:
+                if admitted.is_ok():
+                    admitted = match method.signature.admit_lent_signature(lent, opaques):
+                        Ok(_):
+                            Ok(void)
+                        Err(error):
+                            Err(error.as_contract(resource_type, implemented, method.id, receiver))
+    admitted
+
+
+private pure func admit_lent_signature(
+    signature: FunctionSignature,
+    lent: Substitution,
+    opaques: List[OpaqueRow],
+) -> Result[Void, CheckError]:
+    whole: Option[errors.ResourceUse] = match signature.purity:
+        Pure: Some(errors.ResourcePureParameter)
+        Impure: None
+    var admitted: Result[Void, CheckError] = Ok(void)
+    for parameter in signature.parameters:
+        if admitted.is_ok():
+            admitted = parameter.admit_lent_use(lent, opaques, whole)
+    if admitted.is_ok():
+        admitted = signature.return_type.admit_lent_use(lent, opaques, Some(errors.ResourceResult))
+    admitted
+
+
+private pure func admit_lent_use(
+    written: TypeUse,
+    lent: Substitution,
+    opaques: List[OpaqueRow],
+    whole: Option[errors.ResourceUse],
+) -> Result[Void, CheckError]:
+    value_type ?= written.value_type.substitute_type(lent, written.span)
+    value_type.admit_as_written(opaques, written.span, whole)
+
+
+-- A resource misuse becomes `ResourceContract` at the receiver. Requirement
+-- acceptance refused every other resource a signature could hold.
+private pure func as_contract(
+    error: CheckError,
+    resource_type: OpaqueId,
+    implemented: TraitId,
+    method: TraitMethodId,
+    receiver: Span,
+) -> CheckError:
+    match error.lent_misuse(resource_type):
+        Ok(errors.LentResource(use)):
+            errors.resource_error(
+                receiver,
+                errors.ResourceContract({
+                    resource_type = resource_type,
+                    implemented = implemented,
+                    method = method,
+                    use = use,
+                    at = error.span,
+                }),
+            )
+        Ok(errors.LentScoped(_)):
+            checker_invariant(error.span, UnlentRejection)
+        Err(passed):
+            passed
+
+
 private pure func implementation_headers(
     parsed: ParsedContents,
     namespace: Namespace,
+    traits: List[AcceptedTrait],
 ) -> Result[AcceptedHeaders, CheckError]:
     var headers: List[ImplementationHeader] = []
     var uses: List[NameUse] = []
@@ -728,7 +823,7 @@ private pure func implementation_headers(
             parameters = [],
             self_binding = None,
         }
-        match row.implementation_header(scope, parsed):
+        match row.implementation_header(scope, parsed, traits):
             Ok(accepted):
                 headers = headers.append(accepted.header)
                 uses = uses.concat(accepted.uses)

@@ -109,9 +109,10 @@ done.
     trait has each inherited default checked again. The plan was written and
     reviewed the same day, and Keith approved it with T1 to T4 as
     recommended.
-  - **Landed:** landing 1, impure trait methods.
-  - **Next:** landing 2, resource receivers (the resource-loan hardening is
-    on main); landing 3, resource-aware helps.
+  - **Landed:** landing 1, impure trait methods; landing 2, resource
+    receivers (D41 in `FILESYSTEM_DECISIONS.md`).
+  - **Next:** landing 3, resource-aware helps. Landing 2 must not reach a
+    release without it.
 
 ## Smaller follow-ups
 

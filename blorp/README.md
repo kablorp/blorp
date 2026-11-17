@@ -643,8 +643,7 @@ owner must lend a valid value and close it correctly.
 The promise is on the declared parameter, not the general callable type.
 Saving `invoke` as an ordinary function value loses that promise, so an indirect
 call cannot pass a scoped closure. Trait requirements cannot declare scoped
-parameters. A resource type cannot implement a trait yet. `private resource
-type` keeps the declaration inside its module.
+parameters. `private resource type` keeps the declaration inside its module.
 
 `private` before a declaration keeps it inside its module: it cannot be
 imported or reached through an alias. A public function, field or payload
@@ -917,6 +916,12 @@ level.
 - A call through a method has the purity its trait declares, for every
   receiver and bound, and so does a method used as a function value: a pure
   function calls only pure methods.
+- A resource type may implement a trait only if every method it would be
+  `Self` of, the trait's and its supertraits', is impure and holds the
+  resource nowhere but whole parameters.
+- A default a resource type inherits is checked with `Self` as that
+  resource: it may not return or store it, let a closure capturing it escape
+  or be pure, or pass it to a generic function.
 - Operators and interpolation call methods of the prelude's traits, which
   must be pure.
 

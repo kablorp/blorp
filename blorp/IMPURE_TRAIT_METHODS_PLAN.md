@@ -22,8 +22,8 @@ This plan reads it as three rules:
    leak the loan.
 
 **Status:** approved by Keith on 2026-11-16, with T1 to T4 as recommended.
-Landing 1 is done (see "Landing 1 results"); the resource-loan hardening
-is on main and landing 2 is next. Probe outputs (`p01` to `p17`) come
+Landings 1 and 2 are done (see "Landing 1 results" and "Landing 2
+results"); landing 3 is next. Probe outputs (`p01` to `p17`) come
 from this tree's compiler ("main") and one built from `7672cc3f3`
 ("hardened"). Diagnostics marked "proposed" do not exist yet.
 
@@ -783,7 +783,7 @@ source, 73 lines longer, allocations rose 0.10%.
 | Landing | Instructions | Allocations | Peak heap | Production lines | Test lines |
 | --- | --- | --- | --- | --- | --- |
 | 1 | +0.1% | +0.05% | +0.1% | +80 net | +450 |
-| 2 | +0.15% | +0.05% | +0.1% | +300 net | +700 |
+| 2 | +0.15% | +0.05% | +0.1% | +447 net | +700 |
 | 3 | +0.05% | +0.05% | +0.1% | +50 net | +150 |
 
 - **Landing 1** adds a purity comparison per method call and canonical
@@ -793,7 +793,12 @@ source, 73 lines longer, allocations rose 0.10%.
   (`resource_scopes.brp` +125, `signatures.brp` +70, `render.brp` +45,
   `errors.brp` +25, `bodies.brp` +10). The coordinator lowered revision 2's
   +360 ceiling to +300 after a growth audit dropped the closure walk, the
-  receiver-span join and the help machinery.
+  receiver-span join and the help machinery. Keith raised it from +300 to
+  +447 on 2026-11-16, after the review's audit of the built code: the
+  estimate missed formatter wrapping, the error mapping and the specified
+  diagnostics, and reaching about +350 would have dropped plan behaviour,
+  including the lent-mode written-type check that keeps `pure` respected
+  inside defaults.
 - **Landing 3:** +35 net, in `render.brp`.
 
 ## Landing 1 results
@@ -834,6 +839,117 @@ call tests, the alias test and the supertrait test; removing the
 T2 guard fails the accepted-methods test; recording `Pure` in `requirement`
 fails the accepted tests and the pure-implementation mismatch test; skipping
 the purity comparison in `member_contract` fails both mismatch tests.
+
+## Landing 2 results
+
+**Production lines: +447 net,** at the ceiling Keith set on 2026-11-16 (raised
+from +300; see "Ceilings"). The cost ceilings hold. "Lines" below gives the
+breakdown.
+
+Measured with `blorp/scripts/self-compile-cost 4fee244ad <candidate>
+--rounds 3` (origin/main at the time) on macOS, Darwin 25.6.0 arm64, Apple
+clang, -O2 as the script builds it, seed `blorp-seed-93798484557c`. The
+candidate's source is identified by its trees: `blorp/src`
+`c387c6c64a2de5d2a1a7de405d2bc4e45429af2b` and `blorp/standard_library`
+`b950352fd8e5b0bde020194d1795fad26b348147`, the base's. Raw samples are in
+`build/impure-trait-methods/landing-2/amended/` in the main checkout, beside
+the mutation runner and its results, the fixture compiles, and
+`first-measurement/` (five rounds against `ec0166cf6` before review: fixed
+input instructions +0.0350%, allocations and peak heap unchanged).
+
+| Metric | Base | Candidate | Change |
+| --- | --- | --- | --- |
+| Fixed input allocations | 14,211,981 | 14,211,981 | +0.0000% |
+| Fixed input peak heap, bytes | 170,460,277 | 170,460,277 | +0.0000% |
+| Fixed input instructions (median of 3) | 12,674,159,474 | 12,680,118,280 | +0.0470% |
+| Own source allocations | 14,211,981 | 14,315,638 | +0.7294% |
+| Own source peak heap, bytes | 170,460,276 | 171,313,404 | +0.5005% |
+| Own source instructions (median of 3) | 12,665,180,231 | 12,759,473,869 | +0.7445% |
+
+The fixed-input C is identical (`77769152f5dc23d3`), and all four strict
+runs balance with no leak. The compiler declares no resource
+implementation, so it derives no `ResourceDefault` row and never walks a
+body twice. The fixed-input cost is the `lent_self` match at each type test
+and, since review, one trait lookup per implementation header. The
+own-source rows compile a compiler 447 production lines longer.
+
+The e2e case `resources/traits` compiles in 117,948 allocations and
+400,848,658 instructions (median of 5); its ceilings are those plus 15%,
+135,641 and 460,975,957. After review it measured 117,948 and 400,709,703. Its C passes the Token as `int64_t` throughout: the
+`with_token` lambda calls the inherited default `report` as
+`blorp_f_5(int64_t, struct blorp_string*)` and the authored `count` as
+`blorp_f_6(int64_t)`, and `report` calls `blorp_f_6` directly.
+
+**Lines** against origin/main, after `blorp format`: production `blorp/src`
++638 -191 (+447 net); tests +628 net (`test_resource_scopes.brp` +556 net,
+fixtures 59, `surface.brp` 13). By file, net: `resource_scopes.brp` +170,
+`render.brp` +102, `signatures.brp` +95, `errors.brp` +57,
+`resource_types.brp` +14, `bodies.brp` +10, the `entails` move from
+`traits.brp` to `model.brp` 0 (traits' imports -4), others -1. Review cut
+19 lines of slack and the `admitted` guard on `entails` added 4, from +462.
+Against the estimate (+275), the differences are mostly the formatter's
+wrapping of long chains and calls, two diagnostics with notes and
+rule-chosen helps (`render.brp`), and the lent-type admission for bindings,
+results and pure lambda parameters (`resource_scopes.brp`). The review's
+growth audit found +300 out of reach without dropping plan behaviour.
+
+**Departures from "Code → Landing 2".**
+- `resource` is a reserved keyword, so the records' field is
+  `resource_type`.
+- `entails` moved to `model.brp`, beside `AcceptedTrait`: `signatures.brp`
+  cannot import `traits.brp`, which imports it.
+- `?=` cannot appear in a `match` arm, so the header check finds the
+  resource and the implemented trait first, as `accept_implementation`
+  does, then matches.
+- `ResourceDefault` also holds `default_body`, the body its `TraitDefault`
+  member names, so matching a row to the function being checked needs no
+  lookup that could miss. `admit_resource_body(body, id, signature,
+  functions, opaques, inherited)` runs the first walk and then one walk per
+  row whose default is this body.
+- `errors.lent_misuse` classifies a rejection made with `Self` read as the
+  resource, for both the header and the second walk, and is where
+  `UnlentRejection` arises. `errors.scoped_error` builds a `MisusedScoped`
+  rejection. `resource_types.admit_as_written` is the one written-type
+  admission both use.
+- A library trait is any trait outside a user module (`Stringable` is in a
+  foundation module). The "declare … without pure" help is chosen by the
+  method's written purity, since a pure method always fails first at its
+  `Self` parameter: an impure method whose result is a pure callable taking
+  `Self` gets the "change …" help instead.
+- The lent walk also admits the default's own result as written, which the
+  header check already did; the same function serves each lambda.
+- A note about a lambda's result is at the whole lambda, the span the
+  checked lambda keeps for its result.
+- The e2e case is in `surface.brp`, beside the other resource case.
+
+**Mutation proofs** (each built and run alone, then restored):
+- the header check off fails the seven `ResourceContract` tests; without
+  supertraits, the supertrait test; without D35's refusal, the four pure
+  ones; the library help off, the Stringable test; the method's purity
+  ignored, the pure-callable-result test and, after review's simpler choice,
+  the two other non-purity contract tests; the supertrait note's wording
+  off, the supertrait test. The first, second and purity mutations were
+  rerun on the reviewed code;
+- with no row walked, all fifteen `InheritedDefault` tests fail. Each view
+  off fails its routes: binding, "bind Self"; construction, "put Self in a
+  List"; type arguments, the generic function, generic function value and
+  `?=` tests; closure captures, the five closure tests; lambda result,
+  "return Self from a lambda";
+- written types of the body off fails the binding-type test; of each
+  lambda, the lambda binding, lambda result and pure lambda tests; the
+  lambda result alone, its test; the pure lambda refusal alone, its test;
+- the receiver rule reverted fails the five acceptance tests and the four
+  closure tests, whose closures call `self.size()`; unviewing the receiver
+  fails the same nine, because `admit_type_arguments` then views `Self`;
+- scoped misuses left unmapped fail the four scoped closure tests;
+- the lent view under the wrong owner fails all twenty tests that walk a
+  default again, so `substitute_type` fails closed;
+- generic calls' type arguments unchecked fails the bounded generic test,
+  the two generic default tests and two older tests;
+- the return, match-root and stored views, and `UnlentRejection`'s resource
+  check, fail no test: no source program reaches them, since the header
+  check and the earlier type tests catch every route first. They keep the
+  walk failing closed.
 
 ## Follow-ups from landing 1's review
 

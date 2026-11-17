@@ -172,20 +172,52 @@ union ResourceUse:
     ResourceTypeArgument
     ResourcePureParameter
     ResourcePureCapture
-    ResourceImplementation
     -- A type the user did not write, inferred for a generic call or a construction.
     ResourceInferredType(TypeRef)
+
+
+-- A place a scoped callable cannot be.
+fixed union ScopedUse:
+    ScopedResult
+    ScopedStorage
+    ScopedArgument
+
+
+-- What Self did once read as a resource.
+union LentMisuse:
+    LentResource(ResourceUse)
+    LentScoped(ScopedUse)
+
+
+-- A method of `implemented`, or of a trait above it, whose signature puts
+-- the resource where `use` forbids; `at` is in that trait.
+record LentContract {
+    resource_type: OpaqueId,
+    implemented: TraitId,
+    method: TraitMethodId,
+    use: ResourceUse,
+    at: Span,
+}
+
+
+-- An inherited default that misuses the resource; `at` is in the default.
+record LentDefault {
+    resource_type: OpaqueId,
+    method: TraitMethodId,
+    misuse: LentMisuse,
+    at: Span,
+}
 
 
 -- Loan restrictions are Check-only; accepted programs need no lifetime facts.
 union ResourceError:
     MisusedResource(OpaqueId, ResourceUse)
+    MisusedScoped(ScopedUse)
+    ResourceContract(LentContract)
+    InheritedDefault(LentDefault)
     ResourceGenericDeclaration
     ScopedNonCallable
     ScopedTraitParameter
-    ScopedResult
-    ScopedStorage
-    ScopedArgument
 
 
 -- The six canonical arithmetic traits, each selected for one operator.
@@ -623,6 +655,9 @@ fixed union CheckerInvariant:
     -- Check rejects matching a callable or an opaque value, and admission
     -- rejects a construction that could hold a loan before it checks the root.
     LoanInMatchRoot
+    -- A check with Self read as a resource rejected something other than it:
+    -- every other rejection was possible with Self rigid, and was made then.
+    UnlentRejection
 
 
 pure func checker_invariant(span: Span, invariant: CheckerInvariant) -> CheckError:
@@ -648,3 +683,25 @@ pure func trait_error(span: Span, error: TraitError) -> CheckError:
 
 pure func resource_error(span: Span, error: ResourceError) -> CheckError:
     rejected(span, ResourceRejection(error))
+
+
+pure func scoped_error(span: Span, use: ScopedUse) -> CheckError:
+    rejected(span, ResourceRejection(MisusedScoped(use)))
+
+
+-- What a check with Self read as `resource_type` rejected, or the error itself
+-- when no loan rule made it. The same check with Self rigid made every other
+-- rejection first, so a rejection of another resource or rule is a defect.
+pure func lent_misuse(error: CheckError, resource_type: OpaqueId) -> Result[LentMisuse, CheckError]:
+    match error.kind:
+        ResourceRejection(MisusedResource(id, use)):
+            if id == resource_type:
+                Ok(LentResource(use))
+            else:
+                Err(checker_invariant(error.span, UnlentRejection))
+        ResourceRejection(MisusedScoped(use)):
+            Ok(LentScoped(use))
+        ResourceRejection(_):
+            Err(checker_invariant(error.span, UnlentRejection))
+        _:
+            Err(error)

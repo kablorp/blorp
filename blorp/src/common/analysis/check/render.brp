@@ -9,6 +9,7 @@ import:
         ImportOrigin(RelativeImport, LibraryImport),
         ImportSelection(NamedSelection, ConstructorSelection, MethodsSelection),
         ModulePath,
+    ../../syntax/source: ModuleKind(UserModule), module_number
     ../../syntax/syntax:
         IntegerFormat(Int64Format, UInt8Format),
         Purity(Pure, Impure),
@@ -142,6 +143,7 @@ private pure func invariant_message(invariant: errors.CheckerInvariant) -> Strin
         errors.UnsupportedPatternReachedResolution: "unsupported pattern form reached resolution"
         errors.JoinWithoutArms: "match without arms reached join resolution"
         errors.LoanInMatchRoot: "a lent value reached a match root"
+        errors.UnlentRejection: "a lent Self check rejected another type"
 
 
 private pure func rendered(span: Span, message: String, help: String) -> Diagnostic:
@@ -235,12 +237,21 @@ private pure func parsed_spelling(
         .or_render_fault(span, errors.InvalidParsedName(name))
 
 
--- The trait and method names a diagnostic cites, as `Logger.log`.
-private pure func method_label(
+-- How a diagnostic names a trait method, and what changing it allows: its
+-- written purity, and whether its trait is the user's to edit.
+private record MethodSpelling {
+    trait_name: String,
+    method_name: String,
+    purity: Purity,
+    library: Bool,
+}
+
+
+private pure func method_spelling(
     method: TraitMethodId,
     context: RenderContext,
     span: Span,
-) -> Result[String, Diagnostic]:
+) -> Result[MethodSpelling, Diagnostic]:
     row ?= context.parsed.declarations
         .inventory_traits()
         .get(
@@ -255,9 +266,27 @@ private pure func method_label(
     header ?= written
         .trait_method_header(context.parsed.declarations)
         .or_render_fault(span, errors.InvalidFunctionContract)
+    module ?= context.parsed.modules
+        .get(row.module.module_number())
+        .or_render_fault(span, errors.InvalidFunctionContract)
     trait_name ?= row.type_name.id.parsed_spelling(context.parsed.names, span)
     method_name ?= header.function_name.id.parsed_spelling(context.parsed.names, span)
-    Ok("${trait_name}.${method_name}")
+    Ok({
+        trait_name = trait_name,
+        method_name = method_name,
+        purity = header.purity,
+        library = module.role != UserModule,
+    })
+
+
+-- The trait and method names a diagnostic cites, as `Logger.log`.
+private pure func method_label(
+    method: TraitMethodId,
+    context: RenderContext,
+    span: Span,
+) -> Result[String, Diagnostic]:
+    spelling ?= method.method_spelling(context, span)
+    Ok("${spelling.trait_name}.${spelling.method_name}")
 
 
 pure func render_check_error(program: ParsedProgram, error: errors.CheckError) -> Diagnostic:
@@ -3056,65 +3085,156 @@ private pure func parameter_spelling(
             id.ordinary_parameter_spelling(context, span)
 
 
+-- Where a resource cannot be, worded once for its rejection and for a note.
+private pure func misuse_message(use: errors.ResourceUse, spelled: String) -> String:
+    match use:
+        errors.ResourceResult:
+            "the resource type ${spelled} cannot be returned"
+        errors.ResourceStorage:
+            "the resource type ${spelled} cannot be stored"
+        errors.ResourceTypeArgument:
+            "the resource type ${spelled} cannot be a type argument"
+        errors.ResourcePureParameter:
+            "pure functions cannot take the resource type ${spelled}"
+        errors.ResourcePureCapture:
+            "pure closures cannot capture the resource type ${spelled}"
+        errors.ResourceInferredType(_):
+            "generic parameters and containers cannot mention the resource type ${spelled}"
+
+
+private pure func scoped_message(use: errors.ScopedUse) -> String:
+    match use:
+        errors.ScopedResult: "scoped callables cannot be returned"
+        errors.ScopedStorage: "scoped callables cannot be stored here"
+        errors.ScopedArgument: "scoped callables require a scoped parameter"
+
+
+-- The resource `id` is the rejected type, or the type that holds it.
+private pure func misused_resource(
+    context: RenderContext,
+    span: Span,
+    id: OpaqueId,
+    use: errors.ResourceUse,
+) -> Result[Diagnostic, Diagnostic]:
+    spelled ?= id.opaque_spelling(context, span)
+    help: String ?= match use:
+        errors.ResourceResult:
+            Ok("consume the resource inside its scope and return an ordinary value instead")
+        errors.ResourceStorage:
+            Ok("pass the resource directly to an impure function instead of binding or wrapping it")
+        errors.ResourceTypeArgument:
+            Ok("use a whole ${spelled} parameter on an impure function instead")
+        errors.ResourcePureParameter:
+            Ok("remove pure and consume the resource synchronously")
+        errors.ResourcePureCapture:
+            Ok("remove pure and invoke the closure inside the resource scope")
+        errors.ResourceInferredType(inferred_type):
+            inferred_type
+                .type_spelling(context, span)
+                .map(
+                    pure func(inferred): "the inferred type here is ${inferred}; call functions that take a ${spelled} directly instead",
+                )
+    Ok(rendered(span, use.misuse_message(spelled), help))
+
+
+-- At the receiver, noted at the type in the trait's signature. A library
+-- trait cannot be changed, so its help offers only the impure function.
+private pure func resource_contract(
+    context: RenderContext,
+    span: Span,
+    contract: errors.LentContract,
+) -> Result[Diagnostic, Diagnostic]:
+    spelled ?= contract.resource_type.opaque_spelling(context, span)
+    implemented ?= contract.implemented.trait_spelling(context, span)
+    method ?= contract.method.method_spelling(context, span)
+    instead = "write an impure function that takes the ${spelled} instead"
+    -- A pure method always fails first at its Self parameter, under D35.
+    help = if method.library:
+        instead
+    else if method.purity == Pure:
+        "declare ${method.method_name} without pure in ${method.trait_name}, or ${instead}"
+    else:
+        "change ${method.method_name} in ${method.trait_name} so that the ${spelled} is not its result or part of a List, tuple or record, or ${instead}"
+    place = if contract.method.trait_method_owner() == contract.implemented:
+        "${method.trait_name}.${method.method_name}"
+    else:
+        "${method.method_name}, inherited from ${method.trait_name} via ${implemented}"
+    note: NoteLine = {
+        span = contract.at,
+        text = "in ${place}: ${contract.use.misuse_message(spelled)}",
+    }
+    Ok(
+        noted(
+            span,
+            "the resource type ${spelled} cannot implement ${implemented}",
+            help,
+            NoteLines([note]),
+        ),
+    )
+
+
+-- At the implementation, noted at the misuse in the default. The help says
+-- how to override the trait author's default.
+private pure func inherited_default(
+    context: RenderContext,
+    span: Span,
+    inherited: errors.LentDefault,
+) -> Result[Diagnostic, Diagnostic]:
+    spelled ?= inherited.resource_type.opaque_spelling(context, span)
+    method ?= inherited.method.method_spelling(context, span)
+    misuse = match inherited.misuse:
+        errors.LentResource(use): use.misuse_message(spelled)
+        errors.LentScoped(use): use.scoped_message()
+    fix = match inherited.misuse:
+        errors.LentScoped(_) | errors.LentResource(errors.ResourcePureCapture):
+            "without a closure that captures the ${spelled}"
+        errors.LentResource(errors.ResourceInferredType(_)) | errors.LentResource(errors.ResourceTypeArgument):
+            "and pass the ${spelled} only to functions that take a ${spelled}"
+        errors.LentResource(errors.ResourceResult) | errors.LentResource(errors.ResourceStorage):
+            "without returning or storing the ${spelled}"
+        errors.LentResource(errors.ResourcePureParameter):
+            "without a pure lambda that takes the ${spelled}"
+    note: NoteLine = {
+        span = inherited.at,
+        text = "in ${method.trait_name}'s default, with Self as ${spelled}: ${misuse}",
+    }
+    Ok(
+        noted(
+            span,
+            "the resource type ${spelled} cannot use ${method.trait_name}'s default ${method.method_name}",
+            "write ${method.method_name} in this implementation ${fix}, or do not implement ${method.trait_name} for ${spelled}",
+            NoteLines([note]),
+        ),
+    )
+
+
 private pure func render_resource_error(
     context: RenderContext,
     span: Span,
     rejection: errors.ResourceError,
 ) -> Diagnostic:
     match rejection:
-        -- The resource `id` is the rejected type, or the type that holds it.
         errors.MisusedResource(id, use):
-            match id.opaque_spelling(context, span):
-                Err(fault):
-                    fault
-                Ok(spelled):
-                    match use:
-                        errors.ResourceResult:
-                            rendered(
-                                span,
-                                "the resource type ${spelled} cannot be returned",
-                                "consume the resource inside its scope and return an ordinary value instead",
-                            )
-                        errors.ResourceStorage:
-                            rendered(
-                                span,
-                                "the resource type ${spelled} cannot be stored",
-                                "pass the resource directly to an impure function instead of binding or wrapping it",
-                            )
-                        errors.ResourceTypeArgument:
-                            rendered(
-                                span,
-                                "the resource type ${spelled} cannot be a type argument",
-                                "use a whole ${spelled} parameter on an impure function instead",
-                            )
-                        errors.ResourcePureParameter:
-                            rendered(
-                                span,
-                                "pure functions cannot take the resource type ${spelled}",
-                                "remove pure and consume the resource synchronously",
-                            )
-                        errors.ResourcePureCapture:
-                            rendered(
-                                span,
-                                "pure closures cannot capture the resource type ${spelled}",
-                                "remove pure and invoke the closure inside the resource scope",
-                            )
-                        errors.ResourceImplementation:
-                            rendered(
-                                span,
-                                "the resource type ${spelled} cannot implement a trait",
-                                "resource types cannot implement traits yet; write an impure function that takes a ${spelled} instead",
-                            )
-                        errors.ResourceInferredType(inferred_type):
-                            match inferred_type.type_spelling(context, span):
-                                Err(fault):
-                                    fault
-                                Ok(inferred):
-                                    rendered(
-                                        span,
-                                        "generic parameters and containers cannot mention the resource type ${spelled}",
-                                        "the inferred type here is ${inferred}; call functions that take a ${spelled} directly instead",
-                                    )
+            match context.misused_resource(span, id, use):
+                Ok(diagnostic): diagnostic
+                Err(fault): fault
+        errors.ResourceContract(contract):
+            match context.resource_contract(span, contract):
+                Ok(diagnostic): diagnostic
+                Err(fault): fault
+        errors.InheritedDefault(inherited):
+            match context.inherited_default(span, inherited):
+                Ok(diagnostic): diagnostic
+                Err(fault): fault
+        errors.MisusedScoped(use):
+            help = match use:
+                errors.ScopedResult:
+                    "invoke the callable during this call, or return a closure that captures only ordinary values"
+                errors.ScopedStorage:
+                    "keep the callable in an immutable local binding and invoke or forward it synchronously"
+                errors.ScopedArgument:
+                    "declare the receiving callback parameter scoped and call the function directly"
+            rendered(span, use.scoped_message(), help)
         errors.ResourceGenericDeclaration:
             rendered(
                 span,
@@ -3132,22 +3252,4 @@ private pure func render_resource_error(
                 span,
                 "trait requirements cannot declare scoped parameters",
                 "declare the scoped callback on an ordinary function instead",
-            )
-        errors.ScopedResult:
-            rendered(
-                span,
-                "scoped callables cannot be returned",
-                "invoke the callable during this call, or return a closure that captures only ordinary values",
-            )
-        errors.ScopedStorage:
-            rendered(
-                span,
-                "scoped callables cannot be stored here",
-                "keep the callable in an immutable local binding and invoke or forward it synchronously",
-            )
-        errors.ScopedArgument:
-            rendered(
-                span,
-                "scoped callables require a scoped parameter",
-                "declare the receiving callback parameter scoped and call the function directly",
             )
