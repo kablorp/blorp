@@ -67,7 +67,6 @@ import:
             CanonicalEquatableSupertraits,
             EqualityMemberUnsupported,
             DuplicateRequirementParameter,
-            ImpureRequirement,
             GenericRequirement,
             FirstParameterMustBeSelf,
             CallableFormalDeferred,
@@ -154,10 +153,6 @@ private pure func requirement(
     header ?= row
         .trait_method_header(parsed.declarations)
         .or_checker_invariant(row.span, InvalidFunctionContract)
-    _: Void ?= if header.purity == Pure:
-        Ok(void)
-    else:
-        Err(trait_error(header.function_name.span, ImpureRequirement(row.id)))
     _: Void ?= if header.type_parameters.is_empty():
         Ok(void)
     else:
@@ -180,7 +175,12 @@ private pure func requirement(
         match resolved:
             Ok(ResolvedTypeTerm(value_type, parameter_uses)):
                 span = parameter.type_name.type_span()
-                match value_type.refuse_resource(scope.opaques, span, errors.ResourcePureParameter):
+                -- D35: only a pure method keeps resources out of its parameters.
+                refused = if header.purity == Pure:
+                    value_type.refuse_resource(scope.opaques, span, errors.ResourcePureParameter)
+                else:
+                    Ok(void)
+                match refused:
                     Err(error):
                         failure = Some(error)
                         break
@@ -221,7 +221,7 @@ private pure func requirement(
             signature = {
                 type_parameters = [self],
                 requirements = [],
-                purity = Pure,
+                purity = header.purity,
                 parameters = parameters,
                 return_type = { value_type = result, span = result_span },
             },
@@ -433,9 +433,13 @@ private pure func unary_operation(self: TypeRef) -> MemberShape:
     { parameters = [self], result = self }
 
 
+-- Operators and interpolation holes call canonical members from pure code
+-- without a purity check, so a canonical member must be pure.
 private pure func has_shape(method: AcceptedTraitMethod, shape: MemberShape) -> Bool:
-    (method.signature.parameters.map(pure func(parameter): parameter.value_type) == shape.parameters).and(
-        method.signature.return_type.value_type == shape.result,
+    (method.signature.purity == Pure).and(
+        (method.signature.parameters.map(pure func(parameter): parameter.value_type) == shape.parameters).and(
+            method.signature.return_type.value_type == shape.result,
+        ),
     )
 
 

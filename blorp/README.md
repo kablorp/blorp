@@ -643,9 +643,8 @@ owner must lend a valid value and close it correctly.
 The promise is on the declared parameter, not the general callable type.
 Saving `invoke` as an ordinary function value loses that promise, so an indirect
 call cannot pass a scoped closure. Trait requirements cannot declare scoped
-parameters. While every trait method must be pure, a resource type cannot
-implement a trait. `private resource type` keeps the declaration inside its
-module.
+parameters. A resource type cannot implement a trait yet. `private resource
+type` keeps the declaration inside its module.
 
 `private` before a declaration keeps it inside its module: it cannot be
 imported or reached through an alias. A public function, field or payload
@@ -889,8 +888,8 @@ way, with help to implement the trait or use a type that implements it.
 
 ### Traits
 
-A trait declares pure methods whose first parameter is `Self`. A signature
-without a body is required; one with a body is a default.
+A trait declares methods whose first parameter is `Self`, each `pure` or
+not. A signature without a body is required; one with a body is a default.
 
 ```blorp
 trait Describe:
@@ -912,8 +911,14 @@ This exits 6. An implementation defines every required method with the same
 parameter, result and purity contract and may override defaults; one that
 uses only defaults ends after its receiver, with no colon. A module may
 implement a trait only if it declares the trait or the receiver type. Traits
-have no type parameters, generic or impure methods, or callable parameters
-at the top level.
+have no type parameters, generic methods or callable parameters at the top
+level.
+
+- A call through a method has the purity its trait declares, for every
+  receiver and bound, and so does a method used as a function value: a pure
+  function calls only pure methods.
+- Operators and interpolation call methods of the prelude's traits, which
+  must be pure.
 
 A method name names a family across receivers: importing `int: equals` makes
 `equals` available for every type with an implementation, not only Int. Two

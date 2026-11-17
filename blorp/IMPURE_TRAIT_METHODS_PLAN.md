@@ -22,7 +22,8 @@ This plan reads it as three rules:
    leak the loan.
 
 **Status:** approved by Keith on 2026-11-16, with T1 to T4 as recommended.
-Landing 1 is next. Probe outputs (`p01` to `p17`) come
+Landing 1 is done (see "Landing 1 results"); the resource-loan hardening
+is on main and landing 2 is next. Probe outputs (`p01` to `p17`) come
 from this tree's compiler ("main") and one built from `7672cc3f3`
 ("hardened"). Diagnostics marked "proposed" do not exist yet.
 
@@ -355,6 +356,7 @@ trait Logger:
     func log_all(self: Self, lines: List[String]) -> Void:
         for line in lines:
             self.log(line)
+        void
 
 record Console { prefix: String }
 
@@ -765,6 +767,19 @@ Upper bounds, measured with `blorp/scripts/self-compile-cost BASE CANDIDATE
 --rounds 5` against each landing's parent. Budget corrections are the
 coordinator's, recorded here with old and new figures.
 
+Which row binds: the fixed-input rows isolate the change's cost; the
+own-source rows also grow with the compiler's own source. Landing 1's
+own-source allocation row (+0.1040%) exceeds +0.05% for that reason alone.
+
+**Which row the cost ceilings bind (coordinator, 2026-11-16).** The
+instruction, allocation and peak heap ceilings bind the fixed-input row, where
+both compilers compile the base's source, so only the compiler differs. The
+own-source row is reported but not held: each revision compiles its own,
+longer source, and added source alone costs about 0.3% per 100 lines
+(`UINT8_BYTES_PLAN.md`, L1). Landing 1 showed why: on the fixed input its
+allocations were unchanged and its instructions fell 0.04%, while on its own
+source, 73 lines longer, allocations rose 0.10%.
+
 | Landing | Instructions | Allocations | Peak heap | Production lines | Test lines |
 | --- | --- | --- | --- | --- | --- |
 | 1 | +0.1% | +0.05% | +0.1% | +80 net | +450 |
@@ -780,6 +795,58 @@ coordinator's, recorded here with old and new figures.
   +360 ceiling to +300 after a growth audit dropped the closure walk, the
   receiver-span join and the help machinery.
 - **Landing 3:** +35 net, in `render.brp`.
+
+## Landing 1 results
+
+Measured with `blorp/scripts/self-compile-cost 8f1ee3054 <candidate>
+--rounds 5` on macOS, -O2 as the script builds it. The base is `8f1ee3054`
+(origin/main, after the resource-loan hardening). The candidate's source is
+identified by its trees: `blorp/src` `764cc8f5b31dcaa12cd3dd725df1f8dfca0f09d6`
+and `blorp/standard_library` `b950352fd8e5b0bde020194d1795fad26b348147`,
+identical to the measured revision's. Raw samples:
+`build/impure-trait-methods/landing-1/` in the main checkout.
+
+| Metric | Base | Candidate | Change |
+| --- | --- | --- | --- |
+| Fixed input allocations | 14,176,929 | 14,176,929 | +0.0000% |
+| Fixed input peak heap, bytes | 170,239,903 | 170,239,903 | +0.0000% |
+| Fixed input instructions (median of 5) | 12,635,250,744 | 12,630,139,157 | -0.0405% |
+| Own source allocations | 14,176,929 | 14,191,674 | +0.1040% |
+| Own source peak heap, bytes | 170,239,902 | 170,381,790 | +0.0833% |
+| Own source instructions (median of 5) | 12,626,488,286 | 12,638,920,897 | +0.0985% |
+
+The fixed-input C is identical (`51cbd4fb7ff3fecb`), so the change costs a
+compile of the same program nothing. The own-source rows compile a compiler
+whose source is 73 production lines longer, and exceed the allocation ceiling
+only through that input growth (see the note under Ceilings).
+
+The e2e case's ceilings are the measured cost plus 15%: 115,436 allocations
+(132,751) and 388,436,320 instructions (446,701,768).
+
+Lines against origin/main: production `blorp/src` +99 -26 (+73 net); tests
++436 net (`test_trait_purity.brp` 385, `control.brp` 12, fixture 38,
+`driver.brp` 1, `test_resource_scopes.brp` 0 net).
+
+Mutation proofs (each restored): removing the `has_shape` purity test fails
+the three canonical tests; removing `method_contract`'s check fails the five
+call tests, the alias test and the supertrait test; removing the
+`callable_permission` method arm fails the pure-callback test; removing the
+T2 guard fails the accepted-methods test; recording `Pure` in `requirement`
+fails the accepted tests and the pure-implementation mismatch test; skipping
+the purity comparison in `member_contract` fails both mismatch tests.
+
+## Follow-ups from landing 1's review
+
+- **Landing 2** (same files): `method_contract` repeats `validate_purity`'s
+  if/else; make `validate_purity` take an `ImpureCallee`. Rename `refused` to
+  `admitted` in `requirement`.
+- **Landing 3** (wording):
+  - `ImpureCall`'s help "remove pure from the caller" leads nowhere for a pure
+    implementation member: following it gives `ImplementationSignatureMismatch`.
+  - "pure callback requires a pure method" also shows for constants, returns
+    and fields.
+  - `MalformedCanonicalTrait`'s help for an impure abstract `equals` never
+    says to add `pure`.
 
 ## Scope and non-goals
 

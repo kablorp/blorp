@@ -1,0 +1,388 @@
+import:
+    bool: and
+    int: Int methods
+    option: Option methods
+    result: Result methods
+    string: String methods
+    test: TestSuite
+    ../../../../src/common/analysis/check/check: CheckedProgram, check
+    ../../../../src/common/syntax/source: module_id, module_source, root_module_id
+    ../../../../src/common/syntax/syntax: Diagnostic
+    ../../../support/input: setup_diagnostic
+    ../../../support/module_input:
+        FOUNDATION_TYPES,
+        TestFoundation,
+        parse_modules,
+        parse_modules_with_base,
+
+
+-- A trait method is pure only when its trait says `pure`. The test base has no
+-- print, so `touch` stands for an impure effect.
+private TOUCH: String =
+    |func touch() -> Void:
+    |    void
+    |
+
+
+private LOGGER: String =
+    |trait Logger:
+    |    func log(self: Self, text: String) -> Void
+    |record Console { prefix: String }
+    |implements Logger for Console:
+    |    func log(self: Self, text: String) -> Void:
+    |        touch()
+    |
+
+
+private MAIN: String =
+    |func main() -> Int:
+    |    0
+    |
+
+
+private MISMATCH: String = "implementation signature does not match the trait requirement"
+
+
+private MISMATCH_HELP: String = "match the requirement's purity, parameter types and return type, replacing Self with the receiver"
+
+
+private IMPURE_METHOD: String = "pure functions cannot call the impure method Logger.log"
+
+
+private IMPURE_METHOD_HELP: String = "remove pure from the caller, or call a pure method instead"
+
+
+private pure func checked_source(source: String) -> Result[CheckedProgram, Diagnostic]:
+    parsed ?= parse_modules([{ source = source, targets = [] }])
+    check(parsed).map_err(setup_diagnostic)
+
+
+-- The single rejection, compared exactly: `marked` is the text its span covers.
+private pure func rejects_at(
+    before: String,
+    marked: String,
+    after: String,
+    message: String,
+    help: String,
+) -> Bool:
+    match checked_source(before + marked + after):
+        Ok(_):
+            False
+        Err(error):
+            (error.message == message)
+                .and(error.help == help)
+                .and(error.span.source == module_source(root_module_id()))
+                .and(error.span.start == before.length())
+                .and(error.span.end == before.length() + marked.length())
+                .and(error.note.is_none())
+
+
+-- A pure function written after `touch` and `Logger`, ending in `main`.
+private pure func rejects_pure_call(prefix: String, marked: String, suffix: String) -> Bool:
+    rejects_at(TOUCH + LOGGER + prefix, marked, suffix + MAIN, IMPURE_METHOD, IMPURE_METHOD_HELP)
+
+
+-- Impure requirements, defaults and implementations, and each call route to
+-- them from impure code. A resource may be an impure method's parameter: D35
+-- forbids it only for a pure one.
+pure func test_impure_methods_are_accepted() -> Bool:
+    source: String =
+        |resource type Token = Int
+        |trait Logger:
+        |    func log(self: Self, text: String) -> Void
+        |    func log_twice(self: Self, text: String) -> Void:
+        |        self.log(text)
+        |        self.log(text)
+        |    func log_to(self: Self, token: Token) -> Void
+        |record Console { prefix: String }
+        |implements Logger for Console:
+        |    func log(self: Self, text: String) -> Void:
+        |        touch()
+        |    func log_to(self: Self, token: Token) -> Void:
+        |        touch()
+        |func touch() -> Void:
+        |    void
+        |func through_bound[T: Logger](logger: T) -> Void:
+        |    logger.log("x")
+        |func through_name(console: Console) -> Void:
+        |    log(console, "x")
+        |func through_receiver(console: Console) -> Void:
+        |    console.log_twice("x")
+        |func main() -> Int:
+        |    0
+        |
+    checked_source(source).is_ok()
+
+
+-- An impure callable expectation takes a method of either purity.
+pure func test_impure_callback_takes_either_purity() -> Bool:
+    source: String =
+        |trait Mixed:
+        |    func log(self: Self, text: String) -> Void
+        |    pure func name(self: Self, text: String) -> Void
+        |record Console { prefix: String }
+        |implements Mixed for Console:
+        |    func log(self: Self, text: String) -> Void:
+        |        void
+        |    pure func name(self: Self, text: String) -> Void:
+        |        void
+        |func each(callback: (Console, String) -> Void) -> Void:
+        |    void
+        |func main() -> Int:
+        |    each(log)
+        |    each(name)
+        |    0
+        |
+    checked_source(source).is_ok()
+
+
+pure func test_impure_implementation_of_pure_method() -> Bool:
+    before = "trait Logger:\n    pure func log(self: Self, text: String) -> Void\nrecord Console { prefix: String }\nimplements Logger for Console:\n    func "
+    rejects_at(
+        before,
+        "log",
+        "(self: Self, text: String) -> Void:\n        void\n" + MAIN,
+        MISMATCH,
+        MISMATCH_HELP,
+    )
+
+
+pure func test_pure_implementation_of_impure_method() -> Bool:
+    before = "trait Logger:\n    func log(self: Self, text: String) -> Void\nrecord Console { prefix: String }\nimplements Logger for Console:\n    pure func "
+    rejects_at(
+        before,
+        "log",
+        "(self: Self, text: String) -> Void:\n        void\n" + MAIN,
+        MISMATCH,
+        MISMATCH_HELP,
+    )
+
+
+pure func test_pure_call_through_bound() -> Bool:
+    rejects_pure_call(
+        "pure func quiet[T: Logger](logger: T) -> Int:\n    logger.",
+        "log",
+        "(\"x\")\n    0\n",
+    )
+
+
+pure func test_pure_call_on_receiver() -> Bool:
+    rejects_pure_call(
+        "pure func quiet(console: Console) -> Int:\n    console.",
+        "log",
+        "(\"x\")\n    0\n",
+    )
+
+
+pure func test_pure_call_by_name() -> Bool:
+    rejects_pure_call(
+        "pure func quiet(console: Console) -> Int:\n    ",
+        "log",
+        "(console, \"x\")\n    0\n",
+    )
+
+
+-- A call qualified by a module alias reaches the same contract.
+pure func test_pure_call_through_alias() -> Bool:
+    root: String = "import:\n    ./sinks as sinks\npure func quiet(console: sinks.Console) -> Void:\n    sinks."
+    provider: String = TOUCH + LOGGER
+    suffix: String = "(console, \"x\")\n" + MAIN
+    match parse_modules([
+        { source = root + "log" + suffix, targets = [1] },
+        { source = provider, targets = [] },
+    ]):
+        Err(_):
+            False
+        Ok(parsed):
+            match check(parsed).map_err(setup_diagnostic):
+                Ok(_):
+                    False
+                Err(error):
+                    (error.message == IMPURE_METHOD)
+                        .and(error.help == IMPURE_METHOD_HELP)
+                        .and(error.span.source == module_source(root_module_id()))
+                        .and(error.span.start == root.length())
+                        .and(error.span.end == root.length() + 3)
+                        .and(error.note.is_none())
+
+
+-- A default is pure when its trait says so, even beside an impure method.
+pure func test_pure_default_call() -> Bool:
+    rejects_at(
+        "trait Logger:\n    func log(self: Self, text: String) -> Void\n    pure func quiet(self: Self, text: String) -> Int:\n        self.",
+        "log",
+        "(text)\n        0\n" + MAIN,
+        IMPURE_METHOD,
+        IMPURE_METHOD_HELP,
+    )
+
+
+-- A lambda written pure is pure, whatever function holds it.
+pure func test_pure_lambda_call() -> Bool:
+    rejects_pure_call(
+        "func hold(console: Console) -> Int:\n    callback = pure func() -> Void: console.",
+        "log",
+        "(\"x\")\n    0\n",
+    )
+
+
+pure func test_pure_callback_method() -> Bool:
+    rejects_at(
+        (
+            TOUCH
+            + LOGGER
+            + "func each(callback: pure (Console, String) -> Void) -> Void:\n    void\nfunc pass() -> Void:\n    each("
+        ),
+        "log",
+        ")\n" + MAIN,
+        "pure callback requires a pure method, and Logger.log is impure",
+        "pass a pure function, or make the callback's type impure",
+    )
+
+
+-- Stored first, the method is a plain callable of its own purity, so the
+-- mismatch is the ordinary argument type error.
+pure func test_stored_method_is_impure_callable() -> Bool:
+    prefix: String =
+        |func each(console: Console, callback: pure (Console, String) -> Void) -> Void:
+        |    void
+        |func store(console: Console) -> Void:
+        |    callback: (Console, String) -> Void = log
+        |
+    rejects_at(
+        TOUCH + LOGGER + prefix + "    each(console, ",
+        "callback",
+        ")\n" + MAIN,
+        "argument type does not match the parameter type",
+        "use an expression of type pure (Console, String) -> Void here",
+    )
+
+
+-- A trait may mix purities with its supertraits: a bound gives each method its
+-- own purity.
+pure func test_bound_keeps_each_purity() -> Bool:
+    traits: String =
+        |trait Named:
+        |    pure func name(self: Self) -> Int
+        |trait Sink: Named:
+        |    func send(self: Self) -> Void
+        |
+    accepted = traits + "pure func reach[T: Sink](sink: T) -> Int:\n    sink.name()\n" + MAIN
+    checked_source(accepted)
+        .is_ok()
+        .and(
+            rejects_at(
+                traits + "pure func reach[T: Sink](sink: T) -> Void:\n    sink.",
+                "send",
+                "()\n" + MAIN,
+                "pure functions cannot call the impure method Sink.send",
+                IMPURE_METHOD_HELP,
+            ),
+        )
+
+
+private pure func base_with(traits: String, selections: String) -> TestFoundation:
+    {
+        types = FOUNDATION_TYPES + traits,
+        prelude_selections = (
+            "Int, Float, String, Void, List, Bool(True, False), Option(Some, None), Result(Ok, Err), "
+            + selections
+        ),
+    }
+
+
+-- Operators and interpolation call canonical members from pure code
+-- unchecked, so the trait is rejected at the base, at `marked`.
+private pure func canonical_rejected(
+    traits: String,
+    selections: String,
+    before: String,
+    marked: String,
+    message: String,
+    help: String,
+) -> Bool:
+    match module_id(1):
+        None:
+            False
+        Some(base):
+            match parse_modules_with_base(
+                [{ source = MAIN, targets = [] }],
+                base_with(traits, selections),
+            ):
+                Err(_):
+                    False
+                Ok(parsed):
+                    match check(parsed).map_err(setup_diagnostic):
+                        Ok(_):
+                            False
+                        Err(error):
+                            start = FOUNDATION_TYPES.length() + before.length()
+                            (error.message == message)
+                                .and(error.help == help)
+                                .and(error.span.source == module_source(base))
+                                .and(error.span.start == start)
+                                .and(error.span.end == start + marked.length())
+                                .and(error.note.is_none())
+
+
+pure func test_impure_canonical_abstract() -> Bool:
+    canonical_rejected(
+        "trait Equatable:\n    func equals(left: Self, right: Self) -> Bool\n",
+        "Equatable",
+        "trait ",
+        "Equatable",
+        "canonical Equatable requires pure equals(Self, Self) -> Bool as its sole abstract method",
+        "keep equals abstract; additional pure methods require default bodies",
+    )
+
+
+pure func test_impure_canonical_default() -> Bool:
+    equals = "trait Equatable:\n    pure func equals(left: Self, right: Self) -> Bool\n"
+    canonical_rejected(
+        equals + "    func not_equals(left: Self, right: Self) -> Bool:\n        False\n",
+        "Equatable",
+        equals + "    func ",
+        "not_equals",
+        "canonical Equatable.not_equals requires pure (Self, Self) -> Bool with a default body",
+        "use that signature and provide a default body, or rename this helper",
+    )
+
+
+pure func test_impure_orderable_default() -> Bool:
+    less = "trait Orderable:\n    pure func less_than(left: Self, right: Self) -> Bool\n"
+    canonical_rejected(
+        (
+            less
+            + "    func greater_than(left: Self, right: Self) -> Bool:\n        False\n"
+            + "    pure func less_than_or_equal(left: Self, right: Self) -> Bool:\n        False\n"
+            + "    pure func greater_than_or_equal(left: Self, right: Self) -> Bool:\n        False\n"
+        ),
+        "Orderable",
+        less + "    func ",
+        "greater_than",
+        "canonical Orderable.greater_than requires pure (Self, Self) -> Bool with a default body",
+        "use that signature and provide a default body",
+    )
+
+
+TESTS: TestSuite = {
+    description = "trait method purity",
+    tests = [
+        ("impure methods are accepted", test_impure_methods_are_accepted),
+        ("an impure callback takes either purity", test_impure_callback_takes_either_purity),
+        ("impure implementation of a pure method", test_impure_implementation_of_pure_method),
+        ("pure implementation of an impure method", test_pure_implementation_of_impure_method),
+        ("pure call through a bound", test_pure_call_through_bound),
+        ("pure call on a receiver", test_pure_call_on_receiver),
+        ("pure call by name", test_pure_call_by_name),
+        ("pure call through an alias", test_pure_call_through_alias),
+        ("pure default call", test_pure_default_call),
+        ("pure lambda call", test_pure_lambda_call),
+        ("pure callback given a method", test_pure_callback_method),
+        ("stored method is an impure callable", test_stored_method_is_impure_callable),
+        ("a bound keeps each purity", test_bound_keeps_each_purity),
+        ("impure canonical abstract member", test_impure_canonical_abstract),
+        ("impure canonical default", test_impure_canonical_default),
+        ("impure Orderable default", test_impure_orderable_default),
+    ],
+}

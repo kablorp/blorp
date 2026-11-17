@@ -235,6 +235,31 @@ private pure func parsed_spelling(
         .or_render_fault(span, errors.InvalidParsedName(name))
 
 
+-- The trait and method names a diagnostic cites, as `Logger.log`.
+private pure func method_label(
+    method: TraitMethodId,
+    context: RenderContext,
+    span: Span,
+) -> Result[String, Diagnostic]:
+    row ?= context.parsed.declarations
+        .inventory_traits()
+        .get(
+            method
+                .trait_method_owner()
+                .trait_number(),
+        )
+        .or_render_fault(span, errors.InvalidFunctionContract)
+    written ?= row.methods
+        .get(method.trait_method_number())
+        .or_render_fault(span, errors.InvalidFunctionContract)
+    header ?= written
+        .trait_method_header(context.parsed.declarations)
+        .or_render_fault(span, errors.InvalidFunctionContract)
+    trait_name ?= row.type_name.id.parsed_spelling(context.parsed.names, span)
+    method_name ?= header.function_name.id.parsed_spelling(context.parsed.names, span)
+    Ok("${trait_name}.${method_name}")
+
+
 pure func render_check_error(program: ParsedProgram, error: errors.CheckError) -> Diagnostic:
     render_context_error({ parsed = program.parsed_contents(), functions = [] }, error)
 
@@ -1053,12 +1078,22 @@ private pure func render_call_error(
                 "standalone lambda needs a complete result type",
                 "write a return annotation or give the lambda a callable type annotation",
             )
-        errors.ImpureCall(_, _):
+        errors.ImpureCall(_, errors.CalledFunction(_)):
             rendered(
                 span,
                 "pure functions cannot call impure functions",
                 "mark the callee pure or remove pure from the caller",
             )
+        errors.ImpureCall(_, errors.CalledMethod(method)):
+            match method.method_label(context, span):
+                Ok(label):
+                    rendered(
+                        span,
+                        "pure functions cannot call the impure method ${label}",
+                        "remove pure from the caller, or call a pure method instead",
+                    )
+                Err(fault):
+                    fault
         errors.CallableReceiverSyntax(_):
             rendered(
                 span,
@@ -1071,12 +1106,22 @@ private pure func render_call_error(
                 "pure functions cannot call an impure callable",
                 "use a pure callable type, or remove pure from the calling function",
             )
-        errors.ImpureCallback(_):
+        errors.ImpureCallback(errors.CalledFunction(_)):
             rendered(
                 span,
                 "pure callback requires a pure function",
                 "pass a pure named function; impure functions cannot satisfy a pure callable parameter",
             )
+        errors.ImpureCallback(errors.CalledMethod(method)):
+            match method.method_label(context, span):
+                Ok(label):
+                    rendered(
+                        span,
+                        "pure callback requires a pure method, and ${label} is impure",
+                        "pass a pure function, or make the callback's type impure",
+                    )
+                Err(fault):
+                    fault
         errors.CallableValueRequired:
             rendered(
                 span,
@@ -2476,12 +2521,6 @@ private pure func render_trait_error(
                 "rename the free function, or import one declaration through a module alias",
                 PreviousDeclaration(previous),
             )
-        errors.ImpureRequirement(_):
-            rendered(
-                span,
-                "trait requirements must be pure",
-                "declare a pure func requirement and a pure implementation",
-            )
         errors.GenericRequirement(_):
             rendered(
                 span,
@@ -3064,7 +3103,7 @@ private pure func render_resource_error(
                             rendered(
                                 span,
                                 "the resource type ${spelled} cannot implement a trait",
-                                "trait methods are pure, so they cannot take a ${spelled}; write an impure function that takes it instead",
+                                "resource types cannot implement traits yet; write an impure function that takes a ${spelled} instead",
                             )
                         errors.ResourceInferredType(inferred_type):
                             match inferred_type.type_spelling(context, span):
