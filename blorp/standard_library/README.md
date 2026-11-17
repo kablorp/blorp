@@ -872,13 +872,16 @@ func run_suite(suite: Path) -> Result[RunExit, RunError]:
   ends only the child, and `run` returns `Ok(Signaled(INTERRUPT_SIGNAL))`; Ctrl-\ is
   `Signaled(3)`. A caller that runs programs in turn must stop at
   `Signaled(INTERRUPT_SIGNAL)` as a shell does, and once it has cleaned up end with
-  `exit_interrupted`: it flushes stdout and stderr, resets SIGINT to its default
+  `exit_interrupted`: it flushes stdout and stderr as `run` does, resets SIGINT to its default
   and raises it, so a shell loop around the caller stops as well. It returns only if
   SIGINT cannot end the process, as when a parent left it blocked across exec; the
   caller then returns 130. A signal sent to this process alone, such as SIGTERM, is
   not intercepted: this process ends and the child runs on.
 - What this process printed before the call comes before what the child prints, on a
   pipe as on a terminal: stdout and stderr are flushed before the child starts.
+  Stdout's flush runs under the SIGPIPE guard `capture` uses, so a reader that has gone
+  does not end this process: the child still starts, and stdout is closed at exit
+  under the same guard, so this process ends with its own status.
   Input this process read ahead and did not consume is not the child's.
 - Nothing is killed afterwards, and there is no timeout: a process the child started
   and left running goes on. SIGCHLD must keep its default disposition, as for

@@ -484,6 +484,73 @@ static int run_interrupt_blocked(const char *program) {
     return run_program(program, 1, arguments, &ended, &error) && ended == RUN_EXITED(0) ? 0 : 1;
 }
 
+/* Runs `act` in a forked process whose stdout is a pipe with its reader gone and output in
+ * its buffer, as print leaves it, and returns how that process ended: its wait status, or
+ * -1. It exits with what `act` returns, so stdio's flush at exit is part of the test. The
+ * output has no newline, so it stays buffered whether stdout is line or fully buffered, and
+ * SIGPIPE starts at its default, so an unguarded write would end the process. */
+static int closed_stdout_ending(int (*act)(const char *program), const char *program) {
+    if (fflush(NULL) != 0) return -1;
+    const pid_t child = fork();
+    if (child < 0) return -1;
+    if (child == 0) {
+        struct sigaction default_action;
+        memset(&default_action, 0, sizeof default_action);
+        default_action.sa_handler = SIG_DFL;
+        int ends[2];
+        if (sigemptyset(&default_action.sa_mask) != 0 || sigaction(SIGPIPE, &default_action, NULL) != 0 ||
+            pipe(ends) != 0 || close(ends[0]) != 0 || dup2(ends[1], STDOUT_FILENO) != STDOUT_FILENO ||
+            close(ends[1]) != 0 || fputs("buffered", stdout) == EOF) _exit(1);
+        exit(act(program));
+    }
+    int status = 0;
+    pid_t waited;
+    do {
+        waited = waitpid(child, &status, 0);
+    } while (waited < 0 && errno == EINTR);
+    return waited == child ? status : -1;
+}
+
+/* 0 when the process ended as expected; otherwise 1, after saying on stderr, which the driver
+ * shows, how it did end. */
+static int closed_stdout_verdict(int status, int ended_as_expected) {
+    if (ended_as_expected) return 0;
+    if (status == -1) {
+        (void)fputs("closed stdout: the process could not be started or waited for\n", stderr);
+    } else if (WIFSIGNALED(status)) {
+        (void)fprintf(stderr, "closed stdout: the process ended by signal %d\n", WTERMSIG(status));
+    } else {
+        (void)fprintf(stderr, "closed stdout: the process exited %d\n", WEXITSTATUS(status));
+    }
+    return 1;
+}
+
+static int run_exit_zero(const char *program) {
+    const char *const arguments[] = {"exit", "0"};
+    int64_t ended = -1, error = 0;
+    return run_program(program, 2, arguments, &ended, &error) && ended == RUN_EXITED(0) ? 0 : 1;
+}
+
+/* run flushes stdout before the fork. With the reader gone that flush fails with EPIPE, not
+ * SIGPIPE: the child runs, and the caller goes on to exit with its own status. */
+static int run_closed_stdout(const char *program) {
+    const int status = closed_stdout_ending(run_exit_zero, program);
+    return closed_stdout_verdict(status, status != -1 && WIFEXITED(status) && WEXITSTATUS(status) == 0);
+}
+
+static int exit_interrupted_returning(const char *program) {
+    (void)program;
+    int64_t error = 0;
+    (void)blorp_process_exit_interrupted(&error);
+    return 1;
+}
+
+/* exit_interrupted flushes stdout too, and must still end the process by SIGINT. */
+static int exit_interrupted_closed_stdout(const char *program) {
+    const int status = closed_stdout_ending(exit_interrupted_returning, program);
+    return closed_stdout_verdict(status, status != -1 && WIFSIGNALED(status) && WTERMSIG(status) == SIGINT);
+}
+
 /* SIGCHLD ignored is LaunchFailed(OtherOs(ECHILD)), decided before forking. */
 static int run_sigchld(const char *program) {
     struct sigaction original, changed;
@@ -813,6 +880,10 @@ static int child_case(int argc, char **argv) {
         if (strcmp(argv[1], "run-terminal") == 0) return run_terminal(argv[2]);
         if (strcmp(argv[1], "run-session") == 0) return run_session(argv[2], argv[3]);
         if (strcmp(argv[1], "run-interrupt-blocked") == 0) return run_interrupt_blocked(argv[2]);
+        if (strcmp(argv[1], "run-closed-stdout") == 0) return run_closed_stdout(argv[2]);
+        if (strcmp(argv[1], "exit-interrupted-closed-stdout") == 0) {
+            return exit_interrupted_closed_stdout(argv[2]);
+        }
     }
     return 1;
 }

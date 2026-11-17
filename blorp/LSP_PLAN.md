@@ -865,7 +865,6 @@ onto `07ff200b4`, whose new commits touch none of its compiler files;
   each result first; all 25 cases, the directory on stdin among them, now
   pass on Linux x64 and ARM64 with GCC and Clang.
 - **Found, not fixed.**
-  - `capture` and `exit_interrupted` call `fflush(stdout)` without the guard.
   - A small write to a closed reader reports EPIPE at the next flush, or not
     at all if the program exits first.
   - `console_suite.brp` repeats about 40 lines of `fs_suite.brp`'s helpers,

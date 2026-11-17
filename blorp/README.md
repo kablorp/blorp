@@ -1304,8 +1304,10 @@ of zero or less. Both reads share standard input's one buffer, flush standard
 output first so a prompt shows before the program waits, and drop bytes already
 read if the read then fails. The writes and the flush run under the SIGPIPE
 guard `process.capture` uses, so a reader that has gone is an error, not the
-end of the program; the first `write` also closes standard output at exit under
-that guard, so the final flush cannot raise SIGPIPE.
+end of the program. Every console operation also closes standard output at exit
+under that guard, so the final flush cannot raise SIGPIPE. `process.run` and
+`process.exit_interrupted` also flush standard output under the guard, and close
+it at exit the same way.
 
 ## Compiler architecture
 

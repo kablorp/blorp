@@ -1,6 +1,7 @@
 import:
     bool: Bool methods
     int: Int methods
+    list: List methods
     option: Option methods
     result: Result methods
     string: String methods
@@ -19,6 +20,26 @@ import:
 
 
 private CAPTURE_DECLARATION: String = "func query(program: String, arguments: List[String], directory: List[String], environment: List[String], stdin: List[String], timeout: Int) -> Result[List[String], Int]:\n    builtin(\"process.capture\")\n"
+
+
+-- run and exit_interrupted flush stdout through the console's guarded flush.
+private TERMINAL_DECLARATIONS: String =
+    |func start(program: String, arguments: List[String], directory: List[String], environment: List[String]) -> Result[Int, Int]:
+    |    builtin("process.run")
+    |func interrupt() -> Result[Void, Int]:
+    |    builtin("process.exit_interrupted")
+    |
+
+
+private RUN_CALL: String =
+    |    nothing: List[String] = []
+    |    started = start("/program", nothing, nothing, nothing)
+    |
+
+
+private INTERRUPT_CALL: String =
+    |    interrupted = interrupt()
+    |
 
 
 private CONSOLE_DECLARATIONS: String =
@@ -75,10 +96,11 @@ private pure func emitted(source: String) -> Result[String, Int]:
                         Ok(code): Ok(code)
 
 
--- The guard is the one fragment capture and the console share, so a program
--- using both gets it once, and every console helper once as well.
-pure func test_the_guard_is_emitted_once_for_capture_and_the_console() -> Bool:
-    source = "${CAPTURE_DECLARATION}${CONSOLE_DECLARATIONS}func main() -> Int:\n${CAPTURE_CALL}${CONSOLE_CALLS}    0\n"
+-- The guard is the one fragment capture, run, exit_interrupted and the console
+-- share, and run and exit_interrupted call the console helpers, so a program
+-- using them all gets each once.
+pure func test_the_guard_is_emitted_once_for_the_process_natives_and_the_console() -> Bool:
+    source = "${CAPTURE_DECLARATION}${TERMINAL_DECLARATIONS}${CONSOLE_DECLARATIONS}func main() -> Int:\n${CAPTURE_CALL}${RUN_CALL}${INTERRUPT_CALL}${CONSOLE_CALLS}    0\n"
     match emitted(source):
         Err(_):
             False
@@ -87,6 +109,9 @@ pure func test_the_guard_is_emitted_once_for_capture_and_the_console() -> Bool:
                 .equals(1)
                 .and(occurrences(code, PROCESS_HELPERS_RUNTIME).equals(1))
                 .and(occurrences(code, CONSOLE_HELPERS_RUNTIME).equals(1))
+                .and(occurrences(code, "uint8_t blorp_process_capture(").equals(1))
+                .and(occurrences(code, "uint8_t blorp_process_run(").equals(1))
+                .and(occurrences(code, "uint8_t blorp_process_exit_interrupted(").equals(1))
                 .and(occurrences(code, "uint8_t blorp_console_write(").equals(1))
                 .and(occurrences(code, "uint8_t blorp_console_write_error(").equals(1))
                 .and(occurrences(code, "uint8_t blorp_console_flush(").equals(1))
@@ -109,6 +134,21 @@ pure func test_flush_alone_selects_the_guard_and_no_process_fragment() -> Bool:
                 .and(occurrences(code, "uint8_t blorp_console_read_line(").equals(0))
 
 
+-- Alone, run and exit_interrupted each take the guard and the console helpers
+-- their flush calls, and no console native.
+pure func test_run_or_exit_interrupted_alone_selects_the_guard_and_the_console_helpers() -> Bool:
+    [RUN_CALL, INTERRUPT_CALL].all(pure func(call: String) -> Bool:
+        match emitted("${TERMINAL_DECLARATIONS}func main() -> Int:\n${call}    0\n"):
+            Err(_):
+                False
+            Ok(code):
+                occurrences(code, SIGPIPE_GUARD_RUNTIME)
+                    .equals(1)
+                    .and(occurrences(code, CONSOLE_HELPERS_RUNTIME).equals(1))
+                    .and(occurrences(code, "uint8_t blorp_console_").equals(0))
+    )
+
+
 -- Declared and never called, the natives select no fragment.
 pure func test_an_uncalled_console_declaration_selects_no_fragment() -> Bool:
     source = "${CONSOLE_DECLARATIONS}func main() -> Int:\n    0\n"
@@ -125,8 +165,12 @@ TESTS: TestSuite = {
     description = "console operations emission",
     tests = [
         (
-            "the guard, the helpers and each console native are emitted once beside capture",
-            test_the_guard_is_emitted_once_for_capture_and_the_console,
+            "the guard, the helpers and each console native are emitted once beside capture, run and exit_interrupted",
+            test_the_guard_is_emitted_once_for_the_process_natives_and_the_console,
+        ),
+        (
+            "run or exit_interrupted alone selects the guard and the console helpers but no console native",
+            test_run_or_exit_interrupted_alone_selects_the_guard_and_the_console_helpers,
         ),
         (
             "flush alone selects the guard and the helpers but no process fragment",
