@@ -33,7 +33,9 @@ not rely on a remembered list. Each time:
 3. For a change under `blorp/`, run `make -C blorp test`.
 4. Run `scripts/blorp-fixpoint --prove` and
    `bash blorp/test/test_bootstrap/test_bootstrap.sh` exactly when
-   `blorp/AGENTS.md` ("Which gates a change runs") says the change needs them.
+   `blorp/AGENTS.md` ("Which gates a change runs") says the change needs them
+   locally. Otherwise the fixpoint is the branch's dispatched Seed job: report
+   its result if the caller gives you the run, and do not run it here.
 5. For a change to `benchmarks/`, run `bash benchmarks/bench.sh <name>` for a
    benchmark the change touches. For a docs-only change, check links and paths
    and run the whitespace check on the diff.

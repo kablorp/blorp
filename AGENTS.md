@@ -165,11 +165,15 @@ acceptable merely because the model is cleaner or another metric improves.
 Necessary correctness-test growth is allowed; do not hide growth through
 compressed formatting or deleted coverage. Set numerical cost ceilings before
 implementation, investigate repeatable increases at the owning phase, and
-reject or rescope a change that exceeds them. Keith has given the coordinating
-agent a standing delegation for routine budget corrections (confirmed
-2026-11-09). The coordinator, not the implementer, makes such a correction, and
-records it in the owning plan or results file with the old and new figures and
-the reason.
+reject or rescope a change that exceeds them. Set a production-line ceiling
+from compiled code, such as a spike, where you can. A line ceiling estimated
+from uncompiled sketches is a trigger for a growth audit: exceeding it stops
+the change, and the coordinator decides, from the audit, whether to cut it,
+accept it, or rescope it. Keith decides any change beyond a routine
+correction, and has given the coordinating agent a standing delegation for
+routine budget corrections (confirmed 2026-11-09). The coordinator, not the
+implementer, makes such a correction, and records it in the owning plan or
+results file with the old and new figures and the reason.
 
 ### Naming
 
@@ -268,8 +272,10 @@ lines at most: what was wrong, what changed, and one or two headline numbers.
 No issue numbers or names, no pasted tables or gate lists; that detail lives
 in the plan documents.
 
-**12. Get it reviewed.** Every change gets reviewed before commit. Use the code-reviewer and
-test-runner agents. No exceptions for "trivial" changes — trivial changes have trivial reviews.
+**12. Get it reviewed.** Every change gets reviewed before commit. Use the code-reviewer agent,
+which also checks the gate evidence; use the test-runner agent when the gates have not run on
+the final commit ([`blorp/AGENTS.md`](blorp/AGENTS.md), "Which gates a change runs"). No
+exceptions for "trivial" changes — trivial changes have trivial reviews.
 
 **13. Update docs with the code.** If your change is user-facing (syntax, API, error message),
 update `blorp/README.md` and `blorp/grammar.ebnf` in the same commit. Documentation drift is a bug.
@@ -328,7 +334,11 @@ subagents on Sonnet by default. Choose Opus only when a task is demanding
 enough to need it, such as a design that spans several phases or a subtle
 ownership or miscompilation investigation, and say why when you do.
 
-Every change still gets code-reviewer and test-runner review before commit.
+Every change still gets code review before commit, and a test-runner when
+its gates have not run on the final commit. A plan or change gets one review
+per concern: soundness, and ergonomics for user-facing design. The
+coordinator checks that the findings are fixed. A second review round is for
+blocker or soundness findings only.
 A worker should ask for guidance when a boundary or result is ambiguous, and
 a negative performance experiment is a valid result.
 

@@ -24,6 +24,9 @@ compiler, then runs the bootstrap shell test. On a push to main that passes,
 three native targets, verifies that the three emit identical C, runs the
 fixtures under both generations, and publishes that commit's seed as the
 immutable release `blorp-seed-<12hex>`, whose assets are `blorp-<target>`.
+A manual run on a branch (`gh workflow run blorp.yml --ref <branch>`) runs
+the same Seed job with publishing off, which is how a change proves its
+fixpoint before landing.
 
 The Makefile's explicit component selection (`COMPONENT_SOURCES` in
 `blorp/test/driver/driver.brp`; `TARGET_COMPONENT_SOURCES=<paths>` overrides

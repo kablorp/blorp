@@ -1594,9 +1594,11 @@ running `blorp format blorp`. The gate's roots are `blorp/scripts`, `blorp/src`,
 
 `scripts/blorp-fixpoint --prove` checks that the compiler reproduces itself:
 the seed builds A, A builds B and B builds C. B and C must emit identical C,
-and A and B must agree on every fixture. The seed workflow also runs the
-components and the e2e selection under B on every target after each push to
-main. Artifacts stay under `blorp/build/fixpoint/`.
+and A and B must agree on every fixture. The seed workflow proves the same
+on every target, and also runs the components and the e2e selection under B,
+after each push to main and on a manual branch run of the Blorp workflow,
+which publishes nothing. [AGENTS.md](AGENTS.md) says when a change runs which.
+Artifacts stay under `blorp/build/fixpoint/`.
 
 A seed rotation moves the pin forward. Once the seed workflow has published
 and qualified a release for every target, one change updates the tag, source

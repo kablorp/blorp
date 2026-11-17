@@ -218,7 +218,14 @@ against one frozen baseline on a quiet machine, covering the targeted boundary
 and the whole compilation, with source, binary, flags, inputs and output
 identity. The full record goes in the owning plan and raw samples under
 `build/`; the commit message carries only the headline numbers.
-`blorp/scripts/self-compile-cost` measures the whole compilation. Check an
+`blorp/scripts/self-compile-cost` measures the whole compilation. Its
+fixed-input row, where both compilers compile the base's source, is the row
+self-compile ceilings bind; the own-source row grows with the source itself
+and is reported, not held. Measure once per landing, on the final commit, with
+`--rounds 3`: allocations and peak heap are deterministic, and the rounds only
+steady the instruction median. Use `--rounds 5` when an instruction result
+lands within 0.05% of its ceiling. A data-model refactor commit inside a
+multi-commit landing is also measured against its own parent. Check an
 artifact's inputs and toolchain before reusing it, and run cheap publication
 checks early. Until self-compilation works, label owned-input measurements
 as proxies and say what they omit.
@@ -227,18 +234,26 @@ as proxies and say what they omit.
 other documents point here.
 
 - `make -C blorp test` runs for every change under `blorp/`.
-- `scripts/blorp-fixpoint --prove` runs only when the change touches what the
-  compiler's C is built from: `blorp/src/`, `blorp/standard_library/`,
+- The fixpoint proof runs in CI. A change that touches what the compiler's C
+  is built from (`blorp/src/`, `blorp/standard_library/`,
   `blorp/scripts/embed_library.brp`, `blorp/Makefile`, `blorp/bootstrap.env`,
-  `scripts/blorp-compiler-bootstrap` or `scripts/blorp-fixpoint`. A seed
-  rotation changes `bootstrap.env`, so it runs all three gates.
+  `scripts/blorp-compiler-bootstrap` or `scripts/blorp-fixpoint`) dispatches
+  the Blorp workflow on its landing branch before landing:
+  `gh workflow run blorp.yml --ref <branch>`. Its Seed job proves on all three
+  targets that B and C emit identical C and that A and B agree on every
+  fixture. A dispatched run publishes nothing.
+- `scripts/blorp-fixpoint --prove` runs locally only for a change to
+  `scripts/blorp-fixpoint`, `scripts/blorp-compiler-bootstrap`,
+  `blorp/bootstrap.env` or `.github/workflows/blorp-seed.yml`, or to debug a
+  failed Seed job. A seed rotation changes `bootstrap.env`, so it runs all
+  three gates.
 - `bash blorp/test/test_bootstrap/test_bootstrap.sh` runs when the change
   touches `scripts/blorp-compiler-bootstrap`, `blorp/Makefile` or
   `blorp/bootstrap.env`.
-- The component and native e2e suites run under compiler B only in
-  `.github/workflows/blorp-seed.yml`, after each push to main. A change to that
-  step also runs them locally with the fixpoint's B, as the script's `--help`
-  shows.
+- The component and native e2e suites run under compiler B only in the Seed
+  job of `.github/workflows/blorp-seed.yml`, on a dispatched branch run and
+  after each push to main. A change to that step also runs them locally with
+  the fixpoint's B, as the script's `--help` shows.
 - A docs-only change needs link and path checks and `git diff --check`, not a
   compiled gate.
 
@@ -248,8 +263,10 @@ that review and landing cite. If main moves before the push, replay the
 commits. Re-run the gates only when main's new commits touch `blorp/src/`,
 `blorp/standard_library/` or a file this change also touches; otherwise
 `git diff <gated commit> HEAD -- blorp/src blorp/standard_library` showing no
-change is the evidence. Code-reviewer and test-runner review apply to every
-change.
+change is the evidence. Code review applies to every change, and the reviewer
+checks that evidence. A test-runner runs the gates only when they have not
+run on the final commit: the logs are missing or incomplete, or the code
+changed after gating.
 
 Archiving a chat can also archive its managed worktrees. Git snapshots exclude
 ignored build evidence. Before archiving, preserve and verify every artifact
