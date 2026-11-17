@@ -258,6 +258,8 @@ static void expect_no_pending_sigpipe(void) {
     assert(sigismember(&pending, SIGPIPE) == 0);
 }
 
+/* Callers must store the call's result before passing `error`: C leaves argument order
+ * unspecified, and GCC on x86_64 reads `error` before the other argument's call sets it. */
 static void expect_closed_reader(uint8_t result, int64_t error) {
     assert(result == BLORP_FS_FAILED);
     assert(error == -(int64_t)EPIPE);
@@ -270,7 +272,8 @@ static int closed_write(void) {
     static unsigned char large[1 << 20];
     bytes_list data = bytes_of(large, sizeof large);
     int64_t error = -1;
-    expect_closed_reader(blorp_console_write(data, &error), error);
+    const uint8_t result = blorp_console_write(data, &error);
+    expect_closed_reader(result, error);
     blorp_list_drop_0_b(data);
     return 0;
 }
@@ -280,7 +283,8 @@ static int closed_flush(void) {
     bytes_list data = bytes_of("small", 5);
     int64_t error = -1;
     assert(blorp_console_write(data, &error) == BLORP_FS_SUCCEEDED);
-    expect_closed_reader(blorp_console_flush(&error), error);
+    const uint8_t result = blorp_console_flush(&error);
+    expect_closed_reader(result, error);
     blorp_list_drop_0_b(data);
     return 0;
 }
