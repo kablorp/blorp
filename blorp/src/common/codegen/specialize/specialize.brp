@@ -17,7 +17,6 @@ import:
         TypeParameterId,
     ../../analysis/ids as declared: FunctionId, OpaqueId, RecordId, UnionId, VariantId
     ../../analysis/namespace/builtins as builtins:
-        integer_fixed_storage,
         DesignatedBoolean,
         DesignatedOption,
         DesignatedResult,
@@ -113,13 +112,18 @@ opaque type FieldInstanceId = FieldIdentity
 
 private fixed union RecordRepresentation:
     InlineRecord
-    ManagedRecord
+    ValueRecord
+    CountedRecord
 
 
 -- InlineFields: a C struct by value with no managed field. ValueFields: a C
 -- struct by value with no cell or count of its own; copying or dropping it
--- acquires or drops each managed field, so nothing can hold it by address.
--- CountedFields: a counted heap cell, which a runtime closure's `void*` needs.
+-- acquires or drops each counted field, so nothing can hold it by address.
+-- A declared record or a tuple is stored so only when that is one count; a
+-- capture environment no runtime closure holds is, whatever it holds
+-- (sealed_record_layout). CountedFields: a counted heap cell, which a record
+-- that contains itself, a record whose copy would acquire more than one
+-- counted pointer and a runtime closure's `void*` need.
 union ConcreteRecord:
     InlineFields(List[TypeRef])
     ValueFields(List[TypeRef])
@@ -1387,11 +1391,11 @@ private pure func request_span(
             fallback
 
 
-private pure func known_arguments(arguments: List[TypeRef]) -> List[PartialType]:
+private pure func known_partial_types(types: List[TypeRef]) -> List[PartialType]:
     var partial: List[PartialType] = []
 
-    for argument in arguments:
-        partial = partial.append(KnownType(argument))
+    for known in types:
+        partial = partial.append(KnownType(known))
 
     partial
 
@@ -1441,8 +1445,8 @@ private pure func slot_record_representation(slot: RecordSlot) -> RecordRepresen
         CompleteRecord(instance):
             match instance.layout:
                 InlineFields(_): InlineRecord
-                -- A by-value record owns its fields and is not inline storage.
-                ValueFields(_) | CountedFields(_): ManagedRecord
+                ValueFields(_): ValueRecord
+                CountedFields(_): CountedRecord
         PendingRecord(instance):
             instance.representation
 
@@ -1744,7 +1748,8 @@ private pure func settle_record(
                     Ok(fields):
                         layout: ConcreteRecord = match instance.representation:
                             InlineRecord: InlineFields(fields)
-                            ManagedRecord: CountedFields(fields)
+                            ValueRecord: ValueFields(fields)
+                            CountedRecord: CountedFields(fields)
                         Ok(
                             CompleteRecord({
                                 key = { origin = instance.key.origin, arguments = arguments },
@@ -1851,42 +1856,125 @@ private pure func resolve_record_slots(
         None: Ok({ slots | entries = resolved })
 
 
--- Whether a prepared payload owns managed storage: a managed record, an
--- owning or boxed union, a String, a List, or any layout still in progress.
-private pure func payload_owns_children(
-    payload: PartialType,
+-- What copying a prepared value costs in reference counting: nothing for
+-- plain data, one count, or more than one. A record is stored by value only
+-- while a copy of it costs at most one count, which is what copying a
+-- counted cell costs, so no copy or drop of a value costs more counting than
+-- the cell it replaces would.
+private fixed union CopyCost:
+    NoCount
+    OneCount
+    SeveralCounts
+
+
+-- The cost of copying two values together.
+private pure func plus(left: CopyCost, right: CopyCost) -> CopyCost:
+    match (left, right):
+        (NoCount, _): right
+        (_, NoCount): left
+        _: SeveralCounts
+
+
+-- The cost of copying a record's fields, or one case's payloads, together.
+private pure func fields_cost(
+    fields: List[PartialType],
     unions: IndexedList[UnionSlot],
     records: IndexedList[RecordSlot],
     span: Span,
-) -> Result[Bool, Diagnostic]:
-    match payload:
+) -> Result[CopyCost, Diagnostic]:
+    var cost: CopyCost = NoCount
+    var failure: Option[Diagnostic] = None
+    for field in fields:
+        match field.copy_cost(unions, records, span):
+            Ok(field_cost):
+                cost = cost.plus(field_cost)
+            Err(error):
+                failure = Some(error)
+                break
+    match failure:
+        Some(error): Err(error)
+        None: Ok(cost)
+
+
+-- An inline union costs its widest case.
+private pure func cases_cost(
+    variants: List[List[PartialType]],
+    unions: IndexedList[UnionSlot],
+    records: IndexedList[RecordSlot],
+    span: Span,
+) -> Result[CopyCost, Diagnostic]:
+    var cost: CopyCost = NoCount
+    var failure: Option[Diagnostic] = None
+    for payloads in variants:
+        match payloads.fields_cost(unions, records, span):
+            Ok(NoCount):
+                void
+            Ok(OneCount):
+                cost = match cost:
+                    NoCount: OneCount
+                    OneCount | SeveralCounts: cost
+            Ok(SeveralCounts):
+                cost = SeveralCounts
+            Err(error):
+                failure = Some(error)
+                break
+    match failure:
+        Some(error): Err(error)
+        None: Ok(cost)
+
+
+-- A String, a List, a callable, a boxed union and any record that is not
+-- inline each cost one count: a value record holds one counted pointer, and
+-- a counted record or boxed union is one. A layout still in progress lies on
+-- a cycle of layouts, which passes through a pointer, so it costs at least
+-- one, and counts as one. That is exact but for an owning union whose widest
+-- case holds more, which recount_value_records corrects when it completes.
+private pure func copy_cost(
+    value: PartialType,
+    unions: IndexedList[UnionSlot],
+    records: IndexedList[RecordSlot],
+    span: Span,
+) -> Result[CopyCost, Diagnostic]:
+    match value:
         PendingUnionType(_) | PendingRecordType(_) | PendingListType(_) | PendingCallable(_, _):
-            Ok(True)
+            Ok(OneCount)
         KnownType(known):
             match known:
                 -- Every integer format is plain data and never owned.
                 VoidType | IntegerType(_) | FloatType:
-                    Ok(False)
+                    Ok(NoCount)
                 StringType | ListType(_) | CallableType(_, _):
-                    Ok(True)
+                    Ok(OneCount)
                 RecordType(child):
                     match records.entries.get(child.record_number()):
                         None:
                             Err(internal_error(span, "missing concrete record child layout"))
                         Some(slot):
-                            owns_children: Bool = match slot.slot_record_representation():
-                                ManagedRecord: True
-                                InlineRecord: False
-                            Ok(owns_children)
+                            match slot.slot_record_representation():
+                                InlineRecord: Ok(NoCount)
+                                ValueRecord | CountedRecord: Ok(OneCount)
                 UnionType(child):
                     match unions.entries.get(child.union_number()):
                         None:
                             Err(internal_error(span, "missing concrete child layout"))
-                        Some(slot):
-                            owns_children: Bool = match slot.slot_union_representation():
-                                InlineOwningPayload | BoxedRecursive: True
-                                InlineUnmanaged: False
-                            Ok(owns_children)
+                        Some(CompleteUnion(instance)):
+                            match instance.layout:
+                                PlainCases(_):
+                                    Ok(NoCount)
+                                BoxedCases(_):
+                                    Ok(OneCount)
+                                OwningCases(variants):
+                                    variants
+                                        .map(known_partial_types)
+                                        .cases_cost(unions, records, span)
+                        Some(PendingUnion(instance)):
+                            match instance.representation:
+                                InlineUnmanaged:
+                                    Ok(NoCount)
+                                BoxedRecursive:
+                                    Ok(OneCount)
+                                InlineOwningPayload:
+                                    instance.variants.cases_cost(unions, records, span)
 
 
 private pure func ensure_union(
@@ -1964,13 +2052,11 @@ private pure func prepare_union(
                     record_dependencies = prepared.records
                     layouts = prepared.in_progress
                     fields = fields.append(prepared.value_type)
-                    match prepared.value_type.payload_owns_children(
-                        dependencies,
-                        record_dependencies,
-                        span,
-                    ):
-                        Ok(owns):
-                            owning = owning.or(owns)
+                    match prepared.value_type.copy_cost(dependencies, record_dependencies, span):
+                        Ok(NoCount):
+                            void
+                        Ok(OneCount | SeveralCounts):
+                            owning = True
                         Err(error):
                             failure = Some(error)
                             break
@@ -2020,12 +2106,19 @@ private pure func prepare_union(
             })
         ReferencedBack:
             completed: CompletedLayout = CompletedUnion(key, id)
+            first_record = records.entries.length()
             match published.resolve_union_slots(unions.entries.length(), completed, span):
                 Ok(resolved_unions):
-                    match record_dependencies.resolve_record_slots(
-                        records.entries.length(),
-                        completed,
-                        span,
+                    match (
+                        record_dependencies
+                            .resolve_record_slots(first_record, completed, span)
+                            .and_then(
+                                pure func(resolved): resolved.recount_value_records(
+                                    first_record,
+                                    resolved_unions,
+                                    span,
+                                ),
+                            )
                     ):
                         Ok(resolved_records):
                             Ok({
@@ -2040,91 +2133,100 @@ private pure func prepare_union(
                     Err(error)
 
 
--- Whether a prepared field keeps its record inline: a number, a record whose
--- own layout is inline, or a union declared fixed. A fixed union is always
--- InlineUnmanaged, which prepare_union asserts; an ordinary union is not
--- inline here even when it is unmanaged, so that a record's layout follows
--- declared promises rather than another union's current payloads.
-private pure func inline_record_field(
-    field: PartialType,
-    checked: model.CheckedFunctions,
+-- An owning union in progress counts as one count (copy_cost), which
+-- undercounts one whose widest case holds more. Every record whose cost read
+-- it, as a field or in another union's payload, was published while it was in
+-- progress, so when it completes, each value record published since is costed
+-- again and becomes a counted cell if a copy would cost more than one count.
+-- Value and counted records both cost a holder one count and make a union
+-- payload owning, so this moves no other layout, and a record's storage does
+-- not depend on which layout of a cycle specialization meets first.
+private pure func recount_value_records(
+    slots: IndexedList[RecordSlot],
+    first: Int,
+    unions: IndexedList[UnionSlot],
+    span: Span,
+) -> Result[IndexedList[RecordSlot], Diagnostic]:
+    var recounted = slots.entries
+    var position = first
+    var failure: Option[Diagnostic] = None
+
+    while (position < recounted.length()).and(failure.is_none()):
+        match recounted.get(position):
+            Some(slot):
+                match slot.recounted_slot(unions, slots, span):
+                    Ok(Some(counted)): recounted = recounted.set(position, counted)
+                    Ok(None): void
+                    Err(error): failure = Some(error)
+            None:
+                failure = Some(internal_error(span, "record slot left its builder"))
+        position = position + 1
+
+    match failure:
+        Some(error): Err(error)
+        None: Ok({ slots | entries = recounted })
+
+
+-- A value record's slot as a counted cell when a copy of its fields now
+-- costs more than one count; None when the slot stays as it is.
+private pure func recounted_slot(
+    slot: RecordSlot,
     unions: IndexedList[UnionSlot],
     records: IndexedList[RecordSlot],
     span: Span,
-) -> Result[Bool, Diagnostic]:
-    match field:
-        KnownType(IntegerType(format)):
-            Ok(format.integer_fixed_storage())
-        KnownType(FloatType):
-            Ok(True)
-        KnownType(UnionType(child)):
-            match unions.entries.get(child.union_number()):
-                None:
-                    Err(internal_error(span, "missing concrete child layout"))
-                Some(slot):
-                    declaration: UnionId = match slot:
-                        CompleteUnion(instance): instance.key.declaration
-                        PendingUnion(instance): instance.key.declaration
-                    checked.unions
-                        .get(declaration.union_number())
-                        .map(
-                            pure func(union_declaration: model.CheckedUnion) -> Bool: union_declaration.fixed,
-                        )
-                        .or_internal_error(span, "unknown union declaration")
-        KnownType(RecordType(child)):
-            match records.entries.get(child.record_number()):
-                None:
-                    Err(internal_error(span, "missing concrete record child layout"))
-                Some(slot):
-                    is_inline: Bool = match slot.slot_record_representation():
-                        InlineRecord: True
-                        ManagedRecord: False
-                    Ok(is_inline)
-        _:
-            Ok(False)
+) -> Result[Option[RecordSlot], Diagnostic]:
+    match slot.slot_record_representation():
+        InlineRecord | CountedRecord:
+            Ok(None)
+        ValueRecord:
+            fields: List[PartialType] = match slot:
+                CompleteRecord(instance): known_partial_types(record_fields(instance.layout))
+                PendingRecord(instance): instance.fields
+            match fields.fields_cost(unions, records, span):
+                Ok(OneCount):
+                    Ok(None)
+                Ok(SeveralCounts):
+                    counted: RecordSlot = match slot:
+                        CompleteRecord(instance):
+                            CompleteRecord(
+                                { instance |
+                                    layout = CountedFields(record_fields(instance.layout)),
+                                },
+                            )
+                        PendingRecord(instance):
+                            PendingRecord({ instance | representation = CountedRecord })
+                    Ok(Some(counted))
+                -- A recount replaces an in-progress layout's one count with its own.
+                Ok(NoCount):
+                    Err(internal_error(span, "a recounted value record holds no counted value"))
+                Err(error):
+                    Err(error)
 
 
--- Whether a record keeps its fields inline: every field must be a number, an
--- inline record or a fixed union. A layout still in progress is not a
--- KnownType, so a field that closes a cycle keeps the record counted.
+-- A record that contains itself, or that a runtime closure may hold as
+-- `void*`, needs a counted cell. Any other record is inline when a copy costs
+-- nothing, a value when it costs one count and a counted cell when it would
+-- cost more. The fields' own layouts decide, as a union's payloads decide
+-- its storage, so `fixed` plays no part: Check limits a fixed record to
+-- fields that cost nothing, and this rule then keeps it inline.
 private pure func record_representation(
     fields: List[PartialType],
-    storage: RecordStoragePolicy,
-    checked: model.CheckedFunctions,
+    needs_cell: Bool,
     unions: IndexedList[UnionSlot],
     records: IndexedList[RecordSlot],
     span: Span,
 ) -> Result[RecordRepresentation, Diagnostic]:
-    var managed: Bool = match storage:
-        InlineEligible | DeclaredInline: False
-        AlwaysManaged: True
-    var found_error: Option[Diagnostic] = None
-    for field in fields:
-        match field.inline_record_field(checked, unions, records, span):
-            Ok(inline):
-                if inline.not():
-                    managed = True
-            Err(failure):
-                found_error = Some(failure)
-                break
-
-    _: Void ?= match found_error:
-        Some(failure): Err(failure)
-        None: Ok(void)
-
-    -- Checking accepts a fixed record only when every field is a number, a
-    -- fixed record or a fixed union and none contains the record.
-    match storage:
-        DeclaredInline:
-            if managed:
-                Err(internal_error(span, "a fixed record instance is not stored inline"))
-            else:
-                Ok(InlineRecord)
-        InlineEligible | AlwaysManaged:
-            if managed:
-                Ok(ManagedRecord)
-            else:
-                Ok(InlineRecord)
+    if needs_cell:
+        Ok(CountedRecord)
+    else:
+        fields
+            .fields_cost(unions, records, span)
+            .map(pure func(cost) -> RecordRepresentation:
+                match cost:
+                    NoCount: InlineRecord
+                    OneCount: ValueRecord
+                    SeveralCounts: CountedRecord
+            )
 
 
 private pure func ensure_record(
@@ -2157,20 +2259,11 @@ private pure func ensure_record(
                     key.prepare_record(checked, unions, span, records, in_progress)
 
 
--- How a record's fields decide its storage. A fixed record has promised
--- inline storage, which checking has verified, so any other layout is a
--- disagreement between the two rules.
-private fixed union RecordStoragePolicy:
-    InlineEligible
-    DeclaredInline
-    AlwaysManaged
-
-
 private record SelectedRecord {
     type_parameters: List[TypeParameterId],
     parameter_owner: model.TypeParameterOwner,
     fields: List[model.TypeUse],
-    storage: RecordStoragePolicy,
+    needs_cell: Bool,
 }
 
 
@@ -2184,10 +2277,10 @@ private pure func prepare_record(
 ) -> Result[PreparedType, Diagnostic]:
     match key.origin:
         StructuralTuple:
+            -- A tuple names no declaration, so it cannot contain itself.
             key.publish_record(
                 key.arguments,
-                InlineEligible,
-                checked,
+                False,
                 unions,
                 span,
                 records,
@@ -2213,15 +2306,11 @@ private pure func prepare_source_record(
     declaration ?= checked.records
         .get(id.record_number())
         .or_internal_error(span, "unknown record declaration")
-    storage: RecordStoragePolicy = if declaration.fixed:
-        DeclaredInline
-    else:
-        InlineEligible
     selected: SelectedRecord = {
         type_parameters = declaration.type_parameters,
         parameter_owner = model.RecordDeclaration(id),
         fields = declaration.fields.map(pure func(field): field.value_type),
-        storage = storage,
+        needs_cell = declaration.contains_itself,
     }
     key.prepare_declared_record(selected, checked, unions, span, records, in_progress)
 
@@ -2245,7 +2334,9 @@ private pure func prepare_capture_record(
         type_parameters = root.signature.type_parameters,
         parameter_owner = model.FunctionDeclaration(lambda.root),
         fields = lambda.captures.map(pure func(capture): capture.value_type),
-        storage = AlwaysManaged,
+        -- sealed_record_layout stores the environment by value unless a
+        -- runtime closure holds it.
+        needs_cell = True,
     }
     key.prepare_declared_record(selected, checked, unions, span, records, in_progress)
 
@@ -2296,8 +2387,7 @@ private pure func prepare_declared_record(
 
     key.publish_record(
         fields,
-        declaration.storage,
-        checked,
+        declaration.needs_cell,
         dependencies,
         span,
         record_dependencies,
@@ -2311,8 +2401,7 @@ private pure func prepare_declared_record(
 private pure func publish_record(
     key: PartialRecordKey,
     fields: List[PartialType],
-    storage: RecordStoragePolicy,
-    checked: model.CheckedFunctions,
+    needs_cell: Bool,
     dependencies: IndexedList[UnionSlot],
     span: Span,
     record_dependencies: IndexedList[RecordSlot],
@@ -2321,8 +2410,7 @@ private pure func publish_record(
     first_record: Int,
 ) -> Result[PreparedType, Diagnostic]:
     representation ?= fields.record_representation(
-        storage,
-        checked,
+        needs_cell,
         dependencies,
         record_dependencies,
         span,
@@ -2674,7 +2762,7 @@ private pure func sealed_record_layout(
         DeclaredRecord(_) | StructuralTuple:
             Ok(instance.layout)
         CaptureEnvironment(_):
-            -- prepare_capture_record requests AlwaysManaged storage.
+            -- prepare_capture_record asks for a counted cell.
             match instance.layout:
                 CountedFields(fields):
                     if converted.any(pure func(closure): closure == id):
@@ -3186,7 +3274,7 @@ private pure func prepare_callable_storage(
         Ok({ storage = ErasedCallable, prepared = prepared })
     else:
         match ensure_record(
-            { origin = CaptureEnvironment(id), arguments = arguments.known_arguments() },
+            { origin = CaptureEnvironment(id), arguments = arguments.known_partial_types() },
             checked,
             prepared.unions,
             span,

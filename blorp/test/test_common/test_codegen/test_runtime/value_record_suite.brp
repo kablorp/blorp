@@ -1,0 +1,154 @@
+---
+A record that holds one counted value is stored by value: its emitted copy
+acquires that value and its drop releases it, with no cell of its own. A C
+probe drives the helpers emitted for SOURCE under the strict leak check,
+which must balance, and prints how many allocations each step leaves live:
+a copy and two drops, a List of the records, and a closure environment, a
+counted cell, holding one.
+---
+import:
+    bool: and
+    io/process: Captured
+    result: Result methods
+    string: String methods
+    test: TestSuite
+    ../../../../src/common/codegen/emit/emit: aggregate_runtime
+    ../../../../src/common/codegen/own/own: own
+    ../../../../src/common/codegen/runtime/memory: MEMORY_RUNTIME
+    ../../../../src/common/codegen/runtime/string: string_runtime
+    ../../../../src/common/codegen/specialize/specialize as specialized
+    ../../../../src/common/codegen/verify/verify: verify, verified_contents, VerifiedProgram
+    ../../../../src/common/syntax/syntax: IntegerFormat(Int64Format)
+    ../../../driver/file_access: write_file
+    ../../../driver/harness: isolated, run_expecting, strict_leak_check
+    ../../../driver/reports: verify_accounting
+    ../../../support/list_update_inputs: lowered
+
+
+private COMPILE_TIMEOUT_MS: Int = 600000
+private CHILD_TIMEOUT_MS: Int = 60000
+
+
+private PROBE_SOURCE: String = "blorp/test/test_common/test_codegen/test_runtime/fixtures/value_record_test.c"
+
+
+-- Named is a value; the closure bound to `callback` is a runtime closure, so
+-- its environment is a counted cell holding a Named; and `[named]` makes the
+-- List helpers for Named.
+private SOURCE: String =
+    |record Named { name: String, count: Int }
+    |pure func keep(item: Named, items: List[Named], callback: pure (Int) -> Int) -> Int:
+    |    item.count
+    |func main() -> Int:
+    |    named: Named = { name = "one", count = 1 }
+    |    callback: pure (Int) -> Int = pure func(extra: Int) -> Int: named.count
+    |    keep(named, [named], callback)
+    |
+
+
+-- The probe's C names are admitted only after this typed catalogue: record 0
+-- is Named, stored by value, and record 1 the counted environment holding it.
+private pure func catalogue(program: VerifiedProgram) -> Bool:
+    match verified_contents(program).records:
+        [specialized.ValueFields([specialized.StringType, specialized.IntegerType(Int64Format)]), specialized.CountedFields([specialized.RecordType(held)])]:
+            specialized.record_number(held) == 0
+        _:
+            False
+
+
+private func ready(c_compiler: String, directory: String) -> Result[String, String]:
+    program ?= lowered(SOURCE)
+        .and_then(own)
+        .and_then(verify)
+        .map_err(pure func(error): error.message + "; " + error.help)
+    _: Void ?= if catalogue(program):
+        Ok(void)
+    else:
+        Err("value record concrete catalogue differs")
+    aggregates ?= aggregate_runtime(program).map_err(
+        pure func(error): error.message + "; " + error.help,
+    )
+    _ ?= write_file(directory + "/value_memory.c", MEMORY_RUNTIME)
+    _ ?= write_file(directory + "/value_records.c", (string_runtime() + aggregates) + "\n")
+    executable = directory + "/value_record_probe"
+    build ?= isolated(
+        c_compiler,
+        [
+            "-std=c11",
+            "-O0",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            "-pedantic",
+            "-fsanitize=address,undefined",
+            "-fno-sanitize-recover=all",
+            "-DBLORP_MEMORY_DIAGNOSTICS=1",
+            "-I",
+            directory,
+            PROBE_SOURCE,
+            "-o",
+            executable,
+        ],
+        COMPILE_TIMEOUT_MS,
+    )
+    built ?= run_expecting("value record native build", build, 0)
+    if built.stderr == "":
+        Ok(executable)
+    else:
+        Err("value record native build: " + built.stderr)
+
+
+-- Runs `mode` under the strict leak check; its stdout must be `expected` and
+-- its allocation report must balance.
+private func probed(executable: String, mode: String, expected: String) -> Bool:
+    checked: Result[Void, String] = match isolated(executable, [mode], CHILD_TIMEOUT_MS):
+        Err(error):
+            Err(error)
+        Ok(probe):
+            match run_expecting(
+                "value record " + mode,
+                { probe | environment = strict_leak_check() },
+                0,
+            ):
+                Err(error):
+                    Err(error)
+                Ok(run):
+                    if run.stdout == expected:
+                        verify_accounting(run.stderr, True)
+                    else:
+                        Err("value record ${mode}: expected [${expected}] got [${run.stdout}]")
+    match checked:
+        Ok(_):
+            True
+        Err(error):
+            print_error(error)
+            False
+
+
+func suite(c_compiler: String, directory: String) -> TestSuite:
+    match ready(c_compiler, directory):
+        Err(error):
+            print_error(error)
+            { description = "Value record setup", tests = [("native probe builds", func(): False)] }
+        Ok(executable):
+            {
+                description = "Records stored by value",
+                tests = [
+                    (
+                        "a copy shares the String and each drop releases it once",
+                        func(): probed(
+                            executable,
+                            "copy",
+                            "copied 1 after one drop 1 after both 0\n",
+                        ),
+                    ),
+                    (
+                        "a List stores the records themselves and its drop releases them",
+                        func(): probed(executable, "list", "stored 2 read 2 after drop 0\n"),
+                    ),
+                    (
+                        "a counted environment holds a record by value and releases it",
+                        func(): probed(executable, "capture", "held 2 after copy 2 after drop 0\n"),
+                    ),
+                ],
+            }

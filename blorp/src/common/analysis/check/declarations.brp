@@ -692,11 +692,23 @@ private record ResolvedUnion {
 }
 
 
+-- A record declaration with its annotations resolved, before
+-- validate_finite_declarations publishes it as a CheckedRecord with whether
+-- it contains itself. Only Check reads `fixed`, to enforce it on the fields.
+private record ResolvedRecord {
+    id: RecordId,
+    type_parameters: List[TypeParameterId],
+    requirements: List[TraitRequirement],
+    fields: List[CheckedField],
+    fixed: Bool,
+}
+
+
 -- The nominal declarations with every annotation resolved, which the finite
 -- storage checks read before any is published.
 private record ResolvedDeclarations {
     unions: List[ResolvedUnion],
-    records: List[CheckedRecord],
+    records: List[ResolvedRecord],
     opaques: List[CheckedOpaque],
 }
 
@@ -760,7 +772,7 @@ private pure func declare_types(
 
             declared: Result[ResolvedNominals, CheckError] = match declaration:
                 UnionDeclarationRow(parsed_union): parsed_union.resolved_union(scope, resolved)
-                RecordDeclarationRow(parsed_record): parsed_record.checked_record(scope, resolved)
+                RecordDeclarationRow(parsed_record): parsed_record.resolved_record(scope, resolved)
                 OpaqueDeclarationRow(parsed_opaque): parsed_opaque.checked_opaque(scope, resolved)
 
             match declared:
@@ -834,7 +846,7 @@ private pure func resolved_union(
             })
 
 
-private pure func checked_record(
+private pure func resolved_record(
     row: RecordRow,
     module_scope: TypeScope,
     resolved: ResolvedDeclarations,
@@ -874,7 +886,7 @@ private pure func checked_record(
         Some(error):
             Err(error)
         None:
-            declared: CheckedRecord = {
+            declared: ResolvedRecord = {
                 id = row.id,
                 type_parameters = scope.declared_parameters(),
                 requirements = bounds.bounds.parameter_requirements(owner),
@@ -974,10 +986,16 @@ pure func occurrence_fields(
     fields: List[TypeUse],
     occurrence: UnionOccurrence,
 ) -> Result[List[TypeUse], CheckError]:
-    substitution: Substitution = {
+    fields.substituted_fields({
         owner = UnionDeclaration(occurrence.owner),
         values = occurrence.arguments,
-    }
+    })
+
+
+private pure func substituted_fields(
+    fields: List[TypeUse],
+    substitution: Substitution,
+) -> Result[List[TypeUse], CheckError]:
     var resolved: List[TypeUse] = []
     var failure: Option[CheckError] = None
     for written in fields:
@@ -1318,7 +1336,7 @@ private pure func fixed_storage(
         NominalType(AggregateNominal(RecordAggregate(id)), _):
             declarations.records
                 .get(id.record_number())
-                .map(pure func(declaration: CheckedRecord) -> Bool: declaration.fixed)
+                .map(pure func(declaration: ResolvedRecord) -> Bool: declaration.fixed)
                 .or_checker_invariant(span, InvalidRecordDeclaration(id))
         _:
             Ok(False)
@@ -1457,20 +1475,80 @@ private pure func validate_fixed_types(
         None: Ok(void)
 
 
+-- One record or union a walk meets, at its type arguments.
+private record StoredOccurrence {
+    aggregate: AggregateId,
+    arguments: List[TypeRef],
+}
+
+
+-- How a walk treats a record it meets. Records are classified first, each
+-- following every record and union it stores, so a record's fact depends on
+-- no other. Unions are classified after them, given whether each record, by
+-- record number, contains itself: such a record is a counted cell, a pointer
+-- that ends a union's walk, and any other record is stored by value.
+private union RecordEdges:
+    EveryRecordByValue
+    ClassifiedRecords(List[Bool])
+
+
+-- What a walk meets at one stored field: its root, a record or union stored
+-- by value, the elements of a tuple, or a pointer that ends the walk there.
+private union Met:
+    MetRoot
+    MetOccurrence(StoredOccurrence)
+    MetElements(List[TypeUse])
+    MetPointer
+
+
+-- What a walk from `root` meets at `field`, seen through opaque types. Lists,
+-- Strings and callables are pointers, and so is a record `edges` marks as
+-- containing itself.
+private pure func met(
+    field: TypeUse,
+    root: AggregateId,
+    edges: RecordEdges,
+    declarations: ResolvedDeclarations,
+) -> Result[Met, CheckError]:
+    stored ?= field.value_type.stored_type(field.span, declarations)
+    match stored:
+        TupleType(elements):
+            Ok(MetElements(elements.map(pure func(element): { field | value_type = element })))
+        NominalType(AggregateNominal(aggregate), arguments):
+            if aggregate == root:
+                Ok(MetRoot)
+            else:
+                cell: Result[Bool, CheckError] = match (aggregate, edges):
+                    (RecordAggregate(id), ClassifiedRecords(cells)):
+                        cells
+                            .get(id.record_number())
+                            .or_checker_invariant(field.span, InvalidRecordDeclaration(id))
+                    _:
+                        Ok(False)
+                cell.map(pure func(pointer) -> Met:
+                    if pointer:
+                        MetPointer
+                    else:
+                        MetOccurrence({ aggregate = aggregate, arguments = arguments })
+                )
+        _:
+            Ok(MetPointer)
+
+
 -- Whether a declaration contains itself: its fields or payloads, followed
--- through the payloads of the unions and the underlying types of the opaque
--- types they store by value, at their substituted arguments, reach it again.
--- Records, tuples, Lists, Strings and callables are stored behind a pointer
--- and end the walk. Each union occurrence is expanded once, and there are
--- finitely many because growing recursion is rejected first.
+-- through the tuples, records and unions and the underlying types of the
+-- opaque types they store by value, at their substituted arguments, reach it
+-- again. Each occurrence is expanded once, and there are finitely many
+-- because growing recursion is rejected first.
 private pure func contains_itself(
     root: AggregateId,
+    edges: RecordEdges,
     declarations: ResolvedDeclarations,
 ) -> Result[Bool, CheckError]:
     fields ?= root.root_fields(declarations)
     var pending = fields
     var pending_count = fields.length()
-    var expanded: List[UnionOccurrence] = []
+    var expanded: List[StoredOccurrence] = []
     var found: Bool = False
     var failure: Option[CheckError] = None
 
@@ -1480,41 +1558,48 @@ private pure func contains_itself(
             .and(failure.is_none())
     ):
         pending_count = pending_count - 1
+        step: Result[Met, CheckError] = pending
+            .get(pending_count)
+            .or_checker_invariant(compiler_span(), InvalidDeclarationVisit)
+            .and_then(pure func(field): field.met(root, edges, declarations))
 
-        match pending.get(pending_count):
-            None:
-                failure = Some(checker_invariant(compiler_span(), InvalidDeclarationVisit))
-            Some(payload):
-                match payload.value_type.stored_type(payload.span, declarations):
-                    Err(error):
-                        failure = Some(error)
-                    Ok(NominalType(AggregateNominal(UnionAggregate(id)), arguments)):
-                        occurrence: UnionOccurrence = { owner = id, arguments = arguments }
-
-                        if UnionAggregate(id) == root:
-                            found = True
-                        else if (
-                            expanded
-                                .contains(occurrence)
-                                .not()
-                        ):
-                            expanded = expanded.append(occurrence)
-
-                            match (
-                                UnionAggregate(id)
-                                    .root_fields(declarations)
-                                    .and_then(
-                                        pure func(written): written.occurrence_fields(occurrence),
-                                    )
-                            ):
-                                Ok(payloads):
-                                    for stored in payloads:
-                                        pending = pending.push_at(pending_count, stored)
-                                        pending_count = pending_count + 1
-                                Err(error):
-                                    failure = Some(error)
-                    Ok(_):
-                        void
+        match step:
+            Err(error):
+                failure = Some(error)
+            Ok(MetRoot):
+                found = True
+            Ok(MetPointer):
+                void
+            Ok(MetElements(elements)):
+                for element in elements:
+                    pending = pending.push_at(pending_count, element)
+                    pending_count = pending_count + 1
+            Ok(MetOccurrence(occurrence)):
+                if (
+                    expanded
+                        .contains(occurrence)
+                        .not()
+                ):
+                    expanded = expanded.append(occurrence)
+                    written = occurrence.aggregate.root_fields(declarations)
+                    -- An occurrence without arguments names a declaration
+                    -- without type parameters: its fields are stored as written.
+                    stored: Result[List[TypeUse], CheckError] = if occurrence.arguments.is_empty():
+                        written
+                    else:
+                        written.and_then(
+                            pure func(declared): declared.substituted_fields({
+                                owner = occurrence.aggregate.aggregate_owner(),
+                                values = occurrence.arguments,
+                            }),
+                        )
+                    match stored:
+                        Ok(children):
+                            for child in children:
+                                pending = pending.push_at(pending_count, child)
+                                pending_count = pending_count + 1
+                        Err(error):
+                            failure = Some(error)
 
     match failure:
         Some(error): Err(error)
@@ -1523,25 +1608,41 @@ private pure func contains_itself(
 
 -- Every declaration must have a finite layout. An opaque type must not
 -- contain itself, a fixed type must be stored inline, and a generic type
--- must reach finitely many applications of itself. A union that contains
--- itself is then the only by-value cycle left, and each union is published
--- with that classification: specialization stores such a union's values in
--- counted heap nodes, which breaks every such cycle. A record on a cycle is
--- always managed today, so records are not classified. Fixed types are
--- checked before growth, so a fixed type that contains itself is reported
--- by its own rule.
+-- must reach finitely many applications of itself. Every by-value cycle then
+-- passes through a record or union that contains itself, and each is
+-- published with that classification: specialization stores such a record or
+-- union in counted heap cells, which breaks every such cycle. Fixed types are
+-- checked before growth, so a fixed type that contains itself is reported by
+-- its own rule.
 private pure func validate_finite_declarations(
     declarations: ResolvedDeclarations,
 ) -> Result[CheckedDeclarations, CheckError]:
     -- Expanding opaque types below terminates only once no opaque is on a cycle.
     _: Void ?= declarations.validate_opaque_representations()
     _: Void ?= declarations.validate_fixed_types()
-    -- Substituting union bodies below terminates only once growth is rejected.
+    -- Substituting declaration bodies below terminates only once growth is rejected.
     _: Void ?= declarations.validate_type_growth()
+    records ?= declarations.records.translated_list(
+        pure func(declaration: ResolvedRecord) -> Result[CheckedRecord, CheckError]:
+            RecordAggregate(declaration.id)
+                .contains_itself(EveryRecordByValue, declarations)
+                .map(
+                    pure func(found) -> CheckedRecord: {
+                        id = declaration.id,
+                        type_parameters = declaration.type_parameters,
+                        requirements = declaration.requirements,
+                        fields = declaration.fields,
+                        contains_itself = found,
+                    },
+                )
+    )
+    cells: RecordEdges = ClassifiedRecords(
+        records.map(pure func(declaration: CheckedRecord) -> Bool: declaration.contains_itself),
+    )
     unions ?= declarations.unions.translated_list(
         pure func(declaration: ResolvedUnion) -> Result[CheckedUnion, CheckError]:
             UnionAggregate(declaration.id)
-                .contains_itself(declarations)
+                .contains_itself(cells, declarations)
                 .map(
                     pure func(found) -> CheckedUnion: {
                         id = declaration.id,
@@ -1554,7 +1655,7 @@ private pure func validate_finite_declarations(
                     },
                 )
     )
-    Ok({ unions = unions, records = declarations.records, opaques = declarations.opaques })
+    Ok({ unions = unions, records = records, opaques = declarations.opaques })
 
 
 -- Fixed-target reachability is fresh for every opaque. Mark a type only when

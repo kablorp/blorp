@@ -1,0 +1,396 @@
+---
+A record's storage follows its fields' own layouts, and `fixed` takes no part:
+inline when a copy acquires no counted pointer, by value when it acquires
+exactly one, and a counted cell when it would acquire more, or when Check
+found that the record contains itself. A String, a List, a callable, a boxed
+union and any record that is not inline count one; an owning union counts its
+widest case, whichever layout on a cycle specialization meets first.
+---
+import:
+    bool: and
+    test: TestSuite
+    ../../../../src/common/analysis/check/check: check
+    ../../../../src/common/codegen/specialize/specialize as specialized
+    ../../../../src/common/syntax/syntax: IntegerFormat(Int64Format)
+    ../../../support/module_input: parse_modules
+
+
+-- Each record has its own field shape, so its layout is found by shape.
+private SOURCE: String =
+    |fixed union Signal:
+    |    Quiet
+    |    Level(Int)
+    |union Toggle:
+    |    On
+    |    Off
+    |union Text:
+    |    Blank
+    |    Words(String)
+    |union Both:
+    |    Neither
+    |    Two(String, String)
+    |record Flagged { signal: Signal }
+    |record Switched { set: Bool, value: Int }
+    |record Toggled { value: Int, toggle: Toggle }
+    |record Labelled { text: Text, value: Int, count: Int }
+    |record Named { name: String, count: Int }
+    |record Pair { first: String, second: String }
+    |record Wrapped { inner: Named, weight: Float }
+    |record Doubled { inner: Named, label: String }
+    |record Holder { pair: Pair, flag: Bool }
+    |record Twice { both: Both, weight: Float }
+    |record Chain { next: Option[Chain], weight: Float, count: Int }
+    |record Box[T] { value: T, weight: Float }
+    |pure func flagged(item: Flagged) -> Int:
+    |    0
+    |pure func switched(item: Switched) -> Int:
+    |    item.value
+    |pure func toggled(item: Toggled) -> Int:
+    |    item.value
+    |pure func labelled(item: Labelled) -> Int:
+    |    item.value
+    |pure func named(item: Named) -> Int:
+    |    item.count
+    |pure func paired(item: Pair) -> Int:
+    |    0
+    |pure func wrapped(item: Wrapped) -> Int:
+    |    item.inner.count
+    |pure func doubled(item: Doubled) -> Int:
+    |    item.inner.count
+    |pure func held(item: Holder) -> Int:
+    |    0
+    |pure func twice(item: Twice) -> Int:
+    |    0
+    |pure func chained(item: Chain) -> Int:
+    |    item.count
+    |pure func boxed[T](item: Box[T]) -> Int:
+    |    0
+    |func main() -> Int:
+    |    named_item: Named = { name = "five", count = 5 }
+    |    pair: Pair = { first = "six", second = "seven" }
+    |    first = flagged({ signal = Level(1) })
+    |    second = switched({ set = True, value = 2 })
+    |    third = toggled({ value = 3, toggle = On })
+    |    fourth = labelled({ text = Words("four"), value = 4, count = 4 })
+    |    fifth = named(named_item)
+    |    sixth = paired(pair)
+    |    seventh = wrapped({ inner = named_item, weight = 7.0 })
+    |    eighth = doubled({ inner = named_item, label = "eight" })
+    |    ninth = held({ pair = pair, flag = True })
+    |    tenth = twice({ both = Neither, weight = 10.0 })
+    |    eleventh = chained({ next = None, weight = 11.0, count = 11 })
+    |    void_box: Box[Void] = { value = void, weight = 12.0 }
+    |    text_box: Box[String] = { value = "thirteen", weight = 13.0 }
+    |    twelfth = boxed(void_box)
+    |    thirteenth = boxed(text_box)
+    |    0
+    |
+
+
+-- Shape's widest case holds two Strings and Shape reaches Wrapper through a
+-- List, so specialization prepares one of them while the other is in
+-- progress; main's first binding decides which.
+private WRAPPER_CYCLE: String =
+    |union Shape:
+    |    Pair(String, String)
+    |    Many(List[Wrapper])
+    |record Wrapper { shape: Shape }
+    |pure func shape_size(shape: Shape) -> Int:
+    |    0
+    |pure func wrapper_size(item: Wrapper) -> Int:
+    |    0
+    |
+
+
+-- Holder reaches the in-progress Shape only through Outer's payload.
+private HOLDER_CYCLE: String =
+    |union Shape:
+    |    Pair(String, String)
+    |    Many(List[Holder])
+    |union Outer:
+    |    Hold(Shape)
+    |    Empty
+    |record Holder { outer: Outer }
+    |pure func shape_size(shape: Shape) -> Int:
+    |    0
+    |pure func holder_size(item: Holder) -> Int:
+    |    0
+    |
+
+
+private SHAPE_FIRST: String =
+    |func main() -> Int:
+    |    shape: Shape = Pair("a", "b")
+    |    shape_size(shape)
+    |
+
+
+private WRAPPER_FIRST: String =
+    |func main() -> Int:
+    |    item: Wrapper = { shape = Pair("a", "b") }
+    |    wrapper_size(item)
+    |
+
+
+private HOLDER_FIRST: String =
+    |func main() -> Int:
+    |    item: Holder = { outer = Empty }
+    |    holder_size(item)
+    |
+
+
+private union Storage:
+    Inline
+    ByValue
+    Counted
+
+
+private pure func specialized_records(source: String) -> List[specialized.ConcreteRecord]:
+    match parse_modules([{ source = source, targets = [] }]):
+        Err(_):
+            []
+        Ok(parsed):
+            match check(parsed):
+                Err(_):
+                    []
+                Ok(accepted):
+                    match specialized.specialize(accepted):
+                        Err(_): []
+                        Ok(program): specialized.specialized_contents(program).records
+
+
+-- The storage of the one record of `source` whose fields have this shape;
+-- None when no record, or more than one, has the shape.
+private pure func storage_with_shape(
+    source: String,
+    shape: pure (List[specialized.TypeRef]) -> Bool,
+) -> Option[Storage]:
+    var found: Option[Storage] = None
+    var matches = 0
+    for layout in specialized_records(source):
+        if shape(specialized.record_fields(layout)):
+            matches = matches + 1
+            found = match layout:
+                specialized.InlineFields(_): Some(Inline)
+                specialized.ValueFields(_): Some(ByValue)
+                specialized.CountedFields(_): Some(Counted)
+    if matches == 1:
+        found
+    else:
+        None
+
+
+pure func test_fixed_union_field_keeps_a_record_inline() -> Bool:
+    (
+        storage_with_shape(SOURCE, pure func(fields: List[specialized.TypeRef]) -> Bool:
+            match fields:
+                [specialized.UnionType(_)]: True
+                _: False
+        )
+        == Some(Inline)
+    )
+
+
+pure func test_bool_field_keeps_a_record_inline() -> Bool:
+    (
+        storage_with_shape(SOURCE, pure func(fields: List[specialized.TypeRef]) -> Bool:
+            match fields:
+                [specialized.UnionType(_), specialized.IntegerType(Int64Format)]: True
+                _: False
+        )
+        == Some(Inline)
+    )
+
+
+-- Toggle has no payload, so it is unmanaged although it is not declared fixed.
+pure func test_ordinary_unmanaged_union_field_keeps_a_record_inline() -> Bool:
+    (
+        storage_with_shape(SOURCE, pure func(fields: List[specialized.TypeRef]) -> Bool:
+            match fields:
+                [specialized.IntegerType(Int64Format), specialized.UnionType(_)]: True
+                _: False
+        )
+        == Some(Inline)
+    )
+
+
+pure func test_void_field_keeps_a_record_inline() -> Bool:
+    (
+        storage_with_shape(SOURCE, pure func(fields: List[specialized.TypeRef]) -> Bool:
+            match fields:
+                [specialized.VoidType, specialized.FloatType]: True
+                _: False
+        )
+        == Some(Inline)
+    )
+
+
+pure func test_owning_union_with_one_pointer_stores_a_record_by_value() -> Bool:
+    (
+        storage_with_shape(SOURCE, pure func(fields: List[specialized.TypeRef]) -> Bool:
+            match fields:
+                [specialized.UnionType(_), specialized.IntegerType(Int64Format), specialized.IntegerType(Int64Format)]:
+                    True
+                _:
+                    False
+        )
+        == Some(ByValue)
+    )
+
+
+pure func test_one_string_stores_a_record_by_value() -> Bool:
+    (
+        storage_with_shape(SOURCE, pure func(fields: List[specialized.TypeRef]) -> Bool:
+            match fields:
+                [specialized.StringType, specialized.IntegerType(Int64Format)]: True
+                _: False
+        )
+        == Some(ByValue)
+    )
+
+
+-- Box[String] is a value at the instance Box[Void] is inline at.
+pure func test_a_generic_record_with_one_string_is_stored_by_value() -> Bool:
+    (
+        storage_with_shape(SOURCE, pure func(fields: List[specialized.TypeRef]) -> Bool:
+            match fields:
+                [specialized.StringType, specialized.FloatType]: True
+                _: False
+        )
+        == Some(ByValue)
+    )
+
+
+pure func test_two_strings_keep_a_record_counted() -> Bool:
+    (
+        storage_with_shape(SOURCE, pure func(fields: List[specialized.TypeRef]) -> Bool:
+            match fields:
+                [specialized.StringType, specialized.StringType]: True
+                _: False
+        )
+        == Some(Counted)
+    )
+
+
+-- Named is a value with one String, which Wrapped holds by value.
+pure func test_a_value_record_counts_its_one_pointer() -> Bool:
+    (
+        storage_with_shape(SOURCE, pure func(fields: List[specialized.TypeRef]) -> Bool:
+            match fields:
+                [specialized.RecordType(_), specialized.FloatType]: True
+                _: False
+        )
+        == Some(ByValue)
+    )
+
+
+pure func test_a_value_record_beside_a_string_is_over_the_bound() -> Bool:
+    (
+        storage_with_shape(SOURCE, pure func(fields: List[specialized.TypeRef]) -> Bool:
+            match fields:
+                [specialized.RecordType(_), specialized.StringType]: True
+                _: False
+        )
+        == Some(Counted)
+    )
+
+
+-- Pair is a counted cell, so holding it costs one count, as a String does.
+pure func test_a_counted_record_counts_one() -> Bool:
+    (
+        storage_with_shape(SOURCE, pure func(fields: List[specialized.TypeRef]) -> Bool:
+            match fields:
+                [specialized.RecordType(_), specialized.UnionType(_)]: True
+                _: False
+        )
+        == Some(ByValue)
+    )
+
+
+-- Both's case Two holds two Strings, so a copy of Twice may acquire two.
+pure func test_an_owning_union_counts_its_widest_case() -> Bool:
+    (
+        storage_with_shape(SOURCE, pure func(fields: List[specialized.TypeRef]) -> Bool:
+            match fields:
+                [specialized.UnionType(_), specialized.FloatType]: True
+                _: False
+        )
+        == Some(Counted)
+    )
+
+
+-- Chain holds one counted pointer, within the bound, but contains itself.
+pure func test_a_record_that_contains_itself_is_counted() -> Bool:
+    (
+        storage_with_shape(SOURCE, pure func(fields: List[specialized.TypeRef]) -> Bool:
+            match fields:
+                [specialized.UnionType(_), specialized.FloatType, specialized.IntegerType(Int64Format)]:
+                    True
+                _:
+                    False
+        )
+        == Some(Counted)
+    )
+
+
+private pure func only_a_union(fields: List[specialized.TypeRef]) -> Bool:
+    match fields:
+        [specialized.UnionType(_)]: True
+        _: False
+
+
+-- A copy of Wrapper acquires both of Pair's Strings, so Wrapper is a counted
+-- cell whether Shape or Wrapper is prepared first.
+pure func test_a_record_on_a_cycle_is_counted_whichever_layout_comes_first() -> Bool:
+    and(
+        storage_with_shape(WRAPPER_CYCLE + SHAPE_FIRST, only_a_union) == Some(Counted),
+        storage_with_shape(WRAPPER_CYCLE + WRAPPER_FIRST, only_a_union) == Some(Counted),
+    )
+
+
+-- Holder's cost reads Outer, which holds Shape while Shape is in progress.
+pure func test_a_record_beside_a_cycle_is_counted_whichever_layout_comes_first() -> Bool:
+    and(
+        storage_with_shape(HOLDER_CYCLE + SHAPE_FIRST, only_a_union) == Some(Counted),
+        storage_with_shape(HOLDER_CYCLE + HOLDER_FIRST, only_a_union) == Some(Counted),
+    )
+
+
+TESTS: TestSuite = {
+    description = "Record storage from field layouts",
+    tests = [
+        ("a fixed union field keeps a record inline", test_fixed_union_field_keeps_a_record_inline),
+        ("a Bool field keeps a record inline", test_bool_field_keeps_a_record_inline),
+        (
+            "an ordinary unmanaged union field keeps a record inline",
+            test_ordinary_unmanaged_union_field_keeps_a_record_inline,
+        ),
+        ("a Void field keeps a record inline", test_void_field_keeps_a_record_inline),
+        (
+            "an owning union with one pointer stores a record by value",
+            test_owning_union_with_one_pointer_stores_a_record_by_value,
+        ),
+        ("one String stores a record by value", test_one_string_stores_a_record_by_value),
+        (
+            "a generic record with one String is stored by value",
+            test_a_generic_record_with_one_string_is_stored_by_value,
+        ),
+        ("two Strings keep a record counted", test_two_strings_keep_a_record_counted),
+        ("a value record counts its one pointer", test_a_value_record_counts_its_one_pointer),
+        (
+            "a value record beside a String is over the bound",
+            test_a_value_record_beside_a_string_is_over_the_bound,
+        ),
+        ("a counted record counts one", test_a_counted_record_counts_one),
+        ("an owning union counts its widest case", test_an_owning_union_counts_its_widest_case),
+        ("a record that contains itself is counted", test_a_record_that_contains_itself_is_counted),
+        (
+            "a record on a cycle is counted whichever layout comes first",
+            test_a_record_on_a_cycle_is_counted_whichever_layout_comes_first,
+        ),
+        (
+            "a record beside a cycle is counted whichever layout comes first",
+            test_a_record_beside_a_cycle_is_counted_whichever_layout_comes_first,
+        ),
+    ],
+}

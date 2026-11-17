@@ -163,9 +163,11 @@ static void managed(void) {
     atomic_init(&entry->references, 1);
     entry->blorp_rf_0_0 = text;
     blorp_string_retain(text);
+    entry->blorp_rf_0_1 = text;
+    blorp_string_retain(text);
     struct blorp_l_0_r0 *root = blorp_list_repeat_0_r0(entry, 4);
     root = blorp_list_append_take_left_0_r0(root, entry);
-    assert(atomic_load(&entry->references) == 6 && atomic_load(&text->references) == 2);
+    assert(atomic_load(&entry->references) == 6 && atomic_load(&text->references) == 3);
     blorp_list_drop_0_r0(root);
     assert(atomic_load(&entry->references) == 1);
     blorp_record_drop_0(entry);
@@ -285,6 +287,7 @@ static void update_families(void) {
 
     blorp_r_0 entry = observed_allocate(sizeof *entry);
     atomic_init(&entry->references, 1); entry->blorp_rf_0_0 = text; blorp_string_retain(text);
+    entry->blorp_rf_0_1 = text; blorp_string_retain(text);
     struct blorp_l_0_r0 *entries = blorp_list_repeat_0_r0(entry, 1);
     entries = blorp_list_set_take_left_0_r0(entries, 0, entry);
     struct blorp_l_0_r0 *right_entries = blorp_list_repeat_0_r0(entry, 1);

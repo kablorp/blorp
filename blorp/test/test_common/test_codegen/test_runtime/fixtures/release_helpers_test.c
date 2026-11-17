@@ -2,8 +2,9 @@
    HELPERS_SOURCE and releases each from a thread with a 512 KB stack, where a
    release that recursed through the value would overflow. The suite admits
    the C names only after checking the program's typed catalogue: record 0 is
-   `Node { value: Int, next: Option[Node] }`, record 1 is
-   `Branch { value: Int, children: List[Branch] }`, union 0 is `Option[Node]`
+   `Node { value: Int, next: Option[Node] }`, a counted record, record 1 is
+   `Branch { value: Int, children: List[Branch] }`, stored by value because its
+   one counted pointer is its List, union 0 is `Option[Node]`
    stored inline (variant 0 `Some`, variant 1 `None`), union 1 is the boxed
    `Nat` (variant 0 `Zero`, variant 1 `Succ`) and union 2 is the boxed `Tree`
    (variant 0 `Leaf`, variant 1 `Fork(Tree, Int, Tree)`). Each mode prints how
@@ -29,14 +30,15 @@ static void record_chain(void){
     blorp_union_drop_0(next);
 }
 
-/* A chain of records through Lists: each Branch's one child is the last. */
+/* A chain of records through Lists: each Branch's one child is the last.
+   A Branch is a struct; repeating no element reads none. */
 static void list_chain(void){
-    blorp_r_1 head=blorp_record_make_1((struct blorp_r_1){.blorp_rf_1_0=0,.blorp_rf_1_1=blorp_list_repeat_0_r1(NULL,0)});
+    blorp_r_1 head={.blorp_rf_1_0=0,.blorp_rf_1_1=blorp_list_repeat_0_r1((blorp_r_1){.blorp_rf_1_0=0},0)};
     built++;
     for(int64_t index=1;index<DEPTH;index++){
         struct blorp_l_0_r1 *children=blorp_list_repeat_0_r1(head,1);
         blorp_record_drop_1(head);
-        head=blorp_record_make_1((struct blorp_r_1){.blorp_rf_1_0=index,.blorp_rf_1_1=children});
+        head=(blorp_r_1){.blorp_rf_1_0=index,.blorp_rf_1_1=children};
         built++;
     }
     blorp_record_drop_1(head);

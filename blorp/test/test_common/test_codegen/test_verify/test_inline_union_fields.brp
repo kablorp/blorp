@@ -1,8 +1,8 @@
 ---
-Verification accepts an inline record whose union field is PlainCases, which
-every fixed union is, and rejects one whose union field owns a child. It sees
-only concrete layouts, so it checks "no counted child", not whether the union
-was declared fixed.
+Verification accepts an inline record whose fields are numbers, Void or
+PlainCases unions, whether or not a union was declared fixed, and rejects one
+whose union field owns a child. It sees only concrete layouts, so it checks
+"no counted child", not a declared promise.
 ---
 import:
     bool: and
@@ -31,16 +31,21 @@ private SOURCE: String =
     |record Flagged { value: Int, signal: Signal }
     |record Labelled { value: Int, text: Text }
     |record Toggled { value: Int, toggle: Toggle }
+    |record Box[T] { held: T, count: Int }
     |pure func flagged(item: Flagged) -> Int:
     |    item.value
     |pure func labelled(item: Labelled) -> Int:
     |    item.value
     |pure func toggled(item: Toggled) -> Int:
     |    item.value
+    |pure func counted(item: Box[Void]) -> Int:
+    |    item.count
     |func main() -> Int:
     |    first = flagged({ value = 1, signal = Level(1) })
     |    second = labelled({ value = 2, text = Words("two") })
     |    third = toggled({ value = 3, toggle = On })
+    |    unit: Box[Void] = { held = void, count = 4 }
+    |    fourth = counted(unit)
     |    0
     |
 
@@ -49,27 +54,6 @@ private pure func owned_program() -> Option[own.OwnershipProgram]:
     match lowered(SOURCE).and_then(own.own):
         Ok(program): Some(program)
         Err(_): None
-
-
--- Whether some inline record stores a union by value.
-private pure func has_inline_union_field(records: List[specialized.ConcreteRecord]) -> Bool:
-    records.any(pure func(layout: specialized.ConcreteRecord) -> Bool:
-        match layout:
-            specialized.InlineFields(fields):
-                fields.any(pure func(field: specialized.TypeRef) -> Bool:
-                    match field:
-                        specialized.UnionType(_): True
-                        _: False
-                )
-            specialized.ValueFields(_) | specialized.CountedFields(_):
-                False
-    )
-
-
-pure func test_inline_record_with_a_plain_union_field_verifies() -> Bool:
-    match owned_program():
-        None: False
-        Some(program): and(has_inline_union_field(program.records), verify(program).is_ok())
 
 
 -- Whether every field is Int or a PlainCases union.
@@ -90,68 +74,41 @@ private pure func numbers_and_plain_unions(
     )
 
 
--- Every function reduced to returning 0, keeping its label, so that only
--- the layouts remain to verify: Toggled's values carry ownership obligations
--- in the real program, which an inline layout would contradict.
-private pure func layouts_only(program: own.OwnershipProgram) -> Option[own.OwnershipProgram]:
-    var zero: Option[own.OwnedDefinition] = None
-    for function in program.functions:
-        for operation in function.operations:
-            match operation:
-                own.DefineValue(definition):
-                    if zero.is_none():
-                        zero = Some(
-                            { definition |
-                                value_type = specialized.IntegerType(Int64Format),
-                                operation = own.IntegerDefinition(Int64Format, 0),
-                                result = own.UnmanagedResult,
-                            },
-                        )
-                _:
-                    void
-    zero.map(pure func(definition: own.OwnedDefinition) -> own.OwnershipProgram:
-        functions = program.functions.map(
-            pure func(function: own.OwnedFunction) -> own.OwnedFunction:
-                {
-                    label = function.label,
-                    parameters = [],
-                    return_type = specialized.IntegerType(Int64Format),
-                    operations = [own.DefineValue(definition)],
-                    result = own.UnmanagedReturn(definition.id),
-                }
-        )
-        { program | functions = functions }
-    )
-
-
--- Specialization keeps Toggled managed because Toggle is not declared fixed,
--- but verification checks only that Toggle has no counted child, so the same
--- record forced inline is accepted.
-pure func test_inline_record_with_an_ordinary_plain_union_field_verifies() -> Bool:
-    reduced: Option[own.OwnershipProgram] = match owned_program():
-        Some(owned): layouts_only(owned)
-        None: None
-    match reduced:
+-- Flagged's Signal is declared fixed and Toggled's Toggle is not; both are
+-- PlainCases, so both records are inline and verify.
+pure func test_inline_records_with_plain_union_fields_verify() -> Bool:
+    match owned_program():
         None:
             False
         Some(program):
-            var forced = 0
-            var records: List[specialized.ConcreteRecord] = []
-            for layout in program.records:
-                stored: specialized.ConcreteRecord = match layout:
-                    specialized.CountedFields(fields):
-                        if numbers_and_plain_unions(fields, program.unions):
-                            forced = forced + 1
-                            specialized.InlineFields(fields)
-                        else:
-                            layout
-                    specialized.InlineFields(_) | specialized.ValueFields(_):
-                        layout
-                records = records.append(stored)
-            and(
-                and(forced == 1, verify(program).is_ok()),
-                verify({ program | records = records }).is_ok(),
+            inline_with_unions = program.records.filter(
+                pure func(layout: specialized.ConcreteRecord) -> Bool:
+                    match layout:
+                        specialized.InlineFields(fields):
+                            and(
+                                fields.length() == 2,
+                                numbers_and_plain_unions(fields, program.unions),
+                            )
+                        specialized.ValueFields(_) | specialized.CountedFields(_):
+                            False
             )
+            and(inline_with_unions.length() == 2, verify(program).is_ok())
+
+
+-- Void stores nothing, so Box[Void] holds only plain data.
+pure func test_inline_record_with_a_void_field_verifies() -> Bool:
+    match owned_program():
+        None:
+            False
+        Some(program):
+            void_box = program.records.any(pure func(layout: specialized.ConcreteRecord) -> Bool:
+                match layout:
+                    specialized.InlineFields([specialized.VoidType, specialized.IntegerType(Int64Format)]):
+                        True
+                    _:
+                        False
+            )
+            and(void_box, verify(program).is_ok())
 
 
 -- Labelled's Text owns a String, so Labelled cannot claim inline storage.
@@ -181,12 +138,12 @@ TESTS: TestSuite = {
     description = "Verified inline records with union fields",
     tests = [
         (
-            "an inline record with a plain union field verifies",
-            test_inline_record_with_a_plain_union_field_verifies,
+            "inline records with plain union fields verify",
+            test_inline_records_with_plain_union_fields_verify,
         ),
         (
-            "an inline record with an ordinary plain union field verifies",
-            test_inline_record_with_an_ordinary_plain_union_field_verifies,
+            "an inline record with a Void field verifies",
+            test_inline_record_with_a_void_field_verifies,
         ),
         (
             "an inline record with an owning union field is rejected",

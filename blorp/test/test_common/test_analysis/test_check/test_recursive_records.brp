@@ -1,0 +1,181 @@
+---
+A record contains itself when its fields, followed through every record,
+union, tuple and opaque type they store by value at their substituted
+arguments, reach it again; a List, a String or a callable is a pointer and
+ends the walk. Check publishes that on every record, and specialization
+stores such a record in a counted cell. Records are classified before
+unions: a record that contains itself is a pointer to a union's walk, and
+any other record or tuple is stored by value inside the union.
+---
+import:
+    test: TestSuite
+    ../../../../src/common/analysis/check/check: check, checked_functions
+    ../../../../src/common/syntax/source: module_source, root_module_id
+    ../../../support/module_input: parse_modules
+
+
+private ENTRY: String = "func main() -> Int:\n    0\n"
+
+
+private union Classified:
+    Rejected
+    Accepted(List[Bool], List[Bool])
+
+
+-- Whether each record, then each union, the program declares contains
+-- itself, in declaration order; the foundation's declarations are left out.
+private pure func classified(declarations: String) -> Classified:
+    root = module_source(root_module_id())
+    match parse_modules([{ source = declarations + ENTRY, targets = [] }]):
+        Err(_):
+            Rejected
+        Ok(parsed):
+            match check(parsed):
+                Err(_):
+                    Rejected
+                Ok(accepted):
+                    functions = checked_functions(accepted)
+                    var records: List[Bool] = []
+                    for declaration in functions.records:
+                        if declaration.fields.any(
+                            pure func(field) -> Bool: field.name.span.source == root,
+                        ):
+                            records = records.append(declaration.contains_itself)
+                    var unions: List[Bool] = []
+                    for declaration in functions.unions:
+                        if declaration.name.span.source == root:
+                            unions = unions.append(declaration.contains_itself)
+                    Accepted(records, unions)
+
+
+pure func test_a_record_through_an_option_of_itself_contains_itself() -> Bool:
+    (
+        classified("record Node {\n    value: Int,\n    next: Option[Node],\n}\n")
+        == Accepted([True], [])
+    )
+
+
+-- Expr reaches itself through Form's payload, and Spanned only holds an Expr.
+pure func test_a_record_through_a_union_payload_contains_itself() -> Bool:
+    (
+        classified(
+            "record Expr {\n    form: Form,\n}\nunion Form:\n    Leaf(Int)\n    Pair(Expr, Expr)\nrecord Spanned {\n    expr: Expr,\n    at: Int,\n}\n",
+        )
+        == Accepted([True, False], [False])
+    )
+
+
+pure func test_lists_strings_and_callables_end_a_record_walk() -> Bool:
+    (
+        classified(
+            "record Tree {\n    label: String,\n    children: List[Tree],\n}\nrecord Step {\n    next: (Int) -> Step,\n}\n",
+        )
+        == Accepted([False, False], [])
+    )
+
+
+-- Box stores its argument by value but never itself, so only Pair, which
+-- writes the cycle through Box and a tuple, contains itself.
+pure func test_a_record_through_a_generic_record_and_a_tuple_contains_itself() -> Bool:
+    (
+        classified(
+            "record Box[T] {\n    value: T,\n}\nrecord Pair {\n    pair: (Int, Box[Option[Pair]]),\n}\n",
+        )
+        == Accepted([False, True], [])
+    )
+
+
+-- An opaque type is stored as its underlying type.
+pure func test_a_record_through_an_opaque_type_contains_itself() -> Bool:
+    (
+        classified("opaque type Box[V] = V\nrecord Chain {\n    next: Option[Box[Chain]],\n}\n")
+        == Accepted([True], [])
+    )
+
+
+pure func test_each_record_of_a_mutual_cycle_contains_itself() -> Bool:
+    (
+        classified(
+            "record Ping {\n    pong: Option[Pong],\n}\nrecord Pong {\n    ping: Ping,\n    count: Int,\n}\n",
+        )
+        == Accepted([True, True], [])
+    )
+
+
+-- Records are classified before unions, so a record's walk follows a union
+-- that contains itself as well as any other.
+pure func test_a_record_through_a_union_that_contains_itself_contains_itself() -> Bool:
+    (
+        classified(
+            "record Labelled {\n    labels: Labels,\n}\nunion Labels:\n    Done\n    More(Labelled, Labels)\n",
+        )
+        == Accepted([True], [True])
+    )
+
+
+-- A record that does not contain itself is stored by value, so a union that
+-- reaches itself through one contains itself.
+pure func test_a_union_through_a_record_that_does_not_contain_itself_contains_itself() -> Bool:
+    (
+        classified(
+            "record Box[T] {\n    value: T,\n}\nunion Tree:\n    Leaf\n    Node(Box[Tree])\n",
+        )
+        == Accepted([False], [True])
+    )
+
+
+pure func test_a_union_through_a_tuple_contains_itself() -> Bool:
+    classified("union Sequence:\n    End\n    Cons((Int, Sequence))\n") == Accepted([], [True])
+
+
+-- A record that contains itself is a pointer, so the union it closes a cycle
+-- with stays inline.
+pure func test_a_record_that_contains_itself_ends_a_union_walk() -> Bool:
+    (
+        classified("record Expr {\n    form: Form,\n}\nunion Form:\n    Lit(Int)\n    Neg(Expr)\n")
+        == Accepted([True], [False])
+    )
+
+
+TESTS: TestSuite = {
+    description = "Records that contain themselves",
+    tests = [
+        (
+            "a record through an Option of itself contains itself",
+            test_a_record_through_an_option_of_itself_contains_itself,
+        ),
+        (
+            "a record through a union payload contains itself",
+            test_a_record_through_a_union_payload_contains_itself,
+        ),
+        (
+            "Lists, Strings and callables end a record's walk",
+            test_lists_strings_and_callables_end_a_record_walk,
+        ),
+        (
+            "a record through a generic record and a tuple contains itself",
+            test_a_record_through_a_generic_record_and_a_tuple_contains_itself,
+        ),
+        (
+            "a record through an opaque type contains itself",
+            test_a_record_through_an_opaque_type_contains_itself,
+        ),
+        (
+            "each record of a mutual cycle contains itself",
+            test_each_record_of_a_mutual_cycle_contains_itself,
+        ),
+        (
+            "a record through a union that contains itself contains itself",
+            test_a_record_through_a_union_that_contains_itself_contains_itself,
+        ),
+        (
+            "a union through a record that does not contain itself contains itself",
+            test_a_union_through_a_record_that_does_not_contain_itself_contains_itself,
+        ),
+        ("a union through a tuple contains itself", test_a_union_through_a_tuple_contains_itself),
+        (
+            "a record that contains itself ends a union's walk",
+            test_a_record_that_contains_itself_ends_a_union_walk,
+        ),
+    ],
+}

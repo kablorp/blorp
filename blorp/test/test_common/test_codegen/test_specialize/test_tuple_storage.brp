@@ -1,7 +1,8 @@
 ---
-A structural tuple follows the record storage rule: it stays inline when every
-element is a number, an inline record or a fixed union, and is counted when any
-element is managed or is a layout still in progress.
+A structural tuple follows the record storage rule: inline when a copy
+acquires no counted pointer, by value when it acquires one, and counted when
+it would acquire more. An element whose layout is still in progress lies on a
+cycle, which passes through a pointer, so it counts one.
 ---
 import:
     test: TestSuite
@@ -19,6 +20,8 @@ private SOURCE: String =
     |    (1, 2)
     |pure func labelled() -> (Int, String):
     |    (1, "one")
+    |pure func named() -> (String, String):
+    |    ("one", "two")
     |pure func located() -> (Point, Int):
     |    ({ x = 1.5, y = 2 }, 3)
     |pure func descendants(node: Node) -> (Node, Float):
@@ -26,6 +29,7 @@ private SOURCE: String =
     |func main() -> Int:
     |    first = numbers()
     |    second = labelled()
+    |    named_pair = named()
     |    third = located()
     |    fourth = descendants({ children = [] })
     |    0
@@ -46,19 +50,26 @@ private pure func specialized_records() -> List[specialized.ConcreteRecord]:
                         Ok(program): specialized.specialized_contents(program).records
 
 
--- Whether the one layout whose fields have this shape is inline; None when no
+private union Storage:
+    Inline
+    ByValue
+    Counted
+
+
+-- The storage of the one layout whose fields have this shape; None when no
 -- layout, or more than one, has the shape.
-private pure func inline_with_shape(
+private pure func storage_with_shape(
     shape: pure (List[specialized.TypeRef]) -> Bool,
-) -> Option[Bool]:
-    var found: Option[Bool] = None
+) -> Option[Storage]:
+    var found: Option[Storage] = None
     var matches = 0
     for layout in specialized_records():
         if shape(specialized.record_fields(layout)):
             matches = matches + 1
             found = match layout:
-                specialized.InlineFields(_): Some(True)
-                specialized.ValueFields(_) | specialized.CountedFields(_): Some(False)
+                specialized.InlineFields(_): Some(Inline)
+                specialized.ValueFields(_): Some(ByValue)
+                specialized.CountedFields(_): Some(Counted)
     if matches == 1:
         found
     else:
@@ -67,47 +78,59 @@ private pure func inline_with_shape(
 
 pure func test_number_tuple_is_inline() -> Bool:
     (
-        inline_with_shape(pure func(fields: List[specialized.TypeRef]) -> Bool:
+        storage_with_shape(pure func(fields: List[specialized.TypeRef]) -> Bool:
             match fields:
                 [specialized.IntegerType(Int64Format), specialized.IntegerType(Int64Format)]: True
                 _: False
         )
-        == Some(True)
+        == Some(Inline)
     )
 
 
-pure func test_tuple_with_a_string_is_counted() -> Bool:
+pure func test_tuple_with_a_string_is_stored_by_value() -> Bool:
     (
-        inline_with_shape(pure func(fields: List[specialized.TypeRef]) -> Bool:
+        storage_with_shape(pure func(fields: List[specialized.TypeRef]) -> Bool:
             match fields:
                 [specialized.IntegerType(Int64Format), specialized.StringType]: True
                 _: False
         )
-        == Some(False)
+        == Some(ByValue)
+    )
+
+
+pure func test_tuple_with_two_strings_is_counted() -> Bool:
+    (
+        storage_with_shape(pure func(fields: List[specialized.TypeRef]) -> Bool:
+            match fields:
+                [specialized.StringType, specialized.StringType]: True
+                _: False
+        )
+        == Some(Counted)
     )
 
 
 pure func test_tuple_holding_an_inline_record_is_inline() -> Bool:
     (
-        inline_with_shape(pure func(fields: List[specialized.TypeRef]) -> Bool:
+        storage_with_shape(pure func(fields: List[specialized.TypeRef]) -> Bool:
             match fields:
                 [specialized.RecordType(_), specialized.IntegerType(Int64Format)]: True
                 _: False
         )
-        == Some(True)
+        == Some(Inline)
     )
 
 
--- While (Node, Float) is prepared, Node's layout is still in progress, so the
--- tuple cannot know Node is inline and stays counted.
-pure func test_tuple_closing_a_recursive_cycle_is_counted() -> Bool:
+-- While (Node, Float) is prepared, Node's layout is still in progress. A
+-- layout referred back to lies on a cycle, which passes through a pointer
+-- (here Node's List), so it counts one, as the value Node turns out to be does.
+pure func test_tuple_closing_a_recursive_cycle_is_stored_by_value() -> Bool:
     (
-        inline_with_shape(pure func(fields: List[specialized.TypeRef]) -> Bool:
+        storage_with_shape(pure func(fields: List[specialized.TypeRef]) -> Bool:
             match fields:
                 [specialized.RecordType(_), specialized.FloatType]: True
                 _: False
         )
-        == Some(False)
+        == Some(ByValue)
     )
 
 
@@ -115,14 +138,15 @@ TESTS: TestSuite = {
     description = "Structural tuple storage",
     tests = [
         ("a tuple of numbers is inline", test_number_tuple_is_inline),
-        ("a tuple with a String is counted", test_tuple_with_a_string_is_counted),
+        ("a tuple with a String is stored by value", test_tuple_with_a_string_is_stored_by_value),
+        ("a tuple with two Strings is counted", test_tuple_with_two_strings_is_counted),
         (
             "a tuple holding an inline record is inline",
             test_tuple_holding_an_inline_record_is_inline,
         ),
         (
-            "a tuple closing a recursive cycle is counted",
-            test_tuple_closing_a_recursive_cycle_is_counted,
+            "a tuple closing a recursive cycle is stored by value",
+            test_tuple_closing_a_recursive_cycle_is_stored_by_value,
         ),
     ],
 }

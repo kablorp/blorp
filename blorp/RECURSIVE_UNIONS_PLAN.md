@@ -95,7 +95,8 @@ and a record that contains itself becomes a pointer that ends the union walk.
 `AggregateId` root and reads fields through `root_fields`, a `ResolvedRecord`
 row and a `CheckedRecord.contains_itself` join the same pass, and the union
 walk then follows records that do not contain themselves, and tuples, as
-by-value edges. Not done here.
+by-value edges. Records by value landed it
+([`RECORDS_PLAN.md`](RECORDS_PLAN.md)).
 
 ## Tests
 

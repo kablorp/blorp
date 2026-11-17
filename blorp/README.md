@@ -493,19 +493,29 @@ replacement; `{ first : 7 }` reports a missing update bar.
 `record Box[T] { value: T }` declares type parameters. A receiving `Box[T]`
 annotation is enough context for `{ value = 7 }` to infer `Int`.
 
-A record whose fields are all `Int`, `Float`, inline records or fixed unions is
-stored inline, as a C struct passed by value; any other record is a
-reference-counted heap object. `fixed record` promises inline storage and is
-checked: every field is `Int`, `Float`, a `fixed record`, a `fixed union` or an
-opaque type over one of these, and a fixed type takes no type parameters and
-never contains itself. An ordinary record is not accepted as a fixed field
-even when it happens to be inline.
+A record is stored as a C struct passed by value when a copy of it costs no
+more reference counting than a copy of a pointer to it: when it holds at most
+one String, List, function or heap-stored value, counting those inside the
+records, tuples and inline unions it holds, and an inline union's widest
+case. Building, updating or returning such a record allocates nothing, and a
+copy acquires its one counted value. Any other record, and every record that
+contains itself (below), is a reference-counted heap object. Tuples follow
+the same rule. `fixed record` promises that a record holds only plain data and
+is checked: every field is `Int`, `Float`, a `fixed record`, a `fixed union` or
+an opaque type over one of these, and a fixed type takes no type parameters
+and never contains itself. Such a record is a struct by the same rule. An
+ordinary record is not accepted as a fixed field even when it happens to hold
+only plain data, so that editing it cannot break the promise.
 
-Records may be recursive, as in `record Node { value: Int, next: Option[Node] }`.
-Values never form cycles, so reference counting frees them. Releasing a value
-of any depth uses bounded C stack: up to 128 nested releases run directly, and
-deeper ones wait on a per-thread list that one loop releases, with no
-allocation.
+A record may contain itself: through a union, as
+`record Node { value: Int, next: Option[Node] }` does through `Option[Node]`,
+or through another record, a tuple or an opaque type. Such a record is a
+reference-counted heap object. A List element and a function are references,
+so `record Branch { value: Int, children: List[Branch] }` does not contain
+itself, and with one counted value, its List, it is a struct. Values never
+form cycles, so reference counting frees them. Releasing a value of any depth
+uses bounded C stack: up to 128 nested releases run directly, and deeper ones
+wait on a per-thread list that one loop releases, with no allocation.
 
 ### Tuples
 
@@ -575,13 +585,14 @@ inline that owns only its active variant's payload.
 A union may contain itself: directly, as in `Succ(Nat)`, `Node(Tree, Int,
 Tree)` or a generic `Link(T, Chain[T])`; through other unions, as `Even` and
 `Odd` do through `EvenNext(Odd)` and `OddNext(Even)`, or `Node` does through
-`Next(Option[Node])`; or through an opaque type. A union that contains itself
-is stored on the heap: each value is one reference-counted node, and the union
-is passed as a pointer to it. Every other union is stored inline, so
-`Option[Node]` above is an inline union holding a pointer. A union stores its
-payloads by value, while a record field, a List element and a callable are
-references, so a union that is recursive only through them, as `Form` is
-through `Call(String, List[Expr])` in the
+`Next(Option[Node])`; or through a tuple, an opaque type or a record that does
+not contain itself, as `Tree` does through `Node(Box[Tree])` with
+`record Box[T] { value: T }`. A union that contains itself is stored on the
+heap: each value is one reference-counted node, and the union is passed as a
+pointer to it. Every other union is stored inline, so `Option[Node]` above is
+an inline union holding a pointer. A record that contains itself, a List
+element and a callable are references, so a union that is recursive only
+through them, as `Form` is through `Call(String, List[Expr])` in the
 [tree fixture](test/test_compile/fixtures/recursive/tree.brp), is inline.
 Releasing a union value of any depth and shape uses bounded C stack, as a
 record's release does.
@@ -764,8 +775,8 @@ or of an arm of its final `match`; a final UFCS self call counts. Arguments,
 receivers, initializers and scrutinees are not tail positions, and a self call
 in a nested match or an `if` branch is rejected. The function is nongeneric,
 contains a self call, takes no callable parameters, and has only unmanaged
-values (no String, List or counted record) in its signature and in everything
-it evaluates, even an unused initializer. All next arguments are evaluated
+values (no String, List or record that holds one) in its signature and in
+everything it evaluates, even an unused initializer. All next arguments are evaluated
 before any parameter is replaced. Other calls, mutual recursion included, use
 the ordinary stack, and the annotation does not prove termination. See the
 [accumulator fixture](test/test_compile/fixtures/tail_recursion/accumulator.brp).
@@ -1420,6 +1431,8 @@ the output may already be new.
    checked call carries its resolved target and complete
    substitution, every local read a function-owned `BindingId`, and every
    constructor its union and variant ids; matches are proved exhaustive.
+   Every record and union declaration is published with whether it contains
+   itself, records first.
    Operators become trait calls, Dict literals calls, and interpolation String
    concatenation. [`render.brp`](src/common/analysis/check/render.brp) turns a failure into
    diagnostics.
@@ -1428,9 +1441,11 @@ the output may already be new.
    declaration and complete list of type arguments, phantom ones included. Its
    `SpecializedProgram` holds those functions and the record, union and List
    layouts they need, children before parents. No type parameter or trait
-   reaches later phases. It also decides representation: unmanaged, a managed
-   String, List or record root, a boxed union, or an inline union with owned
-   children.
+   reaches later phases. It also decides representation from each type's own
+   fields: an inline record, a record by value that owns one counted value, a
+   counted record (one that contains itself or whose copy would acquire more
+   than one counted value), a boxed union, or an inline union with or without
+   owned children.
 7. **Lower** ([`lower`](src/common/codegen/lower/lower.brp)) publishes ordered value
    definitions with function-owned `ValueId`s, separate from the bindings that
    name them. Matches become selection graphs over typed places that enter one
@@ -1448,9 +1463,10 @@ the output may already be new.
    inherits but never reads, such as a field a `while` condition read: that
    one ends at the back edge. So an update (`append`, `set`, `concat`, `+`)
    reuses its operand when no later code can read the old value and no such
-   owner still holds it; otherwise it copies. A record or tuple holding a
-   String, List or record, and a lambda bound to a name, allocate each time
-   they are built.
+   owner still holds it; otherwise it copies. A record or tuple that is a
+   heap object (one that holds more than one String, List, function or
+   heap-stored value, or contains itself), and a lambda bound to a name,
+   allocate each time they are built.
 9. **Verify** ([`verify`](src/common/codegen/verify/verify.brp)) checks the ownership IR
    independently and alone produces a `VerifiedProgram`. It rejects dead or
    wrong owners, invalid borrows, undischarged obligations, calls that disagree
@@ -1473,8 +1489,8 @@ the output may already be new.
 - `Int` is `int64_t`, with `INT64_C` literals and `INT64_MIN` for the minimum.
   `Void` is a zero `uint8_t`. A union of bare variants is a C enum; any other
   union is a struct of an enum tag and a C union of one field struct per
-  variant with fields. Inline records are structs passed by value; managed
-  records, Lists and Strings are counted heap objects.
+  variant with fields. Inline and by-value records are structs passed by
+  value; counted records, Lists and Strings are counted heap objects.
 - A String literal is a static byte array plus a
   `struct blorp_string_literal_site`, from which the runtime makes the shared
   String on first use.

@@ -99,8 +99,7 @@ done.
     interpolation as one left-nested chain; L2, loop iterations ending the
     owners they inherit at their last read; L3, stale workaround notes; and
     Q2, emit's failure-flag loops carrying a `Result`.
-  - **Next:** land them in order. Records by value moved here and wait for
-    the records design pilot.
+  - **Next:** land them in order. Records by value has its own plan below.
 - **Release in constant C stack:** [`RELEASE_PLAN.md`](RELEASE_PLAN.md).
   - **Status:** Keith approved two stacked landings on 2026-11-16: L1, the
     cold split (a drop only decrements and calls an out-of-line release
@@ -114,7 +113,16 @@ done.
     release: Check classifies each union that contains itself and
     specialization stores it on the heap, and a generic type may recurse
     unless its arguments grow.
-  - **Follow-ups:** records by value joins the same classification.
+  - **Follow-ups:** records by value joined the same classification.
+- **Records by value:** [`RECORDS_PLAN.md`](RECORDS_PLAN.md).
+  - **Status:** approved by Keith on 2026-11-16 (a bound of one counted
+    pointer per copy) and landed: Check classifies the records that contain
+    themselves, records first, and specialize stores every other record
+    inline, by value or in a counted cell from what a copy costs; `fixed`
+    only constrains fields.
+  - **Next:** raising the bound, after field moves in own, borrowed records
+    by address and `static` functions each measure (the plan's last
+    section).
 
 ## Smaller follow-ups
 
