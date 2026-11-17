@@ -1,0 +1,222 @@
+import:
+    list: List methods
+    result: Result methods
+    string: String methods
+    test: TestSuite
+    ../../../../src/common/codegen/runtime/console:
+        CONSOLE_FLUSH_RUNTIME,
+        CONSOLE_HELPERS_RUNTIME,
+        console_read_exact_runtime,
+        console_read_line_runtime,
+        console_write_error_runtime,
+        console_write_runtime,
+    ../../../../src/common/codegen/runtime/fs: FS_HELPERS_RUNTIME
+    ../../../../src/common/codegen/runtime/list:
+        list_runtime,
+        list_element_key,
+        list_c_type,
+        LIST_SHARED_RUNTIME,
+    ../../../../src/common/codegen/runtime/memory: MEMORY_RUNTIME
+    ../../../../src/common/codegen/runtime/process: PROCESS_POSIX_PRELUDE
+    ../../../../src/common/codegen/runtime/sigpipe: SIGPIPE_GUARD_RUNTIME
+    ../../../../src/common/codegen/runtime/string: string_runtime
+    ../../../../src/common/codegen/specialize/specialize: TypeRef(IntegerType)
+    ../../../../src/common/syntax/syntax: IntegerFormat(UInt8Format)
+    ../../../driver/file_access: write_file
+    ../../../driver/harness: isolated, run_expecting, strict_leak_check
+    ../../../driver/reports: verify_accounting
+
+
+private COMPILE_TIMEOUT_MS: Int = 600000
+private CASE_TIMEOUT_MS: Int = 60000
+
+
+-- Builds fixtures/console_test.c, which includes the fragments as
+-- console_runtime.c in the order a program calling all five operations emits
+-- them, and calls their C functions directly.
+private func ready(c_compiler: String, directory: String) -> Result[String, String]:
+    byte_list_type = list_c_type(list_element_key(IntegerType(UInt8Format)))
+    fragments = (
+        PROCESS_POSIX_PRELUDE
+        + MEMORY_RUNTIME
+        + string_runtime()
+        + "\n"
+        + LIST_SHARED_RUNTIME
+        + list_runtime(list_element_key(IntegerType(UInt8Format)), "uint8_t", "", "")
+        + FS_HELPERS_RUNTIME
+        + SIGPIPE_GUARD_RUNTIME
+        + CONSOLE_HELPERS_RUNTIME
+        + console_write_runtime(byte_list_type)
+        + console_write_error_runtime(byte_list_type)
+        + CONSOLE_FLUSH_RUNTIME
+        + console_read_line_runtime(byte_list_type)
+        + console_read_exact_runtime(byte_list_type)
+    )
+    _ ?= write_file(directory + "/console_runtime.c", fragments)
+    executable = directory + "/console_test"
+    build ?= isolated(
+        c_compiler,
+        [
+            "-std=c11",
+            "-O0",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            "-pedantic",
+            "-fsanitize=address,undefined",
+            "-fno-sanitize-recover=all",
+            "-DBLORP_MEMORY_DIAGNOSTICS=1",
+            "-I",
+            directory,
+            "blorp/test/test_common/test_codegen/test_runtime/fixtures/console_test.c",
+            "-o",
+            executable,
+            "-lm",
+            "-lpthread",
+        ],
+        COMPILE_TIMEOUT_MS,
+    )
+    built ?= run_expecting("console native build", build, 0)
+    if built.stderr == "":
+        Ok(executable)
+    else:
+        Err("console native build: " + built.stderr)
+
+
+-- A case passes with exit 0, nothing on stdout, and one balanced strict
+-- allocation report on stderr.
+private func native_case(
+    executable: String,
+    directory: String,
+    name: String,
+) -> Result[Void, String]:
+    case ?= isolated(executable, [name, directory], CASE_TIMEOUT_MS)
+    ran ?= run_expecting(name, { case | environment = strict_leak_check() }, 0)
+    if ran.stdout != "":
+        Err(name + ": wrote stdout: " + ran.stdout)
+    else:
+        verify_accounting(ran.stderr, True).map_err(
+            pure func(message: String): name + ": " + message + ": " + ran.stderr,
+        )
+
+
+private func reported(result: Result[Void, String]) -> Bool:
+    match result:
+        Ok(_):
+            True
+        Err(error):
+            print_error(error)
+            False
+
+
+private func console_tests(executable: String, directory: String) -> List[(String, () -> Bool)]:
+    [
+        (
+            "read_line returns a line with its LF, one line at a time, and empty at the end",
+            func(): reported(native_case(executable, directory, "line_lf")),
+        ),
+        (
+            "read_line keeps the CR of a CRLF line",
+            func(): reported(native_case(executable, directory, "line_crlf")),
+        ),
+        (
+            "read_line returns an empty line as a lone LF, distinct from the end",
+            func(): reported(native_case(executable, directory, "line_empty")),
+        ),
+        (
+            "read_line returns a last line without an LF as it is",
+            func(): reported(native_case(executable, directory, "line_last_without_lf")),
+        ),
+        (
+            "read_line at end of input is empty, however often it is asked",
+            func(): reported(native_case(executable, directory, "line_end_of_input")),
+        ),
+        (
+            "read_line keeps a lone CR",
+            func(): reported(native_case(executable, directory, "line_lone_cr")),
+        ),
+        (
+            "read_line returns bytes that are not UTF-8, a NUL and a long line unchanged",
+            func(): reported(native_case(executable, directory, "line_raw_bytes")),
+        ),
+        (
+            "both reads of standard input that is a directory fail with the IsADirectory code",
+            func(): reported(native_case(executable, directory, "read_directory")),
+        ),
+        (
+            "read_exact returns the count asked for, then what remains, then empty",
+            func(): reported(native_case(executable, directory, "exact_counts")),
+        ),
+        (
+            "read_exact returns fewer bytes at end of input",
+            func(): reported(native_case(executable, directory, "exact_short")),
+        ),
+        (
+            "read_exact of zero or less reads nothing",
+            func(): reported(native_case(executable, directory, "exact_non_positive")),
+        ),
+        (
+            "read_exact of a count far beyond the input holds only what arrived",
+            func(): reported(native_case(executable, directory, "exact_huge_count")),
+        ),
+        (
+            "read_exact crosses its growth steps without losing a byte",
+            func(): reported(native_case(executable, directory, "exact_growth")),
+        ),
+        (
+            "read_exact returns bytes that are not UTF-8 unchanged",
+            func(): reported(native_case(executable, directory, "exact_raw_bytes")),
+        ),
+        (
+            "read_line and read_exact share one buffer, header lines then the exact body",
+            func(): reported(native_case(executable, directory, "shared_buffer")),
+        ),
+        (
+            "input that arrives after an end of input is read",
+            func(): reported(native_case(executable, directory, "input_after_end")),
+        ),
+        (
+            "a read interrupted by a signal is retried and returns the line",
+            func(): reported(native_case(executable, directory, "interrupted_read")),
+        ),
+        (
+            "print-style output and console writes keep their order",
+            func(): reported(native_case(executable, directory, "output_order")),
+        ),
+        (
+            "a read flushes standard output before it waits",
+            func(): reported(native_case(executable, directory, "flush_before_read")),
+        ),
+        (
+            "a write larger than the buffer to a closed reader is EPIPE and the process lives",
+            func(): reported(native_case(executable, directory, "closed_write")),
+        ),
+        (
+            "flush to a closed reader is EPIPE and the process lives",
+            func(): reported(native_case(executable, directory, "closed_flush")),
+        ),
+        (
+            "write_error to a closed reader is EPIPE and the process lives",
+            func(): reported(native_case(executable, directory, "closed_write_error")),
+        ),
+        (
+            "a program that wrote, with its reader gone, exits 0 without SIGPIPE",
+            func(): reported(native_case(executable, directory, "closed_exit")),
+        ),
+        (
+            "a program that printed and only flushed, with its reader gone, exits 0 without SIGPIPE",
+            func(): reported(native_case(executable, directory, "closed_flush_exit")),
+        ),
+        (
+            "a program that printed and only read, with its reader gone, exits 0 without SIGPIPE",
+            func(): reported(native_case(executable, directory, "closed_read_exit")),
+        ),
+    ]
+
+
+func suite(c_compiler: String, directory: String) -> TestSuite:
+    -- A probe that does not build is one failing test.
+    tests: List[(String, () -> Bool)] = match ready(c_compiler, directory):
+        Err(error): [("the console probe builds", func(): reported(Err(error)))]
+        Ok(executable): console_tests(executable, directory)
+    { description = "console runtime", tests = tests }

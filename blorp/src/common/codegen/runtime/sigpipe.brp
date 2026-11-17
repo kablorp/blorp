@@ -1,0 +1,41 @@
+-- The SIGPIPE guard, which both process.capture and the console operations use.
+
+
+-- Emitted once, however many operations use it. The leading blank line keeps
+-- each #include at the start of a line. Both functions are static: every
+-- operation that lists the fragment calls both.
+SIGPIPE_GUARD_RUNTIME: String =
+    raw
+        |
+        |#include <errno.h>
+        |#include <pthread.h>
+        |#include <signal.h>
+        |/* SIGPIPE is blocked in the calling thread only, so a write to a reader that has
+        | * gone (a child that closed its stdin, or our own stdout's pipe) fails with EPIPE
+        | * instead of ending the program. No disposition changes. A SIGPIPE that was
+        | * pending before the block is not ours and is left. */
+        |struct blorp_pipe_guard {
+        |    sigset_t original;
+        |    int pending_before;
+        |};
+        |static int blorp_block_sigpipe(struct blorp_pipe_guard *guard) {
+        |    sigset_t pipe_only, pending;
+        |    if (sigemptyset(&pipe_only) != 0 || sigaddset(&pipe_only, SIGPIPE) != 0 ||
+        |        sigpending(&pending) != 0) {
+        |        return errno;
+        |    }
+        |    guard->pending_before = sigismember(&pending, SIGPIPE) == 1;
+        |    return pthread_sigmask(SIG_BLOCK, &pipe_only, &guard->original);
+        |}
+        |/* Consumes the SIGPIPE our write raised, if any, then restores the mask. */
+        |static void blorp_restore_sigpipe(const struct blorp_pipe_guard *guard, int raised) {
+        |    sigset_t pipe_only, pending;
+        |    if (raised && !guard->pending_before && sigemptyset(&pipe_only) == 0 &&
+        |        sigaddset(&pipe_only, SIGPIPE) == 0 && sigpending(&pending) == 0 &&
+        |        sigismember(&pending, SIGPIPE) == 1) {
+        |        int taken;
+        |        (void)sigwait(&pipe_only, &taken);
+        |    }
+        |    (void)pthread_sigmask(SIG_SETMASK, &guard->original, NULL);
+        |}
+        |

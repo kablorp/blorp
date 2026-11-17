@@ -1,0 +1,187 @@
+-- The C half of the console natives (standard_library/io/console.brp calls them
+-- by label). Every operation reports a failure as an Int code of the shared
+-- native error protocol: the kind's positive code when BLORP_CONSOLE_KINDS names
+-- it, else the errno negated (fs.brp, io/_errors.brp).
+
+
+import:
+    ../../utils/text: concat
+    ./list: list_root_allocation
+
+
+-- Emitted once, however many console operations a program calls. Not every
+-- program calls both stream helpers, and an unused static function would warn
+-- under -Werror, so they have external linkage, as fs's partly used helpers do.
+CONSOLE_HELPERS_RUNTIME: String =
+    raw
+        |/* The one kind a console error names is IsADirectory (EISDIR from a directory on stdin). */
+        |enum {BLORP_CONSOLE_KINDS=BLORP_FS_KIND(IS_A_DIRECTORY)};
+        |/* The code of an errno, or of EIO when a stdio failure left none. */
+        |int64_t blorp_console_error(int number){
+        |return blorp_fs_errno_code_within(number!=0?number:EIO,BLORP_CONSOLE_KINDS);
+        |}
+        |/* print shares standard output's buffer, so their order holds. Every console
+        | * operation arms, once, an exit handler that closes stdout under the guard.
+        | * Without it, stdio's own flush at exit would write to a closed pipe unguarded and
+        | * the program would die of SIGPIPE instead of exiting with its status: a failed
+        | * fflush keeps the buffer, so stdio's flush would retry. fclose flushes once under
+        | * the guard and removes the stream, leaving nothing for stdio. It flushes what print
+        | * buffered too, or drops it when the reader has gone. No other atexit handler
+        | * exists, so nothing runs after this one and writes stdout; keep it that way. It
+        | * allocates nothing, and the leak check, which runs inside main, has finished. */
+        |static pthread_once_t blorp_console_exit_once=PTHREAD_ONCE_INIT;
+        |static void blorp_console_close_stdout(void){
+        |struct blorp_pipe_guard guard;
+        |if(blorp_block_sigpipe(&guard)!=0){return;}
+        |errno=0;
+        |const int failed=fclose(stdout)!=0;
+        |blorp_restore_sigpipe(&guard,failed&&errno==EPIPE);
+        |}
+        |static void blorp_console_register_exit(void){(void)atexit(blorp_console_close_stdout);}
+        |/* No retry on EINTR here: Blorp installs no catching signal handler, so a write or
+        | * flush sees it only under a handler installed elsewhere without SA_RESTART, and then
+        | * reports EINTR as its error. Some bytes may already be out when a write reports any
+        | * error. The reads retry, because a retried read cannot duplicate anything. */
+        |/* Sends the stream's buffer under the SIGPIPE guard, so a reader that has gone
+        | * yields EPIPE and not the end of the program. Returns 0 or the errno. */
+        |int blorp_console_flush_stream(FILE *stream){
+        |(void)pthread_once(&blorp_console_exit_once,blorp_console_register_exit);
+        |struct blorp_pipe_guard guard;
+        |const int blocked=blorp_block_sigpipe(&guard);
+        |if(blocked!=0){return blocked;}
+        |clearerr(stream);
+        |errno=0;
+        |const int number=fflush(stream)==0?0:(errno!=0?errno:EIO);
+        |blorp_restore_sigpipe(&guard,number==EPIPE);
+        |return number;
+        |}
+        |/* The bytes through the stream's stdio buffer, under the same guard. A buffered
+        | * stream reports a closed reader only when the buffer fills or is flushed. */
+        |int blorp_console_write_stream(FILE *stream,const void *bytes,size_t length){
+        |(void)pthread_once(&blorp_console_exit_once,blorp_console_register_exit);
+        |struct blorp_pipe_guard guard;
+        |const int blocked=blorp_block_sigpipe(&guard);
+        |if(blocked!=0){return blocked;}
+        |clearerr(stream);
+        |errno=0;
+        |const int number=fwrite(bytes,1,length,stream)==length?0:(errno!=0?errno:EIO);
+        |blorp_restore_sigpipe(&guard,number==EPIPE);
+        |return number;
+        |}
+        |
+
+
+-- Writes through the stdio buffer that print shares.
+pure func console_write_runtime(byte_list_type: String) -> String:
+    |uint8_t blorp_console_write(${byte_list_type} data,int64_t *error){
+    |const int number=blorp_console_write_stream(stdout,data->values,(size_t)data->length);
+    |if(number!=0){*error=blorp_console_error(number);return BLORP_FS_FAILED;}
+    |return BLORP_FS_SUCCEEDED;
+    |}
+    |
+
+
+-- Standard error is unbuffered, so its write reports a closed reader at once.
+pure func console_write_error_runtime(byte_list_type: String) -> String:
+    |uint8_t blorp_console_write_error(${byte_list_type} data,int64_t *error){
+    |const int number=blorp_console_write_stream(stderr,data->values,(size_t)data->length);
+    |if(number!=0){*error=blorp_console_error(number);return BLORP_FS_FAILED;}
+    |return BLORP_FS_SUCCEEDED;
+    |}
+    |
+
+
+CONSOLE_FLUSH_RUNTIME: String =
+    raw
+        |uint8_t blorp_console_flush(int64_t *error){
+        |const int number=blorp_console_flush_stream(stdout);
+        |if(number!=0){*error=blorp_console_error(number);return BLORP_FS_FAILED;}
+        |return BLORP_FS_SUCCEEDED;
+        |}
+        |
+
+
+-- Both reads take stdin's one stdio buffer, never read(0, ...), so a line read
+-- then an exact read continue where the other stopped. Each flushes stdout first,
+-- so a prompt shows before the program waits; that failure is the next write's
+-- to report. clearerr starts each read so a sticky end of input does not hide
+-- later input, as Python's input retries after a terminal's ^D. EINTR clears the
+-- flag and continues. An error after some bytes drops them: the Result has room
+-- for one or the other.
+--
+-- The line includes its LF. Any line takes at least that, so an empty result is
+-- end of input and "\n" stays distinct from it.
+pure func console_read_line_runtime(byte_list_type: String) -> String:
+    |enum {BLORP_CONSOLE_LINE_CAPACITY=64};
+    |uint8_t blorp_console_read_line(${byte_list_type} *line,int64_t *error){
+    |(void)blorp_console_flush_stream(stdout);
+    |clearerr(stdin);
+    |${list_root_allocation(byte_list_type, "result", "BLORP_CONSOLE_LINE_CAPACITY")}
+    |for(;;){
+    |errno=0;
+    |const int next=getc(stdin);
+    |if(next==EOF){
+    |if(!ferror(stdin)){break;}
+    |if(errno==EINTR){clearerr(stdin);continue;}
+    |const int64_t failure=blorp_console_error(errno);
+    |blorp_memory_release(result);
+    |*error=failure;
+    |return BLORP_FS_FAILED;
+    |}
+    |if(result->length==(int64_t)result->capacity){
+    |const size_t grown_capacity=result->capacity*2;
+    |${byte_list_type} grown=blorp_memory_resize(result,sizeof *result+grown_capacity*sizeof *result->values);
+    |if(grown==NULL){abort();}
+    |result=grown;
+    |result->capacity=grown_capacity;
+    |}
+    |result->values[result->length++]=(uint8_t)next;
+    |if(next=='\n'){break;}
+    |}
+    |*line=result;
+    |return BLORP_FS_SUCCEEDED;
+    |}
+    |
+
+
+-- Up to `count` bytes, fewer only at end of input. The result grows in steps as
+-- bytes arrive and never reserves `count`, so a huge count costs the input
+-- received. A count of zero or less reads, and flushes, nothing.
+pure func console_read_exact_runtime(byte_list_type: String) -> String:
+    |enum {BLORP_CONSOLE_READ_STEP=1<<16};
+    |uint8_t blorp_console_read_exact(int64_t count,${byte_list_type} *bytes,int64_t *error){
+    |const size_t first=count<=0?0:(count<BLORP_CONSOLE_READ_STEP?(size_t)count:(size_t)BLORP_CONSOLE_READ_STEP);
+    |${list_root_allocation(byte_list_type, "result", "first")}
+    |uint64_t remaining=count<=0?0:(uint64_t)count;
+    |if(remaining>0){
+    |(void)blorp_console_flush_stream(stdout);
+    |clearerr(stdin);
+    |}
+    |while(remaining>0){
+    |if(result->length==(int64_t)result->capacity){
+    |const size_t addition=remaining<result->capacity?(size_t)remaining:result->capacity;
+    |const size_t grown_capacity=result->capacity+addition;
+    |${byte_list_type} grown=blorp_memory_resize(result,sizeof *result+grown_capacity*sizeof *result->values);
+    |if(grown==NULL){abort();}
+    |result=grown;
+    |result->capacity=grown_capacity;
+    |}
+    |size_t room=result->capacity-(size_t)result->length;
+    |if(room>remaining){room=(size_t)remaining;}
+    |errno=0;
+    |const size_t received=fread(result->values+result->length,1,room,stdin);
+    |result->length+=(int64_t)received;
+    |remaining-=received;
+    |if(received<room){
+    |if(!ferror(stdin)){break;}
+    |if(errno==EINTR){clearerr(stdin);continue;}
+    |const int64_t failure=blorp_console_error(errno);
+    |blorp_memory_release(result);
+    |*error=failure;
+    |return BLORP_FS_FAILED;
+    |}
+    |}
+    |*bytes=result;
+    |return BLORP_FS_SUCCEEDED;
+    |}
+    |

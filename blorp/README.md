@@ -1284,6 +1284,24 @@ writer remembers its first write error and cannot publish after that failure.
 Public reader/writer scopes are deferred until the bootstrap seed supports
 these compiler mechanisms.
 
+The console builtins `console.write`, `console.write_error`, `console.flush`,
+`console.read_line` and `console.read_exact` carry standard streams as bytes,
+and any module may declare them: they take no handle. Each returns
+`Result[_, Int]`, and its error is the `io/_errors` code (EISDIR is the
+`IsADirectory` kind, any other errno is sent negated), not a raw errno. Write
+takes a `List[UInt8]` and returns `Result[Void, Int]`, through the stdio buffer
+that `print` shares, so their order holds; `flush` sends it. `read_line`
+returns the bytes it consumed, a line with its LF or the last bytes before end
+of input, so it is empty only at end of input and an empty line is `"\n"`;
+`read_exact(count)` takes the count and returns up to that many bytes, fewer
+only at end of input, never reserving the count, and reads nothing for a count
+of zero or less. Both reads share standard input's one buffer, flush standard
+output first so a prompt shows before the program waits, and drop bytes already
+read if the read then fails. The writes and the flush run under the SIGPIPE
+guard `process.capture` uses, so a reader that has gone is an error, not the
+end of the program; the first `write` also closes standard output at exit under
+that guard, so the final flush cannot raise SIGPIPE.
+
 ## Compiler architecture
 
 [`src/main.brp`](src/main.brp) reads the command word and dispatches to

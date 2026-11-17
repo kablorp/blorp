@@ -49,11 +49,13 @@ done.
     Load phase).
   - **Landed:** landing 1, analysis without an entry point; landing 2,
     comments as lexer output; landing 3, the lexer's prefix on failure;
-    landing 4, fixed identities; and landing 5, name uses: analysis records
+    landing 4, fixed identities; landing 5, name uses: analysis records
     one inline row per name used in source, its span and the identity it
-    resolves to.
-  - **Next:** landing 6, console labels: the byte console's builtin labels,
-    runtime and emission, with no library functions yet.
+    resolves to; and landing 6, console labels: `console.write`,
+    `write_error`, `flush`, `read_line` and `read_exact`, with their runtime
+    and emission and no library functions yet.
+  - **Next:** landing 7, a plain seed rotation so the seed knows the console
+    labels; then landing 8, the `io/console` functions.
 - **String code points:** [`STRING_PLAN.md`](STRING_PLAN.md).
   - **Status:** approved on 2026-11-10: `length` counts code points, from a
     count stored in each String, and byte work uses `byte_*` functions. L1

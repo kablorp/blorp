@@ -397,7 +397,7 @@ PROCESS_LAUNCH_RUNTIME: String =
 
 
 -- What capture needs beside the shared helpers: the output and input
--- buffers, the child, and the SIGPIPE guard. Only capture calls these.
+-- buffers and the child. Only capture calls these.
 private CAPTURE_SUPPORT: String =
     raw
         |enum {
@@ -505,34 +505,6 @@ private CAPTURE_SUPPORT: String =
         |                          : (lead & 0xF8) == 0xF0 ? 4 : 1;
         |    return expected > continuation + 1 ? length - 1 - continuation : length;
         |}
-        |/* SIGPIPE is blocked in the calling thread only, so a write to a child that has
-        | * closed its stdin fails with EPIPE instead of ending the program. No disposition
-        | * changes. A SIGPIPE that was pending before the block is not ours and is left. */
-        |struct blorp_process_pipe_guard {
-        |    sigset_t original;
-        |    int pending_before;
-        |};
-        |static int blorp_process_block_sigpipe(struct blorp_process_pipe_guard *guard) {
-        |    sigset_t pipe_only, pending;
-        |    if (sigemptyset(&pipe_only) != 0 || sigaddset(&pipe_only, SIGPIPE) != 0 ||
-        |        sigpending(&pending) != 0) {
-        |        return errno;
-        |    }
-        |    guard->pending_before = sigismember(&pending, SIGPIPE) == 1;
-        |    return pthread_sigmask(SIG_BLOCK, &pipe_only, &guard->original);
-        |}
-        |/* Consumes the SIGPIPE our write raised, if any, then restores the mask. */
-        |static void blorp_process_restore_sigpipe(const struct blorp_process_pipe_guard *guard,
-        |                                          int raised) {
-        |    sigset_t pipe_only, pending;
-        |    if (raised && !guard->pending_before && sigemptyset(&pipe_only) == 0 &&
-        |        sigaddset(&pipe_only, SIGPIPE) == 0 && sigpending(&pending) == 0 &&
-        |        sigismember(&pending, SIGPIPE) == 1) {
-        |        int taken;
-        |        (void)sigwait(&pipe_only, &taken);
-        |    }
-        |    (void)pthread_sigmask(SIG_SETMASK, &guard->original, NULL);
-        |}
         |/* The child leads its own group, then takes its streams. Only the child creates its
         | * group: when the parent also called setpgid, Darwin returned EPERM to whichever call
         | * lost the race. Until the child's call runs, a group signal finds no group and the
@@ -577,7 +549,7 @@ private CAPTURE_BODY: String =
         |    struct blorp_process_input in = {-1, NULL, 0, 0, 0};
         |    int stdout_pipe[2] = {-1, -1}, stderr_pipe[2] = {-1, -1}, stdin_pipe[2] = {-1, -1};
         |    int report[2] = {-1, -1};
-        |    struct blorp_process_pipe_guard guard;
+        |    struct blorp_pipe_guard guard;
         |    int guarded = 0, timed_out = 0, number = 0, status = 0;
         |    int64_t now = 0, deadline = 0;
         |    pid_t child = -1;
@@ -636,7 +608,7 @@ private CAPTURE_BODY: String =
         |        in.bytes = input->values[0]->bytes;
         |        in.length = (size_t)input->values[0]->length;
         |        stdin_pipe[1] = -1;
-        |        number = blorp_process_block_sigpipe(&guard);
+        |        number = blorp_block_sigpipe(&guard);
         |        if (number != 0) {
         |            failure = blorp_process_launch_error(number);
         |            goto cleanup;
@@ -717,7 +689,7 @@ private CAPTURE_BODY: String =
         |    }
         |cleanup:
         |    if (guarded) {
-        |        blorp_process_restore_sigpipe(&guard, in.broken);
+        |        blorp_restore_sigpipe(&guard, in.broken);
         |    }
         |    if (child > 0) {
         |        const int problem = blorp_process_reap(child, &status);
