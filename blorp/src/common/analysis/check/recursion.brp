@@ -410,7 +410,7 @@ private pure func append_dependencies(
     collected
 
 
-private pure func automatic_origin(implementation: AcceptedImplementation) -> List[AggregateId]:
+pure func automatic_origin(implementation: AcceptedImplementation) -> List[AggregateId]:
     var origin: List[AggregateId] = []
     for member in implementation.methods:
         match member.body:
@@ -795,45 +795,31 @@ private pure func validate_base_dependencies(
         Ok(void)
 
 
+-- What one checked body calls and creates. Checking walks each elaborated
+-- body and structural-equality template once, for the bodies it reaches, and
+-- hands the walks here. `automatic` is a template's automatic origin, and
+-- empty for a declared body or a lambda.
+record BodyCalls {
+    calls: List[CheckedCall],
+    creations: List[CheckedExpr],
+    automatic: List[AggregateId],
+}
+
+
 -- This returns only candidate-specific finite causes. Check's final use
 -- validation must consume them before publishing the pruned accepted rows.
 pure func validate_recursive_instantiation(
-    functions: List[CheckedFunction],
-    lambdas: List[CheckedLambda],
+    bodies: List[BodyCalls],
     traits: AcceptedTraits,
 ) -> Result[List[AggregateId], CheckError]:
     var dependencies: List[ParameterDependency] = []
-    for function in functions:
-        dependencies = dependencies.append_call_dependencies(function.function_calls(), traits, [])
+    for body in bodies:
+        dependencies = dependencies.append_call_dependencies(body.calls, traits, body.automatic)
         dependencies = dependencies.append_creation_dependencies(
-            function.statements.body_callable_creations(function.body),
+            body.creations,
             traits,
-            [],
+            body.automatic,
         )
-    for lambda in lambdas:
-        dependencies = dependencies.append_call_dependencies(lambda.lambda_calls(), traits, [])
-        dependencies = dependencies.append_creation_dependencies(
-            lambda.statements.body_callable_creations(lambda.body),
-            traits,
-            [],
-        )
-    for implementation in traits.implementations.implementation_rows():
-        for member in implementation.methods:
-            match member.body:
-                StructuralEquality(_, template):
-                    origins = implementation.automatic_origin()
-                    dependencies = dependencies.append_call_dependencies(
-                        body_calls([], template.body),
-                        traits,
-                        origins,
-                    )
-                    dependencies = dependencies.append_creation_dependencies(
-                        body_callable_creations([], template.body),
-                        traits,
-                        origins,
-                    )
-                _:
-                    void
     base = dependencies.filter(pure func(dependency): dependency.automatic.is_empty())
     _: Void ?= base.validate_base_dependencies()
     if dependencies.any(
@@ -1133,7 +1119,7 @@ pure func finalize_trait_instances(
                     traits,
                     unavailable,
                     function.function_calls(),
-                    function.statements.body_callable_creations(function.body),
+                    function.function_callable_creations(),
                 ):
                     Err(error): invalid = Some(error)
                     Ok(error): first = error

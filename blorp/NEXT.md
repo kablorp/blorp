@@ -88,13 +88,12 @@ done.
     `read_text(path).lines()` collects lines.
   - **Later:** the plan's "Later" list.
 - **Library cost:** [`LIBRARY_COST_PLAN.md`](LIBRARY_COST_PLAN.md).
-  - **Status:** hello's compile is about 99% standard-library work. Keith
-    approved option (a) on 2026-11-12. Checking now closes instantiation
-    paths only within strongly connected components and decides ordinary
-    growth from the same components, so bounded generic functions no
-    longer cost time quadratic in their number.
-  - **Next:** option (b), elaborating a library body only when the program
-    reaches it, waits on four decisions for Keith in the plan.
+  - **Status:** option (a) landed: bounded generic functions no longer cost
+    time quadratic in their number. Keith approved option (b) on 2026-11-16:
+    checking elaborates a library body only when the program reaches it, and
+    `make test` checks the whole library. Its landing is in review.
+  - **Next:** a faster lexer and parser, which then carry most of a small
+    compile's cost (the plan's "Adjacent problems").
 - **Cost quirks:** [`COST_QUIRKS_PLAN.md`](COST_QUIRKS_PLAN.md).
   - **Status:** Keith approved four stacked landings on 2026-11-12: L1,
     interpolation as one left-nested chain; L2, loop iterations ending the
@@ -145,9 +144,9 @@ None of these is planned yet. Each wants its own short design or brief.
     instructions since `Path` and the `io/files/` modules, because it follows
     the size of the embedded library text. `Path` stays an explicit import
     for the same reason (about +31,000 allocations and +26% instructions to
-    compile an empty program as a prelude name); revisit once the checker
-    checks only the declarations a program uses (option (b) of
-    [`LIBRARY_COST_PLAN.md`](LIBRARY_COST_PLAN.md)).
+    compile an empty program as a prelude name). Option (b) of
+    [`LIBRARY_COST_PLAN.md`](LIBRARY_COST_PLAN.md) roughly halves that cost;
+    Keith kept `Path` out of the prelude on 2026-11-16 all the same.
   - **Temporary-directory cleanup and `ENOSPC`.** One native serves
     `RemoveTreeError`, which has no `NoSpace`, and a temporary directory's
     cleanup, so `ENOSPC` during cleanup arrives as `OtherOs(28)`.

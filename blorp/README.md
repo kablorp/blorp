@@ -1052,7 +1052,11 @@ wildcards. Imported functions resolve names in their own module. Every
 declaration has one identity, so same-named declarations in two modules are
 distinct. Import cycles, including a module importing itself, are rejected at
 the import that closes the cycle, and a module reached along several paths is
-loaded once. Every loaded module is checked, including unused declarations.
+loaded once. Every declaration of every loaded module is checked, used or
+not, and so is every body of a user module and every default a resource type
+inherits. Any other library function's body is checked when the program can
+reach it, so a compile pays only for the library code it uses;
+`make -C blorp test` checks every library body.
 
 Same-named functions that UFCS reaches on different receivers, such as List's
 and Path's `join` once `path: Path` is selected, are told apart by the
@@ -1403,7 +1407,11 @@ the output may already be new.
    reachable or not, and publishes a `CheckedProgram` or a `CheckFailure`. It
    accepts declarations, constant annotations, signatures, traits and
    implementations, then constants and bodies, with expression-local
-   inference. Every checked call carries its resolved target and complete
+   inference. It checks every user body and every default a resource type
+   inherits, and any other library body only when a constant, a
+   structural-equality template or a checked body can reach it; a trait call
+   on a type parameter reaches every implementation of that member. Every
+   checked call carries its resolved target and complete
    substitution, every local read a function-owned `BindingId`, and every
    constructor its union and variant ids; matches are proved exhaustive.
    Operators become trait calls, Dict literals calls, and interpolation String

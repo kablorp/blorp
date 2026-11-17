@@ -228,7 +228,10 @@ back through their file's window, and answers forward through theirs.
 `null`. A position at an identifier's end counts as inside it.
 
 **References** returns every use with that referent. It includes the
-declaration only on request.
+declaration only on request. Analysis checks a library body only when the
+program can reach it (`LIBRARY_COST_PLAN.md`, option (b), approved
+2026-11-16), so uses inside library bodies the program never reaches are not
+recorded and references omit them; Keith accepted that on 2026-11-16.
 
 **Lifecycle.** `shutdown` returns `null`. `exit` ends with status 0 after
 `shutdown` and 1 otherwise, as does end of input without `exit`, even

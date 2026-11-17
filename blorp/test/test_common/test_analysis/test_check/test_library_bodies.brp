@@ -1,0 +1,342 @@
+---
+Checking elaborates every user body, and a library body only when checked code
+can reach it; `analyze_whole_library` elaborates every body. Each program
+loads the standard library plus one probe library module, supplied as source.
+---
+import:
+    list: List methods
+    option: Option methods
+    string: String methods
+    test: TestSuite
+    ../../../../src/common/analysis/assemble: ParsedProgram
+    ../../../../src/common/analysis/check/check: analyze_whole_library, check, checked_functions
+    ../../../../src/common/analysis/check/model as model
+    ../../../../src/common/analysis/load/load:
+        LibrarySource(LibraryDirectory),
+        load_program_with_sources,
+    ../../../../src/common/syntax/source: label_text
+    ../../../../src/common/syntax/syntax: DiagnosticKind(ProgramProblem)
+    ../../../support/input: setup_diagnostic
+
+
+private LIBRARY_ROOT: String = "blorp/standard_library"
+
+
+-- Supplied as source, so neither file exists.
+private ROOT_PATH: String = "blorp/build/library_bodies/main.brp"
+private PROBE_PATH: String = "blorp/standard_library/library_bodies_probe.brp"
+
+
+-- The root calls `used`, which calls `helper`; nothing calls `unused` or
+-- `broken`, and `broken`'s body has a type error.
+private PROBE: String =
+    |import:
+    |    _base: Int, String
+    |pure func used(value: Int) -> Int:
+    |    helper(value)
+    |pure func helper(value: Int) -> Int:
+    |    value
+    |pure func unused(value: Int) -> Int:
+    |    value
+    |pure func broken() -> Int:
+    |    "not an Int"
+    |
+
+
+private ROOT: String =
+    |import:
+    |    library_bodies_probe: used
+    |func main() -> Int:
+    |    used(7)
+    |
+
+
+-- `measure` calls `area` on a type parameter, which can run any
+-- implementation's `area` but no `sides`.
+private SHAPES: String =
+    |import:
+    |    _base: Int
+    |trait Shape:
+    |    pure func area(value: Self) -> Int
+    |    pure func sides(value: Self) -> Int
+    |implements Shape for Int:
+    |    pure func area(value: Self) -> Int:
+    |        value
+    |    pure func sides(value: Self) -> Int:
+    |        4
+    |pure func measure[T: Shape](value: T) -> Int:
+    |    value.area()
+    |
+
+
+private SHAPES_ROOT: String =
+    |import:
+    |    library_bodies_probe: measure
+    |func main() -> Int:
+    |    measure(3)
+    |
+
+
+-- An impure trait that a resource type and Int both implement. `total` calls
+-- `count` on a type parameter, which can run either implementation's `count`,
+-- though the root passes an Int; no `describe` is reachable.
+private RESOURCES: String =
+    |import:
+    |    _base: Int
+    |trait Counted:
+    |    func count(self: Self) -> Int
+    |    func describe(self: Self) -> Int
+    |resource type Token = Int
+    |implements Counted for Token:
+    |    func count(self: Self) -> Int:
+    |        from_opaque Token(self)
+    |    func describe(self: Self) -> Int:
+    |        0
+    |implements Counted for Int:
+    |    func count(self: Self) -> Int:
+    |        self
+    |    func describe(self: Self) -> Int:
+    |        1
+    |func total[T: Counted](value: T) -> Int:
+    |    value.count()
+    |
+
+
+private RESOURCES_ROOT: String =
+    |import:
+    |    library_bodies_probe: total
+    |func main() -> Int:
+    |    total(3)
+    |
+
+
+-- `routes` reaches each function after it by one route, named in the test that
+-- checks it. Nothing reaches `unused` or Token's `mark`.
+private ROUTES: String =
+    |import:
+    |    _base: Int, Bool(True), Equatable
+    |pure func routes(value: Int) -> Int:
+    |    through_lambda = pure func(x: Int) -> Int: by_lambda(x)
+    |    apply(by_value, apply(scaled, apply(through_lambda, padded_size(value))))
+    |pure func apply(function: pure (Int) -> Int, value: Int) -> Int:
+    |    function(value)
+    |pure func by_value(value: Int) -> Int:
+    |    value
+    |trait Scaled:
+    |    pure func scaled(value: Self) -> Int
+    |implements Scaled for Int:
+    |    pure func scaled(value: Self) -> Int:
+    |        value
+    |pure func by_lambda(value: Int) -> Int:
+    |    value
+    |CALLBACK: pure (Int) -> Int = by_constant
+    |pure func by_constant(value: Int) -> Int:
+    |    value
+    |record Celsius { degrees: Int }
+    |implements Equatable for Celsius:
+    |    pure func equals(left: Self, right: Self) -> Bool:
+    |        same_degrees(left, right)
+    |pure func same_degrees(left: Celsius, right: Celsius) -> Bool:
+    |    True
+    |record Reading { temperature: Celsius }
+    |trait Sized:
+    |    pure func size(value: Self) -> Int
+    |    pure func padded(value: Self) -> Int:
+    |        size(value)
+    |implements Sized for Int:
+    |    pure func size(value: Self) -> Int:
+    |        value
+    |pure func padded_size[T: Sized](value: T) -> Int:
+    |    value.padded()
+    |resource type Token = Int
+    |trait Marked:
+    |    func mark(self: Self) -> Int
+    |    func noted(self: Self) -> Int:
+    |        0
+    |implements Marked for Token:
+    |    func mark(self: Self) -> Int:
+    |        from_opaque Token(self)
+    |pure func unused(value: Int) -> Int:
+    |    value
+    |
+
+
+private ROUTES_ROOT: String =
+    |import:
+    |    library_bodies_probe: routes
+    |func main() -> Int:
+    |    routes(1)
+    |
+
+
+private func loaded(root: String, probe: String) -> List[ParsedProgram]:
+    match load_program_with_sources(ROOT_PATH, LibraryDirectory(LIBRARY_ROOT), [
+        { path = ROOT_PATH, contents = root },
+        { path = PROBE_PATH, contents = probe },
+    ]):
+        Ok(program): [program.program]
+        Err(_): []
+
+
+-- The probe's functions, in declaration order, each labelled with whether its
+-- body was elaborated.
+private pure func probe_bodies(parsed: ParsedProgram) -> List[String]:
+    match check(parsed):
+        Err(failure):
+            [setup_diagnostic(failure).message]
+        Ok(checked):
+            var found: List[String] = []
+            for function in checked_functions(checked).functions:
+                label = function.label.label_text()
+                if label.starts_with("library_bodies_probe."):
+                    state = match function.elaboration:
+                        model.ElaboratedBody(_): "elaborated"
+                        model.BodyNotReached: "not reached"
+                    found = found.append("${label} ${state}")
+            found
+
+
+-- Whether checking ROUTES_ROOT leaves every ROUTES function `entries` names in
+-- the state it gives.
+private func routes_leave(entries: List[String]) -> Bool:
+    match loaded(ROUTES_ROOT, ROUTES):
+        [parsed]:
+            found = probe_bodies(parsed)
+            entries.all(pure func(entry): found.contains("library_bodies_probe.${entry}"))
+        _:
+            False
+
+
+func test_a_library_body_is_elaborated_only_when_reached() -> Bool:
+    expected: List[String] = [
+        "library_bodies_probe.used elaborated",
+        "library_bodies_probe.helper elaborated",
+        "library_bodies_probe.unused not reached",
+        "library_bodies_probe.broken not reached",
+    ]
+    loaded(ROOT, PROBE).map(probe_bodies) == [expected]
+
+
+func test_a_trait_call_on_a_type_parameter_reaches_every_implementation() -> Bool:
+    expected: List[String] = [
+        "library_bodies_probe.area elaborated",
+        "library_bodies_probe.sides not reached",
+        "library_bodies_probe.measure elaborated",
+    ]
+    loaded(SHAPES_ROOT, SHAPES).map(probe_bodies) == [expected]
+
+
+func test_an_impure_trait_call_reaches_resource_and_plain_implementations() -> Bool:
+    expected: List[String] = [
+        "library_bodies_probe.count elaborated",
+        "library_bodies_probe.describe not reached",
+        "library_bodies_probe.count elaborated",
+        "library_bodies_probe.describe not reached",
+        "library_bodies_probe.total elaborated",
+    ]
+    loaded(RESOURCES_ROOT, RESOURCES).map(probe_bodies) == [expected]
+
+
+func test_a_function_value_reaches_the_function() -> Bool:
+    routes_leave(["by_value elaborated", "unused not reached"])
+
+
+func test_a_method_value_reaches_the_receivers_implementation() -> Bool:
+    routes_leave(["scaled elaborated"])
+
+
+func test_a_lambda_in_a_library_body_reaches_what_it_calls() -> Bool:
+    routes_leave(["by_lambda elaborated"])
+
+
+func test_an_unused_constant_reaches_the_function_it_names() -> Bool:
+    routes_leave(["by_constant elaborated"])
+
+
+func test_an_equality_template_reaches_a_fields_equals() -> Bool:
+    routes_leave(["equals elaborated", "same_degrees elaborated"])
+
+
+func test_a_trait_call_on_a_type_parameter_reaches_an_inherited_default() -> Bool:
+    routes_leave(["padded elaborated", "size elaborated"])
+
+
+-- Its walk with Self as Token reports Token's implementation, a user's error
+-- when the implementation is the user's.
+func test_a_default_a_resource_type_inherits_is_elaborated_unreached() -> Bool:
+    routes_leave(["noted elaborated", "mark not reached"])
+
+
+func test_an_unreached_library_error_appears_only_in_the_whole_library() -> Bool:
+    match loaded(ROOT, PROBE):
+        [parsed]:
+            -- The compile succeeds; only the whole-library analysis checks `broken`.
+            match check(parsed):
+                Err(_):
+                    False
+                Ok(_):
+                    match analyze_whole_library(parsed):
+                        Ok(_):
+                            False
+                        Err(failure):
+                            found = setup_diagnostic(failure)
+                            [
+                                found.message == "expression does not match the expected type",
+                                found.help == "use an expression of type Int here",
+                                (
+                                    PROBE.slice(found.span.start, found.span.end)
+                                    == Some("\"not an Int\"")
+                                ),
+                                found.kind == ProgramProblem,
+                                found.note.is_none(),
+                            ].all(pure func(holds): holds)
+        _:
+            False
+
+
+TESTS: TestSuite = {
+    description = "Library bodies are checked when reached",
+    tests = [
+        (
+            "a library body is elaborated only when reached",
+            test_a_library_body_is_elaborated_only_when_reached,
+        ),
+        (
+            "a trait call on a type parameter reaches every implementation",
+            test_a_trait_call_on_a_type_parameter_reaches_every_implementation,
+        ),
+        (
+            "an impure trait call reaches resource and plain implementations",
+            test_an_impure_trait_call_reaches_resource_and_plain_implementations,
+        ),
+        ("a function value reaches the function", test_a_function_value_reaches_the_function),
+        (
+            "a method value reaches the receiver's implementation",
+            test_a_method_value_reaches_the_receivers_implementation,
+        ),
+        (
+            "a lambda in a library body reaches what it calls",
+            test_a_lambda_in_a_library_body_reaches_what_it_calls,
+        ),
+        (
+            "an unused constant reaches the function it names",
+            test_an_unused_constant_reaches_the_function_it_names,
+        ),
+        (
+            "an equality template reaches a field's equals",
+            test_an_equality_template_reaches_a_fields_equals,
+        ),
+        (
+            "a trait call on a type parameter reaches an inherited default",
+            test_a_trait_call_on_a_type_parameter_reaches_an_inherited_default,
+        ),
+        (
+            "a default a resource type inherits is elaborated unreached",
+            test_a_default_a_resource_type_inherits_is_elaborated_unreached,
+        ),
+        (
+            "an unreached library error appears only in the whole library",
+            test_an_unreached_library_error_appears_only_in_the_whole_library,
+        ),
+    ],
+}

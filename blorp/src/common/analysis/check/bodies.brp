@@ -8,7 +8,7 @@ import:
     list: repeat, List methods
     option: Option methods
     result: Result methods
-    ../../syntax/source: ModuleId
+    ../../syntax/source: ModuleId, ModuleKind(UserModule)
     ../../syntax/syntax:
         IntegerFormat(Int64Format),
         ParsedBinding,
@@ -50,7 +50,8 @@ import:
         ValueExpression,
         WrittenName,
         TypeSyntax,
-    ../ids: FunctionId, OpaqueRow, VariantId
+    ../assemble: ParsedModuleRow
+    ../ids: FunctionId, OpaqueRow, TraitId, TraitMethodId, VariantId
     ../namespace/builtins: DesignatedResult, DesignatedBoolean, DesignatedOption, RuntimeOperation
     ../namespace/namespace: Namespace
     ./callables: ResolutionContext
@@ -68,6 +69,7 @@ import:
         value_error,
         CheckerInvariant(
             InvalidReceiverScope,
+            InvalidResolvedFunction,
             InvalidInferenceWorklist,
             InvalidCheckedUnion,
             InvalidResolvedParameter,
@@ -114,7 +116,25 @@ import:
         unsupported_form,
     ./expressions: CheckedValueResult, ResolvedBody, check_value, synthesize_value
     ./model:
-        BodyOwner(DeclaredBody),
+        BodyOwner(DeclaredBody, LambdaBody, DerivedEqualityBody),
+        AcceptedMethodCall,
+        AcceptedTraits,
+        CallableChoice(
+            MethodCallable,
+            NamedCallable,
+            ForwardedCallable,
+            LambdaCallable,
+            StoredCallable,
+        ),
+        CheckedCall,
+        CheckedFunctionBody,
+        FunctionElaboration(ElaboratedBody, BodyNotReached),
+        ImplementationTable,
+        ImplementedBody(AuthoredMethod, TraitDefault, StructuralEquality),
+        body_calls,
+        body_callable_creations,
+        expression_calls,
+        expression_callable_creations,
         AdmittedReceiverScope,
         CheckedLambda,
         LambdaRow(CollectingLambda, CheckedLambdaRow),
@@ -122,7 +142,7 @@ import:
         BindingDefinition,
         BindingId,
         BindingOrigin(BodyLocal, MatchCapture, ParameterBinding, CallableParameterBinding),
-        CallTarget(RuntimeFunction),
+        CallTarget(RuntimeFunction, TraitMethod, UserFunction, CallableParameter, ValueCall),
         CheckedArm,
         CheckedBody(CheckedMatchBody, CheckedValueBody),
         CheckedExit(RecurWith, ReturnExpression),
@@ -134,11 +154,12 @@ import:
             LiteralInteger,
             LiteralVoid,
             Match,
+            MakeCallable,
             ReadBinding,
             ConstructVariant,
             ReadTupleElement,
         ),
-        CheckedCallOperand(ValueOperand),
+        CheckedCallOperand(ValueOperand, CallableOperand),
         CheckedFunction,
         CheckedPatternPlace,
         CheckedPatternRoute(MatchRoot, UnionField),
@@ -170,7 +191,7 @@ import:
         implementation_rows,
     ./name_uses: NameUse, Referent(BindingReferent), name_use
     ./patterns as patterns: ParsedPattern methods, TypeRef methods
-    ./recursion: check_execution
+    ./recursion: BodyCalls, automatic_origin, check_execution
     ./resource_scopes: ResourceDefault, admit_resource_body, resource_defaults
     ./scope:
         ScopedValue(DataLocal, CallableLocal),
@@ -2104,21 +2125,155 @@ private pure func resolve_propagation(
     })
 
 
--- Every checked function body and lambda. It lives here, not in `model`, which
--- cannot import `name_uses`.
+-- Every function, its body elaborated or not, and every checked lambda. It
+-- lives here, not in `model`, which cannot import `name_uses`.
 record CheckedBodies {
     functions: List[CheckedFunction],
     lambdas: List[CheckedLambda],
     -- The names every body uses, except a synthesised entry's.
     uses: List[NameUse],
+    -- What each function body, then each lambda, then each structural-equality
+    -- template calls and creates, walked once for the reach; the recursion
+    -- check reads it. Not published.
+    calls: List[BodyCalls],
 }
 
 
--- Checks every function body in declaration order, including unreachable ones.
+-- The declared bodies that implement each trait member, by trait number and
+-- member position. Derived once from the implementation table and only read:
+-- a trait call on a type parameter can run any of them.
+private pure func member_bodies(traits: AcceptedTraits) -> List[List[List[FunctionId]]]:
+    var index: List[List[List[FunctionId]]] = traits.declarations.map(
+        pure func(declaration) -> List[List[FunctionId]]: declaration.methods.map(
+            pure func(_) -> List[FunctionId]: [],
+        ),
+    )
+    for implementation in traits.implementations.implementation_rows():
+        for member in implementation.methods:
+            match member.body:
+                AuthoredMethod(function) | TraitDefault(function):
+                    owner = member.method
+                        .trait_method_owner()
+                        .trait_number()
+                    -- An implemented member's trait and position index the table.
+                    no_members: List[List[FunctionId]] = []
+                    index = index.set(
+                        owner,
+                        index
+                            .get_or(owner, no_members)
+                            .set(
+                                member.method.trait_method_number(),
+                                index
+                                    .bodies_of(member.method)
+                                    .append(function),
+                            ),
+                    )
+                StructuralEquality(_, _):
+                    void
+    index
+
+
+private pure func bodies_of(
+    index: List[List[List[FunctionId]]],
+    member: TraitMethodId,
+) -> List[FunctionId]:
+    no_members: List[List[FunctionId]] = []
+    no_bodies: List[FunctionId] = []
+    index
+        .get_or(
+            member
+                .trait_method_owner()
+                .trait_number(),
+            no_members,
+        )
+        .get_or(member.trait_method_number(), no_bodies)
+
+
+-- Appends the function number of every declaration a trait call can run.
+private pure func reach_method(
+    queue: List[Int],
+    method: AcceptedMethodCall,
+    traits: AcceptedTraits,
+    members: List[List[List[FunctionId]]],
+) -> List[Int]:
+    match traits.method_body(method):
+        Some(selected):
+            match selected.body:
+                DeclaredBody(function): queue.append(function.function_number())
+                -- Structural-equality templates are seeds, and lambdas belong
+                -- to the body that creates them.
+                LambdaBody(_) | DerivedEqualityBody(_): queue
+        None:
+            var reached = queue
+            for function in members.bodies_of(method.method_identity()):
+                reached = reached.append(function.function_number())
+            reached
+
+
+private pure func reach_choice(
+    queue: List[Int],
+    choice: CallableChoice,
+    traits: AcceptedTraits,
+    members: List[List[List[FunctionId]]],
+) -> List[Int]:
+    match choice:
+        MethodCallable(method): queue.reach_method(method, traits, members)
+        NamedCallable(id, _): queue.append(id.function_number())
+        ForwardedCallable(_) | LambdaCallable(_, _) | StoredCallable(_): queue
+
+
+-- Appends the function number of every declaration a body's calls and created
+-- callables can run. A number may repeat; the queue elaborates each body once.
+private pure func reach_calls(
+    queue: List[Int],
+    body: BodyCalls,
+    traits: AcceptedTraits,
+    members: List[List[List[FunctionId]]],
+) -> List[Int]:
+    var reached = queue
+    for call in body.calls:
+        match call.target:
+            UserFunction(id, _): reached = reached.append(id.function_number())
+            TraitMethod(method): reached = reached.reach_method(method, traits, members)
+            RuntimeFunction(_) | CallableParameter(_) | ValueCall(_): void
+        for operand in call.operands:
+            match operand:
+                CallableOperand(_, choice, _):
+                    reached = reached.reach_choice(choice, traits, members)
+                ValueOperand(_):
+                    void
+    for value in body.creations:
+        match value.form:
+            MakeCallable(choice): reached = reached.reach_choice(choice, traits, members)
+            _: void
+    reached
+
+
+private pure func calls_of(
+    statements: List[CheckedStatement],
+    body: CheckedBody,
+    automatic: List[AggregateId],
+) -> BodyCalls:
+    {
+        calls = body_calls(statements, body),
+        creations = body_callable_creations(statements, body),
+        automatic = automatic,
+    }
+
+
+-- Every user body is elaborated, and with `whole_library` every library body
+-- too. Otherwise a library body is elaborated only when a constant, a
+-- structural-equality template or an elaborated body can reach it, or a
+-- resource type inherits it as a default (LIBRARY_COST_PLAN.md, option (b)).
+-- User bodies come first, in declaration order, so of the errors in user bodies
+-- the first reported is the one checking every body in order finds. A library
+-- body's error is found only when the body is reached, after every user body.
 -- `synthesized_entry` is the entry function assembly wrote, if it wrote one: no
 -- source spells its names, so its body records none.
 pure func resolve_functions(
     functions: List[AcceptedFunction],
+    modules: List[ParsedModuleRow],
+    whole_library: Bool,
     declarations: CheckedDeclarations,
     opaque_declarations: List[OpaqueRow],
     namespace: Namespace,
@@ -2138,14 +2293,71 @@ pure func resolve_functions(
             .resource_defaults(opaque_declarations)
     else:
         Ok([])
-    var checked: List[CheckedFunction] = []
+    trait_table = traits.accepted_traits()
+    members = trait_table.member_bodies()
+    var pending: List[Int] = []
+    var failure: Option[CheckError] = None
+    for accepted in functions:
+        match modules.get(accepted.body_types.module.module_number()):
+            Some(module):
+                if whole_library.or(module.role == UserModule):
+                    pending = pending.append(accepted.id.function_number())
+            None:
+                failure = Some(
+                    checker_invariant(
+                        accepted.declaration.function_name.span,
+                        InvalidResolvedFunction(accepted.id),
+                    ),
+                )
+    -- A default a resource type inherits is walked again with Self as that
+    -- resource, and what that walk finds is the implementation's own error, so
+    -- it is checked whether or not a call reaches it.
+    for row in inherited:
+        pending = pending.append(row.default_body.function_number())
+    -- Only a structural-equality template has an automatic origin.
+    no_origin: List[AggregateId] = []
+    for constant in constants:
+        pending = pending.reach_calls(
+            {
+                calls = constant.value.expression_calls(),
+                creations = constant.value.expression_callable_creations(),
+                automatic = no_origin,
+            },
+            trait_table,
+            members,
+        )
+    var template_reach: List[BodyCalls] = []
+    for implementation in trait_table.implementations.implementation_rows():
+        for member in implementation.methods:
+            match member.body:
+                StructuralEquality(_, template):
+                    reached = calls_of([], template.body, implementation.automatic_origin())
+                    template_reach = template_reach.append(reached)
+                    pending = pending.reach_calls(reached, trait_table, members)
+                AuthoredMethod(_) | TraitDefault(_):
+                    void
+    no_calls: BodyCalls = { calls = [], creations = [], automatic = no_origin }
+    var function_reach: List[BodyCalls] = repeat(no_calls, functions.length())
+    var lambda_reach: List[BodyCalls] = []
+    var elaborations: List[FunctionElaboration] = repeat(BodyNotReached, functions.length())
     var lambdas: List[LambdaRow] = []
     var uses: List[NameUse] = []
-    var failure: Option[CheckError] = None
-    while failure.is_none():
-        match functions.get(checked.length()):
+    var head = 0
+    while (
+        failure
+            .is_none()
+            .and(head < pending.length())
+    ):
+        position = pending.get_or(head, 0)
+        head = head + 1
+        first_lambda = lambdas.length()
+        -- A body is queued once per call that reaches it and elaborated once.
+        unelaborated: Option[AcceptedFunction] = match elaborations.get(position):
+            Some(BodyNotReached): functions.get(position)
+            Some(ElaboratedBody(_)) | None: None
+        match unelaborated:
             None:
-                break
+                void
             Some(accepted):
                 match receivers.get(accepted.body_types.module.module_number()):
                     None:
@@ -2203,7 +2415,7 @@ pure func resolve_functions(
                                         body.statements,
                                         body.body,
                                         id,
-                                        traits.accepted_traits(),
+                                        trait_table,
                                     ),
                                 ):
                                     Ok(execution):
@@ -2215,15 +2427,22 @@ pure func resolve_functions(
                                         else:
                                             executed
 
-                                        checked = checked.append({
-                                            id = id,
-                                            label = accepted.label,
-                                            execution = execution.execution,
-                                            signature = signature,
-                                            bindings = published.bindings,
-                                            statements = published.statements,
-                                            body = published.body,
-                                        })
+                                        elaborations = elaborations.set(
+                                            position,
+                                            ElaboratedBody({
+                                                execution = execution.execution,
+                                                bindings = published.bindings,
+                                                statements = published.statements,
+                                                body = published.body,
+                                            }),
+                                        )
+                                        reached = calls_of(
+                                            published.statements,
+                                            published.body,
+                                            no_origin,
+                                        )
+                                        function_reach = function_reach.set(position, reached)
+                                        pending = pending.reach_calls(reached, trait_table, members)
                                         lambdas = published.lambdas
                                         if synthesized_entry != Some(id):
                                             uses = uses.concat(published.uses)
@@ -2231,13 +2450,42 @@ pure func resolve_functions(
                                         failure = Some(error)
                             Err(error):
                                 failure = Some(error)
+        -- A body's lambdas are its own: what they call is reached through it.
+        for lambda_position in first_lambda..lambdas.length():
+            match lambdas.get(lambda_position):
+                Some(CheckedLambdaRow(lambda)):
+                    reached = calls_of(lambda.statements, lambda.body, no_origin)
+                    lambda_reach = lambda_reach.append(reached)
+                    pending = pending.reach_calls(reached, trait_table, members)
+                Some(CollectingLambda(_)) | None:
+                    void
     match failure:
         Some(error):
             Err(error)
         None:
+            var checked: List[CheckedFunction] = []
+            for accepted in functions:
+                checked = checked.append({
+                    id = accepted.id,
+                    label = accepted.label,
+                    signature = accepted.signature,
+                    elaboration = elaborations.get_or(
+                        accepted.id.function_number(),
+                        BodyNotReached,
+                    ),
+                })
             match lambdas.seal_lambda_rows():
-                Ok(rows): Ok({ functions = checked, lambdas = rows, uses = uses })
-                Err(error): Err(error)
+                Ok(rows):
+                    Ok({
+                        functions = checked,
+                        lambdas = rows,
+                        uses = uses,
+                        calls = function_reach
+                            .concat(lambda_reach)
+                            .concat(template_reach),
+                    })
+                Err(error):
+                    Err(error)
 
 
 private record NormalizedVoidExit {

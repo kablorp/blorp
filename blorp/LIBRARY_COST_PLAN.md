@@ -1,17 +1,18 @@
 # Library cost
 
-Plan revision 1, 2026-11-12, from the `library-cost` pilot, written against
-origin/main `73f73dfe6` (pilot measurements against `95f37e437`).
+Plan revision 2, 2026-11-16. Revision 1 (2026-11-12) came from the
+`library-cost` pilot, written against origin/main `73f73dfe6` (pilot
+measurements against `95f37e437`).
 
 A compile's cost follows the size of the standard library, not the program.
 Hello's compile is about 99% library work. Checking also grew superlinearly
 in the number of bounded generic functions.
 
-**Status:** Keith approved option (a) on 2026-11-12, as two landings that
-remove both superlinear algorithms (see "Option (a) results"). Option (b),
-elaborating library bodies only when they are reached, is a proposal; it
-waits on the four decisions below. Options (c), (d) and (e) are not
-recommended.
+**Status:** option (a) landed as `081fa6570` and `01f27c350`, removing both
+superlinear algorithms (see "Option (a) results"). Keith approved option (b),
+elaborating library bodies only when they are reached, on 2026-11-16 with
+all four recommendations (see "Decisions"); its landing is in review (see
+"Option (b) results"). Options (c), (d) and (e) are not recommended.
 
 ## Findings
 
@@ -200,7 +201,7 @@ noise of five runs on a shared machine.
 
 ## Option (b): elaborate library bodies when reached
 
-A proposal; it waits on Keith's decisions below.
+Approved by Keith on 2026-11-16.
 
 **Design.** Checking still accepts every declaration and signature, and
 elaborates every body of a user module (`ModuleKind`, a typed role). A
@@ -240,19 +241,95 @@ implementation per trait call; the member index removes that scan.
 +0.1%; at most +280 production lines; hello at -O0 at least 25% below
 option (a).
 
-**Decisions for Keith.**
+**Budget correction (coordinator, 2026-11-17):** production-line ceiling +280 → +295. The review added a required correctness fix (every inherited default a user implementation brings in is checked, +5) and two quality fixes (a module-role invariant replacing a silent fallback, +4; one shared member lookup in place of a duplicated chain, +3), plus a docstring (+2). Growth audit: `bodies.brp` +248 (imports 21, index and reach helpers 134, queue in `resolve_functions` 93), model +21, check +14, name_uses +11, specialize +11, recursion −14. Nothing else can be cut without losing function.
 
-1. Approve (b): library bodies elaborated only when reachable, the whole
-   library checked by `make test`, and the README promise above.
-2. Whether `--library-root` compiles follow the same rule (recommended), or
-   check every library body. Tests, the build and the language server all use
-   library directories, so a rule keyed on where the library came from would
-   leave the shipped path unmeasured.
-3. Whether `Path` joins the prelude after (b), at +10 M instructions and
-   +13,880 allocations per compile.
-4. Whether the language server may omit references from unreached library
-   bodies. User files keep full checking, and library diagnostics are never
+**Decisions** (Keith, 2026-11-16, each as recommended).
+
+1. (b) is approved: every signature and every user body is checked, a
+   library body only when checked code can reach it, and `make test` checks
+   the whole library. README's promise changes accordingly.
+2. `--library-root` compiles follow the same rule. Tests, the build and the
+   language server all use library directories, so a rule keyed on where the
+   library came from would leave the shipped path unmeasured.
+3. The language server may omit references from unreached library bodies.
+   User files keep full checking, and library diagnostics are never
    published.
+4. `Path` stays out of the prelude, as Keith decided for PATH_PLAN's L8. With
+   (b) it would cost +10 M instructions and +13,880 allocations per compile.
+
+### Option (b) results
+
+The landing, `check/library-bodies-when-reached` against origin/main
+`4d8b381f0`, with the host and recipes of option (a). Raw samples, scripts and
+logs are in the main checkout's ignored
+`build/pilots/2026-11-12/library-cost/data/option-b-4d8b381f0/`, with the
+`make -C blorp test INSTRUCTION_CHECK=on` log of `0a334431e` (3,054 passed,
+0 failed) as `make-test-0a334431e.log`.
+
+- `CheckedFunction.elaboration` is `ElaboratedBody(CheckedFunctionBody)` or
+  `BodyNotReached`; specialize reports a body it reaches unelaborated as a
+  missing body.
+- `bodies.brp` queues every user body, every default a resource type
+  inherits and the targets of every constant and structural-equality
+  template, then adds each elaborated body's and lambda's call targets and
+  created callables. An inherited default is walked again with Self as the
+  resource, and that walk reports the implementation's own error, so it is
+  checked whether or not a call reaches it. A trait call on a type
+  parameter reaches every implementation of its member through
+  `member_bodies`, an index built once from the implementation table.
+- Each elaborated body, lambda and template is walked once, and the walks
+  (`BodyCalls`) go to the recursion check, which used to walk every body
+  itself. Without that sharing the self-compile cost +1.7% instructions and
+  +1.1% allocations.
+- `analyze_whole_library` elaborates every body;
+  `test_standard_library/test_whole_library.brp` runs it on a program that
+  imports every library module and prints a failure with its location.
+
+Hello (`effects/hello.brp`), base and candidate built from the same tree
+with the Makefile's recipes; median of 3 alternating runs (`/usr/bin/time
+-l`), allocations from the `-O0` diagnostic build under strict leak check:
+
+| hello | `4d8b381f0` | candidate | change |
+|---|---:|---:|---:|
+| -O0 instructions | 337.1 M | 240.3 M | -28.7% |
+| -O2 instructions | 106.5 M | 73.8 M | -30.8% |
+| allocations | 109,983 | 69,550 | -36.8% |
+
+`blorp/scripts/self-compile-cost 4d8b381f0 <landing> --rounds 5`, fixed
+input (the base's own source): allocations 14,315,638 to 14,304,002
+(-0.081%), instructions 12,782,668,705 to 12,778,267,265 (-0.034%), peak
+heap unchanged, C identical. The own-source rows (+0.28% allocations,
++0.38% instructions) include compiling the landing's added source.
+
+Output identity: 748 inputs (every e2e fixture that declares `main`, every
+`trait_inputs` module compiled directly, and `blorp/src/main.brp`; 132 of them
+rejections) give byte-identical C, stdout, stderr and status. Seeding every
+body fails all four `test_library_bodies.brp` tests, and a trait call on a type
+parameter that reaches no implementation fails its two trait tests, one of
+them an impure trait implemented by a resource type and by Int. Existing e2e
+ceilings are unchanged; hello-sized compiles now measure about 29% under
+them at `-O0`.
+
+The measurements above are of `0a334431e`. Code review then found that a
+user's resource type inheriting a library default was checked only when a
+call reached the default (`trait_inputs/resource_defaults`, now an e2e
+rejection), and asked for the reach routes to be pinned. The fixes seed
+inherited defaults, add a test per route (function and method values, a
+lambda in a library body, an unused constant, an equality template, a default
+reached through the member index, and an inherited resource default), report
+a module a function's body names but the program lacks as a checker
+invariant, and share the member lookup between building and reading the
+index. Production lines are +291 (+277 before the fixes; see the budget
+correction above), tests +548.
+
+The fixed commit, `c4a04e833` against origin/main `f95a8204d` (raw data in
+`data/option-b-f95a8204d/`): `make -C blorp test INSTRUCTION_CHECK=on`
+3,063 passed, 0 failed (`make-test-c4a04e833.log`); output identity on 752
+inputs, 136 of them rejections, 0 differences; fixed-input self-compile
+allocations 14,338,845 to 14,327,233 (-0.081%), instructions 12,789,220,891
+to 12,785,726,615 (-0.027%), peak heap unchanged, C identical; hello -O0
+336.6 M to 240.1 M (-28.7%), -O2 106.3 M to 73.7 M (-30.7%), allocations
+109,983 to 69,549 (-36.8%).
 
 ## Options not recommended
 
