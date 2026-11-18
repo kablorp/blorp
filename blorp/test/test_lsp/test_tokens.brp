@@ -1,0 +1,543 @@
+---
+Semantic tokens: the legend, each lexer kind and each referent case to its
+type and modifiers, string pieces, tokens split per line, lengths in both
+encodings, the relative encoding, and a text that does not lex. Tokens are
+decoded as a client decodes them, through the legend's names, so a type or
+modifier missing from the legend fails its test.
+---
+import:
+    bool: and, not
+    json: Json(Text, Array, Object), render
+    list: List methods
+    option: Option methods
+    string: String methods
+    test: TestSuite
+    ../../src/common/analysis/check/check: analyze
+    ../../src/common/analysis/load/load: LibrarySource(EmbeddedLibrary), load_program_with_sources
+    ../../src/common/syntax/source: SourceFile, root_module_id
+    ../../src/lsp/positions: PositionEncoding(Utf8, Utf16)
+    ../../src/lsp/tokens: analysed_identifiers, semantic_tokens, token_legend
+
+
+-- The names the legend lists under `field`, in its order.
+private pure func legend_names(field: String) -> List[String]:
+    match token_legend():
+        Object(legend):
+            match legend.get(field):
+                Some(Array(names)):
+                    names.map(pure func(name: Json) -> String:
+                        match name:
+                            Text(text): text
+                            _: "not a name"
+                    )
+                _:
+                    []
+        _:
+            []
+
+
+-- The legend's names of the modifiers `bits` sets, comma-separated. A bit past
+-- the legend shows as `unknown`.
+private pure func modifier_names(bits: Int) -> String:
+    var named: List[String] = []
+    var remaining = bits
+    for name in legend_names("tokenModifiers"):
+        if remaining % 2 == 1:
+            named = named.append(name)
+        remaining = remaining / 2
+    if remaining > 0:
+        named = named.append("unknown")
+    named.join(",")
+
+
+-- One token as a client reads it, its type and modifiers by the legend's
+-- names.
+private record DecodedToken {
+    line: Int,
+    start: Int,
+    text: String,
+    token_type: String,
+    modifiers: String
+}
+
+
+private pure func shown(token: DecodedToken) -> String:
+    at = "${token.line}:${token.start} ${token.text} ${token.token_type}"
+    if token.modifiers == "":
+        at
+    else:
+        "${at} ${token.modifiers}"
+
+
+-- Each token in `data`, decoded as a client decodes it: the line and start
+-- accumulate, the text is cut from `text` by the UTF-8 position, and the type
+-- and modifiers are read through the legend.
+private pure func decoded(text: String, data: List[Int]) -> List[DecodedToken]:
+    lines = text.lines()
+    types = legend_names("tokenTypes")
+    var tokens: List[DecodedToken] = []
+    var line = 0
+    var start = 0
+    var index = 0
+    while index + 4 < data.length():
+        line_delta = data.get_or(index, 0)
+        line = line + line_delta
+        start = if line_delta == 0:
+            start + data.get_or(index + 1, 0)
+        else:
+            data.get_or(index + 1, 0)
+        tokens = tokens.append({
+            line = line,
+            start = start,
+            text = lines
+                .get_or(line, "")
+                .slice(start, start + data.get_or(index + 2, 0))
+                .get_or("not on a scalar boundary"),
+            token_type = types.get_or(data.get_or(index + 3, 0), "unknown"),
+            modifiers = modifier_names(data.get_or(index + 4, 0))
+        })
+        index = index + 5
+    tokens
+
+
+-- The tokens of `text` that the lexer alone classifies, decoded.
+private pure func lexed(text: String) -> List[String]:
+    text
+        .decoded(text.semantic_tokens(root_module_id(), {}, Utf8))
+        .map(shown)
+
+
+private ROOT: String = "/work/shapes.brp"
+
+
+-- The tokens of `text`, analysed as the root of its own program with the
+-- `imported` files beside it, decoded; none when it does not load or check.
+private func analysed(text: String, imported: List[SourceFile]) -> List[DecodedToken]:
+    sources = [{ path = ROOT, contents = text }].concat(imported)
+    match load_program_with_sources(ROOT, EmbeddedLibrary, sources):
+        Ok(loaded):
+            match analyze(loaded.program):
+                Ok(analysis):
+                    identifiers = analysis.analysed_identifiers(loaded.sources, root_module_id())
+                    text.decoded(text.semantic_tokens(root_module_id(), identifiers, Utf8))
+                Err(_):
+                    []
+        Err(_):
+            []
+
+
+pure func test_the_legend_lists_standard_types_and_modifiers_in_order() -> Bool:
+    (
+        token_legend().render()
+        == "{\"tokenTypes\":[\"namespace\",\"type\",\"interface\",\"enumMember\",\"typeParameter\",\"parameter\",\"variable\",\"property\",\"function\",\"method\",\"keyword\",\"comment\",\"string\",\"number\",\"operator\"],\"tokenModifiers\":[\"declaration\",\"readonly\",\"defaultLibrary\",\"documentation\"]}"
+    )
+
+
+-- Without an analysis no identifier has a type: `f`, `Int`, `x` and `y` are
+-- left out, and so are the parentheses and the colon.
+pure func test_each_lexer_kind_has_its_type() -> Bool:
+    text =
+        |pure func f() -> Int:  -- note
+        |    x = 'q' + "s"
+        |    y = 1.5 * 2
+    (
+        text.lexed()
+        == [
+            "0:0 pure keyword",
+            "0:5 func keyword",
+            "0:14 -> operator",
+            "0:23 -- note comment",
+            "1:6 = operator",
+            "1:8 'q' string",
+            "1:12 + operator",
+            "1:14 \"s\" string",
+            "2:6 = operator",
+            "2:8 1.5 number",
+            "2:12 * operator",
+            "2:14 2 number"
+        ]
+    )
+
+
+pure func test_operators_have_a_type_and_punctuation_none() -> Bool:
+    text = "a = b == c != d < e > f <= g >= h ?= i | j / k * l + m - n % o -> p => q .. r ... s @t _ (u) [v] {w} x.y, z:\n"
+    (
+        text.lexed()
+        == [
+            "0:2 = operator",
+            "0:6 == operator",
+            "0:11 != operator",
+            "0:16 < operator",
+            "0:20 > operator",
+            "0:24 <= operator",
+            "0:29 >= operator",
+            "0:34 ?= operator",
+            "0:39 | operator",
+            "0:43 / operator",
+            "0:47 * operator",
+            "0:51 + operator",
+            "0:55 - operator",
+            "0:59 % operator",
+            "0:63 -> operator",
+            "0:68 => operator",
+            "0:73 .. operator",
+            "0:78 ... operator"
+        ]
+    )
+
+
+-- The `${` and `}` around the value are punctuation; the pieces on either side
+-- are strings, and none of them overlaps another.
+pure func test_string_pieces_stop_at_an_interpolation() -> Bool:
+    text = "x = \"a $\{b} c\"\n"
+    (
+        text.lexed()
+        == ["0:2 = operator", "0:4 \" string", "0:5 a  string", "0:11  c string", "0:13 \" string"]
+    )
+
+
+-- A pipe string without a value in it is one lexer token from its first `|`
+-- to its end, so its second piece starts the line. No piece holds an LF.
+pure func test_a_pipe_string_and_a_documentation_block_are_split_per_line() -> Bool:
+    text = "---\nTwo\n---\nx =\n    |one\n    |two\n"
+    (
+        text.lexed()
+        == [
+            "0:0 --- comment documentation",
+            "1:0 Two comment documentation",
+            "2:0 --- comment documentation",
+            "3:2 = operator",
+            "4:4 |one string",
+            "5:0     |two string"
+        ]
+    )
+
+
+-- The accented e is two bytes and one UTF-16 unit, the emoji four bytes and
+-- two units, so the string's length and the start of the `+` after it differ.
+-- The types are the legend's operator and string, 14 and 12.
+pure func test_lengths_and_starts_count_in_the_agreed_encoding() -> Bool:
+    text = "x = \"é😀\" + \"a\"\n"
+    and(
+        (
+            text.semantic_tokens(root_module_id(), {}, Utf8)
+            == [0, 2, 1, 14, 0, 0, 2, 8, 12, 0, 0, 9, 1, 14, 0, 0, 2, 3, 12, 0]
+        ),
+        (
+            text.semantic_tokens(root_module_id(), {}, Utf16)
+            == [0, 2, 1, 14, 0, 0, 2, 5, 12, 0, 0, 6, 1, 14, 0, 0, 2, 3, 12, 0]
+        )
+    )
+
+
+-- A start counts from the token before on the same line, and from the line's
+-- start after a line delta. The second piece of the block follows its first.
+pure func test_tokens_are_encoded_relative_to_the_one_before() -> Bool:
+    text = "a = 1 + 2\n\n  -- x\n---\ny\n---\n"
+    (
+        text.semantic_tokens(root_module_id(), {}, Utf8)
+        == [
+            0,
+            2,
+            1,
+            14,
+            0,
+            0,
+            2,
+            1,
+            13,
+            0,
+            0,
+            2,
+            1,
+            14,
+            0,
+            0,
+            2,
+            1,
+            13,
+            0,
+            2,
+            2,
+            4,
+            11,
+            0,
+            1,
+            0,
+            3,
+            11,
+            8,
+            1,
+            0,
+            1,
+            11,
+            8,
+            1,
+            0,
+            3,
+            11,
+            8
+        ]
+    )
+
+
+-- The prefix before an unterminated string keeps its tokens; the string has
+-- none.
+pure func test_a_text_that_does_not_lex_keeps_the_tokens_before_its_error() -> Bool:
+    text = "pure func f() -> String:\n    \"open\n"
+    text.lexed() == ["0:0 pure keyword", "0:5 func keyword", "0:14 -> operator"]
+
+
+-- Every referent case once, keeping only the tokens the analysis classifies.
+-- The parameter of the requirement on line 7 has no token: a requirement has
+-- no body to bind it in.
+func test_each_referent_case_has_its_type_and_modifiers() -> Bool:
+    text =
+        |import:
+        |    list: List methods
+        |    path as paths: Path
+        |
+        |
+        |-- Shapes.
+        |trait Shape:
+        |    pure func area(shape: Self) -> Int
+        |
+        |
+        |record Square {
+        |    side: Int
+        |}
+        |
+        |
+        |union Fit:
+        |    Tight
+        |    Loose(Int)
+        |
+        |
+        |implements Shape for Square:
+        |    pure func area(shape: Self) -> Int:
+        |        shape.side * shape.side
+        |
+        |
+        |LIMIT: Int = 10
+        |
+        |
+        |pure func first[T](values: List[T], fallback: T) -> T:
+        |    values.get_or(0, fallback)
+        |
+        |
+        |pure func fit(square: Square, place: paths.Path) -> Fit:
+        |    var total = square.area()
+        |    total = total + LIMIT
+        |    if total > first([1], 2):
+        |        Loose(total)
+        |    else:
+        |        Tight
+    lexical = ["keyword", "comment", "string", "number", "operator"]
+    named = text
+        .analysed([])
+        .filter(pure func(token: DecodedToken) -> Bool: not(lexical.contains(token.token_type)))
+        .map(shown)
+    (
+        named
+        == [
+            "1:10 List type defaultLibrary",
+            "2:19 Path type defaultLibrary",
+            "6:6 Shape interface declaration",
+            "7:14 area method declaration",
+            "7:26 Self interface",
+            "7:35 Int type defaultLibrary",
+            "10:7 Square type declaration",
+            "11:4 side property declaration",
+            "11:10 Int type defaultLibrary",
+            "15:6 Fit type declaration",
+            "16:4 Tight enumMember declaration",
+            "17:4 Loose enumMember declaration",
+            "17:10 Int type defaultLibrary",
+            "20:11 Shape interface",
+            "20:21 Square type",
+            "21:14 area method declaration",
+            "21:19 shape parameter declaration,readonly",
+            "21:26 Self type",
+            "21:35 Int type defaultLibrary",
+            "22:8 shape parameter readonly",
+            "22:14 side property",
+            "22:21 shape parameter readonly",
+            "22:27 side property",
+            "25:0 LIMIT variable declaration,readonly",
+            "25:7 Int type defaultLibrary",
+            "28:10 first function declaration",
+            "28:16 T typeParameter declaration",
+            "28:19 values parameter declaration,readonly",
+            "28:27 List type defaultLibrary",
+            "28:32 T typeParameter",
+            "28:36 fallback parameter declaration,readonly",
+            "28:46 T typeParameter",
+            "28:52 T typeParameter",
+            "29:4 values parameter readonly",
+            "29:11 get_or function defaultLibrary",
+            "29:21 fallback parameter readonly",
+            "32:10 fit function declaration",
+            "32:14 square parameter declaration,readonly",
+            "32:22 Square type",
+            "32:30 place parameter declaration,readonly",
+            "32:37 paths namespace defaultLibrary",
+            "32:43 Path type defaultLibrary",
+            "32:52 Fit type",
+            "33:8 total variable declaration",
+            "33:16 square parameter readonly",
+            "33:23 area method",
+            "34:4 total variable",
+            "34:12 total variable",
+            "34:20 LIMIT variable readonly",
+            "35:7 total variable",
+            "35:15 first function",
+            "36:8 Loose enumMember",
+            "36:14 total variable",
+            "38:8 Tight enumMember"
+        ]
+    )
+
+
+-- Each origin of a binding: a function-typed parameter, a lambda's parameter,
+-- an immutable local and a match capture. A call to a trait's default is a
+-- method, and a user module's alias is a namespace the library does not
+-- declare.
+func test_each_binding_and_a_user_alias_have_their_types_and_modifiers() -> Bool:
+    text =
+        |import:
+        |    list: List methods
+        |    ./helpers as helpers: one
+        |
+        |
+        |trait Doubled:
+        |    pure func value(item: Self) -> Int
+        |    pure func twice(item: Self) -> Int:
+        |        item.value() * 2
+        |
+        |
+        |pure func apply(transform: pure (Int) -> Int, start: Int) -> Int:
+        |    transform(start)
+        |
+        |
+        |pure func doubled[T: Doubled](item: T) -> Int:
+        |    item.twice()
+        |
+        |
+        |pure func uses(items: List[Int], chosen: Option[Int]) -> Int:
+        |    shifted = items.map(pure func(item: Int) -> Int: item + helpers.one())
+        |    match chosen:
+        |        Some(found): found + shifted.length()
+        |        None: apply(pure func(x: Int) -> Int: x, 0)
+    helpers: SourceFile = {
+        path = "/work/helpers.brp",
+        contents = "pure func one() -> Int:\n    1\n"
+    }
+    lexical = ["keyword", "comment", "string", "number", "operator"]
+    named = text
+        .analysed([helpers])
+        .filter(pure func(token: DecodedToken) -> Bool: not(lexical.contains(token.token_type)))
+        .map(shown)
+    (
+        named
+        == [
+            "1:10 List type defaultLibrary",
+            "2:26 one function",
+            "5:6 Doubled interface declaration",
+            "6:14 value method declaration",
+            "6:26 Self interface",
+            "6:35 Int type defaultLibrary",
+            "7:14 twice method declaration",
+            "7:20 item parameter declaration,readonly",
+            "7:26 Self interface",
+            "7:35 Int type defaultLibrary",
+            "8:8 item parameter readonly",
+            "8:13 value method",
+            "11:10 apply function declaration",
+            "11:16 transform parameter declaration,readonly",
+            "11:33 Int type defaultLibrary",
+            "11:41 Int type defaultLibrary",
+            "11:46 start parameter declaration,readonly",
+            "11:53 Int type defaultLibrary",
+            "11:61 Int type defaultLibrary",
+            "12:4 transform parameter readonly",
+            "12:14 start parameter readonly",
+            "15:10 doubled function declaration",
+            "15:18 T typeParameter declaration",
+            "15:21 Doubled interface",
+            "15:30 item parameter declaration,readonly",
+            "15:36 T typeParameter",
+            "15:42 Int type defaultLibrary",
+            "16:4 item parameter readonly",
+            "16:9 twice method",
+            "19:10 uses function declaration",
+            "19:15 items parameter declaration,readonly",
+            "19:22 List type defaultLibrary",
+            "19:27 Int type defaultLibrary",
+            "19:33 chosen parameter declaration,readonly",
+            "19:41 Option type defaultLibrary",
+            "19:48 Int type defaultLibrary",
+            "19:57 Int type defaultLibrary",
+            "20:4 shifted variable declaration,readonly",
+            "20:14 items parameter readonly",
+            "20:20 map function defaultLibrary",
+            "20:34 item parameter declaration,readonly",
+            "20:40 Int type defaultLibrary",
+            "20:48 Int type defaultLibrary",
+            "20:53 item parameter readonly",
+            "20:60 helpers namespace",
+            "20:68 one function",
+            "21:10 chosen parameter readonly",
+            "22:8 Some enumMember defaultLibrary",
+            "22:13 found variable declaration,readonly",
+            "22:21 found variable readonly",
+            "22:29 shifted variable readonly",
+            "22:37 length function defaultLibrary",
+            "23:8 None enumMember defaultLibrary",
+            "23:14 apply function",
+            "23:30 x parameter declaration,readonly",
+            "23:33 Int type defaultLibrary",
+            "23:41 Int type defaultLibrary",
+            "23:46 x parameter readonly"
+        ]
+    )
+
+
+TESTS: TestSuite = {
+    description = "LSP semantic tokens",
+    tests = [
+        (
+            "the legend lists standard types and modifiers in order",
+            test_the_legend_lists_standard_types_and_modifiers_in_order
+        ),
+        ("each lexer kind has its type", test_each_lexer_kind_has_its_type),
+        (
+            "operators have a type and punctuation none",
+            test_operators_have_a_type_and_punctuation_none
+        ),
+        ("string pieces stop at an interpolation", test_string_pieces_stop_at_an_interpolation),
+        (
+            "a pipe string and a documentation block are split per line",
+            test_a_pipe_string_and_a_documentation_block_are_split_per_line
+        ),
+        (
+            "lengths and starts count in the agreed encoding",
+            test_lengths_and_starts_count_in_the_agreed_encoding
+        ),
+        (
+            "tokens are encoded relative to the one before",
+            test_tokens_are_encoded_relative_to_the_one_before
+        ),
+        (
+            "a text that does not lex keeps the tokens before its error",
+            test_a_text_that_does_not_lex_keeps_the_tokens_before_its_error
+        ),
+        (
+            "each referent case has its type and modifiers",
+            test_each_referent_case_has_its_type_and_modifiers
+        ),
+        (
+            "each binding and a user alias have their types and modifiers",
+            test_each_binding_and_a_user_alias_have_their_types_and_modifiers
+        )
+    ]
+}

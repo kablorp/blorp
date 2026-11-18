@@ -1,7 +1,7 @@
 # Language server: `blorp lsp`
 
 **Status: plan, 2026-11-10; Keith settled its decisions and asked for a byte
-console on 2026-11-11. Landings 1–8 and 9a have landed; 9b is next.**
+console on 2026-11-11. Landings 1–8, 9a and 9b have landed; 9c is next.**
 
 ## Problem
 
@@ -578,6 +578,7 @@ lines counted apart. Compile cost must also fit the e2e instruction ceilings'
 | 6 console labels, fixed input | ≤ +0.1% | ≤ +0.01% | ≤ +0.1% | ≤ +280 net |
 | 8 console functions, fixed input | ≤ +0.1% | ≤ +0.01% | ≤ +0.1% | ≤ +170 net |
 | 9a server core, fixed input | ≤ +0.1% | ≤ +0.01% | ≤ +0.1% | ≤ +1,350 net |
+| 9b semantic tokens, fixed input | ≤ +0.1% | ≤ +0.01% | ≤ +0.1% | ≤ +780 net |
 | 11 broken files | ≤ +0.5% (more source to compile) | ≤ +0.5% | ≤ +0.5% | ≤ +300 |
 
 **Latency.** Per request after one change, on this host: ≤ 1.0 s for
@@ -982,6 +983,81 @@ writing `didOpen` to reading the reply (`latency/measure.py`):
     client's spelling is later updated only under ours (open a file as
     `%6D…`, analyse an importer, close both). 9b publishes `[]` to the
     client's URI on close when the spellings differ.
+
+**Landing 9b** (against `7564157d3`). `self-compile-cost`, `-O2`, 3 rounds:
+
+| Measure | Base | Candidate | Change |
+| --- | ---: | ---: | ---: |
+| Fixed input, allocations | 15,256,707 | 15,256,707 | unchanged |
+| Fixed input, instructions (median) | 13,688,607,855 | 13,686,862,021 | −0.013% |
+| Fixed input, peak heap (requested bytes) | 178,719,922 | 178,719,922 | unchanged |
+| Own source, allocations | 15,256,707 | 15,464,958 | +1.37% |
+| Own source, instructions (median) | 13,676,411,636 | 13,889,211,044 | +1.56% |
+| Own source, peak heap (requested bytes) | 178,719,921 | 180,478,124 | +0.98% |
+| Lines, production and tests | | | +772 and +1,042 net |
+
+`semanticTokens/full` after one `didChange`, an `-O2` build, a fresh server
+per run, measured before review (its fixes leave the analysis and token
+paths unchanged):
+
+| Input | Tokens | Median | Range | Runs |
+| --- | ---: | ---: | ---: | ---: |
+| One module | 44 | 3.8 ms | 3.4–8.3 ms | 9 |
+| `blorp/src/main.brp` | 282 | 344 ms | 342–354 ms | 7 |
+| `common/syntax/lex.brp` | 5,816 | 23.8 ms | 23.4–24.1 ms | 5 |
+
+With `main.brp` open (open, tokens, change, tokens, exit), peak heap is
+86.2 MB, and the strict leak check reports nothing leaked.
+
+- **Ceiling.** A compiled spike measured +627 (`365086533`; `tokens.brp`
+  426), none of it padding; the coordinator set ≤ +780 from it.
+- **Identity.** The fixed-input C is identical (`2301c6be4f3782bc`).
+- **Design.**
+  - The server re-lexes the requested document, so compile cost is
+    untouched; a broken file needs the lexer anyway.
+  - A token's identity comes only from `NameUse` and the declaration
+    tables. Its type is the `Referent`'s case, with bindings split into
+    `parameter` and `variable` by their definition, and implementation
+    methods `method` through a new pure `function_role`. Modifiers are
+    `declaration`, `readonly`, `defaultLibrary` (the module's role, or a
+    built-in head) and `documentation` (`Comment.documentation`).
+  - `TOKEN_TYPES` orders the legend; the mapping tests decode each token
+    through the legend's names, so a type missing from it fails them.
+  - Each open root keeps its whole `Analysis`, which 9c reads.
+  - Staleness: `didChange`, `didClose` and a watched change stale every
+    root whose last analysis read the file, a failed load is stale on any
+    change, and a watched change to an open file stales nothing. A token
+    request on a stale document analyses first; the step that asks for the
+    analysis carries the request's id, and `analysed` answers exactly that
+    id. A burst of edits costs one analysis.
+  - `client/registerCapability` for `**/*.brp` goes out once after
+    `initialized`, only when the client supports dynamic registration; the
+    server numbers its requests and ignores the answer.
+  - 9a's follow-ups: on `didClose`, `[]` goes to the client's URI when it
+    differs from `file_uri(path)`, then what other roots report there is
+    republished under ours; closing stales the roots that read the closed
+    file's unsaved text.
+- **Tests.** `test_tokens.brp`, server tests built from real analyses,
+  line pieces, and an e2e session: a broken file's lexer tokens, an edit,
+  then full tokens and `[]`. Each of 30 mutations, and 7 more after review,
+  run alone, failed its test; two of the first 30 were rerun after a fix.
+- **Not coloured, by decision.** Import paths and an alias's declaration
+  have no `NameUse` (landing 5's decision g), so their names stay plain and
+  `..` and `/` there read as operators; the contextual words `fixed` and
+  `methods`; a trait requirement's parameters; and a pipe string's
+  continuation `|`.
+- **For the plugin.** An edit to A leaves an open importer B stale until the
+  editor next asks for B's tokens. If CLion does not re-ask for visible
+  files, the server can send `workspace/semanticTokens/refresh`.
+- **Found, not fixed (review nits, for 9c).**
+  - Each identifier's `Classified` still holds the analysis's span, which
+    the lexer's span replaces before sending; mapping each offset to its
+    type and modifiers would drop the field.
+  - The test meant for a trait default's body may resolve to a
+    `TraitMethodReferent`, leaving the `TraitDefaultBody` case unproven;
+    a mutation of it would tell.
+  - Closing a document while its token request waits answers `null`, as
+    `analysed` promises, but no test pins it.
 
 ## Testing
 

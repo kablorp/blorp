@@ -57,9 +57,10 @@ done.
     error type: `io/console/output` (`print`, `write`, `write_error`,
     `flush`), `io/console/read_line` and `io/console/read_exact`. Then 9a,
     the `blorp lsp` server core: the command, transport, lifecycle, UTF-8
-    and UTF-16 positions, open documents and diagnostics (`src/lsp/`).
-  - **Next:** 9b, semantic tokens with staleness and watched files; then
-    9c, definition and references; then the CLion plugin.
+    and UTF-16 positions, open documents and diagnostics (`src/lsp/`). Then
+    9b: semantic tokens, with staleness, analysis on demand and watched
+    files.
+  - **Next:** 9c, definition and references; then the CLion plugin.
 - **String code points:** [`STRING_PLAN.md`](STRING_PLAN.md).
   - **Status:** approved on 2026-11-10: `length` counts code points, from a
     count stored in each String, and byte work uses `byte_*` functions. L1

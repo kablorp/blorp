@@ -1,0 +1,449 @@
+---
+Semantic tokens: the legend `initialize` announces, each token of a document
+classified, and the protocol's relative encoding of them. The lexer says
+which tokens are keywords, comments, strings, numbers and operators; the
+analysis says what each identifier is, from what the name resolved to and the
+tables that declare it. Pure; the server holds the documents and analyses.
+---
+import:
+    bool: not
+    dict: Dict
+    json: Json(Text, Array, Object)
+    list: List methods
+    option: Option methods
+    ../common/analysis/check/check:
+        Analysis,
+        binding_definition,
+        declaration_span,
+        declarations,
+        function_role,
+        name_uses
+    ../common/analysis/check/model:
+        BindingOrigin(ParameterBinding, CallableParameterBinding, BodyLocal, MatchCapture)
+    ../common/analysis/check/name_uses:
+        Referent(
+            FunctionReferent,
+            TraitMethodReferent,
+            ConstantReferent,
+            TypeReferent,
+            TraitReferent,
+            FieldReferent,
+            VariantReferent,
+            TypeParameterReferent,
+            BindingReferent,
+            ModuleReferent
+        )
+    ../common/analysis/ids: FunctionRole(FreeFunctionBody, ImplementationBody, TraitDefaultBody)
+    ../common/analysis/namespace/namespace:
+        TypeHead(PrimitiveHead, ListHead, UnionHead, RecordHead, OpaqueHead)
+    ../common/syntax/lex: lex
+    ../common/syntax/names: program_names
+    ../common/syntax/source:
+        ModuleId,
+        ModuleKind(UserModule, LibraryModule, FoundationTypesModule, FoundationPreludeModule),
+        ModuleSource,
+        SourceInputs,
+        module_number,
+        module_source,
+        source_module
+    ../common/syntax/syntax:
+        Comment,
+        LexedProgram,
+        Span,
+        Symbol(
+            AtSign,
+            Equals,
+            EqualsEquals,
+            NotEquals,
+            Less,
+            Greater,
+            LessEquals,
+            GreaterEquals,
+            QuestionEquals,
+            Wildcard,
+            LeftParen,
+            RightParen,
+            LeftBracket,
+            RightBracket,
+            LeftBrace,
+            RightBrace,
+            Bar,
+            Dot,
+            Slash,
+            Star,
+            Plus,
+            Minus,
+            Percent,
+            Comma,
+            Arrow,
+            FatArrow,
+            Colon,
+            DotDot,
+            Ellipsis,
+            Newline,
+            Indent,
+            Dedent
+        ),
+        TokenKind
+    ./positions: LineIndex, Position, PositionEncoding, line_index, line_pieces
+
+
+-- The protocol's standard token types that the server uses.
+fixed union TokenType:
+    SemanticNamespace
+    SemanticType
+    SemanticInterface
+    SemanticEnumMember
+    SemanticTypeParameter
+    SemanticParameter
+    SemanticVariable
+    SemanticProperty
+    SemanticFunction
+    SemanticMethod
+    SemanticKeyword
+    SemanticComment
+    SemanticString
+    SemanticNumber
+    SemanticOperator
+
+
+-- The legend's token types. A token sends its type as its position here, so
+-- this list alone sets the order.
+private TOKEN_TYPES: List[TokenType] = [
+    SemanticNamespace,
+    SemanticType,
+    SemanticInterface,
+    SemanticEnumMember,
+    SemanticTypeParameter,
+    SemanticParameter,
+    SemanticVariable,
+    SemanticProperty,
+    SemanticFunction,
+    SemanticMethod,
+    SemanticKeyword,
+    SemanticComment,
+    SemanticString,
+    SemanticNumber,
+    SemanticOperator
+]
+
+
+private pure func type_name(token_type: TokenType) -> String:
+    match token_type:
+        SemanticNamespace: "namespace"
+        SemanticType: "type"
+        SemanticInterface: "interface"
+        SemanticEnumMember: "enumMember"
+        SemanticTypeParameter: "typeParameter"
+        SemanticParameter: "parameter"
+        SemanticVariable: "variable"
+        SemanticProperty: "property"
+        SemanticFunction: "function"
+        SemanticMethod: "method"
+        SemanticKeyword: "keyword"
+        SemanticComment: "comment"
+        SemanticString: "string"
+        SemanticNumber: "number"
+        SemanticOperator: "operator"
+
+
+-- The protocol's standard modifiers that the server uses.
+fixed record TokenModifiers {
+    -- The name declares what it names.
+    declaration: Bool,
+    -- An immutable binding or a constant.
+    readonly: Bool,
+    -- The standard library declares it, or the language builds it in.
+    default_library: Bool,
+    -- A `---` documentation block.
+    documentation: Bool
+}
+
+
+-- One classified token, before encoding: where it is and what it is.
+fixed record Classified {
+    span: Span,
+    token_type: TokenType,
+    modifiers: TokenModifiers
+}
+
+
+-- Each modifier's protocol name and whether `modifiers` has it, in legend
+-- order: the legend lists the names, and a token sets bit i when it has the
+-- i-th modifier.
+private pure func modifier_entries(modifiers: TokenModifiers) -> List[(String, Bool)]:
+    [
+        ("declaration", modifiers.declaration),
+        ("readonly", modifiers.readonly),
+        ("defaultLibrary", modifiers.default_library),
+        ("documentation", modifiers.documentation)
+    ]
+
+
+private pure func modifier_bits(modifiers: TokenModifiers) -> Int:
+    var bits = 0
+    var bit = 1
+    for (_, present) in modifiers.modifier_entries():
+        if present:
+            bits = bits + bit
+        bit = bit * 2
+    bits
+
+
+private pure func no_modifiers() -> TokenModifiers:
+    { declaration = False, readonly = False, default_library = False, documentation = False }
+
+
+-- What `initialize` announces: the token types and modifiers, in legend order.
+pure func token_legend() -> Json:
+    Object(
+        {
+            "tokenTypes" => Array(
+                TOKEN_TYPES.map(
+                    pure func(token_type: TokenType) -> Json: Text(token_type.type_name())
+                )
+            ),
+            "tokenModifiers" => Array(
+                no_modifiers()
+                    .modifier_entries()
+                    .map(pure func(entry: (String, Bool)) -> Json: Text(entry[0]))
+            )
+        }
+    )
+
+
+-- Whether a library file declares `referent`, read from the role the loader
+-- gave the declaring module. A built-in type such as `Int` is declared by no
+-- file: the language builds it in.
+private pure func library_declared(
+    analysis: Analysis,
+    sources: SourceInputs,
+    referent: Referent
+) -> Bool:
+    match referent:
+        TypeReferent(PrimitiveHead(_) | ListHead):
+            True
+        TypeReferent(UnionHead(_) | RecordHead(_) | OpaqueHead(_)) | FunctionReferent(_) | TraitMethodReferent(_) | ConstantReferent(_) | TraitReferent(_) | FieldReferent(_) | VariantReferent(_) | TypeParameterReferent(_) | BindingReferent(_) | ModuleReferent(_):
+            row: Option[ModuleSource] = match analysis.declaration_span(referent):
+                Some(span):
+                    match span.source.source_module():
+                        Some(module): sources.modules.get(module.module_number())
+                        None: None
+                None:
+                    None
+            match row.map(pure func(declaring: ModuleSource) -> ModuleKind: declaring.role):
+                Some(LibraryModule | FoundationTypesModule | FoundationPreludeModule): True
+                Some(UserModule) | None: False
+
+
+-- The identifier at `span`, which names `referent`, and declares it when
+-- `declaration` is set. A binding is a parameter or a variable by its origin.
+-- None for a binding no source declares, which no identifier can name, and
+-- for an id the analysis does not hold.
+private pure func classified_name(
+    analysis: Analysis,
+    sources: SourceInputs,
+    span: Span,
+    referent: Referent,
+    declaration: Bool
+) -> Option[Classified]:
+    -- Each case's type, and whether it is read-only.
+    named: Option[(TokenType, Bool)] = match referent:
+        -- An implementation's method is declared as a function and called as
+        -- its trait's method; both are coloured as methods.
+        FunctionReferent(id):
+            match analysis.function_role(id):
+                Some(FreeFunctionBody): Some((SemanticFunction, False))
+                Some(ImplementationBody(_) | TraitDefaultBody(_)): Some((SemanticMethod, False))
+                None: None
+        TraitMethodReferent(_):
+            Some((SemanticMethod, False))
+        ConstantReferent(_):
+            Some((SemanticVariable, True))
+        TypeReferent(_):
+            Some((SemanticType, False))
+        TraitReferent(_):
+            Some((SemanticInterface, False))
+        FieldReferent(_):
+            Some((SemanticProperty, False))
+        VariantReferent(_):
+            Some((SemanticEnumMember, False))
+        TypeParameterReferent(_):
+            Some((SemanticTypeParameter, False))
+        ModuleReferent(_):
+            Some((SemanticNamespace, False))
+        BindingReferent(id):
+            match analysis.binding_definition(id):
+                Some(binding):
+                    token_type: TokenType = match binding.origin:
+                        ParameterBinding(_) | CallableParameterBinding(_): SemanticParameter
+                        BodyLocal | MatchCapture: SemanticVariable
+                    Some((token_type, not(binding.mutable)))
+                None:
+                    None
+    match named:
+        Some((token_type, readonly)):
+            Some({
+                span = span,
+                token_type = token_type,
+                modifiers = {
+                    declaration = declaration,
+                    readonly = readonly,
+                    default_library = analysis.library_declared(sources, referent),
+                    documentation = False
+                }
+            })
+        None:
+            None
+
+
+-- The identifiers of `module` that the analysis resolved, by the byte offset
+-- each starts at: every name used there, and every declaration there, which
+-- wins over a use with the same span. Derived from the analysis's name uses
+-- and declaration tables, once per request.
+pure func analysed_identifiers(
+    analysis: Analysis,
+    sources: SourceInputs,
+    module: ModuleId
+) -> Dict[Int, Classified]:
+    source = module_source(module)
+    var identifiers: Dict[Int, Classified] = {}
+    for use in analysis.name_uses():
+        if use.span.source == source:
+            match analysis.classified_name(sources, use.span, use.referent, False):
+                Some(name): identifiers = identifiers.set(use.span.start, name)
+                None: void
+    for referent in analysis.declarations():
+        match analysis.declaration_span(referent):
+            Some(span):
+                if span.source == source:
+                    match analysis.classified_name(sources, span, referent, True):
+                        Some(name): identifiers = identifiers.set(span.start, name)
+                        None: void
+            None:
+                void
+    identifiers
+
+
+-- The type the lexer alone gives a token. Punctuation and layout get none,
+-- and neither does an identifier: what a name is, only the analysis knows.
+-- The `${` and `}` around an interpolated value are punctuation.
+private pure func lexical_type(kind: TokenKind) -> Option[TokenType]:
+    match kind:
+        TokenKind.IdentifierToken(_, _) | TokenKind.InterpolationOpen | TokenKind.InterpolationClose:
+            None
+        TokenKind.KeywordToken(_):
+            Some(SemanticKeyword)
+        TokenKind.SymbolToken(symbol):
+            match symbol:
+                Equals | EqualsEquals | NotEquals | Less | Greater | LessEquals | GreaterEquals | QuestionEquals | Bar | Slash | Star | Plus | Minus | Percent | Arrow | FatArrow | DotDot | Ellipsis:
+                    Some(SemanticOperator)
+                AtSign | Wildcard | LeftParen | RightParen | LeftBracket | RightBracket | LeftBrace | RightBrace | Dot | Comma | Colon | Newline | Indent | Dedent:
+                    None
+        TokenKind.IntegerLiteral(_) | TokenKind.FloatLiteral(_):
+            Some(SemanticNumber)
+        TokenKind.QuotedString(_) | TokenKind.PipeString(_) | TokenKind.StringStart(_) | TokenKind.StringSegment(_) | TokenKind.StringEnd | TokenKind.CharLiteral:
+            Some(SemanticString)
+
+
+-- A comment, marked as documentation when it is a `---` block.
+private pure func comment_token(comment: Comment) -> Classified:
+    {
+        span = comment.span,
+        token_type = SemanticComment,
+        modifiers = { no_modifiers() | documentation = comment.documentation }
+    }
+
+
+-- Every token of a lexed text in source order, comments among them. An
+-- identifier takes its type and modifiers from `identifiers`, and has none when
+-- the analysis resolved no name there; its span is the lexer's, so every token
+-- sent is one the lexer read.
+private pure func classified_tokens(
+    lexed: LexedProgram,
+    identifiers: Dict[Int, Classified]
+) -> List[Classified]:
+    var tokens: List[Classified] = []
+    var next_comment = 0
+    for token in lexed.tokens:
+        while True:
+            match lexed.comments.get(next_comment):
+                Some(comment):
+                    if comment.span.start < token.span.start:
+                        tokens = tokens.append(comment.comment_token())
+                        next_comment = next_comment + 1
+                    else:
+                        break
+                None:
+                    break
+        classified: Option[Classified] = match token.kind:
+            TokenKind.IdentifierToken(_, _):
+                identifiers
+                    .get(token.span.start)
+                    .map(pure func(name: Classified) -> Classified: { name | span = token.span })
+            _:
+                token.kind
+                    .lexical_type()
+                    .map(
+                        pure func(token_type: TokenType) -> Classified: {
+                            span = token.span,
+                            token_type = token_type,
+                            modifiers = no_modifiers()
+                        }
+                    )
+        match classified:
+            Some(present): tokens = tokens.append(present)
+            None: void
+    for comment in lexed.comments.drop(next_comment):
+        tokens = tokens.append(comment.comment_token())
+    tokens
+
+
+-- The protocol's relative encoding: for each token, its line delta, start
+-- delta, length, type index and modifier bits, five integers counted in the
+-- agreed encoding. A token that crosses lines is sent once per line.
+private pure func encoded(
+    index: LineIndex,
+    encoding: PositionEncoding,
+    tokens: List[Classified]
+) -> List[Int]:
+    var data: List[Int] = []
+    var previous: Position = { line = 0, character = 0 }
+    for token in tokens:
+        -- TOKEN_TYPES lists every type. Were one missing, its tokens would go
+        -- uncoloured rather than show as another type, and the tests, which
+        -- decode tokens through the legend's names, would fail.
+        match TOKEN_TYPES.index_of(token.token_type):
+            Some(type_index):
+                bits = token.modifiers.modifier_bits()
+                for piece in index.line_pieces(token.span.start, token.span.end, encoding):
+                    line_delta = piece.start.line - previous.line
+                    start_delta = if line_delta == 0:
+                        piece.start.character - previous.character
+                    else:
+                        piece.start.character
+                    data = data
+                        .append(line_delta)
+                        .append(start_delta)
+                        .append(piece.length)
+                        .append(type_index)
+                        .append(bits)
+                    previous = piece.start
+            None:
+                void
+    data
+
+
+-- The encoded tokens of an open document's text. A text that does not lex
+-- gives the tokens before its first error. The document is `module` of the
+-- analysis that `identifiers` came from.
+pure func semantic_tokens(
+    text: String,
+    module: ModuleId,
+    identifiers: Dict[Int, Classified],
+    encoding: PositionEncoding
+) -> List[Int]:
+    lexed: LexedProgram = match lex(module_source(module), text, program_names().names):
+        Ok(program): program
+        Err(failure): failure.prefix
+    line_index(text).encoded(encoding, lexed.classified_tokens(identifiers))

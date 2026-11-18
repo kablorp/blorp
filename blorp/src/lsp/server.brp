@@ -1,7 +1,8 @@
 ---
 The language server's state and its one step per message: the lifecycle, the
-open documents, what each root's last analysis published, and the
-replies each message earns. Pure: the transport reads, analyses and writes.
+open documents, each root's last analysis and what it published, which roots a
+change stales, and the replies each message earns, token requests among them.
+Pure: the transport reads, analyses and writes.
 ---
 import:
     bool: not
@@ -12,7 +13,7 @@ import:
     option: Option methods
     path: Path, to_path
     string: String methods
-    ../common/analysis/check/check: analyze
+    ../common/analysis/check/check: Analysis, analyze
     ../common/analysis/check/render: render_failure
     ../common/analysis/load/load:
         LoadedProgram,
@@ -42,15 +43,17 @@ import:
         Call,
         ClientMessage(Request, Notification, ClientResponse, InvalidMessage),
         ErrorCode(ParseError, InvalidRequest, MethodNotFound, ServerNotInitialized),
-        RequestId,
+        RequestId(NumberId),
         client_message,
         error_response,
         field,
         file_uri,
         notification,
+        request,
         response,
         text_field,
         uri_path
+    ./tokens: Classified, analysed_identifiers, semantic_tokens, token_legend
 
 
 -- How far loading and analysing one root got.
@@ -60,7 +63,7 @@ union AnalysisOutcome:
     -- The program loaded, and checking rejected it.
     CheckFailed(Diagnostics)
     -- The program loaded and checked.
-    Analysed
+    Analysed(Analysis)
 
 
 -- What the transport hands back after it loads and analyses one root: the
@@ -78,7 +81,7 @@ pure func document_analysis(loaded: Result[LoadedProgram, SourceLoadFailure]) ->
     match loaded:
         Ok(program):
             outcome: AnalysisOutcome = match analyze(program.program):
-                Ok(_): Analysed
+                Ok(analysis): Analysed(analysis)
                 Err(failure): CheckFailed(render_failure(failure))
             { sources = program.sources, outcome = outcome }
         Err(LoadingFailed(failure)):
@@ -95,10 +98,20 @@ pure func document_analysis(loaded: Result[LoadedProgram, SourceLoadFailure]) ->
             }
 
 
--- What a root's last analysis published: the diagnostics of each user file it
--- reports in, so that when it stops reporting in a file another root's can be
--- shown there again.
+-- Whether a root's last analysis still holds.
+private union RootAnalysis:
+    -- No file it read has changed since, so requests are answered from it.
+    Current(DocumentAnalysis)
+    -- A file it read has changed, or its load failed and some file has. The
+    -- root's next request analyses it again.
+    Stale
+
+
+-- A root's last analysis, and what it published: the diagnostics of each user
+-- file it reports in, so that when it stops reporting in a file another root's
+-- can be shown there again.
 private record AnalysedRoot {
+    analysis: RootAnalysis,
     published: Dict[Path, List[Json]]
 }
 
@@ -117,10 +130,18 @@ private record Session {
     -- the root of its own program (the v1 limitation), and every analysis
     -- reads these texts instead of the disk.
     documents: Dict[Path, OpenDocument],
-    -- What each root's last analysis published, in the order the roots were
-    -- last analysed, so that a file several roots report in shows the latest
-    -- analysis's diagnostics. A root not yet analysed has no row.
-    roots: Dict[Path, AnalysedRoot]
+    -- Each root's last analysis, current or stale, and what it published, in
+    -- the order the roots were last analysed, so that a file several roots
+    -- report in shows the latest analysis's diagnostics. Token requests are
+    -- answered from a current analysis. A root not yet analysed has no row.
+    roots: Dict[Path, AnalysedRoot],
+    -- Whether the server is still to register for changed files: the client
+    -- can report them, and `initialized`, after which the server may ask, has
+    -- not come yet.
+    registers_watchers: Bool,
+    -- How many requests the server has sent; each takes the next number as
+    -- its id.
+    requests_sent: Int
 }
 
 
@@ -138,12 +159,19 @@ private union Lifecycle:
 opaque type Server = Lifecycle
 
 
+-- An analysis for the transport to run and hand back to `analysed`: the root
+-- to load and analyse, and the token request that waits for it, if any.
+-- `didOpen` asks for its own document and answers nothing.
+record AnalysisRequest {
+    root: Path,
+    answering: Option[RequestId]
+}
+
+
 record Step {
     server: Server,
     replies: List[Json],
-    -- The open document to analyse before the pending request can be
-    -- answered; `didOpen` asks for its own document.
-    analyse: Option[Path]
+    analyse: Option[AnalysisRequest]
 }
 
 
@@ -224,9 +252,14 @@ pure func receive(server: Server, message: Json) -> Step:
         (AwaitingInitialize, Request(id, call)):
             if call.method == "initialize":
                 encoding = call.params.agreed_encoding()
-                replying(Serving({ encoding = encoding, documents = {}, roots = {} }), [
-                    response(id, initialize_result(encoding))
-                ])
+                session: Session = {
+                    encoding = encoding,
+                    documents = {},
+                    roots = {},
+                    registers_watchers = call.params.watches_files(),
+                    requests_sent = 0
+                }
+                replying(Serving(session), [response(id, initialize_result(encoding))])
             else:
                 lifecycle.replying([
                     error_response(
@@ -239,10 +272,12 @@ pure func receive(server: Server, message: Json) -> Step:
             lifecycle.replying([
                 error_response(Some(id), InvalidRequest, "the server has shut down")
             ])
-        (Serving(_), Request(id, call)):
+        (Serving(session), Request(id, call)):
             match call.method:
                 "shutdown":
                     replying(ShutDown, [response(id, Null)])
+                "textDocument/semanticTokens/full":
+                    session.tokens_requested(id, call.params)
                 "initialize":
                     lifecycle.replying([
                         error_response(
@@ -293,7 +328,22 @@ private pure func agreed_encoding(params: Option[Json]) -> PositionEncoding:
             Utf16
 
 
--- What the server serves: the encoding chosen, and the whole text on every change.
+-- Whether the client can tell the server of changed files that the server
+-- registers for after `initialized`.
+private pure func watches_files(params: Option[Json]) -> Bool:
+    match (
+        params
+            .field("capabilities")
+            .field("workspace")
+            .field("didChangeWatchedFiles")
+            .field("dynamicRegistration")
+    ):
+        Some(Boolean(True)): True
+        _: False
+
+
+-- What the server serves: the encoding chosen, the whole text on every
+-- change, and every token of a document at once.
 private pure func initialize_result(encoding: PositionEncoding) -> Json:
     Object(
         {
@@ -302,6 +352,9 @@ private pure func initialize_result(encoding: PositionEncoding) -> Json:
                     "positionEncoding" => Text(encoding.encoding_name()),
                     "textDocumentSync" => Object(
                         { "openClose" => Boolean(True), "change" => Number(integer(FULL_SYNC)) }
+                    ),
+                    "semanticTokensProvider" => Object(
+                        { "legend" => token_legend(), "full" => Boolean(True) }
                     )
                 }
             )
@@ -309,10 +362,92 @@ private pure func initialize_result(encoding: PositionEncoding) -> Json:
     )
 
 
+-- Whether a change to `path` can change what `result` found: its analysis read
+-- the file, or its load failed, and a file it could not find may now exist.
+private pure func depends_on(result: DocumentAnalysis, path: Path) -> Bool:
+    match result.outcome:
+        LoadFailed(_):
+            True
+        CheckFailed(_) | Analysed(_):
+            result.sources.modules.any(pure func(row: ModuleSource) -> Bool:
+                match row.path.to_path():
+                    Ok(read): read == path
+                    Err(_): False
+            )
+
+
+-- Every root whose analysis a change to `path` affects, marked stale. A stale
+-- root keeps what it published until its next request analyses it again, so a
+-- burst of edits costs one analysis.
+private pure func staled(roots: Dict[Path, AnalysedRoot], path: Path) -> Dict[Path, AnalysedRoot]:
+    var marked = roots
+    for (root, row) in roots.entries():
+        match row.analysis:
+            Current(result):
+                if result.depends_on(path):
+                    marked = marked.set(root, { row | analysis = Stale })
+            Stale:
+                void
+    marked
+
+
+-- The `semanticTokens/full` result for the open document `path`, from its
+-- root's current analysis. While the root fails to analyse, only the lexer's
+-- tokens are sent. `null` for a document that is not open.
+private pure func document_tokens(session: Session, path: Path, result: DocumentAnalysis) -> Json:
+    match session.documents.get(path):
+        None:
+            Null
+        Some(open):
+            identifiers: Dict[Int, Classified] = match result.outcome:
+                Analysed(analysis): analysis.analysed_identifiers(result.sources, root_module_id())
+                LoadFailed(_) | CheckFailed(_): {}
+            data = open.text.semantic_tokens(root_module_id(), identifiers, session.encoding)
+            Object(
+                {
+                    "data" => Array(
+                        data.map(pure func(value: Int) -> Json: Number(integer(value)))
+                    )
+                }
+            )
+
+
+-- Answers from the root's current analysis. A stale root, or one not yet
+-- analysed, is analysed first, and `analysed` answers.
+private pure func tokens_requested(session: Session, id: RequestId, params: Option[Json]) -> Step:
+    document: Option[Path] = params
+        .field("textDocument")
+        .text_field("uri")
+        .map(uri_path)
+        .get_or(None)
+    match document:
+        Some(path):
+            match (
+                session.roots
+                    .get(path)
+                    .map(pure func(row: AnalysedRoot) -> RootAnalysis: row.analysis)
+            ):
+                Some(Current(result)):
+                    replying(Serving(session), [
+                        response(id, session.document_tokens(path, result))
+                    ])
+                Some(Stale) | None:
+                    if session.documents.contains(path):
+                        {
+                            server = into_opaque Server(Serving(session)),
+                            replies = [],
+                            analyse = Some({ root = path, answering = Some(id) })
+                        }
+                    else:
+                        replying(Serving(session), [response(id, Null)])
+        None:
+            replying(Serving(session), [response(id, Null)])
+
+
 -- Notifications the server does not serve, `$/cancelRequest` among them, are
 -- dropped, as are those about documents that are not `file://` URIs or are
--- not open. Only `didOpen` analyses; a change or a close only keeps the
--- documents current for the next analysis.
+-- not open. Only `didOpen` analyses; a change, a close or a change on disk
+-- stales the roots it affects, which analyse again at their next request.
 private pure func notified(session: Session, call: Call) -> Step:
     document = call.params.field("textDocument")
     uri = document.text_field("uri")
@@ -324,15 +459,24 @@ private pure func notified(session: Session, call: Call) -> Step:
     ):
         ("exit", _):
             replying(Exited(EXIT_ABANDONED), [])
+        ("initialized", _):
+            session.registered()
+        ("workspace/didChangeWatchedFiles", _):
+            session.watched(call.params)
         ("textDocument/didOpen", Some(path)):
             match (uri, document.text_field("text")):
                 (Some(written), Some(text)):
                     opened: Lifecycle = Serving(
                         { session |
-                            documents = session.documents.set(path, { uri = written, text = text })
+                            documents = session.documents.set(path, { uri = written, text = text }),
+                            roots = session.roots.staled(path)
                         }
                     )
-                    { server = into_opaque Server(opened), replies = [], analyse = Some(path) }
+                    {
+                        server = into_opaque Server(opened),
+                        replies = [],
+                        analyse = Some({ root = path, answering = None })
+                    }
                 _:
                     replying(Serving(session), [])
         ("textDocument/didChange", Some(path)):
@@ -349,7 +493,8 @@ private pure func notified(session: Session, call: Call) -> Step:
                     replying(
                         Serving(
                             { session |
-                                documents = session.documents.set(path, { open | text = text })
+                                documents = session.documents.set(path, { open | text = text }),
+                                roots = session.roots.staled(path)
                             }
                         ),
                         []
@@ -362,6 +507,69 @@ private pure func notified(session: Session, call: Call) -> Step:
             replying(Serving(session), [])
 
 
+-- The files the server watches: every Blorp source, wherever it is.
+private WATCHED_FILES: String = "**/*.brp"
+
+-- The name the registration goes by, which could unregister it.
+private WATCHER_REGISTRATION: String = "blorp-source-files"
+
+
+-- Asks the client, once, to send a notification when a Blorp file changes on
+-- disk, if it can.
+private pure func registered(session: Session) -> Step:
+    if session.registers_watchers:
+        watchers: Json = Object(
+            { "watchers" => Array([Object({ "globPattern" => Text(WATCHED_FILES) })]) }
+        )
+        registration: Json = Object(
+            {
+                "id" => Text(WATCHER_REGISTRATION),
+                "method" => Text("workspace/didChangeWatchedFiles"),
+                "registerOptions" => watchers
+            }
+        )
+        id = session.requests_sent + 1
+        replying(Serving({ session | registers_watchers = False, requests_sent = id }), [
+            request(
+                NumberId(id),
+                "client/registerCapability",
+                Object({ "registrations" => Array([registration]) })
+            )
+        ])
+    else:
+        replying(Serving(session), [])
+
+
+-- Files changed on disk. An open file's text is the editor's, so a change to
+-- it on disk changes no analysis; any other file stales the roots it affects.
+private pure func watched(session: Session, params: Option[Json]) -> Step:
+    var roots = session.roots
+    match params.field("changes"):
+        Some(Array(changes)):
+            for change in changes:
+                match (
+                    Some(change)
+                        .text_field("uri")
+                        .map(uri_path)
+                        .get_or(None)
+                ):
+                    Some(path):
+                        if not(session.documents.contains(path)):
+                            roots = roots.staled(path)
+                    None:
+                        void
+        _:
+            void
+    replying(Serving({ session | roots = roots }), [])
+
+
+private pure func diagnostics_notification(uri: String, diagnostics: List[Json]) -> Json:
+    notification(
+        "textDocument/publishDiagnostics",
+        Object({ "uri" => Text(uri), "diagnostics" => Array(diagnostics) })
+    )
+
+
 -- The diagnostics of one file, to the client's own URI when the file is open
 -- and to the server's encoding of its path otherwise.
 private pure func published_diagnostics(
@@ -372,10 +580,7 @@ private pure func published_diagnostics(
     uri = match session.documents.get(path):
         Some(open): open.uri
         None: path.file_uri()
-    notification(
-        "textDocument/publishDiagnostics",
-        Object({ "uri" => Text(uri), "diagnostics" => Array(diagnostics) })
-    )
+    diagnostics_notification(uri, diagnostics)
 
 
 -- What to publish to each of `files` once the root `leaving` no longer reports
@@ -394,49 +599,77 @@ private pure func handed_over(session: Session, leaving: Path, files: List[Path]
     replies
 
 
--- The file reverts to the disk and stops being a root. Each file it reported
--- in shows what another root reports there, if any does.
+-- The file reverts to the disk and stops being a root, and every root that
+-- read its unsaved text is stale. Each file it reported in shows what another
+-- root reports there, if any does. The server forgets the client's URI for the
+-- file and publishes to it under its own from now on, so when the two differ
+-- the client's is cleared, and what other roots report in the file is
+-- published again under the server's.
 private pure func closed(session: Session, path: Path) -> Step:
     reported: List[Path] = match session.roots.get(path):
         Some(last): last.published.keys()
         None: []
-    replying(
-        Serving(
-            { session |
-                documents = session.documents.remove(path),
-                roots = session.roots.remove(path)
-            }
-        ),
-        session.handed_over(path, reported)
-    )
+    remaining = { session |
+        documents = session.documents.remove(path),
+        roots = session.roots
+            .remove(path)
+            .staled(path)
+    }
+    respelled: Option[String] = match session.documents.get(path):
+        Some(open):
+            if open.uri != path.file_uri():
+                Some(open.uri)
+            else:
+                None
+        None:
+            None
+    match respelled:
+        Some(uri):
+            files = if reported.contains(path):
+                reported
+            else:
+                reported.append(path)
+            replying(
+                Serving(remaining),
+                [diagnostics_notification(uri, [])].concat(remaining.handed_over(path, files))
+            )
+        None:
+            replying(Serving(remaining), remaining.handed_over(path, reported))
 
 
--- Publishes the analysis of `root`. A document that was closed before its
--- analysis came back is no longer a root, and the result is dropped.
-pure func analysed(server: Server, root: Path, result: DocumentAnalysis) -> Step:
+-- Publishes the analysis of the requested root, then answers the token
+-- request that waited for it, if any. A document that was closed before its
+-- analysis came back is no longer a root: the result is dropped, and the
+-- request gets `null`.
+pure func analysed(server: Server, asked: AnalysisRequest, result: DocumentAnalysis) -> Step:
     lifecycle = from_opaque Server(server)
+    root = asked.root
     match lifecycle:
         Serving(session):
+            var current = session
+            var replies: List[Json] = []
             if session.documents.contains(root):
                 published = result.publications(session.encoding, root)
                 previous: List[Path] = match session.roots.get(root):
                     Some(last): last.published.keys()
                     None: []
-                var replies: List[Json] = []
                 for (path, diagnostics) in published.entries():
                     replies = replies.append(session.published_diagnostics(path, diagnostics))
                 stopped = previous.filter(pure func(path: Path): not(published.contains(path)))
+                replies = replies.concat(session.handed_over(root, stopped))
                 -- Removing the row first moves the root to the end, so the
                 -- rows stay in analysis order.
-                roots = session.roots
-                    .remove(root)
-                    .set(root, { published = published })
-                replying(
-                    Serving({ session | roots = roots }),
-                    replies.concat(session.handed_over(root, stopped))
-                )
-            else:
-                lifecycle.replying([])
+                current = { session |
+                    roots = session.roots
+                        .remove(root)
+                        .set(root, { analysis = Current(result), published = published })
+                }
+            match asked.answering:
+                Some(id):
+                    replies = replies.append(response(id, current.document_tokens(root, result)))
+                None:
+                    void
+            replying(Serving(current), replies)
         AwaitingInitialize | ShutDown | Exited(_):
             lifecycle.replying([])
 
@@ -462,7 +695,7 @@ private pure func publications(
     errors: List[Diagnostic] = match result.outcome:
         LoadFailed(error): [error]
         CheckFailed(rejected): [rejected.first].concat(rejected.remaining)
-        Analysed: []
+        Analysed(_): []
     root_text: String = match result.sources.modules.get(root_module_id().module_number()):
         Some(row): row.contents
         None: ""

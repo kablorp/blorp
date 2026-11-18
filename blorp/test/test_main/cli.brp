@@ -690,7 +690,7 @@ private pure func framed(body: String) -> String:
 private LSP_INITIALIZE: String = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"capabilities\":{\"general\":{\"positionEncodings\":[\"utf-8\"]}}}}"
 
 
-private LSP_INITIALIZED_REPLY: String = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"capabilities\":{\"positionEncoding\":\"utf-8\",\"textDocumentSync\":{\"openClose\":true,\"change\":1}}}}"
+private LSP_INITIALIZED_REPLY: String = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"capabilities\":{\"positionEncoding\":\"utf-8\",\"textDocumentSync\":{\"openClose\":true,\"change\":1},\"semanticTokensProvider\":{\"legend\":{\"tokenTypes\":[\"namespace\",\"type\",\"interface\",\"enumMember\",\"typeParameter\",\"parameter\",\"variable\",\"property\",\"function\",\"method\",\"keyword\",\"comment\",\"string\",\"number\",\"operator\"],\"tokenModifiers\":[\"declaration\",\"readonly\",\"defaultLibrary\",\"documentation\"]},\"full\":true}}}}"
 
 
 private LSP_EXIT: String = "{\"jsonrpc\":\"2.0\",\"method\":\"exit\"}"
@@ -747,6 +747,57 @@ private func lsp_serves_a_session_from_initialize_to_exit(
             .map(framed)
             .join(""),
         "${work_directory}/cli_lsp_session",
+        0
+    )
+    expect_output(
+        output,
+        expected
+            .map(framed)
+            .join(""),
+        ""
+    )
+
+
+-- The editor opens a file whose constant is not an Int and asks for its
+-- tokens: only the lexer's `=` and `1.5`. It fixes the constant and asks again;
+-- the edit is analysed then, which clears the diagnostic, and the answer
+-- colours `ONE` as a read-only variable's declaration and `Int` as a library
+-- type.
+private func lsp_refreshes_tokens_and_diagnostics_after_an_edit(
+    compiler: String,
+    work_directory: String
+) -> Result[Void, String]:
+    uri = "file:///work/one.brp"
+    document = "{\"uri\":\"${uri}\",\"languageId\":\"blorp\",\"version\":1,\"text\":\"ONE: Int = 1.5\"}"
+    tokens = pure func(id: Int) -> String:
+        "{\"jsonrpc\":\"2.0\",\"id\":${id},\"method\":\"textDocument/semanticTokens/full\",\"params\":{\"textDocument\":{\"uri\":\"${uri}\"}}}"
+    published = pure func(diagnostics: String) -> String:
+        "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/publishDiagnostics\",\"params\":{\"uri\":\"${uri}\",\"diagnostics\":[${diagnostics}]}}"
+    input = [
+        LSP_INITIALIZE,
+        "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":{\"textDocument\":${document}}}",
+        tokens(2),
+        "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didChange\",\"params\":{\"textDocument\":{\"uri\":\"${uri}\",\"version\":2},\"contentChanges\":[{\"text\":\"ONE: Int = 1\"}]}}",
+        tokens(3),
+        "{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"shutdown\"}",
+        LSP_EXIT
+    ]
+    expected = [
+        LSP_INITIALIZED_REPLY,
+        published(
+            "{\"range\":{\"start\":{\"line\":0,\"character\":11},\"end\":{\"line\":0,\"character\":14}},\"severity\":1,\"message\":\"expression does not match the expected type\\nhelp: use an expression of type Int here\"}"
+        ),
+        "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"data\":[0,9,1,14,0,0,2,3,13,0]}}",
+        published(""),
+        "{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"data\":[0,0,3,6,3,0,5,3,1,4,0,4,1,14,0,0,2,1,13,0]}}",
+        "{\"jsonrpc\":\"2.0\",\"id\":4,\"result\":null}"
+    ]
+    output ?= lsp_session(
+        compiler,
+        input
+            .map(framed)
+            .join(""),
+        "${work_directory}/cli_lsp_tokens",
         0
     )
     expect_output(
@@ -1096,6 +1147,16 @@ func suite(compiler: String, work_directory: String) -> TestSuite:
                 func(): reported(
                     lsp_serves_a_session_from_initialize_to_exit(compiler, work_directory)
                 )
+            ),
+            (
+                "lsp refreshes tokens and diagnostics after an edit",
+                func():
+                    reported(
+                        lsp_refreshes_tokens_and_diagnostics_after_an_edit(
+                            compiler,
+                            work_directory
+                        )
+                    )
             ),
             (
                 "lsp exits 1 on exit without shutdown",

@@ -1371,16 +1371,40 @@ end a line. The editor sends each open file's whole text with every change.
 Each open file is the root of its own program: the file, the modules it
 imports and the standard library built into blorp. A file is analysed when it
 is opened, with the other open files' unsaved text in place of their saved
-text. Edits are not analysed as they are typed: a changed file is analysed
-again only when it is opened again. A file that several open programs report
-in shows the diagnostics of the one analysed last; when that program stops
-reporting there, or its file is closed, the file shows what the others last
-reported. An error inside the standard library is shown at the start of the
-open file, with its library location. Modules that import the open file are
-not part of its program, so their errors show only when they are opened
-themselves.
+text. Edits are not analysed as they are typed. Editing, opening or closing a
+file makes every program that read it stale, and a stale program is analysed
+again at its file's next request, so a burst of edits costs one analysis.
+When the editor can report files changed on disk, the server asks it to for
+`**/*.brp`; such a change stales the programs that read the file, unless the
+file is open, since its open text wins. A program that failed to load is
+stale after any change, since a missing module may now exist. Every analysis
+publishes its diagnostics again, so an edit's errors refresh at the next
+request, which editors make as they colour the file. A file that several open
+programs report in shows the diagnostics of the one analysed last; when that
+program stops reporting there, or its file is closed, the file shows what the
+others last reported. An error inside the standard library is shown at the
+start of the open file, with its library location. Modules that import the
+open file are not part of its program, so their errors show only when they are
+opened themselves.
 The server ends with status 0 after `shutdown` then `exit`, and 1 for an
 `exit` without `shutdown` or input that ends without `exit`.
+
+The server colours a file through `textDocument/semanticTokens/full`, with
+only the protocol's standard token types and modifiers. Keywords, comments,
+strings, numbers and operators are coloured by the lexer. A name is coloured
+by what it resolved to: a `function`; a `method`, of a trait or an
+implementation; a `type`; a trait, as an `interface`; a field, as a
+`property`; a variant, as an `enumMember`; a `typeParameter`; a `parameter`;
+a local or a constant, as a `variable`; or a module alias, as a `namespace`.
+A declaration has the modifier `declaration`, an immutable binding or a
+constant `readonly`, anything the standard library declares or the language
+builds in `defaultLibrary`, and a `---` block `documentation`. A string with
+values in it is coloured in pieces around each `${…}`, and a token that spans
+lines is sent once per line. While a file's program fails to load or check,
+the file gets only the lexer's tokens; a file that does not lex gets those
+before its first error. The names in an import path (its `..` and `/` are
+operators), a module alias where it is declared, the words `fixed` and
+`methods`, and a trait requirement's parameters are not coloured.
 
 ## Compiler architecture
 
@@ -1430,12 +1454,14 @@ prints its tree, taking comments, blank lines and literal spellings from the
 source between tokens. It imports only `common/syntax/`, `common/cli/` and `common/utils/`.
 
 [`src/lsp`](src/lsp/server.brp) is not a phase either. `protocol.brp` frames
-messages and converts JSON-RPC to and from `Json`, and `positions.brp` converts
-byte offsets to and from protocol positions. `server.brp` is pure: it keeps the
-open documents and answers one message at a time, and when a document needs
-analysing it asks the transport, `lsp_command.brp`, which loads that root with
-the open documents as snapshots, runs `analyze` and hands the files read and
-the diagnostics back as data.
+messages and converts JSON-RPC to and from `Json`, `positions.brp` converts
+byte offsets to and from protocol positions, and `tokens.brp` classifies and
+encodes semantic tokens: it lexes the open text again and takes each name's
+type from the analysis's name uses and declarations. `server.brp` is pure: it
+keeps the open documents and answers one message at a time, and when a
+document needs analysing it asks the transport, `lsp_command.brp`, which loads
+that root with the open documents as snapshots, runs `analyze` and hands the
+files read and the analysis or its diagnostics back as data.
 
 The output is replaced atomically, as by
 [`write_text`](standard_library/README.md#the-file-modules): a symlinked output
