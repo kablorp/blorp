@@ -19,6 +19,8 @@ import:
         Visibility(Public, Private),
         Span,
         compiler_span,
+        TUPLE_MINIMUM_ELEMENTS,
+        TUPLE_MAXIMUM_ELEMENTS,
     ../assemble: ParsedContents
     ../ids:
         DeclarationInventory,
@@ -96,6 +98,7 @@ import:
         NominalId(AggregateNominal, OpaqueNominal),
         EqualityMember(EqualityField, EqualityPayload, EqualityRepresentation),
         EqualityOwner(AggregateEquality, OpaqueEquality),
+        ImplementationHead(NamedHead, TupleHead),
         equality_head,
         equality_parameter_owner,
         CheckedOpaque,
@@ -117,7 +120,13 @@ import:
         AcceptedTraitMethod,
         AcceptedImplementation,
         ImplementedMethod,
-        ImplementedBody(AuthoredMethod, TraitDefault, StructuralEquality, RepresentationBody),
+        ImplementedBody(
+            AuthoredMethod,
+            TraitDefault,
+            StructuralEquality,
+            RepresentationBody,
+            TupleEquality,
+        ),
         TypeParameterId,
         LocatedTrait,
         TraitRequirement,
@@ -125,7 +134,7 @@ import:
         ImplementationHeader,
         FunctionSignature,
         TypeUse,
-        TypeRef(ParameterType, VoidType, NominalType, StringType),
+        TypeRef(ParameterType, VoidType, NominalType, StringType, TupleType),
         TypeParameterOwner(TraitDeclaration),
         type_parameter_id,
         direct_supertraits,
@@ -670,7 +679,9 @@ private pure func accept_implementation(
         Err(trait_error(row.header.span, OrphanImplementation(owner, header.receiver_head)))
     var failure: Option[CheckError] = None
     for existing in previous:
-        if (existing.trait_id == owner).and(existing.receiver_head == header.receiver_head):
+        if (existing.trait_id == owner).and(
+            existing.receiver_head == NamedHead(header.receiver_head),
+        ):
             failure = Some(
                 trait_error(
                     row.header.span,
@@ -783,7 +794,7 @@ private pure func accept_implementation(
         None:
             Ok({
                 trait_id = owner,
-                receiver_head = header.receiver_head,
+                receiver_head = NamedHead(header.receiver_head),
                 parameter_bounds = header.parameter_bounds,
                 methods = members,
                 method_provider = Some(row.header.module),
@@ -1203,10 +1214,7 @@ private pure func prove_family(
     span: Span,
 ) -> Result[Void, CheckError]:
     traits = availability.accepted_traits()
-    head: TypeHead ?= match receiver.type_head():
-        Some(present): Ok(present)
-        None: Err(trait_error(span, MissingTraitBound(required, receiver)))
-    family = traits.family_for(required, head)
+    family = traits.family_for_receiver(required, receiver)
     selected: Result[AcceptedImplementation, CheckError] = match family:
         Some(implementation):
             Ok(implementation)
@@ -1417,56 +1425,73 @@ private pure func summarize_family(
 ) -> Result[EqualitySummary, CheckError]:
     var result = summary
     var invalid: Option[CheckError] = None
-    match receiver.type_head():
+    arguments = receiver.receiver_arguments()
+    canonical: Bool = match traits.canonical.equality:
+        Some(contract): contract.canonical_owner() == required
+        None: False
+    -- A tuple's row is added with the derived ones, after this round, so its
+    -- condition is read from the same bounds that row will carry.
+    declared: Option[List[List[LocatedTrait]]] = match traits.family_for_receiver(
+        required,
+        receiver,
+    ):
+        Some(family):
+            Some(family.parameter_bounds)
         None:
-            result = { result |
-                failure = Some({
-                    owner = owner,
-                    member = member,
-                    required_trait = required,
-                    receiver = receiver,
-                }),
-            }
-        Some(head):
-            arguments = receiver.receiver_arguments()
-            match traits.family_for(required, head):
-                Some(family):
-                    var position = 0
-                    for bounds in family.parameter_bounds:
-                        match arguments.get(position):
-                            Some(argument):
-                                for bound in bounds:
-                                    match traits.summarize_goal(
-                                        bound.required_trait,
-                                        argument,
-                                        possible,
-                                        owner,
-                                        member,
-                                        result,
-                                        span,
-                                    ):
-                                        Ok(updated): result = updated
-                                        Err(error): invalid = Some(error)
-                                    if (
-                                        result.failure
-                                            .is_some()
-                                            .or(invalid.is_some())
-                                    ):
-                                        break
-                            None:
-                                invalid = Some(checker_invariant(span, InvalidFunctionContract))
-                        if (
-                            result.failure
-                                .is_some()
-                                .or(invalid.is_some())
-                        ):
-                            break
-                        position = position + 1
+            match receiver:
+                TupleType(elements):
+                    if canonical:
+                        Some(tuple_element_bounds(elements.length(), required))
+                    else:
+                        None
+                _:
+                    None
+    match declared:
+        Some(declared_bounds):
+            var position = 0
+            for bounds in declared_bounds:
+                match arguments.get(position):
+                    Some(argument):
+                        for bound in bounds:
+                            match traits.summarize_goal(
+                                bound.required_trait,
+                                argument,
+                                possible,
+                                owner,
+                                member,
+                                result,
+                                span,
+                            ):
+                                Ok(updated): result = updated
+                                Err(error): invalid = Some(error)
+                            if (
+                                result.failure
+                                    .is_some()
+                                    .or(invalid.is_some())
+                            ):
+                                break
+                    None:
+                        invalid = Some(checker_invariant(span, InvalidFunctionContract))
+                if (
+                    result.failure
+                        .is_some()
+                        .or(invalid.is_some())
+                ):
+                    break
+                position = position + 1
+        None:
+            match receiver.type_head():
                 None:
+                    result = { result |
+                        failure = Some({
+                            owner = owner,
+                            member = member,
+                            required_trait = required,
+                            receiver = receiver,
+                        }),
+                    }
+                Some(head):
                     var provisional: Option[EqualityCandidate] = None
-                    canonical: Bool = match traits.canonical.equality:
-                        Some(canonical): canonical.canonical_owner() == required
-                        None: False
                     if canonical:
                         -- `possible` holds one candidate per aggregate: complete_equality_availability
                         -- appends one per record and union row, and each round only filters it, so
@@ -1516,6 +1541,7 @@ private pure func summarize_family(
                                         .or(invalid.is_some())
                                 ):
                                     break
+
     match invalid:
         Some(error): Err(error)
         None: Ok(result)
@@ -1775,6 +1801,10 @@ private pure func complete_equality_availability(
     _: Void ?= match error:
         Some(failure): Err(failure)
         None: Ok(void)
+    for arity in TUPLE_MINIMUM_ELEMENTS..(TUPLE_MAXIMUM_ELEMENTS + 1):
+        implementations = implementations.append(
+            tuple_implementation(arity, contract, boolean, canonical),
+        )
     table ?= implementations.checked_implementation_table()
     Ok(
         into_opaque TraitAvailability({
@@ -1841,12 +1871,49 @@ private pure func supported_implementation(
         None: Ok(void)
     Ok({
         trait_id = canonical,
-        receiver_head = aggregate.aggregate_head(),
+        receiver_head = NamedHead(aggregate.aggregate_head()),
         parameter_bounds = inferred_bounds(parameters, requirements),
         methods = methods,
         method_provider = None,
         span = span,
     })
+
+
+-- Every element of a tuple must implement the trait.
+private pure func tuple_element_bounds(arity: Int, required: TraitId) -> List[List[LocatedTrait]]:
+    var bounds: List[List[LocatedTrait]] = []
+    for position in 0..arity:
+        bounds = bounds.append([{ required_trait = required, span = compiler_span() }])
+    bounds
+
+
+-- A tuple has no declaration to derive from: its implementation of the
+-- canonical trait is fixed per arity, and holds when every element does.
+private pure func tuple_implementation(
+    arity: Int,
+    contract: AcceptedTrait,
+    boolean: DesignatedBoolean[VariantId],
+    canonical: TraitId,
+) -> AcceptedImplementation:
+    span = compiler_span()
+    var methods: List[ImplementedMethod] = []
+    for method in contract.methods:
+        match method.default_body:
+            Some(function):
+                methods = methods.append({ method = method.id, body = TraitDefault(function) })
+            None:
+                methods = methods.append({
+                    method = method.id,
+                    body = TupleEquality(arity, { method = method, boolean = boolean }),
+                })
+    {
+        trait_id = canonical,
+        receiver_head = TupleHead(arity),
+        parameter_bounds = tuple_element_bounds(arity, canonical),
+        methods = methods,
+        method_provider = None,
+        span = span,
+    }
 
 
 -- Each declared parameter's bounds: its written ones, then what members need.
@@ -1893,7 +1960,7 @@ private pure func representation_implementation(
         methods = methods.append({ method = method.id, body = body })
     Ok({
         trait_id = canonical,
-        receiver_head = OpaqueHead(id),
+        receiver_head = NamedHead(OpaqueHead(id)),
         parameter_bounds = inferred_bounds(declared.type_parameters, requirements),
         methods = methods,
         method_provider = None,

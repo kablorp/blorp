@@ -13,6 +13,7 @@ import:
         begin_program,
     ../../../../src/common/analysis/check/check: check, checked_functions
     ../../../../src/common/analysis/check/model as model
+    ../../../../src/common/analysis/ids: TraitId
     ../../../../src/common/analysis/namespace/builtins: PrimitiveType(BuiltinInt)
     ../../../../src/common/analysis/namespace/namespace:
         TypeHead(ListHead, PrimitiveHead, RecordHead, UnionHead),
@@ -118,7 +119,7 @@ private pure func checked_traits() -> Result[model.AcceptedTraits, Diagnostic]:
 
 private pure func is_record_row(row: model.AcceptedImplementation) -> Bool:
     match row.receiver_head:
-        RecordHead(_): True
+        model.NamedHead(RecordHead(_)): True
         _: False
 
 
@@ -131,6 +132,22 @@ private pure func point_rows(
     match (named, equality):
         (Some(written), Some(automatic)): Some((written, automatic))
         _: None
+
+
+-- The family of a row's receiver: a tuple of the arity has elements of one type.
+private pure func family_of(
+    traits: model.AcceptedTraits,
+    equality: TraitId,
+    head: model.ImplementationHead,
+) -> Option[model.AcceptedImplementation]:
+    match head:
+        model.NamedHead(named):
+            model.family_for(traits, equality, named)
+        model.TupleHead(arity):
+            var elements: List[model.TypeRef] = []
+            for position in 0..arity:
+                elements = elements.append(model.VoidType)
+            model.family_for_receiver(traits, equality, model.TupleType(elements))
 
 
 private pure func same_rows(
@@ -154,17 +171,19 @@ pure func test_each_row_is_the_family_of_its_trait_and_head() -> Bool:
         Ok(traits):
             rows = model.implementation_rows(traits.implementations)
             covered = rows
-                .any(pure func(row): row.receiver_head == PrimitiveHead(BuiltinInt))
+                .any(
+                    pure func(row): row.receiver_head == model.NamedHead(PrimitiveHead(BuiltinInt)),
+                )
                 .and(rows.any(pure func(row): is_record_row(row)))
                 .and(
                     rows.any(pure func(row) -> Bool:
                         match row.receiver_head:
-                            UnionHead(_): True
+                            model.NamedHead(UnionHead(_)): True
                             _: False
                     ),
                 )
             found = rows.all(pure func(row) -> Bool:
-                match model.family_for(traits, row.trait_id, row.receiver_head):
+                match family_of(traits, row.trait_id, row.receiver_head):
                     Some(family): family.span == row.span
                     None: False
             )
@@ -180,15 +199,36 @@ pure func test_a_head_without_the_trait_has_no_family() -> Bool:
             rows = model.implementation_rows(traits.implementations)
             union_row = rows.find(pure func(row) -> Bool:
                 match row.receiver_head:
-                    UnionHead(_): True
+                    model.NamedHead(UnionHead(_)): True
                     _: False
             )
             match (point_rows(rows), union_row):
                 (Some((named, _)), Some(automatic)):
-                    model.family_for(traits, named.trait_id, automatic.receiver_head)
+                    family_of(traits, named.trait_id, automatic.receiver_head)
                         .is_none()
                         .and(model.family_for(traits, named.trait_id, ListHead).is_none())
                 _:
+                    False
+
+
+-- Checking adds one canonical row per tuple arity of two to four, keyed on the
+-- arity, and none for an arity the parser rejects.
+pure func test_each_tuple_arity_has_its_own_equality_family() -> Bool:
+    match checked_traits():
+        Err(_):
+            False
+        Ok(traits):
+            rows = model.implementation_rows(traits.implementations)
+            match rows.find(pure func(row): is_record_row(row).and(row.method_provider.is_none())):
+                Some(automatic):
+                    equality = automatic.trait_id
+                    present = [2, 3, 4].all(pure func(arity) -> Bool:
+                        family_of(traits, equality, model.TupleHead(arity)).is_some()
+                    )
+                    present
+                        .and(family_of(traits, equality, model.TupleHead(5)).is_none())
+                        .and(family_of(traits, equality, model.TupleHead(1)).is_none())
+                None:
                     False
 
 
@@ -238,6 +278,10 @@ TESTS: TestSuite = {
             test_each_row_is_the_family_of_its_trait_and_head,
         ),
         ("a head without the trait has no family", test_a_head_without_the_trait_has_no_family),
+        (
+            "each tuple arity has its own equality family",
+            test_each_tuple_arity_has_its_own_equality_family,
+        ),
         ("rebuilding the rows keeps their order", test_rebuilding_the_rows_keeps_their_order),
         (
             "a second family for one trait and head is rejected",

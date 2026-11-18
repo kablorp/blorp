@@ -536,7 +536,8 @@ destructure flat tuples into new immutable names; nested destructuring and
 member annotations are not supported. Tuple patterns nest inside `match`, and
 `match (left, right):` matches a tuple directly. `(Int, String) -> Int` is a
 callable with two parameters, and `((Int, String)) -> Int` takes one tuple.
-Tuples have no `==`, ordering or trait implementations.
+A tuple supports `==` when every element does (see Automatic equality) and has
+no ordering or other trait implementations.
 
 ### Unions
 
@@ -1011,8 +1012,9 @@ type, so `[] == []` needs a typed binding.
 
 #### Automatic equality
 
-A record, union or opaque type supports `==` when every field, payload or
-representation does, with no declaration. Fields compare in declaration order and stop at the first
+A record, union, opaque type or tuple supports `==` when every field, payload,
+representation or element does, with no declaration. A record or union with a
+tuple member qualifies the same way. Fields compare in declaration order and stop at the first
 difference; union tags must agree before payloads compare. A written
 `Equatable` implementation replaces the automatic one for that type. A generic
 type's condition comes from its actual fields, so a phantom parameter needs no

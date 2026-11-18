@@ -4,7 +4,7 @@ belongs to traits; this module receives its accepted canonical method contract.
 ---
 import:
     int: Int methods
-    ../../syntax/source: FunctionLabel
+    ../../syntax/source: FunctionLabel, equality_label
     ../../syntax/syntax: Span
     ../ids: VariantId, TraitMethodId, RecordId, UnionId
     ../namespace/builtins: DesignatedBoolean
@@ -299,23 +299,15 @@ private pure func union_template(
     }
 
 
--- The canonical contract is already accepted. Substitute its genuine Self
--- once; no parsed header, spelling or new implicit parameter domain is needed.
-pure func equality_template(
-    aggregate: model.AggregateId,
-    label: FunctionLabel,
+-- The canonical member's signature at `receiver`, over the declaration's own
+-- parameters and requirements.
+private pure func contract_signature(
+    receiver: model.TypeRef,
     type_parameters: List[model.TypeParameterId],
     requirements: List[model.TraitRequirement],
-    records: List[model.CheckedRecord],
-    unions: List[model.CheckedUnion],
     method: model.AcceptedTraitMethod,
-    boolean: DesignatedBoolean[VariantId],
     span: Span,
-) -> Result[model.CheckedEqualityBody, CheckError]:
-    arguments = type_parameters.map(
-        pure func(parameter) -> model.TypeRef: model.ParameterType(parameter),
-    )
-    receiver: model.TypeRef = model.NominalType(model.AggregateNominal(aggregate), arguments)
+) -> Result[model.FunctionSignature, CheckError]:
     substitution: Substitution = {
         owner = model.TraitDeclaration(method.id.trait_method_owner()),
         values = [receiver],
@@ -333,13 +325,88 @@ pure func equality_template(
         Some(error): Err(error)
         None: Ok(void)
     result ?= method.signature.return_type.value_type.substitute_type(substitution, span)
-    signature: model.FunctionSignature = {
+    Ok({
         type_parameters = type_parameters,
         requirements = requirements,
         purity = method.signature.purity,
         parameters = parameters,
         return_type = { value_type = result, span = span },
-    }
+    })
+
+
+-- The elements of any tuple of `arity`, compared in order, stopping at the
+-- first difference: the record rule over `ReadTupleElement`.
+pure func tuple_equality_template(
+    arity: Int,
+    recipe: model.TupleEqualityRecipe,
+    span: Span,
+) -> Result[model.CheckedEqualityBody, CheckError]:
+    method = recipe.method
+    boolean = recipe.boolean
+    canonical = method.id.trait_method_owner()
+    label = equality_label("tuple of ${arity}")
+    owner = model.TupleDeclaration(arity)
+    var type_parameters: List[model.TypeParameterId] = []
+    var elements: List[model.TypeRef] = []
+    var requirements: List[model.TraitRequirement] = []
+    for position in 0..arity:
+        parameter = model.type_parameter_id(owner, position)
+        type_parameters = type_parameters.append(parameter)
+        elements = elements.append(model.ParameterType(parameter))
+        requirements = requirements.append({
+            parameter = parameter,
+            required_trait = canonical,
+            span = span,
+        })
+    receiver: model.TypeRef = model.TupleType(elements)
+    signature ?= receiver.contract_signature(type_parameters, requirements, method, span)
+    var result = boolean_value(True, boolean, span)
+    var remaining = arity
+    while remaining > 0:
+        remaining = remaining - 1
+        match elements.get(remaining):
+            Some(element):
+                left: model.CheckedExpr = {
+                    form = model.ReadTupleElement(read_parameter(0, receiver, span), remaining),
+                    value_type = element,
+                    span = span,
+                }
+                right: model.CheckedExpr = {
+                    form = model.ReadTupleElement(read_parameter(1, receiver, span), remaining),
+                    value_type = element,
+                    span = span,
+                }
+                result = left
+                    .compare(right, method)
+                    .and_then(result, boolean)
+            None:
+                void
+    Ok({
+        label = label,
+        signature = signature,
+        bindings = [parameter_binding(0, receiver, span), parameter_binding(1, receiver, span)],
+        body = model.CheckedValueBody(model.ReturnExpression(result)),
+    })
+
+
+-- The canonical contract is already accepted. Substitute its genuine Self
+-- once; no parsed header, spelling or new implicit parameter domain is needed.
+pure func equality_template(
+    aggregate: model.AggregateId,
+    label: FunctionLabel,
+    type_parameters: List[model.TypeParameterId],
+    requirements: List[model.TraitRequirement],
+    records: List[model.CheckedRecord],
+    unions: List[model.CheckedUnion],
+    method: model.AcceptedTraitMethod,
+    boolean: DesignatedBoolean[VariantId],
+    span: Span,
+) -> Result[model.CheckedEqualityBody, CheckError]:
+    arguments = type_parameters.map(
+        pure func(parameter) -> model.TypeRef: model.ParameterType(parameter),
+    )
+    receiver: model.TypeRef = model.NominalType(model.AggregateNominal(aggregate), arguments)
+    signature ?= receiver.contract_signature(type_parameters, requirements, method, span)
     match aggregate:
         model.RecordAggregate(record_row):
             match records.get(record_row.record_number()):

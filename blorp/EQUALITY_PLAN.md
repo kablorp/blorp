@@ -1,7 +1,7 @@
 # Equality derivation plan
 
-Status: landing 1 implemented on `equality/derived-opaque`, awaiting review;
-landing 2 designed, not started.
+Status: landings 1 (opaque types) and 2 (tuples) landed on 2026-11-17; landing 3
+waits for a seed rotation.
 
 ## Decision
 
@@ -19,7 +19,9 @@ implementation. This supersedes the pilot's opt-in recommendation (a bodiless
 Keith accepted the +0.53% fixed-input instruction cost of derived opaque
 equality on 2026-11-17, on the measurements under Measurements below: the
 increase is real from -O1 up, about half of it the opaque candidates, and
-landing 3 does not give it back at -O2.
+landing 3 does not give it back at -O2. Landing 2's increment (+0.07% fixed-input
+instructions, below) lands under the same decision: Keith's "Also land equality"
+(2026-11-17) approved both landings.
 
 ## Landing 1: opaque types
 
@@ -58,14 +60,51 @@ explicit override, record field, `T: Equatable` use);
 `reject_opaque_argument.brp` (generic opaque at an argument without equality:
 exact message, help, span and note); `test_substitute_parameters.brp` (unit).
 
-## Landing 2: tuples (not started)
+## Landing 2: tuples
 
-Option T1 from the pilot: a tuple head with synthesized rows per arity 2-4.
-It needs `TypeHead` to name a tuple (about 12 exhaustive matches), a third
-`EqualityOwner`, a tuple template in `equality.brp` built over
-`ReadTupleElement`, and a tuple type-parameter owner so the template's
-parameters have an identity. Estimated 250-400 production lines; the work stops
-and reports if it passes about 450.
+Status: landed on 2026-11-17, after landing 1.
+
+Design. The coordinator kept the namespace `TypeHead` unchanged, because no written name
+denotes a tuple. `AcceptedImplementation.receiver_head` is a check-local
+`ImplementationHead`: `NamedHead(TypeHead)` or `TupleHead(arity)`. Checking adds
+one canonical-trait row per arity two to four (the parser's limits, now shared
+as `TUPLE_MINIMUM_ELEMENTS` and `TUPLE_MAXIMUM_ELEMENTS` in `syntax.brp`), each
+bounding every element by the trait. The table indexes named rows as before and
+keeps the three tuple rows apart (`family_for` for a named head,
+`family_for_receiver` for a type), so a named lookup builds no wrapper. A record
+or union with a tuple member reads the same bounds during its availability
+round, so it qualifies.
+
+The row carries a recipe, not a template: specialization builds the arity's
+template (`equality.tuple_equality_template`, the record rule over
+`ReadTupleElement`, parameters owned by the new `TupleDeclaration(arity)`) when
+a body is requested, so a program that never compares a tuple pays nothing for
+it. The growth analysis sees a tuple row as its template would show it: each
+element position is a call of the member at that element's parameter.
+
+Tests. `equality/tuple_derived.brp` (`(Int, String)`, nested tuples, tuples of
+a record, a union, a List and an opaque type, arity four, a record with a tuple
+field, a union with tuple payloads, a `T: Equatable` use) and
+`equality/reject_tuple_element.brp` (an element without equality, exact
+message, help, span and note); `test_each_tuple_arity_has_its_own_equality_family`.
+
+Cost. Tuple rows exist in the table always (the three rows cost about 110
+allocations), but the growth analysis reads the traits without them first and
+widens to them only when a dependency touches a tuple: a tuple type pushes or
+pops a `TupleElement` slot, and a tuple equality targets a `TupleDeclaration`
+parameter. Programs with no tuple pay nothing for the analysis, which had been
+about 1,000 allocations and 2 to 3 million instructions per compile (17 to 19%
+of the smallest e2e programs). Growth through a tuple is still rejected
+(`equality/reject_tuple_growth.brp`). Against landing 1 the smallest compile
+(`derived_accepted_generic_head`) is 4,649 allocations against 4,619, and the
+self-compile fixed input was +0.14% instructions and +0.02% allocations
+before the lazy widening. Re-measured at the tip against landing 1
+(`cost_final_tuples.log`): fixed input +0.07% instructions and +0.001%
+allocations, own source +0.60%.
+
+Ceilings: every e2e ceiling passes at the landing base (main `11e0d2c8c`), and
+none was changed. The two derived_accepted_* programs that had exceeded
+theirs on older bases came back under after library-cost (b).
 
 ## Landing 3: delete the 28 hand-written identity implementations
 

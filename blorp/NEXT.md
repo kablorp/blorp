@@ -9,10 +9,10 @@ done.
 ## Workstreams
 
 - **Equality derivation:** [`EQUALITY_PLAN.md`](EQUALITY_PLAN.md).
-  - **Status:** decided 2026-11-16. Opaque types derive `==` from their
-    representation (landing 1, `equality/derived-opaque`); tuples follow
-    (landing 2, not started).
-  - **Next:** review and land landing 1; tuple head design is in the plan.
+  - **Status:** opaque types and tuples derive `==` from their constituents
+    (landings 1 and 2, landed 2026-11-17).
+  - **Next:** landing 3 deletes the 28 hand-written identity implementations
+    after a seed rotation.
 - **UInt8 and Bytes:** [`UINT8_BYTES_PLAN.md`](UINT8_BYTES_PLAN.md).
   - **Status:** U1 to U9 and B1 to B3 are decided. L0, the
     `IntegerType(Int64Format)` refactor, and L1, the compiler's `UInt8` with

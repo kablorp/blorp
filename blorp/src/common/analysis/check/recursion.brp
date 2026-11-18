@@ -37,8 +37,9 @@ import:
         bound_instantiation_paths,
         strong_components,
     ./model:
-        BodyOwner(DeclaredBody, LambdaBody, DerivedEqualityBody),
+        BodyOwner(DeclaredBody, LambdaBody, DerivedEqualityBody, DerivedTupleEquality),
         AggregateId(RecordAggregate, UnionAggregate),
+        ImplementationHead(NamedHead, TupleHead),
         NominalId(AggregateNominal, OpaqueNominal),
         body_calls,
         CanonicalEquality,
@@ -46,7 +47,13 @@ import:
         AcceptedImplementation,
         ImplementationTable,
         AcceptedMethodCall,
-        ImplementedBody(AuthoredMethod, TraitDefault, StructuralEquality, RepresentationBody),
+        ImplementedBody(
+            AuthoredMethod,
+            TraitDefault,
+            StructuralEquality,
+            RepresentationBody,
+            TupleEquality,
+        ),
         CallTarget(TraitMethod, RuntimeFunction, UserFunction, CallableParameter, ValueCall),
         CheckedArm,
         CheckedBody(CheckedMatchBody, CheckedValueBody),
@@ -67,7 +74,7 @@ import:
         CheckedConstant,
         CheckedStatement,
         TypeParameterId,
-        TypeParameterOwner(FunctionDeclaration, OpaqueDeclaration),
+        TypeParameterOwner(FunctionDeclaration, OpaqueDeclaration, TupleDeclaration),
         accepted_method,
         TypeRef(TupleType, CallableType, NominalType, ListType, ParameterType),
         statement_expressions,
@@ -442,13 +449,20 @@ private pure func with_origins(
     result
 
 
-private pure func receiver_slot(head: TypeHead, position: Int) -> Option[ConstructorSlot]:
+private pure func receiver_slot(head: ImplementationHead, position: Int) -> Option[ConstructorSlot]:
     match head:
-        ListHead: Some(ListElement)
-        RecordHead(owner): Some(NominalArgument(AggregateNominal(RecordAggregate(owner)), position))
-        UnionHead(owner): Some(NominalArgument(AggregateNominal(UnionAggregate(owner)), position))
-        OpaqueHead(owner): Some(NominalArgument(OpaqueNominal(owner), position))
-        PrimitiveHead(_): None
+        NamedHead(ListHead):
+            Some(ListElement)
+        NamedHead(RecordHead(owner)):
+            Some(NominalArgument(AggregateNominal(RecordAggregate(owner)), position))
+        NamedHead(UnionHead(owner)):
+            Some(NominalArgument(AggregateNominal(UnionAggregate(owner)), position))
+        NamedHead(OpaqueHead(owner)):
+            Some(NominalArgument(OpaqueNominal(owner), position))
+        NamedHead(PrimitiveHead(_)):
+            None
+        TupleHead(arity):
+            Some(TupleElement(arity, position))
 
 
 private pure func append_method_dependencies(
@@ -462,22 +476,14 @@ private pure func append_method_dependencies(
     match traits.method_body(method):
         Some(selected):
             var origins = automatic
-            match (
+            match traits.family_for_receiver(
                 method
-                    .method_receiver()
-                    .type_head()
+                    .method_identity()
+                    .trait_method_owner(),
+                method.method_receiver(),
             ):
-                Some(head):
-                    match traits.family_for(
-                        method
-                            .method_identity()
-                            .trait_method_owner(),
-                        head,
-                    ):
-                        Some(family): origins = origins.with_origins(family.automatic_origin())
-                        None: void
-                None:
-                    void
+                Some(family): origins = origins.with_origins(family.automatic_origin())
+                None: void
             var position = 0
             for argument in selected.arguments:
                 match selected.body:
@@ -494,6 +500,15 @@ private pure func append_method_dependencies(
                         dependencies = dependencies.append_dependencies(
                             argument,
                             type_parameter_id(aggregate.aggregate_owner(), position),
+                            [],
+                            True,
+                            origins,
+                            span,
+                        )
+                    DerivedTupleEquality(arity):
+                        dependencies = dependencies.append_dependencies(
+                            argument,
+                            type_parameter_id(TupleDeclaration(arity), position),
                             [],
                             True,
                             origins,
@@ -531,6 +546,18 @@ private pure func append_method_dependencies(
                                                         method.method_receiver(),
                                                         type_parameter_id(
                                                             aggregate.aggregate_owner(),
+                                                            position,
+                                                        ),
+                                                        [pop],
+                                                        True,
+                                                        origins,
+                                                        span,
+                                                    )
+                                                TupleEquality(arity, _):
+                                                    dependencies = dependencies.append_dependencies(
+                                                        method.method_receiver(),
+                                                        type_parameter_id(
+                                                            TupleDeclaration(arity),
                                                             position,
                                                         ),
                                                         [pop],
@@ -819,12 +846,12 @@ record BodyCalls {
 }
 
 
--- This returns only candidate-specific finite causes. Check's final use
--- validation must consume them before publishing the pruned accepted rows.
-pure func validate_recursive_instantiation(
+-- Every parameter dependency the program's calls and creations, and the
+-- generated rows, give rise to.
+private pure func collect_dependencies(
     bodies: List[BodyCalls],
     traits: AcceptedTraits,
-) -> Result[List[AggregateId], CheckError]:
+) -> List[ParameterDependency]:
     var dependencies: List[ParameterDependency] = []
     for body in bodies:
         dependencies = dependencies.append_call_dependencies(body.calls, traits, body.automatic)
@@ -838,6 +865,19 @@ pure func validate_recursive_instantiation(
     for implementation in traits.implementations.implementation_rows():
         for member in implementation.methods:
             match member.body:
+                TupleEquality(arity, _):
+                    -- The template's body calls the member at each element, which is
+                    -- all the growth analysis needs of it.
+                    for position in 0..arity:
+                        element: TypeRef = ParameterType(
+                            type_parameter_id(TupleDeclaration(arity), position),
+                        )
+                        dependencies = dependencies.append_method_dependencies(
+                            accepted_method(member.method, element),
+                            traits,
+                            [],
+                            implementation.span,
+                        )
                 RepresentationBody(_, representation):
                     dependencies = dependencies.append_method_dependencies(
                         accepted_method(member.method, representation),
@@ -847,6 +887,39 @@ pure func validate_recursive_instantiation(
                     )
                 AuthoredMethod(_) | TraitDefault(_) | StructuralEquality(_, _):
                     void
+    dependencies
+
+
+private pure func touch_tuples(dependencies: List[ParameterDependency]) -> Bool:
+    dependencies.any(pure func(dependency) -> Bool:
+        owned: Bool = match dependency.target.parameter_owner():
+            TupleDeclaration(_): True
+            _: False
+        owned.or(
+            dependency.operations.any(pure func(operation) -> Bool:
+                match operation:
+                    PushConstructor(TupleElement(_, _)): True
+                    PopConstructor(TupleElement(_, _)): True
+                    _: False
+            ),
+        )
+    )
+
+
+-- This returns only candidate-specific finite causes. Check's final use
+-- validation must consume them before publishing the pruned accepted rows.
+pure func validate_recursive_instantiation(
+    bodies: List[BodyCalls],
+    traits: AcceptedTraits,
+) -> Result[List[AggregateId], CheckError]:
+    -- Tuple rows add an edge per element to every generic equality call, which a
+    -- program with no tuple in its dependencies never needs: read without them
+    -- first, and again with them only when a dependency touches a tuple.
+    first = bodies.collect_dependencies(traits.without_tuple_rows())
+    dependencies = if first.touch_tuples():
+        bodies.collect_dependencies(traits)
+    else:
+        first
     base = dependencies.filter(pure func(dependency): dependency.automatic.is_empty())
     _: Void ?= base.validate_base_dependencies()
     if dependencies.any(
@@ -890,42 +963,43 @@ private pure func unavailable_goal(
 ) -> Result[Bool, CheckError]:
     var blocked: Bool = False
     var invalid: Option[CheckError] = None
+    canonical: Bool = match traits.canonical.equality:
+        Some(owner): owner.canonical_owner() == required
+        None: False
+    -- A tuple names no aggregate, so only its elements can be blocked.
     match receiver.type_head():
-        None:
-            void
         Some(head):
-            canonical: Bool = match traits.canonical.equality:
-                Some(owner): owner.canonical_owner() == required
-                None: False
             blocked = canonical.and(
                 unavailable.any(pure func(aggregate): head == aggregate.aggregate_head()),
             )
-            if blocked.not():
-                match traits.family_for(required, head):
-                    None:
-                        void
-                    Some(family):
-                        arguments = receiver.receiver_arguments()
-                        var position = 0
-                        for bounds in family.parameter_bounds:
-                            match arguments.get(position):
-                                None:
-                                    invalid = Some(checker_invariant(span, InvalidFunctionContract))
-                                Some(argument):
-                                    for bound in bounds:
-                                        match traits.unavailable_goal(
-                                            unavailable,
-                                            bound.required_trait,
-                                            argument,
-                                            span,
-                                        ):
-                                            Ok(value): blocked = value
-                                            Err(error): invalid = Some(error)
-                                        if blocked.or(invalid.is_some()):
-                                            break
-                            if blocked.or(invalid.is_some()):
-                                break
-                            position = position + 1
+        None:
+            void
+    if blocked.not():
+        match traits.family_for_receiver(required, receiver):
+            None:
+                void
+            Some(family):
+                arguments = receiver.receiver_arguments()
+                var position = 0
+                for bounds in family.parameter_bounds:
+                    match arguments.get(position):
+                        None:
+                            invalid = Some(checker_invariant(span, InvalidFunctionContract))
+                        Some(argument):
+                            for bound in bounds:
+                                match traits.unavailable_goal(
+                                    unavailable,
+                                    bound.required_trait,
+                                    argument,
+                                    span,
+                                ):
+                                    Ok(value): blocked = value
+                                    Err(error): invalid = Some(error)
+                                if blocked.or(invalid.is_some()):
+                                    break
+                    if blocked.or(invalid.is_some()):
+                        break
+                    position = position + 1
     match invalid:
         Some(error): Err(error)
         None: Ok(blocked)

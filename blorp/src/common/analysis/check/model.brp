@@ -92,6 +92,8 @@ fixed union TypeParameterOwner:
     UnionDeclaration(UnionId)
     RecordDeclaration(RecordId)
     OpaqueDeclaration(OpaqueId)
+    -- The elements of every tuple of this arity: one structural template.
+    TupleDeclaration(Int)
 
 
 -- Owner and declaration position identify a rigid parameter within this compilation.
@@ -350,6 +352,8 @@ union ImplementedBody:
     -- An opaque type's derived member is its representation's, written over the
     -- opaque declaration's own parameters; erasure makes them one function.
     RepresentationBody(OpaqueId, TypeRef)
+    -- Every tuple of an arity compares its elements in order.
+    TupleEquality(Int, TupleEqualityRecipe)
 
 
 fixed union EqualityMember:
@@ -410,7 +414,7 @@ record ImplementedMethod {
 record AcceptedImplementation {
     span: Span,
     trait_id: TraitId,
-    receiver_head: TypeHead,
+    receiver_head: ImplementationHead,
     parameter_bounds: List[List[LocatedTrait]],
     methods: List[ImplementedMethod],
     -- Written name-publication authority; None supplies automatic capability
@@ -419,7 +423,23 @@ record AcceptedImplementation {
 }
 
 
--- One trait implemented for one receiver head: at most one accepted row.
+-- What builds a tuple's equality template. Programs that never compare a tuple
+-- never pay for one: specialization builds it for an arity when asked.
+record TupleEqualityRecipe {
+    method: AcceptedTraitMethod,
+    boolean: DesignatedBoolean[VariantId],
+}
+
+
+-- The receiver an implementation row is for: a head a written name denotes, or
+-- a tuple of an arity. A tuple has no name, so no implementation header can
+-- write one; only checking adds a tuple row.
+fixed union ImplementationHead:
+    NamedHead(TypeHead)
+    TupleHead(Int)
+
+
+-- One trait implemented for one named receiver head: at most one accepted row.
 record ImplementationKey {
     trait_id: TraitId,
     head: TypeHead,
@@ -432,11 +452,13 @@ implements Hashable for ImplementationKey:
 
 
 -- Accepted implementations in acceptance order, with an index by trait and
--- receiver head derived from them in the same step. Only `implementation_table`
--- builds one, so the index cannot disagree with the rows.
+-- named receiver head derived from them in the same step, and the few tuple
+-- rows apart so a named lookup builds no wrapper. Only `implementation_table`
+-- builds one, so the indexes cannot disagree with the rows.
 private record ImplementationRows {
     ordered: List[AcceptedImplementation],
     by_key: Dict[ImplementationKey, AcceptedImplementation],
+    tuples: List[AcceptedImplementation],
 }
 
 
@@ -448,26 +470,53 @@ opaque type ImplementationTable = ImplementationRows
 -- family of its own trait for the receiver head.
 pure func implementation_table(rows: List[AcceptedImplementation]) -> Option[ImplementationTable]:
     var by_key: Dict[ImplementationKey, AcceptedImplementation] = {}
+    var tuples: List[AcceptedImplementation] = []
     var valid: Bool = True
     for row in rows:
-        key: ImplementationKey = { trait_id = row.trait_id, head = row.receiver_head }
         other_trait_member = row.methods.any(
             pure func(member): member.method.trait_method_owner() != row.trait_id,
         )
-        if (
-            by_key
-                .contains(key)
-                .not()
-                .and(other_trait_member.not())
-        ):
-            by_key = by_key.set(key, row)
-        else:
-            valid = False
+        match row.receiver_head:
+            NamedHead(head):
+                key: ImplementationKey = { trait_id = row.trait_id, head = head }
+                if (
+                    by_key
+                        .contains(key)
+                        .not()
+                        .and(other_trait_member.not())
+                ):
+                    by_key = by_key.set(key, row)
+                else:
+                    valid = False
+            TupleHead(_):
+                repeated = tuples.any(pure func(other): other.receiver_head == row.receiver_head)
+                if (
+                    repeated
+                        .not()
+                        .and(other_trait_member.not())
+                ):
+                    tuples = tuples.append(row)
+                else:
+                    valid = False
+        if valid.not():
             break
     if valid:
-        Some(into_opaque ImplementationTable({ ordered = rows, by_key = by_key }))
+        Some(into_opaque ImplementationTable({ ordered = rows, by_key = by_key, tuples = tuples }))
     else:
         None
+
+
+-- The same traits with the tuple rows left out of the row list, which lookups
+-- by receiver still reach. The growth analysis reads these first and widens to
+-- the tuple rows only when the program has a tuple to widen for.
+pure func without_tuple_rows(traits: AcceptedTraits) -> AcceptedTraits:
+    rows = from_opaque ImplementationTable(traits.implementations)
+    var named: List[AcceptedImplementation] = []
+    for row in rows.ordered:
+        match row.receiver_head:
+            NamedHead(_): named = named.append(row)
+            TupleHead(_): void
+    { traits | implementations = into_opaque ImplementationTable({ rows | ordered = named }) }
 
 
 -- The rows in acceptance order.
@@ -475,7 +524,7 @@ pure func implementation_rows(table: ImplementationTable) -> List[AcceptedImplem
     from_opaque ImplementationTable(table).ordered
 
 
--- The one accepted implementation of `required` for `head`.
+-- The one accepted implementation of `required` for a named `head`.
 pure func family_for(
     traits: AcceptedTraits,
     required: TraitId,
@@ -483,6 +532,27 @@ pure func family_for(
 ) -> Option[AcceptedImplementation]:
     key: ImplementationKey = { trait_id = required, head = head }
     from_opaque ImplementationTable(traits.implementations).by_key.get(key)
+
+
+-- The one accepted implementation of `required` for the type `receiver`, whose
+-- head is a name's or a tuple's arity. A tuple of an arity has one row per trait.
+pure func family_for_receiver(
+    traits: AcceptedTraits,
+    required: TraitId,
+    receiver: TypeRef,
+) -> Option[AcceptedImplementation]:
+    match receiver:
+        TupleType(elements):
+            arity = elements.length()
+            from_opaque ImplementationTable(traits.implementations).tuples.find(
+                pure func(row): (row.trait_id == required).and(
+                    row.receiver_head == TupleHead(arity),
+                ),
+            )
+        _:
+            match receiver.type_head():
+                Some(head): traits.family_for(required, head)
+                None: None
 
 
 private record CanonicalEqualityContents {
@@ -642,6 +712,7 @@ pure func receiver_arguments(receiver: TypeRef) -> List[TypeRef]:
     match receiver:
         NominalType(_, arguments): arguments
         ListType(element): [element]
+        TupleType(elements): elements
         _: []
 
 
@@ -658,9 +729,7 @@ pure func method_body(
     var resolving: Bool = True
     while resolving:
         resolving = False
-        family: Option[AcceptedImplementation] = match receiver.type_head():
-            Some(head): traits.family_for(method.trait_method_owner(), head)
-            None: None
+        family = traits.family_for_receiver(method.trait_method_owner(), receiver)
         match family:
             None:
                 void
@@ -681,6 +750,11 @@ pure func method_body(
                             StructuralEquality(aggregate, _):
                                 found = Some({
                                     body = DerivedEqualityBody(aggregate),
+                                    arguments = receiver.receiver_arguments(),
+                                })
+                            TupleEquality(arity, _):
+                                found = Some({
+                                    body = DerivedTupleEquality(arity),
                                     arguments = receiver.receiver_arguments(),
                                 })
                             RepresentationBody(opaque_id, representation):
@@ -798,6 +872,7 @@ fixed union BodyOwner:
     DeclaredBody(FunctionId)
     LambdaBody(LambdaId)
     DerivedEqualityBody(AggregateId)
+    DerivedTupleEquality(Int)
 
 
 fixed record ScopedBindingId {
@@ -845,6 +920,19 @@ pure func aggregate_owner(aggregate: AggregateId) -> TypeParameterOwner:
     match aggregate:
         RecordAggregate(record_row): RecordDeclaration(record_row)
         UnionAggregate(union_row): UnionDeclaration(union_row)
+
+
+pure func tuple_equality_recipe(traits: AcceptedTraits, arity: Int) -> Option[TupleEqualityRecipe]:
+    var found: Option[TupleEqualityRecipe] = None
+    for implementation in traits.implementations.implementation_rows():
+        for member in implementation.methods:
+            match member.body:
+                TupleEquality(owner, recipe):
+                    if owner == arity:
+                        found = Some(recipe)
+                _:
+                    void
+    found
 
 
 pure func equality_body(
