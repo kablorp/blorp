@@ -47,20 +47,17 @@ done.
     read). Keith settled its open decisions on 2026-11-11: CLion first, name
     uses always recorded, and broken files served from the last good
     analysis in a landing after the plugin. He then asked for, and approved, a
-    byte console API, so landing 6 waits for the UInt8 plan's L1 and landing 8 for its
-    L3. Its foundations have
-    landed: the `json` codec
-    and loader source snapshots (`load_program_with_sources`, in the README's
-    Load phase).
-  - **Landed:** landing 1, analysis without an entry point; landing 2,
-    comments as lexer output; landing 3, the lexer's prefix on failure;
-    landing 4, fixed identities; landing 5, name uses: analysis records
-    one inline row per name used in source, its span and the identity it
-    resolves to; landing 6, console labels: `console.write`,
-    `write_error`, `flush`, `read_line` and `read_exact`, with their runtime
-    and emission and no library functions yet; and landing 7, a seed
-    rotation to `blorp-seed-4fee244ad96f`, which knows those labels.
-  - **Next:** landing 8, the `io/console` functions.
+    byte console API. Its foundations have landed: the `json` codec and loader
+    source snapshots (`load_program_with_sources`, in the README's Load phase).
+  - **Landed:** landings 1 to 8: analysis without an entry point; comments as
+    lexer output; the lexer's prefix on failure; fixed identities; name uses,
+    one inline row per name used in source with its span and the identity it
+    resolves to; the console labels with their runtime; a seed rotation to
+    `blorp-seed-4fee244ad96f`; and the byte console library, one module per
+    error type: `io/console/output` (`print`, `write`, `write_error`,
+    `flush`), `io/console/read_line` and `io/console/read_exact`.
+  - **Next:** landing 9, `blorp lsp`: the `src/lsp/` modules and the
+    transport.
 - **String code points:** [`STRING_PLAN.md`](STRING_PLAN.md).
   - **Status:** approved on 2026-11-10: `length` counts code points, from a
     count stored in each String, and byte work uses `byte_*` functions. L1

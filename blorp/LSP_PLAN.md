@@ -1,7 +1,7 @@
 # Language server: `blorp lsp`
 
 **Status: plan, 2026-11-10; Keith settled its decisions and asked for a byte
-console on 2026-11-11. Landings 1–7 have landed; 8 is next.**
+console on 2026-11-11. Landings 1–8 have landed; 9 is next.**
 
 ## Problem
 
@@ -406,20 +406,10 @@ and `CheckFailure` (`TypeReferent` of an `OpaqueHead`), `Result` (of a
 `UnionHead`), `program` (`BindingReferent`) and `check_program`
 (`FunctionReferent`).
 
-**The console.** Today all of `standard_library/io/console.brp` is:
+**The console**, reviewed for ergonomics, in one module per error type:
 
 ```blorp
-func print(value: String) -> Void:
-    builtin("string.print")
-
-
-func print_error(message: String) -> Void:
-    builtin("string.print_error")
-```
-
-The additions, reviewed for ergonomics:
-
-```blorp
+-- io/console/output.brp, beside print and print_error.
 -- The bytes exactly as given; no newline is added. Output a closed pipe
 -- refuses is dropped, under the SIGPIPE guard `capture` already uses, so a
 -- client that has gone does not end the program.
@@ -427,18 +417,11 @@ func write(data: Bytes) -> Void
 func write_error(data: Bytes) -> Void
 -- Sends buffered standard output now. Every read does this first.
 func flush() -> Void
--- Bytes, unlike `io/files`'s String line functions: those before the next LF,
--- without it or a CR just before it (a lone CR stays). A last line with no
--- LF comes as it is; None once input has ended.
-func read_line() -> Result[Option[Bytes], ReadLineError]
--- Exactly `byte_count` bytes. A count of zero or less gives Some(empty)
--- without reading; None means input ended before the first byte. Bytes are
--- held only as they arrive, so a large count costs only the input received.
-func read_exact(byte_count: Int) -> Result[Option[Bytes], ReadExactError]
 
 
--- Why standard input could not be read: one exact union per operation, as
--- the library's exact-error convention requires. Both implement Stringable.
+-- io/console/read_line.brp. Each read has its own exact error union, as the
+-- library's convention requires; variant names are unique within a module, so
+-- each union has its own module. Both implement Stringable.
 fixed union ReadLineError:
     -- EISDIR: standard input is a directory.
     IsADirectory
@@ -446,11 +429,24 @@ fixed union ReadLineError:
     OtherOs(Int)
 
 
+-- Bytes, unlike `io/files`'s String line functions: those before the next LF,
+-- without it or a CR just before it (a lone CR stays). A last line with no
+-- LF comes as it is; None once input has ended.
+func read_line() -> Result[Option[Bytes], ReadLineError]
+
+
+-- io/console/read_exact.brp.
 fixed union ReadExactError:
     -- Input ended after this many of the bytes asked for.
     EndedEarly(Int)
     IsADirectory
     OtherOs(Int)
+
+
+-- Exactly `byte_count` bytes. A count of zero or less gives Some(empty)
+-- without reading; None means input ended before the first byte. Bytes are
+-- held only as they arrive, so a large count costs only the input received.
+func read_exact(byte_count: Int) -> Result[Option[Bytes], ReadExactError]
 ```
 
 The transport counts and sends the same bytes:
@@ -458,7 +454,7 @@ The transport counts and sends the same bytes:
 ```blorp
 import:
     bytes: Bytes, String methods
-    io/console: write, flush
+    io/console/output: write, flush
     json: Json, render
 
 
@@ -474,7 +470,8 @@ A text prompt converts once each way, and needs no flush:
 ```blorp
 import:
     bytes: Bytes, String methods
-    io/console: write, read_line
+    io/console/output: write
+    io/console/read_line: read_line
 
 
 func main() -> Int:
@@ -548,11 +545,6 @@ the other's `length` and `slice` uses.
 
 ## Dependencies
 
-- Landing 5 follows 1 and 4; landings 6, 7 and 8 go strictly in order.
-- Landing 6 needs `UINT8_BYTES_PLAN.md`'s L1, since its natives pass byte
-  lists. If it lands before that plan's L2, L2's rotation carries it and
-  landing 7 is dropped.
-- Landing 8 needs `Bytes` (L3).
 - Landing 9's pure modules follow landings 1, 3 and 5; its transport, 8.
 - Landing 11 follows 10.
 
@@ -587,7 +579,7 @@ lines counted apart. Compile cost must also fit the e2e instruction ceilings'
 | 4 fixed identities | ≤ +0.1% | no increase | ≤ +0.1% | ≤ +20 net |
 | 5 name uses, fixed input | ≤ +1% | ≤ +0.6% | unchanged | ≤ +1,320 net |
 | 6 console labels, fixed input | ≤ +0.1% | ≤ +0.01% | ≤ +0.1% | ≤ +280 net |
-| 8 console functions | ≤ +0.1% | ≤ +0.01% | ≤ +0.1% | ≤ +60 net |
+| 8 console functions, fixed input | ≤ +0.1% | ≤ +0.01% | ≤ +0.1% | ≤ +170 net |
 | 9 server | ≤ +3% (more source to compile) | ≤ +3% | ≤ +3% | ≤ +1,700 |
 | 11 broken files | ≤ +0.5% (more source to compile) | ≤ +0.5% | ≤ +0.5% | ≤ +300 |
 
@@ -880,6 +872,53 @@ A program that declares and calls the five console labels fails under the
 old seed with "unknown builtin operation" and compiles under the new one.
 The compiler build, `test_bootstrap.sh`, `make test`, the fixpoint and
 `make -C blorp test-e2e INSTRUCTION_CHECK=on` pass with no ceiling raised.
+
+**Landing 8** (against `e4e2eb735`). `self-compile-cost`, `-O2`, 3 rounds:
+
+| Measure | Base | Candidate | Change |
+| --- | ---: | ---: | ---: |
+| Fixed input, allocations | 14,551,725 | 14,551,727 | +2 |
+| Fixed input, instructions (median) | 12,998,488,299 | 12,995,282,725 | −0.025% |
+| Fixed input, peak heap (requested bytes) | 173,267,667 | 173,267,797 | +130 bytes |
+| Own source, allocations | 14,551,725 | 14,554,126 | +0.017% |
+| Own source, instructions (median) | 12,987,308,263 | 12,992,831,394 | +0.043% |
+| Own source, peak heap (requested bytes) | 173,267,666 | 173,296,305 | +0.017% |
+| Lines, production and tests | | | +152 and +377 net |
+
+- **Modules.** The planned API put `ReadLineError` and `ReadExactError` in
+  one module, but variant names are unique across a module's unions. Keith
+  chose modules built around types, within reason (2026-11-17), so
+  `io/console.brp` became `io/console/output` (`print`, `print_error`,
+  `write`, `write_error`, `flush`), `io/console/read_line` and
+  `io/console/read_exact`, each union as approved. A module file beside a
+  folder of its name is rejected, so no `io/console.brp` remains; every
+  `io/console: print` import, the prelude's among them, names
+  `io/console/output`.
+- **Correction.** The line ceiling was +60, estimated from the plan's sketch.
+  A compiled spike measured +155: three module headers and imports, two
+  unions, two decoders, two `Stringable` implementations, five natives, five
+  functions and the line-ending helper, none of it redundant. The
+  coordinator set ≤ +170 from it, as the 2026-11-16 rule for sketch
+  estimates provides. Review then trimmed three unused imports.
+- **Identity.** The fixed-input C is identical (`bc35d2e8456ec168`): the
+  compiler imports no console function.
+- **Tests.** `test_console_errors.brp` binds both decoders to literal codes
+  and checks every phrase. `test_compile/console.brp` runs three fixtures,
+  normal and strict, through `capture` with stdin: LF, CRLF, empty lines, a
+  lone CR kept, one CR of two stripped, no final LF, end of input, headers
+  then an exact body, a short body, input ending before the body, a zero
+  and a negative count, a prompt before the reply, `print` and `write` in
+  order, and `write` beside `write_text`. Applied together, four mutations
+  (no CR strip, `EndedEarly(n + 1)`, `<=` as `<`, `write` to stderr) fail all
+  three tests, though only the first case each test reaches was seen to fail;
+  `<=` as `==` alone fails the negative count. Their compile ceilings are
+  measured plus 15%.
+- **Criterion 8.** `capture` carries Strings, so no e2e case can send bytes
+  that are not UTF-8 or close the reader. Landing 6's C cases cover both at
+  the natives, and the library passes the bytes through unchanged.
+- **Rough edges.** `NativeRun` has no stdin field, so `console.brp` has its
+  own small runner over `run_expecting`, as `streaming_files.brp` does.
+  `test-e2e` cannot run one suite.
 
 ## Testing
 

@@ -18,7 +18,7 @@ The library root contains two designated foundation modules:
   `Negatable`, plus the checked-arithmetic error `MathError`. It is the only
   module that may declare builtin types. Any module may import it as `_base`.
 - `prelude.brp` imports the base types, the operation modules' methods and
-  `io/console`'s `print` and `print_error`. It
+  `io/console/output`'s `print` and `print_error`. It
   is the only implicit import: application roots and ordinary user helper
   modules receive its selections, and it cannot be imported explicitly.
 
@@ -114,7 +114,16 @@ The original modules are preserved in the legacy
 Pass `blorp/standard_library` explicitly as the argument to `blorp compile --library-root`. Bare `int: add` imports resolve here; relative
 imports still resolve beside their importer. There is no host-library fallback.
 
-`io/console.brp` adapts the legacy
+`io/console/` has one module per error type, and reads and writes `Bytes`:
+
+- `output.brp`: `print` and `print_error`, and the byte writes `write`,
+  `write_error` and `flush`. A write a closed pipe refuses is dropped.
+- `read_line.brp`: `read_line` and `ReadLineError`.
+- `read_exact.brp`: `read_exact` and `ReadExactError`.
+
+Each read returns `Result[Option[Bytes], _]`, with `None` at end of input.
+
+`output.brp`'s `print` adapts the legacy
 [`standard_library/src/io.brp`](https://github.com/kablorp/blorp/blob/ee9e001c6de8911ee486fd992419bef5bc628e8b/standard_library/src/io.brp). The prelude
 supplies `print` and `print_error`. `print(String) -> Void` is concrete and
 impure, mapped to the closed `string.print` operation. It borrows the String,
@@ -378,7 +387,7 @@ rejected and `int: Int methods` uses `int`'s functions on Int; no module
 reexports another module's types or methods. The prelude is a compiler input and
 cannot be imported explicitly.
 
-`io/console.print_error(String) -> Void` concretely adapts the host Stringable API.
+`io/console/output.print_error(String) -> Void` concretely adapts the host Stringable API.
 It borrows its input, writes counted bytes to stderr once, and attempts LF only
 following a full transfer; short writes (including EINTR) stop without retry.
 The host attempts LF after short writes as well. Neither API reports delivery.

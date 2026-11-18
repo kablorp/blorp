@@ -1103,12 +1103,13 @@ with their constructors, the operator traits, `Equatable`, `Hashable`,
 generic `max` and `min` of any `Orderable`, the conversions
 `to_uint8` and `parse_uint8`, and the methods of Int, UInt8, Float, String and
 List, so `(42 + 1).to_string().length()`
-needs no import. Other direct calls need named imports: console output is in
-the prelude, while files, processes and the environment are explicit imports.
-A user module cannot declare `print`, `print_error`, `max` or `min` ("max is
-provided by the prelude", with the help "give this function another name").
-Selecting `print` or `print_error` from `io/console` as well is redundant but
-accepted: an import of a name already in scope enters once. A function whose
+needs no import. Other direct calls need named imports: console text output is
+in the prelude, while byte console I/O, files, processes and the environment are
+explicit imports. A user module cannot declare `print`, `print_error`, `max` or
+`min` ("max is provided by the prelude", with the help "give this function
+another name"). Selecting `print` or `print_error` from `io/console/output` as
+well is redundant but accepted: an import of a name already in scope enters
+once. A function whose
 first parameter is a String and whose name is a String method the prelude
 provides, such as `lines` or `parse_uint8`, is rejected as well, with "two
 functions named lines can accept the same receiver"; give it another name. Library modules
@@ -1337,6 +1338,25 @@ end of the program. Every console operation also closes standard output at exit
 under that guard, so the final flush cannot raise SIGPIPE. `process.run` and
 `process.exit_interrupted` also flush standard output under the guard, and close
 it at exit the same way.
+
+The library exposes them as bytes under `io/console/`, one module per error
+type:
+
+- `io/console/output`: `print` and `print_error` for text lines, and
+  `write(data: Bytes)`, `write_error(data: Bytes)` and `flush()`. They return
+  `Void`: a write a closed pipe refuses is dropped, by design.
+- `io/console/read_line`: `read_line() -> Result[Option[Bytes], ReadLineError]`
+  gives the line without its LF or a CR just before it (a lone CR stays), a
+  last line without an LF as it is, and `None` at end of input.
+- `io/console/read_exact`:
+  `read_exact(byte_count: Int) -> Result[Option[Bytes], ReadExactError]` gives
+  exactly that many bytes; `Some` of the empty bytes for a count of zero or
+  less; `None` when input ended before the first byte; and `Err(EndedEarly(n))`
+  when it ended after `n`.
+
+Both error unions have `IsADirectory` and `OtherOs(Int)`, with a `Stringable`
+text. A language server reads its headers with `read_line` and its body with
+`read_exact`, which share one input buffer.
 
 ## Compiler architecture
 

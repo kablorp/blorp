@@ -1,0 +1,179 @@
+-- End-to-end cases for io/console: compiled programs run with standard input,
+-- which the harness's own runs cannot give. Each program compiles once within
+-- its ceiling, with no runs of its own, then every case runs its normal and its
+-- strict binary here, through process.capture, with exact stdout and a clean
+-- leak report. Standard input and output are Strings here, so bytes that are not
+-- UTF-8 are covered by the runtime suite (console_test.c), as is a write after
+-- the reader has closed.
+import:
+    list: List methods
+    result: Result methods
+    test: TestSuite
+    ../driver/harness:
+        CompileCeiling,
+        Program,
+        fixture_program,
+        isolated,
+        reported,
+        run_expecting,
+        strict_leak_check,
+        strict_native_binary,
+        verify_program,
+    ../driver/reports: report_allocations
+
+
+private RUN_TIMEOUT_MS: Int = 10000
+
+-- Each ceiling is the compile's measured cost plus 15%.
+private LINES_CEILING: CompileCeiling = { allocations = 128552, instructions = 400993918 }
+private PROTOCOL_CEILING: CompileCeiling = { allocations = 151491, instructions = 455707164 }
+private PROMPT_CEILING: CompileCeiling = { allocations = 171485, instructions = 525072293 }
+
+
+-- One run of a compiled program: what it is given on standard input and after its
+-- name, and what it must print.
+record Case {
+    label: String,
+    arguments: List[String],
+    stdin: String,
+    stdout: String,
+}
+
+
+private pure func input_case(label: String, stdin: String, stdout: String) -> Case:
+    { label = label, arguments = [], stdin = stdin, stdout = stdout }
+
+
+private func run_case(binary: String, strict: Bool, case: Case) -> Result[Void, String]:
+    name = "${binary}.${case.label}"
+    started ?= isolated(binary, case.arguments, RUN_TIMEOUT_MS)
+    environment = if strict:
+        strict_leak_check()
+    else:
+        started.environment
+    ran ?= run_expecting(name, { started | stdin = Some(case.stdin), environment = environment }, 0)
+    _ ?= if strict:
+        report_allocations(ran.stderr).map_err(pure func(error: String): "${name}: ${error}")
+    else:
+        Ok(0)
+    if ran.stdout == case.stdout:
+        Ok(void)
+    else:
+        Err("${name}: expected stdout ${case.stdout}; got ${ran.stdout}")
+
+
+-- Runs every case on the normal binary, then the strict one, until one fails.
+private func run_cases(prefix: String, cases: List[Case]) -> Result[Void, String]:
+    var outcome: Result[Void, String] = Ok(void)
+    for case in cases:
+        match outcome:
+            Ok(_):
+                outcome = run_case(prefix + ".normal", False, case)
+                match outcome:
+                    Ok(_): outcome = run_case(strict_native_binary(prefix), True, case)
+                    Err(_): void
+            Err(_):
+                void
+    outcome
+
+
+-- Builds the fixture with no runs of its own, then runs the cases on both binaries.
+private func verify_cases(
+    compiler: String,
+    c_compiler: String,
+    work_directory: String,
+    check_instructions: Bool,
+    program: Program,
+    cases: List[Case],
+) -> Bool:
+    built = verify_program(compiler, c_compiler, work_directory, check_instructions, program)
+    outcome = match built:
+        Ok(_): run_cases(work_directory + "/" + program.name, cases)
+        Err(message): Err(message)
+    reported(outcome)
+
+
+private pure func console_program(
+    name: String,
+    fixture: String,
+    ceiling: CompileCeiling,
+) -> Program:
+    fixture_program(name, "console/" + fixture, ceiling, [])
+
+
+func suite(
+    compiler: String,
+    c_compiler: String,
+    work_directory: String,
+    check_instructions: Bool,
+) -> TestSuite:
+    run_cases_of = func(program: Program, cases: List[Case]) -> Bool: verify_cases(
+        compiler,
+        c_compiler,
+        work_directory,
+        check_instructions,
+        program,
+        cases,
+    )
+    written_file = work_directory + "/console_prompt.txt"
+    {
+        description = "Blorp console",
+        tests = [
+            (
+                "read_line returns LF and CRLF lines, keeps a lone CR, and ends with None",
+                func(): run_cases_of(console_program("console_lines", "lines", LINES_CEILING), [
+                    input_case("lf", "one\ntwo\n", "line 3 [one]\nline 3 [two]\nend\n"),
+                    input_case("crlf", "one\r\ntwo\r\n", "line 3 [one]\nline 3 [two]\nend\n"),
+                    input_case("empty lines", "\n\r\n", "line 0 []\nline 0 []\nend\n"),
+                    input_case("lone cr", "a\rb\nc\r", "line 3 [a\rb]\nline 2 [c\r]\nend\n"),
+                    input_case("one cr stripped", "a\r\r\n", "line 2 [a\r]\nend\n"),
+                    input_case("no final lf", "one\ntwo", "line 3 [one]\nline 3 [two]\nend\n"),
+                    input_case("end of input", "", "end\n"),
+                ]),
+            ),
+            (
+                "headers then an exact body, a zero count and a short body read as the language server does",
+                func(): run_cases_of(
+                    console_program("console_protocol", "protocol", PROTOCOL_CEILING),
+                    [
+                        input_case(
+                            "exact body",
+                            "Content-Length: 5\r\nOther: x\r\n\r\nhelloX",
+                            "body 5 [hello]\nbody 0 []\nbody 1 [X]\n",
+                        ),
+                        input_case(
+                            "short body",
+                            "Content-Length: 10\r\n\r\nabc",
+                            "error: input ended after 3 bytes\nbody 0 []\nnone\n",
+                        ),
+                        input_case(
+                            "input ends before the body",
+                            "Content-Length: 4\r\n\r\n",
+                            "none\nbody 0 []\nnone\n",
+                        ),
+                        input_case(
+                            "zero count",
+                            "Content-Length: 0\r\n\r\nq",
+                            "body 0 []\nbody 0 []\nbody 1 [q]\n",
+                        ),
+                        input_case(
+                            "negative count",
+                            "Content-Length: -3\r\n\r\nq",
+                            "body 0 []\nbody 0 []\nbody 1 [q]\n",
+                        ),
+                    ],
+                ),
+            ),
+            (
+                "a prompt appears before the reply, print and write keep their order, and write sits beside write_text",
+                func(): run_cases_of(console_program("console_prompt", "prompt", PROMPT_CEILING), [
+                    {
+                        label = "prompt",
+                        arguments = [written_file],
+                        stdin = "hi\n",
+                        stdout = "prompt> \n[\nhi]\n\nwritten\n",
+                    },
+                ]),
+            ),
+        ],
+    }
