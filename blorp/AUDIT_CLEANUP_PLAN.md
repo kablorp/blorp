@@ -88,3 +88,4 @@ is identical in every row (`85cbfd8e3e7afde3`). Lines are each commit's
 | Change | Allocations | Instructions | Peak heap | Own-source allocations, instructions | Production lines | Test lines |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
 | 1. Dead code | -0.00% | +0.04% | +0.00% | -0.10%, -0.09% | +28, -156 (net -128) | +22, -41 |
+| 2. Native labels | +0.02% | +0.03% | +0.00% | +0.01%, +0.06% | +152, -230 (net -78) | +30, -49 |
