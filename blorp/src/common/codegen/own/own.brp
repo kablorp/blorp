@@ -420,7 +420,7 @@ private pure func block_uses(
     outer: List[ValueInterval],
     first_value: Int,
     seed_count: Int,
-    span_result: Result[Span, Diagnostic]
+    terminal_use_span: Span
 ) -> Result[List[Option[Int]], Diagnostic]:
     unused: Option[Int] = None
     var uses = repeat(unused, seed_count + steps.block_value_count())
@@ -483,16 +483,19 @@ private pure func block_uses(
         TerminalValue(result): [result]
         TerminalArguments(arguments): arguments
         TerminalJoin(result, _, _): [result]
-    -- Resolve once at the caller, but keep operand errors ahead of a bad exit.
-    span ?= span_result
-
     -- Start this builder inside the successful span scope. The outer snapshot
     -- may cause one initial copy; subsequent writes keep the local vector owner.
     var terminal_uses = uses
     var invalid: Option[Diagnostic] = None
 
     for operand in operands:
-        match operand.use_slot(introduced_count, outer, first_value, terminal_uses.length(), span):
+        match operand.use_slot(
+            introduced_count,
+            outer,
+            first_value,
+            terminal_uses.length(),
+            terminal_use_span
+        ):
             Ok(Some(index)):
                 terminal_uses = terminal_uses.set(index, Some(step_position))
             Ok(None):
@@ -512,7 +515,10 @@ private pure func block_uses(
                 match arguments.get(position):
                     None:
                         invalid = Some(
-                            internal_error(span, "join arm carries the wrong number of values")
+                            internal_error(
+                                terminal_use_span,
+                                "join arm carries the wrong number of values"
+                            )
                         )
                     Some(operand):
                         match operand.use_slot(
@@ -538,46 +544,6 @@ private pure func block_uses(
     match invalid:
         Some(error): Err(error)
         None: Ok(terminal_uses)
-
-
--- A loop edge reads every outgoing occurrence before retiring any owner.
-pure func exit_last_uses(
-    steps: List[LoweredStep],
-    exit: LoopExit,
-    prefix_count: Int,
-    first_value: Int
-) -> Result[List[Option[Int]], Diagnostic]:
-    outer: List[ValueInterval] = [{ first = 0, count = prefix_count }]
-    terminal: BlockTerminal = match exit:
-        lower.Recur(arguments, _): TerminalArguments(arguments)
-        lower.Break(outputs): TerminalArguments([outputs.value].concat(outputs.carried))
-    span = match exit:
-        lower.Recur(_, span): span
-        lower.Break(outputs): outputs.span
-    steps.block_uses(terminal, outer, first_value, 0, Ok(span))
-
-
-pure func block_last_uses(
-    steps: List[LoweredStep],
-    result: ValueId,
-    prefix_count: Int,
-    first_value: Int
-) -> Result[List[Option[Int]], Diagnostic]:
-    outer: List[ValueInterval] = [{ first = 0, count = prefix_count }]
-    steps.block_uses(
-        TerminalValue(result),
-        outer,
-        first_value,
-        0,
-        steps.terminal_span(result, outer)
-    )
-
-
-pure func last_uses(
-    steps: List[LoweredStep],
-    result: ValueId
-) -> Result[List[Option[Int]], Diagnostic]:
-    steps.block_last_uses(result, 0, 0)
 
 
 record OwnerAcquisition {
@@ -2663,7 +2629,7 @@ private pure func insert_yielding_arm(
     outer = enclosing.enclosing_intervals()
     span ?= arm.join_terminal_span(outputs.value, outer)
     terminal: BlockTerminal = TerminalJoin(outputs.value, outputs.carried, parameters)
-    uses ?= arm.steps.block_uses(terminal, outer, first_value, arm.inputs.length(), Ok(span))
+    uses ?= arm.steps.block_uses(terminal, outer, first_value, arm.inputs.length(), span)
     discharges ?= arm.entering_discharges(outputs, entering, enclosing, span)
     inserted ?= arm.steps.insert_steps(
         DropAtLastUse(uses),
@@ -3079,7 +3045,7 @@ private pure func insert_loop_exit_block(
         enclosing.enclosing_intervals(),
         first_value,
         seed_inputs.length(),
-        Ok(span)
+        span
     )
     -- Header obligations survive until the complete edge batch, including
     -- old values that are not outgoing. Arm inputs keep last-use scheduling.
@@ -3396,7 +3362,7 @@ private pure func insert_contracted_function(
     records: List[ConcreteRecord]
 ) -> Result[InsertedFunction, Diagnostic]:
     span ?= function.steps.terminal_span(function.result, [])
-    uses ?= function.steps.block_uses(TerminalValue(function.result), [], 0, 0, Ok(span))
+    uses ?= function.steps.block_uses(TerminalValue(function.result), [], 0, 0, span)
     inserted ?= function.steps.insert_steps(
         DropAtLastUse(uses),
         [],
