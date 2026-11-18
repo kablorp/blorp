@@ -463,24 +463,19 @@ private pure func freeze_record_fields(
     assumptions: List[model.TraitRequirement],
     traits: TraitAvailability
 ) -> Result[List[CheckedRecordField], CheckError]:
-    var frozen: List[CheckedRecordField] = []
-    var failure: Option[CheckError] = None
-
     -- All child errors precede ordinary field mismatches, including later children.
-    for field in fields:
-        match field.value.freeze_pending_value(slots, captures, constructions, assumptions, traits):
-            Ok(value):
-                frozen = frozen.append({
-                    field = field.field,
-                    value = value,
-                    span = field.value.span
-                })
-            Err(error):
-                failure = Some(error)
-                break
-    _: Void ?= match failure:
-        Some(error): Err(error)
-        None: Ok(void)
+    frozen ?= fields.translated_list(
+        pure func(field: PendingRecordField) -> Result[CheckedRecordField, CheckError]:
+            field.value
+                .freeze_pending_value(slots, captures, constructions, assumptions, traits)
+                .map(
+                    pure func(value: CheckedExpr) -> CheckedRecordField: {
+                        field = field.field,
+                        value = value,
+                        span = field.value.span
+                    }
+                )
+    )
     valid ?= fields.validate_record_fields(slots)
     Ok(frozen)
 
@@ -4114,18 +4109,17 @@ private pure func freeze_retained_fields(
     slots: List[InferenceSlot],
     span: Span
 ) -> Result[List[RetainedRecordField], CheckError]:
-    var frozen: List[RetainedRecordField] = []
-    var failure: Option[CheckError] = None
-    for field in fields:
-        match field.value_type.publish_inference_type(slots, CompleteInference, span):
-            Ok(value_type):
-                frozen = frozen.append({ field = field.field, value_type = value_type })
-            Err(error):
-                failure = Some(error)
-                break
-    match failure:
-        Some(error): Err(error)
-        None: Ok(frozen)
+    fields.translated_list(
+        pure func(field: PendingRetainedField) -> Result[RetainedRecordField, CheckError]:
+            field.value_type
+                .publish_inference_type(slots, CompleteInference, span)
+                .map(
+                    pure func(value_type: TypeRef) -> RetainedRecordField: {
+                        field = field.field,
+                        value_type = value_type
+                    }
+                )
+    )
 
 
 private pure func freeze_opaque_operand(
@@ -4167,23 +4161,17 @@ private pure func freeze_callable_choice(
 ) -> Result[model.CallableChoice, CheckError]:
     match value.base:
         PendingNamedCallable(id, signature, start):
-            var arguments: List[TypeRef] = []
-            var failure: Option[CheckError] = None
-            for parameter in signature.type_parameters:
-                match inference_type(ParameterType(parameter), signature.type_parameters, start).publish_inference_type(
-                    slots,
-                    CompleteInference,
-                    value.span
-                ):
-                    Ok(argument):
-                        arguments = arguments.append(argument)
-                    Err(error):
-                        failure = Some(error)
-                        break
-            match failure:
-                Some(error):
+            match signature.type_parameters.translated_list(
+                pure func(parameter: TypeParameterId) -> Result[TypeRef, CheckError]:
+                    inference_type(ParameterType(parameter), signature.type_parameters, start).publish_inference_type(
+                        slots,
+                        CompleteInference,
+                        value.span
+                    )
+            ):
+                Err(error):
                     Err(error)
-                None:
+                Ok(arguments):
                     match traits.prove_requirements(signature, arguments, assumptions, value.span):
                         Err(error): Err(error)
                         Ok(_): Ok(NamedCallable(id, arguments))

@@ -89,3 +89,10 @@ is identical in every row (`85cbfd8e3e7afde3`). Lines are each commit's
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
 | 1. Dead code | -0.00% | +0.04% | +0.00% | -0.10%, -0.09% | +28, -156 (net -128) | +22, -41 |
 | 2. Native labels | +0.02% | +0.03% | +0.00% | +0.01%, +0.06% | +152, -230 (net -78) | +30, -49 |
+| 3. Result helpers | +0.23% | +0.38% | +0.00% | +0.33%, +0.51% | +169, -274 (net -105) | 0 |
+
+Change 3's cost comes from closures. Each converted site allocates the
+closure it passes to `translated_list` once per call of the enclosing
+function, and several sites run per expression in inference. The cost is
+within the ceilings, and it is the compiler's to remove: a closure passed to
+an immediately called pure helper could live on the stack.
