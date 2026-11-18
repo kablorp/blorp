@@ -7,6 +7,7 @@ import:
     dict: combine_hash
     int: Int methods
     list: repeat
+    result: Result methods
     ../../syntax/names: NameId
     ../../syntax/source: FunctionLabel, ModuleId
     ../../syntax/syntax:
@@ -133,6 +134,67 @@ pure func type_children(value_type: TypeRef) -> List[TypeRef]:
         NominalType(_, arguments): arguments
         -- No integer format has type children.
         VoidType | IntegerType(_) | FloatType | StringType | ParameterType(_): []
+
+
+-- The type with each rigid parameter of `owner` replaced, simultaneously, by the
+-- value at its declaration position. Replacements are terminal: they are never
+-- substituted again, so a caller's own parameters may appear among them. The
+-- error names a parameter of `owner` that has no value.
+pure func substitute_parameters(
+    value_type: TypeRef,
+    owner: TypeParameterOwner,
+    values: List[TypeRef],
+) -> Result[TypeRef, TypeParameterId]:
+    match value_type:
+        TupleType(elements):
+            elements
+                .substitute_each(owner, values)
+                .map(pure func(replaced): TupleType(replaced))
+        CallableType(purity, parameters, result):
+            match parameters.substitute_each(owner, values):
+                Err(missing):
+                    Err(missing)
+                Ok(replaced):
+                    result
+                        .substitute_parameters(owner, values)
+                        .map(pure func(value): CallableType(purity, replaced, value))
+        ListType(element):
+            element
+                .substitute_parameters(owner, values)
+                .map(pure func(value): ListType(value))
+        NominalType(declaration, arguments):
+            arguments
+                .substitute_each(owner, values)
+                .map(pure func(replaced): NominalType(declaration, replaced))
+        ParameterType(id):
+            replacement = if id.parameter_owner() == owner:
+                values.get(id.parameter_position())
+            else:
+                None
+            match replacement:
+                Some(value): Ok(value)
+                None: Err(id)
+        VoidType | IntegerType(_) | FloatType | StringType:
+            Ok(value_type)
+
+
+private pure func substitute_each(
+    types: List[TypeRef],
+    owner: TypeParameterOwner,
+    values: List[TypeRef],
+) -> Result[List[TypeRef], TypeParameterId]:
+    var replaced: List[TypeRef] = []
+    var missing: Option[TypeParameterId] = None
+    for value_type in types:
+        match value_type.substitute_parameters(owner, values):
+            Ok(value):
+                replaced = replaced.append(value)
+            Err(id):
+                missing = Some(id)
+                break
+    match missing:
+        Some(id): Err(id)
+        None: Ok(replaced)
 
 
 -- Whether a rigid type parameter occurs anywhere in the type.
@@ -285,11 +347,34 @@ union ImplementedBody:
     AuthoredMethod(FunctionId)
     TraitDefault(FunctionId)
     StructuralEquality(AggregateId, CheckedEqualityBody)
+    -- An opaque type's derived member is its representation's, written over the
+    -- opaque declaration's own parameters; erasure makes them one function.
+    RepresentationBody(OpaqueId, TypeRef)
 
 
 fixed union EqualityMember:
     EqualityField(FieldId)
     EqualityPayload(VariantId, Int)
+    EqualityRepresentation(OpaqueId)
+
+
+-- The declaration whose equality is derived from its parts: an aggregate's
+-- fields or payloads, or an opaque type's representation.
+fixed union EqualityOwner:
+    AggregateEquality(AggregateId)
+    OpaqueEquality(OpaqueId)
+
+
+pure func equality_head(owner: EqualityOwner) -> TypeHead:
+    match owner:
+        AggregateEquality(aggregate): aggregate.aggregate_head()
+        OpaqueEquality(id): OpaqueHead(id)
+
+
+pure func equality_parameter_owner(owner: EqualityOwner) -> TypeParameterOwner:
+    match owner:
+        AggregateEquality(aggregate): aggregate.aggregate_owner()
+        OpaqueEquality(id): OpaqueDeclaration(id)
 
 
 -- A record or union declaration: the head of a nominal type, and the owner of
@@ -565,31 +650,54 @@ pure func method_body(
     call: AcceptedMethodCall,
 ) -> Option[SelectedMethodBody]:
     var found: Option[SelectedMethodBody] = None
-    receiver = call.method_receiver()
+    var receiver = call.method_receiver()
     method = call.method_identity()
-    family: Option[AcceptedImplementation] = match receiver.type_head():
-        Some(head): traits.family_for(method.trait_method_owner(), head)
-        None: None
-    match family:
-        None:
-            void
-        Some(implementation):
-            for member in implementation.methods:
-                if member.method == method:
-                    found = match member.body:
-                        AuthoredMethod(function):
-                            Some({
-                                body = DeclaredBody(function),
-                                arguments = receiver.receiver_arguments(),
-                            })
-                        TraitDefault(function):
-                            Some({ body = DeclaredBody(function), arguments = [receiver] })
-                        StructuralEquality(aggregate, _):
-                            Some({
-                                body = DerivedEqualityBody(aggregate),
-                                arguments = receiver.receiver_arguments(),
-                            })
-                    break
+    -- A derived opaque member continues at its representation, so this loops
+    -- rather than recurses: a recursive method_body is never inlined into its
+    -- many hot callers. Declarations are finite, so the chain ends.
+    var resolving: Bool = True
+    while resolving:
+        resolving = False
+        family: Option[AcceptedImplementation] = match receiver.type_head():
+            Some(head): traits.family_for(method.trait_method_owner(), head)
+            None: None
+        match family:
+            None:
+                void
+            Some(implementation):
+                for member in implementation.methods:
+                    if member.method == method:
+                        match member.body:
+                            AuthoredMethod(function):
+                                found = Some({
+                                    body = DeclaredBody(function),
+                                    arguments = receiver.receiver_arguments(),
+                                })
+                            TraitDefault(function):
+                                found = Some({
+                                    body = DeclaredBody(function),
+                                    arguments = [receiver],
+                                })
+                            StructuralEquality(aggregate, _):
+                                found = Some({
+                                    body = DerivedEqualityBody(aggregate),
+                                    arguments = receiver.receiver_arguments(),
+                                })
+                            RepresentationBody(opaque_id, representation):
+                                match representation.substitute_parameters(
+                                    OpaqueDeclaration(opaque_id),
+                                    receiver.receiver_arguments(),
+                                ):
+                                    Ok(actual):
+                                        receiver = actual
+                                        resolving = True
+                                    -- Every use supplies the opaque type's own arguments, so
+                                    -- a missing one cannot happen; the None left in `found`
+                                    -- would reach specialize's "accepted method has no
+                                    -- implementation body" fault.
+                                    Err(_):
+                                        void
+                        break
     found
 
 

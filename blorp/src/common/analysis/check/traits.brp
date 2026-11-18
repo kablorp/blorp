@@ -22,6 +22,7 @@ import:
     ../assemble: ParsedContents
     ../ids:
         DeclarationInventory,
+        OpaqueRow,
         RecordRow,
         UnionRow,
         FunctionId,
@@ -93,7 +94,11 @@ import:
     ./model:
         AggregateId(RecordAggregate, UnionAggregate),
         NominalId(AggregateNominal, OpaqueNominal),
-        EqualityMember(EqualityField, EqualityPayload),
+        EqualityMember(EqualityField, EqualityPayload, EqualityRepresentation),
+        EqualityOwner(AggregateEquality, OpaqueEquality),
+        equality_head,
+        equality_parameter_owner,
+        CheckedOpaque,
         CheckedRecord,
         CheckedUnion,
         AcceptedTraits,
@@ -112,7 +117,7 @@ import:
         AcceptedTraitMethod,
         AcceptedImplementation,
         ImplementedMethod,
-        ImplementedBody(AuthoredMethod, TraitDefault, StructuralEquality),
+        ImplementedBody(AuthoredMethod, TraitDefault, StructuralEquality, RepresentationBody),
         TypeParameterId,
         LocatedTrait,
         TraitRequirement,
@@ -1276,7 +1281,7 @@ pure func prove_requirements(
 -- Negative causes are checker-local. Successful publication keeps only the
 -- same accepted view; no partially supported body or proof cache escapes.
 private record EqualityUnavailable {
-    aggregate: AggregateId,
+    owner: EqualityOwner,
     member: EqualityMember,
     required_trait: TraitId,
     receiver: TypeRef,
@@ -1338,7 +1343,7 @@ pure func unavailable_equality_member(
     head: TypeHead,
 ) -> Option[EqualityMember]:
     from_opaque TraitAvailability(availability).unavailable
-        .find(pure func(failure): failure.aggregate.aggregate_head() == head)
+        .find(pure func(failure): failure.owner.equality_head() == head)
         .map(pure func(failure): failure.member)
 
 
@@ -1346,7 +1351,10 @@ pure func unavailable_equality_member(
 -- read the preceding round's summary, substituting real ordered arguments;
 -- they never recursively reopen another declaration's fields.
 private record EqualityCandidate {
-    aggregate: AggregateId,
+    owner: EqualityOwner,
+    -- The owner's head, taken once at construction: `summarize_family` scans every
+    -- candidate for each goal, so the scan must not recompute it.
+    head: TypeHead,
     requirements: List[TraitRequirement],
 }
 
@@ -1362,14 +1370,14 @@ private pure func summarize_goal(
     required: TraitId,
     receiver: TypeRef,
     possible: List[EqualityCandidate],
-    owner: AggregateId,
+    owner: EqualityOwner,
     member: EqualityMember,
     summary: EqualitySummary,
     span: Span,
 ) -> Result[EqualitySummary, CheckError]:
     match receiver:
         ParameterType(parameter):
-            if parameter.parameter_owner() == owner.aggregate_owner():
+            if parameter.parameter_owner() == owner.equality_parameter_owner():
                 var requirements = summary.requirements
                 var known: Bool = False
                 var position = 0
@@ -1402,7 +1410,7 @@ private pure func summarize_family(
     required: TraitId,
     receiver: TypeRef,
     possible: List[EqualityCandidate],
-    owner: AggregateId,
+    owner: EqualityOwner,
     member: EqualityMember,
     summary: EqualitySummary,
     span: Span,
@@ -1413,7 +1421,7 @@ private pure func summarize_family(
         None:
             result = { result |
                 failure = Some({
-                    aggregate = owner,
+                    owner = owner,
                     member = member,
                     required_trait = required,
                     receiver = receiver,
@@ -1464,14 +1472,14 @@ private pure func summarize_family(
                         -- appends one per record and union row, and each round only filters it, so
                         -- heads are unique and the first head match is the only one.
                         for candidate in possible:
-                            if candidate.aggregate.aggregate_head() == head:
+                            if candidate.head == head:
                                 provisional = Some(candidate)
                                 break
                     match provisional:
                         None:
                             result = { result |
                                 failure = Some({
-                                    aggregate = owner,
+                                    owner = owner,
                                     member = member,
                                     required_trait = required,
                                     receiver = receiver,
@@ -1479,7 +1487,7 @@ private pure func summarize_family(
                             }
                         Some(candidate):
                             substitution: Substitution = {
-                                owner = candidate.aggregate.aggregate_owner(),
+                                owner = candidate.owner.equality_parameter_owner(),
                                 values = arguments,
                             }
                             for bound in candidate.requirements:
@@ -1513,20 +1521,28 @@ private pure func summarize_family(
         None: Ok(result)
 
 
+private pure func equality_candidate(
+    owner: EqualityOwner,
+    requirements: List[TraitRequirement],
+) -> EqualityCandidate:
+    { owner = owner, head = owner.equality_head(), requirements = requirements }
+
+
 private pure func summarize_members(
     traits: AcceptedTraits,
     required: TraitId,
     candidate: EqualityCandidate,
     records: List[CheckedRecord],
     unions: List[CheckedUnion],
+    opaques: List[CheckedOpaque],
     possible: List[EqualityCandidate],
 ) -> Result[EqualitySummary, CheckError]:
     -- Atom order is first-established and never oscillates through recursive
     -- summaries. The written member walk can refine an atom's earlier span.
     var summary: EqualitySummary = { requirements = candidate.requirements, failure = None }
     var invalid: Option[CheckError] = None
-    match candidate.aggregate:
-        RecordAggregate(record_row):
+    match candidate.owner:
+        AggregateEquality(RecordAggregate(record_row)):
             match records.get(record_row.record_number()):
                 Some(row):
                     for field in row.fields:
@@ -1534,7 +1550,7 @@ private pure func summarize_members(
                             required,
                             field.value_type.value_type,
                             possible,
-                            candidate.aggregate,
+                            candidate.owner,
                             EqualityField(field.id),
                             summary,
                             field.value_type.span,
@@ -1549,7 +1565,7 @@ private pure func summarize_members(
                             break
                 None:
                     invalid = Some(checker_invariant(compiler_span(), InvalidFunctionContract))
-        UnionAggregate(union_row):
+        AggregateEquality(UnionAggregate(union_row)):
             match unions.get(union_row.union_number()):
                 Some(row):
                     for variant in row.variants:
@@ -1559,7 +1575,7 @@ private pure func summarize_members(
                                 required,
                                 field.value_type,
                                 possible,
-                                candidate.aggregate,
+                                candidate.owner,
                                 EqualityPayload(variant.id, position),
                                 summary,
                                 field.span,
@@ -1579,6 +1595,22 @@ private pure func summarize_members(
                                 .or(invalid.is_some())
                         ):
                             break
+                None:
+                    invalid = Some(checker_invariant(compiler_span(), InvalidFunctionContract))
+        OpaqueEquality(opaque_id):
+            match opaques.get(opaque_id.opaque_number()):
+                Some(row):
+                    match traits.summarize_goal(
+                        required,
+                        row.underlying_type.value_type,
+                        possible,
+                        candidate.owner,
+                        EqualityRepresentation(opaque_id),
+                        summary,
+                        row.underlying_type.span,
+                    ):
+                        Ok(updated): summary = updated
+                        Err(error): invalid = Some(error)
                 None:
                     invalid = Some(checker_invariant(compiler_span(), InvalidFunctionContract))
     match invalid:
@@ -1628,20 +1660,47 @@ private pure func complete_equality_availability(
                 .family_for(canonical, RecordHead(record_row.id))
                 .is_none()
         ):
-            possible = possible.append({
-                aggregate = RecordAggregate(record_row.id),
-                requirements = record_row.requirements,
-            })
+            possible = possible.append(
+                equality_candidate(
+                    AggregateEquality(RecordAggregate(record_row.id)),
+                    record_row.requirements,
+                ),
+            )
     for union_row in unions:
         if (
             traits
                 .family_for(canonical, UnionHead(union_row.id))
                 .is_none()
         ):
-            possible = possible.append({
-                aggregate = UnionAggregate(union_row.id),
-                requirements = union_row.requirements,
-            })
+            possible = possible.append(
+                equality_candidate(
+                    AggregateEquality(UnionAggregate(union_row.id)),
+                    union_row.requirements,
+                ),
+            )
+    -- A resource type is never copied, so its handle has no value equality.
+    var derivation_fault: Option[CheckError] = None
+    for opaque_row in declarations.opaques:
+        written = parsed.declarations
+            .inventory_opaques()
+            .get(opaque_row.id.opaque_number())
+        derives = match written:
+            Some(row):
+                row.declaration.resource_type.not()
+            None:
+                derivation_fault = Some(checker_invariant(compiler_span(), InvalidFunctionContract))
+                False
+        if derives.and(
+            traits
+                .family_for(canonical, OpaqueHead(opaque_row.id))
+                .is_none(),
+        ):
+            possible = possible.append(
+                equality_candidate(OpaqueEquality(opaque_row.id), opaque_row.requirements),
+            )
+    _: Void ?= match derivation_fault:
+        Some(error): Err(error)
+        None: Ok(void)
     var unavailable: List[EqualityUnavailable] = []
     var invalid: Option[CheckError] = None
     var changed: Bool = True
@@ -1649,7 +1708,14 @@ private pure func complete_equality_availability(
         changed = False
         var retained: List[EqualityCandidate] = []
         for candidate in possible:
-            match traits.summarize_members(canonical, candidate, records, unions, possible):
+            match traits.summarize_members(
+                canonical,
+                candidate,
+                records,
+                unions,
+                declarations.opaques,
+                possible,
+            ):
                 Ok(summary):
                     match summary.failure:
                         Some(failure):
@@ -1676,17 +1742,31 @@ private pure func complete_equality_availability(
     var implementations = traits.implementations.implementation_rows()
     var error: Option[CheckError] = None
     for candidate in possible:
-        match supported_implementation(
-            parsed.names,
-            written_records,
-            written_unions,
-            candidate,
-            records,
-            unions,
-            contract,
-            boolean,
-            canonical,
-        ):
+        built = match candidate.owner:
+            AggregateEquality(aggregate):
+                supported_implementation(
+                    parsed.names,
+                    written_records,
+                    written_unions,
+                    aggregate,
+                    candidate.requirements,
+                    records,
+                    unions,
+                    contract,
+                    boolean,
+                    canonical,
+                )
+            OpaqueEquality(opaque_id):
+                parsed.declarations
+                    .inventory_opaques()
+                    .representation_implementation(
+                        opaque_id,
+                        candidate.requirements,
+                        declarations.opaques,
+                        contract,
+                        canonical,
+                    )
+        match built:
             Ok(implementation):
                 implementations = implementations.append(implementation)
             Err(failure):
@@ -1709,14 +1789,14 @@ private pure func supported_implementation(
     names: NameTable,
     written_records: List[RecordRow],
     written_unions: List[UnionRow],
-    candidate: EqualityCandidate,
+    aggregate: AggregateId,
+    requirements: List[TraitRequirement],
     records: List[CheckedRecord],
     unions: List[CheckedUnion],
     contract: AcceptedTrait,
     boolean: DesignatedBoolean[VariantId],
     canonical: TraitId,
 ) -> Result[AcceptedImplementation, CheckError]:
-    aggregate = candidate.aggregate
     name ?= aggregate_name(written_records, written_unions, aggregate)
     span = name.span
     spelling ?= names
@@ -1732,16 +1812,6 @@ private pure func supported_implementation(
                 .get(union_row.union_number())
                 .map(pure func(row): row.type_parameters)
     parameters ?= declared_parameters.or_checker_invariant(span, InvalidFunctionContract)
-    var parameter_bounds: List[List[LocatedTrait]] = []
-    for parameter in parameters:
-        var bounds: List[LocatedTrait] = []
-        for inferred_bound in candidate.requirements:
-            if inferred_bound.parameter == parameter:
-                bounds = bounds.append({
-                    required_trait = inferred_bound.required_trait,
-                    span = inferred_bound.span,
-                })
-        parameter_bounds = parameter_bounds.append(bounds)
     var methods: List[ImplementedMethod] = []
     var error: Option[CheckError] = None
     for method in contract.methods:
@@ -1752,7 +1822,7 @@ private pure func supported_implementation(
                 match aggregate.equality_template(
                     equality_label(spelling),
                     parameters,
-                    candidate.requirements,
+                    requirements,
                     records,
                     unions,
                     method,
@@ -1772,7 +1842,59 @@ private pure func supported_implementation(
     Ok({
         trait_id = canonical,
         receiver_head = aggregate.aggregate_head(),
-        parameter_bounds = parameter_bounds,
+        parameter_bounds = inferred_bounds(parameters, requirements),
+        methods = methods,
+        method_provider = None,
+        span = span,
+    })
+
+
+-- Each declared parameter's bounds: its written ones, then what members need.
+private pure func inferred_bounds(
+    parameters: List[TypeParameterId],
+    requirements: List[TraitRequirement],
+) -> List[List[LocatedTrait]]:
+    var parameter_bounds: List[List[LocatedTrait]] = []
+    for parameter in parameters:
+        var bounds: List[LocatedTrait] = []
+        for inferred_bound in requirements:
+            if inferred_bound.parameter == parameter:
+                bounds = bounds.append({
+                    required_trait = inferred_bound.required_trait,
+                    span = inferred_bound.span,
+                })
+        parameter_bounds = parameter_bounds.append(bounds)
+    parameter_bounds
+
+
+-- An opaque type with no written implementation implements the trait by its
+-- representation. Erasure makes the two one function, so no body is generated:
+-- the row names the representation, and `method_body` selects its member.
+private pure func representation_implementation(
+    written: List[OpaqueRow],
+    id: OpaqueId,
+    requirements: List[TraitRequirement],
+    opaques: List[CheckedOpaque],
+    contract: AcceptedTrait,
+    canonical: TraitId,
+) -> Result[AcceptedImplementation, CheckError]:
+    row ?= written
+        .get(id.opaque_number())
+        .or_checker_invariant(compiler_span(), InvalidFunctionContract)
+    span = row.declaration.type_name.span
+    declared ?= opaques
+        .get(id.opaque_number())
+        .or_checker_invariant(span, InvalidFunctionContract)
+    var methods: List[ImplementedMethod] = []
+    for method in contract.methods:
+        body: ImplementedBody = match method.default_body:
+            Some(function): TraitDefault(function)
+            None: RepresentationBody(id, declared.underlying_type.value_type)
+        methods = methods.append({ method = method.id, body = body })
+    Ok({
+        trait_id = canonical,
+        receiver_head = OpaqueHead(id),
+        parameter_bounds = inferred_bounds(declared.type_parameters, requirements),
         methods = methods,
         method_provider = None,
         span = span,
@@ -1821,9 +1943,9 @@ pure func equality_error(
             Some(head):
                 if current_trait == required:
                     for failure in contents.unavailable:
-                        if failure.aggregate.aggregate_head() == head:
+                        if failure.owner.equality_head() == head:
                             substitution: Substitution = {
-                                owner = failure.aggregate.aggregate_owner(),
+                                owner = failure.owner.equality_parameter_owner(),
                                 values = current.receiver_arguments(),
                             }
                             match failure.receiver.substitute_type(substitution, span):

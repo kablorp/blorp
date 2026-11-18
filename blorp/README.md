@@ -1011,14 +1011,20 @@ type, so `[] == []` needs a typed binding.
 
 #### Automatic equality
 
-A record or union supports `==` when every field or payload does, with no
-declaration. Fields compare in declaration order and stop at the first
+A record, union or opaque type supports `==` when every field, payload or
+representation does, with no declaration. Fields compare in declaration order and stop at the first
 difference; union tags must agree before payloads compare. A written
 `Equatable` implementation replaces the automatic one for that type. A generic
 type's condition comes from its actual fields, so a phantom parameter needs no
 bound. An unused type with a field that is not Equatable is legal; using `==`
-on it is rejected at that field. Tuples, opaque types and callables get no
-automatic equality.
+on it is rejected at that field. Callables get no automatic equality.
+
+An opaque type's automatic `==` compares representations, under the type's
+declared bounds, so `Box[Plain]` is Equatable when `List[Plain]` is. A type
+whose distinct representations mean the same value (an unsorted List standing
+for a set, an unnormalized spelling) must write its own `Equatable`
+implementation, which replaces the automatic one. A resource type is never
+copied and gets none.
 
 `Hashable: Equatable` requires `hash(value: Self) -> Int`, and equal values must
 hash equally, so implementing it needs an `Equatable` implementation, written or
