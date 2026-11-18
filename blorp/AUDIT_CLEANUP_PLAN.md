@@ -87,16 +87,41 @@ is identical in every row (`85cbfd8e3e7afde3`). Lines are each commit's
 
 | Change | Allocations | Instructions | Peak heap | Own-source allocations, instructions | Production lines | Test lines |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| 1. Dead code | -0.00% | +0.04% | +0.00% | -0.10%, -0.09% | +28, -156 (net -128) | +22, -41 |
-| 2. Native labels | +0.02% | +0.03% | +0.00% | +0.01%, +0.06% | +152, -230 (net -78) | +30, -49 |
-| 3. Result helpers | +0.23% | +0.38% | +0.00% | +0.33%, +0.51% | +169, -274 (net -105) | 0 |
+| 1. Dead code | -0.00% | +0.04% | +0.00% | -0.10%, -0.09% | +28, -156 (net -128) | +21, -40 |
+| 2. Native labels | +0.02% | +0.03% | +0.00% | +0.01%, +0.06% | +153, -231 (net -78) | +30, -49 |
+| 3. Result helpers | +0.23% | +0.38% | +0.00% | +0.33%, +0.51% | +170, -275 (net -105) | 0 |
+| 5. Function owner | -0.00% | +0.09% | +0.01% | +0.00%, +0.13% | +67, -87 (net -20) | 0 |
 
 Change 3's cost comes from closures. Each converted site allocates the
 closure it passes to `translated_list` once per call of the enclosing
 function, and several sites run per expression in inference. The cost is
 within the ceilings, and it is the compiler's to remove: a closure passed to
 an immediately called pure helper could live on the stack.
-| 5. Function owner | -0.00% | +0.09% | +0.01% | +0.00%, +0.13% | +65, -85 (net -20) | 0 |
 
 Change 5 was measured at `eb12bbffd`. Its review fix only gathers one
 invariant error into a helper.
+
+**The stack.** Measured at `b120468d8` against `31dd58125`, over 7 rounds:
+
+- **Fixed input:** allocations +0.25%, instructions +0.36% and peak heap
+  +0.01%, with identical C.
+- **Own source:** allocations +0.24% and instructions +0.34%.
+
+**The replay.** While branch CI ran, main gained `421322f3b`, which drops the
+formatter's trailing commas across the tree. The stack was replayed onto that
+commit, and each of its changed files was formatted with that commit's
+formatter.
+
+- Every replayed file outside `src/format/` is byte-identical to the earlier
+  stack's version reformatted by that formatter.
+- In `format.brp`, the only difference from main is change 3's
+  `import_rows`.
+
+The line counts above are the replayed commits'. The stack totals production
++418 / −749 (net −331) and tests +51 / −89.
+
+**Gates.** `make -C blorp test INSTRUCTION_CHECK=on` passed all 3,173 cases
+on the replayed `9cd738b8f`, with no ceiling exceeded, in 656 s. That commit
+differs from the landing commit only in this file. The log is the main
+checkout's `build/audit-2026-11-17/gate-replayed.log`. Branch CI on it ran as
+run `44245283147`.
