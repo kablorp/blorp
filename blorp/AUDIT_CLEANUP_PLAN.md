@@ -96,3 +96,7 @@ closure it passes to `translated_list` once per call of the enclosing
 function, and several sites run per expression in inference. The cost is
 within the ceilings, and it is the compiler's to remove: a closure passed to
 an immediately called pure helper could live on the stack.
+| 5. Function owner | -0.00% | +0.09% | +0.01% | +0.00%, +0.13% | +65, -85 (net -20) | 0 |
+
+Change 5 was measured at `eb12bbffd`. Its review fix only gathers one
+invariant error into a helper.
