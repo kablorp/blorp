@@ -106,7 +106,8 @@ The layout rules:
   alphabetical. The names inside one selection keep their written order. A
   comment on an import's line, or directly above it, moves with it.
 - A list of parameters, arguments, fields, elements or selections is on one
-  line or has one item per line with a trailing comma. A final list literal,
+  line or has one item per line, with a comma after each item but the last.
+  The formatter removes a written trailing comma. A final list literal,
   record literal or block lambda hugs the line when everything before it fits.
 - A chain of two or more method calls always breaks, one call per line, one
   level deeper than its head. In a block header (`if`, `while`, `for`,
