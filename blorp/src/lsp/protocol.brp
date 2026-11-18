@@ -1,0 +1,393 @@
+---
+The base protocol: the header that frames each message, JSON-RPC messages to
+and from `Json`, and the `file://` URIs that name documents. Pure; the
+transport reads and writes the bytes.
+---
+import:
+    bool: and, not, or
+    bytes: Bytes, String methods, from_list, to_list, to_text
+    int: Int methods
+    io/console/read_exact: ReadExactError
+    io/console/read_line: ReadLineError
+    json: Json(Null, Number, Text, Object), as_int, integer, render
+    list: List methods
+    option: Option methods
+    path: Path, is_absolute, normalize, to_path
+    string: String methods
+    uint8: UInt8 methods, to_uint8
+
+
+-- Why a message could not be read. After any of them the server cannot tell
+-- where the next message starts, so the session ends.
+union FramingError:
+    -- Input ended inside a header.
+    HeaderUnfinished
+    -- The header ended without a Content-Length.
+    MissingContentLength
+    -- A second Content-Length.
+    RepeatedContentLength
+    -- A Content-Length value that is not a count of bytes, as written.
+    BadContentLength(Bytes)
+    LineUnreadable(ReadLineError)
+    -- Input ended before the body did, or could not be read.
+    BodyUnreadable(ReadExactError)
+
+
+implements Stringable for FramingError:
+    pure func to_string(value: Self) -> String:
+        match value:
+            HeaderUnfinished: "input ended inside a message header"
+            MissingContentLength: "a message header has no Content-Length"
+            RepeatedContentLength: "a message header gives Content-Length twice"
+            BadContentLength(_): "a message header's Content-Length is not a count of bytes"
+            LineUnreadable(error): "could not read a message header: ${error}"
+            BodyUnreadable(error): "could not read a message body: ${error}"
+
+
+private CONTENT_LENGTH: String = "Content-Length:"
+
+-- The ASCII bytes the protocol's headers and URIs are read by.
+private TAB: UInt8 = 9
+private SPACE: UInt8 = 32
+private PERCENT: UInt8 = 37
+private HYPHEN: UInt8 = 45
+private DOT: UInt8 = 46
+private SLASH: UInt8 = 47
+private DIGIT_ZERO: UInt8 = 48
+private DIGIT_NINE: UInt8 = 57
+private UPPER_A: UInt8 = 65
+private UPPER_F: UInt8 = 70
+private UPPER_Z: UInt8 = 90
+private UNDERSCORE: UInt8 = 95
+private LOWER_A: UInt8 = 97
+private LOWER_F: UInt8 = 102
+private LOWER_Z: UInt8 = 122
+private TILDE: UInt8 = 126
+
+
+-- Whether `byte` lies from `low` to `high`, both included.
+private pure func within(byte: UInt8, low: UInt8, high: UInt8) -> Bool:
+    and(byte >= low, byte <= high)
+
+
+-- The count a Content-Length value states: digits only, with the spaces and
+-- tabs HTTP allows around a header's value.
+private pure func stated_count(value: Bytes) -> Result[Int, FramingError]:
+    var start = 0
+    var end = value.length()
+    while or(value.get(start) == Some(SPACE), value.get(start) == Some(TAB)):
+        start = start + 1
+    while and(end > start, or(value.get(end - 1) == Some(SPACE), value.get(end - 1) == Some(TAB))):
+        end = end - 1
+    digits = value.slice(start, end)
+    all_digits = and(
+        not(digits.is_empty()),
+        digits
+            .to_list()
+            .all(pure func(byte: UInt8): byte.within(DIGIT_ZERO, DIGIT_NINE))
+    )
+    -- Digits are UTF-8, so to_text is never None; parse_int is, past INT_MAX.
+    count = if all_digits:
+        digits
+            .to_text()
+            .get_or("")
+            .parse_int()
+    else:
+        None
+    match count:
+        Some(present): Ok(present)
+        None: Err(BadContentLength(digits))
+
+
+-- The body's length, from the header lines before the blank one. Other
+-- headers, such as Content-Type, say nothing the server uses.
+pure func content_length(header: List[Bytes]) -> Result[Int, FramingError]:
+    name = CONTENT_LENGTH.to_bytes()
+    match header.filter(pure func(line: Bytes): line.starts_with(name)):
+        []:
+            Err(MissingContentLength)
+        [line]:
+            line
+                .slice(name.length(), line.length())
+                .stated_count()
+        [_, _, ..._]:
+            Err(RepeatedContentLength)
+
+
+-- A message as it goes out: a header counting the body's UTF-8 bytes, then the body.
+pure func framed(message: Json) -> Bytes:
+    body = message
+        .render()
+        .to_bytes()
+    "Content-Length: ${body.length()}\r\n\r\n".to_bytes() + body
+
+
+-- A request's id, which its response repeats: an integer or a string, as the
+-- protocol allows. Any other id makes the message invalid.
+union RequestId:
+    NumberId(Int)
+    TextId(String)
+
+
+-- A method and its parameters, which the protocol lets a client omit.
+record Call {
+    method: String,
+    params: Option[Json]
+}
+
+
+-- A message from the client, by what it asks of the server.
+union ClientMessage:
+    -- A call the server must answer.
+    Request(RequestId, Call)
+    -- A call with no answer.
+    Notification(Call)
+    -- An answer to a request the server sent.
+    ClientResponse
+    -- A JSON value that is no JSON-RPC message, with its id when it has one.
+    InvalidMessage(Option[RequestId])
+
+
+private pure func request_id(value: Json) -> Option[RequestId]:
+    match value:
+        Number(number):
+            number
+                .as_int()
+                .map(pure func(id: Int) -> RequestId: NumberId(id))
+        Text(text):
+            Some(TextId(text))
+        _:
+            None
+
+
+pure func client_message(message: Json) -> ClientMessage:
+    match message:
+        Object(fields):
+            id = fields.get("id")
+            match (fields.get("method"), id):
+                (Some(Text(method)), None):
+                    Notification({ method = method, params = fields.get("params") })
+                (Some(Text(method)), Some(written)):
+                    match written.request_id():
+                        Some(present):
+                            Request(present, { method = method, params = fields.get("params") })
+                        None:
+                            InvalidMessage(None)
+                (None, Some(written)):
+                    if or(fields.contains("result"), fields.contains("error")):
+                        ClientResponse
+                    else:
+                        InvalidMessage(written.request_id())
+                (_, _):
+                    InvalidMessage(
+                        id
+                            .map(request_id)
+                            .get_or(None)
+                    )
+        _:
+            InvalidMessage(None)
+
+
+-- The member of an object, or None for a value that is not an object or lacks it.
+pure func field(value: Option[Json], name: String) -> Option[Json]:
+    match value:
+        Some(Object(fields)): fields.get(name)
+        _: None
+
+
+pure func text_field(value: Option[Json], name: String) -> Option[String]:
+    match value.field(name):
+        Some(Text(text)): Some(text)
+        _: None
+
+
+private JSONRPC_VERSION: String = "2.0"
+
+
+private pure func id_json(id: Option[RequestId]) -> Json:
+    match id:
+        Some(NumberId(number)): Number(integer(number))
+        Some(TextId(text)): Text(text)
+        None: Null
+
+
+pure func response(id: RequestId, result: Json) -> Json:
+    Object({ "jsonrpc" => Text(JSONRPC_VERSION), "id" => id_json(Some(id)), "result" => result })
+
+
+-- The errors the server answers with.
+fixed union ErrorCode:
+    ParseError
+    InvalidRequest
+    MethodNotFound
+    ServerNotInitialized
+
+
+-- JSON-RPC 2.0 numbers the first three; the Language Server Protocol the last.
+private pure func code_number(code: ErrorCode) -> Int:
+    match code:
+        ParseError: -32700
+        InvalidRequest: -32600
+        MethodNotFound: -32601
+        ServerNotInitialized: -32002
+
+
+-- `id` is None when the message had no usable id, and the reply then says null.
+pure func error_response(id: Option[RequestId], code: ErrorCode, message: String) -> Json:
+    Object(
+        {
+            "jsonrpc" => Text(JSONRPC_VERSION),
+            "id" => id_json(id),
+            "error" => Object(
+                { "code" => Number(integer(code.code_number())), "message" => Text(message) }
+            )
+        }
+    )
+
+
+pure func notification(method: String, params: Json) -> Json:
+    Object({ "jsonrpc" => Text(JSONRPC_VERSION), "method" => Text(method), "params" => params })
+
+
+private FILE_SCHEME: String = "file://"
+
+private LOCAL_HOST: String = "localhost"
+
+private HEX_DIGITS: String = "0123456789ABCDEF"
+
+private HEX_BASE: Int = 16
+
+-- The value of the hex digits A and a.
+private FIRST_HEX_LETTER_VALUE: Int = 10
+
+
+-- RFC 3986's unreserved bytes: ASCII letters and digits, `-`, `.`, `_` and `~`.
+private pure func unreserved(byte: UInt8) -> Bool:
+    letter = or(byte.within(UPPER_A, UPPER_Z), byte.within(LOWER_A, LOWER_Z))
+    mark = or(or(byte == HYPHEN, byte == DOT), or(byte == UNDERSCORE, byte == TILDE))
+    or(letter, or(byte.within(DIGIT_ZERO, DIGIT_NINE), mark))
+
+
+-- `value` is below HEX_BASE, so the slice is one digit and never None.
+private pure func hex_digit(value: Int) -> String:
+    HEX_DIGITS
+        .slice(value, value + 1)
+        .get_or("")
+
+
+-- The `file://` URI of an absolute path. Every byte but an unreserved one or
+-- `/` is percent-encoded, so a space is `%20` and an e with an acute accent is
+-- `%C3%A9`.
+pure func file_uri(path: Path) -> String:
+    text = path.to_string()
+    var uri = FILE_SCHEME
+    var kept = 0
+    var position = 0
+    for byte in (
+        text
+            .to_bytes()
+            .to_list()
+    ):
+        if not(or(byte == SLASH, byte.unreserved())):
+            value = byte.to_int()
+            escape = "%${hex_digit(value / HEX_BASE)}${hex_digit(value % HEX_BASE)}"
+            -- A kept run holds only ASCII, so its ends are scalar boundaries
+            -- and the slice is never None.
+            uri = (
+                uri
+                + text
+                    .slice(kept, position)
+                    .get_or("")
+                + escape
+            )
+            kept = position + 1
+        position = position + 1
+    (
+        uri
+        + text
+            .slice(kept, text.length())
+            .get_or("")
+    )
+
+
+private pure func hex_value(byte: Option[UInt8]) -> Option[Int]:
+    match byte:
+        None:
+            None
+        Some(present):
+            value = present.to_int()
+            if present.within(DIGIT_ZERO, DIGIT_NINE):
+                Some(value - DIGIT_ZERO.to_int())
+            else if present.within(UPPER_A, UPPER_F):
+                Some(value - UPPER_A.to_int() + FIRST_HEX_LETTER_VALUE)
+            else if present.within(LOWER_A, LOWER_F):
+                Some(value - LOWER_A.to_int() + FIRST_HEX_LETTER_VALUE)
+            else:
+                None
+
+
+-- The bytes `encoded` holds from `start`, each `%XX` decoded, or None for a
+-- `%` without two hex digits after it.
+private pure func percent_decoded(encoded: Bytes, start: Int) -> Option[Bytes]:
+    var decoded: List[UInt8] = []
+    var valid: Bool = True
+    var cursor = start
+    while valid:
+        match encoded.get(cursor):
+            None:
+                break
+            Some(byte):
+                if byte == PERCENT:
+                    -- Two hex digits are below 256, so to_uint8 is never None.
+                    match (
+                        encoded
+                            .get(cursor + 1)
+                            .hex_value(),
+                        encoded
+                            .get(cursor + 2)
+                            .hex_value()
+                    ):
+                        (Some(high), Some(low)):
+                            match (high * HEX_BASE + low).to_uint8():
+                                Some(escaped): decoded = decoded.append(escaped)
+                                None: valid = False
+                            cursor = cursor + 3
+                        _:
+                            valid = False
+                else:
+                    decoded = decoded.append(byte)
+                    cursor = cursor + 1
+    if valid:
+        Some(decoded.from_list())
+    else:
+        None
+
+
+-- The normalized path a `file://` URI names. None for another scheme, a host
+-- other than localhost, a bad escape, a path that is not UTF-8 once decoded,
+-- or one that is not absolute.
+pure func uri_path(uri: String) -> Option[Path]:
+    encoded = uri.to_bytes()
+    scheme = FILE_SCHEME.to_bytes()
+    var path_start = scheme.length()
+    while and(path_start < encoded.length(), encoded.get(path_start) != Some(SLASH)):
+        path_start = path_start + 1
+    host = encoded.slice(scheme.length(), path_start)
+    local = and(encoded.starts_with(scheme), or(host.is_empty(), host == LOCAL_HOST.to_bytes()))
+    decoded = if local:
+        percent_decoded(encoded, path_start)
+    else:
+        None
+    match (
+        decoded
+            .map(to_text)
+            .get_or(None)
+            .map(to_path)
+    ):
+        Some(Ok(path)):
+            if path.is_absolute():
+                Some(path.normalize())
+            else:
+                None
+        Some(Err(_)) | None:
+            None

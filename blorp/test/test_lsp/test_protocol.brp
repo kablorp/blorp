@@ -1,0 +1,291 @@
+---
+The base protocol: header blocks, outgoing frames, JSON-RPC messages to and
+from Json, and file URIs.
+---
+import:
+    bool: and
+    bytes: Bytes, String methods
+    json: Json(Null, Number, Text, Object), integer, parse, render
+    list: List methods
+    option: Option methods
+    path: Path, to_path
+    result: Result methods
+    string: String methods
+    test: TestSuite
+    ../../src/lsp/protocol:
+        ClientMessage(Request, Notification, ClientResponse, InvalidMessage),
+        ErrorCode(ParseError, InvalidRequest, MethodNotFound, ServerNotInitialized),
+        FramingError(MissingContentLength, RepeatedContentLength, BadContentLength),
+        RequestId(NumberId, TextId),
+        client_message,
+        content_length,
+        error_response,
+        file_uri,
+        framed,
+        notification,
+        response,
+        uri_path
+
+
+private pure func header(lines: List[String]) -> Result[Int, FramingError]:
+    content_length(lines.map(pure func(line: String) -> Bytes: line.to_bytes()))
+
+
+-- The JSON a test writes as text; text that does not parse is Null, which no
+-- test expects.
+private pure func json(text: String) -> Json:
+    match parse(text):
+        Ok(value): value
+        Err(_): Null
+
+
+-- header blocks
+
+pure func test_content_length_may_come_before_or_after_other_headers() -> Bool:
+    and(
+        (
+            header([
+                "Content-Length: 52",
+                "Content-Type: application/vscode-jsonrpc; charset=utf-8"
+            ])
+            == Ok(52)
+        ),
+        (
+            header([
+                "Content-Type: application/vscode-jsonrpc; charset=utf-8",
+                "Content-Length: 52"
+            ])
+            == Ok(52)
+        )
+    )
+
+
+pure func test_spaces_and_tabs_around_the_count_are_allowed() -> Bool:
+    and(header(["Content-Length:\t 7  "]) == Ok(7), header(["Content-Length:0"]) == Ok(0))
+
+
+pure func test_a_header_without_content_length_is_rejected() -> Bool:
+    and(
+        header([]) == Err(MissingContentLength),
+        header(["Content-Type: x"]) == Err(MissingContentLength)
+    )
+
+
+pure func test_a_second_content_length_is_rejected() -> Bool:
+    header(["Content-Length: 2", "Content-Length: 2"]) == Err(RepeatedContentLength)
+
+
+pure func test_a_count_that_is_not_digits_is_rejected() -> Bool:
+    and(
+        and(
+            header(["Content-Length: 12a"]) == Err(BadContentLength("12a".to_bytes())),
+            header(["Content-Length: -5"]) == Err(BadContentLength("-5".to_bytes()))
+        ),
+        and(
+            header(["Content-Length: +5"]) == Err(BadContentLength("+5".to_bytes())),
+            header(["Content-Length:  "]) == Err(BadContentLength("".to_bytes()))
+        )
+    )
+
+
+pure func test_a_count_too_large_for_an_int_is_rejected() -> Bool:
+    (
+        header(["Content-Length: 99999999999999999999"])
+        == Err(BadContentLength("99999999999999999999".to_bytes()))
+    )
+
+
+-- frames
+
+pure func test_a_frame_counts_the_body_in_utf8_bytes() -> Bool:
+    and(
+        framed(Object({ "a" => Null })) == "Content-Length: 10\r\n\r\n{\"a\":null}".to_bytes(),
+        framed(Text("é")) == "Content-Length: 4\r\n\r\n\"é\"".to_bytes()
+    )
+
+
+-- messages from the client
+
+pure func test_a_request_keeps_its_id_method_and_params() -> Bool:
+    and(
+        (
+            client_message(json("{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"shutdown\"}"))
+            == Request(NumberId(7), { method = "shutdown", params = None })
+        ),
+        (
+            client_message(json("{\"id\":\"seven\",\"method\":\"m\",\"params\":{\"a\":1}}"))
+            == Request(TextId("seven"), { method = "m", params = Some(json("{\"a\":1}")) })
+        )
+    )
+
+
+pure func test_a_message_without_an_id_is_a_notification() -> Bool:
+    (
+        client_message(json("{\"jsonrpc\":\"2.0\",\"method\":\"exit\",\"params\":[]}"))
+        == Notification({ method = "exit", params = Some(json("[]")) })
+    )
+
+
+pure func test_a_result_or_an_error_is_a_response() -> Bool:
+    and(
+        client_message(json("{\"id\":1,\"result\":null}")) == ClientResponse,
+        client_message(json("{\"id\":1,\"error\":{\"code\":1}}")) == ClientResponse
+    )
+
+
+pure func test_an_id_that_is_not_an_integer_or_a_string_is_invalid() -> Bool:
+    and(
+        client_message(json("{\"id\":1.5,\"method\":\"m\"}")) == InvalidMessage(None),
+        client_message(json("{\"id\":[1],\"method\":\"m\"}")) == InvalidMessage(None)
+    )
+
+
+pure func test_other_json_is_an_invalid_message_with_its_id() -> Bool:
+    and(
+        and(
+            client_message(json("[1]")) == InvalidMessage(None),
+            client_message(json("{\"id\":3,\"method\":4}")) == InvalidMessage(Some(NumberId(3)))
+        ),
+        and(
+            client_message(json("{\"id\":null,\"method\":\"m\"}")) == InvalidMessage(None),
+            client_message(json("{\"id\":\"x\"}")) == InvalidMessage(Some(TextId("x")))
+        )
+    )
+
+
+-- messages to the client
+
+pure func test_responses_repeat_the_id() -> Bool:
+    and(
+        render(response(NumberId(1), Null)) == "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":null}",
+        (
+            render(response(TextId("a"), Text("b")))
+            == "{\"jsonrpc\":\"2.0\",\"id\":\"a\",\"result\":\"b\"}"
+        )
+    )
+
+
+pure func test_each_error_has_its_protocol_code() -> Bool:
+    expected = [
+        "{\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{\"code\":-32700,\"message\":\"m\"}}",
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32600,\"message\":\"m\"}}",
+        "{\"jsonrpc\":\"2.0\",\"id\":\"r\",\"error\":{\"code\":-32601,\"message\":\"m\"}}",
+        "{\"jsonrpc\":\"2.0\",\"id\":2,\"error\":{\"code\":-32002,\"message\":\"m\"}}"
+    ]
+    actual = [
+        error_response(None, ParseError, "m"),
+        error_response(Some(NumberId(1)), InvalidRequest, "m"),
+        error_response(Some(TextId("r")), MethodNotFound, "m"),
+        error_response(Some(NumberId(2)), ServerNotInitialized, "m")
+    ]
+    actual.map(render) == expected
+
+
+pure func test_a_notification_has_no_id() -> Bool:
+    (
+        render(notification("m", json("{\"a\":[]}")))
+        == "{\"jsonrpc\":\"2.0\",\"method\":\"m\",\"params\":{\"a\":[]}}"
+    )
+
+
+-- file URIs
+
+private pure func path(text: String) -> Option[Path]:
+    match text.to_path():
+        Ok(present): Some(present)
+        Err(_): None
+
+
+pure func test_a_space_and_a_non_ascii_character_are_percent_encoded() -> Bool:
+    match path("/tmp/a b/é~_.-x.brp"):
+        Some(present): present.file_uri() == "file:///tmp/a%20b/%C3%A9~_.-x.brp"
+        None: False
+
+
+pure func test_a_file_uri_decodes_to_its_normalized_path() -> Bool:
+    and(
+        and(
+            uri_path("file:///tmp/a%20b/%c3%A9.brp") == path("/tmp/a b/é.brp"),
+            uri_path("file://localhost/x/./y/../z.brp") == path("/x/z.brp")
+        ),
+        uri_path("file:///tmp/plain.brp") == path("/tmp/plain.brp")
+    )
+
+
+-- `%`, `#`, `?` and `+` mean something in a URI, so they must be escaped and
+-- must decode back to themselves.
+pure func test_uri_syntax_characters_round_trip() -> Bool:
+    match path("/a%b#c?d+e.brp"):
+        Some(present):
+            and(
+                present.file_uri() == "file:///a%25b%23c%3Fd%2Be.brp",
+                uri_path(present.file_uri()) == Some(present)
+            )
+        None:
+            False
+
+
+pure func test_other_uris_name_no_path() -> Bool:
+    and(
+        and(
+            and(uri_path("untitled:Untitled-1") == None, uri_path("file://host/x.brp") == None),
+            and(uri_path("file:///x%2") == None, uri_path("file:///x%zz") == None)
+        ),
+        and(
+            and(uri_path("file:///x%FF.brp") == None, uri_path("file://") == None),
+            uri_path("file:///x%00.brp") == None
+        )
+    )
+
+
+TESTS: TestSuite = {
+    description = "LSP base protocol",
+    tests = [
+        (
+            "Content-Length may come before or after other headers",
+            test_content_length_may_come_before_or_after_other_headers
+        ),
+        (
+            "spaces and tabs around the count are allowed",
+            test_spaces_and_tabs_around_the_count_are_allowed
+        ),
+        (
+            "a header without Content-Length is rejected",
+            test_a_header_without_content_length_is_rejected
+        ),
+        ("a second Content-Length is rejected", test_a_second_content_length_is_rejected),
+        ("a count that is not digits is rejected", test_a_count_that_is_not_digits_is_rejected),
+        ("a count too large for an Int is rejected", test_a_count_too_large_for_an_int_is_rejected),
+        ("a frame counts the body in UTF-8 bytes", test_a_frame_counts_the_body_in_utf8_bytes),
+        (
+            "a request keeps its id, method and params",
+            test_a_request_keeps_its_id_method_and_params
+        ),
+        (
+            "a message without an id is a notification",
+            test_a_message_without_an_id_is_a_notification
+        ),
+        ("a result or an error is a response", test_a_result_or_an_error_is_a_response),
+        (
+            "an id that is not an integer or a string is invalid",
+            test_an_id_that_is_not_an_integer_or_a_string_is_invalid
+        ),
+        (
+            "other JSON is an invalid message, with its id",
+            test_other_json_is_an_invalid_message_with_its_id
+        ),
+        ("responses repeat the id", test_responses_repeat_the_id),
+        ("each error has its protocol code", test_each_error_has_its_protocol_code),
+        ("a notification has no id", test_a_notification_has_no_id),
+        (
+            "a space and a non-ASCII character are percent-encoded",
+            test_a_space_and_a_non_ascii_character_are_percent_encoded
+        ),
+        (
+            "a file URI decodes to its normalized path",
+            test_a_file_uri_decodes_to_its_normalized_path
+        ),
+        ("URI syntax characters round-trip", test_uri_syntax_characters_round_trip),
+        ("other URIs name no path", test_other_uris_name_no_path)
+    ]
+}

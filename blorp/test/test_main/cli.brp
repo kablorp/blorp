@@ -1,14 +1,18 @@
 -- The `blorp` command, run as a user runs it: exact stdout, stderr and status
--- for compile, format, help and bad usage, on files in the work directory.
+-- for compile, format, lsp, help and bad usage, on files in the work directory.
 import:
     bool: and, not
+    bytes: Bytes, String methods, from_list
     int: Int methods
+    io/files/write: WriteError, write_bytes
     io/process: Captured, FindProgramError, command, find_program
     list: List methods
+    path: Path, to_path
     result: Result methods
     string: String methods
     test: TestSuite
     ../../src/common/cli/usage: EXIT_PATH, EXIT_REJECTED, EXIT_USAGE
+    ../../src/lsp/server: EXIT_ABANDONED
     ../driver/file_access: read_file, write_file, make_directories
     ../driver/harness: COMPILATION_TIMEOUT_MS, LIBRARY_ROOT, isolated, reported, run_expecting
 
@@ -36,6 +40,7 @@ private OVERVIEW: String =
     |commands:
     |  compile  write the C for a program
     |  format   put source files in the canonical layout
+    |  lsp      serve the Language Server Protocol to an editor
     |  help     show this overview, or the help of one command
     |
     |run blorp help COMMAND for the options of a command
@@ -75,6 +80,17 @@ private COMPILE_HELP: String =
     |                           built into blorp
     |  --test-suite             compile the listed test suite files into one program
     |  -h, --help               show this help
+
+
+private LSP_HELP: String =
+    |usage: blorp lsp
+    |
+    |Serves the Language Server Protocol on standard input and output, for an
+    |editor to start. Each open .brp file is the root of its own program: the
+    |file, the modules it imports and the standard library.
+    |
+    |options:
+    |  -h, --help  show this help
 
 
 private HELP_HELP: String =
@@ -664,6 +680,174 @@ private func exclude_beyond_a_parent_root_is_a_usage_error(
     )
 
 
+-- lsp
+
+-- One message as a client frames it: the body's UTF-8 byte count, then the body.
+private pure func framed(body: String) -> String:
+    "Content-Length: ${body.length()}\r\n\r\n${body}"
+
+
+private LSP_INITIALIZE: String = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"capabilities\":{\"general\":{\"positionEncodings\":[\"utf-8\"]}}}}"
+
+
+private LSP_INITIALIZED_REPLY: String = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"capabilities\":{\"positionEncoding\":\"utf-8\",\"textDocumentSync\":{\"openClose\":true,\"change\":1}}}}"
+
+
+private LSP_EXIT: String = "{\"jsonrpc\":\"2.0\",\"method\":\"exit\"}"
+
+
+private LSP_STOPPED_HELP: String = "help: start blorp lsp from a language client, which frames each message with a Content-Length header\n"
+
+
+-- `blorp lsp` with `input` as standard input.
+private func lsp_session(
+    compiler: String,
+    input: String,
+    name: String,
+    status: Int
+) -> Result[Captured, String]:
+    invocation ?= isolated(compiler, ["lsp"], COMPILATION_TIMEOUT_MS)
+    run_expecting(name, { invocation | stdin = Some(input) }, status)
+
+
+-- The editor opens a file whose name needs percent-encoding and whose string
+-- literal holds a two-byte scalar, so the range counts UTF-8 bytes. The file
+-- is not on disk: its text is the editor's snapshot, and it imports nothing.
+private LSP_ROOT_URI: String = "file:///blorp%20lsp/caf%C3%A9.brp"
+
+
+private func lsp_serves_a_session_from_initialize_to_exit(
+    compiler: String,
+    work_directory: String
+) -> Result[Void, String]:
+    uri = LSP_ROOT_URI
+    document = "{\"uri\":\"${uri}\",\"languageId\":\"blorp\",\"version\":1,\"text\":\"func main() -> Int:\\n    x: Int = \\\"é\\\"\\n    x\\n\"}"
+    input = [
+        LSP_INITIALIZE,
+        "{\"jsonrpc\":\"2.0\",\"method\":\"initialized\",\"params\":{}}",
+        "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"textDocument/hover\",\"params\":{}}",
+        "{x}",
+        "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":{\"textDocument\":${document}}}",
+        "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didChange\",\"params\":{\"textDocument\":{\"uri\":\"${uri}\",\"version\":2},\"contentChanges\":[{\"text\":\"func main() -> Int:\\n    0\\n\"}]}}",
+        "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didClose\",\"params\":{\"textDocument\":{\"uri\":\"${uri}\"}}}",
+        "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"shutdown\"}",
+        LSP_EXIT
+    ]
+    expected = [
+        LSP_INITIALIZED_REPLY,
+        "{\"jsonrpc\":\"2.0\",\"id\":2,\"error\":{\"code\":-32601,\"message\":\"unknown method `textDocument/hover`\"}}",
+        "{\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{\"code\":-32700,\"message\":\"the message body is not JSON: expected a quoted object name\"}}",
+        "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/publishDiagnostics\",\"params\":{\"uri\":\"${uri}\",\"diagnostics\":[{\"range\":{\"start\":{\"line\":1,\"character\":13},\"end\":{\"line\":1,\"character\":17}},\"severity\":1,\"message\":\"expression does not match the expected type\\nhelp: use an expression of type Int here\"}]}}",
+        "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/publishDiagnostics\",\"params\":{\"uri\":\"${uri}\",\"diagnostics\":[]}}",
+        "{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":null}"
+    ]
+    output ?= lsp_session(
+        compiler,
+        input
+            .map(framed)
+            .join(""),
+        "${work_directory}/cli_lsp_session",
+        0
+    )
+    expect_output(
+        output,
+        expected
+            .map(framed)
+            .join(""),
+        ""
+    )
+
+
+private func lsp_exit_without_shutdown_exits_1(
+    compiler: String,
+    work_directory: String
+) -> Result[Void, String]:
+    output ?= lsp_session(
+        compiler,
+        framed(LSP_INITIALIZE) + framed(LSP_EXIT),
+        "${work_directory}/cli_lsp_exit",
+        EXIT_ABANDONED
+    )
+    expect_output(output, framed(LSP_INITIALIZED_REPLY), "")
+
+
+private func lsp_exits_1_when_input_ends_between_messages(
+    compiler: String,
+    work_directory: String
+) -> Result[Void, String]:
+    output ?= lsp_session(
+        compiler,
+        framed(LSP_INITIALIZE),
+        "${work_directory}/cli_lsp_end",
+        EXIT_ABANDONED
+    )
+    expect_output(output, framed(LSP_INITIALIZED_REPLY), "")
+
+
+private func lsp_exits_1_when_input_ends_inside_a_header(
+    compiler: String,
+    work_directory: String
+) -> Result[Void, String]:
+    output ?= lsp_session(
+        compiler,
+        framed(LSP_INITIALIZE) + "Content-Length: 5\r\n",
+        "${work_directory}/cli_lsp_header",
+        EXIT_ABANDONED
+    )
+    expect_output(
+        output,
+        framed(LSP_INITIALIZED_REPLY),
+        "blorp: error: blorp lsp stopped: input ended inside a message header\n" + LSP_STOPPED_HELP
+    )
+
+
+-- Process stdin is a String, so bytes that are not UTF-8 go through a file the
+-- shell redirects. Input then ends inside a body: the server says why on
+-- stderr and exits 1.
+private func lsp_answers_a_body_that_is_not_utf8_and_stops_inside_a_body(
+    compiler: String,
+    work_directory: String
+) -> Result[Void, String]:
+    prefix = "${work_directory}/cli_lsp_bytes"
+    -- The second body is two bytes that are not UTF-8; the third stops short.
+    input: Bytes = (
+        framed(LSP_INITIALIZE).to_bytes()
+        + "Content-Length: 2\r\n\r\n".to_bytes()
+        + from_list([255, 254])
+        + "Content-Length: 10\r\n\r\n{}".to_bytes()
+    )
+    input_path: Path ?= "${prefix}.in"
+        .to_path()
+        .map_err(pure func(error) -> String: "${prefix}.in: ${error}")
+    _ ?= input_path
+        .write_bytes(input)
+        .map_err(pure func(error: WriteError) -> String: "${input_path}: ${error}")
+    shell ?= find_program("sh").map_err(
+        pure func(error: FindProgramError) -> String: "sh: ${error}"
+    )
+    invocation ?= isolated(
+        "${shell}",
+        ["-c", "exec \"$0\" lsp < \"$1\"", compiler, "${input_path}"],
+        COMPILATION_TIMEOUT_MS
+    )
+    output ?= run_expecting(prefix, invocation, EXIT_ABANDONED)
+    not_utf8 = "{\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{\"code\":-32700,\"message\":\"the message body is not UTF-8\"}}"
+    stopped = "blorp: error: blorp lsp stopped: could not read a message body: input ended after 2 bytes\n"
+    expect_output(
+        output,
+        framed(LSP_INITIALIZED_REPLY) + framed(not_utf8),
+        stopped + LSP_STOPPED_HELP
+    )
+
+
+private func help_lsp_prints_its_help(
+    compiler: String,
+    work_directory: String
+) -> Result[Void, String]:
+    output ?= run(compiler, ["help", "lsp"], "${work_directory}/cli_help_lsp", 0)
+    expect_output(output, LSP_HELP + "\n", "")
+
+
 -- help and usage
 
 private func help_prints_the_overview_to_stdout(
@@ -906,6 +1090,41 @@ func suite(compiler: String, work_directory: String) -> TestSuite:
                 func(): reported(
                     exclude_beyond_a_parent_root_is_a_usage_error(compiler, work_directory)
                 )
+            ),
+            (
+                "lsp serves a session from initialize to exit",
+                func(): reported(
+                    lsp_serves_a_session_from_initialize_to_exit(compiler, work_directory)
+                )
+            ),
+            (
+                "lsp exits 1 on exit without shutdown",
+                func(): reported(lsp_exit_without_shutdown_exits_1(compiler, work_directory))
+            ),
+            (
+                "lsp exits 1 when input ends between messages",
+                func(): reported(
+                    lsp_exits_1_when_input_ends_between_messages(compiler, work_directory)
+                )
+            ),
+            (
+                "lsp exits 1 when input ends inside a header",
+                func(): reported(
+                    lsp_exits_1_when_input_ends_inside_a_header(compiler, work_directory)
+                )
+            ),
+            (
+                "lsp answers a body that is not UTF-8 and stops inside a body",
+                func(): reported(
+                    lsp_answers_a_body_that_is_not_utf8_and_stops_inside_a_body(
+                        compiler,
+                        work_directory
+                    )
+                )
+            ),
+            (
+                "help lsp prints its help",
+                func(): reported(help_lsp_prints_its_help(compiler, work_directory))
             ),
             (
                 "help and -h print the overview to stdout",

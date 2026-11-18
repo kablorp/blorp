@@ -55,9 +55,11 @@ done.
     resolves to; the console labels with their runtime; a seed rotation to
     `blorp-seed-4fee244ad96f`; and the byte console library, one module per
     error type: `io/console/output` (`print`, `write`, `write_error`,
-    `flush`), `io/console/read_line` and `io/console/read_exact`.
-  - **Next:** landing 9, `blorp lsp`: the `src/lsp/` modules and the
-    transport.
+    `flush`), `io/console/read_line` and `io/console/read_exact`. Then 9a,
+    the `blorp lsp` server core: the command, transport, lifecycle, UTF-8
+    and UTF-16 positions, open documents and diagnostics (`src/lsp/`).
+  - **Next:** 9b, semantic tokens with staleness and watched files; then
+    9c, definition and references; then the CLion plugin.
 - **String code points:** [`STRING_PLAN.md`](STRING_PLAN.md).
   - **Status:** approved on 2026-11-10: `length` counts code points, from a
     count stored in each String, and byte work uses `byte_*` functions. L1

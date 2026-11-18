@@ -1,0 +1,175 @@
+---
+Positions in a document: the protocol's line and character, to and from the
+byte offsets spans hold. LF, CRLF and a lone CR each end a line, as the
+protocol requires; a character counts UTF-8 bytes or UTF-16 code units, as the
+client and server agreed at `initialize`. A text's line starts are found once,
+so converting many positions scans each line only for its own characters.
+---
+import:
+    bool: and, or
+    int: Int methods
+    list: List methods
+    string: String methods
+    uint8: UInt8 methods
+
+
+-- What a position's character counts.
+fixed union PositionEncoding:
+    Utf8
+    Utf16
+
+
+-- The name the protocol gives the encoding.
+pure func encoding_name(encoding: PositionEncoding) -> String:
+    match encoding:
+        Utf8: "utf-8"
+        Utf16: "utf-16"
+
+
+-- Zero-based, as the protocol counts both.
+fixed record Position {
+    line: Int,
+    character: Int
+}
+
+
+private LINE_FEED: UInt8 = 10
+
+private CARRIAGE_RETURN: UInt8 = 13
+
+-- The lead bytes that start a scalar of two, three and four UTF-8 bytes. A
+-- four-byte scalar lies beyond the Basic Multilingual Plane, so UTF-16 writes
+-- it as a surrogate pair. Text is valid UTF-8, so no scalar starts with a
+-- continuation byte.
+private FIRST_TWO_BYTE_LEAD: UInt8 = 192
+
+private FIRST_THREE_BYTE_LEAD: UInt8 = 224
+
+private FIRST_FOUR_BYTE_LEAD: UInt8 = 240
+
+
+-- The UTF-8 bytes of the scalar that `lead` starts.
+private pure func scalar_bytes(lead: UInt8) -> Int:
+    if lead >= FIRST_FOUR_BYTE_LEAD:
+        4
+    else if lead >= FIRST_THREE_BYTE_LEAD:
+        3
+    else if lead >= FIRST_TWO_BYTE_LEAD:
+        2
+    else:
+        1
+
+
+-- The characters the scalar that `lead` starts counts for.
+private pure func scalar_width(lead: UInt8, encoding: PositionEncoding) -> Int:
+    match encoding:
+        Utf8:
+            lead.scalar_bytes()
+        Utf16:
+            if lead >= FIRST_FOUR_BYTE_LEAD:
+                2
+            else:
+                1
+
+
+-- Whether the byte at `cursor` ends a line: an LF, or a CR not followed by an
+-- LF. A CR just before an LF is part of that line ending.
+private pure func ends_line(text: String, cursor: Int) -> Bool:
+    match text.byte_at(cursor):
+        Some(byte):
+            if byte == LINE_FEED:
+                True
+            else if byte == CARRIAGE_RETURN:
+                text.byte_at(cursor + 1) != Some(LINE_FEED)
+            else:
+                False
+        None:
+            False
+
+
+-- A text and the byte offset at which each of its lines starts, the first at
+-- 0. Only `line_index` builds one, so the starts always belong to the text.
+-- Build it once per text and pass it to every conversion.
+private record IndexedText {
+    text: String,
+    starts: List[Int]
+}
+
+
+opaque type LineIndex = IndexedText
+
+
+pure func line_index(text: String) -> LineIndex:
+    var starts: List[Int] = [0]
+    for cursor in 0..text.length():
+        if text.ends_line(cursor):
+            starts = starts.append(cursor + 1)
+    into_opaque LineIndex({ text = text, starts = starts })
+
+
+-- The line holding `offset`: the last whose start is at or before it, found by
+-- binary search. `starts` is never empty, so the fallback is never read.
+private pure func line_of(starts: List[Int], offset: Int) -> Int:
+    var low = 0
+    var high = starts.length() - 1
+    while low < high:
+        middle = (low + high + 1) / 2
+        if starts.get_or(middle, 0) <= offset:
+            low = middle
+        else:
+            high = middle - 1
+    low
+
+
+-- The position of the byte at `offset`; an offset past the end is the end, and
+-- one inside a scalar or a line ending is where that starts.
+pure func position_of(index: LineIndex, offset: Int, encoding: PositionEncoding) -> Position:
+    indexed = from_opaque LineIndex(index)
+    line = indexed.starts.line_of(offset)
+    var character = 0
+    var cursor = indexed.starts.get_or(line, 0)
+    while cursor < offset:
+        match indexed.text.byte_at(cursor):
+            None:
+                break
+            Some(byte):
+                if or(
+                    or(byte == LINE_FEED, byte == CARRIAGE_RETURN),
+                    cursor + byte.scalar_bytes() > offset
+                ):
+                    break
+                character = character + byte.scalar_width(encoding)
+                cursor = cursor + byte.scalar_bytes()
+    { line = line, character = character }
+
+
+-- The byte offset of a position. A line past the last is the end of the text;
+-- a character past its line's end is that end, before the line ending, as the
+-- protocol asks; and one inside a scalar is that scalar's start.
+pure func offset_of(index: LineIndex, position: Position, encoding: PositionEncoding) -> Int:
+    indexed = from_opaque LineIndex(index)
+    text = indexed.text
+    start: Option[Int] = if position.line < 0:
+        Some(0)
+    else:
+        indexed.starts.get(position.line)
+    match start:
+        None:
+            text.length()
+        Some(line_start):
+            var character = 0
+            var cursor = line_start
+            while cursor < text.length():
+                match text.byte_at(cursor):
+                    None:
+                        break
+                    Some(byte):
+                        width = byte.scalar_width(encoding)
+                        if or(
+                            or(byte == LINE_FEED, byte == CARRIAGE_RETURN),
+                            character + width > position.character
+                        ):
+                            break
+                        character = character + width
+                        cursor = cursor + byte.scalar_bytes()
+            cursor

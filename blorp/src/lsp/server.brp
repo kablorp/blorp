@@ -1,0 +1,538 @@
+---
+The language server's state and its one step per message: the lifecycle, the
+open documents, what each root's last analysis published, and the
+replies each message earns. Pure: the transport reads, analyses and writes.
+---
+import:
+    bool: not
+    bytes: Bytes
+    dict: Dict
+    json: Json(Null, Boolean, Number, Text, Array, Object), integer, parse
+    list: List methods
+    option: Option methods
+    path: Path, to_path
+    string: String methods
+    ../common/analysis/check/check: analyze
+    ../common/analysis/check/render: render_failure
+    ../common/analysis/load/load:
+        LoadedProgram,
+        SourceLoadFailure(
+            DuplicateSourcePath,
+            SourcePathContainsNul,
+            SourcePathEmpty,
+            LoadingFailed
+        )
+    ../common/syntax/source:
+        ModuleKind(UserModule, LibraryModule, FoundationTypesModule, FoundationPreludeModule),
+        ModuleSource,
+        SourceFile,
+        SourceInputs,
+        module_number,
+        root_module_id,
+        source_module
+    ../common/syntax/syntax: Diagnostic, Diagnostics, compiler_span, internal_error
+    ./positions:
+        LineIndex,
+        Position,
+        PositionEncoding(Utf8, Utf16),
+        encoding_name,
+        line_index,
+        position_of
+    ./protocol:
+        Call,
+        ClientMessage(Request, Notification, ClientResponse, InvalidMessage),
+        ErrorCode(ParseError, InvalidRequest, MethodNotFound, ServerNotInitialized),
+        RequestId,
+        client_message,
+        error_response,
+        field,
+        file_uri,
+        notification,
+        response,
+        text_field,
+        uri_path
+
+
+-- How far loading and analysing one root got.
+union AnalysisOutcome:
+    -- Loading stopped at its first error.
+    LoadFailed(Diagnostic)
+    -- The program loaded, and checking rejected it.
+    CheckFailed(Diagnostics)
+    -- The program loaded and checked.
+    Analysed
+
+
+-- What the transport hands back after it loads and analyses one root: the
+-- files the load read, whose texts the diagnostics' spans index, and how far
+-- it got.
+record DocumentAnalysis {
+    sources: SourceInputs,
+    outcome: AnalysisOutcome
+}
+
+
+-- The server's paths are normalized and absolute, and so unique and free of
+-- NUL, so only a defect in the server makes the loader refuse them.
+pure func document_analysis(loaded: Result[LoadedProgram, SourceLoadFailure]) -> DocumentAnalysis:
+    match loaded:
+        Ok(program):
+            outcome: AnalysisOutcome = match analyze(program.program):
+                Ok(_): Analysed
+                Err(failure): CheckFailed(render_failure(failure))
+            { sources = program.sources, outcome = outcome }
+        Err(LoadingFailed(failure)):
+            { sources = failure.sources, outcome = LoadFailed(failure.diagnostic) }
+        Err(DuplicateSourcePath(_) | SourcePathContainsNul(_) | SourcePathEmpty):
+            {
+                sources = { modules = [] },
+                outcome = LoadFailed(
+                    internal_error(
+                        compiler_span(),
+                        "the language server gave the loader an unusable path"
+                    )
+                )
+            }
+
+
+-- What a root's last analysis published: the diagnostics of each user file it
+-- reports in, so that when it stops reporting in a file another root's can be
+-- shown there again.
+private record AnalysedRoot {
+    published: Dict[Path, List[Json]]
+}
+
+
+-- An open document: the URI the client named it by, which every publication to
+-- it repeats so that the editor matches it, and its text.
+private record OpenDocument {
+    uri: String,
+    text: String
+}
+
+
+private record Session {
+    encoding: PositionEncoding,
+    -- Each open document, by its normalized absolute path. An open document is
+    -- the root of its own program (the v1 limitation), and every analysis
+    -- reads these texts instead of the disk.
+    documents: Dict[Path, OpenDocument],
+    -- What each root's last analysis published, in the order the roots were
+    -- last analysed, so that a file several roots report in shows the latest
+    -- analysis's diagnostics. A root not yet analysed has no row.
+    roots: Dict[Path, AnalysedRoot]
+}
+
+
+private union Lifecycle:
+    -- Requests other than `initialize` get -32002, and notifications other
+    -- than `exit` are dropped.
+    AwaitingInitialize
+    Serving(Session)
+    -- After `shutdown`, requests get -32600 and `exit` ends with status 0.
+    ShutDown
+    -- `exit` has arrived; the process ends with this status.
+    Exited(Int)
+
+
+opaque type Server = Lifecycle
+
+
+record Step {
+    server: Server,
+    replies: List[Json],
+    -- The open document to analyse before the pending request can be
+    -- answered; `didOpen` asks for its own document.
+    analyse: Option[Path]
+}
+
+
+-- The status the process ends with unless `exit` follows `shutdown`: an exit
+-- without shutdown (the protocol's rule) or input that ends without exit.
+EXIT_ABANDONED: Int = 1
+
+private EXIT_AFTER_SHUTDOWN: Int = 0
+
+-- TextDocumentSyncKind.Full: every change sends the whole text.
+private FULL_SYNC: Int = 1
+
+-- DiagnosticSeverity.Error: every diagnostic stops compilation.
+private ERROR_SEVERITY: Int = 1
+
+
+pure func start_server() -> Server:
+    into_opaque Server(AwaitingInitialize)
+
+
+-- Some once `exit` has arrived.
+pure func exit_status(server: Server) -> Option[Int]:
+    match from_opaque Server(server):
+        Exited(status): Some(status)
+        AwaitingInitialize | Serving(_) | ShutDown: None
+
+
+-- The open documents, which an analysis reads instead of the disk.
+pure func snapshots(server: Server) -> List[SourceFile]:
+    match from_opaque Server(server):
+        Serving(session):
+            session.documents
+                .entries()
+                .map(
+                    pure func(document: (Path, OpenDocument)) -> SourceFile: {
+                        path = document[0].to_string(),
+                        contents = document[1].text
+                    }
+                )
+        AwaitingInitialize | ShutDown | Exited(_):
+            []
+
+
+private pure func replying(lifecycle: Lifecycle, replies: List[Json]) -> Step:
+    { server = into_opaque Server(lifecycle), replies = replies, analyse = None }
+
+
+-- A body that is not UTF-8 JSON gets -32700 with a null id in any state:
+-- nothing in it says what was asked.
+pure func receive_body(server: Server, body: Bytes) -> Step:
+    lifecycle = from_opaque Server(server)
+    match body.to_text():
+        None:
+            lifecycle.replying([error_response(None, ParseError, "the message body is not UTF-8")])
+        Some(text):
+            match parse(text):
+                Ok(message):
+                    server.receive(message)
+                Err(error):
+                    lifecycle.replying([
+                        error_response(None, ParseError, "the message body is not JSON: ${error}")
+                    ])
+
+
+pure func receive(server: Server, message: Json) -> Step:
+    lifecycle = from_opaque Server(server)
+    match (lifecycle, client_message(message)):
+        (Exited(_), _) | (_, ClientResponse):
+            lifecycle.replying([])
+        (_, InvalidMessage(id)):
+            lifecycle.replying([
+                error_response(
+                    id,
+                    InvalidRequest,
+                    "the message is not a JSON-RPC request or notification"
+                )
+            ])
+        (AwaitingInitialize, Request(id, call)):
+            if call.method == "initialize":
+                encoding = call.params.agreed_encoding()
+                replying(Serving({ encoding = encoding, documents = {}, roots = {} }), [
+                    response(id, initialize_result(encoding))
+                ])
+            else:
+                lifecycle.replying([
+                    error_response(
+                        Some(id),
+                        ServerNotInitialized,
+                        "the server has not been initialized"
+                    )
+                ])
+        (ShutDown, Request(id, _)):
+            lifecycle.replying([
+                error_response(Some(id), InvalidRequest, "the server has shut down")
+            ])
+        (Serving(_), Request(id, call)):
+            match call.method:
+                "shutdown":
+                    replying(ShutDown, [response(id, Null)])
+                "initialize":
+                    lifecycle.replying([
+                        error_response(
+                            Some(id),
+                            InvalidRequest,
+                            "the server is already initialized"
+                        )
+                    ])
+                _:
+                    lifecycle.replying([
+                        error_response(Some(id), MethodNotFound, "unknown method `${call.method}`")
+                    ])
+        (ShutDown, Notification(call)):
+            if call.method == "exit":
+                replying(Exited(EXIT_AFTER_SHUTDOWN), [])
+            else:
+                lifecycle.replying([])
+        (AwaitingInitialize, Notification(call)):
+            if call.method == "exit":
+                replying(Exited(EXIT_ABANDONED), [])
+            else:
+                lifecycle.replying([])
+        (Serving(session), Notification(call)):
+            session.notified(call)
+
+
+-- UTF-8 when the client offers it, which saves converting; otherwise UTF-16,
+-- which every client supports.
+private pure func agreed_encoding(params: Option[Json]) -> PositionEncoding:
+    match (
+        params
+            .field("capabilities")
+            .field("general")
+            .field("positionEncodings")
+    ):
+        Some(Array(offered)):
+            utf8 = Utf8.encoding_name()
+            offers_utf8 = offered.any(pure func(offer: Json) -> Bool:
+                match offer:
+                    Text(name): name == utf8
+                    _: False
+            )
+            if offers_utf8:
+                Utf8
+            else:
+                Utf16
+        _:
+            Utf16
+
+
+-- What the server serves: the encoding chosen, and the whole text on every change.
+private pure func initialize_result(encoding: PositionEncoding) -> Json:
+    Object(
+        {
+            "capabilities" => Object(
+                {
+                    "positionEncoding" => Text(encoding.encoding_name()),
+                    "textDocumentSync" => Object(
+                        { "openClose" => Boolean(True), "change" => Number(integer(FULL_SYNC)) }
+                    )
+                }
+            )
+        }
+    )
+
+
+-- Notifications the server does not serve, `$/cancelRequest` among them, are
+-- dropped, as are those about documents that are not `file://` URIs or are
+-- not open. Only `didOpen` analyses; a change or a close only keeps the
+-- documents current for the next analysis.
+private pure func notified(session: Session, call: Call) -> Step:
+    document = call.params.field("textDocument")
+    uri = document.text_field("uri")
+    match (
+        call.method,
+        uri
+            .map(uri_path)
+            .get_or(None)
+    ):
+        ("exit", _):
+            replying(Exited(EXIT_ABANDONED), [])
+        ("textDocument/didOpen", Some(path)):
+            match (uri, document.text_field("text")):
+                (Some(written), Some(text)):
+                    opened: Lifecycle = Serving(
+                        { session |
+                            documents = session.documents.set(path, { uri = written, text = text })
+                        }
+                    )
+                    { server = into_opaque Server(opened), replies = [], analyse = Some(path) }
+                _:
+                    replying(Serving(session), [])
+        ("textDocument/didChange", Some(path)):
+            -- With full sync each change holds the whole text, so the last one wins.
+            changed: Option[String] = match call.params.field("contentChanges"):
+                Some(Array(changes)):
+                    changes
+                        .last()
+                        .text_field("text")
+                _:
+                    None
+            match (session.documents.get(path), changed):
+                (Some(open), Some(text)):
+                    replying(
+                        Serving(
+                            { session |
+                                documents = session.documents.set(path, { open | text = text })
+                            }
+                        ),
+                        []
+                    )
+                _:
+                    replying(Serving(session), [])
+        ("textDocument/didClose", Some(path)):
+            session.closed(path)
+        (_, _):
+            replying(Serving(session), [])
+
+
+-- The diagnostics of one file, to the client's own URI when the file is open
+-- and to the server's encoding of its path otherwise.
+private pure func published_diagnostics(
+    session: Session,
+    path: Path,
+    diagnostics: List[Json]
+) -> Json:
+    uri = match session.documents.get(path):
+        Some(open): open.uri
+        None: path.file_uri()
+    notification(
+        "textDocument/publishDiagnostics",
+        Object({ "uri" => Text(uri), "diagnostics" => Array(diagnostics) })
+    )
+
+
+-- What to publish to each of `files` once the root `leaving` no longer reports
+-- in it: what the most recently analysed other root last published there, or
+-- `[]` when no other root reports there.
+private pure func handed_over(session: Session, leaving: Path, files: List[Path]) -> List[Json]:
+    var replies: List[Json] = []
+    for file in files:
+        var latest: List[Json] = []
+        for (root, last) in session.roots.entries():
+            if root != leaving:
+                match last.published.get(file):
+                    Some(diagnostics): latest = diagnostics
+                    None: void
+        replies = replies.append(session.published_diagnostics(file, latest))
+    replies
+
+
+-- The file reverts to the disk and stops being a root. Each file it reported
+-- in shows what another root reports there, if any does.
+private pure func closed(session: Session, path: Path) -> Step:
+    reported: List[Path] = match session.roots.get(path):
+        Some(last): last.published.keys()
+        None: []
+    replying(
+        Serving(
+            { session |
+                documents = session.documents.remove(path),
+                roots = session.roots.remove(path)
+            }
+        ),
+        session.handed_over(path, reported)
+    )
+
+
+-- Publishes the analysis of `root`. A document that was closed before its
+-- analysis came back is no longer a root, and the result is dropped.
+pure func analysed(server: Server, root: Path, result: DocumentAnalysis) -> Step:
+    lifecycle = from_opaque Server(server)
+    match lifecycle:
+        Serving(session):
+            if session.documents.contains(root):
+                published = result.publications(session.encoding, root)
+                previous: List[Path] = match session.roots.get(root):
+                    Some(last): last.published.keys()
+                    None: []
+                var replies: List[Json] = []
+                for (path, diagnostics) in published.entries():
+                    replies = replies.append(session.published_diagnostics(path, diagnostics))
+                stopped = previous.filter(pure func(path: Path): not(published.contains(path)))
+                -- Removing the row first moves the root to the end, so the
+                -- rows stay in analysis order.
+                roots = session.roots
+                    .remove(root)
+                    .set(root, { published = published })
+                replying(
+                    Serving({ session | roots = roots }),
+                    replies.concat(session.handed_over(root, stopped))
+                )
+            else:
+                lifecycle.replying([])
+        AwaitingInitialize | ShutDown | Exited(_):
+            lifecycle.replying([])
+
+
+-- One file's diagnostics, with the text their spans index.
+private record FileReport {
+    text: String,
+    diagnostics: List[Diagnostic]
+}
+
+
+-- Each user file the analysis reports in, with its diagnostics in report
+-- order. A diagnostic no user file can show goes at the start of the root:
+-- one about blorp itself, at no file; one in a file the load did not record;
+-- and one in a library file, whose location then leads its message, since an
+-- editor has no library file to show it in. Each file's lines are indexed
+-- once.
+private pure func publications(
+    result: DocumentAnalysis,
+    encoding: PositionEncoding,
+    root: Path
+) -> Dict[Path, List[Json]]:
+    errors: List[Diagnostic] = match result.outcome:
+        LoadFailed(error): [error]
+        CheckFailed(rejected): [rejected.first].concat(rejected.remaining)
+        Analysed: []
+    root_text: String = match result.sources.modules.get(root_module_id().module_number()):
+        Some(row): row.contents
+        None: ""
+    var reports: Dict[Path, FileReport] = {}
+    for error in errors:
+        at_root_start = { error | span = { error.span | start = 0, end = 0 } }
+        row: Option[ModuleSource] = match error.span.source.source_module():
+            Some(module): result.sources.modules.get(module.module_number())
+            None: None
+        (path, text, shown) = match row:
+            Some(file):
+                match (file.role, file.path.to_path()):
+                    (UserModule, Ok(path)):
+                        (path, file.contents, error)
+                    (UserModule, Err(_)):
+                        (root, root_text, at_root_start)
+                    (LibraryModule | FoundationTypesModule | FoundationPreludeModule, _):
+                        -- Lines and columns count from 1, as `blorp compile` reports them.
+                        at = line_index(file.contents).position_of(error.span.start, Utf8)
+                        location = "${file.path}:${at.line + 1}:${at.character + 1}"
+                        (
+                            root,
+                            root_text,
+                            { at_root_start | message = "${location}: ${error.message}" }
+                        )
+            None:
+                (root, root_text, at_root_start)
+        report: FileReport = match reports.get(path):
+            Some(earlier): { earlier | diagnostics = earlier.diagnostics.append(shown) }
+            None: { text = text, diagnostics = [shown] }
+        reports = reports.set(path, report)
+    var published: Dict[Path, List[Json]] = {}
+    for (path, report) in reports.entries():
+        index = line_index(report.text)
+        published = published.set(
+            path,
+            report.diagnostics.map(
+                pure func(error: Diagnostic) -> Json: error.diagnostic_json(index, encoding)
+            )
+        )
+    published
+
+
+private pure func position_json(position: Position) -> Json:
+    Object(
+        {
+            "line" => Number(integer(position.line)),
+            "character" => Number(integer(position.character))
+        }
+    )
+
+
+private pure func diagnostic_json(
+    error: Diagnostic,
+    index: LineIndex,
+    encoding: PositionEncoding
+) -> Json:
+    Object(
+        {
+            "range" => Object(
+                {
+                    "start" => index
+                        .position_of(error.span.start, encoding)
+                        .position_json(),
+                    "end" => index
+                        .position_of(error.span.end, encoding)
+                        .position_json()
+                }
+            ),
+            "severity" => Number(integer(ERROR_SEVERITY)),
+            "message" => Text("${error.message}\nhelp: ${error.help}")
+        }
+    )

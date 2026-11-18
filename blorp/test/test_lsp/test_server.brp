@@ -1,0 +1,648 @@
+---
+The server's step: each message through `receive`, the lifecycle and its
+errors, the open documents, and the diagnostics each analysis publishes.
+---
+import:
+    bool: and, not
+    bytes: Bytes, String methods, from_list
+    json: Json(Null), parse, render
+    list: List methods
+    option: Option methods
+    path: Path, to_path
+    result: Result methods
+    string: String methods
+    test: TestSuite
+    ../../src/common/analysis/load/load: LibrarySource(EmbeddedLibrary), load_program_with_sources
+    ../../src/common/syntax/source:
+        ModuleKind(UserModule, LibraryModule, FoundationTypesModule, FoundationPreludeModule),
+        ModuleSource,
+        SourceFile,
+        module_id,
+        module_source
+    ../../src/common/syntax/syntax: Diagnostic, Span, compiler_span, diagnostic, internal_error
+    ../../src/lsp/server:
+        AnalysisOutcome(LoadFailed, CheckFailed, Analysed),
+        DocumentAnalysis,
+        Server,
+        Step,
+        analysed,
+        document_analysis,
+        exit_status,
+        receive,
+        receive_body,
+        snapshots,
+        start_server
+
+
+private pure func json(text: String) -> Json:
+    match parse(text):
+        Ok(value): value
+        Err(_): Null
+
+
+private pure func path(text: String) -> Option[Path]:
+    match text.to_path():
+        Ok(present): Some(present)
+        Err(_): None
+
+
+-- The step the last message gives, after the ones before it, from a new server.
+private pure func after(messages: List[String]) -> Step:
+    var step: Step = { server = start_server(), replies = [], analyse = None }
+    for message in messages:
+        step = step.server.receive(json(message))
+    step
+
+
+private pure func replies(step: Step) -> List[String]:
+    step.replies.map(render)
+
+
+-- Whether the step answers with exactly `expected` and asks for no analysis.
+private pure func answers(step: Step, expected: List[String]) -> Bool:
+    and(step.replies.map(render) == expected, step.analyse.is_none())
+
+
+private INITIALIZE: String = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"capabilities\":{\"general\":{\"positionEncodings\":[\"utf-16\",\"utf-8\"]}}}}"
+
+
+private INITIALIZE_UTF16: String = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"capabilities\":{}}}"
+
+
+private SHUTDOWN: String = "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"shutdown\"}"
+
+private EXIT: String = "{\"jsonrpc\":\"2.0\",\"method\":\"exit\"}"
+
+private ROOT: String = "/work/main.brp"
+
+private ROOT_URI: String = "file:///work/main.brp"
+
+private OTHER: String = "/work/other.brp"
+
+private OTHER_URI: String = "file:///work/other.brp"
+
+-- The accented e takes two bytes and one UTF-16 unit, so a span after it has different
+-- characters in the two encodings.
+private ROOT_TEXT: String = "x = \"é\" + 1\n"
+
+
+private pure func did_open(uri: String, text: String) -> String:
+    "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":{\"textDocument\":{\"uri\":\"${uri}\",\"languageId\":\"blorp\",\"version\":1,\"text\":\"${text}\"}}}"
+
+
+private pure func did_change(uri: String, text: String) -> String:
+    "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didChange\",\"params\":{\"textDocument\":{\"uri\":\"${uri}\",\"version\":2},\"contentChanges\":[{\"text\":\"old\"},{\"text\":\"${text}\"}]}}"
+
+
+private pure func did_close(uri: String) -> String:
+    "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didClose\",\"params\":{\"textDocument\":{\"uri\":\"${uri}\"}}}"
+
+
+private pure func initialized_reply(encoding: String) -> String:
+    "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"capabilities\":{\"positionEncoding\":\"${encoding}\",\"textDocumentSync\":{\"openClose\":true,\"change\":1}}}}"
+
+
+private pure func error_reply(id: String, code: Int, message: String) -> String:
+    "{\"jsonrpc\":\"2.0\",\"id\":${id},\"error\":{\"code\":${code},\"message\":\"${message}\"}}"
+
+
+-- lifecycle
+
+pure func test_initialize_chooses_utf8_when_the_client_offers_it() -> Bool:
+    after([INITIALIZE]).answers([initialized_reply("utf-8")])
+
+
+pure func test_initialize_chooses_utf16_otherwise() -> Bool:
+    after([INITIALIZE_UTF16]).answers([initialized_reply("utf-16")])
+
+
+pure func test_a_request_before_initialize_gets_32002() -> Bool:
+    after([SHUTDOWN]).answers([error_reply("2", -32002, "the server has not been initialized")])
+
+
+pure func test_a_notification_before_initialize_is_dropped() -> Bool:
+    and(
+        after([did_open(ROOT_URI, "x")]).answers([]),
+        after([did_open(ROOT_URI, "x"), INITIALIZE]).server
+            .snapshots()
+            .is_empty()
+    )
+
+
+pure func test_an_unknown_request_gets_32601() -> Bool:
+    after([INITIALIZE, "{\"jsonrpc\":\"2.0\",\"id\":\"h\",\"method\":\"textDocument/hover\"}"]).answers(
+        [error_reply("\"h\"", -32601, "unknown method `textDocument/hover`")]
+    )
+
+
+pure func test_an_invalid_message_gets_32600() -> Bool:
+    after([INITIALIZE, "{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":7}"]).answers([
+        error_reply("5", -32600, "the message is not a JSON-RPC request or notification")
+    ])
+
+
+pure func test_a_second_initialize_gets_32600() -> Bool:
+    after([INITIALIZE, INITIALIZE]).answers([
+        error_reply("1", -32600, "the server is already initialized")
+    ])
+
+
+pure func test_shutdown_returns_null_and_later_requests_get_32600() -> Bool:
+    and(
+        after([INITIALIZE, SHUTDOWN]).answers(["{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":null}"]),
+        after([INITIALIZE, SHUTDOWN, SHUTDOWN]).answers([
+            error_reply("2", -32600, "the server has shut down")
+        ])
+    )
+
+
+pure func test_exit_ends_with_0_only_after_shutdown() -> Bool:
+    and(
+        and(
+            after([INITIALIZE, SHUTDOWN, EXIT]).server.exit_status() == Some(0),
+            after([INITIALIZE, EXIT]).server.exit_status() == Some(1)
+        ),
+        and(
+            after([EXIT]).server.exit_status() == Some(1),
+            after([INITIALIZE, SHUTDOWN]).server.exit_status() == None
+        )
+    )
+
+
+pure func test_nothing_is_answered_after_exit() -> Bool:
+    after([INITIALIZE, EXIT, SHUTDOWN]).answers([])
+
+
+pure func test_cancellations_responses_and_unknown_notifications_are_ignored() -> Bool:
+    and(
+        and(
+            after([
+                INITIALIZE,
+                "{\"jsonrpc\":\"2.0\",\"method\":\"$/cancelRequest\",\"params\":{\"id\":1}}"
+            ]).answers([]),
+            after([
+                INITIALIZE,
+                "{\"jsonrpc\":\"2.0\",\"method\":\"workspace/didChangeConfiguration\"}"
+            ]).answers([])
+        ),
+        after([INITIALIZE, "{\"jsonrpc\":\"2.0\",\"id\":9,\"result\":null}"]).answers([])
+    )
+
+
+-- bodies
+
+pure func test_a_body_that_is_not_utf8_gets_32700() -> Bool:
+    start_server()
+        .receive_body(from_list([123, 255]))
+        .answers([error_reply("null", -32700, "the message body is not UTF-8")])
+
+
+pure func test_a_body_that_is_not_json_gets_32700() -> Bool:
+    start_server()
+        .receive_body("{x}".to_bytes())
+        .answers([
+            error_reply(
+                "null",
+                -32700,
+                "the message body is not JSON: expected a quoted object name"
+            )
+        ])
+
+
+pure func test_a_json_body_is_received() -> Bool:
+    start_server()
+        .receive_body(INITIALIZE.to_bytes())
+        .answers([initialized_reply("utf-8")])
+
+
+-- documents
+
+private pure func snapshot(path_text: String, contents: String) -> SourceFile:
+    { path = path_text, contents = contents }
+
+
+pure func test_did_open_asks_to_analyse_its_document() -> Bool:
+    step = after([INITIALIZE, did_open(ROOT_URI, "x = 1")])
+    and(
+        and(step.replies.is_empty(), step.analyse == path(ROOT)),
+        step.server.snapshots() == [snapshot(ROOT, "x = 1")]
+    )
+
+
+pure func test_did_change_keeps_the_last_text_without_analysing() -> Bool:
+    step = after([INITIALIZE, did_open(ROOT_URI, "x = 1"), did_change(ROOT_URI, "x = 2")])
+    and(step.answers([]), step.server.snapshots() == [snapshot(ROOT, "x = 2")])
+
+
+pure func test_a_change_to_a_document_not_open_is_ignored() -> Bool:
+    after([INITIALIZE, did_change(ROOT_URI, "x = 2")]).server
+        .snapshots()
+        .is_empty()
+
+
+pure func test_did_close_reverts_the_document_to_the_disk() -> Bool:
+    step = after([
+        INITIALIZE,
+        did_open(ROOT_URI, "x = 1"),
+        did_open(OTHER_URI, "y = 1"),
+        did_close(ROOT_URI)
+    ])
+    and(step.answers([]), step.server.snapshots() == [snapshot(OTHER, "y = 1")])
+
+
+pure func test_a_document_without_a_file_uri_is_ignored() -> Bool:
+    after([INITIALIZE, did_open("untitled:Untitled-1", "x = 1")]).answers([])
+
+
+pure func test_a_percent_encoded_uri_names_its_decoded_path() -> Bool:
+    after([INITIALIZE, did_open("file:///work/a%20b.brp", "x")]).analyse == path("/work/a b.brp")
+
+
+-- diagnostics
+
+private pure func in_module(module: Int, start: Int, end: Int) -> Span:
+    match module_id(module):
+        Some(id): { source = id.module_source(), start = start, end = end }
+        None: compiler_span()
+
+
+-- Rows in module order: the root, the foundation inputs, a library module and
+-- a user module the root imports.
+private pure func sources(root_text: String) -> List[ModuleSource]:
+    [
+        { path = ROOT, contents = root_text, role = UserModule },
+        { path = "<standard library>/_base.brp", contents = "", role = FoundationTypesModule },
+        { path = "<standard library>/prelude.brp", contents = "", role = FoundationPreludeModule },
+        { path = "<standard library>/list.brp", contents = "a\nbc\n", role = LibraryModule },
+        { path = OTHER, contents = "one\ntwo\n", role = UserModule }
+    ]
+
+
+private pure func rejected(
+    root_text: String,
+    first: Diagnostic,
+    remaining: List[Diagnostic]
+) -> DocumentAnalysis:
+    {
+        sources = { modules = sources(root_text) },
+        outcome = CheckFailed({ first = first, remaining = remaining })
+    }
+
+
+private pure func clean(root_text: String) -> DocumentAnalysis:
+    { sources = { modules = sources(root_text) }, outcome = Analysed }
+
+
+-- The step `analysed` gives for the root.
+private pure func analysed_root(server: Server, result: DocumentAnalysis) -> Step:
+    match path(ROOT):
+        Some(present): server.analysed(present, result)
+        None: { server = server, replies = [], analyse = None }
+
+
+private pure func analysed_at(server: Server, root: String, result: DocumentAnalysis) -> Step:
+    match root.to_path():
+        Ok(present): server.analysed(present, result)
+        Err(_): { server = server, replies = [], analyse = None }
+
+
+private pure func published(uri: String, diagnostics: List[String]) -> String:
+    "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/publishDiagnostics\",\"params\":{\"uri\":\"${uri}\",\"diagnostics\":[${diagnostics.join(",")}]}}"
+
+
+private pure func reported(
+    start_line: Int,
+    start_character: Int,
+    end_line: Int,
+    end_character: Int,
+    message: String
+) -> String:
+    "{\"range\":{\"start\":{\"line\":${start_line},\"character\":${start_character}},\"end\":{\"line\":${end_line},\"character\":${end_character}}},\"severity\":1,\"message\":\"${message}\"}"
+
+
+-- The server after `initialize` and the root's didOpen.
+private pure func with_root_open(initialize: String) -> Server:
+    after([initialize, did_open(ROOT_URI, "x")]).server
+
+
+-- The library file cannot be shown, so its diagnostic goes at the start of the
+-- root, led by its location: `bc` starts line 2 of the library text.
+pure func test_each_user_file_gets_its_diagnostics_and_the_library_its_root() -> Bool:
+    step = with_root_open(INITIALIZE).analysed_root(
+        rejected(ROOT_TEXT, diagnostic(in_module(0, 10, 11), "first", "fix it"), [
+            diagnostic(in_module(3, 2, 4), "in the library", "nothing"),
+            diagnostic(in_module(4, 4, 7), "second", "fix that"),
+            diagnostic(in_module(0, 0, 1), "third", "and this")
+        ])
+    )
+    step.answers([
+        published(ROOT_URI, [
+            reported(0, 10, 0, 11, "first\\nhelp: fix it"),
+            reported(0, 0, 0, 0, "<standard library>/list.brp:2:1: in the library\\nhelp: nothing"),
+            reported(0, 0, 0, 1, "third\\nhelp: and this")
+        ]),
+        published(OTHER_URI, [reported(1, 0, 1, 3, "second\\nhelp: fix that")])
+    ])
+
+
+pure func test_ranges_count_in_the_agreed_encoding() -> Bool:
+    result = rejected(ROOT_TEXT, diagnostic(in_module(0, 10, 11), "first", "fix it"), [])
+    and(
+        with_root_open(INITIALIZE)
+            .analysed_root(result)
+            .answers([published(ROOT_URI, [reported(0, 10, 0, 11, "first\\nhelp: fix it")])]),
+        with_root_open(INITIALIZE_UTF16)
+            .analysed_root(result)
+            .answers([published(ROOT_URI, [reported(0, 9, 0, 10, "first\\nhelp: fix it")])])
+    )
+
+
+pure func test_a_diagnostic_about_blorp_is_shown_at_the_start_of_the_root() -> Bool:
+    failure: DocumentAnalysis = {
+        sources = { modules = [] },
+        outcome = LoadFailed(internal_error(compiler_span(), "broken"))
+    }
+    with_root_open(INITIALIZE)
+        .analysed_root(failure)
+        .answers([
+            published(ROOT_URI, [
+                reported(
+                    0,
+                    0,
+                    0,
+                    0,
+                    "internal compiler error: broken\\nhelp: report this compiler error with the input program"
+                )
+            ])
+        ])
+
+
+pure func test_a_fixed_error_publishes_an_empty_list() -> Bool:
+    first = with_root_open(INITIALIZE).analysed_root(
+        rejected(ROOT_TEXT, diagnostic(in_module(4, 0, 1), "second", "fix that"), [])
+    )
+    and(
+        first.server
+            .analysed_root(clean(ROOT_TEXT))
+            .answers([published(OTHER_URI, [])]),
+        first.server
+            .analysed_root(clean(ROOT_TEXT)).server
+            .analysed_root(clean(ROOT_TEXT))
+            .answers([])
+    )
+
+
+pure func test_an_analysis_of_a_document_no_longer_open_is_dropped() -> Bool:
+    closed = after([INITIALIZE, did_open(ROOT_URI, "x"), did_close(ROOT_URI)]).server
+    closed
+        .analysed_root(rejected(ROOT_TEXT, diagnostic(in_module(0, 0, 1), "first", "fix it"), []))
+        .answers([])
+
+
+pure func test_diagnostics_go_to_the_uri_the_client_opened_the_file_by() -> Bool:
+    -- `%6D` is an `m` that the server's own encoding would not escape.
+    written = "file:///work/%6Dain.brp"
+    after([INITIALIZE, did_open(written, "x")]).server
+        .analysed_root(rejected(ROOT_TEXT, diagnostic(in_module(0, 0, 1), "first", "fix it"), []))
+        .answers([published(written, [reported(0, 0, 0, 1, "first\\nhelp: fix it")])])
+
+
+-- shared files: ROOT imports OTHER, and both are open. ROOT reports `second`
+-- in OTHER, and OTHER, analysed as its own root, reports `own` there.
+
+private SECOND: String = "second\\nhelp: fix that"
+
+private OWN: String = "own\\nhelp: fix"
+
+
+private pure func root_reports_second() -> DocumentAnalysis:
+    rejected(ROOT_TEXT, diagnostic(in_module(0, 0, 1), "first", "fix it"), [
+        diagnostic(in_module(4, 0, 1), "second", "fix that")
+    ])
+
+
+private pure func other_result(errors: List[Diagnostic]) -> DocumentAnalysis:
+    outcome: AnalysisOutcome = match errors:
+        []: Analysed
+        [first, ...remaining]: CheckFailed({ first = first, remaining = remaining })
+    {
+        sources = { modules = [{ path = OTHER, contents = "one\ntwo\n", role = UserModule }] },
+        outcome = outcome
+    }
+
+
+private pure func both_open() -> Server:
+    after([INITIALIZE, did_open(ROOT_URI, "x"), did_open(OTHER_URI, "one")]).server
+
+
+-- OTHER analysed, then ROOT, so OTHER shows `second`.
+private pure func other_then_root() -> Server:
+    both_open()
+        .analysed_at(OTHER, other_result([diagnostic(in_module(0, 4, 7), "own", "fix")])).server
+        .analysed_root(root_reports_second()).server
+
+
+-- ROOT analysed, then OTHER, so OTHER shows `own`.
+private pure func root_then_other() -> Server:
+    both_open()
+        .analysed_root(root_reports_second()).server
+        .analysed_at(OTHER, other_result([diagnostic(in_module(0, 4, 7), "own", "fix")])).server
+
+
+pure func test_closing_a_root_shows_what_another_root_reports_in_a_shared_file() -> Bool:
+    and(
+        other_then_root()
+            .receive(json(did_close(ROOT_URI)))
+            .answers([published(ROOT_URI, []), published(OTHER_URI, [reported(1, 0, 1, 3, OWN)])]),
+        and(
+            root_then_other()
+                .receive(json(did_close(ROOT_URI)))
+                .answers([
+                    published(ROOT_URI, []),
+                    published(OTHER_URI, [reported(1, 0, 1, 3, OWN)])
+                ]),
+            root_then_other()
+                .receive(json(did_close(OTHER_URI)))
+                .answers([published(OTHER_URI, [reported(0, 0, 0, 1, SECOND)])])
+        )
+    )
+
+
+pure func test_a_root_that_stops_reporting_in_a_shared_file_shows_another_roots() -> Bool:
+    and(
+        other_then_root()
+            .analysed_root(clean(ROOT_TEXT))
+            .answers([published(ROOT_URI, []), published(OTHER_URI, [reported(1, 0, 1, 3, OWN)])]),
+        root_then_other()
+            .analysed_at(OTHER, other_result([]))
+            .answers([published(OTHER_URI, [reported(0, 0, 0, 1, SECOND)])])
+    )
+
+
+-- Three roots report in one shared file. After X, Y and Z, X is analysed again,
+-- so when Z closes the file shows X's, the latest of the others, not Y's.
+private SHARED: String = "/work/shared.brp"
+
+
+private pure func reports_in_shared(root: String, message: String) -> DocumentAnalysis:
+    {
+        sources = {
+            modules = [
+                { path = root, contents = "", role = UserModule },
+                { path = SHARED, contents = "s\n", role = UserModule }
+            ]
+        },
+        outcome = CheckFailed({
+            first = diagnostic(in_module(1, 0, 1), message, "h"),
+            remaining = []
+        })
+    }
+
+
+pure func test_the_most_recently_analysed_root_wins_a_shared_file() -> Bool:
+    opened = after([
+        INITIALIZE,
+        did_open("file:///work/x.brp", "x"),
+        did_open("file:///work/y.brp", "y"),
+        did_open("file:///work/z.brp", "z")
+    ]).server
+    reported_by_all = opened
+        .analysed_at("/work/x.brp", reports_in_shared("/work/x.brp", "x")).server
+        .analysed_at("/work/y.brp", reports_in_shared("/work/y.brp", "y")).server
+        .analysed_at("/work/z.brp", reports_in_shared("/work/z.brp", "z")).server
+        .analysed_at("/work/x.brp", reports_in_shared("/work/x.brp", "x again")).server
+    reported_by_all
+        .receive(json(did_close("file:///work/z.brp")))
+        .answers([
+            published("file:///work/shared.brp", [reported(0, 0, 0, 1, "x again\\nhelp: h")])
+        ])
+
+
+-- analysing a loaded program
+
+private func analysis_of(text: String) -> DocumentAnalysis:
+    document_analysis(load_program_with_sources(ROOT, EmbeddedLibrary, [snapshot(ROOT, text)]))
+
+
+func test_a_check_failure_reaches_the_server_as_data() -> Bool:
+    result = analysis_of("func main() -> Int:\n    x: Int = \"one\"\n    x\n")
+    match result.outcome:
+        CheckFailed(errors):
+            and(
+                and(errors.first.span == in_module(0, 33, 38), errors.remaining.is_empty()),
+                and(
+                    errors.first.message == "expression does not match the expected type",
+                    (
+                        result.sources.modules
+                            .get(0)
+                            .map(pure func(row: ModuleSource): row.role)
+                        == Some(UserModule)
+                    )
+                )
+            )
+        LoadFailed(_) | Analysed:
+            False
+
+
+func test_a_load_failure_reaches_the_server_as_data() -> Bool:
+    match analysis_of("$").outcome:
+        LoadFailed(error):
+            and(error.span == in_module(0, 0, 1), error.message == "unsupported character")
+        CheckFailed(_) | Analysed:
+            False
+
+
+func test_a_program_without_main_analyses() -> Bool:
+    match analysis_of("pure func value() -> Int:\n    1\n").outcome:
+        Analysed: True
+        LoadFailed(_) | CheckFailed(_): False
+
+
+TESTS: TestSuite = {
+    description = "LSP server",
+    tests = [
+        (
+            "initialize chooses UTF-8 when the client offers it",
+            test_initialize_chooses_utf8_when_the_client_offers_it
+        ),
+        ("initialize chooses UTF-16 otherwise", test_initialize_chooses_utf16_otherwise),
+        ("a request before initialize gets -32002", test_a_request_before_initialize_gets_32002),
+        (
+            "a notification before initialize is dropped",
+            test_a_notification_before_initialize_is_dropped
+        ),
+        ("an unknown request gets -32601", test_an_unknown_request_gets_32601),
+        ("an invalid message gets -32600", test_an_invalid_message_gets_32600),
+        ("a second initialize gets -32600", test_a_second_initialize_gets_32600),
+        (
+            "shutdown returns null and later requests get -32600",
+            test_shutdown_returns_null_and_later_requests_get_32600
+        ),
+        ("exit ends with 0 only after shutdown", test_exit_ends_with_0_only_after_shutdown),
+        ("nothing is answered after exit", test_nothing_is_answered_after_exit),
+        (
+            "cancellations, responses and unknown notifications are ignored",
+            test_cancellations_responses_and_unknown_notifications_are_ignored
+        ),
+        ("a body that is not UTF-8 gets -32700", test_a_body_that_is_not_utf8_gets_32700),
+        ("a body that is not JSON gets -32700", test_a_body_that_is_not_json_gets_32700),
+        ("a JSON body is received", test_a_json_body_is_received),
+        ("didOpen asks to analyse its document", test_did_open_asks_to_analyse_its_document),
+        (
+            "didChange keeps the last text without analysing",
+            test_did_change_keeps_the_last_text_without_analysing
+        ),
+        (
+            "a change to a document not open is ignored",
+            test_a_change_to_a_document_not_open_is_ignored
+        ),
+        (
+            "didClose reverts the document to the disk",
+            test_did_close_reverts_the_document_to_the_disk
+        ),
+        ("a document without a file URI is ignored", test_a_document_without_a_file_uri_is_ignored),
+        (
+            "a percent-encoded URI names its decoded path",
+            test_a_percent_encoded_uri_names_its_decoded_path
+        ),
+        (
+            "each user file gets its diagnostics, and the library its root",
+            test_each_user_file_gets_its_diagnostics_and_the_library_its_root
+        ),
+        ("ranges count in the agreed encoding", test_ranges_count_in_the_agreed_encoding),
+        (
+            "a diagnostic about blorp is shown at the start of the root",
+            test_a_diagnostic_about_blorp_is_shown_at_the_start_of_the_root
+        ),
+        ("a fixed error publishes an empty list", test_a_fixed_error_publishes_an_empty_list),
+        (
+            "an analysis of a document no longer open is dropped",
+            test_an_analysis_of_a_document_no_longer_open_is_dropped
+        ),
+        (
+            "diagnostics go to the URI the client opened the file by",
+            test_diagnostics_go_to_the_uri_the_client_opened_the_file_by
+        ),
+        (
+            "closing a root shows what another root reports in a shared file",
+            test_closing_a_root_shows_what_another_root_reports_in_a_shared_file
+        ),
+        (
+            "a root that stops reporting in a shared file shows another root's",
+            test_a_root_that_stops_reporting_in_a_shared_file_shows_another_roots
+        ),
+        (
+            "the most recently analysed root wins a shared file",
+            test_the_most_recently_analysed_root_wins_a_shared_file
+        ),
+        (
+            "a check failure reaches the server as data",
+            test_a_check_failure_reaches_the_server_as_data
+        ),
+        (
+            "a load failure reaches the server as data",
+            test_a_load_failure_reaches_the_server_as_data
+        ),
+        ("a program without main analyses", test_a_program_without_main_analyses)
+    ]
+}

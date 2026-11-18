@@ -1,0 +1,151 @@
+---
+`blorp lsp`: its help text and the transport, the only impure code of the
+language server. The transport reads each message, steps the server, analyses
+a root when the step asks for one, and writes every reply.
+---
+import:
+    bool: and, not
+    bytes: Bytes
+    io/console/output: flush, write
+    io/console/read_exact: ReadExactError(EndedEarly), read_exact
+    io/console/read_line: read_line
+    list: List methods
+    option: Option methods
+    path: Path
+    result: Result methods
+    string: String methods
+    ../common/analysis/load/load: LibrarySource(EmbeddedLibrary), load_program_with_sources
+    ../common/cli/usage: error_message, unknown_option
+    ./protocol:
+        FramingError(HeaderUnfinished, LineUnreadable, BodyUnreadable),
+        content_length,
+        framed
+    ./server:
+        EXIT_ABANDONED,
+        Server,
+        Step,
+        analysed,
+        document_analysis,
+        exit_status,
+        receive_body,
+        snapshots,
+        start_server
+
+
+LSP_HELP: String =
+    |usage: blorp lsp
+    |
+    |Serves the Language Server Protocol on standard input and output, for an
+    |editor to start. Each open .brp file is the root of its own program: the
+    |file, the modules it imports and the standard library.
+    |
+    |options:
+    |  -h, --help  show this help
+
+
+-- `blorp lsp` takes no arguments: the editor sends everything else over the protocol.
+pure func parse_lsp(words: List[String]) -> Result[Void, String]:
+    match words:
+        []:
+            Ok(void)
+        [word, ..._]:
+            if word.starts_with("-"):
+                Err(unknown_option(word, "lsp"))
+            else:
+                Err(
+                    error_message(
+                        "blorp lsp takes no arguments, but `${word}` was given",
+                        "run blorp lsp alone; the editor sends the files it opens"
+                    )
+                )
+
+
+-- The library every analysis reads: the copy built into blorp.
+private LIBRARY: LibrarySource = EmbeddedLibrary
+
+
+-- The header lines after `first`, up to the blank one, which is dropped.
+private func header_lines(first: Bytes) -> Result[List[Bytes], FramingError]:
+    var lines: List[Bytes] = []
+    var line = first
+    var ended: Option[FramingError] = None
+    while and(ended.is_none(), not(line.is_empty())):
+        lines = lines.append(line)
+        match read_line():
+            Ok(Some(next)): line = next
+            Ok(None): ended = Some(HeaderUnfinished)
+            Err(error): ended = Some(LineUnreadable(error))
+    match ended:
+        Some(error): Err(error)
+        None: Ok(lines)
+
+
+-- The body after a header whose first line is `first`: exactly the bytes its
+-- Content-Length counts.
+private func read_body(first: Bytes) -> Result[Bytes, FramingError]:
+    header ?= header_lines(first)
+    length ?= content_length(header)
+    match read_exact(length):
+        Ok(Some(body)): Ok(body)
+        Ok(None): Err(BodyUnreadable(EndedEarly(0)))
+        Err(error): Err(BodyUnreadable(error))
+
+
+-- One message: header lines up to the blank one, then the body. None at end
+-- of input between messages.
+private func read_message() -> Result[Option[Bytes], FramingError]:
+    match read_line():
+        Err(error):
+            Err(LineUnreadable(error))
+        Ok(None):
+            Ok(None)
+        Ok(Some(first)):
+            first
+                .read_body()
+                .map(pure func(body: Bytes): Some(body))
+
+
+-- Writes the step's replies, then analyses the root it asks for, with the open
+-- documents as snapshots, and performs the step that answers.
+private func perform(step: Step) -> Server:
+    for reply in step.replies:
+        write(framed(reply))
+        flush()
+    match step.analyse:
+        None:
+            step.server
+        Some(root):
+            loaded = root
+                .to_string()
+                .load_program_with_sources(LIBRARY, step.server.snapshots())
+            step.server
+                .analysed(root, document_analysis(loaded))
+                .perform()
+
+
+func serve() -> Int:
+    var server = start_server()
+    var status = EXIT_ABANDONED
+    while True:
+        match read_message():
+            Ok(Some(body)):
+                server = server
+                    .receive_body(body)
+                    .perform()
+                match server.exit_status():
+                    Some(ended):
+                        status = ended
+                        break
+                    None:
+                        void
+            Ok(None):
+                break
+            Err(error):
+                print_error(
+                    error_message(
+                        "blorp lsp stopped: ${error}",
+                        "start blorp lsp from a language client, which frames each message with a Content-Length header"
+                    )
+                )
+                break
+    status

@@ -1,7 +1,7 @@
 # Language server: `blorp lsp`
 
 **Status: plan, 2026-11-10; Keith settled its decisions and asked for a byte
-console on 2026-11-11. Landings 1–8 have landed; 9 is next.**
+console on 2026-11-11. Landings 1–8 and 9a have landed; 9b is next.**
 
 ## Problem
 
@@ -499,12 +499,12 @@ record Step {
     server: Server,
     replies: List[Json],
     -- The open document to analyse before the pending request can be answered.
-    analyse: Option[String],
+    analyse: Option[Path],
 }
 
 pure func receive(server: Server, message: Json) -> Step
 
-pure func analysed(server: Server, path: String, result: DocumentAnalysis) -> Step
+pure func analysed(server: Server, root: Path, result: DocumentAnalysis) -> Step
 ```
 
 **`Command`** (`src/main.brp:15`) gains a case, and the overview text
@@ -528,9 +528,7 @@ the builtin tables, `editor/`, the README and the tests.
 **Not:** completion, hover, rename, formatting through the server, TextMate,
 threads, incremental analysis, or grammar changes.
 
-**Concurrent work:** `UINT8_BYTES_PLAN.md` edits the same builtin tables,
-so coordinate before our landings 6 and 8. Of the
-String plan's breaking switch and this work, whichever lands second migrates
+**Concurrent work:** of the String plan's breaking switch and this work, whichever lands second migrates
 the other's `length` and `slice` uses.
 
 ## Risks and unknowns
@@ -538,9 +536,6 @@ the other's `length` and `slice` uses.
 - **Recording cost:** every compile pays it, measured in landing 5.
 - **Do semantic tokens alone colour a file in CLion?** The plugin landing
   probes it first with a stub server, with `null` and error replies too.
-- **Bootstrap.** A library call to a `builtin` label the seed lacks stops
-  the seed parsing the library (`common/syntax/parse.brp:4708`). So the
-  console labels land alone, a rotation follows, and then the library.
 - **Latency.** Analysing `blorp/src/main.brp` may be slow.
 
 ## Dependencies
@@ -561,8 +556,10 @@ backs it out; for landing 7, re-pinning the previous seed does.
 6. **Console labels:** builtin labels, runtime and emission, no library.
 7. **Seed rotation**, pinning `blorp-seed-4fee244ad96f`.
 8. **The `io/console` functions.**
-9. **`blorp lsp`:** the `src/lsp/` modules, the transport, and the README's
-   v1 limitation.
+9. **`blorp lsp`**, in three landings (Keith, 2026-11-17): **9a** the
+   command, transport, lifecycle, positions, open documents and diagnostics;
+   **9b** semantic tokens, staleness and watched files; **9c** definition,
+   references and the library on disk.
 10. **The CLion plugin.**
 11. **Broken files** served from the last good analysis.
 
@@ -580,7 +577,7 @@ lines counted apart. Compile cost must also fit the e2e instruction ceilings'
 | 5 name uses, fixed input | ≤ +1% | ≤ +0.6% | unchanged | ≤ +1,320 net |
 | 6 console labels, fixed input | ≤ +0.1% | ≤ +0.01% | ≤ +0.1% | ≤ +280 net |
 | 8 console functions, fixed input | ≤ +0.1% | ≤ +0.01% | ≤ +0.1% | ≤ +170 net |
-| 9 server | ≤ +3% (more source to compile) | ≤ +3% | ≤ +3% | ≤ +1,700 |
+| 9a server core, fixed input | ≤ +0.1% | ≤ +0.01% | ≤ +0.1% | ≤ +1,350 net |
 | 11 broken files | ≤ +0.5% (more source to compile) | ≤ +0.5% | ≤ +0.5% | ≤ +300 |
 
 **Latency.** Per request after one change, on this host: ≤ 1.0 s for
@@ -920,6 +917,72 @@ The compiler build, `test_bootstrap.sh`, `make test`, the fixpoint and
   own small runner over `run_expecting`, as `streaming_files.brp` does.
   `test-e2e` cannot run one suite.
 
+**Landing 9a** (against `1ca3f4b1c`). `self-compile-cost`, `-O2`, 3 rounds:
+
+| Measure | Base | Candidate | Change |
+| --- | ---: | ---: | ---: |
+| Fixed input, allocations | 14,730,759 | 14,730,759 | unchanged |
+| Fixed input, instructions (median) | 13,213,542,067 | 13,214,711,034 | +0.009% |
+| Fixed input, peak heap (requested bytes) | 174,395,154 | 174,395,866 | +712 bytes |
+| Own source, allocations | 14,730,759 | 15,256,707 | +3.57% |
+| Own source, instructions (median) | 13,203,493,079 | 13,682,754,052 | +3.63% |
+| Own source, peak heap (requested bytes) | 174,395,153 | 178,720,409 | +2.48% |
+| Lines, production and tests | | | +1,292 and +1,375 net |
+
+Latency, an `-O2` build (Apple clang 21), a fresh process per run, from
+writing `didOpen` to reading the reply (`latency/measure.py`):
+
+| Input | Median | Range | Runs |
+| --- | ---: | ---: | ---: |
+| One module with a type error | 3.0 ms | 2.9–10.1 ms | 9 |
+| `blorp/src/main.brp`, clean | 342 ms | 338–347 ms | 7 |
+| `main.brp` with a type error appended | 154 ms | 153–160 ms | 7 |
+
+- **Split.** Keith split landing 9 into 9a, 9b and 9c on 2026-11-17.
+  Staleness and watched files moved from 9a to 9b, where the token requests
+  that read staleness arrive, and the library on disk to 9c, which needs
+  real library paths. 9a analyses on `didOpen` only.
+- **Correction.** The plan's +1,700 lines for all of landing 9 was a sketch.
+  A compiled spike of 9a measured +1,138 (`47b4e4e45`: protocol 364,
+  server 500, transport 176, positions 84), none of it padding; the largest
+  single piece is `file://` encoding and decoding. The coordinator set 9a's
+  ceiling at ≤ +1,350 from it; expect 9a, 9b and 9c together near +2,200.
+  The own-source rows are reported, not held (`blorp/AGENTS.md`), so the old
+  ≤ +3% no longer binds.
+- **Identity.** The fixed-input C is identical (`1a8d5a3ff943f162`).
+- **Design.**
+  - The loader records each module's role in `SourceInputs`
+    (`ModuleSource`), and the server reads it rather than reclassifying.
+  - `Step.analyse` and `analysed` take a `Path`.
+  - `initialize` picks UTF-8 if offered, else UTF-16, and announces full
+    sync only.
+  - -32600 answers an invalid message, a request after `shutdown`, a second
+    `initialize`, and an id that is neither an integer nor a string.
+  - Positions go through a line index built once per text.
+  - Each root keeps what it last published per file. When a root stops
+    reporting in a file, by re-analysis or `didClose`, the most recently
+    analysed other open root's diagnostics are republished there, or `[]`.
+  - Open documents are published to by the URI the client sent.
+  - A diagnostic in a library module shows at the root's start, with its
+    location in the message.
+- **Tests.** 62 unit tests in `test/test_lsp/`, two role tests and e2e
+  sessions in `cli.brp`, among them a body that is not UTF-8 fed by
+  `sh -c 'exec "$0" lsp < "$1"'`, since process stdin is a String. Each of 26
+  unit mutations and 8 more after review failed exactly its tests, run one
+  at a time.
+- **Found, not fixed.**
+  - Note spans are dropped; they could become `relatedInformation`.
+  - `--stdio`, which VS Code clients pass, is rejected.
+  - A closed file another open root still reports in keeps that root's
+    diagnostics, as LSP allows; they were computed against the closed
+    document's unsaved text, so 9b's staleness rule must re-analyse that
+    root.
+  - After `didClose` the server forgets the client's URI, so when the client
+    spelled it differently from `file_uri(path)`, a set published under the
+    client's spelling is later updated only under ours (open a file as
+    `%6D…`, analyse an importer, close both). 9b publishes `[]` to the
+    client's URI on close when the spellings differ.
+
 ## Testing
 
 Each landing starts with a failing test.
@@ -933,7 +996,9 @@ Each landing starts with a failing test.
 | 5 | One case per `Referent` case, checking the use's span and, through `declaration_span`, its declaration's. Mutation proof: stop recording one case, and only its test fails. |
 | 6 | Direct C tests of the natives, under `test/test_common/test_codegen/test_runtime/`. |
 | 8 | e2e programs through `capture`: LF and CRLF, a last line without LF, header and body in one chunk, a short `read_exact`, a zero count at end of input, bytes that are not UTF-8 through each read, `write` output before a read, `print` and `write` output in order, a write after the reader closes, and `write` imported beside `io/files/write`'s `write_text`. |
-| 9 | `test/test_lsp/`: framing; a body that is not UTF-8; positions for `é`, an astral emoji and `\r`; token splitting; a broken file's lexer tokens; lifecycle errors; staleness after a new import, a late open, a shared file's edit and a close; each request through `receive`. An e2e session in `cli.brp` runs `initialize` through `exit` and checks replies, a diagnostic and the status. |
+| 9a | `test/test_lsp/`: framing; a body that is not UTF-8; positions for `é`, an astral emoji and `\r`; lifecycle errors; a shared file's diagnostics; each message through `receive`. An e2e session in `cli.brp` runs `initialize` through `exit` and checks replies, a diagnostic and the status. |
+| 9b | Token splitting; a broken file's lexer tokens; staleness after a new import, a late open, a shared file's edit and a close. |
+| 9c | Each request through `receive`. |
 | 10 | A manual checklist in the plugin's README. |
 | 11 | `test/test_lsp/`: edit windows, with positions before, inside and after one, and two distant edits. |
 

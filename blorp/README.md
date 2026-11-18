@@ -26,7 +26,7 @@ make -C blorp example          # compile, build and run test/test_compile/fixtur
 ```
 
 The `blorp` command (`blorp/build/blorp`) has the commands
-`compile`, `format` and `help`. `compile` takes the input and where to write the
+`compile`, `format`, `lsp` and `help`. `compile` takes the input and where to write the
 C; the standard library is built into the binary:
 
 ```sh
@@ -1359,11 +1359,35 @@ Both error unions have `IsADirectory` and `OtherOs(Int)`, with a `Stringable`
 text. A language server reads its headers with `read_line` and its body with
 `read_exact`, which share one input buffer.
 
+### The language server
+
+`blorp lsp` serves the Language Server Protocol on standard input and output,
+for an editor to start; it takes no arguments, not even `--stdio`. It
+publishes each analysis's errors as diagnostics, as `blorp compile` would
+report them, without needing `main`. Positions count UTF-8 bytes when the
+editor offers them and UTF-16 units otherwise, and LF, CRLF and a lone CR each
+end a line. The editor sends each open file's whole text with every change.
+
+Each open file is the root of its own program: the file, the modules it
+imports and the standard library built into blorp. A file is analysed when it
+is opened, with the other open files' unsaved text in place of their saved
+text. Edits are not analysed as they are typed: a changed file is analysed
+again only when it is opened again. A file that several open programs report
+in shows the diagnostics of the one analysed last; when that program stops
+reporting there, or its file is closed, the file shows what the others last
+reported. An error inside the standard library is shown at the start of the
+open file, with its library location. Modules that import the open file are
+not part of its program, so their errors show only when they are opened
+themselves.
+The server ends with status 0 after `shutdown` then `exit`, and 1 for an
+`exit` without `shutdown` or input that ends without `exit`.
+
 ## Compiler architecture
 
 [`src/main.brp`](src/main.brp) reads the command word and dispatches to
-[`compile/compile_command.brp`](src/compile/compile_command.brp) or
-[`format/format_command.brp`](src/format/format_command.brp). The compile
+[`compile/compile_command.brp`](src/compile/compile_command.brp),
+[`format/format_command.brp`](src/format/format_command.brp) or
+[`lsp/lsp_command.brp`](src/lsp/lsp_command.brp). The compile
 command loads the program, runs the pure pipeline
 ([`generate_c`](src/common/codegen/generate_c.brp)) and writes the C:
 
@@ -1374,7 +1398,7 @@ lex -> parse -> load -> namespace -> check -> specialize -> lower -> own -> veri
 Load drives lexing and parsing of each module, and checking begins by
 building the namespace.
 
-`src/` has `compile/` and `format/`, one folder per command (each holds its
+`src/` has `compile/`, `format/` and `lsp/`, one folder per command (each holds its
 `*_command.brp`: options, help text and shell), `common/`, and the entry
 point `main.brp`. `common/` holds what the commands share, one folder per
 layer. `utils/` holds helpers with no Blorp knowledge. `syntax/` is the front
@@ -1404,6 +1428,14 @@ returns a new one or its first error.
 [formatter](#formatting) lexes and parses one file with the front end and
 prints its tree, taking comments, blank lines and literal spellings from the
 source between tokens. It imports only `common/syntax/`, `common/cli/` and `common/utils/`.
+
+[`src/lsp`](src/lsp/server.brp) is not a phase either. `protocol.brp` frames
+messages and converts JSON-RPC to and from `Json`, and `positions.brp` converts
+byte offsets to and from protocol positions. `server.brp` is pure: it keeps the
+open documents and answers one message at a time, and when a document needs
+analysing it asks the transport, `lsp_command.brp`, which loads that root with
+the open documents as snapshots, runs `analyze` and hands the files read and
+the diagnostics back as data.
 
 The output is replaced atomically, as by
 [`write_text`](standard_library/README.md#the-file-modules): a symlinked output
