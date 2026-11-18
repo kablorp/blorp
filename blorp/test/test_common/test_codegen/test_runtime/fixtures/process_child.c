@@ -7,8 +7,17 @@
 #if defined(__APPLE__)
 #define _DARWIN_C_SOURCE
 #endif
+/* Before the renaming macros below, so that they rewrite the runtime's calls and not
+ * these headers' declarations. */
+#include <time.h>
 #include <unistd.h>
 
+/* The sleep probe pretends the host slept an hour before each read of a clock that
+ * counts time asleep, so a deadline on such a clock passes at once. */
+enum { SLEEP_SECONDS = 3600 };
+static int host_sleeping = 0;
+static int sleeps = 0;
+static int probe_clock_gettime(clockid_t clock, struct timespec *now);
 /* Only the startup-timeout probe stalls at the native exec boundary. */
 static int stall_exec = 0;
 static int exec_ready_writer = -1;
@@ -38,7 +47,9 @@ static ssize_t probe_write(int descriptor, const void *bytes, size_t length);
 #define fork probe_fork
 #define pipe probe_pipe
 #define write probe_write
+#define clock_gettime probe_clock_gettime
 #include "process_runtime.c"
+#undef clock_gettime
 #undef write
 #undef pipe
 #undef fork
@@ -46,6 +57,23 @@ static ssize_t probe_write(int descriptor, const void *bytes, size_t length);
 #undef execve
 #include <sys/ioctl.h>
 #include <sys/resource.h>
+
+/* CLOCK_REALTIME counts time asleep everywhere, and so does Darwin's CLOCK_MONOTONIC
+ * (clock_gettime(3)); Linux's CLOCK_MONOTONIC stops during suspend (clock_gettime(2)). */
+static int counts_sleep(clockid_t clock) {
+#if defined(__APPLE__)
+    if (clock == CLOCK_MONOTONIC) return 1;
+#endif
+    return clock == CLOCK_REALTIME;
+}
+
+static int probe_clock_gettime(clockid_t clock, struct timespec *now) {
+    const int status = clock_gettime(clock, now);
+    if (status == 0 && host_sleeping && counts_sleep(clock)) {
+        now->tv_sec += (time_t)SLEEP_SECONDS * ++sleeps;
+    }
+    return status;
+}
 
 static int probe_pipe(int ends[2]) {
     const int made = pipe(ends);
@@ -261,6 +289,17 @@ static int capture_startup(const char *program) {
     if (close(ready[0]) != 0 || close(ready[1]) != 0) return 1;
     return succeeded && exit == BLORP_PROCESS_TIMED_OUT * BLORP_PROCESS_EXIT_SPAN && acknowledged &&
         no_child() ? 0 : 1;
+}
+
+/* A host asleep through a capture does not use up its timeout: no child runs then, so the
+ * deadline counts only time awake, and a quick child exits normally. */
+static int capture_asleep(const char *program) {
+    const char *const arguments[] = {"exit", "0"};
+    int64_t exit = -1, error = 0;
+    host_sleeping = 1;
+    const uint8_t succeeded = run_capture(program, 2, arguments, NULL, 0, INT64_C(10000), &exit, &error);
+    host_sleeping = 0;
+    return succeeded && exit == BLORP_PROCESS_EXITED * BLORP_PROCESS_EXIT_SPAN ? 0 : 1;
 }
 
 /* With stdin, stdout and stderr closed, each descriptor capture opens would take one of
@@ -867,6 +906,7 @@ static int child_case(int argc, char **argv) {
         if (strcmp(argv[1], "capture-reap") == 0) return capture_reap(argv[2]);
         if (strcmp(argv[1], "capture-fork-failure") == 0) return capture_fork_failure(argv[2]);
         if (strcmp(argv[1], "capture-startup") == 0) return capture_startup(argv[2]);
+        if (strcmp(argv[1], "capture-asleep") == 0) return capture_asleep(argv[2]);
         if (strcmp(argv[1], "capture-closed-stdio") == 0) return capture_closed_stdio(argv[2]);
         if (strcmp(argv[1], "capture-group-race") == 0) return capture_group_race(argv[2]);
         if (strcmp(argv[1], "capture-stray-report") == 0) return capture_stray_report_holder(argv[2]);

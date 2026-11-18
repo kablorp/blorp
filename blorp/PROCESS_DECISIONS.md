@@ -186,6 +186,10 @@ pure func isolated(binary: Path, arguments: List[String], timeout_ms: Int) -> Co
   system would reap the child itself and the wait would report ECHILD.
 - A timeout of 0 or less is `Ok` with `TimedOut` and empty output as soon as
   the command is validated, without starting the program.
+- A timeout counts only time the host is awake, since no child runs while it
+  sleeps. Linux's `CLOCK_MONOTONIC` stops during suspend; Darwin's keeps
+  counting, so Darwin uses `CLOCK_UPTIME_RAW`. A laptop that slept through a
+  gate had failed every compile with a ten-minute timeout.
 - The program and a `directory` are `Path`s, which cannot hold NUL, so
   `ContainsNul` is about the arguments and the environment, and
   `DirectoryFailed` has no NUL case. The native still checks every input.
