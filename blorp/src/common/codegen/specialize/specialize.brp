@@ -3976,6 +3976,50 @@ private record TranslationBindings {
 }
 
 
+-- What every step of one function's translation reads. Built once per
+-- function instance; nothing below `translate_function` changes it.
+private record TranslationContext {
+    opaques: List[model.CheckedOpaque],
+    substitution: declarations.Substitution,
+    callables: TranslationBindings,
+    keys: IndexedList[FunctionRequest],
+    unions: SealedUnions,
+    records: SealedRecords
+}
+
+
+-- The concrete type of `value_type` under the function's substitution.
+private pure func translated_type(
+    context: TranslationContext,
+    value_type: model.TypeRef,
+    span: Span
+) -> Result[TypeRef, Diagnostic]:
+    concrete_type(
+        context.opaques,
+        value_type,
+        context.substitution,
+        context.unions,
+        span,
+        context.records
+    )
+
+
+-- The concrete types of `arguments` under the function's substitution.
+private pure func translated_types(
+    context: TranslationContext,
+    arguments: List[model.TypeRef],
+    span: Span
+) -> Result[List[TypeRef], Diagnostic]:
+    concrete_types(
+        context.opaques,
+        arguments,
+        context.substitution,
+        context.unions,
+        span,
+        context.records
+    )
+
+
 private pure func translated_binding(
     translation: TranslationBindings,
     id: BindingId,
@@ -4090,22 +4134,21 @@ private pure func callable_environment(
 
 
 private pure func translate_call(
-    opaques: List[model.CheckedOpaque],
+    context: TranslationContext,
     call: model.CheckedCall,
-    substitution: declarations.Substitution,
-    callables: TranslationBindings,
-    keys: IndexedList[FunctionRequest],
-    unions: SealedUnions,
-    records: SealedRecords,
     result_type: TypeRef
 ) -> Result[ConcreteCall, Diagnostic]:
     target_result: Result[CallTarget, Diagnostic] = match call.target:
         model.TraitMethod(method):
-            match method.selected_method_body(substitution, callables.traits, call.span):
+            match method.selected_method_body(
+                context.substitution,
+                context.callables.traits,
+                call.span
+            ):
                 Err(error):
                     Err(error)
                 Ok(selected):
-                    keys
+                    context.keys
                         .runtime_instance(selected.body, selected.arguments, call.span)
                         .map(pure func(id): UserFunction(id))
         model.RuntimeFunction(operation):
@@ -4168,23 +4211,23 @@ private pure func translate_call(
                     accepted: RuntimeOperation[VariantInstanceId, TypeRef] = builtins.FloatCopySign
                     Ok(accepted)
                 ListRepeat(element):
-                    match concrete_type(opaques, element, substitution, unions, call.span, records):
+                    match context.translated_type(element, call.span):
                         Ok(concrete): Ok(builtins.ListRepeat(concrete))
                         Err(error): Err(error)
                 ListLength(element):
-                    match concrete_type(opaques, element, substitution, unions, call.span, records):
+                    match context.translated_type(element, call.span):
                         Ok(concrete): Ok(builtins.ListLength(concrete))
                         Err(error): Err(error)
                 ListAppend(element):
-                    match concrete_type(opaques, element, substitution, unions, call.span, records):
+                    match context.translated_type(element, call.span):
                         Ok(concrete): Ok(builtins.ListAppend(concrete))
                         Err(error): Err(error)
                 ListSet(element):
-                    match concrete_type(opaques, element, substitution, unions, call.span, records):
+                    match context.translated_type(element, call.span):
                         Ok(concrete): Ok(builtins.ListSet(concrete))
                         Err(error): Err(error)
                 ListConcat(element):
-                    match concrete_type(opaques, element, substitution, unions, call.span, records):
+                    match context.translated_type(element, call.span):
                         Ok(concrete): Ok(builtins.ListConcat(concrete))
                         Err(error): Err(error)
                 StringLength:
@@ -4203,34 +4246,34 @@ private pure func translate_call(
                     accepted: RuntimeOperation[VariantInstanceId, TypeRef] = builtins.StringPrintError
                     Ok(accepted)
                 StringParseInt(option):
-                    match option.translate_option(result_type, unions, call.span):
+                    match option.translate_option(result_type, context.unions, call.span):
                         Ok(translated): Ok(builtins.StringParseInt(translated))
                         Err(error): Err(error)
                 StringParseFloat(option):
-                    match option.translate_option(result_type, unions, call.span):
+                    match option.translate_option(result_type, context.unions, call.span):
                         Ok(translated): Ok(builtins.StringParseFloat(translated))
                         Err(error): Err(error)
                 StringByteAtUInt8(option):
-                    match option.translate_option(result_type, unions, call.span):
+                    match option.translate_option(result_type, context.unions, call.span):
                         Ok(translated): Ok(builtins.StringByteAtUInt8(translated))
                         Err(error): Err(error)
                 SystemCall(system, result):
-                    match result.translate_result(result_type, unions, call.span):
+                    match result.translate_result(result_type, context.unions, call.span):
                         Ok(translated): Ok(builtins.SystemCall(system, translated))
                         Err(error): Err(error)
                 StringFromCodepoint(option):
-                    match option.translate_option(result_type, unions, call.span):
+                    match option.translate_option(result_type, context.unions, call.span):
                         Ok(translated): Ok(builtins.StringFromCodepoint(translated))
                         Err(error): Err(error)
                 StringSlice(option):
-                    match option.translate_option(result_type, unions, call.span):
+                    match option.translate_option(result_type, context.unions, call.span):
                         Ok(translated): Ok(builtins.StringSlice(translated))
                         Err(error): Err(error)
                 StringByteLength:
                     accepted: RuntimeOperation[VariantInstanceId, TypeRef] = builtins.StringByteLength
                     Ok(accepted)
                 StringByteSlice(option):
-                    match option.translate_option(result_type, unions, call.span):
+                    match option.translate_option(result_type, context.unions, call.span):
                         Ok(translated): Ok(builtins.StringByteSlice(translated))
                         Err(error): Err(error)
                 StringCodepointLength:
@@ -4240,42 +4283,42 @@ private pure func translate_call(
                     accepted: RuntimeOperation[VariantInstanceId, TypeRef] = builtins.StringCodepointSlice
                     Ok(accepted)
                 StringCodepointAt(option):
-                    match option.translate_option(result_type, unions, call.span):
+                    match option.translate_option(result_type, context.unions, call.span):
                         Ok(translated): Ok(builtins.StringCodepointAt(translated))
                         Err(error): Err(error)
                 StringToBytes:
                     accepted: RuntimeOperation[VariantInstanceId, TypeRef] = builtins.StringToBytes
                     Ok(accepted)
                 BytesToText(option):
-                    match option.translate_option(result_type, unions, call.span):
+                    match option.translate_option(result_type, context.unions, call.span):
                         Ok(translated): Ok(builtins.BytesToText(translated))
                         Err(error): Err(error)
                 ListGet(element, option):
-                    match concrete_type(opaques, element, substitution, unions, call.span, records):
+                    match context.translated_type(element, call.span):
                         Ok(concrete):
-                            match option.translate_option(result_type, unions, call.span):
+                            match option.translate_option(result_type, context.unions, call.span):
                                 Ok(translated): Ok(builtins.ListGet(concrete, translated))
                                 Err(error): Err(error)
                         Err(error):
                             Err(error)
                 IntegerEquals(format, boolean):
-                    match boolean.translate_boolean(result_type, unions, call.span):
+                    match boolean.translate_boolean(result_type, context.unions, call.span):
                         Ok(translated): Ok(builtins.IntegerEquals(format, translated))
                         Err(error): Err(error)
                 IntegerLessThan(format, boolean):
-                    match boolean.translate_boolean(result_type, unions, call.span):
+                    match boolean.translate_boolean(result_type, context.unions, call.span):
                         Ok(translated): Ok(builtins.IntegerLessThan(format, translated))
                         Err(error): Err(error)
                 FloatEquals(boolean):
-                    match boolean.translate_boolean(result_type, unions, call.span):
+                    match boolean.translate_boolean(result_type, context.unions, call.span):
                         Ok(translated): Ok(builtins.FloatEquals(translated))
                         Err(error): Err(error)
                 FloatLessThan(boolean):
-                    match boolean.translate_boolean(result_type, unions, call.span):
+                    match boolean.translate_boolean(result_type, context.unions, call.span):
                         Ok(translated): Ok(builtins.FloatLessThan(translated))
                         Err(error): Err(error)
                 StringEquals(boolean):
-                    match boolean.translate_boolean(result_type, unions, call.span):
+                    match boolean.translate_boolean(result_type, context.unions, call.span):
                         Ok(translated): Ok(builtins.StringEquals(translated))
                         Err(error): Err(error)
 
@@ -4283,9 +4326,9 @@ private pure func translate_call(
                 Ok(concrete): Ok(RuntimeFunction(concrete))
                 Err(error): Err(error)
         model.ValueCall(_):
-            Err(internal_error(call.span, "stored call reached direct call translation"))
+            Err(internal_error(call.span, "stored call reached direct call context.callables"))
         model.CallableParameter(parameter):
-            match callables.translated_callable(parameter, call.span):
+            match context.callables.translated_callable(parameter, call.span):
                 Err(error):
                     Err(error)
                 Ok(binding):
@@ -4298,18 +4341,18 @@ private pure func translate_call(
                             Err(
                                 internal_error(
                                     call.span,
-                                    "runtime callable reached direct call translation"
+                                    "runtime callable reached direct call context.callables"
                                 )
                             )
                     match choice:
                         Err(error):
                             Err(error)
                         Ok(known):
-                            keys
+                            context.keys
                                 .runtime_instance(known.body, known.arguments, call.span)
                                 .map(pure func(id): UserFunction(id))
         model.UserFunction(declaration, arguments):
-            match arguments.semantic_arguments(substitution, call.span):
+            match arguments.semantic_arguments(context.substitution, call.span):
                 Err(error):
                     Err(error)
                 Ok(concrete):
@@ -4322,21 +4365,21 @@ private pure func translate_call(
                             model.CallableOperand(written_parameter, written_choice, written_span):
                                 choice_result: Result[CallableMode, Diagnostic] = match written_choice:
                                     model.ForwardedCallable(parameter):
-                                        callables.forward_translation(
+                                        context.callables.forward_translation(
                                             parameter,
                                             written_parameter,
                                             written_span
                                         )
                                     model.LambdaCallable(id, captures):
-                                        root_arguments = substitution.values
+                                        root_arguments = context.substitution.values
                                         id
                                             .lambda_storage(
                                                 captures.length(),
                                                 root_arguments,
-                                                opaques,
-                                                substitution,
-                                                unions,
-                                                records,
+                                                context.opaques,
+                                                context.substitution,
+                                                context.unions,
+                                                context.records,
                                                 written_span
                                             )
                                             .map(
@@ -4350,13 +4393,13 @@ private pure func translate_call(
                                     model.MethodCallable(method):
                                         method.method_callable(
                                             written_parameter,
-                                            substitution,
-                                            callables.traits,
+                                            context.substitution,
+                                            context.callables.traits,
                                             written_span
                                         )
                                     model.NamedCallable(id, named_arguments):
                                         named_arguments
-                                            .semantic_arguments(substitution, written_span)
+                                            .semantic_arguments(context.substitution, written_span)
                                             .map(
                                                 pure func(values): StaticCallable({
                                                     parameter = written_parameter,
@@ -4377,7 +4420,7 @@ private pure func translate_call(
                         Some(error):
                             Err(error)
                         None:
-                            match keys.find_instance(
+                            match context.keys.find_instance(
                                 {
                                     body = model.DeclaredBody(declaration),
                                     arguments = concrete,
@@ -4434,42 +4477,23 @@ private pure func translate_variant(
 
 -- A written record field of a literal or an update, with its field instance.
 private pure func translate_record_field(
-    opaques: List[model.CheckedOpaque],
+    context: TranslationContext,
     field: model.CheckedRecordField,
-    owner: RecordInstanceId,
-    substitution: declarations.Substitution,
-    callables: TranslationBindings,
-    keys: IndexedList[FunctionRequest],
-    unions: SealedUnions,
-    records: SealedRecords
+    owner: RecordInstanceId
 ) -> Result[ConcreteRecordField, Diagnostic]:
-    id ?= field.field.translate_field(owner, records, field.span)
-    child ?= translate_expr(opaques, field.value, substitution, callables, keys, unions, records)
+    id ?= field.field.translate_field(owner, context.records, field.span)
+    child ?= translate_expr(context, field.value)
     Ok({ field = id, value = child })
 
 
 private pure func translate_record_fields(
-    opaques: List[model.CheckedOpaque],
+    context: TranslationContext,
     fields: List[model.CheckedRecordField],
-    owner: RecordInstanceId,
-    substitution: declarations.Substitution,
-    callables: TranslationBindings,
-    keys: IndexedList[FunctionRequest],
-    unions: SealedUnions,
-    records: SealedRecords
+    owner: RecordInstanceId
 ) -> Result[List[ConcreteRecordField], Diagnostic]:
     fields.translated_list(
         pure func(field: model.CheckedRecordField) -> Result[ConcreteRecordField, Diagnostic]:
-            translate_record_field(
-                opaques,
-                field,
-                owner,
-                substitution,
-                callables,
-                keys,
-                unions,
-                records
-            )
+            translate_record_field(context, field, owner)
     )
 
 
@@ -4509,29 +4533,24 @@ private pure func callable_binding_value(
 
 
 private pure func translate_callable_value(
-    opaques: List[model.CheckedOpaque],
+    context: TranslationContext,
     choice: model.CallableChoice,
     value_type: TypeRef,
-    substitution: declarations.Substitution,
-    translation: TranslationBindings,
-    keys: IndexedList[FunctionRequest],
-    unions: SealedUnions,
-    records: SealedRecords,
     span: Span
 ) -> Result[ConcreteExpr, Diagnostic]:
     match choice:
         model.StoredCallable(value):
-            translate_expr(opaques, value, substitution, translation, keys, unions, records)
+            translate_expr(context, value)
         model.ForwardedCallable(parameter):
-            match translation.translated_callable(parameter, span):
+            match context.callables.translated_callable(parameter, span):
                 Err(error): Err(error)
-                Ok(binding): binding.callable_binding_value(keys, span)
+                Ok(binding): binding.callable_binding_value(context.keys, span)
         model.MethodCallable(method):
-            match method.selected_method_body(substitution, translation.traits, span):
+            match method.selected_method_body(context.substitution, context.callables.traits, span):
                 Err(error):
                     Err(error)
                 Ok(selected):
-                    keys
+                    context.keys
                         .runtime_instance(selected.body, selected.arguments, span)
                         .map(
                             pure func(body) -> ConcreteExpr: {
@@ -4541,32 +4560,22 @@ private pure func translate_callable_value(
                             }
                         )
         model.NamedCallable(id, arguments):
-            match arguments.semantic_arguments(substitution, span):
+            match arguments.semantic_arguments(context.substitution, span):
                 Err(error):
                     Err(error)
                 Ok(concrete):
-                    match keys.runtime_instance(model.DeclaredBody(id), concrete, span):
+                    match context.keys.runtime_instance(model.DeclaredBody(id), concrete, span):
                         Err(error):
                             Err(error)
                         Ok(body):
                             Ok({ form = FreeCallable(body), value_type = value_type, span = span })
         model.LambdaCallable(id, captures):
-            arguments = substitution.values
-            match keys.runtime_instance(model.LambdaBody(id), arguments, span):
+            arguments = context.substitution.values
+            match context.keys.runtime_instance(model.LambdaBody(id), arguments, span):
                 Err(error):
                     Err(error)
                 Ok(body):
-                    match translate_capture_environment(
-                        opaques,
-                        id,
-                        captures,
-                        substitution,
-                        translation,
-                        keys,
-                        unions,
-                        records,
-                        span
-                    ):
+                    match translate_capture_environment(context, id, captures, span):
                         Err(error):
                             Err(error)
                         Ok(environment):
@@ -4580,15 +4589,10 @@ private pure func translate_callable_value(
 -- taking the one below it as its translated first operand, so translation's
 -- stack does not grow with the chain.
 private pure func translate_call_chain(
-    opaques: List[model.CheckedOpaque],
+    context: TranslationContext,
     value: model.CheckedExpr,
     call: model.CheckedCall,
-    first: CallLink,
-    substitution: declarations.Substitution,
-    translation: TranslationBindings,
-    keys: IndexedList[FunctionRequest],
-    unions: SealedUnions,
-    records: SealedRecords
+    first: CallLink
 ) -> Result[ConcreteExpr, Diagnostic]:
     -- The links between `value` and the innermost one, outermost first.
     var links: List[CallLink] = []
@@ -4600,17 +4604,7 @@ private pure func translate_call_chain(
             Some(next):
                 links = links.append(innermost)
                 innermost = next
-    var current = translate_invocation(
-        opaques,
-        innermost.value,
-        innermost.call,
-        None,
-        substitution,
-        translation,
-        keys,
-        unions,
-        records
-    )
+    var current = translate_invocation(context, innermost.value, innermost.call, None)
     var position = links.length()
     while (position > 0).and(current.is_ok()):
         position = position - 1
@@ -4618,81 +4612,48 @@ private pure func translate_call_chain(
             Some(link):
                 current.and_then(
                     pure func(below): translate_invocation(
-                        opaques,
+                        context,
                         link.value,
                         link.call,
-                        Some(below),
-                        substitution,
-                        translation,
-                        keys,
-                        unions,
-                        records
+                        Some(below)
                     )
                 )
             None:
                 Err(internal_error(value.span, "call chain link is missing"))
     match current:
-        Ok(below):
-            translate_invocation(
-                opaques,
-                value,
-                call,
-                Some(below),
-                substitution,
-                translation,
-                keys,
-                unions,
-                records
-            )
-        Err(error):
-            Err(error)
+        Ok(below): translate_invocation(context, value, call, Some(below))
+        Err(error): Err(error)
 
 
 -- `first` is the call's first operand when a chain loop has translated it.
 private pure func translate_invocation(
-    opaques: List[model.CheckedOpaque],
+    context: TranslationContext,
     value: model.CheckedExpr,
     call: model.CheckedCall,
-    first: Option[ConcreteExpr],
-    substitution: declarations.Substitution,
-    translation: TranslationBindings,
-    keys: IndexedList[FunctionRequest],
-    unions: SealedUnions,
-    records: SealedRecords
+    first: Option[ConcreteExpr]
 ) -> Result[ConcreteExpr, Diagnostic]:
     callee: Result[Option[ConcreteExpr], Diagnostic] = match call.target:
         model.ValueCall(operand):
-            translate_expr(opaques, operand, substitution, translation, keys, unions, records).map(
-                pure func(callee_value): Some(callee_value)
-            )
+            translate_expr(context, operand).map(pure func(callee_value): Some(callee_value))
         model.CallableParameter(parameter):
-            match translation.translated_callable(parameter, call.span):
+            match context.callables.translated_callable(parameter, call.span):
                 Err(error):
                     Err(error)
                 Ok(binding):
                     match binding:
                         RuntimeCallableBinding(_, _, _):
                             binding
-                                .callable_binding_value(keys, call.span)
+                                .callable_binding_value(context.keys, call.span)
                                 .map(pure func(callee_value): Some(callee_value))
                         _:
                             Ok(None)
         _:
             Ok(None)
     selected ?= callee
-    value_type ?= concrete_type(opaques, value.value_type, substitution, unions, call.span, records)
+    value_type ?= context.translated_type(value.value_type, call.span)
     match selected:
         Some(callable):
-            match translate_call_operands(
-                opaques,
-                call,
-                first,
-                substitution,
-                translation,
-                keys,
-                unions,
-                records
-            ):
+            match translate_call_operands(context, call, first):
                 Err(error):
                     Err(error)
                 Ok(values):
@@ -4702,29 +4663,11 @@ private pure func translate_invocation(
                         span = value.span
                     })
         None:
-            match translate_call(
-                opaques,
-                call,
-                substitution,
-                translation,
-                keys,
-                unions,
-                records,
-                value_type
-            ):
+            match translate_call(context, call, value_type):
                 Err(error):
                     Err(error)
                 Ok(concrete):
-                    match translate_call_arguments(
-                        opaques,
-                        call,
-                        first,
-                        substitution,
-                        translation,
-                        keys,
-                        unions,
-                        records
-                    ):
+                    match translate_call_arguments(context, call, first):
                         Err(error):
                             Err(error)
                         Ok(values):
@@ -4736,51 +4679,27 @@ private pure func translate_invocation(
 
 
 private pure func translate_tuple_element(
-    opaques: List[model.CheckedOpaque],
+    context: TranslationContext,
     value: model.CheckedExpr,
     receiver: model.CheckedExpr,
-    ordinal: Int,
-    substitution: declarations.Substitution,
-    callables: TranslationBindings,
-    keys: IndexedList[FunctionRequest],
-    unions: SealedUnions,
-    records: SealedRecords
+    ordinal: Int
 ) -> Result[ConcreteExpr, Diagnostic]:
-    source ?= translate_expr(opaques, receiver, substitution, callables, keys, unions, records)
+    source ?= translate_expr(context, receiver)
     match source.value_type:
         RecordType(owner):
             field = into_opaque FieldInstanceId({ owner = owner, position = ordinal })
-            translate_leaf(
-                opaques,
-                ReadRecordField(source, field),
-                value,
-                substitution,
-                unions,
-                records
-            )
+            translate_leaf(context, ReadRecordField(source, field), value)
         _:
             Err(internal_error(value.span, "tuple projection has a non-record concrete receiver"))
 
 
 private pure func translate_tuple(
-    opaques: List[model.CheckedOpaque],
+    context: TranslationContext,
     value: model.CheckedExpr,
-    elements: List[model.CheckedExpr],
-    substitution: declarations.Substitution,
-    callables: TranslationBindings,
-    keys: IndexedList[FunctionRequest],
-    unions: SealedUnions,
-    records: SealedRecords
+    elements: List[model.CheckedExpr]
 ) -> Result[ConcreteExpr, Diagnostic]:
-    value_type ?= concrete_type(
-        opaques,
-        value.value_type,
-        substitution,
-        unions,
-        value.span,
-        records
-    )
-    values ?= translate_exprs(opaques, elements, substitution, callables, keys, unions, records)
+    value_type ?= context.translated_type(value.value_type, value.span)
+    values ?= translate_exprs(context, elements)
     match value_type:
         RecordType(owner):
             var fields: List[ConcreteRecordField] = []
@@ -4803,66 +4722,36 @@ private pure func translate_tuple(
 -- A node's type and identity translate before its children, except a field read,
 -- whose instance needs its receiver's concrete record.
 private pure func translate_expr(
-    opaques: List[model.CheckedOpaque],
-    value: model.CheckedExpr,
-    substitution: declarations.Substitution,
-    callables: TranslationBindings,
-    keys: IndexedList[FunctionRequest],
-    unions: SealedUnions,
-    records: SealedRecords
+    context: TranslationContext,
+    value: model.CheckedExpr
 ) -> Result[ConcreteExpr, Diagnostic]:
     match value.form:
         model.MakeCallable(choice):
-            match concrete_type(
-                opaques,
-                value.value_type,
-                substitution,
-                unions,
-                value.span,
-                records
-            ):
-                Err(error):
-                    Err(error)
-                Ok(value_type):
-                    translate_callable_value(
-                        opaques,
-                        choice,
-                        value_type,
-                        substitution,
-                        callables,
-                        keys,
-                        unions,
-                        records,
-                        value.span
-                    )
+            match context.translated_type(value.value_type, value.span):
+                Err(error): Err(error)
+                Ok(value_type): translate_callable_value(context, choice, value_type, value.span)
         model.ConstructOpaque(_, child):
-            match translate_expr(opaques, child, substitution, callables, keys, unions, records):
+            match translate_expr(context, child):
                 Ok(translated): Ok({ translated | span = value.span })
                 Err(error): Err(error)
         model.ProjectOpaque(_, child):
-            match translate_expr(opaques, child, substitution, callables, keys, unions, records):
+            match translate_expr(context, child):
                 Ok(translated): Ok({ translated | span = value.span })
                 Err(error): Err(error)
         model.ReadTupleElement(receiver, ordinal):
-            translate_tuple_element(
-                opaques,
-                value,
-                receiver,
-                ordinal,
-                substitution,
-                callables,
-                keys,
-                unions,
-                records
-            )
+            translate_tuple_element(context, value, receiver, ordinal)
         model.ReadRecordField(receiver, field):
-            match translate_expr(opaques, receiver, substitution, callables, keys, unions, records):
+            match translate_expr(context, receiver):
                 Ok(source):
                     -- The receiver's translated type already names its record instance.
                     match source.value_type:
                         RecordType(owner):
                             -- The prepared receiver row already owns this exact concrete field type.
-                            match field.concrete_record_field_type(owner, records, value.span):
+                            match field.concrete_record_field_type(
+                                owner,
+                                context.records,
+                                value.span
+                            ):
                                 Ok(value_type):
                                     translated_field = into_opaque FieldInstanceId({
                                         owner = owner,
@@ -4886,53 +4775,21 @@ private pure func translate_expr(
                     Err(error)
         model.InvokeFunction(call):
             match call.chained_operand():
-                Some(first):
-                    translate_call_chain(
-                        opaques,
-                        value,
-                        call,
-                        first,
-                        substitution,
-                        callables,
-                        keys,
-                        unions,
-                        records
-                    )
-                None:
-                    translate_invocation(
-                        opaques,
-                        value,
-                        call,
-                        None,
-                        substitution,
-                        callables,
-                        keys,
-                        unions,
-                        records
-                    )
+                Some(first): translate_call_chain(context, value, call, first)
+                None: translate_invocation(context, value, call, None)
         model.UpdateRecord(declaration, update):
-            match record_instance(opaques, declaration, value, substitution, unions, records):
+            match record_instance(
+                context.opaques,
+                declaration,
+                value,
+                context.substitution,
+                context.unions,
+                context.records
+            ):
                 Ok(owner):
-                    match translate_expr(
-                        opaques,
-                        update.base,
-                        substitution,
-                        callables,
-                        keys,
-                        unions,
-                        records
-                    ):
+                    match translate_expr(context, update.base):
                         Ok(base):
-                            match translate_record_fields(
-                                opaques,
-                                update.replacements,
-                                owner,
-                                substitution,
-                                callables,
-                                keys,
-                                unions,
-                                records
-                            ):
+                            match translate_record_fields(context, update.replacements, owner):
                                 Ok(replacements):
                                     inherited_result: Result[List[RetainedRecordField], Diagnostic] = update.inherited.translated_list(
                                         pure func(
@@ -4940,17 +4797,13 @@ private pure func translate_expr(
                                         ) -> Result[RetainedRecordField, Diagnostic]:
                                             match field.field.translate_field(
                                                 owner,
-                                                records,
+                                                context.records,
                                                 update.base_expression_span
                                             ):
                                                 Ok(id):
-                                                    match concrete_type(
-                                                        opaques,
+                                                    match context.translated_type(
                                                         field.value_type,
-                                                        substitution,
-                                                        unions,
-                                                        update.base_expression_span,
-                                                        records
+                                                        update.base_expression_span
                                                     ):
                                                         Ok(value_type):
                                                             Ok({
@@ -4984,28 +4837,13 @@ private pure func translate_expr(
                 Err(error):
                     Err(error)
         model.ConstructVariant(id, children):
-            match concrete_type(
-                opaques,
-                value.value_type,
-                substitution,
-                unions,
-                value.span,
-                records
-            ):
+            match context.translated_type(value.value_type, value.span):
                 Ok(value_type):
                     match value_type.concrete_union_owner(value.span):
                         Ok(owner):
-                            match id.translate_variant(owner, unions, value.span):
+                            match id.translate_variant(owner, context.unions, value.span):
                                 Ok(variant):
-                                    match translate_exprs(
-                                        opaques,
-                                        children,
-                                        substitution,
-                                        callables,
-                                        keys,
-                                        unions,
-                                        records
-                                    ):
+                                    match translate_exprs(context, children):
                                         Ok(values):
                                             Ok({
                                                 form = ConstructVariant(variant, values),
@@ -5021,29 +4859,18 @@ private pure func translate_expr(
                 Err(error):
                     Err(error)
         model.ConstructTuple(elements):
-            translate_tuple(
-                opaques,
-                value,
-                elements,
-                substitution,
-                callables,
-                keys,
-                unions,
-                records
-            )
+            translate_tuple(context, value, elements)
         model.ConstructRecord(declaration, fields):
-            match record_instance(opaques, declaration, value, substitution, unions, records):
+            match record_instance(
+                context.opaques,
+                declaration,
+                value,
+                context.substitution,
+                context.unions,
+                context.records
+            ):
                 Ok(owner):
-                    match translate_record_fields(
-                        opaques,
-                        fields,
-                        owner,
-                        substitution,
-                        callables,
-                        keys,
-                        unions,
-                        records
-                    ):
+                    match translate_record_fields(context, fields, owner):
                         Ok(concrete):
                             Ok({
                                 form = ConstructRecord(owner, concrete),
@@ -5055,24 +4882,9 @@ private pure func translate_expr(
                 Err(error):
                     Err(error)
         model.ConstructList(elements):
-            match concrete_type(
-                opaques,
-                value.value_type,
-                substitution,
-                unions,
-                value.span,
-                records
-            ):
+            match context.translated_type(value.value_type, value.span):
                 Ok(value_type):
-                    match translate_exprs(
-                        opaques,
-                        elements,
-                        substitution,
-                        callables,
-                        keys,
-                        unions,
-                        records
-                    ):
+                    match translate_exprs(context, elements):
                         Ok(values):
                             Ok({
                                 form = ConstructList(values),
@@ -5084,25 +4896,9 @@ private pure func translate_expr(
                 Err(error):
                     Err(error)
         model.Match(join):
-            match concrete_type(
-                opaques,
-                value.value_type,
-                substitution,
-                unions,
-                value.span,
-                records
-            ):
+            match context.translated_type(value.value_type, value.span):
                 Ok(value_type):
-                    match translate_join(
-                        opaques,
-                        join,
-                        substitution,
-                        callables,
-                        keys,
-                        unions,
-                        records,
-                        value.span
-                    ):
+                    match translate_join(context, join, value.span):
                         Ok(concrete):
                             Ok({
                                 form = Match(concrete),
@@ -5114,15 +4910,15 @@ private pure func translate_expr(
                 Err(error):
                     Err(error)
         model.LiteralVoid:
-            translate_leaf(opaques, LiteralVoid, value, substitution, unions, records)
+            translate_leaf(context, LiteralVoid, value)
         model.LiteralString(text):
-            translate_leaf(opaques, LiteralString(text), value, substitution, unions, records)
+            translate_leaf(context, LiteralString(text), value)
         model.LiteralInteger(integer):
-            translate_leaf(opaques, LiteralInteger(integer), value, substitution, unions, records)
+            translate_leaf(context, LiteralInteger(integer), value)
         model.LiteralFloat(number):
-            translate_leaf(opaques, LiteralFloat(number), value, substitution, unions, records)
+            translate_leaf(context, LiteralFloat(number), value)
         model.ReadCapture(id):
-            match callables.capture:
+            match context.callables.capture:
                 NoCaptureBinding:
                     Err(internal_error(value.span, "capture read outside a capture environment"))
                 LambdaCaptureBinding(lambda, owner, binding):
@@ -5136,53 +4932,31 @@ private pure func translate_expr(
                             owner = owner,
                             position = id.capture_number()
                         })
-                        translate_leaf(
-                            opaques,
-                            ReadRecordField(receiver, field),
-                            value,
-                            substitution,
-                            unions,
-                            records
-                        )
+                        translate_leaf(context, ReadRecordField(receiver, field), value)
                     else:
                         Err(internal_error(value.span, "capture read belongs to another lambda"))
         model.ReadBinding(id):
-            match callables.translated_binding(id, value.span):
+            match context.callables.translated_binding(id, value.span):
                 Err(error): Err(error)
-                Ok(binding): binding.callable_binding_value(keys, value.span)
+                Ok(binding): binding.callable_binding_value(context.keys, value.span)
 
 
 -- A leaf keeps its checked form; only its type is made concrete.
 private pure func translate_leaf(
-    opaques: List[model.CheckedOpaque],
+    context: TranslationContext,
     form: ConcreteForm,
-    value: model.CheckedExpr,
-    substitution: declarations.Substitution,
-    unions: SealedUnions,
-    records: SealedRecords
+    value: model.CheckedExpr
 ) -> Result[ConcreteExpr, Diagnostic]:
-    value_type ?= concrete_type(
-        opaques,
-        value.value_type,
-        substitution,
-        unions,
-        value.span,
-        records
-    )
+    value_type ?= context.translated_type(value.value_type, value.span)
     Ok({ form = form, value_type = value_type, span = value.span })
 
 
 -- Ordinary values, stored callables and callback environments retain written
 -- order. `first`, when present, is the already translated first operand.
 private pure func translate_call_operands(
-    opaques: List[model.CheckedOpaque],
+    context: TranslationContext,
     call: model.CheckedCall,
-    first: Option[ConcreteExpr],
-    substitution: declarations.Substitution,
-    translation: TranslationBindings,
-    keys: IndexedList[FunctionRequest],
-    unions: SealedUnions,
-    records: SealedRecords
+    first: Option[ConcreteExpr]
 ) -> Result[List[ConcreteExpr], Diagnostic]:
     var values: List[ConcreteExpr] = []
     var failure: Option[Diagnostic] = None
@@ -5198,28 +4972,11 @@ private pure func translate_call_operands(
     for operand in operands:
         match operand:
             model.ValueOperand(argument):
-                match translate_expr(
-                    opaques,
-                    argument,
-                    substitution,
-                    translation,
-                    keys,
-                    unions,
-                    records
-                ):
+                match translate_expr(context, argument):
                     Err(error): failure = Some(error)
                     Ok(value): values = values.append(value)
             model.CallableOperand(_, choice, span):
-                match translate_callable_operand(
-                    opaques,
-                    choice,
-                    span,
-                    substitution,
-                    translation,
-                    keys,
-                    unions,
-                    records
-                ):
+                match translate_callable_operand(context, choice, span):
                     Err(error):
                         failure = Some(error)
                     Ok(environment):
@@ -5235,28 +4992,14 @@ private pure func translate_call_operands(
 
 
 private pure func translate_call_arguments(
-    opaques: List[model.CheckedOpaque],
+    context: TranslationContext,
     call: model.CheckedCall,
-    first: Option[ConcreteExpr],
-    substitution: declarations.Substitution,
-    translation: TranslationBindings,
-    keys: IndexedList[FunctionRequest],
-    unions: SealedUnions,
-    records: SealedRecords
+    first: Option[ConcreteExpr]
 ) -> Result[List[ConcreteExpr], Diagnostic]:
-    values ?= translate_call_operands(
-        opaques,
-        call,
-        first,
-        substitution,
-        translation,
-        keys,
-        unions,
-        records
-    )
+    values ?= translate_call_operands(context, call, first)
     match call.target:
         model.CallableParameter(parameter):
-            match translation.translated_callable(parameter, call.span):
+            match context.callables.translated_callable(parameter, call.span):
                 Err(error):
                     Err(error)
                 Ok(binding):
@@ -5264,14 +5007,14 @@ private pure func translate_call_arguments(
                         ErasedCallableBinding(_, _):
                             Ok(values)
                         CapturedCallableBinding(_, _, _):
-                            match parameter.callable_environment(translation, call.span):
+                            match parameter.callable_environment(context.callables, call.span):
                                 Err(error): Err(error)
                                 Ok(environment): Ok([environment].concat(values))
                         _:
                             Err(
                                 internal_error(
                                     call.span,
-                                    "runtime callable reached direct argument translation"
+                                    "runtime callable reached direct argument context.callables"
                                 )
                             )
         model.TraitMethod(_) | model.RuntimeFunction(_) | model.UserFunction(_, _) | model.ValueCall(_):
@@ -5279,24 +5022,17 @@ private pure func translate_call_arguments(
 
 
 private pure func translate_callable_operand(
-    opaques: List[model.CheckedOpaque],
+    context: TranslationContext,
     choice: model.CallableChoice,
-    span: Span,
-    substitution: declarations.Substitution,
-    translation: TranslationBindings,
-    keys: IndexedList[FunctionRequest],
-    unions: SealedUnions,
-    records: SealedRecords
+    span: Span
 ) -> Result[Option[ConcreteExpr], Diagnostic]:
     match choice:
         model.MethodCallable(_) | model.NamedCallable(_, _):
             Ok(None)
         model.StoredCallable(value):
-            translate_expr(opaques, value, substitution, translation, keys, unions, records).map(
-                pure func(concrete): Some(concrete)
-            )
+            translate_expr(context, value).map(pure func(concrete): Some(concrete))
         model.ForwardedCallable(parameter):
-            match translation.translated_callable(parameter, span):
+            match context.callables.translated_callable(parameter, span):
                 Err(error):
                     Err(error)
                 Ok(binding):
@@ -5305,11 +5041,11 @@ private pure func translate_callable_operand(
                             Ok(None)
                         CapturedCallableBinding(_, _, _):
                             parameter
-                                .callable_environment(translation, span)
+                                .callable_environment(context.callables, span)
                                 .map(pure func(value): Some(value))
                         RuntimeCallableBinding(_, _, _):
                             binding
-                                .callable_binding_value(keys, span)
+                                .callable_binding_value(context.keys, span)
                                 .map(pure func(value): Some(value))
                         RuntimeValueBinding(_, _):
                             Err(
@@ -5319,37 +5055,22 @@ private pure func translate_callable_operand(
                                 )
                             )
         model.LambdaCallable(id, captures):
-            translate_capture_environment(
-                opaques,
-                id,
-                captures,
-                substitution,
-                translation,
-                keys,
-                unions,
-                records,
-                span
-            )
+            translate_capture_environment(context, id, captures, span)
 
 
 private pure func translate_capture_environment(
-    opaques: List[model.CheckedOpaque],
+    context: TranslationContext,
     id: LambdaId,
     captures: List[model.CheckedExpr],
-    substitution: declarations.Substitution,
-    translation: TranslationBindings,
-    keys: IndexedList[FunctionRequest],
-    unions: SealedUnions,
-    records: SealedRecords,
     span: Span
 ) -> Result[Option[ConcreteExpr], Diagnostic]:
     match id.lambda_storage(
         captures.length(),
-        substitution.values,
-        opaques,
-        substitution,
-        unions,
-        records,
+        context.substitution.values,
+        context.opaques,
+        context.substitution,
+        context.unions,
+        context.records,
         span
     ):
         Err(error):
@@ -5357,15 +5078,7 @@ private pure func translate_capture_environment(
         Ok(ErasedCallable):
             Ok(None)
         Ok(EnvironmentCallable(owner)):
-            match translate_exprs(
-                opaques,
-                captures,
-                substitution,
-                translation,
-                keys,
-                unions,
-                records
-            ):
+            match translate_exprs(context, captures):
                 Err(error):
                     Err(error)
                 Ok(children):
@@ -5390,107 +5103,57 @@ private pure func translate_capture_environment(
 
 
 private pure func translate_exprs(
-    opaques: List[model.CheckedOpaque],
-    values: List[model.CheckedExpr],
-    substitution: declarations.Substitution,
-    callables: TranslationBindings,
-    keys: IndexedList[FunctionRequest],
-    unions: SealedUnions,
-    records: SealedRecords
+    context: TranslationContext,
+    values: List[model.CheckedExpr]
 ) -> Result[List[ConcreteExpr], Diagnostic]:
     values.translated_list(pure func(value: model.CheckedExpr) -> Result[ConcreteExpr, Diagnostic]:
-        translate_expr(opaques, value, substitution, callables, keys, unions, records)
+        translate_expr(context, value)
     )
 
 
 private pure func translate_statements(
-    opaques: List[model.CheckedOpaque],
-    statements: List[model.CheckedStatement],
-    substitution: declarations.Substitution,
-    callables: TranslationBindings,
-    keys: IndexedList[FunctionRequest],
-    unions: SealedUnions,
-    records: SealedRecords
+    context: TranslationContext,
+    statements: List[model.CheckedStatement]
 ) -> Result[List[ConcreteStatement], Diagnostic]:
     statements.translated_list(
         pure func(statement: model.CheckedStatement) -> Result[ConcreteStatement, Diagnostic]:
             match statement:
                 model.InitializeBinding(id, value):
-                    match translate_expr(
-                        opaques,
-                        value,
-                        substitution,
-                        callables,
-                        keys,
-                        unions,
-                        records
-                    ):
+                    match translate_expr(context, value):
                         Ok(translated_value):
-                            match callables.runtime_binding(id, value.span):
+                            match context.callables.runtime_binding(id, value.span):
                                 Ok(runtime): Ok(InitializeBinding(runtime, translated_value))
                                 Err(error): Err(error)
                         Err(error):
                             Err(error)
                 model.DiscardExpression(value):
-                    match translate_expr(
-                        opaques,
-                        value,
-                        substitution,
-                        callables,
-                        keys,
-                        unions,
-                        records
-                    ):
+                    match translate_expr(context, value):
                         Ok(translated_value): Ok(DiscardExpression(translated_value))
                         Err(error): Err(error)
                 model.ReassignBinding(id, value):
-                    match translate_expr(
-                        opaques,
-                        value,
-                        substitution,
-                        callables,
-                        keys,
-                        unions,
-                        records
-                    ):
+                    match translate_expr(context, value):
                         Ok(translated_value):
-                            match callables.runtime_binding(id, value.span):
+                            match context.callables.runtime_binding(id, value.span):
                                 Ok(runtime): Ok(ReassignBinding(runtime, translated_value))
                                 Err(error): Err(error)
                         Err(error):
                             Err(error)
                 model.RunWhile(loop):
-                    match callables.runtime_bindings(loop.carried, loop.span):
+                    match context.callables.runtime_bindings(loop.carried, loop.span):
                         Err(error):
                             Err(error)
                         Ok(carried):
-                            match translate_expr(
-                                opaques,
-                                loop.condition,
-                                substitution,
-                                callables,
-                                keys,
-                                unions,
-                                records
-                            ):
+                            match translate_expr(context, loop.condition):
                                 Err(error):
                                     Err(error)
                                 Ok(condition):
-                                    match translate_statements(
-                                        opaques,
-                                        loop.body,
-                                        substitution,
-                                        callables,
-                                        keys,
-                                        unions,
-                                        records
-                                    ):
+                                    match translate_statements(context, loop.body):
                                         Err(error):
                                             Err(error)
                                         Ok(body):
                                             match loop.boolean.translate_boolean(
                                                 condition.value_type,
-                                                unions,
+                                                context.unions,
                                                 loop.span
                                             ):
                                                 Err(error):
@@ -5510,7 +5173,7 @@ private pure func translate_statements(
                 model.ContinueSourceLoop(span):
                     Ok(ContinueSourceLoop(span))
                 model.RunFor(loop):
-                    match callables.runtime_bindings(loop.carried, loop.span):
+                    match context.callables.runtime_bindings(loop.carried, loop.span):
                         Err(error):
                             Err(error)
                         Ok(carried):
@@ -5518,7 +5181,7 @@ private pure func translate_statements(
                                 None:
                                     Ok(None)
                                 Some(id):
-                                    callables
+                                    context.callables
                                         .runtime_binding(id, loop.span)
                                         .map(pure func(runtime): Some(runtime))
                             match item_result:
@@ -5527,31 +5190,18 @@ private pure func translate_statements(
                                 Ok(item):
                                     iteration: Result[ConcreteIteration, Diagnostic] = match loop.iteration:
                                         model.ListIteration(iterable, element, option):
-                                            match translate_expr(
-                                                opaques,
-                                                iterable,
-                                                substitution,
-                                                callables,
-                                                keys,
-                                                unions,
-                                                records
-                                            ):
+                                            match translate_expr(context, iterable):
                                                 Err(error):
                                                     Err(error)
                                                 Ok(value):
-                                                    match concrete_type(
-                                                        opaques,
+                                                    match context.translated_type(
                                                         element,
-                                                        substitution,
-                                                        unions,
-                                                        loop.span,
-                                                        records
+                                                        loop.span
                                                     ):
                                                         Err(error):
                                                             Err(error)
                                                         Ok(concrete_element):
-                                                            match concrete_type(
-                                                                opaques,
+                                                            match context.translated_type(
                                                                 model.NominalType(
                                                                     model.AggregateNominal(
                                                                         model.UnionAggregate(
@@ -5560,17 +5210,14 @@ private pure func translate_statements(
                                                                     ),
                                                                     [element]
                                                                 ),
-                                                                substitution,
-                                                                unions,
-                                                                loop.span,
-                                                                records
+                                                                loop.span
                                                             ):
                                                                 Err(error):
                                                                     Err(error)
                                                                 Ok(option_type):
                                                                     match option.translate_option(
                                                                         option_type,
-                                                                        unions,
+                                                                        context.unions,
                                                                         loop.span
                                                                     ):
                                                                         Err(error):
@@ -5584,32 +5231,15 @@ private pure func translate_statements(
                                                                                 )
                                                                             )
                                         model.AscendingIntRange(start, end, boolean):
-                                            match translate_expr(
-                                                opaques,
-                                                start,
-                                                substitution,
-                                                callables,
-                                                keys,
-                                                unions,
-                                                records
-                                            ):
+                                            match translate_expr(context, start):
                                                 Err(error):
                                                     Err(error)
                                                 Ok(concrete_start):
-                                                    match translate_expr(
-                                                        opaques,
-                                                        end,
-                                                        substitution,
-                                                        callables,
-                                                        keys,
-                                                        unions,
-                                                        records
-                                                    ):
+                                                    match translate_expr(context, end):
                                                         Err(error):
                                                             Err(error)
                                                         Ok(concrete_end):
-                                                            match concrete_type(
-                                                                opaques,
+                                                            match context.translated_type(
                                                                 model.NominalType(
                                                                     model.AggregateNominal(
                                                                         model.UnionAggregate(
@@ -5618,17 +5248,14 @@ private pure func translate_statements(
                                                                     ),
                                                                     []
                                                                 ),
-                                                                substitution,
-                                                                unions,
-                                                                loop.span,
-                                                                records
+                                                                loop.span
                                                             ):
                                                                 Err(error):
                                                                     Err(error)
                                                                 Ok(boolean_type):
                                                                     match boolean.translate_boolean(
                                                                         boolean_type,
-                                                                        unions,
+                                                                        context.unions,
                                                                         loop.span
                                                                     ):
                                                                         Err(error):
@@ -5645,15 +5272,7 @@ private pure func translate_statements(
                                         Err(error):
                                             Err(error)
                                         Ok(concrete_iteration):
-                                            match translate_statements(
-                                                opaques,
-                                                loop.body,
-                                                substitution,
-                                                callables,
-                                                keys,
-                                                unions,
-                                                records
-                                            ):
+                                            match translate_statements(context, loop.body):
                                                 Err(error):
                                                     Err(error)
                                                 Ok(body):
@@ -5680,19 +5299,16 @@ private pure func translate_place_variant(
 
 
 private pure func translate_place(
-    opaques: List[model.CheckedOpaque],
+    context: TranslationContext,
     place: model.CheckedPatternPlace,
-    substitution: declarations.Substitution,
-    unions: SealedUnions,
-    records: SealedRecords,
     span: Span
 ) -> Result[ConcretePatternPlace, Diagnostic]:
-    value_type ?= concrete_type(opaques, place.value_type, substitution, unions, span, records)
+    value_type ?= context.translated_type(place.value_type, span)
     route: Result[ConcretePatternRoute, Diagnostic] = match place.route:
         model.MatchRoot:
             Ok(MatchRoot)
         model.RecordField(parent, ordinal):
-            match translate_place(opaques, parent, substitution, unions, records, span):
+            match translate_place(context, parent, span):
                 Err(error):
                     Err(error)
                 Ok(concrete_parent):
@@ -5715,15 +5331,19 @@ private pure func translate_place(
                                 )
                             )
         model.ListElement(parent, index):
-            match translate_place(opaques, parent, substitution, unions, records, span):
+            match translate_place(context, parent, span):
                 Err(error): Err(error)
                 Ok(concrete_parent): Ok(ListElement(concrete_parent, index))
         model.UnionField(parent, id, ordinal):
-            match translate_place(opaques, parent, substitution, unions, records, span):
+            match translate_place(context, parent, span):
                 Err(error):
                     Err(error)
                 Ok(concrete_parent):
-                    match concrete_parent.value_type.translate_place_variant(id, unions, span):
+                    match concrete_parent.value_type.translate_place_variant(
+                        id,
+                        context.unions,
+                        span
+                    ):
                         Err(error):
                             Err(error)
                         Ok(variant):
@@ -5741,30 +5361,22 @@ private pure func translate_place(
 
 
 private pure func translate_pattern_argument(
-    opaques: List[model.CheckedOpaque],
+    context: TranslationContext,
     argument: model.CheckedPatternArgument,
-    substitution: declarations.Substitution,
-    unions: SealedUnions,
-    records: SealedRecords,
     span: Span
 ) -> Result[ConcretePatternArgument, Diagnostic]:
     match argument:
         model.BorrowPlace(place):
-            translate_place(opaques, place, substitution, unions, records, span).map(
-                pure func(concrete): BorrowPlace(concrete)
-            )
+            translate_place(context, place, span).map(pure func(concrete): BorrowPlace(concrete))
         model.CopyListSuffix(place, skipped):
-            match translate_place(opaques, place, substitution, unions, records, span):
+            match translate_place(context, place, span):
                 Ok(concrete): Ok(CopyListSuffix(concrete, skipped))
                 Err(error): Err(error)
 
 
 private pure func translate_selection(
-    opaques: List[model.CheckedOpaque],
+    context: TranslationContext,
     selection: model.CheckedSelection,
-    substitution: declarations.Substitution,
-    unions: SealedUnions,
-    records: SealedRecords,
     span: Span
 ) -> Result[ConcreteSelection, Diagnostic]:
     nodes ?= selection.nodes.translated_list(
@@ -5775,33 +5387,26 @@ private pure func translate_selection(
                         pure func(
                             argument: model.CheckedPatternArgument
                         ) -> Result[ConcretePatternArgument, Diagnostic]:
-                            translate_pattern_argument(
-                                opaques,
-                                argument,
-                                substitution,
-                                unions,
-                                records,
-                                span
-                            )
+                            translate_pattern_argument(context, argument, span)
                     ):
                         Ok(values): Ok(EnterArm(id, values))
                         Err(error): Err(error)
                 model.TestListLength(place, test, yes, no):
-                    match translate_place(opaques, place, substitution, unions, records, span):
+                    match translate_place(context, place, span):
                         Ok(concrete): Ok(TestListLength(concrete, test, yes, no))
                         Err(error): Err(error)
                 model.TestLiteral(place, literal, yes, no):
-                    match translate_place(opaques, place, substitution, unions, records, span):
+                    match translate_place(context, place, span):
                         Ok(concrete): Ok(TestLiteral(concrete, literal, yes, no))
                         Err(error): Err(error)
                 model.TestVariant(place, id, yes, no):
-                    match translate_place(opaques, place, substitution, unions, records, span):
+                    match translate_place(context, place, span):
                         Err(error):
                             Err(error)
                         Ok(concrete_place):
                             match concrete_place.value_type.translate_place_variant(
                                 id,
-                                unions,
+                                context.unions,
                                 span
                             ):
                                 Ok(variant): Ok(TestVariant(concrete_place, variant, yes, no))
@@ -5812,81 +5417,42 @@ private pure func translate_selection(
 
 -- A non-tail match specializes exactly as the tail match does, arm by arm.
 private pure func translate_join(
-    opaques: List[model.CheckedOpaque],
+    context: TranslationContext,
     join: model.CheckedJoin,
-    substitution: declarations.Substitution,
-    callables: TranslationBindings,
-    keys: IndexedList[FunctionRequest],
-    unions: SealedUnions,
-    records: SealedRecords,
     span: Span
 ) -> Result[ConcreteJoin, Diagnostic]:
-    carried ?= callables.runtime_bindings(join.carried, span)
-    scrutinee ?= translate_expr(
-        opaques,
-        join.scrutinee,
-        substitution,
-        callables,
-        keys,
-        unions,
-        records
-    )
-    selected ?= translate_selection(opaques, join.selection, substitution, unions, records, span)
+    carried ?= context.callables.runtime_bindings(join.carried, span)
+    scrutinee ?= translate_expr(context, join.scrutinee)
+    selected ?= translate_selection(context, join.selection, span)
     arms ?= join.arms.translated_list(
         pure func(arm: model.CheckedJoinArm) -> Result[ConcreteJoinArm, Diagnostic]:
-            translate_join_arm(opaques, arm, substitution, callables, keys, unions, records, span)
+            translate_join_arm(context, arm, span)
     )
     Ok({ scrutinee = scrutinee, selection = selected, arms = arms, carried = carried })
 
 
 private pure func translate_join_arm(
-    opaques: List[model.CheckedOpaque],
+    context: TranslationContext,
     arm: model.CheckedJoinArm,
-    substitution: declarations.Substitution,
-    callables: TranslationBindings,
-    keys: IndexedList[FunctionRequest],
-    unions: SealedUnions,
-    records: SealedRecords,
     span: Span
 ) -> Result[ConcreteJoinArm, Diagnostic]:
-    statements ?= translate_statements(
-        opaques,
-        arm.statements,
-        substitution,
-        callables,
-        keys,
-        unions,
-        records
-    )
-    value ?= translate_expr(opaques, arm.value, substitution, callables, keys, unions, records)
-    inputs ?= callables.runtime_bindings(arm.inputs, span)
+    statements ?= translate_statements(context, arm.statements)
+    value ?= translate_expr(context, arm.value)
+    inputs ?= context.callables.runtime_bindings(arm.inputs, span)
     Ok({ id = arm.id, inputs = inputs, statements = statements, value = value })
 
 
 private pure func translate_exit(
-    opaques: List[model.CheckedOpaque],
-    exit: model.CheckedExit,
-    substitution: declarations.Substitution,
-    callables: TranslationBindings,
-    keys: IndexedList[FunctionRequest],
-    unions: SealedUnions,
-    records: SealedRecords
+    context: TranslationContext,
+    exit: model.CheckedExit
 ) -> Result[ConcreteExit, Diagnostic]:
     match exit:
         model.ReturnExpression(value):
-            match translate_expr(opaques, value, substitution, callables, keys, unions, records):
+            match translate_expr(context, value):
                 Ok(concrete): Ok(ReturnExpression(concrete))
                 Err(error): Err(error)
         model.RecurWith(arguments, span):
-            match translate_exprs(
-                opaques,
-                arguments,
-                substitution,
-                callables,
-                keys,
-                unions,
-                records
-            ):
+            match translate_exprs(context, arguments):
                 Ok(concrete): Ok(RecurWith(concrete, span))
                 Err(error): Err(error)
 
@@ -6321,52 +5887,26 @@ private pure func translate_parameters(
 
 
 private pure func translate_match_arm(
-    opaques: List[model.CheckedOpaque],
+    context: TranslationContext,
     arm: model.CheckedArm,
-    substitution: declarations.Substitution,
-    callables: TranslationBindings,
-    keys: IndexedList[FunctionRequest],
-    unions: SealedUnions,
-    records: SealedRecords,
     span: Span
 ) -> Result[ConcreteArm, Diagnostic]:
-    statements ?= translate_statements(
-        opaques,
-        arm.statements,
-        substitution,
-        callables,
-        keys,
-        unions,
-        records
-    )
-    body ?= translate_exit(opaques, arm.body, substitution, callables, keys, unions, records)
-    inputs ?= callables.runtime_bindings(arm.inputs, span)
+    statements ?= translate_statements(context, arm.statements)
+    body ?= translate_exit(context, arm.body)
+    inputs ?= context.callables.runtime_bindings(arm.inputs, span)
     Ok({ id = arm.id, inputs = inputs, statements = statements, body = body })
 
 
 private pure func translate_match(
-    opaques: List[model.CheckedOpaque],
+    context: TranslationContext,
     matched: model.CheckedMatch,
-    substitution: declarations.Substitution,
-    callables: TranslationBindings,
-    keys: IndexedList[FunctionRequest],
-    unions: SealedUnions,
-    records: SealedRecords,
     span: Span
 ) -> Result[ConcreteMatch, Diagnostic]:
-    scrutinee ?= translate_expr(
-        opaques,
-        matched.scrutinee,
-        substitution,
-        callables,
-        keys,
-        unions,
-        records
-    )
-    selected ?= translate_selection(opaques, matched.selection, substitution, unions, records, span)
+    scrutinee ?= translate_expr(context, matched.scrutinee)
+    selected ?= translate_selection(context, matched.selection, span)
     arms ?= matched.arms.translated_list(
         pure func(arm: model.CheckedArm) -> Result[ConcreteArm, Diagnostic]:
-            translate_match_arm(opaques, arm, substitution, callables, keys, unions, records, span)
+            translate_match_arm(context, arm, span)
     )
     Ok({ scrutinee = scrutinee, selection = selected, arms = arms })
 
@@ -6386,43 +5926,29 @@ private pure func translate_function(
     runtime ?= translate_parameters(opaques, function, key, substitution, unions, records, traits)
     parameters = runtime.parameters
     bindings = runtime.bindings
-    translation = runtime.translation
+    context: TranslationContext = {
+        opaques = opaques,
+        substitution = substitution,
+        callables = runtime.translation,
+        keys = keys,
+        unions = unions,
+        records = records
+    }
 
-    return_type ?= concrete_type(
-        opaques,
+    return_type ?= context.translated_type(
         function.return_type.value_type,
-        substitution,
-        unions,
-        function.return_type.span,
-        records
+        function.return_type.span
     )
 
-    statements ?= translate_statements(
-        opaques,
-        function.statements,
-        substitution,
-        translation,
-        keys,
-        unions,
-        records
-    )
+    statements ?= translate_statements(context, function.statements)
 
     body_result: Result[ConcreteBody, Diagnostic] = match function.body:
         model.CheckedValueBody(value):
-            translate_exit(opaques, value, substitution, translation, keys, unions, records).map(
-                pure func(concrete): ConcreteValueBody(concrete)
-            )
+            translate_exit(context, value).map(pure func(concrete): ConcreteValueBody(concrete))
         model.CheckedMatchBody(matched):
-            translate_match(
-                opaques,
-                matched,
-                substitution,
-                translation,
-                keys,
-                unions,
-                records,
-                span
-            ).map(pure func(concrete): ConcreteMatchBody(concrete))
+            translate_match(context, matched, span).map(
+                pure func(concrete): ConcreteMatchBody(concrete)
+            )
 
     body ?= body_result
     label = match key.body:

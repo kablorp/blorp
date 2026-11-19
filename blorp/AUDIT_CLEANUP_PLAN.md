@@ -185,3 +185,27 @@ rotated base with the same method as above:
   instructions may rise by at most 0.5%.
 - Production lines go down by at least 250; this is a growth-audit trigger.
   Test lines do not change.
+
+**Measured for 7.** `self-compile-cost 4d9fe3796 c4dd130aa --rounds 7`
+compares against the rotation. The review fix in `fceeda91f` only adds a
+comment.
+
+| Change | Allocations | Instructions | Peak heap | Own-source allocations, instructions | Production lines | Test lines |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 7. Translation context | +0.04% | -0.22% | +0.00% | -0.07%, -0.31% | +293, -767 (net -474) | 0 |
+
+The bare-argument lines fell from 309 to 46. The ones left are in layout,
+`translate_parameters`, `admit_scalar_*` and `lambda_storage`.
+`lambda_storage` runs before the context exists, so it still takes four
+tables at two sites. That is a possible follow-up.
+
+**Gates for 6 and 7.** The stack was replayed onto `5716e7aa8`, which
+touches `load.brp`. All of these ran on `f378ab15e`, which differs from the
+landing commit only in this file:
+- `make -C blorp test INSTRUCTION_CHECK=on` passed all 3,293 cases, with no
+  ceiling exceeded, in 639 s.
+- `scripts/blorp-fixpoint --prove` passed, in 106 s.
+- Branch CI ran as run `44473437781`.
+
+The logs are the main checkout's `build/audit-2026-11-17/gate-rotation.log`
+and `fixpoint-rotation.log`.
