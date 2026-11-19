@@ -160,11 +160,17 @@ fixed record TokenModifiers {
 }
 
 
--- One classified token, before encoding: where it is and what it is.
-fixed record Classified {
-    span: Span,
+-- What a token is.
+fixed record TokenClass {
     token_type: TokenType,
     modifiers: TokenModifiers
+}
+
+
+-- One classified token, before encoding: where it is and what it is.
+private fixed record Classified {
+    span: Span,
+    class: TokenClass
 }
 
 
@@ -236,21 +242,22 @@ private pure func library_declared(
                 Some(UserModule) | None: False
 
 
--- The identifier at `span`, which names `referent`, and declares it when
+-- What an identifier that names `referent` is, declaring it when
 -- `declaration` is set. A binding is a parameter or a variable by its origin.
 -- None for a binding no source declares, which no identifier can name, and
 -- for an id the analysis does not hold.
 private pure func classified_name(
     analysis: Analysis,
     sources: SourceInputs,
-    span: Span,
     referent: Referent,
     declaration: Bool
-) -> Option[Classified]:
+) -> Option[TokenClass]:
     -- Each case's type, and whether it is read-only.
     named: Option[(TokenType, Bool)] = match referent:
         -- An implementation's method is declared as a function and called as
-        -- its trait's method; both are coloured as methods.
+        -- its trait's method; both are coloured as methods. No name records a
+        -- trait default's body: its declaration and its calls name its trait
+        -- method.
         FunctionReferent(id):
             match analysis.function_role(id):
                 Some(FreeFunctionBody): Some((SemanticFunction, False))
@@ -284,7 +291,6 @@ private pure func classified_name(
     match named:
         Some((token_type, readonly)):
             Some({
-                span = span,
                 token_type = token_type,
                 modifiers = {
                     declaration = declaration,
@@ -297,27 +303,27 @@ private pure func classified_name(
             None
 
 
--- The identifiers of `module` that the analysis resolved, by the byte offset
--- each starts at: every name used there, and every declaration there, which
--- wins over a use with the same span. Derived from the analysis's name uses
--- and declaration tables, once per request.
+-- What each identifier of `module` that the analysis resolved is, by the byte
+-- offset it starts at: every name used there, and every declaration there,
+-- which wins over a use at the same offset. Derived from the analysis's name
+-- uses and declaration tables, once per request.
 pure func analysed_identifiers(
     analysis: Analysis,
     sources: SourceInputs,
     module: ModuleId
-) -> Dict[Int, Classified]:
+) -> Dict[Int, TokenClass]:
     source = module_source(module)
-    var identifiers: Dict[Int, Classified] = {}
+    var identifiers: Dict[Int, TokenClass] = {}
     for use in analysis.name_uses():
         if use.span.source == source:
-            match analysis.classified_name(sources, use.span, use.referent, False):
+            match analysis.classified_name(sources, use.referent, False):
                 Some(name): identifiers = identifiers.set(use.span.start, name)
                 None: void
     for referent in analysis.declarations():
         match analysis.declaration_span(referent):
             Some(span):
                 if span.source == source:
-                    match analysis.classified_name(sources, span, referent, True):
+                    match analysis.classified_name(sources, referent, True):
                         Some(name): identifiers = identifiers.set(span.start, name)
                         None: void
             None:
@@ -350,18 +356,19 @@ private pure func lexical_type(kind: TokenKind) -> Option[TokenType]:
 private pure func comment_token(comment: Comment) -> Classified:
     {
         span = comment.span,
-        token_type = SemanticComment,
-        modifiers = { no_modifiers() | documentation = comment.documentation }
+        class = {
+            token_type = SemanticComment,
+            modifiers = { no_modifiers() | documentation = comment.documentation }
+        }
     }
 
 
 -- Every token of a lexed text in source order, comments among them. An
--- identifier takes its type and modifiers from `identifiers`, and has none when
--- the analysis resolved no name there; its span is the lexer's, so every token
--- sent is one the lexer read.
+-- identifier takes its class from `identifiers`, and has none when the
+-- analysis resolved no name there.
 private pure func classified_tokens(
     lexed: LexedProgram,
-    identifiers: Dict[Int, Classified]
+    identifiers: Dict[Int, TokenClass]
 ) -> List[Classified]:
     var tokens: List[Classified] = []
     var next_comment = 0
@@ -380,15 +387,19 @@ private pure func classified_tokens(
             TokenKind.IdentifierToken(_, _):
                 identifiers
                     .get(token.span.start)
-                    .map(pure func(name: Classified) -> Classified: { name | span = token.span })
+                    .map(
+                        pure func(name: TokenClass) -> Classified: {
+                            span = token.span,
+                            class = name
+                        }
+                    )
             _:
                 token.kind
                     .lexical_type()
                     .map(
                         pure func(token_type: TokenType) -> Classified: {
                             span = token.span,
-                            token_type = token_type,
-                            modifiers = no_modifiers()
+                            class = { token_type = token_type, modifiers = no_modifiers() }
                         }
                     )
         match classified:
@@ -413,9 +424,9 @@ private pure func encoded(
         -- TOKEN_TYPES lists every type. Were one missing, its tokens would go
         -- uncoloured rather than show as another type, and the tests, which
         -- decode tokens through the legend's names, would fail.
-        match TOKEN_TYPES.index_of(token.token_type):
+        match TOKEN_TYPES.index_of(token.class.token_type):
             Some(type_index):
-                bits = token.modifiers.modifier_bits()
+                bits = token.class.modifiers.modifier_bits()
                 for piece in index.line_pieces(token.span.start, token.span.end, encoding):
                     line_delta = piece.start.line - previous.line
                     start_delta = if line_delta == 0:
@@ -440,7 +451,7 @@ private pure func encoded(
 pure func semantic_tokens(
     text: String,
     module: ModuleId,
-    identifiers: Dict[Int, Classified],
+    identifiers: Dict[Int, TokenClass],
     encoding: PositionEncoding
 ) -> List[Int]:
     lexed: LexedProgram = match lex(module_source(module), text, program_names().names):

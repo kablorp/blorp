@@ -101,6 +101,18 @@ union LibrarySource:
     LibraryDirectory(String)
 
 
+-- Each file of the library built into blorp, by its path below the library
+-- root, so that `blorp lsp` can write the library where an editor can open it.
+-- The generated module gives every path it lists a text, so the Err names a
+-- fault in its generator.
+pure func embedded_library_files() -> Result[List[SourceFile], String]:
+    EMBEDDED_LIBRARY_PATHS.translated_list(
+        pure func(path: String) -> Result[SourceFile, String]: embedded_library_file(path)
+            .map(pure func(contents: String) -> SourceFile: { path = path, contents = contents })
+            .to_result("the embedded library lists ${path} without its text")
+    )
+
+
 -- The root of embedded library paths in diagnostics. A relative name in angle
 -- brackets cannot equal a path Load builds, which are absolute.
 private EMBEDDED_LIBRARY_ROOT: String = "<standard library>"
@@ -205,6 +217,28 @@ pure func module_role(layout: LibraryLayout, path: Path) -> ModuleKind:
         LibraryModule
     else:
         UserModule
+
+
+-- A library file's path below the layout's root, by `module_role`'s prefix:
+-- `io/console/output.brp` for `<standard library>/io/console/output.brp`. A
+-- copy of the library holds the file at that path. None for a path outside
+-- the library.
+pure func library_relative_path(layout: LibraryLayout, path: Path) -> Option[Path]:
+    prefix = layout_contents(layout).prefix
+    text = path.to_string()
+    relative: Option[String] = if text.starts_with(prefix):
+        text.slice(prefix.length(), text.length())
+    else:
+        None
+    match relative.map(to_path):
+        Some(Ok(inside)): Some(inside)
+        Some(Err(_)) | None: None
+
+
+-- The library file at `relative` below the layout's root: the inverse of
+-- `library_relative_path`, which places a file of one layout in another.
+pure func library_path(layout: LibraryLayout, relative: Path) -> Path:
+    path_ops.join(layout_contents(layout).root, relative)
 
 
 private func join_parts(
@@ -386,20 +420,14 @@ private pure func module_store(
     match from_opaque LibraryLayout(layout):
         ReadFromDirectory(_):
             Ok(DiskFile)
-        ReadFromEmbedded(contents):
+        ReadFromEmbedded(_):
             match role:
                 UserModule:
                     Ok(DiskFile)
                 FoundationTypesModule | FoundationPreludeModule | LibraryModule:
-                    prefix = contents.prefix
-                    text = path.to_string()
-                    relative = if text.starts_with(prefix):
-                        text.slice(prefix.length(), text.length())
-                    else:
-                        None
-                    match relative:
+                    match layout.library_relative_path(path):
                         Some(inside):
-                            Ok(EmbeddedFile(inside))
+                            Ok(EmbeddedFile(inside.to_string()))
                         None:
                             Err(
                                 internal_error(

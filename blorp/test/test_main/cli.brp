@@ -4,9 +4,11 @@ import:
     bool: and, not
     bytes: Bytes, String methods, from_list
     int: Int methods
+    io/files/entry: entry_kind
     io/files/write: WriteError, write_bytes
     io/process: Captured, FindProgramError, command, find_program
     list: List methods
+    option: Option methods
     path: Path, to_path
     result: Result methods
     string: String methods
@@ -690,7 +692,7 @@ private pure func framed(body: String) -> String:
 private LSP_INITIALIZE: String = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"capabilities\":{\"general\":{\"positionEncodings\":[\"utf-8\"]}}}}"
 
 
-private LSP_INITIALIZED_REPLY: String = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"capabilities\":{\"positionEncoding\":\"utf-8\",\"textDocumentSync\":{\"openClose\":true,\"change\":1},\"semanticTokensProvider\":{\"legend\":{\"tokenTypes\":[\"namespace\",\"type\",\"interface\",\"enumMember\",\"typeParameter\",\"parameter\",\"variable\",\"property\",\"function\",\"method\",\"keyword\",\"comment\",\"string\",\"number\",\"operator\"],\"tokenModifiers\":[\"declaration\",\"readonly\",\"defaultLibrary\",\"documentation\"]},\"full\":true}}}}"
+private LSP_INITIALIZED_REPLY: String = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"capabilities\":{\"positionEncoding\":\"utf-8\",\"textDocumentSync\":{\"openClose\":true,\"change\":1},\"semanticTokensProvider\":{\"legend\":{\"tokenTypes\":[\"namespace\",\"type\",\"interface\",\"enumMember\",\"typeParameter\",\"parameter\",\"variable\",\"property\",\"function\",\"method\",\"keyword\",\"comment\",\"string\",\"number\",\"operator\"],\"tokenModifiers\":[\"declaration\",\"readonly\",\"defaultLibrary\",\"documentation\"]},\"full\":true},\"definitionProvider\":true,\"referencesProvider\":true}}}"
 
 
 private LSP_EXIT: String = "{\"jsonrpc\":\"2.0\",\"method\":\"exit\"}"
@@ -806,6 +808,212 @@ private func lsp_refreshes_tokens_and_diagnostics_after_an_edit(
             .map(framed)
             .join(""),
         ""
+    )
+
+
+-- Where mkdtemp's folders for the server's library start; six characters,
+-- letters or digits, follow.
+private LSP_LIBRARY_FOLDER: String = "/tmp/blorp-lsp-"
+
+private LSP_FOLDER_SUFFIX_LENGTH: Int = 6
+
+
+-- The library folder the session's output names, if it names one.
+private pure func lsp_library_folder(output: String) -> Option[String]:
+    var found: Option[String] = None
+    for start in 0..output.length():
+        if and(
+            found.is_none(),
+            output.slice(start, start + LSP_LIBRARY_FOLDER.length()) == Some(LSP_LIBRARY_FOLDER)
+        ):
+            found = output.slice(
+                start,
+                start + LSP_LIBRARY_FOLDER.length() + LSP_FOLDER_SUFFIX_LENGTH
+            )
+    found
+
+
+-- The line, counted from 0, of the library's io/console/output.brp that
+-- declares `print`.
+private func print_declaration_line() -> Result[Int, String]:
+    text ?= read_file("${LIBRARY_ROOT}/io/console/output.brp")
+    var found: Option[Int] = None
+    var line = 0
+    for text_line in text.lines():
+        if and(found.is_none(), text_line.starts_with("func print(")):
+            found = Some(line)
+        line = line + 1
+    match found:
+        Some(declared): Ok(declared)
+        None: Err("the library declares no `func print(`")
+
+
+private pure func lsp_location(uri: String, line: Int, start: Int, end: Int) -> String:
+    "{\"uri\":\"${uri}\",\"range\":{\"start\":{\"line\":${line},\"character\":${start}},\"end\":{\"line\":${line},\"character\":${end}}}}"
+
+
+-- The editor goes to the definition of a local call, then of `print`, which
+-- is in the library the server wrote to its own folder, and lists the
+-- references to a parameter with and without its declaration. After `exit`
+-- the folder is gone.
+private func lsp_goes_to_definitions_in_the_library_and_lists_references(
+    compiler: String,
+    work_directory: String
+) -> Result[Void, String]:
+    uri = "file:///work/navigate.brp"
+    document = "{\"uri\":\"${uri}\",\"languageId\":\"blorp\",\"version\":1,\"text\":\"func twice(value: Int) -> Int:\\n    value * 2\\n\\n\\nfunc main() -> Int:\\n    print(\\\"hi\\\")\\n    twice(1)\\n\"}"
+    at = pure func(line: Int, character: Int) -> String:
+        "\"textDocument\":{\"uri\":\"${uri}\"},\"position\":{\"line\":${line},\"character\":${character}}"
+    input = [
+        LSP_INITIALIZE,
+        "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":{\"textDocument\":${document}}}",
+        "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"textDocument/definition\",\"params\":{${at(6, 6)}}}",
+        "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"textDocument/definition\",\"params\":{${at(5, 6)}}}",
+        "{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"textDocument/references\",\"params\":{${at(1, 6)},\"context\":{\"includeDeclaration\":true}}}",
+        "{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"textDocument/references\",\"params\":{${at(0, 13)},\"context\":{\"includeDeclaration\":false}}}",
+        "{\"jsonrpc\":\"2.0\",\"id\":6,\"method\":\"shutdown\"}",
+        LSP_EXIT
+    ]
+    output ?= lsp_session(
+        compiler,
+        input
+            .map(framed)
+            .join(""),
+        "${work_directory}/cli_lsp_navigation",
+        0
+    )
+    folder ?= output.stdout
+        .lsp_library_folder()
+        .to_result("no library folder in the output: ${output.stdout}")
+    line ?= print_declaration_line()
+    declaration = lsp_location(uri, 0, 11, 16)
+    use = lsp_location(uri, 1, 4, 9)
+    library_uri = "file://${folder}/io/console/output.brp"
+    expected = [
+        LSP_INITIALIZED_REPLY,
+        "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":${lsp_location(uri, 0, 5, 10)}}",
+        "{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":${lsp_location(library_uri, line, 5, 10)}}",
+        "{\"jsonrpc\":\"2.0\",\"id\":4,\"result\":[${declaration},${use}]}",
+        "{\"jsonrpc\":\"2.0\",\"id\":5,\"result\":[${use}]}",
+        "{\"jsonrpc\":\"2.0\",\"id\":6,\"result\":null}"
+    ]
+    _ ?= expect_output(
+        output,
+        expected
+            .map(framed)
+            .join(""),
+        ""
+    )
+    removed ?= folder
+        .to_path()
+        .map_err(pure func(error) -> String: "${folder}: ${error}")
+    match removed.entry_kind():
+        Ok(None): Ok(void)
+        Ok(Some(_)): Err("${folder} is still there after exit")
+        Err(error): Err("${folder}: ${error}")
+
+
+-- `capture` sends standard input whole, so this script for sh on macOS and
+-- Linux holds a session open: it starts `blorp lsp` on a FIFO, sends the
+-- first messages ($2), polls up to 2,000 times, 10 ms apart, for the reply
+-- with id 3, keeps a copy of the view's io/console/output.brp, overwrites the
+-- view's file, and sends the rest ($3). $0 is the compiler and $1 the prefix
+-- of the files it uses. If a step fails or the wait runs out, the trap closes
+-- the FIFO, so the server reads the end of its input, removes its folder and
+-- ends. The checks are the test's.
+private LSP_VIEW_EDIT_DRIVER: String =
+    |set -e
+    |rm -f "$1.in"
+    |mkfifo "$1.in"
+    |"$0" lsp < "$1.in" > "$1.out" &
+    |server=$!
+    |exec 3> "$1.in"
+    |trap 'exec 3>&-; wait' EXIT
+    |printf '%s' "$2" >&3
+    |polls=0
+    |until grep -q '"id":3,' "$1.out"; do
+    |    polls=$((polls + 1))
+    |    test "$polls" -le 2000
+    |    sleep 0.01
+    |done
+    |folder=$(grep -o '/tmp/blorp-lsp-[A-Za-z0-9]*' "$1.out" | head -n 1)
+    |test -n "$folder"
+    |cp "$folder/io/console/output.brp" "$1.served"
+    |printf 'this is not Blorp\n' > "$folder/io/console/output.brp"
+    |printf '%s' "$3" >&3
+    |exec 3>&-
+    |wait "$server"
+
+
+-- The server writes the library to its folder, and an editor overwrites the
+-- folder's io/console/output.brp mid-session. The folder is a view: the root,
+-- edited and analysed again, gets the same definitions and references and no
+-- diagnostics, since analyses read the embedded library.
+private func lsp_never_reads_the_library_folder(
+    compiler: String,
+    work_directory: String
+) -> Result[Void, String]:
+    prefix = "${work_directory}/cli_lsp_view"
+    uri = "file:///work/navigate.brp"
+    text = "func twice(value: Int) -> Int:\\n    value * 2\\n\\n\\nfunc main() -> Int:\\n    print(\\\"hi\\\")\\n    twice(1)\\n"
+    at = pure func(line: Int, character: Int) -> String:
+        "\"textDocument\":{\"uri\":\"${uri}\"},\"position\":{\"line\":${line},\"character\":${character}}"
+    navigation = pure func(first_id: Int) -> List[String]: [
+        "{\"jsonrpc\":\"2.0\",\"id\":${first_id},\"method\":\"textDocument/definition\",\"params\":{${at(5, 6)}}}",
+        "{\"jsonrpc\":\"2.0\",\"id\":${first_id + 1},\"method\":\"textDocument/references\",\"params\":{${at(1, 6)},\"context\":{\"includeDeclaration\":true}}}"
+    ]
+    first = [
+        LSP_INITIALIZE,
+        "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":{\"textDocument\":{\"uri\":\"${uri}\",\"languageId\":\"blorp\",\"version\":1,\"text\":\"${text}\"}}}"
+    ].concat(navigation(2))
+    rest = [
+        "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didChange\",\"params\":{\"textDocument\":{\"uri\":\"${uri}\",\"version\":2},\"contentChanges\":[{\"text\":\"${text}\"}]}}"
+    ]
+        .concat(navigation(4))
+        .concat(["{\"jsonrpc\":\"2.0\",\"id\":6,\"method\":\"shutdown\"}", LSP_EXIT])
+    shell ?= find_program("sh").map_err(
+        pure func(error: FindProgramError) -> String: "sh: ${error}"
+    )
+    invocation ?= isolated(
+        "${shell}",
+        [
+            "-c",
+            LSP_VIEW_EDIT_DRIVER,
+            compiler,
+            prefix,
+            first
+                .map(framed)
+                .join(""),
+            rest
+                .map(framed)
+                .join("")
+        ],
+        COMPILATION_TIMEOUT_MS
+    )
+    _ ?= run_expecting(prefix, invocation, 0)
+    stdout ?= read_file("${prefix}.out")
+    served ?= read_file("${prefix}.served")
+    library ?= read_file("${LIBRARY_ROOT}/io/console/output.brp")
+    _ ?= expect(served, library, "the folder's io/console/output.brp before the edit")
+    folder ?= stdout
+        .lsp_library_folder()
+        .to_result("no library folder in the output: ${stdout}")
+    line ?= print_declaration_line()
+    library_uri = "file://${folder}/io/console/output.brp"
+    found = pure func(first_id: Int) -> List[String]: [
+        "{\"jsonrpc\":\"2.0\",\"id\":${first_id},\"result\":${lsp_location(library_uri, line, 5, 10)}}",
+        "{\"jsonrpc\":\"2.0\",\"id\":${first_id + 1},\"result\":[${lsp_location(uri, 0, 11, 16)},${lsp_location(uri, 1, 4, 9)}]}"
+    ]
+    expected = [LSP_INITIALIZED_REPLY]
+        .concat(found(2))
+        .concat(found(4))
+        .append("{\"jsonrpc\":\"2.0\",\"id\":6,\"result\":null}")
+    expect(
+        stdout,
+        expected
+            .map(framed)
+            .join(""),
+        "stdout"
     )
 
 
@@ -1147,6 +1355,19 @@ func suite(compiler: String, work_directory: String) -> TestSuite:
                 func(): reported(
                     lsp_serves_a_session_from_initialize_to_exit(compiler, work_directory)
                 )
+            ),
+            (
+                "lsp goes to definitions in the library and lists references",
+                func(): reported(
+                    lsp_goes_to_definitions_in_the_library_and_lists_references(
+                        compiler,
+                        work_directory
+                    )
+                )
+            ),
+            (
+                "lsp never reads the library folder",
+                func(): reported(lsp_never_reads_the_library_folder(compiler, work_directory))
             ),
             (
                 "lsp refreshes tokens and diagnostics after an edit",

@@ -1,43 +1,50 @@
 ---
 The language server's state and its one step per message: the lifecycle, the
 open documents, each root's last analysis and what it published, which roots a
-change stales, and the replies each message earns, token requests among them.
-Pure: the transport reads, analyses and writes.
+change stales, and the replies each message earns: tokens, definitions and
+references among them. Pure: the transport reads, analyses and writes.
 ---
 import:
-    bool: not
+    bool: and, not
     bytes: Bytes
     dict: Dict
-    json: Json(Null, Boolean, Number, Text, Array, Object), integer, parse
+    json: Json(Null, Boolean, Number, Text, Array, Object), as_int, integer, parse
     list: List methods
     option: Option methods
     path: Path, to_path
     string: String methods
-    ../common/analysis/check/check: Analysis, analyze
+    ../common/analysis/check/check: Analysis, analyze, declaration_span, declarations, name_uses
+    ../common/analysis/check/name_uses: NameUse, Referent
     ../common/analysis/check/render: render_failure
     ../common/analysis/load/load:
+        LibraryLayout,
         LoadedProgram,
         SourceLoadFailure(
             DuplicateSourcePath,
             SourcePathContainsNul,
             SourcePathEmpty,
             LoadingFailed
-        )
+        ),
+        library_path,
+        library_relative_path,
+        module_role
     ../common/syntax/source:
         ModuleKind(UserModule, LibraryModule, FoundationTypesModule, FoundationPreludeModule),
         ModuleSource,
         SourceFile,
         SourceInputs,
         module_number,
+        module_source,
         root_module_id,
         source_module
-    ../common/syntax/syntax: Diagnostic, Diagnostics, compiler_span, internal_error
+    ../common/syntax/syntax: Diagnostic, Diagnostics, Span, compiler_span, internal_error
     ./positions:
         LineIndex,
         Position,
         PositionEncoding(Utf8, Utf16),
         encoding_name,
         line_index,
+        offset_of,
         position_of
     ./protocol:
         Call,
@@ -53,7 +60,7 @@ import:
         response,
         text_field,
         uri_path
-    ./tokens: Classified, analysed_identifiers, semantic_tokens, token_legend
+    ./tokens: TokenClass, analysed_identifiers, semantic_tokens, token_legend
 
 
 -- How far loading and analysing one root got.
@@ -124,16 +131,36 @@ private record OpenDocument {
 }
 
 
+-- The library a session serves, as two layouts of the same files. Every
+-- analysis reads the embedded library, as `blorp compile` does; the transport
+-- wrote a copy of it to a folder for an editor to open, and nothing loads from
+-- there.
+record ServedLibrary {
+    -- The embedded library's layout, which gives a library file's path below
+    -- its root.
+    analysed: LibraryLayout,
+    -- The folder's layout, which places that path in the folder and tells the
+    -- library files a client opens.
+    view: LibraryLayout
+}
+
+
 private record Session {
     encoding: PositionEncoding,
+    library: ServedLibrary,
     -- Each open document, by its normalized absolute path. An open document is
     -- the root of its own program (the v1 limitation), and every analysis
     -- reads these texts instead of the disk.
     documents: Dict[Path, OpenDocument],
+    -- The text of each open file of the library's view, which a definition led
+    -- to. The view is not the library any analysis reads, so these are neither
+    -- roots nor snapshots: they get the lexer's tokens, no definition and no
+    -- references. Edits to them, saved or not, are never read.
+    library_documents: Dict[Path, String],
     -- Each root's last analysis, current or stale, and what it published, in
     -- the order the roots were last analysed, so that a file several roots
-    -- report in shows the latest analysis's diagnostics. Token requests are
-    -- answered from a current analysis. A root not yet analysed has no row.
+    -- report in shows the latest analysis's diagnostics. Requests are answered
+    -- from a current analysis. A root not yet analysed has no row.
     roots: Dict[Path, AnalysedRoot],
     -- Whether the server is still to register for changed files: the client
     -- can report them, and `initialized`, after which the server may ask, has
@@ -147,8 +174,8 @@ private record Session {
 
 private union Lifecycle:
     -- Requests other than `initialize` get -32002, and notifications other
-    -- than `exit` are dropped.
-    AwaitingInitialize
+    -- than `exit` are dropped. The session starts with the library it serves.
+    AwaitingInitialize(ServedLibrary)
     Serving(Session)
     -- After `shutdown`, requests get -32600 and `exit` ends with status 0.
     ShutDown
@@ -159,12 +186,35 @@ private union Lifecycle:
 opaque type Server = Lifecycle
 
 
+-- What a request asks of an open document, answered from its root's analysis.
+union DocumentQuery:
+    TokensQuery
+    -- Where the name at the position is declared.
+    DefinitionQuery(Position)
+    -- Every use of the name at the position.
+    ReferencesQuery(ReferencesAt)
+
+
+fixed record ReferencesAt {
+    position: Position,
+    -- The client's `context.includeDeclaration`: the declaration is listed too.
+    includes_declaration: Bool
+}
+
+
+-- A request that waits for its document's analysis.
+record WaitingRequest {
+    id: RequestId,
+    query: DocumentQuery
+}
+
+
 -- An analysis for the transport to run and hand back to `analysed`: the root
--- to load and analyse, and the token request that waits for it, if any.
--- `didOpen` asks for its own document and answers nothing.
+-- to load and analyse, and the request that waits for it, if any. `didOpen`
+-- asks for its own document and answers nothing.
 record AnalysisRequest {
     root: Path,
-    answering: Option[RequestId]
+    answering: Option[WaitingRequest]
 }
 
 
@@ -188,15 +238,15 @@ private FULL_SYNC: Int = 1
 private ERROR_SEVERITY: Int = 1
 
 
-pure func start_server() -> Server:
-    into_opaque Server(AwaitingInitialize)
+pure func start_server(library: ServedLibrary) -> Server:
+    into_opaque Server(AwaitingInitialize(library))
 
 
 -- Some once `exit` has arrived.
 pure func exit_status(server: Server) -> Option[Int]:
     match from_opaque Server(server):
         Exited(status): Some(status)
-        AwaitingInitialize | Serving(_) | ShutDown: None
+        AwaitingInitialize(_) | Serving(_) | ShutDown: None
 
 
 -- The open documents, which an analysis reads instead of the disk.
@@ -211,7 +261,7 @@ pure func snapshots(server: Server) -> List[SourceFile]:
                         contents = document[1].text
                     }
                 )
-        AwaitingInitialize | ShutDown | Exited(_):
+        AwaitingInitialize(_) | ShutDown | Exited(_):
             []
 
 
@@ -249,12 +299,14 @@ pure func receive(server: Server, message: Json) -> Step:
                     "the message is not a JSON-RPC request or notification"
                 )
             ])
-        (AwaitingInitialize, Request(id, call)):
+        (AwaitingInitialize(library), Request(id, call)):
             if call.method == "initialize":
                 encoding = call.params.agreed_encoding()
                 session: Session = {
                     encoding = encoding,
+                    library = library,
                     documents = {},
+                    library_documents = {},
                     roots = {},
                     registers_watchers = call.params.watches_files(),
                     requests_sent = 0
@@ -277,7 +329,35 @@ pure func receive(server: Server, message: Json) -> Step:
                 "shutdown":
                     replying(ShutDown, [response(id, Null)])
                 "textDocument/semanticTokens/full":
-                    session.tokens_requested(id, call.params)
+                    session.document_requested(id, call.params, Some(TokensQuery))
+                "textDocument/definition":
+                    session.document_requested(
+                        id,
+                        call.params,
+                        call.params
+                            .requested_position()
+                            .map(pure func(at: Position) -> DocumentQuery: DefinitionQuery(at))
+                    )
+                "textDocument/references":
+                    includes_declaration: Bool = match (
+                        call.params
+                            .field("context")
+                            .field("includeDeclaration")
+                    ):
+                        Some(Boolean(True)): True
+                        _: False
+                    session.document_requested(
+                        id,
+                        call.params,
+                        call.params
+                            .requested_position()
+                            .map(
+                                pure func(at: Position) -> DocumentQuery: ReferencesQuery({
+                                    position = at,
+                                    includes_declaration = includes_declaration
+                                })
+                            )
+                    )
                 "initialize":
                     lifecycle.replying([
                         error_response(
@@ -295,7 +375,7 @@ pure func receive(server: Server, message: Json) -> Step:
                 replying(Exited(EXIT_AFTER_SHUTDOWN), [])
             else:
                 lifecycle.replying([])
-        (AwaitingInitialize, Notification(call)):
+        (AwaitingInitialize(_), Notification(call)):
             if call.method == "exit":
                 replying(Exited(EXIT_ABANDONED), [])
             else:
@@ -343,7 +423,7 @@ private pure func watches_files(params: Option[Json]) -> Bool:
 
 
 -- What the server serves: the encoding chosen, the whole text on every
--- change, and every token of a document at once.
+-- change, every token of a document at once, definitions and references.
 private pure func initialize_result(encoding: PositionEncoding) -> Json:
     Object(
         {
@@ -355,7 +435,9 @@ private pure func initialize_result(encoding: PositionEncoding) -> Json:
                     ),
                     "semanticTokensProvider" => Object(
                         { "legend" => token_legend(), "full" => Boolean(True) }
-                    )
+                    ),
+                    "definitionProvider" => Boolean(True),
+                    "referencesProvider" => Boolean(True)
                 }
             )
         }
@@ -391,63 +473,259 @@ private pure func staled(roots: Dict[Path, AnalysedRoot], path: Path) -> Dict[Pa
     marked
 
 
--- The `semanticTokens/full` result for the open document `path`, from its
--- root's current analysis. While the root fails to analyse, only the lexer's
--- tokens are sent. `null` for a document that is not open.
-private pure func document_tokens(session: Session, path: Path, result: DocumentAnalysis) -> Json:
-    match session.documents.get(path):
-        None:
+-- The `position` a request's params give, or None for one that is missing or
+-- not two integers.
+private pure func requested_position(params: Option[Json]) -> Option[Position]:
+    position = params.field("position")
+    match (position.field("line"), position.field("character")):
+        (Some(Number(line)), Some(Number(character))):
+            match (line.as_int(), character.as_int()):
+                (Some(row), Some(column)): Some({ line = row, character = column })
+                _: None
+        _:
+            None
+
+
+-- The answer to `query` about the open document `path`, whose root's analysis
+-- is `result`. While the root fails to analyse, only the lexer's tokens are
+-- sent, a definition is `null` and references are `[]`. `null` for a document
+-- that is not open.
+private pure func answer(
+    session: Session,
+    path: Path,
+    result: DocumentAnalysis,
+    query: DocumentQuery
+) -> Json:
+    match (session.documents.get(path), result.outcome):
+        (None, _):
             Null
-        Some(open):
-            identifiers: Dict[Int, Classified] = match result.outcome:
-                Analysed(analysis): analysis.analysed_identifiers(result.sources, root_module_id())
-                LoadFailed(_) | CheckFailed(_): {}
-            data = open.text.semantic_tokens(root_module_id(), identifiers, session.encoding)
-            Object(
-                {
-                    "data" => Array(
-                        data.map(pure func(value: Int) -> Json: Number(integer(value)))
+        (Some(open), Analysed(analysis)):
+            offset = pure func(at: Position) -> Int:
+                line_index(open.text).offset_of(at, session.encoding)
+            match query:
+                TokensQuery:
+                    open.text.tokens_json(
+                        analysis.analysed_identifiers(result.sources, root_module_id()),
+                        session.encoding
                     )
-                }
-            )
+                DefinitionQuery(at):
+                    declared: List[Span] = match analysis.referent_at(offset(at)):
+                        Some(referent):
+                            match analysis.declaration_span(referent):
+                                Some(span): [span]
+                                None: []
+                        None:
+                            []
+                    -- A built-in type is declared nowhere. A declaration has one
+                    -- location, which `locations` leaves out only for a defect.
+                    match session.locations(result.sources, declared):
+                        [location]: location
+                        _: Null
+                ReferencesQuery(asked):
+                    match analysis.referent_at(offset(asked.position)):
+                        Some(referent):
+                            Array(
+                                session.locations(
+                                    result.sources,
+                                    analysis.references(referent, asked.includes_declaration)
+                                )
+                            )
+                        None:
+                            Array([])
+        (Some(open), LoadFailed(_) | CheckFailed(_)):
+            open.text.unanalysed_answer(query, session.encoding)
+
+
+-- The answer to `query` about a text with no analysis: the lexer's tokens, no
+-- definition and no references.
+private pure func unanalysed_answer(
+    text: String,
+    query: DocumentQuery,
+    encoding: PositionEncoding
+) -> Json:
+    match query:
+        TokensQuery: text.tokens_json({}, encoding)
+        DefinitionQuery(_): Null
+        ReferencesQuery(_): Array([])
+
+
+-- The `semanticTokens/full` result for a document's text.
+private pure func tokens_json(
+    text: String,
+    identifiers: Dict[Int, TokenClass],
+    encoding: PositionEncoding
+) -> Json:
+    data = text.semantic_tokens(root_module_id(), identifiers, encoding)
+    Object({ "data" => Array(data.map(pure func(value: Int) -> Json: Number(integer(value)))) })
+
+
+-- The referent named at `offset` of the root: the declaration written there,
+-- or else the use. A position at a name's end counts as inside it.
+private pure func referent_at(analysis: Analysis, offset: Int) -> Option[Referent]:
+    root = module_source(root_module_id())
+    covers = pure func(span: Span) -> Bool: and(
+        span.source == root,
+        and(span.start <= offset, offset <= span.end)
+    )
+    declared = analysis
+        .declarations()
+        .find(pure func(referent: Referent) -> Bool:
+            match analysis.declaration_span(referent):
+                Some(span): covers(span)
+                None: False
+        )
+    match declared:
+        Some(_):
+            declared
+        None:
+            analysis
+                .name_uses()
+                .find(pure func(use: NameUse) -> Bool: covers(use.span))
+                .map(pure func(use: NameUse) -> Referent: use.referent)
+
+
+-- The spans of every use of `referent`: the uses of every referent declared
+-- at the same span, so that an implementation method's type parameter, which
+-- has an id per method, groups with its header's. Spans compare within this
+-- one analysis; across analyses, whose ids differ, a comparison must use the
+-- declaration's path and byte range instead. A built-in type, declared
+-- nowhere, groups by referent. The declaration leads when it is asked for.
+private pure func references(
+    analysis: Analysis,
+    referent: Referent,
+    includes_declaration: Bool
+) -> List[Span]:
+    match analysis.declaration_span(referent):
+        None:
+            analysis
+                .name_uses()
+                .filter(pure func(use: NameUse) -> Bool: use.referent == referent)
+                .map(pure func(use: NameUse) -> Span: use.span)
+        Some(declared):
+            uses = analysis
+                .name_uses()
+                .filter(
+                    pure func(use: NameUse) -> Bool: (
+                        analysis.declaration_span(use.referent)
+                        == Some(declared)
+                    )
+                )
+                .map(pure func(use: NameUse) -> Span: use.span)
+            if includes_declaration:
+                [declared].concat(uses)
+            else:
+                uses
+
+
+-- The row of the file `span` indexes, with the path an editor opens it by: a
+-- user file's own, or a library file's copy in the view, at its path below the
+-- analysed library's root. None for a span in no file the load read, such as
+-- one about blorp itself. The loader builds each row's path normalized, so it
+-- is always a Path.
+private pure func span_file(
+    sources: SourceInputs,
+    library: ServedLibrary,
+    span: Span
+) -> Option[(Path, ModuleSource)]:
+    row: Option[ModuleSource] = match span.source.source_module():
+        Some(module): sources.modules.get(module.module_number())
+        None: None
+    match row:
+        Some(file):
+            match (file.role, file.path.to_path()):
+                (UserModule, Ok(path)):
+                    Some((path, file))
+                (LibraryModule | FoundationTypesModule | FoundationPreludeModule, Ok(path)):
+                    match library.analysed.library_relative_path(path):
+                        Some(relative): Some((library.view.library_path(relative), file))
+                        None: None
+                (_, Err(_)):
+                    None
+        None:
+            None
+
+
+-- The protocol Locations of `spans`: the client's URI for an open document and
+-- the server's encoding of its path otherwise, with each file's lines indexed
+-- once. Every span comes from the analysis that read `sources`, so a span in
+-- no file it read is a defect in the analysis, not an expected case: its
+-- location is left out rather than guessed.
+private pure func locations(
+    session: Session,
+    sources: SourceInputs,
+    spans: List[Span]
+) -> List[Json]:
+    var indexes: Dict[Path, LineIndex] = {}
+    var found: List[Json] = []
+    for span in spans:
+        match sources.span_file(session.library, span):
+            Some((path, file)):
+                index = match indexes.get(path):
+                    Some(built): built
+                    None: line_index(file.contents)
+                indexes = indexes.set(path, index)
+                uri = match session.documents.get(path):
+                    Some(open): open.uri
+                    None: path.file_uri()
+                found = found.append(
+                    Object(
+                        { "uri" => Text(uri), "range" => index.range_json(span, session.encoding) }
+                    )
+                )
+            None:
+                void
+    found
 
 
 -- Answers from the root's current analysis. A stale root, or one not yet
--- analysed, is analysed first, and `analysed` answers.
-private pure func tokens_requested(session: Session, id: RequestId, params: Option[Json]) -> Step:
+-- analysed, is analysed first, and `analysed` answers. A request whose params
+-- name no document, or lack a position it needs, gets `null`.
+private pure func document_requested(
+    session: Session,
+    id: RequestId,
+    params: Option[Json],
+    query: Option[DocumentQuery]
+) -> Step:
     document: Option[Path] = params
         .field("textDocument")
         .text_field("uri")
         .map(uri_path)
         .get_or(None)
-    match document:
-        Some(path):
+    match (document, query):
+        (Some(path), Some(asked)):
             match (
+                session.library_documents.get(path),
                 session.roots
                     .get(path)
                     .map(pure func(row: AnalysedRoot) -> RootAnalysis: row.analysis)
             ):
-                Some(Current(result)):
+                (Some(text), _):
                     replying(Serving(session), [
-                        response(id, session.document_tokens(path, result))
+                        response(id, text.unanalysed_answer(asked, session.encoding))
                     ])
-                Some(Stale) | None:
+                (None, Some(Current(result))):
+                    replying(Serving(session), [response(id, session.answer(path, result, asked))])
+                (None, Some(Stale) | None):
                     if session.documents.contains(path):
                         {
                             server = into_opaque Server(Serving(session)),
                             replies = [],
-                            analyse = Some({ root = path, answering = Some(id) })
+                            analyse = Some({
+                                root = path,
+                                answering = Some({ id = id, query = asked })
+                            })
                         }
                     else:
                         replying(Serving(session), [response(id, Null)])
-        None:
+        _:
             replying(Serving(session), [response(id, Null)])
 
 
 -- Notifications the server does not serve, `$/cancelRequest` among them, are
 -- dropped, as are those about documents that are not `file://` URIs or are
 -- not open. Only `didOpen` analyses; a change, a close or a change on disk
--- stales the roots it affects, which analyse again at their next request.
+-- stales the roots it affects, which analyse again at their next request. A
+-- file in the library folder is kept only for its tokens.
 private pure func notified(session: Session, call: Call) -> Step:
     document = call.params.field("textDocument")
     uri = document.text_field("uri")
@@ -466,17 +744,34 @@ private pure func notified(session: Session, call: Call) -> Step:
         ("textDocument/didOpen", Some(path)):
             match (uri, document.text_field("text")):
                 (Some(written), Some(text)):
-                    opened: Lifecycle = Serving(
-                        { session |
-                            documents = session.documents.set(path, { uri = written, text = text }),
-                            roots = session.roots.staled(path)
-                        }
-                    )
-                    {
-                        server = into_opaque Server(opened),
-                        replies = [],
-                        analyse = Some({ root = path, answering = None })
-                    }
+                    match session.library.view.module_role(path):
+                        LibraryModule | FoundationTypesModule | FoundationPreludeModule:
+                            replying(
+                                Serving(
+                                    { session |
+                                        library_documents = session.library_documents.set(
+                                            path,
+                                            text
+                                        )
+                                    }
+                                ),
+                                []
+                            )
+                        UserModule:
+                            opened: Lifecycle = Serving(
+                                { session |
+                                    documents = session.documents.set(path, {
+                                        uri = written,
+                                        text = text
+                                    }),
+                                    roots = session.roots.staled(path)
+                                }
+                            )
+                            {
+                                server = into_opaque Server(opened),
+                                replies = [],
+                                analyse = Some({ root = path, answering = None })
+                            }
                 _:
                     replying(Serving(session), [])
         ("textDocument/didChange", Some(path)):
@@ -488,8 +783,8 @@ private pure func notified(session: Session, call: Call) -> Step:
                         .text_field("text")
                 _:
                     None
-            match (session.documents.get(path), changed):
-                (Some(open), Some(text)):
+            match (session.documents.get(path), session.library_documents.contains(path), changed):
+                (Some(open), _, Some(text)):
                     replying(
                         Serving(
                             { session |
@@ -499,10 +794,27 @@ private pure func notified(session: Session, call: Call) -> Step:
                         ),
                         []
                     )
+                (None, True, Some(text)):
+                    replying(
+                        Serving(
+                            { session |
+                                library_documents = session.library_documents.set(path, text)
+                            }
+                        ),
+                        []
+                    )
                 _:
                     replying(Serving(session), [])
         ("textDocument/didClose", Some(path)):
-            session.closed(path)
+            if session.library_documents.contains(path):
+                replying(
+                    Serving(
+                        { session | library_documents = session.library_documents.remove(path) }
+                    ),
+                    []
+                )
+            else:
+                session.closed(path)
         (_, _):
             replying(Serving(session), [])
 
@@ -637,8 +949,8 @@ private pure func closed(session: Session, path: Path) -> Step:
             replying(Serving(remaining), remaining.handed_over(path, reported))
 
 
--- Publishes the analysis of the requested root, then answers the token
--- request that waited for it, if any. A document that was closed before its
+-- Publishes the analysis of the requested root, then answers the request that
+-- waited for it, if any. A document that was closed before its
 -- analysis came back is no longer a root: the result is dropped, and the
 -- request gets `null`.
 pure func analysed(server: Server, asked: AnalysisRequest, result: DocumentAnalysis) -> Step:
@@ -649,7 +961,7 @@ pure func analysed(server: Server, asked: AnalysisRequest, result: DocumentAnaly
             var current = session
             var replies: List[Json] = []
             if session.documents.contains(root):
-                published = result.publications(session.encoding, root)
+                published = result.publications(session.library, session.encoding, root)
                 previous: List[Path] = match session.roots.get(root):
                     Some(last): last.published.keys()
                     None: []
@@ -665,12 +977,14 @@ pure func analysed(server: Server, asked: AnalysisRequest, result: DocumentAnaly
                         .set(root, { analysis = Current(result), published = published })
                 }
             match asked.answering:
-                Some(id):
-                    replies = replies.append(response(id, current.document_tokens(root, result)))
+                Some(waiting):
+                    replies = replies.append(
+                        response(waiting.id, current.answer(root, result, waiting.query))
+                    )
                 None:
                     void
             replying(Serving(current), replies)
-        AwaitingInitialize | ShutDown | Exited(_):
+        AwaitingInitialize(_) | ShutDown | Exited(_):
             lifecycle.replying([])
 
 
@@ -684,11 +998,12 @@ private record FileReport {
 -- Each user file the analysis reports in, with its diagnostics in report
 -- order. A diagnostic no user file can show goes at the start of the root:
 -- one about blorp itself, at no file; one in a file the load did not record;
--- and one in a library file, whose location then leads its message, since an
--- editor has no library file to show it in. Each file's lines are indexed
--- once.
+-- and one in a library file, whose location in the view then leads its
+-- message, since library files are never published. Each file's lines are
+-- indexed once.
 private pure func publications(
     result: DocumentAnalysis,
+    library: ServedLibrary,
     encoding: PositionEncoding,
     root: Path
 ) -> Dict[Path, List[Json]]:
@@ -702,20 +1017,15 @@ private pure func publications(
     var reports: Dict[Path, FileReport] = {}
     for error in errors:
         at_root_start = { error | span = { error.span | start = 0, end = 0 } }
-        row: Option[ModuleSource] = match error.span.source.source_module():
-            Some(module): result.sources.modules.get(module.module_number())
-            None: None
-        (path, text, shown) = match row:
-            Some(file):
-                match (file.role, file.path.to_path()):
-                    (UserModule, Ok(path)):
+        (path, text, shown) = match result.sources.span_file(library, error.span):
+            Some((path, file)):
+                match file.role:
+                    UserModule:
                         (path, file.contents, error)
-                    (UserModule, Err(_)):
-                        (root, root_text, at_root_start)
-                    (LibraryModule | FoundationTypesModule | FoundationPreludeModule, _):
+                    LibraryModule | FoundationTypesModule | FoundationPreludeModule:
                         -- Lines and columns count from 1, as `blorp compile` reports them.
                         at = line_index(file.contents).position_of(error.span.start, Utf8)
-                        location = "${file.path}:${at.line + 1}:${at.character + 1}"
+                        location = "${path}:${at.line + 1}:${at.character + 1}"
                         (
                             root,
                             root_text,
@@ -748,6 +1058,19 @@ private pure func position_json(position: Position) -> Json:
     )
 
 
+private pure func range_json(index: LineIndex, span: Span, encoding: PositionEncoding) -> Json:
+    Object(
+        {
+            "start" => index
+                .position_of(span.start, encoding)
+                .position_json(),
+            "end" => index
+                .position_of(span.end, encoding)
+                .position_json()
+        }
+    )
+
+
 private pure func diagnostic_json(
     error: Diagnostic,
     index: LineIndex,
@@ -755,16 +1078,7 @@ private pure func diagnostic_json(
 ) -> Json:
     Object(
         {
-            "range" => Object(
-                {
-                    "start" => index
-                        .position_of(error.span.start, encoding)
-                        .position_json(),
-                    "end" => index
-                        .position_of(error.span.end, encoding)
-                        .position_json()
-                }
-            ),
+            "range" => index.range_json(error.span, encoding),
             "severity" => Number(integer(ERROR_SEVERITY)),
             "message" => Text("${error.message}\nhelp: ${error.help}")
         }

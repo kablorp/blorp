@@ -1,20 +1,24 @@
 ---
 The server's step: each message through `receive`, the lifecycle and its
 errors, the open documents, the diagnostics each analysis publishes, which
-roots a change stales, and token requests answered at once or after an
-analysis.
+roots a change stales, token requests answered at once or after an analysis,
+definitions and references, and the library files a client opens.
 ---
 import:
-    bool: and, not
+    bool: and, not, or
     bytes: Bytes, String methods, from_list
-    json: Json(Null), parse, render
+    io/environment: get_current_directory
+    json: Json(Null, Text, Array, Object), parse, render
     list: List methods
     option: Option methods
-    path: Path, to_path
+    path: Path, join, normalize, parent, to_path
     result: Result methods
     string: String methods
     test: TestSuite
-    ../../src/common/analysis/load/load: LibrarySource(EmbeddedLibrary), load_program_with_sources
+    ../../src/common/analysis/load/load:
+        LibrarySource(EmbeddedLibrary, LibraryDirectory),
+        library_layout,
+        load_program_with_sources
     ../../src/common/syntax/source:
         ModuleKind(UserModule, LibraryModule, FoundationTypesModule, FoundationPreludeModule),
         ModuleSource,
@@ -22,10 +26,12 @@ import:
         module_id,
         module_source
     ../../src/common/syntax/syntax: Diagnostic, Span, compiler_span, diagnostic, internal_error
+    ../../src/lsp/protocol: file_uri
     ../../src/lsp/server:
         AnalysisOutcome(LoadFailed, CheckFailed, Analysed),
         AnalysisRequest,
         DocumentAnalysis,
+        ServedLibrary,
         Server,
         Step,
         analysed,
@@ -35,6 +41,8 @@ import:
         receive_body,
         snapshots,
         start_server
+    ../driver/file_access: read_file
+    ../driver/harness: LIBRARY_ROOT
 
 
 private pure func json(text: String) -> Json:
@@ -49,12 +57,54 @@ private pure func path(text: String) -> Option[Path]:
         Err(_): None
 
 
--- The step the last message gives, after the ones before it, from a new server.
-private pure func after(messages: List[String]) -> Step:
-    var step: Step = { server = start_server(), replies = [], analyse = None }
+-- The step the last message gives, after the ones before it, from `server`.
+private pure func after(server: Server, messages: List[String]) -> Step:
+    var step: Step = { server = server, replies = [], analyse = None }
     for message in messages:
         step = step.server.receive(json(message))
     step
+
+
+-- The folder the tests' servers view the library in. Nothing is there: every
+-- analysis here reads the embedded library.
+private LIBRARY: String = "/library"
+
+-- Where a load would resolve a relative library root. LIBRARY and the
+-- embedded root are fixed, so the layouts never read it.
+private WORKING_DIRECTORY: String = "/work"
+
+
+-- The library a server serves: the embedded one, viewed in `view`.
+private pure func served(view: Path, directory: Path) -> Option[ServedLibrary]:
+    match (
+        library_layout(EmbeddedLibrary, directory),
+        library_layout(LibraryDirectory(view.to_string()), directory)
+    ):
+        (Ok(embedded), Ok(view_layout)): Some({ analysed = embedded, view = view_layout })
+        _: None
+
+
+-- A new server whose library's view is LIBRARY. The paths are valid, so the
+-- layouts are always built; were they not, every test that needs a server
+-- would fail.
+private pure func new_server() -> Option[Server]:
+    match (LIBRARY.to_path(), WORKING_DIRECTORY.to_path()):
+        (Ok(view), Ok(directory)): served(view, directory).map(start_server)
+        _: None
+
+
+-- A pure test of a new server.
+private pure func serving(test: pure (Server) -> Bool) -> Bool:
+    match new_server():
+        Some(server): test(server)
+        None: False
+
+
+-- A test of a new server that loads real programs.
+private func loading(test: (Server) -> Bool) -> Bool:
+    match new_server():
+        Some(server): test(server)
+        None: False
 
 
 private pure func replies(step: Step) -> List[String]:
@@ -107,7 +157,7 @@ private pure func did_close(uri: String) -> String:
 
 
 private pure func initialized_reply(encoding: String) -> String:
-    "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"capabilities\":{\"positionEncoding\":\"${encoding}\",\"textDocumentSync\":{\"openClose\":true,\"change\":1},\"semanticTokensProvider\":{\"legend\":{\"tokenTypes\":[\"namespace\",\"type\",\"interface\",\"enumMember\",\"typeParameter\",\"parameter\",\"variable\",\"property\",\"function\",\"method\",\"keyword\",\"comment\",\"string\",\"number\",\"operator\"],\"tokenModifiers\":[\"declaration\",\"readonly\",\"defaultLibrary\",\"documentation\"]},\"full\":true}}}}"
+    "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"capabilities\":{\"positionEncoding\":\"${encoding}\",\"textDocumentSync\":{\"openClose\":true,\"change\":1},\"semanticTokensProvider\":{\"legend\":{\"tokenTypes\":[\"namespace\",\"type\",\"interface\",\"enumMember\",\"typeParameter\",\"parameter\",\"variable\",\"property\",\"function\",\"method\",\"keyword\",\"comment\",\"string\",\"number\",\"operator\"],\"tokenModifiers\":[\"declaration\",\"readonly\",\"defaultLibrary\",\"documentation\"]},\"full\":true},\"definitionProvider\":true,\"referencesProvider\":true}}}"
 
 
 private pure func error_reply(id: String, code: Int, message: String) -> String:
@@ -117,110 +167,182 @@ private pure func error_reply(id: String, code: Int, message: String) -> String:
 -- lifecycle
 
 pure func test_initialize_chooses_utf8_when_the_client_offers_it() -> Bool:
-    after([INITIALIZE]).answers([initialized_reply("utf-8")])
+    serving(pure func(server: Server) -> Bool:
+        server
+            .after([INITIALIZE])
+            .answers([initialized_reply("utf-8")])
+    )
 
 
 pure func test_initialize_chooses_utf16_otherwise() -> Bool:
-    after([INITIALIZE_UTF16]).answers([initialized_reply("utf-16")])
+    serving(pure func(server: Server) -> Bool:
+        server
+            .after([INITIALIZE_UTF16])
+            .answers([initialized_reply("utf-16")])
+    )
 
 
 pure func test_a_request_before_initialize_gets_32002() -> Bool:
-    after([SHUTDOWN]).answers([error_reply("2", -32002, "the server has not been initialized")])
+    serving(pure func(server: Server) -> Bool:
+        server
+            .after([SHUTDOWN])
+            .answers([error_reply("2", -32002, "the server has not been initialized")])
+    )
 
 
 pure func test_a_notification_before_initialize_is_dropped() -> Bool:
-    and(
-        after([did_open(ROOT_URI, "x")]).answers([]),
-        after([did_open(ROOT_URI, "x"), INITIALIZE]).server
-            .snapshots()
-            .is_empty()
+    serving(pure func(server: Server) -> Bool:
+        and(
+            server
+                .after([did_open(ROOT_URI, "x")])
+                .answers([]),
+            server
+                .after([did_open(ROOT_URI, "x"), INITIALIZE]).server
+                .snapshots()
+                .is_empty()
+        )
     )
 
 
 pure func test_an_unknown_request_gets_32601() -> Bool:
-    after([INITIALIZE, "{\"jsonrpc\":\"2.0\",\"id\":\"h\",\"method\":\"textDocument/hover\"}"]).answers(
-        [error_reply("\"h\"", -32601, "unknown method `textDocument/hover`")]
+    serving(pure func(server: Server) -> Bool:
+        server
+            .after([
+                INITIALIZE,
+                "{\"jsonrpc\":\"2.0\",\"id\":\"h\",\"method\":\"textDocument/hover\"}"
+            ])
+            .answers([error_reply("\"h\"", -32601, "unknown method `textDocument/hover`")])
     )
 
 
 pure func test_an_invalid_message_gets_32600() -> Bool:
-    after([INITIALIZE, "{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":7}"]).answers([
-        error_reply("5", -32600, "the message is not a JSON-RPC request or notification")
-    ])
+    serving(pure func(server: Server) -> Bool:
+        server
+            .after([INITIALIZE, "{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":7}"])
+            .answers([
+                error_reply("5", -32600, "the message is not a JSON-RPC request or notification")
+            ])
+    )
 
 
 pure func test_a_second_initialize_gets_32600() -> Bool:
-    after([INITIALIZE, INITIALIZE]).answers([
-        error_reply("1", -32600, "the server is already initialized")
-    ])
+    serving(pure func(server: Server) -> Bool:
+        server
+            .after([INITIALIZE, INITIALIZE])
+            .answers([error_reply("1", -32600, "the server is already initialized")])
+    )
 
 
 pure func test_shutdown_returns_null_and_later_requests_get_32600() -> Bool:
-    and(
-        after([INITIALIZE, SHUTDOWN]).answers(["{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":null}"]),
-        after([INITIALIZE, SHUTDOWN, SHUTDOWN]).answers([
-            error_reply("2", -32600, "the server has shut down")
-        ])
+    serving(pure func(server: Server) -> Bool:
+        and(
+            server
+                .after([INITIALIZE, SHUTDOWN])
+                .answers(["{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":null}"]),
+            server
+                .after([INITIALIZE, SHUTDOWN, SHUTDOWN])
+                .answers([error_reply("2", -32600, "the server has shut down")])
+        )
     )
 
 
 pure func test_exit_ends_with_0_only_after_shutdown() -> Bool:
-    and(
+    serving(pure func(server: Server) -> Bool:
         and(
-            after([INITIALIZE, SHUTDOWN, EXIT]).server.exit_status() == Some(0),
-            after([INITIALIZE, EXIT]).server.exit_status() == Some(1)
-        ),
-        and(
-            after([EXIT]).server.exit_status() == Some(1),
-            after([INITIALIZE, SHUTDOWN]).server.exit_status() == None
+            and(
+                (
+                    server
+                        .after([INITIALIZE, SHUTDOWN, EXIT]).server
+                        .exit_status()
+                    == Some(0)
+                ),
+                (
+                    server
+                        .after([INITIALIZE, EXIT]).server
+                        .exit_status()
+                    == Some(1)
+                )
+            ),
+            and(
+                (
+                    server
+                        .after([EXIT]).server
+                        .exit_status()
+                    == Some(1)
+                ),
+                (
+                    server
+                        .after([INITIALIZE, SHUTDOWN]).server
+                        .exit_status()
+                    == None
+                )
+            )
         )
     )
 
 
 pure func test_nothing_is_answered_after_exit() -> Bool:
-    after([INITIALIZE, EXIT, SHUTDOWN]).answers([])
+    serving(pure func(server: Server) -> Bool:
+        server
+            .after([INITIALIZE, EXIT, SHUTDOWN])
+            .answers([])
+    )
 
 
 pure func test_cancellations_responses_and_unknown_notifications_are_ignored() -> Bool:
-    and(
+    serving(pure func(server: Server) -> Bool:
         and(
-            after([
-                INITIALIZE,
-                "{\"jsonrpc\":\"2.0\",\"method\":\"$/cancelRequest\",\"params\":{\"id\":1}}"
-            ]).answers([]),
-            after([
-                INITIALIZE,
-                "{\"jsonrpc\":\"2.0\",\"method\":\"workspace/didChangeConfiguration\"}"
-            ]).answers([])
-        ),
-        after([INITIALIZE, "{\"jsonrpc\":\"2.0\",\"id\":9,\"result\":null}"]).answers([])
+            and(
+                server
+                    .after([
+                        INITIALIZE,
+                        "{\"jsonrpc\":\"2.0\",\"method\":\"$/cancelRequest\",\"params\":{\"id\":1}}"
+                    ])
+                    .answers([]),
+                server
+                    .after([
+                        INITIALIZE,
+                        "{\"jsonrpc\":\"2.0\",\"method\":\"workspace/didChangeConfiguration\"}"
+                    ])
+                    .answers([])
+            ),
+            server
+                .after([INITIALIZE, "{\"jsonrpc\":\"2.0\",\"id\":9,\"result\":null}"])
+                .answers([])
+        )
     )
 
 
 -- bodies
 
 pure func test_a_body_that_is_not_utf8_gets_32700() -> Bool:
-    start_server()
-        .receive_body(from_list([123, 255]))
-        .answers([error_reply("null", -32700, "the message body is not UTF-8")])
+    serving(pure func(server: Server) -> Bool:
+        server
+            .receive_body(from_list([123, 255]))
+            .answers([error_reply("null", -32700, "the message body is not UTF-8")])
+    )
 
 
 pure func test_a_body_that_is_not_json_gets_32700() -> Bool:
-    start_server()
-        .receive_body("{x}".to_bytes())
-        .answers([
-            error_reply(
-                "null",
-                -32700,
-                "the message body is not JSON: expected a quoted object name"
-            )
-        ])
+    serving(pure func(server: Server) -> Bool:
+        server
+            .receive_body("{x}".to_bytes())
+            .answers([
+                error_reply(
+                    "null",
+                    -32700,
+                    "the message body is not JSON: expected a quoted object name"
+                )
+            ])
+    )
 
 
 pure func test_a_json_body_is_received() -> Bool:
-    start_server()
-        .receive_body(INITIALIZE.to_bytes())
-        .answers([initialized_reply("utf-8")])
+    serving(pure func(server: Server) -> Bool:
+        server
+            .receive_body(INITIALIZE.to_bytes())
+            .answers([initialized_reply("utf-8")])
+    )
 
 
 -- documents
@@ -231,45 +353,69 @@ private pure func snapshot(path_text: String, contents: String) -> SourceFile:
 
 -- The analysis answers no request.
 pure func test_did_open_asks_to_analyse_its_document() -> Bool:
-    step = after([INITIALIZE, did_open(ROOT_URI, "x = 1")])
-    answers_nothing = step.analyse.map(
-        pure func(asked: AnalysisRequest) -> Bool: asked.answering.is_none()
-    )
-    and(
-        and(step.replies.is_empty(), step.analysed_path() == path(ROOT)),
-        and(answers_nothing == Some(True), step.server.snapshots() == [snapshot(ROOT, "x = 1")])
+    serving(pure func(server: Server) -> Bool:
+        step = server.after([INITIALIZE, did_open(ROOT_URI, "x = 1")])
+        answers_nothing = step.analyse.map(
+            pure func(asked: AnalysisRequest) -> Bool: asked.answering.is_none()
+        )
+        and(
+            and(step.replies.is_empty(), step.analysed_path() == path(ROOT)),
+            and(
+                answers_nothing == Some(True),
+                step.server.snapshots() == [snapshot(ROOT, "x = 1")]
+            )
+        )
     )
 
 
 pure func test_did_change_keeps_the_last_text_without_analysing() -> Bool:
-    step = after([INITIALIZE, did_open(ROOT_URI, "x = 1"), did_change(ROOT_URI, "x = 2")])
-    and(step.answers([]), step.server.snapshots() == [snapshot(ROOT, "x = 2")])
+    serving(pure func(server: Server) -> Bool:
+        step = server.after([
+            INITIALIZE,
+            did_open(ROOT_URI, "x = 1"),
+            did_change(ROOT_URI, "x = 2")
+        ])
+        and(step.answers([]), step.server.snapshots() == [snapshot(ROOT, "x = 2")])
+    )
 
 
 pure func test_a_change_to_a_document_not_open_is_ignored() -> Bool:
-    after([INITIALIZE, did_change(ROOT_URI, "x = 2")]).server
-        .snapshots()
-        .is_empty()
+    serving(pure func(server: Server) -> Bool:
+        server
+            .after([INITIALIZE, did_change(ROOT_URI, "x = 2")]).server
+            .snapshots()
+            .is_empty()
+    )
 
 
 pure func test_did_close_reverts_the_document_to_the_disk() -> Bool:
-    step = after([
-        INITIALIZE,
-        did_open(ROOT_URI, "x = 1"),
-        did_open(OTHER_URI, "y = 1"),
-        did_close(ROOT_URI)
-    ])
-    and(step.answers([]), step.server.snapshots() == [snapshot(OTHER, "y = 1")])
+    serving(pure func(server: Server) -> Bool:
+        step = server.after([
+            INITIALIZE,
+            did_open(ROOT_URI, "x = 1"),
+            did_open(OTHER_URI, "y = 1"),
+            did_close(ROOT_URI)
+        ])
+        and(step.answers([]), step.server.snapshots() == [snapshot(OTHER, "y = 1")])
+    )
 
 
 pure func test_a_document_without_a_file_uri_is_ignored() -> Bool:
-    after([INITIALIZE, did_open("untitled:Untitled-1", "x = 1")]).answers([])
+    serving(pure func(server: Server) -> Bool:
+        server
+            .after([INITIALIZE, did_open("untitled:Untitled-1", "x = 1")])
+            .answers([])
+    )
 
 
 pure func test_a_percent_encoded_uri_names_its_decoded_path() -> Bool:
-    (
-        after([INITIALIZE, did_open("file:///work/a%20b.brp", "x")]).analysed_path()
-        == path("/work/a b.brp")
+    serving(pure func(server: Server) -> Bool:
+        (
+            server
+                .after([INITIALIZE, did_open("file:///work/a%20b.brp", "x")])
+                .analysed_path()
+            == path("/work/a b.brp")
+        )
     )
 
 
@@ -356,91 +502,116 @@ private pure func reported(
 
 
 -- The server after `initialize` and the root's didOpen.
-private pure func with_root_open(initialize: String) -> Server:
-    after([initialize, did_open(ROOT_URI, "x")]).server
+private pure func with_root_open(server: Server, initialize: String) -> Server:
+    server.after([initialize, did_open(ROOT_URI, "x")]).server
 
 
 -- The library file cannot be shown, so its diagnostic goes at the start of the
--- root, led by its location: `bc` starts line 2 of the library text.
+-- root, led by its location in the view: `bc` starts line 2 of the library
+-- text, which LIBRARY holds at `list.brp`.
 pure func test_each_user_file_gets_its_diagnostics_and_the_library_its_root() -> Bool:
-    step = with_root_open(INITIALIZE).analysed_root(
-        rejected(ROOT_TEXT, diagnostic(in_module(0, 10, 11), "first", "fix it"), [
-            diagnostic(in_module(3, 2, 4), "in the library", "nothing"),
-            diagnostic(in_module(4, 4, 7), "second", "fix that"),
-            diagnostic(in_module(0, 0, 1), "third", "and this")
+    serving(pure func(server: Server) -> Bool:
+        step = server
+            .with_root_open(INITIALIZE)
+            .analysed_root(
+                rejected(ROOT_TEXT, diagnostic(in_module(0, 10, 11), "first", "fix it"), [
+                    diagnostic(in_module(3, 2, 4), "in the library", "nothing"),
+                    diagnostic(in_module(4, 4, 7), "second", "fix that"),
+                    diagnostic(in_module(0, 0, 1), "third", "and this")
+                ])
+            )
+        step.answers([
+            published(ROOT_URI, [
+                reported(0, 10, 0, 11, "first\\nhelp: fix it"),
+                reported(0, 0, 0, 0, "/library/list.brp:2:1: in the library\\nhelp: nothing"),
+                reported(0, 0, 0, 1, "third\\nhelp: and this")
+            ]),
+            published(OTHER_URI, [reported(1, 0, 1, 3, "second\\nhelp: fix that")])
         ])
     )
-    step.answers([
-        published(ROOT_URI, [
-            reported(0, 10, 0, 11, "first\\nhelp: fix it"),
-            reported(0, 0, 0, 0, "<standard library>/list.brp:2:1: in the library\\nhelp: nothing"),
-            reported(0, 0, 0, 1, "third\\nhelp: and this")
-        ]),
-        published(OTHER_URI, [reported(1, 0, 1, 3, "second\\nhelp: fix that")])
-    ])
 
 
 pure func test_ranges_count_in_the_agreed_encoding() -> Bool:
-    result = rejected(ROOT_TEXT, diagnostic(in_module(0, 10, 11), "first", "fix it"), [])
-    and(
-        with_root_open(INITIALIZE)
-            .analysed_root(result)
-            .answers([published(ROOT_URI, [reported(0, 10, 0, 11, "first\\nhelp: fix it")])]),
-        with_root_open(INITIALIZE_UTF16)
-            .analysed_root(result)
-            .answers([published(ROOT_URI, [reported(0, 9, 0, 10, "first\\nhelp: fix it")])])
+    serving(pure func(server: Server) -> Bool:
+        result = rejected(ROOT_TEXT, diagnostic(in_module(0, 10, 11), "first", "fix it"), [])
+        and(
+            server
+                .with_root_open(INITIALIZE)
+                .analysed_root(result)
+                .answers([published(ROOT_URI, [reported(0, 10, 0, 11, "first\\nhelp: fix it")])]),
+            server
+                .with_root_open(INITIALIZE_UTF16)
+                .analysed_root(result)
+                .answers([published(ROOT_URI, [reported(0, 9, 0, 10, "first\\nhelp: fix it")])])
+        )
     )
 
 
 pure func test_a_diagnostic_about_blorp_is_shown_at_the_start_of_the_root() -> Bool:
-    failure: DocumentAnalysis = {
-        sources = { modules = [] },
-        outcome = LoadFailed(internal_error(compiler_span(), "broken"))
-    }
-    with_root_open(INITIALIZE)
-        .analysed_root(failure)
-        .answers([
-            published(ROOT_URI, [
-                reported(
-                    0,
-                    0,
-                    0,
-                    0,
-                    "internal compiler error: broken\\nhelp: report this compiler error with the input program"
-                )
+    serving(pure func(server: Server) -> Bool:
+        failure: DocumentAnalysis = {
+            sources = { modules = [] },
+            outcome = LoadFailed(internal_error(compiler_span(), "broken"))
+        }
+        server
+            .with_root_open(INITIALIZE)
+            .analysed_root(failure)
+            .answers([
+                published(ROOT_URI, [
+                    reported(
+                        0,
+                        0,
+                        0,
+                        0,
+                        "internal compiler error: broken\\nhelp: report this compiler error with the input program"
+                    )
+                ])
             ])
-        ])
+    )
 
 
 func test_a_fixed_error_publishes_an_empty_list() -> Bool:
-    first = with_root_open(INITIALIZE).analysed_root(
-        rejected(ROOT_TEXT, diagnostic(in_module(4, 0, 1), "second", "fix that"), [])
-    )
-    fixed = clean(ROOT)
-    and(
-        first.server
-            .analysed_root(fixed)
-            .answers([published(OTHER_URI, [])]),
-        first.server
-            .analysed_root(fixed).server
-            .analysed_root(fixed)
-            .answers([])
+    loading(func(server: Server) -> Bool:
+        first = server
+            .with_root_open(INITIALIZE)
+            .analysed_root(
+                rejected(ROOT_TEXT, diagnostic(in_module(4, 0, 1), "second", "fix that"), [])
+            )
+        fixed = clean(ROOT)
+        and(
+            first.server
+                .analysed_root(fixed)
+                .answers([published(OTHER_URI, [])]),
+            first.server
+                .analysed_root(fixed).server
+                .analysed_root(fixed)
+                .answers([])
+        )
     )
 
 
 pure func test_an_analysis_of_a_document_no_longer_open_is_dropped() -> Bool:
-    closed = after([INITIALIZE, did_open(ROOT_URI, "x"), did_close(ROOT_URI)]).server
-    closed
-        .analysed_root(rejected(ROOT_TEXT, diagnostic(in_module(0, 0, 1), "first", "fix it"), []))
-        .answers([])
+    serving(pure func(server: Server) -> Bool:
+        closed = server.after([INITIALIZE, did_open(ROOT_URI, "x"), did_close(ROOT_URI)]).server
+        closed
+            .analysed_root(
+                rejected(ROOT_TEXT, diagnostic(in_module(0, 0, 1), "first", "fix it"), [])
+            )
+            .answers([])
+    )
 
 
 pure func test_diagnostics_go_to_the_uri_the_client_opened_the_file_by() -> Bool:
-    -- `%6D` is an `m` that the server's own encoding would not escape.
-    written = "file:///work/%6Dain.brp"
-    after([INITIALIZE, did_open(written, "x")]).server
-        .analysed_root(rejected(ROOT_TEXT, diagnostic(in_module(0, 0, 1), "first", "fix it"), []))
-        .answers([published(written, [reported(0, 0, 0, 1, "first\\nhelp: fix it")])])
+    serving(pure func(server: Server) -> Bool:
+        -- `%6D` is an `m` that the server's own encoding would not escape.
+        written = "file:///work/%6Dain.brp"
+        server
+            .after([INITIALIZE, did_open(written, "x")]).server
+            .analysed_root(
+                rejected(ROOT_TEXT, diagnostic(in_module(0, 0, 1), "first", "fix it"), [])
+            )
+            .answers([published(written, [reported(0, 0, 0, 1, "first\\nhelp: fix it")])])
+    )
 
 
 -- shared files: ROOT imports OTHER, and both are open. ROOT reports `second`
@@ -464,51 +635,68 @@ private pure func other_reports(error: Diagnostic) -> DocumentAnalysis:
     }
 
 
-private pure func both_open() -> Server:
-    after([INITIALIZE, did_open(ROOT_URI, "x"), did_open(OTHER_URI, "one")]).server
+private pure func both_open(server: Server) -> Server:
+    server.after([INITIALIZE, did_open(ROOT_URI, "x"), did_open(OTHER_URI, "one")]).server
 
 
 -- OTHER analysed, then ROOT, so OTHER shows `second`.
-private pure func other_then_root() -> Server:
-    both_open()
+private pure func other_then_root(server: Server) -> Server:
+    server
+        .both_open()
         .analysed_at(OTHER, other_reports(diagnostic(in_module(0, 4, 7), "own", "fix"))).server
         .analysed_root(root_reports_second()).server
 
 
 -- ROOT analysed, then OTHER, so OTHER shows `own`.
-private pure func root_then_other() -> Server:
-    both_open()
+private pure func root_then_other(server: Server) -> Server:
+    server
+        .both_open()
         .analysed_root(root_reports_second()).server
         .analysed_at(OTHER, other_reports(diagnostic(in_module(0, 4, 7), "own", "fix"))).server
 
 
 pure func test_closing_a_root_shows_what_another_root_reports_in_a_shared_file() -> Bool:
-    and(
-        other_then_root()
-            .receive(json(did_close(ROOT_URI)))
-            .answers([published(ROOT_URI, []), published(OTHER_URI, [reported(1, 0, 1, 3, OWN)])]),
+    serving(pure func(server: Server) -> Bool:
         and(
-            root_then_other()
+            server
+                .other_then_root()
                 .receive(json(did_close(ROOT_URI)))
                 .answers([
                     published(ROOT_URI, []),
                     published(OTHER_URI, [reported(1, 0, 1, 3, OWN)])
                 ]),
-            root_then_other()
-                .receive(json(did_close(OTHER_URI)))
-                .answers([published(OTHER_URI, [reported(0, 0, 0, 1, SECOND)])])
+            and(
+                server
+                    .root_then_other()
+                    .receive(json(did_close(ROOT_URI)))
+                    .answers([
+                        published(ROOT_URI, []),
+                        published(OTHER_URI, [reported(1, 0, 1, 3, OWN)])
+                    ]),
+                server
+                    .root_then_other()
+                    .receive(json(did_close(OTHER_URI)))
+                    .answers([published(OTHER_URI, [reported(0, 0, 0, 1, SECOND)])])
+            )
         )
     )
 
 
 func test_a_root_that_stops_reporting_in_a_shared_file_shows_another_roots() -> Bool:
-    and(
-        other_then_root()
-            .analysed_root(clean(ROOT))
-            .answers([published(ROOT_URI, []), published(OTHER_URI, [reported(1, 0, 1, 3, OWN)])]),
-        root_then_other()
-            .analysed_at(OTHER, clean(OTHER))
-            .answers([published(OTHER_URI, [reported(0, 0, 0, 1, SECOND)])])
+    loading(func(server: Server) -> Bool:
+        and(
+            server
+                .other_then_root()
+                .analysed_root(clean(ROOT))
+                .answers([
+                    published(ROOT_URI, []),
+                    published(OTHER_URI, [reported(1, 0, 1, 3, OWN)])
+                ]),
+            server
+                .root_then_other()
+                .analysed_at(OTHER, clean(OTHER))
+                .answers([published(OTHER_URI, [reported(0, 0, 0, 1, SECOND)])])
+        )
     )
 
 
@@ -533,22 +721,24 @@ private pure func reports_in_shared(root: String, message: String) -> DocumentAn
 
 
 pure func test_the_most_recently_analysed_root_wins_a_shared_file() -> Bool:
-    opened = after([
-        INITIALIZE,
-        did_open("file:///work/x.brp", "x"),
-        did_open("file:///work/y.brp", "y"),
-        did_open("file:///work/z.brp", "z")
-    ]).server
-    reported_by_all = opened
-        .analysed_at("/work/x.brp", reports_in_shared("/work/x.brp", "x")).server
-        .analysed_at("/work/y.brp", reports_in_shared("/work/y.brp", "y")).server
-        .analysed_at("/work/z.brp", reports_in_shared("/work/z.brp", "z")).server
-        .analysed_at("/work/x.brp", reports_in_shared("/work/x.brp", "x again")).server
-    reported_by_all
-        .receive(json(did_close("file:///work/z.brp")))
-        .answers([
-            published("file:///work/shared.brp", [reported(0, 0, 0, 1, "x again\\nhelp: h")])
-        ])
+    serving(pure func(server: Server) -> Bool:
+        opened = server.after([
+            INITIALIZE,
+            did_open("file:///work/x.brp", "x"),
+            did_open("file:///work/y.brp", "y"),
+            did_open("file:///work/z.brp", "z")
+        ]).server
+        reported_by_all = opened
+            .analysed_at("/work/x.brp", reports_in_shared("/work/x.brp", "x")).server
+            .analysed_at("/work/y.brp", reports_in_shared("/work/y.brp", "y")).server
+            .analysed_at("/work/z.brp", reports_in_shared("/work/z.brp", "z")).server
+            .analysed_at("/work/x.brp", reports_in_shared("/work/x.brp", "x again")).server
+        reported_by_all
+            .receive(json(did_close("file:///work/z.brp")))
+            .answers([
+                published("file:///work/shared.brp", [reported(0, 0, 0, 1, "x again\\nhelp: h")])
+            ])
+    )
 
 
 -- analysing a loaded program
@@ -634,66 +824,84 @@ private pure func reading(root: String, files: List[String]) -> DocumentAnalysis
 -- ROOT read OTHER from the disk, so opening OTHER, whose unsaved text the next
 -- analysis reads, stales ROOT.
 pure func test_opening_a_file_stales_the_roots_that_read_it() -> Bool:
-    reads_other = with_root_open(INITIALIZE).analysed_root(reading(ROOT, [OTHER])).server
-    and(
-        not(reads_other.stale(ROOT_URI)),
-        reads_other
-            .changed(did_open(OTHER_URI, "y"))
-            .stale(ROOT_URI)
+    serving(pure func(server: Server) -> Bool:
+        reads_other = server
+            .with_root_open(INITIALIZE)
+            .analysed_root(reading(ROOT, [OTHER])).server
+        and(
+            not(reads_other.stale(ROOT_URI)),
+            reads_other
+                .changed(did_open(OTHER_URI, "y"))
+                .stale(ROOT_URI)
+        )
     )
 
 
 -- ROOT read only itself, so editing OTHER leaves it current until ROOT
 -- imports OTHER and is analysed again.
 pure func test_a_newly_imported_file_stales_its_importer_after_the_next_analysis() -> Bool:
-    alone = both_open().analysed_root(reading(ROOT, [])).server
-    importing = alone
-        .changed(did_change(ROOT_URI, "import"))
-        .analysed_root(reading(ROOT, [OTHER])).server
-    and(
-        not(
-            alone
+    serving(pure func(server: Server) -> Bool:
+        alone = server
+            .both_open()
+            .analysed_root(reading(ROOT, [])).server
+        importing = alone
+            .changed(did_change(ROOT_URI, "import"))
+            .analysed_root(reading(ROOT, [OTHER])).server
+        and(
+            not(
+                alone
+                    .changed(did_change(OTHER_URI, "z"))
+                    .stale(ROOT_URI)
+            ),
+            importing
                 .changed(did_change(OTHER_URI, "z"))
                 .stale(ROOT_URI)
-        ),
-        importing
-            .changed(did_change(OTHER_URI, "z"))
-            .stale(ROOT_URI)
+        )
     )
 
 
 pure func test_editing_a_shared_file_stales_every_root_that_read_it() -> Bool:
-    current = both_open()
-        .analysed_root(reading(ROOT, [OTHER])).server
-        .analysed_at(OTHER, reading(OTHER, [])).server
-    edited = current.changed(did_change(OTHER_URI, "z"))
-    and(
-        and(not(current.stale(ROOT_URI)), not(current.stale(OTHER_URI))),
-        and(edited.stale(ROOT_URI), edited.stale(OTHER_URI))
+    serving(pure func(server: Server) -> Bool:
+        current = server
+            .both_open()
+            .analysed_root(reading(ROOT, [OTHER])).server
+            .analysed_at(OTHER, reading(OTHER, [])).server
+        edited = current.changed(did_change(OTHER_URI, "z"))
+        and(
+            and(not(current.stale(ROOT_URI)), not(current.stale(OTHER_URI))),
+            and(edited.stale(ROOT_URI), edited.stale(OTHER_URI))
+        )
     )
 
 
 -- ROOT read OTHER's unsaved text, which closing OTHER discards.
 pure func test_closing_a_file_stales_the_roots_that_read_its_unsaved_text() -> Bool:
-    both_open()
-        .analysed_root(reading(ROOT, [OTHER])).server
-        .analysed_at(OTHER, reading(OTHER, [])).server
-        .changed(did_close(OTHER_URI))
-        .stale(ROOT_URI)
+    serving(pure func(server: Server) -> Bool:
+        server
+            .both_open()
+            .analysed_root(reading(ROOT, [OTHER])).server
+            .analysed_at(OTHER, reading(OTHER, [])).server
+            .changed(did_close(OTHER_URI))
+            .stale(ROOT_URI)
+    )
 
 
 -- A module the load could not find may exist after any change.
 pure func test_a_root_whose_load_failed_is_stale_after_any_change() -> Bool:
-    failed: DocumentAnalysis = {
-        sources = { modules = [{ path = ROOT, contents = "", role = UserModule }] },
-        outcome = LoadFailed(diagnostic(in_module(0, 0, 0), "missing", "h"))
-    }
-    loaded = with_root_open(INITIALIZE).analysed_root(failed).server
-    and(
-        not(loaded.stale(ROOT_URI)),
-        loaded
-            .changed(did_open(OTHER_URI, "y"))
-            .stale(ROOT_URI)
+    serving(pure func(server: Server) -> Bool:
+        failed: DocumentAnalysis = {
+            sources = { modules = [{ path = ROOT, contents = "", role = UserModule }] },
+            outcome = LoadFailed(diagnostic(in_module(0, 0, 0), "missing", "h"))
+        }
+        loaded = server
+            .with_root_open(INITIALIZE)
+            .analysed_root(failed).server
+        and(
+            not(loaded.stale(ROOT_URI)),
+            loaded
+                .changed(did_open(OTHER_URI, "y"))
+                .stale(ROOT_URI)
+        )
     )
 
 
@@ -704,21 +912,27 @@ private pure func watched_change(uri: String) -> String:
 -- A change on disk to a file that is not open stales its readers; an open
 -- file's text is the editor's, so its change on disk stales nothing.
 pure func test_a_change_on_disk_stales_only_through_a_file_not_open() -> Bool:
-    read_from_disk = with_root_open(INITIALIZE).analysed_root(reading(ROOT, [OTHER])).server
-    read_open = both_open().analysed_root(reading(ROOT, [OTHER])).server
-    and(
+    serving(pure func(server: Server) -> Bool:
+        read_from_disk = server
+            .with_root_open(INITIALIZE)
+            .analysed_root(reading(ROOT, [OTHER])).server
+        read_open = server
+            .both_open()
+            .analysed_root(reading(ROOT, [OTHER])).server
         and(
-            read_from_disk
-                .receive(json(watched_change(OTHER_URI)))
-                .answers([]),
-            read_from_disk
-                .changed(watched_change(OTHER_URI))
-                .stale(ROOT_URI)
-        ),
-        not(
-            read_open
-                .changed(watched_change(OTHER_URI))
-                .stale(ROOT_URI)
+            and(
+                read_from_disk
+                    .receive(json(watched_change(OTHER_URI)))
+                    .answers([]),
+                read_from_disk
+                    .changed(watched_change(OTHER_URI))
+                    .stale(ROOT_URI)
+            ),
+            not(
+                read_open
+                    .changed(watched_change(OTHER_URI))
+                    .stale(ROOT_URI)
+            )
         )
     )
 
@@ -741,56 +955,66 @@ private BROKEN_REPORT: String = "{\"range\":{\"start\":{\"line\":0,\"character\"
 
 
 func test_tokens_of_a_current_root_are_sent_at_once() -> Bool:
-    after([INITIALIZE, did_open(ROOT_URI, CLEAN_TEXT)]).server
-        .analysed_root(clean(ROOT)).server
-        .receive(json(tokens_request(7, ROOT_URI)))
-        .answers([tokens_reply(7, CLEAN_TOKENS)])
+    loading(func(server: Server) -> Bool:
+        server
+            .after([INITIALIZE, did_open(ROOT_URI, CLEAN_TEXT)]).server
+            .analysed_root(clean(ROOT)).server
+            .receive(json(tokens_request(7, ROOT_URI)))
+            .answers([tokens_reply(7, CLEAN_TOKENS)])
+    )
 
 
 func test_a_root_that_does_not_check_gets_only_lexer_tokens() -> Bool:
-    after([INITIALIZE, did_open(ROOT_URI, BROKEN_TEXT)]).server
-        .analysed_root(analysis_of(BROKEN_TEXT)).server
-        .receive(json(tokens_request(7, ROOT_URI)))
-        .answers([tokens_reply(7, BROKEN_TOKENS)])
+    loading(func(server: Server) -> Bool:
+        server
+            .after([INITIALIZE, did_open(ROOT_URI, BROKEN_TEXT)]).server
+            .analysed_root(analysis_of(BROKEN_TEXT)).server
+            .receive(json(tokens_request(7, ROOT_URI)))
+            .answers([tokens_reply(7, BROKEN_TOKENS)])
+    )
 
 
 -- The edit fixes the error: the request waits for an analysis, which clears
 -- the diagnostic and then answers with the new tokens.
 func test_an_edit_refreshes_tokens_and_diagnostics_at_the_next_request() -> Bool:
-    opened = after([INITIALIZE, did_open(ROOT_URI, BROKEN_TEXT)]).server.analysed_root(
-        analysis_of(BROKEN_TEXT)
-    )
-    requested = opened.server
-        .changed(did_change(ROOT_URI, CLEAN_TEXT))
-        .receive(json(tokens_request(7, ROOT_URI)))
-    and(
+    loading(func(server: Server) -> Bool:
+        opened = server
+            .after([INITIALIZE, did_open(ROOT_URI, BROKEN_TEXT)]).server
+            .analysed_root(analysis_of(BROKEN_TEXT))
+        requested = opened.server
+            .changed(did_change(ROOT_URI, CLEAN_TEXT))
+            .receive(json(tokens_request(7, ROOT_URI)))
         and(
-            opened.replies.map(render) == [published(ROOT_URI, [BROKEN_REPORT])],
-            and(requested.replies.is_empty(), requested.analysed_path() == path(ROOT))
-        ),
-        requested.server
-            .analysed_as_asked(requested, clean(ROOT))
-            .answers([published(ROOT_URI, []), tokens_reply(7, CLEAN_TOKENS)])
+            and(
+                opened.replies.map(render) == [published(ROOT_URI, [BROKEN_REPORT])],
+                and(requested.replies.is_empty(), requested.analysed_path() == path(ROOT))
+            ),
+            requested.server
+                .analysed_as_asked(requested, clean(ROOT))
+                .answers([published(ROOT_URI, []), tokens_reply(7, CLEAN_TOKENS)])
+        )
     )
 
 
 func test_a_burst_of_edits_costs_one_analysis() -> Bool:
-    var server = after([INITIALIZE, did_open(ROOT_URI, CLEAN_TEXT)]).server.analysed_root(
-        clean(ROOT)
-    ).server
-    var analyses = 0
-    for text in ["ONE: Int = 2", "ONE: Int = 3", CLEAN_TEXT]:
-        step = server.receive(json(did_change(ROOT_URI, text)))
-        if step.analyse.is_some():
-            analyses = analyses + 1
-        server = step.server
-    requested = server.receive(json(tokens_request(7, ROOT_URI)))
-    answered = requested.server
-        .analysed_as_asked(requested, clean(ROOT)).server
-        .receive(json(tokens_request(8, ROOT_URI)))
-    and(
-        and(analyses == 0, requested.analyse.is_some()),
-        answered.answers([tokens_reply(8, CLEAN_TOKENS)])
+    loading(func(server: Server) -> Bool:
+        var edited = server
+            .after([INITIALIZE, did_open(ROOT_URI, CLEAN_TEXT)]).server
+            .analysed_root(clean(ROOT)).server
+        var analyses = 0
+        for text in ["ONE: Int = 2", "ONE: Int = 3", CLEAN_TEXT]:
+            step = edited.receive(json(did_change(ROOT_URI, text)))
+            if step.analyse.is_some():
+                analyses = analyses + 1
+            edited = step.server
+        requested = edited.receive(json(tokens_request(7, ROOT_URI)))
+        answered = requested.server
+            .analysed_as_asked(requested, clean(ROOT)).server
+            .receive(json(tokens_request(8, ROOT_URI)))
+        and(
+            and(analyses == 0, requested.analyse.is_some()),
+            answered.answers([tokens_reply(8, CLEAN_TOKENS)])
+        )
     )
 
 
@@ -800,29 +1024,37 @@ private REJECTED: String = "{\"range\":{\"start\":{\"line\":0,\"character\":0},\
 -- Each request carries its id to its own analysis, so two requests waiting at
 -- once each get their answer, with their own document's tokens.
 pure func test_each_waiting_request_is_answered_by_its_own_analysis() -> Bool:
-    edited = both_open()
-        .analysed_root(reading(ROOT, [])).server
-        .analysed_at(OTHER, reading(OTHER, [])).server
-        .changed(did_change(ROOT_URI, "x = 2"))
-        .changed(did_change(OTHER_URI, "yy = 3.5"))
-    first = edited.receive(json(tokens_request(7, ROOT_URI)))
-    second = first.server.receive(json(tokens_request(8, OTHER_URI)))
-    other_answered = second.server.analysed_as_asked(second, reading(OTHER, []))
-    and(
-        other_answered.answers([
-            published(OTHER_URI, [REJECTED]),
-            tokens_reply(8, "0,3,1,14,0,0,2,3,13,0")
-        ]),
-        other_answered.server
-            .analysed_as_asked(first, reading(ROOT, []))
-            .answers([published(ROOT_URI, [REJECTED]), tokens_reply(7, "0,2,1,14,0,0,2,1,13,0")])
+    serving(pure func(server: Server) -> Bool:
+        edited = server
+            .both_open()
+            .analysed_root(reading(ROOT, [])).server
+            .analysed_at(OTHER, reading(OTHER, [])).server
+            .changed(did_change(ROOT_URI, "x = 2"))
+            .changed(did_change(OTHER_URI, "yy = 3.5"))
+        first = edited.receive(json(tokens_request(7, ROOT_URI)))
+        second = first.server.receive(json(tokens_request(8, OTHER_URI)))
+        other_answered = second.server.analysed_as_asked(second, reading(OTHER, []))
+        and(
+            other_answered.answers([
+                published(OTHER_URI, [REJECTED]),
+                tokens_reply(8, "0,3,1,14,0,0,2,3,13,0")
+            ]),
+            other_answered.server
+                .analysed_as_asked(first, reading(ROOT, []))
+                .answers([
+                    published(ROOT_URI, [REJECTED]),
+                    tokens_reply(7, "0,2,1,14,0,0,2,1,13,0")
+                ])
+        )
     )
 
 
 pure func test_a_token_request_for_a_document_not_open_gets_null() -> Bool:
-    after([INITIALIZE, tokens_request(7, ROOT_URI)]).answers([
-        "{\"jsonrpc\":\"2.0\",\"id\":7,\"result\":null}"
-    ])
+    serving(pure func(server: Server) -> Bool:
+        server
+            .after([INITIALIZE, tokens_request(7, ROOT_URI)])
+            .answers(["{\"jsonrpc\":\"2.0\",\"id\":7,\"result\":null}"])
+    )
 
 
 -- watching files
@@ -837,35 +1069,51 @@ private REGISTRATION: String = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"clien
 
 
 pure func test_initialized_registers_for_changed_files_once_when_the_client_can() -> Bool:
-    and(
-        after([INITIALIZE_WATCHING, INITIALIZED]).answers([REGISTRATION]),
+    serving(pure func(server: Server) -> Bool:
         and(
-            after([INITIALIZE_WATCHING, INITIALIZED, INITIALIZED]).answers([]),
-            after([INITIALIZE, INITIALIZED]).answers([])
+            server
+                .after([INITIALIZE_WATCHING, INITIALIZED])
+                .answers([REGISTRATION]),
+            and(
+                server
+                    .after([INITIALIZE_WATCHING, INITIALIZED, INITIALIZED])
+                    .answers([]),
+                server
+                    .after([INITIALIZE, INITIALIZED])
+                    .answers([])
+            )
         )
     )
 
 
 pure func test_the_clients_answer_to_the_registration_is_accepted() -> Bool:
-    and(
+    serving(pure func(server: Server) -> Bool:
         and(
-            after([
-                INITIALIZE_WATCHING,
-                INITIALIZED,
-                "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":null}"
-            ]).answers([]),
-            after([
-                INITIALIZE_WATCHING,
-                INITIALIZED,
-                "{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32601,\"message\":\"no\"}}"
-            ]).answers([])
-        ),
-        after([
-            INITIALIZE_WATCHING,
-            INITIALIZED,
-            "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":null}",
-            SHUTDOWN
-        ]).answers(["{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":null}"])
+            and(
+                server
+                    .after([
+                        INITIALIZE_WATCHING,
+                        INITIALIZED,
+                        "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":null}"
+                    ])
+                    .answers([]),
+                server
+                    .after([
+                        INITIALIZE_WATCHING,
+                        INITIALIZED,
+                        "{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32601,\"message\":\"no\"}}"
+                    ])
+                    .answers([])
+            ),
+            server
+                .after([
+                    INITIALIZE_WATCHING,
+                    INITIALIZED,
+                    "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":null}",
+                    SHUTDOWN
+                ])
+                .answers(["{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":null}"])
+        )
     )
 
 
@@ -873,39 +1121,568 @@ pure func test_the_clients_answer_to_the_registration_is_accepted() -> Bool:
 -- spelling. Closing MAIN clears the spelling and publishes OTHER's report
 -- under the server's own URI, where later analyses publish it.
 func test_closing_a_file_by_another_spelling_moves_what_others_report_there() -> Bool:
-    written = "file:///work/%6Dain.brp"
-    importer: DocumentAnalysis = {
-        sources = {
-            modules = [
-                { path = OTHER, contents = "", role = UserModule },
-                { path = ROOT, contents = "x\n", role = UserModule }
-            ]
-        },
-        outcome = CheckFailed({
-            first = diagnostic(in_module(1, 0, 1), "in main", "h"),
-            remaining = []
-        })
-    }
-    imported = after([INITIALIZE, did_open(written, CLEAN_TEXT), did_open(OTHER_URI, "o")]).server
-        .analysed_root(clean(ROOT)).server
-        .analysed_at(OTHER, importer)
-    in_main = reported(0, 0, 0, 1, "in main\\nhelp: h")
-    and(
-        imported.answers([published(written, [in_main])]),
-        imported.server
-            .receive(json(did_close(written)))
-            .answers([published(written, []), published(ROOT_URI, [in_main])])
+    loading(func(server: Server) -> Bool:
+        written = "file:///work/%6Dain.brp"
+        importer: DocumentAnalysis = {
+            sources = {
+                modules = [
+                    { path = OTHER, contents = "", role = UserModule },
+                    { path = ROOT, contents = "x\n", role = UserModule }
+                ]
+            },
+            outcome = CheckFailed({
+                first = diagnostic(in_module(1, 0, 1), "in main", "h"),
+                remaining = []
+            })
+        }
+        imported = server
+            .after([INITIALIZE, did_open(written, CLEAN_TEXT), did_open(OTHER_URI, "o")]).server
+            .analysed_root(clean(ROOT)).server
+            .analysed_at(OTHER, importer)
+        in_main = reported(0, 0, 0, 1, "in main\\nhelp: h")
+        and(
+            imported.answers([published(written, [in_main])]),
+            imported.server
+                .receive(json(did_close(written)))
+                .answers([published(written, []), published(ROOT_URI, [in_main])])
+        )
     )
 
 
 -- After the close the server publishes to the file under its own URI, so the
 -- set it published under the client's spelling is cleared.
 pure func test_closing_a_file_opened_by_another_spelling_clears_that_spelling() -> Bool:
-    written = "file:///work/%6Dain.brp"
-    after([INITIALIZE, did_open(written, "x")]).server
-        .analysed_root(rejected(ROOT_TEXT, diagnostic(in_module(0, 0, 1), "first", "fix it"), [])).server
-        .receive(json(did_close(written)))
-        .answers([published(written, []), published(ROOT_URI, [])])
+    serving(pure func(server: Server) -> Bool:
+        written = "file:///work/%6Dain.brp"
+        server
+            .after([INITIALIZE, did_open(written, "x")]).server
+            .analysed_root(
+                rejected(ROOT_TEXT, diagnostic(in_module(0, 0, 1), "first", "fix it"), [])
+            ).server
+            .receive(json(did_close(written)))
+            .answers([published(written, []), published(ROOT_URI, [])])
+    )
+
+
+-- definitions and references, against real analyses that read the library
+-- from its folder, so that library declarations have their files
+
+private HELPERS: String = "/work/helpers.brp"
+
+private HELPERS_URI: String = "file:///work/helpers.brp"
+
+private HELPERS_TEXT: String = "pure func one() -> Int:\n    1\n"
+
+
+-- The root's text up to line 31; lines are counted from 0 in the comments of
+-- the tests below.
+private NAVIGATED_START: String =
+    |import:
+    |    ./helpers as helpers: one
+    |
+    |
+    |record Point {
+    |    x: Int
+    |}
+    |
+    |
+    |union Shape:
+    |    Dot
+    |    Circle(Int)
+    |
+    |
+    |trait Sized:
+    |    pure func size(value: Self) -> Int
+    |
+    |
+    |implements Sized for Point:
+    |    pure func size(value: Self) -> Int:
+    |        value.x
+    |
+    |
+    |pure func area(shape: Shape) -> Int:
+    |    match shape:
+    |        Dot: 0
+    |        Circle(radius): radius * radius
+    |
+    |
+    |func main() -> Int:
+    |    point: Point = { x = 1 }
+    |    total = point.size() + area(Circle(point.x)) + helpers.one()
+
+
+-- The root's whole text. A pipe string cannot hold `$\{`, so the line that
+-- interpolates is quoted.
+private pure func navigated_text() -> String:
+    NAVIGATED_START + "\n    print(\"$\{total}\")\n    0\n"
+
+
+-- An analysis of `text` as ROOT, beside HELPERS, reading the embedded library
+-- as the transport does.
+private func navigated(text: String) -> DocumentAnalysis:
+    document_analysis(
+        load_program_with_sources(ROOT, EmbeddedLibrary, [
+            snapshot(ROOT, text),
+            snapshot(HELPERS, HELPERS_TEXT)
+        ])
+    )
+
+
+-- `text` as the contents of a JSON string.
+private pure func escaped(text: String) -> String:
+    quoted = render(Text(text))
+    quoted
+        .slice(1, quoted.length() - 1)
+        .get_or("")
+
+
+-- `server` with ROOT open as `text` and analysed.
+private func navigating(server: Server, text: String) -> Server:
+    server
+        .after([INITIALIZE, did_open(ROOT_URI, text.escaped())]).server
+        .analysed_root(navigated(text)).server
+
+
+private pure func position_params(uri: String, line: Int, character: Int) -> String:
+    "\"textDocument\":{\"uri\":\"${uri}\"},\"position\":{\"line\":${line},\"character\":${character}}"
+
+
+private pure func definition_request(id: Int, uri: String, line: Int, character: Int) -> String:
+    "{\"jsonrpc\":\"2.0\",\"id\":${id},\"method\":\"textDocument/definition\",\"params\":{${position_params(uri, line, character)}}}"
+
+
+private pure func references_request(
+    id: Int,
+    uri: String,
+    line: Int,
+    character: Int,
+    includes_declaration: Bool
+) -> String:
+    included = if includes_declaration:
+        "true"
+    else:
+        "false"
+    "{\"jsonrpc\":\"2.0\",\"id\":${id},\"method\":\"textDocument/references\",\"params\":{${position_params(uri, line, character)},\"context\":{\"includeDeclaration\":${included}}}}"
+
+
+private pure func location(uri: String, line: Int, start: Int, end: Int) -> String:
+    "{\"uri\":\"${uri}\",\"range\":{\"start\":{\"line\":${line},\"character\":${start}},\"end\":{\"line\":${line},\"character\":${end}}}}"
+
+
+private pure func result_reply(id: Int, result: String) -> String:
+    "{\"jsonrpc\":\"2.0\",\"id\":${id},\"result\":${result}}"
+
+
+-- The reply to a definition request at `line` and `character` of the root.
+private pure func definition_at(server: Server, line: Int, character: Int) -> List[String]:
+    server
+        .receive(json(definition_request(7, ROOT_URI, line, character))).replies
+        .map(render)
+
+
+-- The positions in the root, each with where its name is declared, that do
+-- not get that one location.
+private pure func misplaced(
+    server: Server,
+    cases: List[(Int, Int, String)]
+) -> List[(Int, Int, String)]:
+    cases.filter(
+        pure func(case: (Int, Int, String)) -> Bool: (
+            server.definition_at(case[0], case[1])
+            != [result_reply(7, case[2])]
+        )
+    )
+
+
+-- On line 31: `point` at 12, `size` 18, `area` 27, `Circle` 32, `x` 45,
+-- `helpers` 51 and `one` 59; `shape` on line 24 and `Point` on line 30.
+func test_definition_finds_each_kind_of_declaration() -> Bool:
+    loading(func(server: Server) -> Bool:
+        ready = server.navigating(navigated_text())
+        cases: List[(Int, Int, String)] = [
+            (31, 12, location(ROOT_URI, 30, 4, 9)),
+            (24, 10, location(ROOT_URI, 23, 15, 20)),
+            (31, 45, location(ROOT_URI, 5, 4, 5)),
+            (31, 33, location(ROOT_URI, 11, 4, 10)),
+            (30, 11, location(ROOT_URI, 4, 7, 12)),
+            (31, 27, location(ROOT_URI, 23, 10, 14)),
+            (31, 18, location(ROOT_URI, 15, 14, 18)),
+            (31, 51, location(HELPERS_URI, 0, 0, 0)),
+            (31, 59, location(HELPERS_URI, 0, 10, 13))
+        ]
+        ready
+            .misplaced(cases)
+            .is_empty()
+    )
+
+
+-- `area` on line 23 and the implementation's `size` on line 19 declare what
+-- they name.
+func test_definition_on_a_declarations_own_name_answers_it() -> Bool:
+    loading(func(server: Server) -> Bool:
+        server
+            .navigating(navigated_text())
+            .misplaced([
+                (23, 12, location(ROOT_URI, 23, 10, 14)),
+                (19, 14, location(ROOT_URI, 19, 14, 18))
+            ])
+            .is_empty()
+    )
+
+
+-- The end of `area` on line 31, and the end of `point`, where the `.` after it
+-- starts.
+func test_definition_counts_an_identifiers_end_as_inside_it() -> Bool:
+    loading(func(server: Server) -> Bool:
+        server
+            .navigating(navigated_text())
+            .misplaced([
+                (31, 31, location(ROOT_URI, 23, 10, 14)),
+                (31, 17, location(ROOT_URI, 30, 4, 9))
+            ])
+            .is_empty()
+    )
+
+
+-- `total` inside `${...}` on line 32.
+func test_definition_of_a_name_inside_an_interpolation() -> Bool:
+    loading(func(server: Server) -> Bool:
+        server
+            .navigating(navigated_text())
+            .misplaced([(32, 15, location(ROOT_URI, 31, 4, 9))])
+            .is_empty()
+    )
+
+
+-- `Int` on line 5 is built in, and line 2 is blank.
+func test_definition_of_a_built_in_type_or_of_no_name_is_null() -> Bool:
+    loading(func(server: Server) -> Bool:
+        ready = server.navigating(navigated_text())
+        and(
+            ready.definition_at(5, 8) == [result_reply(7, "null")],
+            ready.definition_at(2, 0) == [result_reply(7, "null")]
+        )
+    )
+
+
+-- A built-in type is declared nowhere, so its references are every use: the
+-- root's on lines 5, 23 and 29, HELPERS', and the rest in the library's view.
+func test_references_to_a_built_in_type_are_its_every_use() -> Bool:
+    -- Every location in the view, LIBRARY, starts so.
+    in_library = "{\"uri\":\"file://${LIBRARY}/"
+    loading(func(server: Server) -> Bool:
+        found = server
+            .navigating(navigated_text())
+            .references_at(5, 8, True)
+            .listed()
+        root_uses = [
+            location(ROOT_URI, 5, 7, 10),
+            location(ROOT_URI, 23, 32, 35),
+            location(ROOT_URI, 29, 15, 18)
+        ]
+        library_uses = found.filter(
+            pure func(each: String) -> Bool: not(
+                or(
+                    each.starts_with("{\"uri\":\"${ROOT_URI}\""),
+                    each.starts_with("{\"uri\":\"${HELPERS_URI}\"")
+                )
+            )
+        )
+        and(
+            root_uses.all(pure func(wanted: String) -> Bool: found.contains(wanted)),
+            and(
+                not(library_uses.is_empty()),
+                library_uses.all(pure func(each: String) -> Bool: each.starts_with(in_library))
+            )
+        )
+    )
+
+
+-- The absolute path the loader gives the library file `relative`.
+private func library_file(relative: String) -> Option[Path]:
+    match (get_current_directory(), "${LIBRARY_ROOT}/${relative}".to_path()):
+        (Ok(directory), Ok(file)):
+            Some(
+                directory
+                    .join(file)
+                    .normalize()
+            )
+        _:
+            None
+
+
+-- The line of `text`, counted from 0, that starts with `prefix`.
+private pure func line_starting(text: String, prefix: String) -> Option[Int]:
+    var found: Option[Int] = None
+    var line = 0
+    for written in text.lines():
+        if and(found.is_none(), written.starts_with(prefix)):
+            found = Some(line)
+        line = line + 1
+    found
+
+
+-- `print` on line 32 is declared in the library's own file, on the line of
+-- that file that declares it.
+func test_definition_of_a_library_function_lands_in_its_file() -> Bool:
+    match (library_server(), library_file("io/console/output.brp")):
+        (Some(server), Some(file)):
+            declared: Option[Int] = match read_file(file.to_string()):
+                Ok(text): text.line_starting("func print(")
+                Err(_): None
+            match declared:
+                Some(line):
+                    (
+                        server
+                            .navigating(navigated_text())
+                            .definition_at(32, 6)
+                        == [result_reply(7, location(file.file_uri(), line, 5, 10))]
+                    )
+                None:
+                    False
+        _:
+            False
+
+
+-- The reply to a references request at `line` and `character` of the root.
+private pure func references_at(
+    server: Server,
+    line: Int,
+    character: Int,
+    includes_declaration: Bool
+) -> List[String]:
+    server
+        .receive(json(references_request(8, ROOT_URI, line, character, includes_declaration))).replies
+        .map(render)
+
+
+-- The locations of the one references reply in `sent`.
+private pure func listed(sent: List[String]) -> List[String]:
+    match sent.map(json):
+        [Object(fields)]:
+            match fields.get("result"):
+                Some(Array(found)): found.map(render)
+                _: []
+        _:
+            []
+
+
+-- Whether `sent` is one references reply listing the distinct `expected`
+-- locations, led by the first: uses come in no promised order.
+private pure func lists(sent: List[String], expected: List[String]) -> Bool:
+    found = sent.listed()
+    and(
+        and(found.length() == expected.length(), found.take(1) == expected.take(1)),
+        expected.all(pure func(wanted: String) -> Bool: found.contains(wanted))
+    )
+
+
+-- `total` is declared on line 31 and used on line 32. The declaration leads
+-- when it is asked for.
+func test_references_list_the_declaration_only_when_asked() -> Bool:
+    loading(func(server: Server) -> Bool:
+        ready = server.navigating(navigated_text())
+        use = location(ROOT_URI, 32, 13, 18)
+        and(
+            (
+                ready.references_at(32, 13, True)
+                == [result_reply(8, "[${location(ROOT_URI, 31, 4, 9)},${use}]")]
+            ),
+            ready.references_at(31, 6, False) == [result_reply(8, "[${use}]")]
+        )
+    )
+
+
+-- Each method of the implementation has its own id for the header's `T`, and
+-- each use groups with the header's written `T` on line 7.
+private RECEIVER_PARAMETER: String =
+    |trait Size:
+    |    pure func size(value: Self) -> Int
+    |    pure func twice(value: Self) -> Int
+    |record Box[T] {
+    |    item: T,
+    |}
+    |implements Size for Box[T]:
+    |    pure func size(value: Self) -> Int:
+    |        items: List[T] = []
+    |        0
+    |    pure func twice(value: Self) -> Int:
+    |        items: List[T] = []
+    |        0
+
+
+func test_references_group_an_implementations_type_parameter_by_its_declaration() -> Bool:
+    loading(func(server: Server) -> Bool:
+        uses = [
+            location(ROOT_URI, 6, 24, 25),
+            location(ROOT_URI, 8, 20, 21),
+            location(ROOT_URI, 11, 20, 21)
+        ]
+        server
+            .navigating(RECEIVER_PARAMETER)
+            .references_at(8, 20, True)
+            .lists(uses)
+    )
+
+
+-- `one` is declared in HELPERS, which the root imports, and the root names it
+-- in its import list on line 1 and calls it on line 31.
+func test_references_reach_a_declaration_in_an_imported_module() -> Bool:
+    loading(func(server: Server) -> Bool:
+        found = [
+            location(HELPERS_URI, 0, 10, 13),
+            location(ROOT_URI, 1, 26, 29),
+            location(ROOT_URI, 31, 59, 62)
+        ]
+        server
+            .navigating(navigated_text())
+            .references_at(31, 60, True)
+            .lists(found)
+    )
+
+
+-- HELPERS is open under another spelling of its path (`%68` is `h`), so its
+-- location repeats the client's URI.
+func test_locations_use_the_uri_the_client_opened_a_file_by() -> Bool:
+    written = "file:///work/%68elpers.brp"
+    loading(func(server: Server) -> Bool:
+        (
+            server
+                .after([
+                    INITIALIZE,
+                    did_open(ROOT_URI, navigated_text().escaped()),
+                    did_open(written, HELPERS_TEXT.escaped())
+                ]).server
+                .analysed_root(navigated(navigated_text())).server
+                .definition_at(31, 59)
+            == [result_reply(7, location(written, 0, 10, 13))]
+        )
+    )
+
+
+-- An edit stales the root, so the request waits for the analysis, which
+-- answers it: `total` moved down a line.
+func test_a_request_on_a_stale_document_waits_for_its_analysis() -> Bool:
+    edited = "\n" + navigated_text()
+    loading(func(server: Server) -> Bool:
+        edited_server = server
+            .navigating(navigated_text())
+            .changed(did_change(ROOT_URI, edited.escaped()))
+        definition = edited_server.receive(json(definition_request(7, ROOT_URI, 33, 15)))
+        references = edited_server.receive(json(references_request(8, ROOT_URI, 33, 15, False)))
+        and(
+            and(definition.replies.is_empty(), definition.analysed_path() == path(ROOT)),
+            and(
+                definition.server
+                    .analysed_as_asked(definition, navigated(edited))
+                    .answers([result_reply(7, location(ROOT_URI, 32, 4, 9))]),
+                references.server
+                    .analysed_as_asked(references, navigated(edited))
+                    .answers([result_reply(8, "[${location(ROOT_URI, 33, 13, 18)}]")])
+            )
+        )
+    )
+
+
+-- While the root does not check, a definition is null and references are none.
+func test_a_root_that_does_not_check_has_no_definitions_or_references() -> Bool:
+    loading(func(server: Server) -> Bool:
+        broken = server
+            .after([INITIALIZE, did_open(ROOT_URI, BROKEN_TEXT)]).server
+            .analysed_root(analysis_of(BROKEN_TEXT)).server
+        and(
+            broken.definition_at(0, 1) == [result_reply(7, "null")],
+            broken.references_at(0, 1, True) == [result_reply(8, "[]")]
+        )
+    )
+
+
+-- A request without a position cannot name a name.
+pure func test_a_request_without_a_position_gets_null() -> Bool:
+    serving(pure func(server: Server) -> Bool:
+        server
+            .after([
+                INITIALIZE,
+                did_open(ROOT_URI, "x"),
+                "{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"textDocument/definition\",\"params\":{\"textDocument\":{\"uri\":\"${ROOT_URI}\"}}}"
+            ])
+            .answers([result_reply(7, "null")])
+    )
+
+
+-- The token request waits for an analysis, and the document closes before it
+-- comes back: the request gets null.
+func test_closing_a_document_while_its_request_waits_answers_null() -> Bool:
+    loading(func(server: Server) -> Bool:
+        waiting = server
+            .after([INITIALIZE, did_open(ROOT_URI, CLEAN_TEXT)]).server
+            .analysed_root(clean(ROOT)).server
+            .changed(did_change(ROOT_URI, CLEAN_TEXT))
+            .receive(json(tokens_request(7, ROOT_URI)))
+        and(
+            waiting.analyse.is_some(),
+            waiting.server
+                .changed(did_close(ROOT_URI))
+                .analysed_as_asked(waiting, clean(ROOT))
+                .answers([result_reply(7, "null")])
+        )
+    )
+
+
+-- A server whose library is the one the analyses here read.
+private func library_server() -> Option[Server]:
+    match (get_current_directory(), LIBRARY_ROOT.to_path()):
+        (Ok(directory), Ok(root)):
+            served(
+                directory
+                    .join(root)
+                    .normalize(),
+                directory
+            ).map(start_server)
+        _:
+            None
+
+
+-- A file of the library's view the client opens, after a definition led
+-- there, is not the root of a program: it gets the lexer's tokens of its text,
+-- no definition and no references. Its text is no snapshot, and every analysis
+-- reads the embedded library, so opening, editing and closing it stale no
+-- root; once closed it is forgotten. The foundation's files are the same.
+func test_a_library_file_the_client_opens_gets_only_lexer_tokens() -> Bool:
+    match (library_server(), library_file("list.brp"), library_file("_base.brp")):
+        (Some(server), Some(list), Some(base)):
+            uri = list.file_uri()
+            ready = server.navigating(navigated_text())
+            opened = ready.receive(json(did_open(uri, "x = 1")))
+            library = opened.server
+            edited = library.receive(json(did_change(uri, "y = 2")))
+            closed = edited.server.receive(json(did_close(uri)))
+            checks = [
+                opened.answers([]),
+                library.snapshots() == [snapshot(ROOT, navigated_text())],
+                library
+                    .receive(json(tokens_request(9, uri)))
+                    .answers([tokens_reply(9, "0,2,1,14,0,0,2,1,13,0")]),
+                library
+                    .receive(json(definition_request(7, uri, 0, 0)))
+                    .answers([result_reply(7, "null")]),
+                library
+                    .receive(json(references_request(8, uri, 0, 0, True)))
+                    .answers([result_reply(8, "[]")]),
+                edited.answers([]),
+                not(edited.server.stale(ROOT_URI)),
+                closed.answers([]),
+                not(closed.server.stale(ROOT_URI)),
+                closed.server
+                    .receive(json(tokens_request(9, uri)))
+                    .answers([result_reply(9, "null")]),
+                ready
+                    .receive(json(did_open(base.file_uri(), "x = 1")))
+                    .answers([])
+            ]
+            checks.all(pure func(check: Bool) -> Bool: check)
+        _:
+            False
 
 
 TESTS: TestSuite = {
@@ -1054,6 +1831,67 @@ TESTS: TestSuite = {
         (
             "each waiting request is answered by its own analysis",
             test_each_waiting_request_is_answered_by_its_own_analysis
+        ),
+        (
+            "definition finds each kind of declaration",
+            test_definition_finds_each_kind_of_declaration
+        ),
+        (
+            "definition on a declaration's own name answers it",
+            test_definition_on_a_declarations_own_name_answers_it
+        ),
+        (
+            "definition counts an identifier's end as inside it",
+            test_definition_counts_an_identifiers_end_as_inside_it
+        ),
+        (
+            "definition of a name inside an interpolation",
+            test_definition_of_a_name_inside_an_interpolation
+        ),
+        (
+            "definition of a built-in type or of no name is null",
+            test_definition_of_a_built_in_type_or_of_no_name_is_null
+        ),
+        (
+            "references to a built-in type are its every use",
+            test_references_to_a_built_in_type_are_its_every_use
+        ),
+        (
+            "definition of a library function lands in its file",
+            test_definition_of_a_library_function_lands_in_its_file
+        ),
+        (
+            "references list the declaration only when asked",
+            test_references_list_the_declaration_only_when_asked
+        ),
+        (
+            "references group an implementation's type parameter by its declaration",
+            test_references_group_an_implementations_type_parameter_by_its_declaration
+        ),
+        (
+            "references reach a declaration in an imported module",
+            test_references_reach_a_declaration_in_an_imported_module
+        ),
+        (
+            "locations use the URI the client opened a file by",
+            test_locations_use_the_uri_the_client_opened_a_file_by
+        ),
+        (
+            "a request on a stale document waits for its analysis",
+            test_a_request_on_a_stale_document_waits_for_its_analysis
+        ),
+        (
+            "a root that does not check has no definitions or references",
+            test_a_root_that_does_not_check_has_no_definitions_or_references
+        ),
+        ("a request without a position gets null", test_a_request_without_a_position_gets_null),
+        (
+            "closing a document while its request waits answers null",
+            test_closing_a_document_while_its_request_waits_answers_null
+        ),
+        (
+            "a library file the client opens gets only lexer tokens",
+            test_a_library_file_the_client_opens_gets_only_lexer_tokens
         )
     ]
 }

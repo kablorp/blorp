@@ -59,8 +59,10 @@ done.
     the `blorp lsp` server core: the command, transport, lifecycle, UTF-8
     and UTF-16 positions, open documents and diagnostics (`src/lsp/`). Then
     9b: semantic tokens, with staleness, analysis on demand and watched
-    files.
-  - **Next:** 9c, definition and references; then the CLion plugin.
+    files. Then 9c: definition and references, with the library written to
+    a temporary folder as a view.
+  - **Next:** landing 10, the CLion plugin (`editor/intellij/`, built and
+    reviewed on its branch), which lands after Keith runs its checklist.
 - **String code points:** [`STRING_PLAN.md`](STRING_PLAN.md).
   - **Status:** approved on 2026-11-10: `length` counts code points, from a
     count stored in each String, and byte work uses `byte_*` functions. L1

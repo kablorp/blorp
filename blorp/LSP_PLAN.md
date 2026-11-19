@@ -1,7 +1,7 @@
 # Language server: `blorp lsp`
 
 **Status: plan, 2026-11-10; Keith settled its decisions and asked for a byte
-console on 2026-11-11. Landings 1–8, 9a and 9b have landed; 9c is next.**
+console on 2026-11-11. Landings 1–8 and 9a–9c have landed; 10 is next.**
 
 ## Problem
 
@@ -204,10 +204,10 @@ shows the latest analysis's. Library files are never published; URIs are
 percent-encoded.
 
 **The library on disk.** The server runs inside
-`fs.with_temporary_directory("/tmp", "blorp-lsp-", …)`, writes each module
-in the generated `EMBEDDED_LIBRARY_PATHS` there, and analyses with
-`LibraryDirectory(folder)`, so library spans carry real paths. `/tmp` is a
-named constant; every supported platform is POSIX.
+`fs.with_temporary_directory("/tmp", "blorp-lsp-", …)` and writes each module
+in `EMBEDDED_LIBRARY_PATHS` there as a view: analyses read the embedded
+library, and library locations map to the view, so an edit there is never
+read. `/tmp` is a named constant.
 
 **Semantic tokens.** Keywords, comments, strings, numbers and operators
 come from the lexer. Identifier tokens take their type and modifiers from
@@ -533,14 +533,12 @@ the other's `length` and `slice` uses.
 
 ## Risks and unknowns
 
-- **Recording cost:** every compile pays it, measured in landing 5.
 - **Do semantic tokens alone colour a file in CLion?** The plugin landing
   probes it first with a stub server, with `null` and error replies too.
 - **Latency.** Analysing `blorp/src/main.brp` may be slow.
 
 ## Dependencies
 
-- Landing 9's pure modules follow landings 1, 3 and 5; its transport, 8.
 - Landing 11 follows 10.
 
 ## Release strategy
@@ -579,6 +577,7 @@ lines counted apart. Compile cost must also fit the e2e instruction ceilings'
 | 8 console functions, fixed input | ≤ +0.1% | ≤ +0.01% | ≤ +0.1% | ≤ +170 net |
 | 9a server core, fixed input | ≤ +0.1% | ≤ +0.01% | ≤ +0.1% | ≤ +1,350 net |
 | 9b semantic tokens, fixed input | ≤ +0.1% | ≤ +0.01% | ≤ +0.1% | ≤ +780 net |
+| 9c navigation, fixed input | ≤ +0.1% | ≤ +0.01% | ≤ +0.1% | ≤ +470 net |
 | 11 broken files | ≤ +0.5% (more source to compile) | ≤ +0.5% | ≤ +0.5% | ≤ +300 |
 
 **Latency.** Per request after one change, on this host: ≤ 1.0 s for
@@ -1058,6 +1057,86 @@ With `main.brp` open (open, tokens, change, tokens, exit), peak heap is
     a mutation of it would tell.
   - Closing a document while its token request waits answers `null`, as
     `analysed` promises, but no test pins it.
+
+**Landing 9c** (against `15879f95f`). `self-compile-cost`, `-O2`, 3 rounds:
+
+| Measure | Base | Candidate | Change |
+| --- | ---: | ---: | ---: |
+| Fixed input, allocations | 15,464,958 | 15,464,958 | unchanged |
+| Fixed input, instructions (median) | 13,875,056,592 | 13,873,312,915 | −0.013% |
+| Fixed input, peak heap (requested bytes) | 180,477,630 | 180,477,630 | unchanged |
+| Own source, allocations | 15,464,958 | 15,645,094 | +1.16% |
+| Own source, instructions (median) | 13,882,456,578 | 14,033,281,207 | +1.09% |
+| Own source, peak heap (requested bytes) | 180,477,629 | 181,231,736 | +0.42% |
+| Lines, production and tests | | | +468 and +1,110 net |
+
+Latency after one `didChange`, an `-O2` build, a fresh server per run,
+measured at `c0fe10f7b` (the last round changed no request path):
+
+| Input | Request | Median | Range | Runs |
+| --- | --- | ---: | ---: | ---: |
+| `blorp/src/main.brp` | definition | 343 ms | 341–347 ms | 7 |
+| `blorp/src/main.brp` | references | 345 ms | 343–353 ms | 7 |
+| `blorp/src/main.brp` | references on `Result`, 1,521 locations | 363 ms | 361–365 ms | 5 |
+| One module | definition | 3.4 ms | 3.4–3.6 ms | 9 |
+| One module | references | 3.5 ms | 3.5–3.6 ms | 9 |
+
+Writing the library at start costs less than the noise: a whole process
+life took 12.6 ms against 12.8 ms before (101 runs).
+
+- **Ceiling.** A compiled spike measured +392 (`59f98e888`); the
+  coordinator set ≤ +450 from it, then raised it to ≤ +470 under the standing
+  delegation for Keith's fold-in below, which added the view layout and the
+  loader's two path accessors.
+- **The library as a view (Keith, 2026-11-18).** Review found that analysing
+  `LibraryDirectory(folder)` let an editor's save change the library for the
+  rest of a session, and `io/files` cannot make a file read-only. Keith
+  rejected a permissions API (several landings, consumers still
+  speculative, and an IDE can clear a read-only flag) and chose this:
+  analyses read the embedded library, the folder is written only to be
+  shown, and the loader's `library_relative_path` and `library_path` place a
+  library span's file in it. `ServedLibrary` holds the analysed layout and
+  the view's.
+- **Identity.** The fixed-input C is identical (`99d63a84584d0498`).
+- **Design.**
+  - Definition answers the declaration of the use or declaration at the
+    position (an identifier's end counts), or `null`; a built-in type has
+    none.
+  - References group by declaration span within the root's one analysis
+    (across analyses, path and range must be compared); `includeDeclaration`
+    adds the declaration; a built-in type lists every use.
+  - A request on a stale document waits for its analysis as a
+    `WaitingRequest`, and closing the document first answers `null`.
+  - Locations use the client's URI for an open file, else `file_uri`, and a
+    library file's place in the view.
+  - A library file the client opens is classified by the view's
+    `module_role` and gets lexer tokens, `null` and `[]`: as a root it would
+    be a user module that the library's own imports reject.
+  - The folder is removed on every path the program controls; failing to
+    make, fill or remove it exits 3, an impossible embedded-library mismatch
+    exits 4.
+- **Tests.** Definition and references for every referent kind, the view
+  classification, the library-diagnostic location, and an e2e session that
+  overwrites the view's copy of `io/console/output.brp` mid-session and gets
+  identical replies. That one runs through a small `sh` driver over a FIFO,
+  since `capture` sends stdin whole; it only orchestrates, and the review
+  found it needs no approval. Each mutation, run alone, failed its tests;
+  analysing the folder again fails the view test.
+- **9b's follow-ups.** The span is gone from the identifier map. A trait
+  default's body is unreachable as a referent (calls record the trait
+  method), so its arm stays for exhaustiveness. Closing a document while its
+  request waits is tested.
+- **Found, not fixed.**
+  - Navigating onward from a library file needs the loader to keep a library
+    root's role, or a new mechanism; Keith's call.
+  - References on an implementation method's own name return only it,
+    because calls record the trait method.
+  - `/tmp` is a symlink on macOS: a client that opens a view file as
+    `/private/tmp/…` makes it a user file; the plugin checklist checks what
+    CLion sends.
+  - Cleaners of `/tmp` may delete view files during a session lasting days.
+  - The process API has no streaming stdin, which is why the view test
+    needs its driver.
 
 ## Testing
 

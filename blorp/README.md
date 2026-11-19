@@ -1369,11 +1369,20 @@ editor offers them and UTF-16 units otherwise, and LF, CRLF and a lone CR each
 end a line. The editor sends each open file's whole text with every change.
 
 Each open file is the root of its own program: the file, the modules it
-imports and the standard library built into blorp. A file is analysed when it
-is opened, with the other open files' unsaved text in place of their saved
-text. Edits are not analysed as they are typed. Editing, opening or closing a
-file makes every program that read it stale, and a stale program is analysed
-again at its file's next request, so a burst of edits costs one analysis.
+imports and the standard library built into blorp, which every analysis reads,
+as `blorp compile` does. Before it reads a message, the server writes a copy of
+that library to a new folder in `/tmp`, named `blorp-lsp-` and six characters,
+so that a library declaration is a file the editor can open. The folder is a
+view: nothing loads from it, so edits there are never read, and they disappear
+when the server ends, which removes the folder. A signal that kills the server
+leaves the folder behind.
+If the folder cannot be made, filled or removed, or the working directory
+cannot be read, the server says so on standard error and ends with status 3.
+A file is analysed when it is opened, with the other open files' unsaved text
+in place of their saved text. Edits are not analysed as they are typed.
+Editing, opening or closing a file makes every program that read it stale,
+and a stale program is analysed again at its file's next request, so a burst
+of edits costs one analysis.
 When the editor can report files changed on disk, the server asks it to for
 `**/*.brp`; such a change stales the programs that read the file, unless the
 file is open, since its open text wins. A program that failed to load is
@@ -1383,11 +1392,29 @@ request, which editors make as they colour the file. A file that several open
 programs report in shows the diagnostics of the one analysed last; when that
 program stops reporting there, or its file is closed, the file shows what the
 others last reported. An error inside the standard library is shown at the
-start of the open file, with its library location. Modules that import the
-open file are not part of its program, so their errors show only when they are
-opened themselves.
+start of the open file, with its location in the server's folder. Modules
+that import the open file are not part of its program, so their errors show
+only when they are opened themselves.
 The server ends with status 0 after `shutdown` then `exit`, and 1 for an
 `exit` without `shutdown` or input that ends without `exit`.
+
+`textDocument/definition` answers with where the name at the position is
+declared, a position at a name's end counting as inside it: a local, a
+parameter, a field, a variant, a type, a function, a trait's method, or the
+start of the module an alias names. On a declaration's own name it answers
+that declaration, and on a type built into the language, such as `Int`, it
+answers `null`. A call of a trait's method, its default or an
+implementation's, goes to the trait's method. A library declaration is in the
+server's folder. `textDocument/references` lists every use of the name at the
+position, and its declaration too when the editor asks; it groups the uses of
+an implementation's type parameter across the implementation's methods, and
+lists every use of a built-in type. Both cover only the open file's program,
+so uses in a module that imports the file are not found, nor are uses in
+library code the program does not call, which is not checked. While a file's
+program fails to load or check, a definition is `null` and references are
+`[]`. A library file the editor opens, after a definition led there, is not
+the root of a program: it gets the lexer's tokens and no diagnostics, no
+definitions and no references.
 
 The server colours a file through `textDocument/semanticTokens/full`, with
 only the protocol's standard token types and modifiers. Keywords, comments,
@@ -1458,10 +1485,14 @@ messages and converts JSON-RPC to and from `Json`, `positions.brp` converts
 byte offsets to and from protocol positions, and `tokens.brp` classifies and
 encodes semantic tokens: it lexes the open text again and takes each name's
 type from the analysis's name uses and declarations. `server.brp` is pure: it
-keeps the open documents and answers one message at a time, and when a
-document needs analysing it asks the transport, `lsp_command.brp`, which loads
-that root with the open documents as snapshots, runs `analyze` and hands the
-files read and the analysis or its diagnostics back as data.
+keeps the open documents and answers one message at a time, joining a name's
+use to its declaration for definitions and references, and when a document
+needs analysing it asks the transport, `lsp_command.brp`. The transport writes
+a copy of the embedded library to its folder at start, and for each request
+loads that root with the open documents as snapshots and the embedded library,
+runs `analyze` and hands the files read and the analysis or its diagnostics
+back as data. The server places library locations in the folder by the
+loader's `library_relative_path`.
 
 The output is replaced atomically, as by
 [`write_text`](standard_library/README.md#the-file-modules): a symlinked output
