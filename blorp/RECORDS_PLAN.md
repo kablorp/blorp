@@ -6,9 +6,10 @@ and raw samples are in the main checkout's ignored
 `build/pilots/2026-11-12/records-by-value/`.
 
 **Status:** approved by Keith on 2026-11-16 (decisions below) and landed in
-this change, after recursive unions and deep release. No seed rotation: the
-pinned seed builds it, and the compiler's own binary stores its records by
-value once a later seed carries it.
+this change, after recursive unions and deep release. No seed rotation was
+needed, because the pinned seed builds it. The compiler's own binary has
+stored its records by value since the pin moved to `blorp-seed-7564157d33bf`
+on 2026-11-18 (`AUDIT_CLEANUP_PLAN.md`, change 6).
 
 ## Problem
 

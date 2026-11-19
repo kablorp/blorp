@@ -125,3 +125,63 @@ on the replayed `9cd738b8f`, with no ceiling exceeded, in 656 s. That commit
 differs from the landing commit only in this file. The log is the main
 checkout's `build/audit-2026-11-17/gate-replayed.log`. Branch CI on it ran as
 run `44245283147`.
+
+## The larger findings
+
+On 2026-11-18 Keith chose "Rotate seed, then specialize" from the larger
+findings.
+
+6. **Rotate the seed.** The pinned seed, `blorp-seed-4fee244ad96f`, predated
+   records by value (`e4e2eb735`). Until a seed carries it, the compiler's own
+   records are heap cells, every record update allocates, and every cost
+   above was measured that way. The new pin is `blorp-seed-7564157d33bf`.
+   Measured with `self-compile-cost 15879f95f 4d9fe3796 --rounds 7`, where
+   each side is built by its own pinned seed, the fixed input changed as
+   follows:
+   - allocations fell 17.8%, from 15,464,958 to 12,716,424;
+   - the median instructions fell 7.6%, from 13.92 G to 12.86 G;
+   - peak heap rose 1.1%;
+   - the C was identical.
+
+   The records plan predicted −17.5% and −6.7% at stage 2.
+
+   **The e2e ceilings.** The e2e instruction ceilings measure the `-O0` test
+   compiler. At `-O0`, a record held by value is copied struct by struct, so a
+   small compile got slower:
+   - instructions rose 34%, from 386 M to 519 M;
+   - cycles rose 22%.
+
+   At `-O2` the same compile got faster: instructions fell 9% and cycles fell
+   8%. On the rotation alone, 32 e2e cases exceeded their ceilings, and the
+   gate rose from 656 s to 713 s.
+
+   Keith chose to rotate and reset the ceilings, by the rule of `72d65fd7a`:
+   every e2e instruction ceiling became the largest of three readings plus
+   15%, rounded up.
+   - **Readings:** three serial `make -C blorp test-e2e INSTRUCTION_CHECK=on`
+     runs on the rotation, at load 2.6. A temporary harness patch printed
+     each compile's ceiling and its reading. The runs differed by at most
+     0.86%.
+   - **Result:** of the 659 ceilings, 566 fell and 93 rose. The rises were at
+     most +50%, in the recent console and data cases, which had little slack.
+     The median change was −3.9%, and the sum of all ceilings fell 1.7%.
+   - **Allocation ceilings** are unchanged.
+
+   Building the test compiler at `-O1` was measured and not taken. A small
+   compile was about 4× cheaper, but each link took 24 s instead of 4 s, and
+   the gate took 676 s. The readings, the rewrite script and its table are
+   under `build/audit-2026-11-17/ceilings/`.
+7. **Specialize's translation context.** The 32 `translate_*` functions pass
+   the same six values (`opaques`, `substitution`, `callables`, `keys`,
+   `unions`, `records`). 309 lines are nothing but one of them as a bare
+   argument. `translate_function` fixes all six once per function, so one
+   record built there replaces them.
+
+**Ceilings for 7.** Set before implementation, and measured against the
+rotated base with the same method as above:
+
+- The fixed-input C is identical.
+- Allocations may rise by at most 0.1%, as may peak heap by 1%. The median
+  instructions may rise by at most 0.5%.
+- Production lines go down by at least 250; this is a growth-audit trigger.
+  Test lines do not change.
