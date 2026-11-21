@@ -578,6 +578,7 @@ lines counted apart. Compile cost must also fit the e2e instruction ceilings'
 | 9a server core, fixed input | ≤ +0.1% | ≤ +0.01% | ≤ +0.1% | ≤ +1,350 net |
 | 9b semantic tokens, fixed input | ≤ +0.1% | ≤ +0.01% | ≤ +0.1% | ≤ +780 net |
 | 9c navigation, fixed input | ≤ +0.1% | ≤ +0.01% | ≤ +0.1% | ≤ +470 net |
+| 10 the CLion plugin | not compiled | not compiled | not compiled | ≤ 580 Kotlin and XML |
 | 11 broken files | ≤ +0.5% (more source to compile) | ≤ +0.5% | ≤ +0.5% | ≤ +300 |
 
 **Latency.** Per request after one change, on this host: ≤ 1.0 s for
@@ -1168,13 +1169,14 @@ plugin's executable) found three server defects.
   client sets `workspace.semanticTokens.refreshSupport` (CLion does), the
   server sends one `workspace/semanticTokens/refresh`; the client re-asks for
   visible files' tokens, which re-analyses them.
-- **Cmd-click did nothing; Cmd-B worked.** CLion asks for a definition on
-  every Cmd-hover move, and the server answered each with a `Location`.
-  CLion's `LspImplicitReferenceProvider` turns a result without an
+- **Cmd-hover underlined nothing.** CLion asks for a definition on every
+  Cmd-hover move, and the server answered each with a `Location`. CLion's
+  `LspImplicitReferenceProvider` turns a result without an
   `originSelectionRange` into an empty range at the mouse, which Cmd-hover
-  cannot underline or click. With `textDocument.definition.linkSupport` (CLion
-  sets it), definition now answers a one-element `LocationLink[]` whose origin
-  is the name under the position.
+  cannot underline. With `textDocument.definition.linkSupport` (CLion sets
+  it), definition now answers a one-element `LocationLink[]` whose origin is
+  the name under the position. This was taken for the cause of Cmd-click
+  failing; landing 10 found the real one.
 - **Ceiling.** A sketch estimate of +80, raised to +120 when links joined, then
   corrected to +150 and +165 under the standing delegation: the audit found
   the shutdown state, refresh and links about 25, 55 and 45 lines, with
@@ -1188,6 +1190,62 @@ plugin's executable) found three server defects.
   notification, with the next id, and the client's answer is ignored; a link's
   origin is exactly the name, its end included, and the answer is an array.
   Each mutation, run alone, failed its tests.
+
+**Landing 10, the CLion plugin** (`editor/intellij/`, against `c0d78722d`).
+A Gradle Kotlin project built against the installed CLion 2026.3
+(`-PclionPath`, with CLion's JBR as `JAVA_HOME`). It registers `.brp` with an
+icon, a lexer and flat parser, the LSP integration provider, a declaration
+handler and one setting, the `blorp` path. A changed path restarts the
+server, and a path that cannot start shows a balloon.
+
+- **What CLion needed beyond the brief**, read from CLion's class files and
+  confirmed in Keith's runs:
+  - `LspSemanticTokensSupport.shouldAskServerForSemanticTokens` asks only
+    for the language ids `TEXT` and `textmate`, so a plugin with its own
+    language overrides it, or nothing is coloured.
+  - The bundled schemes colour neither `DEFAULT_PARAMETER` nor
+    `DEFAULT_CLASS_NAME`, so a parameter and its type looked the same. Tokens
+    map to keys the schemes do colour (the plugin README's table). Keith
+    wanted no colour settings page.
+  - New Scratch File lists a language only with a `ParserDefinition`. Its
+    word-sized leaves are what Go to Declaration underlines and lands on, and
+    quoted strings split at their `${…}` holes so a name in a hole is a leaf.
+- **Cmd-click.** CLion's `LspImplicitReferenceProvider` answers Go to
+  Declaration only while the running action id is `GotoDeclaration`, or
+  during Cmd-hover. CLion's C/C++ engine runs Cmd-B and Cmd-click inside
+  `RiderActionUpdateInterceptor$RiderBackendCompositeAction`, so both
+  reported "Cannot find declaration to go to" while the server answered every
+  request in about 1 ms, and Navigate > Declaration or Usages worked. A probe
+  build that logged each action and reference request in a `.brp` file found
+  it: all 15 shortcut attempts got no reference. CLion asks declaration
+  handlers whatever the action, so `BlorpGotoDeclarationHandler` sends the
+  definition request itself through the public `LspClient` API. Keith
+  confirmed Cmd-click and Cmd-B on 2026-11-21.
+- **Tests.** 41 Gradle tests: launch paths and problems; the lexer, with
+  holes and a restart inside one; the PSI; semantic tokens; definition
+  targets; and one test that runs the repository's `blorp/build/blorp`. In
+  it, under the C/C++ engine's action id, Go to Declaration reaches `helper`'s
+  declaration and `print` in the library folder; with no server the handler
+  gives no target; on a declaration the menu lists usages. Unregistering the
+  handler fails that test, and a lexer that drops its state fails the restart
+  test.
+- **Review.** 0 blockers, 2 majors, 4 minors, 2 nits. The handler's wait
+  matches CLion's own definition request (10 s, giving way to cancellation),
+  now said in the code; holes are lexed as code; a bare name missing from
+  PATH gets the balloon; `.brp` matching already ignored case, as the
+  platform's extension matching does. The visibility and settings-state nits
+  were declined.
+- **Ceiling.** The brief's sketch set Kotlin and XML under 350; corrected to
+  580 under the standing delegation. Launcher, path, settings and settings
+  page 179; language, file type and `plugin.xml` 58; lexer and parser 203;
+  semantic tokens 49; launch balloon 22; declaration handler 68. Each piece
+  answers a CLion requirement above or a fix Keith asked for. Tests are 516
+  lines.
+- **Known limits.** On a declaration's own name, Cmd-B and Cmd-click find
+  nothing instead of listing usages, since listing them is the LSP support's
+  job, which the wrapper blocks; reporting the wrapper to JetBrains is
+  Keith's call. Cmd-click finds nothing until the server has started. No CI
+  builds or tests the plugin.
 
 ## Testing
 
@@ -1205,7 +1263,7 @@ Each landing starts with a failing test.
 | 9a | `test/test_lsp/`: framing; a body that is not UTF-8; positions for `é`, an astral emoji and `\r`; lifecycle errors; a shared file's diagnostics; each message through `receive`. An e2e session in `cli.brp` runs `initialize` through `exit` and checks replies, a diagnostic and the status. |
 | 9b | Token splitting; a broken file's lexer tokens; staleness after a new import, a late open, a shared file's edit and a close. |
 | 9c | Each request through `receive`. |
-| 10 | A manual checklist in the plugin's README. |
+| 10 | Gradle tests in `editor/intellij/`, one running the repository's server, and the manual checklist in the plugin's README. |
 | 11 | `test/test_lsp/`: edit windows, with positions before, inside and after one, and two distant edits. |
 
 **Commands:** those in `blorp/AGENTS.md`, `scripts/blorp-fixpoint --prove`

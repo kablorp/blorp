@@ -65,8 +65,11 @@ done.
     library folder at `shutdown`, asks the client to refresh an importer's
     tokens, and answers definition with `LocationLink`s, which CLion's Cmd-click
     needs.
-  - **Next:** landing 10, the CLion plugin (`editor/intellij/`, built and
-    reviewed on its branch), which lands after Keith reruns its checklist.
+  - **Landed:** landing 10, the CLion plugin (`editor/intellij/`): colours,
+    diagnostics, Cmd-click and Cmd-B into the library, Find Usages and
+    scratch files. It asks the server for Go to Declaration itself, because
+    CLion's C/C++ engine hides those shortcuts from its LSP support.
+  - **Next:** landing 11, broken files served from the last good analysis.
 - **String code points:** [`STRING_PLAN.md`](STRING_PLAN.md).
   - **Status:** approved on 2026-11-10: `length` counts code points, from a
     count stored in each String, and byte work uses `byte_*` functions. L1
