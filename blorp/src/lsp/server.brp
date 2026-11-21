@@ -166,6 +166,12 @@ private record Session {
     -- can report them, and `initialized`, after which the server may ask, has
     -- not come yet.
     registers_watchers: Bool,
+    -- Whether the client accepts `workspace/semanticTokens/refresh`, which asks
+    -- it for the tokens of its visible files again.
+    refreshes_tokens: Bool,
+    -- Whether the client takes `LocationLink`s for definitions, which carry the
+    -- range of the name asked about, so that it can underline and click it.
+    links_definitions: Bool,
     -- How many requests the server has sent; each takes the next number as
     -- its id.
     requests_sent: Int
@@ -177,6 +183,10 @@ private union Lifecycle:
     -- than `exit` are dropped. The session starts with the library it serves.
     AwaitingInitialize(ServedLibrary)
     Serving(Session)
+    -- `shutdown` has arrived. Its reply, which the request's id names, is held
+    -- until the transport has removed the library's folder, so that an editor
+    -- that ends the server right after the reply finds the folder gone.
+    LeavingLibrary(RequestId)
     -- After `shutdown`, requests get -32600 and `exit` ends with status 0.
     ShutDown
     -- `exit` has arrived; the process ends with this status.
@@ -246,7 +256,22 @@ pure func start_server(library: ServedLibrary) -> Server:
 pure func exit_status(server: Server) -> Option[Int]:
     match from_opaque Server(server):
         Exited(status): Some(status)
-        AwaitingInitialize(_) | Serving(_) | ShutDown: None
+        AwaitingInitialize(_) | Serving(_) | LeavingLibrary(_) | ShutDown: None
+
+
+-- The reply to `shutdown`, held until `library_left`: Some while the server is
+-- waiting for the transport to remove the library's folder.
+pure func shutdown_reply(server: Server) -> Option[Json]:
+    match from_opaque Server(server):
+        LeavingLibrary(id): Some(response(id, Null))
+        AwaitingInitialize(_) | Serving(_) | ShutDown | Exited(_): None
+
+
+-- The transport has removed the library's folder, and writes the reply held.
+pure func library_left(server: Server) -> Server:
+    match from_opaque Server(server):
+        LeavingLibrary(_): into_opaque Server(ShutDown)
+        AwaitingInitialize(_) | Serving(_) | ShutDown | Exited(_): server
 
 
 -- The open documents, which an analysis reads instead of the disk.
@@ -261,7 +286,7 @@ pure func snapshots(server: Server) -> List[SourceFile]:
                         contents = document[1].text
                     }
                 )
-        AwaitingInitialize(_) | ShutDown | Exited(_):
+        AwaitingInitialize(_) | LeavingLibrary(_) | ShutDown | Exited(_):
             []
 
 
@@ -309,6 +334,8 @@ pure func receive(server: Server, message: Json) -> Step:
                     library_documents = {},
                     roots = {},
                     registers_watchers = call.params.watches_files(),
+                    refreshes_tokens = call.params.refreshes_tokens(),
+                    links_definitions = call.params.links_definitions(),
                     requests_sent = 0
                 }
                 replying(Serving(session), [response(id, initialize_result(encoding))])
@@ -320,14 +347,14 @@ pure func receive(server: Server, message: Json) -> Step:
                         "the server has not been initialized"
                     )
                 ])
-        (ShutDown, Request(id, _)):
+        (LeavingLibrary(_) | ShutDown, Request(id, _)):
             lifecycle.replying([
                 error_response(Some(id), InvalidRequest, "the server has shut down")
             ])
         (Serving(session), Request(id, call)):
             match call.method:
                 "shutdown":
-                    replying(ShutDown, [response(id, Null)])
+                    replying(LeavingLibrary(id), [])
                 "textDocument/semanticTokens/full":
                     session.document_requested(id, call.params, Some(TokensQuery))
                 "textDocument/definition":
@@ -370,7 +397,7 @@ pure func receive(server: Server, message: Json) -> Step:
                     lifecycle.replying([
                         error_response(Some(id), MethodNotFound, "unknown method `${call.method}`")
                     ])
-        (ShutDown, Notification(call)):
+        (LeavingLibrary(_) | ShutDown, Notification(call)):
             if call.method == "exit":
                 replying(Exited(EXIT_AFTER_SHUTDOWN), [])
             else:
@@ -417,6 +444,32 @@ private pure func watches_files(params: Option[Json]) -> Bool:
             .field("workspace")
             .field("didChangeWatchedFiles")
             .field("dynamicRegistration")
+    ):
+        Some(Boolean(True)): True
+        _: False
+
+
+-- Whether the client can be asked to refresh the tokens it holds.
+private pure func refreshes_tokens(params: Option[Json]) -> Bool:
+    match (
+        params
+            .field("capabilities")
+            .field("workspace")
+            .field("semanticTokens")
+            .field("refreshSupport")
+    ):
+        Some(Boolean(True)): True
+        _: False
+
+
+-- Whether the client takes a `LocationLink` as the answer to a definition.
+private pure func links_definitions(params: Option[Json]) -> Bool:
+    match (
+        params
+            .field("capabilities")
+            .field("textDocument")
+            .field("definition")
+            .field("linkSupport")
     ):
         Some(Boolean(True)): True
         _: False
@@ -473,6 +526,47 @@ private pure func staled(roots: Dict[Path, AnalysedRoot], path: Path) -> Dict[Pa
     marked
 
 
+-- Whether some root is current in `earlier` and stale in `later`: a change
+-- has staled a program whose tokens the client holds. A root the change
+-- itself edits is not in `earlier`, since the client asks for its tokens
+-- anyway.
+private pure func went_stale(
+    earlier: Dict[Path, AnalysedRoot],
+    later: Dict[Path, AnalysedRoot]
+) -> Bool:
+    later
+        .entries()
+        .any(pure func(row: (Path, AnalysedRoot)) -> Bool:
+            match (
+                row[1].analysis,
+                earlier
+                    .get(row[0])
+                    .map(pure func(before: AnalysedRoot) -> RootAnalysis: before.analysis)
+            ):
+                (Stale, Some(Current(_))): True
+                _: False
+        )
+
+
+-- Replies to a change that left the roots in `session`, and asks the client to
+-- refresh its tokens when `went_stale` from `earlier` and it can, once however
+-- many roots went stale. The client answers a request it is sent, and the
+-- server ignores the answer.
+private pure func replying_with_refresh(
+    session: Session,
+    earlier: Dict[Path, AnalysedRoot],
+    replies: List[Json]
+) -> Step:
+    if and(session.refreshes_tokens, went_stale(earlier, session.roots)):
+        id = session.requests_sent + 1
+        replying(
+            Serving({ session | requests_sent = id }),
+            replies.append(request(NumberId(id), REFRESH_METHOD, None))
+        )
+    else:
+        replying(Serving(session), replies)
+
+
 -- The `position` a request's params give, or None for one that is missing or
 -- not two integers.
 private pure func requested_position(params: Option[Json]) -> Option[Position]:
@@ -509,25 +603,32 @@ private pure func answer(
                         session.encoding
                     )
                 DefinitionQuery(at):
-                    declared: List[Span] = match analysis.referent_at(offset(at)):
-                        Some(referent):
-                            match analysis.declaration_span(referent):
+                    named = analysis.name_at(offset(at))
+                    declared: List[Span] = match named:
+                        Some(name):
+                            match analysis.declaration_span(name.referent):
                                 Some(span): [span]
                                 None: []
                         None:
                             []
+                    origin: Option[Json] = match (named, session.links_definitions):
+                        (Some(name), True):
+                            Some(line_index(open.text).range_json(name.span, session.encoding))
+                        _:
+                            None
                     -- A built-in type is declared nowhere. A declaration has one
                     -- location, which `locations` leaves out only for a defect.
-                    match session.locations(result.sources, declared):
+                    match session.locations(result.sources, declared, origin):
                         [location]: location
                         _: Null
                 ReferencesQuery(asked):
-                    match analysis.referent_at(offset(asked.position)):
-                        Some(referent):
+                    match analysis.name_at(offset(asked.position)):
+                        Some(name):
                             Array(
                                 session.locations(
                                     result.sources,
-                                    analysis.references(referent, asked.includes_declaration)
+                                    analysis.references(name.referent, asked.includes_declaration),
+                                    None
                                 )
                             )
                         None:
@@ -559,21 +660,30 @@ private pure func tokens_json(
     Object({ "data" => Array(data.map(pure func(value: Int) -> Json: Number(integer(value)))) })
 
 
--- The referent named at `offset` of the root: the declaration written there,
--- or else the use. A position at a name's end counts as inside it.
-private pure func referent_at(analysis: Analysis, offset: Int) -> Option[Referent]:
+-- A name written in the root: what it refers to, and where it is written.
+private record NameAt {
+    referent: Referent,
+    span: Span
+}
+
+
+-- The name at `offset` of the root: the declaration written there, or else the
+-- use. A position at a name's end counts as inside it.
+private pure func name_at(analysis: Analysis, offset: Int) -> Option[NameAt]:
     root = module_source(root_module_id())
     covers = pure func(span: Span) -> Bool: and(
         span.source == root,
         and(span.start <= offset, offset <= span.end)
     )
-    declared = analysis
-        .declarations()
-        .find(pure func(referent: Referent) -> Bool:
+    var declared: Option[NameAt] = None
+    for referent in analysis.declarations():
+        if declared.is_none():
             match analysis.declaration_span(referent):
-                Some(span): covers(span)
-                None: False
-        )
+                Some(span):
+                    if covers(span):
+                        declared = Some({ referent = referent, span = span })
+                None:
+                    void
     match declared:
         Some(_):
             declared
@@ -581,7 +691,9 @@ private pure func referent_at(analysis: Analysis, offset: Int) -> Option[Referen
             analysis
                 .name_uses()
                 .find(pure func(use: NameUse) -> Bool: covers(use.span))
-                .map(pure func(use: NameUse) -> Referent: use.referent)
+                .map(
+                    pure func(use: NameUse) -> NameAt: { referent = use.referent, span = use.span }
+                )
 
 
 -- The spans of every use of `referent`: the uses of every referent declared
@@ -645,7 +757,8 @@ private pure func span_file(
             None
 
 
--- The protocol Locations of `spans`: the client's URI for an open document and
+-- The protocol Locations of `spans`, or LocationLinks from `origin` (the range
+-- of the name asked about) when it is given: the client's URI for an open document and
 -- the server's encoding of its path otherwise, with each file's lines indexed
 -- once. Every span comes from the analysis that read `sources`, so a span in
 -- no file it read is a defect in the analysis, not an expected case: its
@@ -653,7 +766,8 @@ private pure func span_file(
 private pure func locations(
     session: Session,
     sources: SourceInputs,
-    spans: List[Span]
+    spans: List[Span],
+    origin: Option[Json]
 ) -> List[Json]:
     var indexes: Dict[Path, LineIndex] = {}
     var found: List[Json] = []
@@ -667,11 +781,20 @@ private pure func locations(
                 uri = match session.documents.get(path):
                     Some(open): open.uri
                     None: path.file_uri()
-                found = found.append(
-                    Object(
-                        { "uri" => Text(uri), "range" => index.range_json(span, session.encoding) }
-                    )
-                )
+                range = index.range_json(span, session.encoding)
+                location: Json = match origin:
+                    Some(selected):
+                        Object(
+                            {
+                                "originSelectionRange" => selected,
+                                "targetUri" => Text(uri),
+                                "targetRange" => range,
+                                "targetSelectionRange" => range
+                            }
+                        )
+                    None:
+                        Object({ "uri" => Text(uri), "range" => range })
+                found = found.append(location)
             None:
                 void
     found
@@ -724,8 +847,10 @@ private pure func document_requested(
 -- Notifications the server does not serve, `$/cancelRequest` among them, are
 -- dropped, as are those about documents that are not `file://` URIs or are
 -- not open. Only `didOpen` analyses; a change, a close or a change on disk
--- stales the roots it affects, which analyse again at their next request. A
--- file in the library folder is kept only for its tokens.
+-- stales the roots it affects, which analyse again at their next request, and
+-- when that stales a root other than the edited document's own the client is
+-- asked to refresh its tokens. A file in the library folder is kept only for
+-- its tokens.
 private pure func notified(session: Session, call: Call) -> Step:
     document = call.params.field("textDocument")
     uri = document.text_field("uri")
@@ -758,20 +883,18 @@ private pure func notified(session: Session, call: Call) -> Step:
                                 []
                             )
                         UserModule:
-                            opened: Lifecycle = Serving(
-                                { session |
-                                    documents = session.documents.set(path, {
-                                        uri = written,
-                                        text = text
-                                    }),
-                                    roots = session.roots.staled(path)
-                                }
-                            )
-                            {
-                                server = into_opaque Server(opened),
-                                replies = [],
-                                analyse = Some({ root = path, answering = None })
+                            opened = { session |
+                                documents = session.documents.set(path, {
+                                    uri = written,
+                                    text = text
+                                }),
+                                roots = session.roots.staled(path)
                             }
+                            refreshing = opened.replying_with_refresh(
+                                session.roots.remove(path),
+                                []
+                            )
+                            { refreshing | analyse = Some({ root = path, answering = None }) }
                 _:
                     replying(Serving(session), [])
         ("textDocument/didChange", Some(path)):
@@ -785,15 +908,10 @@ private pure func notified(session: Session, call: Call) -> Step:
                     None
             match (session.documents.get(path), session.library_documents.contains(path), changed):
                 (Some(open), _, Some(text)):
-                    replying(
-                        Serving(
-                            { session |
-                                documents = session.documents.set(path, { open | text = text }),
-                                roots = session.roots.staled(path)
-                            }
-                        ),
-                        []
-                    )
+                    { session |
+                        documents = session.documents.set(path, { open | text = text }),
+                        roots = session.roots.staled(path)
+                    }.replying_with_refresh(session.roots.remove(path), [])
                 (None, True, Some(text)):
                     replying(
                         Serving(
@@ -818,6 +936,8 @@ private pure func notified(session: Session, call: Call) -> Step:
         (_, _):
             replying(Serving(session), [])
 
+
+private REFRESH_METHOD: String = "workspace/semanticTokens/refresh"
 
 -- The files the server watches: every Blorp source, wherever it is.
 private WATCHED_FILES: String = "**/*.brp"
@@ -845,7 +965,7 @@ private pure func registered(session: Session) -> Step:
             request(
                 NumberId(id),
                 "client/registerCapability",
-                Object({ "registrations" => Array([registration]) })
+                Some(Object({ "registrations" => Array([registration]) }))
             )
         ])
     else:
@@ -872,7 +992,7 @@ private pure func watched(session: Session, params: Option[Json]) -> Step:
                         void
         _:
             void
-    replying(Serving({ session | roots = roots }), [])
+    { session | roots = roots }.replying_with_refresh(session.roots, [])
 
 
 private pure func diagnostics_notification(uri: String, diagnostics: List[Json]) -> Json:
@@ -935,18 +1055,19 @@ private pure func closed(session: Session, path: Path) -> Step:
                 None
         None:
             None
+    earlier = session.roots.remove(path)
     match respelled:
         Some(uri):
             files = if reported.contains(path):
                 reported
             else:
                 reported.append(path)
-            replying(
-                Serving(remaining),
+            remaining.replying_with_refresh(
+                earlier,
                 [diagnostics_notification(uri, [])].concat(remaining.handed_over(path, files))
             )
         None:
-            replying(Serving(remaining), remaining.handed_over(path, reported))
+            remaining.replying_with_refresh(earlier, remaining.handed_over(path, reported))
 
 
 -- Publishes the analysis of the requested root, then answers the request that
@@ -984,7 +1105,7 @@ pure func analysed(server: Server, asked: AnalysisRequest, result: DocumentAnaly
                 None:
                     void
             replying(Serving(current), replies)
-        AwaitingInitialize(_) | ShutDown | Exited(_):
+        AwaitingInitialize(_) | LeavingLibrary(_) | ShutDown | Exited(_):
             lifecycle.replying([])
 
 

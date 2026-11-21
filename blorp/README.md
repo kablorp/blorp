@@ -1374,8 +1374,10 @@ as `blorp compile` does. Before it reads a message, the server writes a copy of
 that library to a new folder in `/tmp`, named `blorp-lsp-` and six characters,
 so that a library declaration is a file the editor can open. The folder is a
 view: nothing loads from it, so edits there are never read, and they disappear
-when the server ends, which removes the folder. A signal that kills the server
-leaves the folder behind.
+when the server removes the folder. It removes it on `shutdown`, before it
+writes the reply, since an editor may end the server right after `exit`; at
+the end of input it removes it then. A signal that kills the server leaves the
+folder behind.
 If the folder cannot be made, filled or removed, or the working directory
 cannot be read, the server says so on standard error and ends with status 3.
 A file is analysed when it is opened, with the other open files' unsaved text
@@ -1388,7 +1390,11 @@ When the editor can report files changed on disk, the server asks it to for
 file is open, since its open text wins. A program that failed to load is
 stale after any change, since a missing module may now exist. Every analysis
 publishes its diagnostics again, so an edit's errors refresh at the next
-request, which editors make as they colour the file. A file that several open
+request, which editors make as they colour the file. An edit, close or change
+on disk that stales another open program than the edited file's own makes the
+server send the editor one `workspace/semanticTokens/refresh` request, when the
+editor supports it, so that the importer's colours and errors update without an
+edit of its own; the server ignores the editor's answer. A file that several open
 programs report in shows the diagnostics of the one analysed last; when that
 program stops reporting there, or its file is closed, the file shows what the
 others last reported. An error inside the standard library is shown at the
@@ -1405,7 +1411,10 @@ start of the module an alias names. On a declaration's own name it answers
 that declaration, and on a type built into the language, such as `Int`, it
 answers `null`. A call of a trait's method, its default or an
 implementation's, goes to the trait's method. A library declaration is in the
-server's folder. `textDocument/references` lists every use of the name at the
+server's folder. When the editor sets `textDocument.definition.linkSupport`, the
+answer is a one-element `LocationLink[]` whose `originSelectionRange` is the
+name asked about, so that the editor can underline and click it; the target
+range and its selection range are both the declaration's name. `textDocument/references` lists every use of the name at the
 position, and its declaration too when the editor asks; it groups the uses of
 an implementation's type parameter across the implementation's methods, and
 lists every use of a built-in type. Both cover only the open file's program,
