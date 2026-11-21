@@ -36,13 +36,13 @@ import:
         framed
     ./server:
         EXIT_ABANDONED,
-        ServedLibrary,
         Server,
         Step,
         analysed,
         document_analysis,
         exit_status,
         receive_body,
+        shutdown_answer,
         snapshots,
         start_server
 
@@ -170,10 +170,11 @@ private pure func folder_error(temporary: Path, message: String) -> Diagnostic:
     )
 
 
--- Writes the library into `folder`, then serves until the session ends. The
--- server places library locations in the folder by the analysed library's
--- layout, and tells the library files a client opens by the folder's.
-private func serve_in(folder: Path) -> Result[Int, Diagnostic]:
+-- Writes the library into `folder`, then serves until `shutdown`, `exit` or the
+-- end of input, and returns the server as it stopped. The server places
+-- library locations in the folder by the analysed library's layout, and tells
+-- the library files a client opens by the folder's.
+private func serve_in(folder: Path) -> Result[Server, Diagnostic]:
     directory ?= get_current_directory()
         .working_directory_result()
         .map_err(pure func(failure: LoadFailure) -> Diagnostic: failure.diagnostic)
@@ -202,15 +203,19 @@ private func serve_in(folder: Path) -> Result[Int, Diagnostic]:
             .parent()
             .folder_error("could not write the standard library: ${problem}")
     )
-    Ok(serve_messages({ analysed = embedded, view = view }))
+    Ok(serve_messages(start_server({ analysed = embedded, view = view })))
 
 
 -- Serves with the library written to a fresh folder in `temporary`, which is
--- removed when the session ends, and returns the status the session ends
--- with. `serve` names LIBRARY_PARENT; a test names a folder that cannot hold
--- it.
+-- removed when `shutdown` arrives or the session otherwise ends, and returns
+-- the status the session ends with. The folder goes before the reply to
+-- `shutdown` is written, since an editor may end the server right after `exit`.
+-- Known gap: when the folder cannot be removed, the reply is not written, since
+-- `with_temporary_directory` discards the body's value, which holds the
+-- request id, when its removal fails; the status is still 3.
+-- `serve` names LIBRARY_PARENT; a test names a folder that cannot hold it.
 func serve_in_new_folder(temporary: Path) -> Result[Int, Diagnostic]:
-    with_temporary_directory(
+    stopped ?= with_temporary_directory(
         temporary,
         LIBRARY_FOLDER_PREFIX,
         serve_in,
@@ -218,6 +223,7 @@ func serve_in_new_folder(temporary: Path) -> Result[Int, Diagnostic]:
             "could not make or remove its folder in ${temporary}: ${error}"
         )
     )
+    Ok(stopped.finish_session())
 
 
 -- A failure to make, fill or remove the folder is a path problem; a library
@@ -236,23 +242,35 @@ func serve() -> Int:
             error.kind.kind_status()
 
 
--- Answers messages until `exit` or the end of input, and returns the status
--- the process ends with.
-private func serve_messages(library: ServedLibrary) -> Int:
-    var server = start_server(library)
-    var status = EXIT_ABANDONED
+-- With the library's folder gone, writes the reply to `shutdown` that the
+-- server held, if it stopped for that, serves what the editor sends after it,
+-- and returns the status the process ends with.
+private func finish_session(stopped: Server) -> Int:
+    final = match stopped.shutdown_answer():
+        Some(answer):
+            write(framed(answer.reply))
+            flush()
+            serve_messages(answer.server)
+        None:
+            stopped
+    final
+        .exit_status()
+        .get_or(EXIT_ABANDONED)
+
+
+-- Answers messages until `exit`, `shutdown` or the end of input, and returns
+-- the server as it stopped.
+private func serve_messages(started: Server) -> Server:
+    var server = started
     while True:
         match read_message():
             Ok(Some(body)):
                 server = server
                     .receive_body(body)
                     .perform()
-                match server.exit_status():
-                    Some(ended):
-                        status = ended
-                        break
-                    None:
-                        void
+                match (server.exit_status(), server.shutdown_answer()):
+                    (None, None): void
+                    _: break
             Ok(None):
                 break
             Err(error):
@@ -263,4 +281,4 @@ private func serve_messages(library: ServedLibrary) -> Int:
                     )
                 )
                 break
-    status
+    server
