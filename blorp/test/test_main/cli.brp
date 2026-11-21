@@ -910,6 +910,30 @@ private func lsp_goes_to_definitions_in_the_library_and_lists_references(
         Err(error): Err("${folder}: ${error}")
 
 
+-- The start both FIFO drivers below share: `await PATTERN FILE` polls up to
+-- 2,000 times, 10 ms apart, for the pattern; `blorp lsp` ($0) runs on a FIFO
+-- named from the prefix $1, its output in $1.out; the first messages ($2) are
+-- sent. If a step fails or a wait runs out, the trap closes the FIFO, so the
+-- server reads the end of its input, removes its folder and ends.
+private LSP_FIFO_START: String =
+    |set -e
+    |await() {
+    |    polls=0
+    |    until grep -q "$1" "$2"; do
+    |        polls=$((polls + 1))
+    |        test "$polls" -le 2000
+    |        sleep 0.01
+    |    done
+    |}
+    |rm -f "$1.in"
+    |mkfifo "$1.in"
+    |"$0" lsp < "$1.in" > "$1.out" &
+    |server=$!
+    |exec 3> "$1.in"
+    |trap 'exec 3>&-; wait' EXIT
+    |printf '%s' "$2" >&3
+
+
 -- `capture` sends standard input whole, so this script for sh on macOS and
 -- Linux holds a session open: it starts `blorp lsp` on a FIFO, sends the
 -- first messages ($2), polls up to 2,000 times, 10 ms apart, for the reply
@@ -918,21 +942,8 @@ private func lsp_goes_to_definitions_in_the_library_and_lists_references(
 -- of the files it uses. If a step fails or the wait runs out, the trap closes
 -- the FIFO, so the server reads the end of its input, removes its folder and
 -- ends. The checks are the test's.
-private LSP_VIEW_EDIT_DRIVER: String =
-    |set -e
-    |rm -f "$1.in"
-    |mkfifo "$1.in"
-    |"$0" lsp < "$1.in" > "$1.out" &
-    |server=$!
-    |exec 3> "$1.in"
-    |trap 'exec 3>&-; wait' EXIT
-    |printf '%s' "$2" >&3
-    |polls=0
-    |until grep -q '"id":3,' "$1.out"; do
-    |    polls=$((polls + 1))
-    |    test "$polls" -le 2000
-    |    sleep 0.01
-    |done
+private LSP_VIEW_EDIT_STEPS: String =
+    |await '"id":3,' "$1.out"
     |folder=$(grep -o '/tmp/blorp-lsp-[A-Za-z0-9]*' "$1.out" | head -n 1)
     |test -n "$folder"
     |cp "$folder/io/console/output.brp" "$1.served"
@@ -975,7 +986,7 @@ private func lsp_never_reads_the_library_folder(
         "${shell}",
         [
             "-c",
-            LSP_VIEW_EDIT_DRIVER,
+            LSP_FIFO_START + "\n" + LSP_VIEW_EDIT_STEPS,
             compiler,
             prefix,
             first
@@ -1011,6 +1022,99 @@ private func lsp_never_reads_the_library_folder(
             .map(framed)
             .join(""),
         "stdout"
+    )
+
+
+-- `capture` sends standard input whole, so this script for sh on macOS and
+-- Linux holds a session open: it starts `blorp lsp` on a FIFO, sends the
+-- first messages ($2), polls up to 2,000 times, 10 ms apart, for the reply
+-- with id 2, which names the library folder, sends `shutdown` ($3), polls for
+-- its reply, which has id 3, and fails unless the folder is already gone, then
+-- sends `exit` ($4). $0 is the compiler and $1 the prefix of the files it
+-- uses. If a step fails or a wait runs out, the trap closes the FIFO, so the
+-- server reads the end of its input and ends. The other checks are the test's.
+private LSP_SHUTDOWN_STEPS: String =
+    |await '"id":2,' "$1.out"
+    |folder=$(grep -o '/tmp/blorp-lsp-[A-Za-z0-9]*' "$1.out" | head -n 1)
+    |test -d "$folder"
+    |printf '%s' "$3" >&3
+    |await '"id":3,' "$1.out"
+    |test ! -e "$folder"
+    |printf '%s' "$4" >&3
+    |exec 3>&-
+    |wait "$server"
+
+
+-- The folder is removed before the reply to `shutdown` is written, since an
+-- editor may kill the server right after `exit`: the script checks it the
+-- moment the reply is in the output. `exit` then ends with status 0.
+private func lsp_removes_its_folder_before_answering_shutdown(
+    compiler: String,
+    work_directory: String
+) -> Result[Void, String]:
+    prefix = "${work_directory}/cli_lsp_shutdown"
+    uri = "file:///work/navigate.brp"
+    document = "{\"uri\":\"${uri}\",\"languageId\":\"blorp\",\"version\":1,\"text\":\"func main() -> Int:\\n    print(\\\"hi\\\")\\n    1\\n\"}"
+    first = [
+        LSP_INITIALIZE,
+        "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":{\"textDocument\":${document}}}",
+        "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"textDocument/definition\",\"params\":{\"textDocument\":{\"uri\":\"${uri}\"},\"position\":{\"line\":1,\"character\":6}}}"
+    ]
+    shell ?= find_program("sh").map_err(
+        pure func(error: FindProgramError) -> String: "sh: ${error}"
+    )
+    invocation ?= isolated(
+        "${shell}",
+        [
+            "-c",
+            LSP_FIFO_START + "\n" + LSP_SHUTDOWN_STEPS,
+            compiler,
+            prefix,
+            first
+                .map(framed)
+                .join(""),
+            framed("{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"shutdown\"}"),
+            framed(LSP_EXIT)
+        ],
+        COMPILATION_TIMEOUT_MS
+    )
+    _ ?= run_expecting(prefix, invocation, 0)
+    stdout ?= read_file("${prefix}.out")
+    folder ?= stdout
+        .lsp_library_folder()
+        .to_result("no library folder in the output: ${stdout}")
+    line ?= print_declaration_line()
+    library_uri = "file://${folder}/io/console/output.brp"
+    expected = [
+        LSP_INITIALIZED_REPLY,
+        "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":${lsp_location(library_uri, line, 5, 10)}}",
+        "{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":null}"
+    ]
+    expect(
+        stdout,
+        expected
+            .map(framed)
+            .join(""),
+        "stdout"
+    )
+
+
+-- Input that ends after `shutdown` still gets the reply, and the status is
+-- the one for ending without `exit`.
+private func lsp_answers_shutdown_then_exits_1_when_input_ends(
+    compiler: String,
+    work_directory: String
+) -> Result[Void, String]:
+    output ?= lsp_session(
+        compiler,
+        framed(LSP_INITIALIZE) + framed("{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"shutdown\"}"),
+        "${work_directory}/cli_lsp_shutdown_end",
+        EXIT_ABANDONED
+    )
+    expect_output(
+        output,
+        framed(LSP_INITIALIZED_REPLY) + framed("{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":null}"),
+        ""
     )
 
 
@@ -1375,6 +1479,18 @@ func suite(compiler: String, work_directory: String) -> TestSuite:
                             work_directory
                         )
                     )
+            ),
+            (
+                "lsp removes its folder before answering shutdown",
+                func(): reported(
+                    lsp_removes_its_folder_before_answering_shutdown(compiler, work_directory)
+                )
+            ),
+            (
+                "lsp answers shutdown, then exits 1 when input ends",
+                func(): reported(
+                    lsp_answers_shutdown_then_exits_1_when_input_ends(compiler, work_directory)
+                )
             ),
             (
                 "lsp exits 1 on exit without shutdown",

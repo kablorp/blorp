@@ -61,8 +61,12 @@ done.
     9b: semantic tokens, with staleness, analysis on demand and watched
     files. Then 9c: definition and references, with the library written to
     a temporary folder as a view.
+  - **Landed after the plugin's first checklist run:** the server removes its
+    library folder at `shutdown`, asks the client to refresh an importer's
+    tokens, and answers definition with `LocationLink`s, which CLion's Cmd-click
+    needs.
   - **Next:** landing 10, the CLion plugin (`editor/intellij/`, built and
-    reviewed on its branch), which lands after Keith runs its checklist.
+    reviewed on its branch), which lands after Keith reruns its checklist.
 - **String code points:** [`STRING_PLAN.md`](STRING_PLAN.md).
   - **Status:** approved on 2026-11-10: `length` counts code points, from a
     count stored in each String, and byte work uses `byte_*` functions. L1

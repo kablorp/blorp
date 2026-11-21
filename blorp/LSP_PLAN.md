@@ -1138,6 +1138,57 @@ life took 12.6 ms against 12.8 ms before (101 runs).
   - The process API has no streaming stdin, which is why the view test
     needs its driver.
 
+**Server fixes from the CLion plugin's checklist** (against `e3ebc276f`).
+`self-compile-cost`, `-O2`, 3 rounds:
+
+| Measure | Base | Candidate | Change |
+| --- | ---: | ---: | ---: |
+| Fixed input, allocations | 12,854,450 | 12,854,450 | unchanged |
+| Fixed input, instructions (median) | 12,965,432,911 | 12,963,874,497 | −0.012% |
+| Fixed input, peak heap (requested bytes) | 183,036,020 | 183,036,020 | unchanged |
+| Own source, allocations | 12,854,450 | 12,878,025 | +0.18% |
+| Own source, instructions (median) | 12,949,029,948 | 12,966,257,449 | +0.13% |
+| Own source, peak heap (requested bytes) | 183,036,019 | 183,272,960 | +0.13% |
+| Lines, production and tests | | | +161 and +399 net |
+
+Keith ran the plugin's checklist in CLion 2026.3 on 2026-11-21; its
+`idea.log` and a trace of the stdio traffic (a `tee` wrapper set as the
+plugin's executable) found three server defects.
+
+- **The view folder leaked.** CLion sends `shutdown`, waits for its reply,
+  sends `exit`, and kills the process 4–14 ms later (exit 137 in three of four
+  sessions), before the server had removed 34 files. Now `shutdown` puts the
+  server in `LeavingLibrary(id)`: the transport leaves the folder's scope, the
+  folder is removed, and only then is the reply written; `exit` is read
+  outside the scope. When removal fails the server exits 3 without the reply,
+  because `with_temporary_directory` discards its body's value on that path; a
+  library follow-up.
+- **An open importer never refreshed.** When an open, change, close or
+  watched change stales an open root other than the document's own, and the
+  client sets `workspace.semanticTokens.refreshSupport` (CLion does), the
+  server sends one `workspace/semanticTokens/refresh`; the client re-asks for
+  visible files' tokens, which re-analyses them.
+- **Cmd-click did nothing; Cmd-B worked.** CLion asks for a definition on
+  every Cmd-hover move, and the server answered each with a `Location`.
+  CLion's `LspImplicitReferenceProvider` turns a result without an
+  `originSelectionRange` into an empty range at the mouse, which Cmd-hover
+  cannot underline or click. With `textDocument.definition.linkSupport` (CLion
+  sets it), definition now answers a one-element `LocationLink[]` whose origin
+  is the name under the position.
+- **Ceiling.** A sketch estimate of +80, raised to +120 when links joined, then
+  corrected to +150 and +165 under the standing delegation: the audit found
+  the shutdown state, refresh and links about 25, 55 and 45 lines, with
+  comments, and review's fixes (one shutdown accessor, the link built where the
+  definition is answered) the rest.
+- **Identity.** The fixed-input C is identical (`f9801c340f4048e5`).
+- **Tests.** Shutdown holds its reply until the folder is gone, and an e2e
+  through the FIFO driver checks the folder is absent when the reply arrives;
+  input ending after `shutdown` gives the reply and status 1; refresh is sent
+  only with the capability, only for another root that was current, once per
+  notification, with the next id, and the client's answer is ignored; a link's
+  origin is exactly the name, its end included, and the answer is an array.
+  Each mutation, run alone, failed its tests.
+
 ## Testing
 
 Each landing starts with a failing test.

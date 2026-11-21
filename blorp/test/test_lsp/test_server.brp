@@ -31,12 +31,14 @@ import:
         DocumentAnalysis,
         ServedLibrary,
         Server,
+        ShutdownAnswer,
         Step,
         analysed,
         document_analysis,
         exit_status,
         receive,
         receive_body,
+        shutdown_answer,
         snapshots,
         start_server
     ../driver/file_access: read_file
@@ -231,14 +233,54 @@ pure func test_a_second_initialize_gets_32600() -> Bool:
     )
 
 
-pure func test_shutdown_returns_null_and_later_requests_get_32600() -> Bool:
+private SHUTDOWN_REPLY: String = "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":null}"
+
+
+-- The server once the transport has written the held reply to `shutdown`.
+private pure func left(server: Server) -> Server:
+    match server.shutdown_answer():
+        Some(answer): answer.server
+        None: server
+
+
+-- The reply waits for the transport to leave the library's folder, so the
+-- step carries none; the server holds it in `shutdown_answer`.
+pure func test_shutdown_holds_its_null_reply_until_the_library_is_left() -> Bool:
     serving(pure func(server: Server) -> Bool:
+        shut = server.after([INITIALIZE, SHUTDOWN])
         and(
-            server
-                .after([INITIALIZE, SHUTDOWN])
-                .answers(["{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":null}"]),
-            server
-                .after([INITIALIZE, SHUTDOWN, SHUTDOWN])
+            and(
+                shut.answers([]),
+                (
+                    shut.server
+                        .shutdown_answer()
+                        .map(pure func(answer: ShutdownAnswer) -> String: render(answer.reply))
+                    == Some(SHUTDOWN_REPLY)
+                )
+            ),
+            and(
+                server
+                    .shutdown_answer()
+                    .is_none(),
+                shut.server
+                    .left()
+                    .shutdown_answer()
+                    .is_none()
+            )
+        )
+    )
+
+
+pure func test_requests_after_shutdown_get_32600() -> Bool:
+    serving(pure func(server: Server) -> Bool:
+        shut = server.after([INITIALIZE, SHUTDOWN]).server
+        and(
+            shut
+                .receive(json(SHUTDOWN))
+                .answers([error_reply("2", -32600, "the server has shut down")]),
+            shut
+                .left()
+                .receive(json(SHUTDOWN))
                 .answers([error_reply("2", -32600, "the server has shut down")])
         )
     )
@@ -248,11 +290,21 @@ pure func test_exit_ends_with_0_only_after_shutdown() -> Bool:
     serving(pure func(server: Server) -> Bool:
         and(
             and(
-                (
-                    server
-                        .after([INITIALIZE, SHUTDOWN, EXIT]).server
-                        .exit_status()
-                    == Some(0)
+                and(
+                    (
+                        server
+                            .after([INITIALIZE, SHUTDOWN, EXIT]).server
+                            .exit_status()
+                        == Some(0)
+                    ),
+                    (
+                        server
+                            .after([INITIALIZE, SHUTDOWN]).server
+                            .left()
+                            .receive(json(EXIT)).server
+                            .exit_status()
+                        == Some(0)
+                    )
                 ),
                 (
                     server
@@ -1084,33 +1136,154 @@ pure func test_initialized_registers_for_changed_files_once_when_the_client_can(
     )
 
 
+-- Whether `server` still answers: its `shutdown` gets the null reply.
+private pure func still_serves(server: Server) -> Bool:
+    (
+        server
+            .receive(json(SHUTDOWN)).server
+            .shutdown_answer()
+            .map(pure func(answer: ShutdownAnswer) -> String: render(answer.reply))
+        == Some(SHUTDOWN_REPLY)
+    )
+
+
 pure func test_the_clients_answer_to_the_registration_is_accepted() -> Bool:
     serving(pure func(server: Server) -> Bool:
+        registered = server.after([INITIALIZE_WATCHING, INITIALIZED]).server
+        accepted = registered.receive(json("{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":null}"))
+        refused = registered.receive(
+            json("{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32601,\"message\":\"no\"}}")
+        )
         and(
-            and(
-                server
-                    .after([
-                        INITIALIZE_WATCHING,
-                        INITIALIZED,
-                        "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":null}"
-                    ])
-                    .answers([]),
-                server
-                    .after([
-                        INITIALIZE_WATCHING,
-                        INITIALIZED,
-                        "{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32601,\"message\":\"no\"}}"
-                    ])
-                    .answers([])
-            ),
+            and(accepted.answers([]), refused.answers([])),
+            and(accepted.server.still_serves(), refused.server.still_serves())
+        )
+    )
+
+
+-- refreshing an importer
+
+private INITIALIZE_REFRESHING: String = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"capabilities\":{\"workspace\":{\"semanticTokens\":{\"refreshSupport\":true}}}}}"
+
+
+private INITIALIZE_WATCHING_AND_REFRESHING: String = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"capabilities\":{\"workspace\":{\"didChangeWatchedFiles\":{\"dynamicRegistration\":true},\"semanticTokens\":{\"refreshSupport\":true}}}}}"
+
+
+private pure func refresh_request(id: Int) -> String:
+    "{\"jsonrpc\":\"2.0\",\"id\":${id},\"method\":\"workspace/semanticTokens/refresh\"}"
+
+
+-- ROOT read OTHER, which is open, and OTHER read only itself, each analysed.
+private pure func with_importer(server: Server, initialize: String) -> Server:
+    server
+        .after([initialize, did_open(ROOT_URI, "x"), did_open(OTHER_URI, "one")]).server
+        .analysed_root(reading(ROOT, [OTHER])).server
+        .analysed_at(OTHER, reading(OTHER, [])).server
+
+
+pure func test_an_edit_to_an_imported_file_asks_the_client_to_refresh_when_it_can() -> Bool:
+    serving(pure func(server: Server) -> Bool:
+        and(
             server
-                .after([
-                    INITIALIZE_WATCHING,
-                    INITIALIZED,
-                    "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":null}",
-                    SHUTDOWN
-                ])
-                .answers(["{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":null}"])
+                .with_importer(INITIALIZE_REFRESHING)
+                .receive(json(did_change(OTHER_URI, "z")))
+                .answers([refresh_request(1)]),
+            server
+                .with_importer(INITIALIZE)
+                .receive(json(did_change(OTHER_URI, "z")))
+                .answers([])
+        )
+    )
+
+
+-- ROOT read OTHER from the disk; OTHER's opened text replaces it, and OTHER's
+-- own analysis is still asked for.
+pure func test_opening_an_imported_file_asks_the_client_to_refresh() -> Bool:
+    serving(pure func(server: Server) -> Bool:
+        opened = server
+            .after([INITIALIZE_REFRESHING, did_open(ROOT_URI, "x")]).server
+            .analysed_root(reading(ROOT, [OTHER])).server
+            .receive(json(did_open(OTHER_URI, "y")))
+        and(opened.replies() == [refresh_request(1)], opened.analysed_path() == path(OTHER))
+    )
+
+
+-- Closing OTHER discards the unsaved text ROOT read.
+pure func test_closing_an_imported_file_asks_the_client_to_refresh() -> Bool:
+    serving(pure func(server: Server) -> Bool:
+        server
+            .with_importer(INITIALIZE_REFRESHING)
+            .receive(json(did_close(OTHER_URI)))
+            .answers([published(OTHER_URI, []), refresh_request(1)])
+    )
+
+
+-- ROOT's own edit stales ROOT, whose request the client makes anyway, and
+-- OTHER does not read ROOT.
+pure func test_an_edit_that_stales_only_its_own_root_asks_for_no_refresh() -> Bool:
+    serving(pure func(server: Server) -> Bool:
+        server
+            .with_importer(INITIALIZE_REFRESHING)
+            .receive(json(did_change(ROOT_URI, "z")))
+            .answers([])
+    )
+
+
+pure func test_a_root_already_stale_is_not_refreshed_again() -> Bool:
+    serving(pure func(server: Server) -> Bool:
+        server
+            .with_importer(INITIALIZE_REFRESHING)
+            .changed(did_change(OTHER_URI, "z"))
+            .receive(json(did_change(OTHER_URI, "zz")))
+            .answers([])
+    )
+
+
+private SHARED_URI: String = "file:///work/shared.brp"
+
+
+-- ROOT and OTHER, both open, are analysed having read SHARED from the disk.
+private pure func analysed_sharing(server: Server) -> Server:
+    server
+        .analysed_root(reading(ROOT, [SHARED])).server
+        .analysed_at(OTHER, reading(OTHER, [SHARED])).server
+
+
+-- Two roots go stale, and the client is asked once. The registration took id
+-- 1, so the first refresh takes 2 and the next 3.
+pure func test_a_change_on_disk_asks_once_and_requests_take_the_next_ids() -> Bool:
+    serving(pure func(server: Server) -> Bool:
+        opened = server.after([
+            INITIALIZE_WATCHING_AND_REFRESHING,
+            did_open(ROOT_URI, "x"),
+            did_open(OTHER_URI, "one"),
+            INITIALIZED
+        ])
+        first = opened.server
+            .analysed_sharing()
+            .receive(json(watched_change(SHARED_URI)))
+        second = first.server
+            .analysed_sharing()
+            .receive(json(watched_change(SHARED_URI)))
+        and(
+            opened.answers([REGISTRATION]),
+            and(first.answers([refresh_request(2)]), second.answers([refresh_request(3)]))
+        )
+    )
+
+
+pure func test_the_clients_answer_to_a_refresh_is_ignored() -> Bool:
+    serving(pure func(server: Server) -> Bool:
+        asked = server
+            .with_importer(INITIALIZE_REFRESHING)
+            .changed(did_change(OTHER_URI, "z"))
+        accepted = asked.receive(json("{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":null}"))
+        refused = asked.receive(
+            json("{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32601,\"message\":\"no\"}}")
+        )
+        and(
+            and(accepted.answers([]), refused.answers([])),
+            and(accepted.server.still_serves(), refused.server.still_serves())
         )
     )
 
@@ -1234,11 +1407,33 @@ private pure func escaped(text: String) -> String:
         .get_or("")
 
 
--- `server` with ROOT open as `text` and analysed.
-private func navigating(server: Server, text: String) -> Server:
+-- `server` initialized by `initialize`, with ROOT open as `text` and analysed.
+private func navigating_as(server: Server, initialize: String, text: String) -> Server:
     server
-        .after([INITIALIZE, did_open(ROOT_URI, text.escaped())]).server
+        .after([initialize, did_open(ROOT_URI, text.escaped())]).server
         .analysed_root(navigated(text)).server
+
+
+private func navigating(server: Server, text: String) -> Server:
+    server.navigating_as(INITIALIZE, text)
+
+
+private INITIALIZE_LINKING: String = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"capabilities\":{\"textDocument\":{\"definition\":{\"linkSupport\":true}}}}}"
+
+
+-- A LocationLink whose origin is the name at `line` from `start` to `end` of
+-- the root, and whose target is `target`, a Location.
+private pure func location_link(
+    line: Int,
+    start: Int,
+    end: Int,
+    uri: String,
+    target_line: Int,
+    target_start: Int,
+    target_end: Int
+) -> String:
+    range = "{\"start\":{\"line\":${target_line},\"character\":${target_start}},\"end\":{\"line\":${target_line},\"character\":${target_end}}}"
+    "{\"originSelectionRange\":{\"start\":{\"line\":${line},\"character\":${start}},\"end\":{\"line\":${line},\"character\":${end}}},\"targetUri\":\"${uri}\",\"targetRange\":${range},\"targetSelectionRange\":${range}}"
 
 
 private pure func position_params(uri: String, line: Int, character: Int) -> String:
@@ -1435,6 +1630,53 @@ func test_definition_of_a_library_function_lands_in_its_file() -> Bool:
                             .navigating(navigated_text())
                             .definition_at(32, 6)
                         == [result_reply(7, location(file.file_uri(), line, 5, 10))]
+                    )
+                None:
+                    False
+        _:
+            False
+
+
+-- `area` on line 31 spans 27 to 31 and is declared on line 23; the link's
+-- origin is that name whether the position is inside it or at its end.
+func test_a_link_supporting_client_gets_the_name_it_asked_about_as_the_origin() -> Bool:
+    loading(func(server: Server) -> Bool:
+        linked = server.navigating_as(INITIALIZE_LINKING, navigated_text())
+        expected = [result_reply(7, "[${location_link(31, 27, 31, ROOT_URI, 23, 10, 14)}]")]
+        and(linked.definition_at(31, 29) == expected, linked.definition_at(31, 31) == expected)
+    )
+
+
+-- The same definition without `linkSupport` is a plain Location.
+func test_a_client_without_link_support_gets_a_location() -> Bool:
+    loading(func(server: Server) -> Bool:
+        (
+            server
+                .navigating(navigated_text())
+                .definition_at(31, 29)
+            == [result_reply(7, location(ROOT_URI, 23, 10, 14))]
+        )
+    )
+
+
+func test_a_link_to_a_library_function_targets_its_file() -> Bool:
+    match (library_server(), library_file("io/console/output.brp")):
+        (Some(server), Some(file)):
+            declared: Option[Int] = match read_file(file.to_string()):
+                Ok(text): text.line_starting("func print(")
+                Err(_): None
+            match declared:
+                Some(line):
+                    (
+                        server
+                            .navigating_as(INITIALIZE_LINKING, navigated_text())
+                            .definition_at(32, 6)
+                        == [
+                            result_reply(
+                                7,
+                                "[${location_link(32, 4, 9, file.file_uri(), line, 5, 10)}]"
+                            )
+                        ]
                     )
                 None:
                     False
@@ -1700,9 +1942,10 @@ TESTS: TestSuite = {
         ("an invalid message gets -32600", test_an_invalid_message_gets_32600),
         ("a second initialize gets -32600", test_a_second_initialize_gets_32600),
         (
-            "shutdown returns null and later requests get -32600",
-            test_shutdown_returns_null_and_later_requests_get_32600
+            "shutdown holds its null reply until the library is left",
+            test_shutdown_holds_its_null_reply_until_the_library_is_left
         ),
+        ("requests after shutdown get -32600", test_requests_after_shutdown_get_32600),
         ("exit ends with 0 only after shutdown", test_exit_ends_with_0_only_after_shutdown),
         ("nothing is answered after exit", test_nothing_is_answered_after_exit),
         (
@@ -1817,6 +2060,46 @@ TESTS: TestSuite = {
         (
             "the client's answer to the registration is accepted",
             test_the_clients_answer_to_the_registration_is_accepted
+        ),
+        (
+            "an edit to an imported file asks the client to refresh when it can",
+            test_an_edit_to_an_imported_file_asks_the_client_to_refresh_when_it_can
+        ),
+        (
+            "opening an imported file asks the client to refresh",
+            test_opening_an_imported_file_asks_the_client_to_refresh
+        ),
+        (
+            "closing an imported file asks the client to refresh",
+            test_closing_an_imported_file_asks_the_client_to_refresh
+        ),
+        (
+            "an edit that stales only its own root asks for no refresh",
+            test_an_edit_that_stales_only_its_own_root_asks_for_no_refresh
+        ),
+        (
+            "a root already stale is not refreshed again",
+            test_a_root_already_stale_is_not_refreshed_again
+        ),
+        (
+            "a change on disk asks once and requests take the next ids",
+            test_a_change_on_disk_asks_once_and_requests_take_the_next_ids
+        ),
+        (
+            "the client's answer to a refresh is ignored",
+            test_the_clients_answer_to_a_refresh_is_ignored
+        ),
+        (
+            "a link-supporting client gets the name it asked about as the origin",
+            test_a_link_supporting_client_gets_the_name_it_asked_about_as_the_origin
+        ),
+        (
+            "a client without link support gets a location",
+            test_a_client_without_link_support_gets_a_location
+        ),
+        (
+            "a link to a library function targets its file",
+            test_a_link_to_a_library_function_targets_its_file
         ),
         (
             "closing a file opened by another spelling clears that spelling",
