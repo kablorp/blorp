@@ -324,12 +324,14 @@ pure calculator parsing and evaluation; it has no compiler-specific behavior.
 
 Bool is a fixed union and Option and Result are ordinary unions, all owned by
 `_base.brp`; user modules receive their types and constructors through the
-prelude. Bool, Option
-and Result operations use explicit named imports. `option.brp` provides
-`is_some`, `is_none`, eager `get_or`, eager `to_result` and `map`; `result.brp`
-provides `is_ok`, `map`, `map_err` and `and_then`. These are ordinary generic pure
-functions over the existing base unions. The prelude supplies no operations
-from these two modules. Import them by name or through a module alias.
+prelude. `option.brp` provides `is_some`, `is_none`, eager `get_or`, eager
+`to_result` and `map`; `result.brp` provides `is_ok`, `map`, `map_err` and
+`and_then`. These are ordinary generic pure functions over the existing base
+unions. The prelude selects both modules' methods, so a user module calls them
+as methods, as in `args.get(1).get_or("none")`, without an import. A direct call
+such as `is_some(value)` still needs them imported by name, and a library module
+imports `option: Option methods` or `result: Result methods` itself. Bool
+operations use explicit named imports.
 
 The four callback signatures keep their type parameters independent:
 
@@ -764,7 +766,6 @@ import:
         Command, Exit(Exited, Signaled, TimedOut), Captured, CaptureError, FindProgramError,
         OutputError, command, capture, output, find_program
     path: Path
-    result: Result methods
 
 union CommitError:
     GitMissing(FindProgramError)

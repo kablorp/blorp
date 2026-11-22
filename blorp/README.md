@@ -786,9 +786,9 @@ the ordinary stack, and the annotation does not prove termination. See the
 ### Option, Result and propagation
 
 `Option[A]` is `Some(A)` or `None`; `Result[Value, Error]` is `Ok(Value)` or
-`Err(Error)`. Both are ordinary unions in `_base.brp`, and the prelude supplies
-their types and constructors. The `option` and `result` modules' helpers,
-such as `map`, `and_then` and `get_or`, are in the
+`Err(Error)`. Both are ordinary unions in `_base.brp`. The prelude supplies
+their types and constructors, and the methods of the `option` and `result`
+modules, such as `map`, `and_then` and `get_or`. These are described in the
 [standard library README](standard_library/README.md).
 
 ```blorp
@@ -1102,20 +1102,23 @@ modules receive its selections: the base types, `Bool`, `Option` and `Result`
 with their constructors, the operator traits, `Equatable`, `Hashable`,
 `Stringable`, `Dict`, the console functions `print` and `print_error`, the
 generic `max` and `min` of any `Orderable`, the conversions
-`to_uint8` and `parse_uint8`, and the methods of Int, UInt8, Float, String and
-List, so `(42 + 1).to_string().length()`
-needs no import. Other direct calls need named imports: console text output is
-in the prelude, while byte console I/O, files, processes and the environment are
-explicit imports. A user module cannot declare `print`, `print_error`, `max` or
-`min` ("max is provided by the prelude", with the help "give this function
-another name"). Selecting `print` or `print_error` from `io/console/output` as
-well is redundant but accepted: an import of a name already in scope enters
-once. A function whose
-first parameter is a String and whose name is a String method the prelude
-provides, such as `lines` or `parse_uint8`, is rejected as well, with "two
-functions named lines can accept the same receiver"; give it another name. Library modules
-receive nothing implicitly and cannot import user modules. Any module may
-import the foundation module as `_base`.
+`to_uint8` and `parse_uint8`, and the methods of Int, UInt8, Float, String,
+List, Option and Result. So `(42 + 1).to_string().length()` and
+`args.get(1).get_or("none")` need no import. Other direct calls need named
+imports: console text output is in the prelude, while byte console I/O, files,
+processes and the environment are explicit imports. A user module cannot
+declare `print`, `print_error`, `max` or `min` ("max is provided by the
+prelude", with the help "give this function another name"). Selecting what the
+prelude supplies, such as `print` from `io/console/output` or
+`option: Option methods`, is redundant but accepted: an import of a name
+already in scope enters once. A function is rejected as well when its name is
+a method the prelude provides and its first parameter could be that method's
+receiver. Examples are `lines` or `parse_uint8` on a String, `get_or` on an
+`Option[T]`, and a generic `is_ok[T](value: T)`, whose `T` could be a Result.
+The error is "two functions named lines can accept the same receiver"; give
+the function another name. Library modules receive nothing implicitly and
+cannot import user modules. Any module may import the foundation module as
+`_base`.
 
 ### Dict
 

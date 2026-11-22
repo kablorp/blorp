@@ -53,7 +53,6 @@ import:
         FindProgramError(...), CaptureError(...), OutputError(...),
         command, capture, output, find_program
     path: Path
-    result: Result methods                       -- map_err, in the examples
 
 -- What to run. Build one with `command`, then change fields by record update.
 record Command {
@@ -337,7 +336,6 @@ import:
         terminal_command, run, exit_interrupted
     io/process: SystemCallError(...), FindProgramError, find_program
     path: Path
-    result: Result methods                       -- map_err, in the examples
 
 -- What to run on this terminal. Build one with `terminal_command`, then change
 -- fields by record update. There is no stdin text and no timeout.
