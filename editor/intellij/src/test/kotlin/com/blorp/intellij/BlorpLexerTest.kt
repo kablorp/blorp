@@ -87,9 +87,12 @@ class BlorpLexerTest {
     fun holeIsLexedAsCodeBetweenStringPieces() {
         assertEquals(
             listOf(
-                BlorpTokenTypes.STRING to "\"a \${",
+                BlorpTokenTypes.STRING to "\"a ",
+                BlorpTokenTypes.PUNCTUATION to "$",
+                BlorpTokenTypes.PUNCTUATION to "{",
                 BlorpTokenTypes.WORD to "name",
-                BlorpTokenTypes.STRING to "} b\"",
+                BlorpTokenTypes.PUNCTUATION to "}",
+                BlorpTokenTypes.STRING to " b\"",
                 BlorpTokenTypes.WORD to "after",
             ),
             tokens("\"a \${name} b\"after"),
@@ -100,14 +103,25 @@ class BlorpLexerTest {
     fun recordBracesAndPlainStringsInsideAHoleDoNotEndIt() {
         assertEquals(
             listOf(
-                BlorpTokenTypes.STRING to "\"\${",
+                BlorpTokenTypes.STRING to "\"",
+                BlorpTokenTypes.PUNCTUATION to "$",
+                BlorpTokenTypes.PUNCTUATION to "{",
                 BlorpTokenTypes.WORD to "show",
                 BlorpTokenTypes.PUNCTUATION to "{",
                 BlorpTokenTypes.STRING to "\"}\"",
                 BlorpTokenTypes.PUNCTUATION to "}",
-                BlorpTokenTypes.STRING to "}\"",
+                BlorpTokenTypes.PUNCTUATION to "}",
+                BlorpTokenTypes.STRING to "\"",
             ),
             tokens("\"\${show{\"}\"}}\""),
+        )
+    }
+
+    @Test
+    fun adjacentHolesHaveNoStringBetweenThem() {
+        assertEquals(
+            listOf("\"", "$", "{", "a", "}", "$", "{", "b", "}", "\""),
+            tokens("\"\${a}\${b}\"").map { it.second },
         )
     }
 
@@ -115,7 +129,9 @@ class BlorpLexerTest {
     fun unclosedHoleEndsAtTheLineEnd() {
         assertEquals(
             listOf(
-                BlorpTokenTypes.STRING to "\"\${",
+                BlorpTokenTypes.STRING to "\"",
+                BlorpTokenTypes.PUNCTUATION to "$",
+                BlorpTokenTypes.PUNCTUATION to "{",
                 BlorpTokenTypes.WORD to "x",
                 TokenType.WHITE_SPACE to "\n",
                 BlorpTokenTypes.STRING to "\"y\"",
@@ -124,25 +140,46 @@ class BlorpLexerTest {
         )
     }
 
-    @Test
-    fun lexingRestartedInsideAHoleMatchesAFullPass() {
-        val text = "\"\${f{a}} \${g}\" z"
-        val lexer = BlorpLexer()
-        lexer.start(text)
-        val full = mutableListOf<Triple<Int, Int, IElementType?>>()
-        while (lexer.tokenType != null) {
-            full += Triple(lexer.tokenStart, lexer.state, lexer.tokenType)
-            lexer.advance()
-        }
-        for ((start, state, _) in full) {
-            lexer.start(text, start, text.length, state)
-            val restarted = mutableListOf<Triple<Int, Int, IElementType?>>()
+    // The editor restarts the lexer at a token start with that token's state; it must lex the
+    // rest as a full pass does.
+    private fun assertRestartsMatchAFullPass(text: String) {
+        fun rest(lexer: BlorpLexer): List<Triple<Int, Int, IElementType?>> {
+            val result = mutableListOf<Triple<Int, Int, IElementType?>>()
             while (lexer.tokenType != null) {
-                restarted += Triple(lexer.tokenStart, lexer.state, lexer.tokenType)
+                result += Triple(lexer.tokenStart, lexer.state, lexer.tokenType)
                 lexer.advance()
             }
-            assertEquals(full.dropWhile { it.first < start }, restarted, "restarted at $start")
+            return result
         }
+        val lexer = BlorpLexer()
+        lexer.start(text)
+        val full = rest(lexer)
+        for ((start, state, _) in full) {
+            lexer.start(text, start, text.length, state)
+            assertEquals(full.dropWhile { it.first < start }, rest(lexer), "restarted at $start in '$text'")
+        }
+    }
+
+    @Test
+    fun lexingRestartedAtAnyTokenMatchesAFullPass() {
+        val inputs = listOf(
+            "\"\${f{a}} \${g}\" z",
+            "\"\${a}\${b}\"",
+            "\"\${a}\${b}",
+            "\"\${x\n\"y\"",
+            "\"a \${name",
+            "\"a \${name}",
+            "\"\${show{\"}\"}}\"",
+            "\"\${",
+            "\"\${}",
+            "\"\${a}\n\${b}\"",
+        )
+        inputs.forEach(::assertRestartsMatchAFullPass)
+    }
+
+    @Test
+    fun holeEndingAtTheEndOfTheBufferHasNoStringAfterIt() {
+        assertEquals(listOf("\"", "$", "{", "a", "}"), tokens("\"\${a}").map { it.second })
     }
 
     @Test

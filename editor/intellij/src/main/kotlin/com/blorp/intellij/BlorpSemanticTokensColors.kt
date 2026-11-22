@@ -2,27 +2,21 @@ package com.blorp.intellij
 
 import com.intellij.openapi.editor.DefaultLanguageHighlighterColors as Colors
 import com.intellij.openapi.editor.colors.TextAttributesKey
-import com.intellij.platform.lsp.api.customization.LspSemanticTokensSupport
 import com.intellij.psi.PsiFile
+import com.redhat.devtools.lsp4ij.features.semanticTokens.SemanticTokensColorsProvider
 
 /**
- * The platform's default mapping sends both `type` and `parameter` to keys that Darcula, Dark,
- * Light and Default leave uncoloured, so a parameter and the type beside it render the same.
- * This one picks keys those schemes colour (see the README, "Colours"): types teal, type
- * parameters olive, parameters purple, properties italic purple, functions gold or blue, library
- * functions italic. Colours repeat between kinds that are never neighbours.
+ * Maps the server's token types to keys that Darcula, Dark, Light and Default colour: types
+ * teal, type parameters olive, parameters purple, properties italic purple, functions gold or
+ * blue, library functions italic (see the README, "Colours"). LSP4IJ's own default mapping
+ * would leave a parameter and a type beside it the same plain colour.
  */
-internal class BlorpSemanticTokensSupport : LspSemanticTokensSupport() {
-    /**
-     * The platform asks for tokens only for files whose language is plain text or TextMate.
-     * Blorp has its own language (it needs a parser definition), so it must opt in or the
-     * server is never asked and nothing is coloured.
-     */
-    override fun shouldAskServerForSemanticTokens(psiFile: PsiFile): Boolean =
-        psiFile.language == BlorpLanguage || super.shouldAskServerForSemanticTokens(psiFile)
-
-    override fun getTextAttributesKey(tokenType: String, modifiers: List<String>): TextAttributesKey =
-        blorpTextAttributesKey(tokenType, modifiers)
+internal class BlorpSemanticTokensColors : SemanticTokensColorsProvider {
+    override fun getTextAttributesKey(
+        tokenType: String,
+        tokenModifiers: List<String>,
+        file: PsiFile,
+    ): TextAttributesKey = blorpTextAttributesKey(tokenType, tokenModifiers)
 }
 
 /** Defined by the platform's bundled schemes (teal in all four) under this name. */

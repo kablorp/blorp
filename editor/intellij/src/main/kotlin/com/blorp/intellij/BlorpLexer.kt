@@ -20,11 +20,13 @@ object BlorpTokenTypes {
  * colouring (the server's semantic tokens do) and never fails: every character belongs to
  * some token, so a broken file still splits the same way.
  *
- * A quoted string splits at its `${expression}` holes, as the server's lexer does: one
- * string token ends with `${`, the next starts with the hole's closing `}`, and the hole
- * between is lexed as code, so a name inside it is a leaf of its own. A hole holds one
- * expression on one line and no interpolated string, so the only state is how many record
- * braces the open hole has opened.
+ * A quoted string splits at its `${expression}` holes, as the server's lexer does: a string
+ * token ends before the hole, `$`, `{` and the closing `}` are one punctuation token each, and
+ * the expression between is lexed as code, so a name inside it is a leaf of its own. The
+ * single-character brackets matter to LSP4IJ, which picks the word at a caret from the
+ * element before it and steps over a lone punctuation character to the name. A hole holds one
+ * expression on one line and no interpolated string, so the state is where the lexer stands
+ * in the hole's brackets, or how many record braces the open hole has opened.
  *
  * Keywords are ordinary WORD tokens, and block documentation and `|` strings are not
  * recognised; their text splits into words and punctuation, which is harmless here.
@@ -37,18 +39,17 @@ class BlorpLexer : LexerBase() {
     private var tokenType: IElementType? = null
     private var tokenState = 0
 
-    // The record braces open in the current hole of a quoted string; null outside a hole.
-    private var holeBraces: Int? = null
+    private var hole: HoleState = HoleState.OutsideHole
 
     override fun start(buffer: CharSequence, startOffset: Int, endOffset: Int, initialState: Int) {
         this.buffer = buffer
         this.endOffset = endOffset
         tokenStart = startOffset
-        holeBraces = if (initialState == 0) null else initialState - 1
+        hole = HoleState.decode(initialState)
         locateToken()
     }
 
-    // 0 outside a hole, else 1 more than the hole's open braces, as at the token's start.
+    // The hole state at the token's start, encoded by HoleState.encode.
     override fun getState(): Int = tokenState
 
     override fun getTokenType(): IElementType? = tokenType
@@ -67,8 +68,10 @@ class BlorpLexer : LexerBase() {
     override fun getBufferEnd(): Int = endOffset
 
     private fun locateToken() {
-        val braces = holeBraces
-        tokenState = if (braces == null) 0 else braces + 1
+        // A hole directly after a hole has no string text between them.
+        if (hole == HoleState.ResumesString && startsHole(tokenStart)) hole = HoleState.AtDollar
+        val state = hole
+        tokenState = state.encode()
         if (tokenStart >= endOffset) {
             tokenType = null
             tokenEnd = tokenStart
@@ -76,23 +79,41 @@ class BlorpLexer : LexerBase() {
         }
         val first = buffer[tokenStart]
         when {
+            state == HoleState.AtDollar -> {
+                hole = HoleState.AtBrace
+                token(BlorpTokenTypes.PUNCTUATION, tokenStart + 1)
+            }
+            state == HoleState.AtBrace -> {
+                hole = HoleState.Open(0)
+                token(BlorpTokenTypes.PUNCTUATION, tokenStart + 1)
+            }
+            state == HoleState.ResumesString && first != '\n' -> stringPiece(0)
             first.isWhitespace() -> {
                 val end = scanWhile(1) { it.isWhitespace() }
-                if ('\n' in buffer.subSequence(tokenStart, end)) holeBraces = null
+                if ('\n' in buffer.subSequence(tokenStart, end)) hole = HoleState.OutsideHole
                 token(TokenType.WHITE_SPACE, end)
             }
             startsLineComment(tokenStart) -> token(BlorpTokenTypes.COMMENT, scanLine())
-            braces == 0 && first == '}' -> token(BlorpTokenTypes.STRING, scanStringPiece())
-            braces != null && (first == '{' || first == '}') -> {
-                holeBraces = if (first == '{') braces + 1 else braces - 1
+            state == HoleState.Open(0) && first == '}' -> {
+                hole = HoleState.ResumesString
                 token(BlorpTokenTypes.PUNCTUATION, tokenStart + 1)
             }
-            first == '"' && braces == null -> token(BlorpTokenTypes.STRING, scanStringPiece())
+            state is HoleState.Open && (first == '{' || first == '}') -> {
+                hole = HoleState.Open(state.braces + if (first == '{') 1 else -1)
+                token(BlorpTokenTypes.PUNCTUATION, tokenStart + 1)
+            }
+            first == '"' && state == HoleState.OutsideHole -> stringPiece(1)
             first == '"' || first == '\'' -> token(BlorpTokenTypes.STRING, scanQuoted(first))
             isWordStart(first) -> token(BlorpTokenTypes.WORD, scanWhile(1) { isWordPart(it) })
             first in '0'..'9' -> token(BlorpTokenTypes.NUMBER, scanWhile(1) { it in '0'..'9' || it == '_' })
             else -> token(BlorpTokenTypes.PUNCTUATION, tokenStart + 1)
         }
+    }
+
+    private fun stringPiece(skip: Int) {
+        val piece = scanStringPiece(skip)
+        token(BlorpTokenTypes.STRING, piece.end)
+        hole = if (piece.opensHole) HoleState.AtDollar else HoleState.OutsideHole
     }
 
     private fun token(type: IElementType, end: Int) {
@@ -108,26 +129,27 @@ class BlorpLexer : LexerBase() {
 
     private fun scanLine(): Int = scanWhile(2) { it != '\n' }
 
+    private fun startsHole(offset: Int): Boolean =
+        offset + 1 < endOffset && buffer[offset] == '$' && buffer[offset + 1] == '{'
+
+    private class StringPiece(val end: Int, val opensHole: Boolean)
+
     /**
-     * A string piece, from its opening quote or its hole's closing brace, ends at the
-     * closing quote, just after a `${` (opening a hole), or at the line end when unterminated.
+     * A string piece, after [skip] characters (1 for the opening quote, 0 when resuming after
+     * a hole's `}`), ends at the closing quote, just before a `${` (opening a hole), or at the
+     * line end when unterminated.
      */
-    private fun scanStringPiece(): Int {
-        var end = tokenStart + 1
-        holeBraces = null
+    private fun scanStringPiece(skip: Int): StringPiece {
+        var end = tokenStart + skip
         while (end < endOffset && buffer[end] != '\n') {
-            val char = buffer[end]
-            end += 1
             when {
-                char == '\\' && end < endOffset && buffer[end] != '\n' -> end += 1
-                char == '"' -> return end
-                char == '$' && end < endOffset && buffer[end] == '{' -> {
-                    holeBraces = 0
-                    return end + 1
-                }
+                startsHole(end) -> return StringPiece(end, opensHole = true)
+                buffer[end] == '\\' && end + 1 < endOffset && buffer[end + 1] != '\n' -> end += 2
+                buffer[end] == '"' -> return StringPiece(end + 1, opensHole = false)
+                else -> end += 1
             }
         }
-        return end
+        return StringPiece(end, opensHole = false)
     }
 
     /** A span without holes ends at its closing quote, or at the line end when unterminated. */
@@ -148,4 +170,42 @@ class BlorpLexer : LexerBase() {
     private fun isWordStart(char: Char) = char == '_' || char in 'a'..'z' || char in 'A'..'Z'
 
     private fun isWordPart(char: Char) = isWordStart(char) || char in '0'..'9'
+}
+
+/** Where the lexer stands relative to a quoted string's `${expression}` holes. */
+internal sealed interface HoleState {
+    data object OutsideHole : HoleState
+
+    /** Just after a hole's closing `}`: the rest of the string follows. */
+    data object ResumesString : HoleState
+
+    /** Between a string piece and its hole: `$` is next. */
+    data object AtDollar : HoleState
+
+    /** `{` is next. */
+    data object AtBrace : HoleState
+
+    /** Inside the hole's code, with [braces] record braces open. */
+    data class Open(val braces: Int) : HoleState
+
+    /** The lexer's `Int` state: 0 outside, then the three marker states, then 4 + open braces. */
+    fun encode(): Int = when (this) {
+        OutsideHole -> 0
+        ResumesString -> 1
+        AtDollar -> 2
+        AtBrace -> 3
+        is Open -> OPEN_BASE + braces
+    }
+
+    companion object {
+        private const val OPEN_BASE = 4
+
+        fun decode(state: Int): HoleState = when (state) {
+            0 -> OutsideHole
+            1 -> ResumesString
+            2 -> AtDollar
+            3 -> AtBrace
+            else -> Open(state - OPEN_BASE)
+        }
+    }
 }

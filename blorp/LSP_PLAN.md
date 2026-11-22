@@ -1,8 +1,8 @@
 # Language server: `blorp lsp`
 
 **Status: plan, 2026-11-10; Keith settled its decisions and asked for a byte
-console on 2026-11-11. Landings 1–11 have landed; 12, the plugin on LSP4IJ,
-is in progress; 13 is planned and awaits Keith's approval.**
+console on 2026-11-11. Landings 1–12 have landed; Keith approved 13 on
+2026-11-21.**
 
 ## Problem
 
@@ -600,7 +600,7 @@ lines counted apart. Compile cost must also fit the e2e instruction ceilings'
 | 9c navigation, fixed input | ≤ +0.1% | ≤ +0.01% | ≤ +0.1% | ≤ +470 net |
 | 10 the CLion plugin | not compiled | not compiled | not compiled | ≤ 580 Kotlin and XML |
 | 11 broken files, fixed input | ≤ +0.1% | ≤ +0.01% | ≤ +0.1% | ≤ +460 net |
-| 12 the plugin on LSP4IJ | not compiled | not compiled | not compiled | ≤ 500 Kotlin and XML |
+| 12 the plugin on LSP4IJ | not compiled | not compiled | not compiled | ≤ 570 Kotlin and XML |
 | 13 library files, fixed input | ≤ +0.1% (noise) | no increase | no increase | ≤ −80 net |
 
 **Latency.** Per request after one change, on this host: ≤ 1.0 s for
@@ -1214,6 +1214,7 @@ plugin's executable) found three server defects.
   Each mutation, run alone, failed its tests.
 
 **Landing 10, the CLion plugin** (`editor/intellij/`, against `c0d78722d`).
+Landing 12 moved it to LSP4IJ, which removed the workarounds below.
 A Gradle Kotlin project built against the installed CLion 2026.3
 (`-PclionPath`, with CLion's JBR as `JAVA_HOME`). It registers `.brp` with an
 icon, a lexer and flat parser, the LSP integration provider, a declaration
@@ -1309,6 +1310,43 @@ server, and a path that cannot start shows a balloon.
   the worktree's `blorp/build/lsp-broken-files/`). The CLion plugin's tests
   pass against this server.
 - **Review.** 0 blockers, 0 majors, 4 minors and 3 nits, all fixed.
+
+**Landing 12, the plugin on LSP4IJ** (against `0cdfe13ae`). Keith chose LSP4IJ
+0.30.1 (Red Hat, EPL-2.0) on 2026-11-21, after a spike. On CLion's own LSP API
+the plugin needed three workarounds, and CLion's C/C++ engine wraps the
+shortcuts that later features need.
+
+- **What changed.**
+  - The plugin depends on `com.redhat.devtools.lsp4ij`, which users install
+    from the Marketplace, and defines one server and a language mapping.
+  - The token-type, Go to Declaration and integration workarounds are gone.
+    Colours go through LSP4IJ's colours provider, with the same keys.
+  - A path change restarts the server through LSP4IJ's forced restart, which
+    waits for the stop; a stop then a start would race.
+- **Lexer.**
+  - LSP4IJ takes the word from the element before the caret, unless that is
+    whitespace or one punctuation character. So a hole's `$`, `{` and `}` are
+    one-character tokens; with landing 10's lexer, a name at a hole's start
+    targets `"${`.
+  - The hole state is a sealed type, encoded in the lexer's state, and every
+    lexer input relexes from any token start as a full pass does.
+- **Keith's run of the spike.**
+  - Passed: colours, Cmd-click and Cmd-B into the library, diagnostics and
+    scratch files.
+  - Cmd-click on a declaration's own name still finds nothing.
+  - Alt+F7 lists no usages, though it did on landing 10.
+  - Neither failure reproduces headlessly, even with CLion's own plugins
+    loaded, where Find Usages lists every usage. The plugin README gives both
+    as known limits, and Keith's next run checks Alt+F7 with the new lexer.
+- **Tests.**
+  - 39 Gradle tests, which pass against landing 11's server.
+  - One of them runs the repository's server: Go to Declaration under the
+    C/C++ engine's action id, LSP4IJ's usage search from a name in a hole at
+    exact offsets, and a restart on a path change.
+- **Ceiling.** 500 was set from the spike's 465. It is corrected to 570 under
+  the standing delegation: +30 for the hole tokens, and +32 for the sealed
+  hole state that review asked for. Tests are 581 lines.
+- **Review.** 0 blockers, 2 majors, 3 minors and 3 nits, all fixed.
 
 ## Testing
 

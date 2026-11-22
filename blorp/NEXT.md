@@ -71,9 +71,12 @@ done.
     CLion's C/C++ engine hides those shortcuts from its LSP support.
   - **Landed:** landing 11: while a file fails to check, it is served from
     its program's last analysis that checked, through a line diff.
-  - **Next:** landing 12, the plugin on LSP4IJ (Keith, 2026-11-21), then
-    landing 13: library files through `workspace/textDocumentContent` instead
-    of a folder in `/tmp`, and plain `Location`s.
+  - **Landed:** landing 12, the CLion plugin on LSP4IJ (Keith, 2026-11-21).
+    Known limits: Alt+F7 and Cmd-click on a declaration list no usages in
+    Keith's CLion.
+  - **Next:** landing 13, approved by Keith on 2026-11-21: library files
+    through `workspace/textDocumentContent` instead of a folder in `/tmp`, and
+    plain `Location`s.
 - **String code points:** [`STRING_PLAN.md`](STRING_PLAN.md).
   - **Status:** approved on 2026-11-10: `length` counts code points, from a
     count stored in each String, and byte work uses `byte_*` functions. L1

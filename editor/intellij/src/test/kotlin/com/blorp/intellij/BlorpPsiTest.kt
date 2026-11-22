@@ -2,6 +2,7 @@ package com.blorp.intellij
 
 import com.intellij.lang.LanguageUtil
 import com.intellij.testFramework.fixtures.BasePlatformTestCase
+import com.redhat.devtools.lsp4ij.LanguageServersRegistry
 
 /**
  * Editor features such as Go to Declaration look for a reference at the element under the
@@ -38,8 +39,9 @@ class BlorpPsiTest : BasePlatformTestCase() {
         assertTrue(LanguageUtil.getFileLanguages().any { it.id == "Blorp" })
     }
 
-    fun testServerIsAskedForSemanticTokensOfABrpFile() {
+    fun testLsp4ijMapsABrpFileToTheBlorpServer() {
         val file = myFixture.configureByText("main.brp", source)
-        assertTrue(BlorpSemanticTokensSupport().shouldAskServerForSemanticTokens(file))
+        assertTrue(LanguageServersRegistry.getInstance().isFileSupported(file))
+        assertNotNull(LanguageServersRegistry.getInstance().getServerDefinition(BLORP_SERVER_ID))
     }
 }

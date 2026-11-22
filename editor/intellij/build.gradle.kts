@@ -28,6 +28,7 @@ dependencies {
         } else {
             clion(publishedClionVersion)
         }
+        plugin("com.redhat.devtools.lsp4ij", "0.30.1")
         testFramework(TestFrameworkType.Platform)
     }
 
@@ -48,7 +49,7 @@ intellijPlatform {
 
 tasks.test {
     useJUnitPlatform()
-    // The Go to Declaration tests run the repository's own `blorp lsp` build
+    // The navigation test runs the repository's own `blorp lsp` build
     // (`make -C blorp compiler`); a rebuilt server reruns them.
     val blorpBinary = layout.projectDirectory.file("../../blorp/build/blorp").asFile
     systemProperty("blorp.binary", blorpBinary.path)

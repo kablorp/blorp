@@ -2,18 +2,22 @@ package com.blorp.intellij
 
 import com.intellij.openapi.options.BoundConfigurable
 import com.intellij.openapi.project.Project
-import com.intellij.platform.lsp.api.LspClientManager
+import com.redhat.devtools.lsp4ij.LanguageServerManager
 import com.intellij.ui.dsl.builder.bindText
 import com.intellij.ui.dsl.builder.panel
 
 class BlorpConfigurable(private val project: Project) : BoundConfigurable("Blorp") {
 
-    /** Applies a changed path now: the running server is stopped and restarted for open files. */
+    /** Applies a changed path now: a running server is restarted. */
     override fun apply() {
         val pathBefore = BlorpSettings.getInstance(project).serverPath
         super.apply()
         if (BlorpSettings.getInstance(project).serverPath != pathBefore) {
-            LspClientManager.getInstance(project).stopAndRestartClientsIfNeeded(BlorpLspIntegrationProvider::class.java)
+            // stop() returns before the server has stopped, so a start right after it finds the
+            // old server still running. A forced restart chains the start on the stop and builds
+            // a new connection, which reads the new path. It leaves a server that is not running alone.
+            LanguageServerManager.getInstance(project)
+                .start(BLORP_SERVER_ID, LanguageServerManager.StartOptions().setForceRestart(true))
         }
     }
 

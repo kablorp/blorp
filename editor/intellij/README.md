@@ -1,10 +1,16 @@
 # Blorp for CLion
 
-A minimal plugin: the `.brp` file type, a launcher for `blorp lsp`, and one setting.
-The server supplies the colours (semantic tokens), diagnostics, definition and
-references. The plugin has no highlighter: its lexer and flat parser only split a
-file into word-sized elements, which Go to Declaration underlines and lands on,
-and make Blorp appear in New Scratch File. The plugin colours nothing itself.
+A minimal plugin: the `.brp` file type, a launcher for `blorp lsp`, one setting and the colours
+for the server's semantic tokens. The language client is LSP4IJ (Red Hat's LSP plugin), which
+supplies the semantic-token colours, diagnostics, Go to Declaration and Find Usages. The plugin
+has no highlighter of its own: its lexer and flat parser only split a file into word-sized
+elements, which LSP4IJ's word pick lands on, and make Blorp appear in New Scratch File.
+
+## Prerequisite
+
+Install LSP4IJ first: Settings > Plugins > Marketplace > "LSP4IJ". The plugin depends on it
+(`com.redhat.devtools.lsp4ij`; built and tested against 0.30.1). The Language Servers tool
+window (bottom bar) lists the Blorp server and shows its log and traces.
 
 ## Build
 
@@ -15,14 +21,15 @@ the compiler's own `main.brp`):
     make -C blorp compiler TEST_COMPILER_FLAGS=-O2
 
 Build the plugin against an installed CLion. The path comes from the `clionPath`
-Gradle property; without it Gradle downloads the published CLion (large).
+Gradle property; without it Gradle downloads the published CLion (large). Gradle also
+downloads LSP4IJ 0.30.1 (about 4.7 MB) from the JetBrains Marketplace.
 CLion 2026.3 needs JDK 25, so use its bundled runtime as the Gradle JVM:
 
     cd editor/intellij
     export JAVA_HOME=~/Applications/CLion.app/Contents/jbr/Contents/Home
     ./gradlew -PclionPath=$HOME/Applications/CLion.app test buildPlugin
 
-The Go to Declaration test runs that `blorp/build/blorp` as the server, so build
+The navigation test runs that `blorp/build/blorp` as the server, so build
 the compiler first. The zip is `build/distributions/blorp-intellij-0.0.1.zip`. Gradle may still
 download the Gradle distribution, the IntelliJ Platform and Kotlin Gradle
 plugins, and Kotlin 2.3.
@@ -34,10 +41,10 @@ restart.
 
 ## Colours
 
-The platform's default mapping leaves a parameter and the type beside it the same plain
+LSP4IJ's default mapping leaves a parameter and the type beside it the same plain
 text colour in Darcula, Dark, Light and Default, whose bundled schemes colour neither
 `DEFAULT_CLASS_NAME` nor `DEFAULT_PARAMETER`. The plugin maps the server's token types
-(`BlorpSemanticTokensSupport.kt`) to keys those schemes do colour, read from CLion's
+(`BlorpSemanticTokensColors.kt`, an LSP4IJ colours provider) to keys those schemes do colour, read from CLion's
 `DefaultColorSchemesManager.xml` (Default, Darcula) and `themes/expUI` (New UI Dark and Light):
 
 | Token | Key | Darcula | New UI Dark | New UI Light | Default |
@@ -58,21 +65,23 @@ names it) but every bundled scheme colours it teal, and nothing else standard do
 repeat only between kinds that are not neighbours. There is no settings page: change a
 colour in Settings > Editor > Color Scheme for the key above.
 
-## Go to Declaration
+## Go to Declaration and Find Usages
 
-CLion's LSP support answers Go to Declaration only while the running action is
-`GotoDeclaration`. CLion's C/C++ engine runs Cmd-B and Cmd-click inside its own
-wrapper action, so through the LSP support alone they report "Cannot find
-declaration to go to", while Cmd-hover and Navigate > Declaration work.
-`BlorpGotoDeclarationHandler.kt` asks the server for the definition itself, as
-CLion asks declaration handlers whatever the action. Remove it once CLion's LSP
-support answers the wrapped shortcuts.
+Both come from LSP4IJ; the plugin has no handler of its own. LSP4IJ asks the server for the
+definition through a declaration handler, which CLion consults under any action, so Cmd-B and
+Cmd-click work under CLion's C/C++ engine, into the library too. The lexer splits a string's
+`${` and `}` into single-character tokens so that LSP4IJ's word pick lands on a name inside a
+hole.
+
+Known limits:
 
 - Until the server has started, Cmd-click finds nothing.
-- On a declaration's own name, Cmd-B and Cmd-click report "Cannot find
-  declaration to go to" instead of listing usages: listing them is CLion's LSP
-  support's job, which the wrapper blocks. Navigate > Declaration or Usages and
-  Find Usages (Alt+F7) list them.
+- On a declaration's own name, Cmd-B and Cmd-click report "Cannot find declaration to go to"
+  instead of listing usages. Find Usages (Alt+F7) is the way to list them; Navigate > Declaration or Usages has not been checked under LSP4IJ.
+- Alt+F7 listed no usages in one CLion 2026.3 run, though LSP4IJ's Find Usages works in the
+  test sandbox with CLion's plugins loaded (also when started from a declaration under the
+  C/C++ engine's wrapper action). If it recurs, see LSP4IJ's Language Servers window for a
+  `textDocument/references` request.
 
 ## Setting
 
@@ -86,18 +95,17 @@ runs `<path> lsp` in the project's base directory.
 
 ## Manual checklist
 
-Open this repository in CLion. Tick each item that passes; write down what you saw
-for any that fail.
+Install LSP4IJ and this plugin, then open this repository in CLion. Tick each item that
+passes; write down what you saw for any that fail.
 
-- [ ] Open `blorp/src/main.brp`. Pass: the editor tab and Project view show the Blorp icon (a blue rounded square with a white b) and the Blorp file type (Settings > Editor > File Types lists `*.brp` under Blorp).
-- [ ] Pass: `idea.log` (Help > Show Log in Finder) contains `Launching Blorp LSP: ... lsp`, and no launch error follows it.
+- [ ] Open `blorp/src/main.brp`. Pass: the editor tab and Project view show the Blorp icon and the Blorp file type, and the Language Servers window lists Blorp as started.
 - [ ] In `blorp/src/main.brp`, pass: keywords, comments, strings and numbers each have a colour, and names are coloured rather than plain text.
-- [ ] In the same file, pass: a function parameter, a local, a record field, a function name, a type name and a library name (an imported function) each show a visibly different colour, and a parameter and the type written after it (`name: Type`) differ.
-- [ ] Add `x = 1 + "a"` inside a function body of a scratch `.brp` file. Pass: a diagnostic appears on that line. Delete the line and type a character. Pass: the diagnostic disappears.
-- [ ] In a scratch `.brp` file, add a line `func (` (a syntax error). Pass: the rest of the file keeps its colours.
-- [ ] Open two files where the first imports the second. Edit the second (rename an exported function), then look at the first. Record whether the first file's colours or diagnostics update without editing it. (This answers the `workspace/semanticTokens/refresh` question; either answer is a result.)
-- [ ] Go to Declaration: in `blorp/src/main.brp` Cmd-click `unknown_command` at line 64. Pass: the caret jumps to line 47. Cmd-click `parse_help` at line 107. Pass: it jumps to line 51. Put the caret on `unknown_command` at line 119 and press Cmd-B. Pass: it jumps to line 47. Cmd-click `print` in any file. Pass: a library file opens at its declaration. Also pass: holding Cmd over a name underlines it before the click.
-- [ ] Find Usages (Alt+F7) on `parse_help`: pass if the usages list opens with its call sites.
-- [ ] Change the path setting from one working value to another (for example blank, then an absolute path to the same binary). Pass without restarting CLion: `idea.log` shows a new `Launching Blorp LSP` line for the new path, and colours return.
-- [ ] Set the path to `/nonexistent/blorp` and Apply. Pass: a balloon "The Blorp language server did not start" names `/nonexistent/blorp`, and its "Open Blorp settings" link opens the Blorp settings page. Then set a working path, Apply, and pass: the server starts without restarting CLion.
+- [ ] In the same file, pass: a function parameter, a local, a record field, a function name, a type name and a library name each show a visibly different colour, and a parameter and the type after it (`name: Type`) differ.
+- [ ] Add `x = 1 + "a"` inside a function of a scratch `.brp` file. Pass: a diagnostic appears; delete the line and type a character, and it disappears.
+- [ ] Add a line `func (` (a syntax error). Pass: the rest of the file keeps its colours.
+- [ ] Go to Declaration: Cmd-click `unknown_command` at line 64 of `blorp/src/main.brp`. Pass: the caret jumps to line 47. Cmd-B on `unknown_command` at line 119 also jumps to line 47. Cmd-click `print`. Pass: a library file opens at its declaration.
+- [ ] Cmd-click a name inside a string's `${ }` hole. Pass: it jumps to the declaration.
+- [ ] Find Usages (Alt+F7) on `parse_help`: pass if the usages list opens with its call sites. Record what happens if it does not.
+- [ ] Change the path setting from one working value to another. Pass without restarting CLion: the Language Servers window shows the server restarted, and colours return.
+- [ ] Set the path to `/nonexistent/blorp` and Apply. Pass: a balloon "The Blorp language server did not start" names it, and its "Open Blorp settings" link opens the Blorp settings page. Then set a working path, Apply, and pass: the server starts again.
 - [ ] File > New > Scratch File. Pass: Blorp is in the language list, and the new scratch file gets colours and diagnostics once it has text.
