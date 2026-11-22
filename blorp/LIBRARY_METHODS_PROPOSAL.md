@@ -234,3 +234,20 @@ The estimate missed the per-module receiver lookups.
   No e2e ceiling was exceeded, so none moved.
 
 Logs are in `blorp/build/foundation-methods/final2/`.
+
+## The seed rotation
+
+`blorp/bootstrap.env` pins `blorp-seed-8eb8e16546b3`, which main's CI built
+from landing 1 (`8eb8e1654`). Every target emitted identical compiler C. This
+seed knows the foundation methods role, so the library can rely on it and the
+27 rows can go.
+
+**Gates on the pin:**
+
+- `make -C blorp test`: exit 0, 3,360 PASS, 0 FAIL;
+- `make -C blorp test-e2e INSTRUCTION_CHECK=on`: exit 0, 1,167 PASS, 0 FAIL.
+  No e2e ceiling moved;
+- `scripts/blorp-fixpoint --prove`: exit 0;
+- `bash blorp/test/test_bootstrap/test_bootstrap.sh`: exit 0, 38 PASS.
+
+Logs are in `blorp/build/seed-rotation/`.
