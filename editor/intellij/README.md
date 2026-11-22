@@ -73,6 +73,10 @@ Cmd-click work under CLion's C/C++ engine, into the library too. The lexer split
 `${` and `}` into single-character tokens so that LSP4IJ's word pick lands on a name inside a
 hole.
 
+Library files (Cmd-click `print`) open read-only, as `blorp-library:` documents whose text LSP4IJ
+fetches from the server with `workspace/textDocumentContent`; they get the lexer's colours only,
+and LSP4IJ's own tokens request for them is checked by hand in CLion.
+
 Known limits:
 
 - Until the server has started, Cmd-click finds nothing.
@@ -103,7 +107,7 @@ passes; write down what you saw for any that fail.
 - [ ] In the same file, pass: a function parameter, a local, a record field, a function name, a type name and a library name each show a visibly different colour, and a parameter and the type after it (`name: Type`) differ.
 - [ ] Add `x = 1 + "a"` inside a function of a scratch `.brp` file. Pass: a diagnostic appears; delete the line and type a character, and it disappears.
 - [ ] Add a line `func (` (a syntax error). Pass: the rest of the file keeps its colours.
-- [ ] Go to Declaration: Cmd-click `unknown_command` at line 64 of `blorp/src/main.brp`. Pass: the caret jumps to line 47. Cmd-B on `unknown_command` at line 119 also jumps to line 47. Cmd-click `print`. Pass: a library file opens at its declaration.
+- [ ] Go to Declaration: Cmd-click `unknown_command` at line 64 of `blorp/src/main.brp`. Pass: the caret jumps to line 47. Cmd-B on `unknown_command` at line 119 also jumps to line 47. Cmd-click `print`. Pass: a read-only library file opens at its declaration.
 - [ ] Cmd-click a name inside a string's `${ }` hole. Pass: it jumps to the declaration.
 - [ ] Find Usages (Alt+F7) on `parse_help`: pass if the usages list opens with its call sites. Record what happens if it does not.
 - [ ] Change the path setting from one working value to another. Pass without restarting CLion: the Language Servers window shows the server restarted, and colours return.

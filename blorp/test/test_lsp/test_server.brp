@@ -14,7 +14,7 @@ import:
     result: Result methods
     test: TestSuite
     ../../src/common/analysis/load/load:
-        LibrarySource(EmbeddedLibrary, LibraryDirectory),
+        LibrarySource(EmbeddedLibrary),
         library_layout,
         load_program_with_sources
     ../../src/common/syntax/source:
@@ -24,21 +24,18 @@ import:
         module_id,
         module_source
     ../../src/common/syntax/syntax: Diagnostic, Span, compiler_span, diagnostic, internal_error
-    ../../src/lsp/protocol: file_uri
+    ../../src/lsp/protocol: file_uri, library_uri
     ../../src/lsp/server:
         AnalysisOutcome(LoadFailed, CheckFailed, Analysed),
         AnalysisRequest,
         DocumentAnalysis,
-        ServedLibrary,
         Server,
-        ShutdownAnswer,
         Step,
         analysed,
         document_analysis,
         exit_status,
         receive,
         receive_body,
-        shutdown_answer,
         snapshots,
         start_server
     ../driver/file_access: read_file
@@ -65,32 +62,21 @@ private pure func after(server: Server, messages: List[String]) -> Step:
     step
 
 
--- The folder the tests' servers view the library in. Nothing is there: every
--- analysis here reads the embedded library.
-private LIBRARY: String = "/library"
-
--- Where a load would resolve a relative library root. LIBRARY and the
--- embedded root are fixed, so the layouts never read it.
+-- Where a load would resolve a relative library root. The embedded root is
+-- fixed, so its layout never reads it.
 private WORKING_DIRECTORY: String = "/work"
 
 
--- The library a server serves: the embedded one, viewed in `view`.
-private pure func served(view: Path, directory: Path) -> Option[ServedLibrary]:
-    match (
-        library_layout(EmbeddedLibrary, directory),
-        library_layout(LibraryDirectory(view.to_string()), directory)
-    ):
-        (Ok(embedded), Ok(view_layout)): Some({ analysed = embedded, view = view_layout })
-        _: None
-
-
--- A new server whose library's view is LIBRARY. The paths are valid, so the
--- layouts are always built; were they not, every test that needs a server
--- would fail.
+-- A new server. The path is valid, so the layout is always built; were it not,
+-- every test that needs a server would fail.
 private pure func new_server() -> Option[Server]:
-    match (LIBRARY.to_path(), WORKING_DIRECTORY.to_path()):
-        (Ok(view), Ok(directory)): served(view, directory).map(start_server)
-        _: None
+    match WORKING_DIRECTORY.to_path():
+        Ok(directory):
+            match library_layout(EmbeddedLibrary, directory):
+                Ok(layout): Some(start_server(layout))
+                Err(_): None
+        Err(_):
+            None
 
 
 -- A pure test of a new server.
@@ -157,7 +143,12 @@ private pure func did_close(uri: String) -> String:
 
 
 private pure func initialized_reply(encoding: String) -> String:
-    "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"capabilities\":{\"positionEncoding\":\"${encoding}\",\"textDocumentSync\":{\"openClose\":true,\"change\":1},\"semanticTokensProvider\":{\"legend\":{\"tokenTypes\":[\"namespace\",\"type\",\"interface\",\"enumMember\",\"typeParameter\",\"parameter\",\"variable\",\"property\",\"function\",\"method\",\"keyword\",\"comment\",\"string\",\"number\",\"operator\"],\"tokenModifiers\":[\"declaration\",\"readonly\",\"defaultLibrary\",\"documentation\"]},\"full\":true},\"definitionProvider\":true,\"referencesProvider\":true}}}"
+    encoding.initialized_reply_with("")
+
+
+-- The reply with `extra` capabilities after the references provider.
+private pure func initialized_reply_with(encoding: String, extra: String) -> String:
+    "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"capabilities\":{\"positionEncoding\":\"${encoding}\",\"textDocumentSync\":{\"openClose\":true,\"change\":1},\"semanticTokensProvider\":{\"legend\":{\"tokenTypes\":[\"namespace\",\"type\",\"interface\",\"enumMember\",\"typeParameter\",\"parameter\",\"variable\",\"property\",\"function\",\"method\",\"keyword\",\"comment\",\"string\",\"number\",\"operator\"],\"tokenModifiers\":[\"declaration\",\"readonly\",\"defaultLibrary\",\"documentation\"]},\"full\":true},\"definitionProvider\":true,\"referencesProvider\":true${extra}}}}"
 
 
 private pure func error_reply(id: String, code: Int, message: String) -> String:
@@ -179,6 +170,99 @@ pure func test_initialize_chooses_utf16_otherwise() -> Bool:
         server
             .after([INITIALIZE_UTF16])
             .answers([initialized_reply("utf-16")])
+    )
+
+
+private FETCHES_LIBRARY: String = ",\"workspace\":{\"textDocumentContent\":{\"schemes\":[\"blorp-library\"]}}"
+
+
+-- Fetching library files is offered exactly when the client has the
+-- `workspace.textDocumentContent` capability.
+pure func test_initialize_offers_library_documents_only_to_a_client_that_fetches_them() -> Bool:
+    serving(pure func(server: Server) -> Bool:
+        and(
+            server
+                .after([INITIALIZE_FETCHING])
+                .answers([initialized_reply_with("utf-16", FETCHES_LIBRARY)]),
+            server
+                .after([INITIALIZE_UTF16])
+                .answers([initialized_reply("utf-16")])
+        )
+    )
+
+
+private pure func content_request(id: Int, uri: String) -> String:
+    "{\"jsonrpc\":\"2.0\",\"id\":${id},\"method\":\"workspace/textDocumentContent\",\"params\":{\"uri\":\"${uri}\"}}"
+
+
+private pure func invalid_params(id: Int, message: String) -> String:
+    error_reply("${id}", -32602, message)
+
+
+-- The text is the embedded file's, which the source tree's copy equals.
+func test_the_content_request_answers_the_embedded_file_text() -> Bool:
+    loading(func(server: Server) -> Bool:
+        match library_file("io/console/output.brp"):
+            Some(file):
+                match read_file(file.to_string()):
+                    Ok(text):
+                        server
+                            .after([
+                                INITIALIZE_FETCHING,
+                                content_request(2, "blorp-library:///io/console/output.brp")
+                            ])
+                            .answers([result_reply(2, render(Object({ "text" => Text(text) })))])
+                    Err(_):
+                        False
+            None:
+                False
+    )
+
+
+private pure func not_a_library_uri(id: Int, uri: String) -> String:
+    invalid_params(id, "${uri} is not a blorp-library: URI")
+
+
+pure func test_the_content_request_rejects_a_uri_that_is_not_a_library_uri() -> Bool:
+    serving(pure func(server: Server) -> Bool:
+        ready = server.after([INITIALIZE_FETCHING]).server
+        uris = [
+            "file:///work/main.brp",
+            "blorp-library://host/list.brp",
+            "blorp-library:///list%zz.brp"
+        ]
+        var id = 3
+        var every: Bool = True
+        for uri in uris:
+            every = and(
+                every,
+                ready
+                    .receive(json(content_request(id, uri)))
+                    .answers([not_a_library_uri(id, uri)])
+            )
+            id = id + 1
+        every
+    )
+
+
+-- The file is found by its exact path in the library's table, so a path that
+-- is not exactly a library file's, one that climbs out of the root among them,
+-- finds nothing.
+pure func test_the_content_request_finds_a_file_only_by_its_exact_path() -> Bool:
+    serving(pure func(server: Server) -> Bool:
+        ready = server.after([INITIALIZE_FETCHING]).server
+        files = ["", "../list.brp", "io/../list.brp", "./list.brp", "no/such.brp"]
+        var id = 3
+        var every: Bool = True
+        for file in files:
+            every = and(
+                every,
+                ready
+                    .receive(json(content_request(id, "blorp-library:///${file}")))
+                    .answers([invalid_params(id, "the standard library has no file ${file}")])
+            )
+            id = id + 1
+        every
     )
 
 
@@ -236,53 +320,21 @@ pure func test_a_second_initialize_gets_32600() -> Bool:
 private SHUTDOWN_REPLY: String = "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":null}"
 
 
--- The server once the transport has written the held reply to `shutdown`.
-private pure func left(server: Server) -> Server:
-    match server.shutdown_answer():
-        Some(answer): answer.server
-        None: server
-
-
--- The reply waits for the transport to leave the library's folder, so the
--- step carries none; the server holds it in `shutdown_answer`.
-pure func test_shutdown_holds_its_null_reply_until_the_library_is_left() -> Bool:
+-- `shutdown` replies null at once, with nothing held for the transport.
+pure func test_shutdown_replies_null_at_once() -> Bool:
     serving(pure func(server: Server) -> Bool:
-        shut = server.after([INITIALIZE, SHUTDOWN])
-        and(
-            and(
-                shut.answers([]),
-                (
-                    shut.server
-                        .shutdown_answer()
-                        .map(pure func(answer: ShutdownAnswer) -> String: render(answer.reply))
-                    == Some(SHUTDOWN_REPLY)
-                )
-            ),
-            and(
-                server
-                    .shutdown_answer()
-                    .is_none(),
-                shut.server
-                    .left()
-                    .shutdown_answer()
-                    .is_none()
-            )
-        )
+        server
+            .after([INITIALIZE, SHUTDOWN])
+            .answers([SHUTDOWN_REPLY])
     )
 
 
 pure func test_requests_after_shutdown_get_32600() -> Bool:
     serving(pure func(server: Server) -> Bool:
         shut = server.after([INITIALIZE, SHUTDOWN]).server
-        and(
-            shut
-                .receive(json(SHUTDOWN))
-                .answers([error_reply("2", -32600, "the server has shut down")]),
-            shut
-                .left()
-                .receive(json(SHUTDOWN))
-                .answers([error_reply("2", -32600, "the server has shut down")])
-        )
+        shut
+            .receive(json(SHUTDOWN))
+            .answers([error_reply("2", -32600, "the server has shut down")])
     )
 
 
@@ -290,21 +342,11 @@ pure func test_exit_ends_with_0_only_after_shutdown() -> Bool:
     serving(pure func(server: Server) -> Bool:
         and(
             and(
-                and(
-                    (
-                        server
-                            .after([INITIALIZE, SHUTDOWN, EXIT]).server
-                            .exit_status()
-                        == Some(0)
-                    ),
-                    (
-                        server
-                            .after([INITIALIZE, SHUTDOWN]).server
-                            .left()
-                            .receive(json(EXIT)).server
-                            .exit_status()
-                        == Some(0)
-                    )
+                (
+                    server
+                        .after([INITIALIZE, SHUTDOWN, EXIT]).server
+                        .exit_status()
+                    == Some(0)
                 ),
                 (
                     server
@@ -557,8 +599,8 @@ private pure func with_root_open(server: Server, initialize: String) -> Server:
 
 
 -- The library file cannot be shown, so its diagnostic goes at the start of the
--- root, led by its location in the view: `bc` starts line 2 of the library
--- text, which LIBRARY holds at `list.brp`.
+-- root, led by its path below the library root: `bc` starts line 2 of the
+-- library text, which the embedded library holds at `list.brp`.
 pure func test_each_user_file_gets_its_diagnostics_and_the_library_its_root() -> Bool:
     serving(pure func(server: Server) -> Bool:
         step = server
@@ -573,7 +615,7 @@ pure func test_each_user_file_gets_its_diagnostics_and_the_library_its_root() ->
         step.answers([
             published(ROOT_URI, [
                 reported(0, 10, 0, 11, "first\\nhelp: fix it"),
-                reported(0, 0, 0, 0, "/library/list.brp:2:1: in the library\\nhelp: nothing"),
+                reported(0, 0, 0, 0, "list.brp:2:1: in the library\\nhelp: nothing"),
                 reported(0, 0, 0, 1, "third\\nhelp: and this")
             ]),
             published(OTHER_URI, [reported(1, 0, 1, 3, "second\\nhelp: fix that")])
@@ -1138,13 +1180,9 @@ pure func test_initialized_registers_for_changed_files_once_when_the_client_can(
 
 -- Whether `server` still answers: its `shutdown` gets the null reply.
 private pure func still_serves(server: Server) -> Bool:
-    (
-        server
-            .receive(json(SHUTDOWN)).server
-            .shutdown_answer()
-            .map(pure func(answer: ShutdownAnswer) -> String: render(answer.reply))
-        == Some(SHUTDOWN_REPLY)
-    )
+    server
+        .receive(json(SHUTDOWN))
+        .answers([SHUTDOWN_REPLY])
 
 
 pure func test_the_clients_answer_to_the_registration_is_accepted() -> Bool:
@@ -1418,22 +1456,8 @@ private func navigating(server: Server, text: String) -> Server:
     server.navigating_as(INITIALIZE, text)
 
 
-private INITIALIZE_LINKING: String = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"capabilities\":{\"textDocument\":{\"definition\":{\"linkSupport\":true}}}}}"
-
-
--- A LocationLink whose origin is the name at `line` from `start` to `end` of
--- the root, and whose target is `target`, a Location.
-private pure func location_link(
-    line: Int,
-    start: Int,
-    end: Int,
-    uri: String,
-    target_line: Int,
-    target_start: Int,
-    target_end: Int
-) -> String:
-    range = "{\"start\":{\"line\":${target_line},\"character\":${target_start}},\"end\":{\"line\":${target_line},\"character\":${target_end}}}"
-    "{\"originSelectionRange\":{\"start\":{\"line\":${line},\"character\":${start}},\"end\":{\"line\":${line},\"character\":${end}}},\"targetUri\":\"${uri}\",\"targetRange\":${range},\"targetSelectionRange\":${range}}"
+-- A client that fetches library files with `workspace/textDocumentContent`.
+private INITIALIZE_FETCHING: String = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"capabilities\":{\"workspace\":{\"textDocumentContent\":{}}}}}"
 
 
 private pure func position_params(uri: String, line: Int, character: Int) -> String:
@@ -1559,13 +1583,13 @@ func test_definition_of_a_built_in_type_or_of_no_name_is_null() -> Bool:
 
 
 -- A built-in type is declared nowhere, so its references are every use: the
--- root's on lines 5, 23 and 29, HELPERS', and the rest in the library's view.
+-- root's on lines 5, 23 and 29, HELPERS', and the rest in the library, which a
+-- client that fetches library files is given as `blorp-library:` locations.
 func test_references_to_a_built_in_type_are_its_every_use() -> Bool:
-    -- Every location in the view, LIBRARY, starts so.
-    in_library = "{\"uri\":\"file://${LIBRARY}/"
+    in_library = "{\"uri\":\"blorp-library:///"
     loading(func(server: Server) -> Bool:
         found = server
-            .navigating(navigated_text())
+            .navigating_as(INITIALIZE_FETCHING, navigated_text())
             .references_at(5, 8, True)
             .listed()
         root_uses = [
@@ -1587,6 +1611,29 @@ func test_references_to_a_built_in_type_are_its_every_use() -> Bool:
                 not(library_uses.is_empty()),
                 library_uses.all(pure func(each: String) -> Bool: each.starts_with(in_library))
             )
+        )
+    )
+
+
+-- A client that cannot fetch library files is given the locations in user
+-- files alone, and no definition into the library.
+func test_a_client_that_cannot_fetch_library_files_gets_user_locations_only() -> Bool:
+    loading(func(server: Server) -> Bool:
+        ready = server.navigating(navigated_text())
+        found = ready
+            .references_at(5, 8, True)
+            .listed()
+        and(
+            and(
+                found.contains(location(ROOT_URI, 5, 7, 10)),
+                found.all(
+                    pure func(each: String) -> Bool: or(
+                        each.starts_with("{\"uri\":\"${ROOT_URI}\""),
+                        each.starts_with("{\"uri\":\"${HELPERS_URI}\"")
+                    )
+                )
+            ),
+            ready.definition_at(32, 6) == [result_reply(7, "null")]
         )
     )
 
@@ -1615,73 +1662,36 @@ private pure func line_starting(text: String, prefix: String) -> Option[Int]:
     found
 
 
--- `print` on line 32 is declared in the library's own file, on the line of
--- that file that declares it.
-func test_definition_of_a_library_function_lands_in_its_file() -> Bool:
-    match (library_server(), library_file("io/console/output.brp")):
-        (Some(server), Some(file)):
+-- `print` on line 32 is declared in the library's own file, which the client
+-- fetches as a `blorp-library:` document, on the line of it that declares it.
+func test_definition_of_a_library_function_is_a_library_location() -> Bool:
+    match (library_file("io/console/output.brp"), "io/console/output.brp".to_path()):
+        (Some(file), Ok(relative)):
             declared: Option[Int] = match read_file(file.to_string()):
                 Ok(text): text.line_starting("func print(")
                 Err(_): None
-            match declared:
-                Some(line):
+            match (new_server(), declared):
+                (Some(server), Some(line)):
                     (
                         server
-                            .navigating(navigated_text())
+                            .navigating_as(INITIALIZE_FETCHING, navigated_text())
                             .definition_at(32, 6)
-                        == [result_reply(7, location(file.file_uri(), line, 5, 10))]
+                        == [result_reply(7, location(relative.library_uri(), line, 5, 10))]
                     )
-                None:
+                _:
                     False
         _:
             False
 
 
--- `area` on line 31 spans 27 to 31 and is declared on line 23; the link's
--- origin is that name whether the position is inside it or at its end.
-func test_a_link_supporting_client_gets_the_name_it_asked_about_as_the_origin() -> Bool:
+-- `area` on line 31 spans 27 to 31 and is declared on line 23; a definition is
+-- one plain Location, whether the position is inside the name or at its end.
+func test_a_definition_is_a_plain_location() -> Bool:
     loading(func(server: Server) -> Bool:
-        linked = server.navigating_as(INITIALIZE_LINKING, navigated_text())
-        expected = [result_reply(7, "[${location_link(31, 27, 31, ROOT_URI, 23, 10, 14)}]")]
-        and(linked.definition_at(31, 29) == expected, linked.definition_at(31, 31) == expected)
+        ready = server.navigating(navigated_text())
+        expected = [result_reply(7, location(ROOT_URI, 23, 10, 14))]
+        and(ready.definition_at(31, 29) == expected, ready.definition_at(31, 31) == expected)
     )
-
-
--- The same definition without `linkSupport` is a plain Location.
-func test_a_client_without_link_support_gets_a_location() -> Bool:
-    loading(func(server: Server) -> Bool:
-        (
-            server
-                .navigating(navigated_text())
-                .definition_at(31, 29)
-            == [result_reply(7, location(ROOT_URI, 23, 10, 14))]
-        )
-    )
-
-
-func test_a_link_to_a_library_function_targets_its_file() -> Bool:
-    match (library_server(), library_file("io/console/output.brp")):
-        (Some(server), Some(file)):
-            declared: Option[Int] = match read_file(file.to_string()):
-                Ok(text): text.line_starting("func print(")
-                Err(_): None
-            match declared:
-                Some(line):
-                    (
-                        server
-                            .navigating_as(INITIALIZE_LINKING, navigated_text())
-                            .definition_at(32, 6)
-                        == [
-                            result_reply(
-                                7,
-                                "[${location_link(32, 4, 9, file.file_uri(), line, 5, 10)}]"
-                            )
-                        ]
-                    )
-                None:
-                    False
-        _:
-            False
 
 
 -- The reply to a references request at `line` and `character` of the root.
@@ -1870,29 +1880,16 @@ func test_closing_a_document_while_its_request_waits_answers_null() -> Bool:
     )
 
 
--- A server whose library is the one the analyses here read.
-private func library_server() -> Option[Server]:
-    match (get_current_directory(), LIBRARY_ROOT.to_path()):
-        (Ok(directory), Ok(root)):
-            served(
-                directory
-                    .join(root)
-                    .normalize(),
-                directory
-            ).map(start_server)
-        _:
-            None
-
-
--- A file of the library's view the client opens, after a definition led
--- there, is not the root of a program: it gets the lexer's tokens of its text,
--- no definition and no references. Its text is no snapshot, and every analysis
+-- A `blorp-library:` file the client opens, after a definition led there, is
+-- not the root of a program: it gets the lexer's tokens of its text, no
+-- definition and no references. Its text is no snapshot, and every analysis
 -- reads the embedded library, so opening, editing and closing it stale no
--- root; once closed it is forgotten. The foundation's files are the same.
+-- root; a change to it is dropped, since its editor is read-only, and once
+-- closed it is forgotten. The foundation's files are the same.
 func test_a_library_file_the_client_opens_gets_only_lexer_tokens() -> Bool:
-    match (library_server(), library_file("list.brp"), library_file("_base.brp")):
-        (Some(server), Some(list), Some(base)):
-            uri = list.file_uri()
+    match (new_server(), "list.brp".to_path(), "_base.brp".to_path()):
+        (Some(server), Ok(list), Ok(base)):
+            uri = list.library_uri()
             ready = server.navigating(navigated_text())
             opened = ready.receive(json(did_open(uri, "x = 1")))
             library = opened.server
@@ -1911,6 +1908,9 @@ func test_a_library_file_the_client_opens_gets_only_lexer_tokens() -> Bool:
                     .receive(json(references_request(8, uri, 0, 0, True)))
                     .answers([result_reply(8, "[]")]),
                 edited.answers([]),
+                edited.server
+                    .receive(json(tokens_request(9, uri)))
+                    .answers([tokens_reply(9, "0,2,1,14,0,0,2,1,13,0")]),
                 not(edited.server.stale(ROOT_URI)),
                 closed.answers([]),
                 not(closed.server.stale(ROOT_URI)),
@@ -1918,7 +1918,7 @@ func test_a_library_file_the_client_opens_gets_only_lexer_tokens() -> Bool:
                     .receive(json(tokens_request(9, uri)))
                     .answers([result_reply(9, "null")]),
                 ready
-                    .receive(json(did_open(base.file_uri(), "x = 1")))
+                    .receive(json(did_open(base.library_uri(), "x = 1")))
                     .answers([])
             ]
             checks.all(pure func(check: Bool) -> Bool: check)
@@ -2121,7 +2121,7 @@ func test_closing_an_open_dependency_stops_answers_into_it() -> Bool:
 
 
 -- `size` is called on line 1 after an e acute and an emoji, which UTF-16
--- counts as one unit and two: the position and the link's origin range are in
+-- counts as one unit and two: the position is in
 -- UTF-16 units, and the line is unchanged.
 private WIDE_TEXT: String =
     |func main() -> Int:
@@ -2149,16 +2149,13 @@ private WIDE_INSERTED_TEXT: String =
 func test_a_failed_root_converts_positions_in_utf16_around_wide_characters() -> Bool:
     loading(func(server: Server) -> Bool:
         broken = server
-            .after([INITIALIZE_LINKING, did_open(ROOT_URI, WIDE_TEXT.escaped())]).server
+            .after([INITIALIZE_UTF16, did_open(ROOT_URI, WIDE_TEXT.escaped())]).server
             .analysed_root(analysis_of(WIDE_TEXT)).server
             .failing(
                 [did_change(ROOT_URI, WIDE_INSERTED_TEXT.escaped())],
                 analysis_of(WIDE_INSERTED_TEXT)
             )
-        (
-            broken.definition_at(1, 28)
-            == [result_reply(7, "[${location_link(1, 26, 30, ROOT_URI, 6, 5, 9)}]")]
-        )
+        broken.definition_at(1, 28) == [result_reply(7, location(ROOT_URI, 6, 5, 9))]
     )
 
 
@@ -2328,9 +2325,22 @@ TESTS: TestSuite = {
         ("an unknown request gets -32601", test_an_unknown_request_gets_32601),
         ("an invalid message gets -32600", test_an_invalid_message_gets_32600),
         ("a second initialize gets -32600", test_a_second_initialize_gets_32600),
+        ("shutdown replies null at once", test_shutdown_replies_null_at_once),
         (
-            "shutdown holds its null reply until the library is left",
-            test_shutdown_holds_its_null_reply_until_the_library_is_left
+            "initialize offers library documents only to a client that fetches them",
+            test_initialize_offers_library_documents_only_to_a_client_that_fetches_them
+        ),
+        (
+            "the content request answers the embedded file text",
+            test_the_content_request_answers_the_embedded_file_text
+        ),
+        (
+            "the content request rejects a URI that is not a library URI",
+            test_the_content_request_rejects_a_uri_that_is_not_a_library_uri
+        ),
+        (
+            "the content request finds a file only by its exact path",
+            test_the_content_request_finds_a_file_only_by_its_exact_path
         ),
         ("requests after shutdown get -32600", test_requests_after_shutdown_get_32600),
         ("exit ends with 0 only after shutdown", test_exit_ends_with_0_only_after_shutdown),
@@ -2476,18 +2486,7 @@ TESTS: TestSuite = {
             "the client's answer to a refresh is ignored",
             test_the_clients_answer_to_a_refresh_is_ignored
         ),
-        (
-            "a link-supporting client gets the name it asked about as the origin",
-            test_a_link_supporting_client_gets_the_name_it_asked_about_as_the_origin
-        ),
-        (
-            "a client without link support gets a location",
-            test_a_client_without_link_support_gets_a_location
-        ),
-        (
-            "a link to a library function targets its file",
-            test_a_link_to_a_library_function_targets_its_file
-        ),
+        ("a definition is a plain location", test_a_definition_is_a_plain_location),
         (
             "closing a file opened by another spelling clears that spelling",
             test_closing_a_file_opened_by_another_spelling_clears_that_spelling
@@ -2525,8 +2524,12 @@ TESTS: TestSuite = {
             test_references_to_a_built_in_type_are_its_every_use
         ),
         (
-            "definition of a library function lands in its file",
-            test_definition_of_a_library_function_lands_in_its_file
+            "definition of a library function is a library location",
+            test_definition_of_a_library_function_is_a_library_location
+        ),
+        (
+            "a client that cannot fetch library files gets user locations only",
+            test_a_client_that_cannot_fetch_library_files_gets_user_locations_only
         ),
         (
             "references list the declaration only when asked",

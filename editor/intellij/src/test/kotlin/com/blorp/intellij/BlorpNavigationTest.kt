@@ -5,18 +5,25 @@ import com.intellij.codeInsight.navigation.actions.GotoDeclarationOrUsageHandler
 import com.intellij.codeInsight.navigation.actions.GotoDeclarationOrUsageHandler2.GTDUOutcome
 import com.intellij.concurrency.installThreadContext
 import com.intellij.find.findUsages.FindUsagesOptions
+import com.intellij.lang.Language
 import com.intellij.openapi.actionSystem.ex.ActionContextElement
 import com.intellij.openapi.application.ApplicationManager
 import com.intellij.openapi.application.runReadActionBlocking
 import com.intellij.psi.PsiFile
+import com.intellij.psi.PsiManager
+import com.intellij.openapi.vfs.VirtualFile
 import com.intellij.testFramework.PlatformTestUtil
 import com.intellij.usages.PsiElementUsageTarget
 import com.intellij.usages.UsageInfo2UsageAdapter
 import com.intellij.util.ui.UIUtil
+import com.redhat.devtools.lsp4ij.LSPFileSupport
+import com.redhat.devtools.lsp4ij.features.semanticTokens.SemanticTokensData
 import com.redhat.devtools.lsp4ij.usages.LSPUsageSearcher
 import com.redhat.devtools.lsp4ij.usages.LSPUsageTargetProvider
 import java.nio.file.Files
 import java.nio.file.Path
+import org.eclipse.lsp4j.SemanticTokensParams
+import org.eclipse.lsp4j.TextDocumentIdentifier
 import javax.swing.JTextField
 
 /**
@@ -51,8 +58,8 @@ class BlorpNavigationTest : BlorpServerTestCase() {
         assertEquals(helperDeclaration, local.offset)
 
         val library = targetsUnder(CPP_ENGINE_SHORTCUT_ACTION, file, source.indexOf("print")).single()
-        assertEquals("output.brp", library.fileName)
-        assertTrue(library.path, library.path.contains("/blorp-lsp-"))
+        assertLibraryDocumentIsReadOnlyBlorp(library)
+        myFixture.openFileInEditor(file.virtualFile)
 
         // The use sits inside a string's `${}` hole, the hardest place for LSP4IJ's word pick.
         myFixture.editor.caretModel.moveToOffset(helperUse)
@@ -61,6 +68,25 @@ class BlorpNavigationTest : BlorpServerTestCase() {
         assertEquals(listOf(helperDeclaration, helperDeclaration, helperUse), usages.sorted())
 
         assertChangingThePathRestartsTheServer()
+    }
+
+    // The library target is a `blorp-library:` document: LSP4IJ fetched its text with
+    // `workspace/textDocumentContent` and opened it read-only as Blorp, and the server answers its
+    // tokens. The tokens request is LSP4IJ's own call, made directly; the daemon pass that makes
+    // it for an open editor is checked by hand in CLion (see the plugin README).
+    private fun assertLibraryDocumentIsReadOnlyBlorp(library: Target) {
+        assertEquals("output.brp", library.fileName)
+        assertEquals("blorp-library:///io/console/output.brp", library.file.url)
+        assertEquals(BlorpLanguage, library.language)
+        assertFalse(library.file.isWritable)
+        // Opening it in an editor is what makes LSP4IJ send the server `didOpen`.
+        myFixture.openFileInEditor(library.file)
+        val psiFile = runReadActionBlocking { PsiManager.getInstance(project).findFile(library.file)!! }
+        val tokens = ApplicationManager.getApplication().executeOnPooledThread<SemanticTokensData?> {
+            val params = SemanticTokensParams(TextDocumentIdentifier(library.file.url))
+            LSPFileSupport.getSupport(psiFile).semanticTokensSupport.getSemanticTokens(params).get()
+        }
+        assertNotNull(PlatformTestUtil.waitForFuture(tokens, SERVER_READY_TIMEOUT_MS))
     }
 
     // The new path must start a new server process: each wrapper script logs its own start.
@@ -103,8 +129,8 @@ class BlorpNavigationTest : BlorpServerTestCase() {
         return PlatformTestUtil.waitForFuture(offsets, SERVER_READY_TIMEOUT_MS)
     }
 
-    private class Target(val path: String, val offset: Int) {
-        val fileName get() = path.substringAfterLast('/')
+    private class Target(val file: VirtualFile, val language: Language, val offset: Int) {
+        val fileName get() = file.name
     }
 
     // Off the UI thread and in a read action, as CLion runs Go to Declaration.
@@ -126,7 +152,7 @@ class BlorpNavigationTest : BlorpServerTestCase() {
                     GotoDeclarationHandler.EP_NAME.extensionList.flatMap { handler ->
                         handler.getGotoDeclarationTargets(file.findElementAt(offset), offset, editor)
                             .orEmpty()
-                            .map { Target(it.containingFile.virtualFile.path, it.textOffset) }
+                            .map { Target(it.containingFile.virtualFile, it.containingFile.language, it.textOffset) }
                     }
                 }
             }

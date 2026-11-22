@@ -74,9 +74,12 @@ done.
   - **Landed:** landing 12, the CLion plugin on LSP4IJ (Keith, 2026-11-21).
     Known limits: Alt+F7 and Cmd-click on a declaration list no usages in
     Keith's CLion.
-  - **Next:** landing 13, approved by Keith on 2026-11-21: library files
-    through `workspace/textDocumentContent` instead of a folder in `/tmp`, and
-    plain `Location`s.
+  - **Landed:** landing 13: library files through
+    `workspace/textDocumentContent`, with no folder in `/tmp`, and plain
+    `Location`s.
+  - **Next:** not chosen yet. The candidates are formatting, hover,
+    project-wide references, or a simplification audit of `src/lsp/`. Each
+    starts by checking that CLion's path reaches the server.
 - **String code points:** [`STRING_PLAN.md`](STRING_PLAN.md).
   - **Status:** approved on 2026-11-10: `length` counts code points, from a
     count stored in each String, and byte work uses `byte_*` functions. L1

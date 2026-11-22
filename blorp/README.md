@@ -1370,17 +1370,18 @@ end a line. The editor sends each open file's whole text with every change.
 
 Each open file is the root of its own program: the file, the modules it
 imports and the standard library built into blorp, which every analysis reads,
-as `blorp compile` does. Before it reads a message, the server writes a copy of
-that library to a new folder in `/tmp`, named `blorp-lsp-` and six characters,
-so that a library declaration is a file the editor can open. The folder is a
-view: nothing loads from it, so edits there are never read, and they disappear
-when the server removes the folder. It removes it on `shutdown`, before it
-writes the reply, since an editor may end the server right after `exit`;
-otherwise, when it stops, which also covers `exit` without `shutdown` and a
-framing error. A signal that kills the server leaves the folder behind.
-If the folder cannot be made, filled or removed, or the working directory
-cannot be read, the server says so on standard error and ends with status 3;
-when the removal at `shutdown` fails, it exits 3 without writing the reply.
+as `blorp compile` does. A library declaration is a `blorp-library:` location,
+such as `blorp-library:///io/console/output.brp`: the file's path below the
+library root, percent-encoded, with no host. The server serves these files with
+LSP 3.18's `workspace/textDocumentContent`, so it needs a client that sends the
+`workspace.textDocumentContent` capability in `initialize`; it then answers
+`capabilities.workspace.textDocumentContent` with the scheme `blorp-library`.
+The text never changes, so the server sends no refresh. A request for a URI
+that is not a library file, or names none, gets error -32602 saying why. With a
+client that lacks the capability, definitions into the library are `null` and
+references leave out the library's uses; nothing else changes. The server
+writes no files. If the working directory cannot be read, it says so on standard
+error and ends with status 3.
 A file is analysed when it is opened, with the other open files' unsaved text
 in place of their saved text. Edits are not analysed as they are typed.
 Editing, opening or closing a file makes every program that read it stale,
@@ -1399,7 +1400,7 @@ without an edit of its own; the server ignores the editor's answer. A file
 that several open programs report in shows the diagnostics of the one analysed
 last; when that program stops reporting there, or its file is closed, the file
 shows what the others last reported. An error inside the standard library is
-shown at the start of the open file, with its location in the server's folder.
+shown at the start of the open file, led by the file's path below the library root.
 Modules that import the open file are not part of its program, so their errors
 show only when they are opened themselves.
 The server ends with status 0 after `shutdown` then `exit`, and 1 for an
@@ -1411,11 +1412,7 @@ parameter, a field, a variant, a type, a function, a trait's method, or the
 start of the module an alias names. On a declaration's own name it answers
 that declaration, and on a type built into the language, such as `Int`, it
 answers `null`. A call of a trait's method, its default or an
-implementation's, goes to the trait's method. A library declaration is in the
-server's folder. When the editor sets `textDocument.definition.linkSupport`,
-the answer is a one-element `LocationLink[]` whose `originSelectionRange` is
-the name asked about, so that the editor can underline and click it; the
-target range and its selection range are both the declaration's name.
+implementation's, goes to the trait's method. The answer is one `Location`.
 `textDocument/references` lists every use of the name at the position, and its
 declaration too when the editor asks; it groups the uses of an
 implementation's type parameter across the implementation's methods, and lists
@@ -1424,8 +1421,8 @@ in a module that imports the file are not found, nor are uses in library code
 the program does not call, which is not checked. While a file's program fails
 to load or check, it is served from the last analysis of that program that
 checked, as described below; a program that never checked has no
-definitions (`null`) and no references (`[]`). A library
-file the editor opens, after a definition led there, is not the root of a
+definitions (`null`) and no references (`[]`). A
+library file the editor opens, after a definition led there, is not the root of a
 program: it gets the lexer's tokens and no diagnostics, no definitions and no
 references.
 
@@ -1516,12 +1513,12 @@ encodes semantic tokens: it lexes the open text again and takes each name's
 type from the analysis's name uses and declarations. `server.brp` is pure: it
 keeps the open documents and answers one message at a time, joining a name's
 use to its declaration for definitions and references, and when a document
-needs analysing it asks the transport, `lsp_command.brp`. The transport writes
-a copy of the embedded library to its folder at start, and for each request
-loads that root with the open documents as snapshots and the embedded library,
-runs `analyze` and hands the files read and the analysis or its diagnostics
-back as data. The server places library locations in the folder by the
-loader's `library_relative_path`.
+needs analysing it asks the transport, `lsp_command.brp`. For each request the
+transport loads that root with the open documents as snapshots and the
+embedded library, runs `analyze` and hands the files read and the analysis or
+its diagnostics back as data. The server names a library location by the
+loader's `library_relative_path`, and answers a content request from the
+embedded library's table.
 
 The output is replaced atomically, as by
 [`write_text`](standard_library/README.md#the-file-modules): a symlinked output

@@ -1,7 +1,6 @@
 ---
 `blorp lsp`: its help text and the transport, the only impure code of the
-language server. The transport writes the standard library to a folder of its
-own for an editor to open, reads each message, steps the server, analyses a
+language server. The transport reads each message, steps the server, analyses a
 root when the step asks for one, and writes every reply.
 ---
 import:
@@ -11,23 +10,19 @@ import:
     io/console/read_exact: ReadExactError(EndedEarly), read_exact
     io/console/read_line: read_line
     io/environment: get_current_directory
-    io/files/create_directory: CreateDirectoryError, create_directories
-    io/files/temporary_directory: TemporaryDirectoryError, with_temporary_directory
-    io/files/write: WriteError, write_text
     option: Option methods
-    path: Path, PathError, join, parent, to_path
+    path: PathError
     result: Result methods
     ../common/analysis/load/load:
-        LibrarySource(EmbeddedLibrary, LibraryDirectory),
+        LibraryLayout,
+        LibrarySource(EmbeddedLibrary),
         LoadFailure,
-        embedded_library_files,
         library_layout,
         load_program_with_sources,
         working_directory_result
     ../common/cli/report: kind_status
     ../common/cli/usage: error_message, unknown_option
-    ../common/syntax/source: SourceFile
-    ../common/syntax/syntax: Diagnostic, compiler_span, internal_error, path_error
+    ../common/syntax/syntax: Diagnostic, compiler_span, internal_error
     ./protocol:
         FramingError(HeaderUnfinished, LineUnreadable, BodyUnreadable),
         content_length,
@@ -40,7 +35,6 @@ import:
         document_analysis,
         exit_status,
         receive_body,
-        shutdown_answer,
         snapshots,
         start_server
 
@@ -74,16 +68,8 @@ pure func parse_lsp(words: List[String]) -> Result[Void, String]:
 
 
 -- The library every analysis reads: the copy built into blorp, as `blorp
--- compile` reads it. The folder the transport writes is a view of it for
--- editors, which nothing loads from.
+-- compile` reads it. An editor fetches its files from the server.
 private ANALYSED_LIBRARY: LibrarySource = EmbeddedLibrary
-
--- Where the server writes the standard library for its session, so that a
--- library declaration is a file an editor can open. Every supported platform
--- is POSIX, so /tmp exists.
-private LIBRARY_PARENT: String = "/tmp"
-
-private LIBRARY_FOLDER_PREFIX: String = "blorp-lsp-"
 
 
 -- The header lines after `first`, up to the blank one, which is dropped.
@@ -145,115 +131,31 @@ private func perform(step: Step) -> Server:
                 .perform()
 
 
--- One library file at its place below `folder`, its folders made first.
-private func write_library_file(folder: Path, file: SourceFile) -> Result[Void, String]:
-    relative ?= file.path
-        .to_path()
-        .map_err(pure func(error: PathError) -> String: "${file.path}: ${error}")
-    target = folder.join(relative)
-    _ ?= create_directories(target.parent()).map_err(
-        pure func(error: CreateDirectoryError) -> String: "${target.parent()}: ${error}"
-    )
-    write_text(target, file.contents).map_err(
-        pure func(error: WriteError) -> String: "${target}: ${error}"
-    )
-
-
--- A failure to make, fill or remove the library's folder in `temporary`.
-private pure func folder_error(temporary: Path, message: String) -> Diagnostic:
-    path_error(
-        compiler_span(),
-        "blorp lsp ${message}",
-        "check that ${temporary} is a folder blorp can write to"
-    )
-
-
--- Writes the library into `folder`, then serves until `shutdown`, `exit` or the
--- end of input, and returns the server as it stopped. The server places
--- library locations in the folder by the analysed library's layout, and tells
--- the library files a client opens by the folder's.
-private func serve_in(folder: Path) -> Result[Server, Diagnostic]:
+-- A failure to lay out the embedded library is a fault in blorp, not in the
+-- editor's request.
+private func library_layout_for_session() -> Result[LibraryLayout, Diagnostic]:
     directory ?= get_current_directory()
         .working_directory_result()
         .map_err(pure func(failure: LoadFailure) -> Diagnostic: failure.diagnostic)
-    embedded ?= library_layout(ANALYSED_LIBRARY, directory).map_err(
+    library_layout(ANALYSED_LIBRARY, directory).map_err(
         pure func(error: PathError) -> Diagnostic: internal_error(
             compiler_span(),
             "the embedded library's root is not a usable path: ${error}"
         )
     )
-    view ?= library_layout(LibraryDirectory(folder.to_string()), directory).map_err(
-        pure func(error: PathError) -> Diagnostic: internal_error(
-            compiler_span(),
-            "the library folder ${folder} is not a usable path: ${error}"
-        )
-    )
-    files ?= embedded_library_files().map_err(
-        pure func(problem: String) -> Diagnostic: internal_error(compiler_span(), problem)
-    )
-    var written: Result[Void, String] = Ok(void)
-    for file in files:
-        written = folder.write_library_file(file)
-        if not(written.is_ok()):
-            break
-    _ ?= written.map_err(
-        pure func(problem: String) -> Diagnostic: folder
-            .parent()
-            .folder_error("could not write the standard library: ${problem}")
-    )
-    Ok(serve_messages(start_server({ analysed = embedded, view = view })))
 
 
--- Serves with the library written to a fresh folder in `temporary`, which is
--- removed when `shutdown` arrives or the session otherwise ends, and returns
--- the status the session ends with. The folder goes before the reply to
--- `shutdown` is written, since an editor may end the server right after `exit`.
--- Known gap: when the folder cannot be removed, the reply is not written, since
--- `with_temporary_directory` discards the body's value, which holds the
--- request id, when its removal fails; the status is still 3.
--- `serve` names LIBRARY_PARENT; a test names a folder that cannot hold it.
-func serve_in_new_folder(temporary: Path) -> Result[Int, Diagnostic]:
-    stopped ?= with_temporary_directory(
-        temporary,
-        LIBRARY_FOLDER_PREFIX,
-        serve_in,
-        pure func(error: TemporaryDirectoryError) -> Diagnostic: temporary.folder_error(
-            "could not make or remove its folder in ${temporary}: ${error}"
-        )
-    )
-    Ok(stopped.finish_session())
-
-
--- A failure to make, fill or remove the folder is a path problem; a library
--- that disagrees with itself is a fault in blorp.
+-- Serves until `shutdown`, `exit` or the end of input, and returns the status
+-- the process ends with.
 func serve() -> Int:
-    served: Result[Int, Diagnostic] = match LIBRARY_PARENT.to_path():
-        Ok(temporary):
-            serve_in_new_folder(temporary)
-        Err(error):
-            Err(internal_error(compiler_span(), "${LIBRARY_PARENT} is not a usable path: ${error}"))
-    match served:
-        Ok(status):
-            status
+    match library_layout_for_session():
+        Ok(layout):
+            serve_messages(start_server(layout))
+                .exit_status()
+                .get_or(EXIT_ABANDONED)
         Err(error):
             print_error(error_message(error.message, error.help))
             error.kind.kind_status()
-
-
--- With the library's folder gone, writes the reply to `shutdown` that the
--- server held, if it stopped for that, serves what the editor sends after it,
--- and returns the status the process ends with.
-private func finish_session(stopped: Server) -> Int:
-    final = match stopped.shutdown_answer():
-        Some(answer):
-            write(framed(answer.reply))
-            flush()
-            serve_messages(answer.server)
-        None:
-            stopped
-    final
-        .exit_status()
-        .get_or(EXIT_ABANDONED)
 
 
 -- Answers messages until `exit`, `shutdown` or the end of input, and returns
@@ -266,9 +168,12 @@ private func serve_messages(started: Server) -> Server:
                 server = server
                     .receive_body(body)
                     .perform()
-                match (server.exit_status(), server.shutdown_answer()):
-                    (None, None): void
-                    _: break
+                if (
+                    server
+                        .exit_status()
+                        .is_some()
+                ):
+                    break
             Ok(None):
                 break
             Err(error):

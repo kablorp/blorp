@@ -1,8 +1,7 @@
 # Language server: `blorp lsp`
 
 **Status: plan, 2026-11-10; Keith settled its decisions and asked for a byte
-console on 2026-11-11. Landings 1–12 have landed; Keith approved 13 on
-2026-11-21.**
+console on 2026-11-11. Landings 1–13 have landed.**
 
 ## Problem
 
@@ -207,7 +206,7 @@ shutdown order and 9c's open folder items.
   as `blorp-library:///io/console/output.brp`: the file's path below the
   library root, percent-encoded as `file_uri` does. `uri_path` reads only
   `file:` URIs, so a decoder joins it, and open library files are keyed by
-  that path. `didOpen` tells a library file by its scheme, and `targets`
+  the decoded path. `didOpen` tells a library file by its scheme, and `targets`
   picks the URI by the module's role. A diagnostic about a library file names
   that path.
 - **Capability.** When the client's `workspace.textDocumentContent` object is
@@ -601,7 +600,7 @@ lines counted apart. Compile cost must also fit the e2e instruction ceilings'
 | 10 the CLion plugin | not compiled | not compiled | not compiled | ≤ 580 Kotlin and XML |
 | 11 broken files, fixed input | ≤ +0.1% | ≤ +0.01% | ≤ +0.1% | ≤ +460 net |
 | 12 the plugin on LSP4IJ | not compiled | not compiled | not compiled | ≤ 570 Kotlin and XML |
-| 13 library files, fixed input | ≤ +0.1% (noise) | no increase | no increase | ≤ −80 net |
+| 13 library files, fixed input | ≤ +0.1% (noise) | no increase | no increase | ≤ −40 net |
 
 **Latency.** Per request after one change, on this host: ≤ 1.0 s for
 `blorp/src/main.brp`, and ≤ 50 ms for a one-module program. Landing 1
@@ -1347,6 +1346,58 @@ shortcuts that later features need.
   the standing delegation: +30 for the hole tokens, and +32 for the sealed
   hole state that review asked for. Tests are 581 lines.
 - **Review.** 0 blockers, 2 majors, 3 minors and 3 nits, all fixed.
+
+**Landing 13, library files without a folder** (against `631ab9a73`).
+`self-compile-cost`, `-O2`, 3 rounds, on the final commit:
+
+| Measure | Base | Candidate | Change |
+| --- | ---: | ---: | ---: |
+| Fixed input, allocations | 12,974,188 | 12,974,188 | unchanged |
+| Fixed input, instructions (median) | 13,098,442,619 | 13,096,379,489 | −0.016% |
+| Fixed input, peak heap (requested bytes) | 184,295,479 | 184,295,479 | unchanged |
+| Own source, allocations | 12,974,188 | 12,918,138 | −0.43% |
+| Own source, instructions (median) | 13,077,544,943 | 13,011,081,202 | −0.51% |
+| Own source, peak heap (requested bytes) | 184,295,478 | 183,699,955 | −0.32% |
+| Lines, production | | | −56 net |
+
+- **What changed.**
+  - A library location is a `blorp-library:` URI of the file's path below the
+    library root.
+  - `workspace/textDocumentContent` answers the embedded text by exact lookup.
+    It has two -32602 messages: not a `blorp-library:` URI, and no such file.
+  - The scheme is announced only when the client's
+    `workspace.textDocumentContent` is present; without it, library entries
+    are left out.
+  - The folder, its shutdown order (`LeavingLibrary`, `ShutdownAnswer`), the
+    second layout and the `LocationLink` code are gone. `shutdown` replies at
+    once, and a definition is a plain `Location`.
+  - A `DocumentUri` union keeps user and library documents apart. A library
+    document gets lexer tokens, and its edits are dropped, since its editor is
+    read-only.
+  - This retires 9c's open folder items (the `/tmp` link, and folders left by
+    killed sessions) and the server fixes' known gap, where a failed removal
+    lost the `shutdown` reply.
+- **LSP4IJ.** Checked first, headlessly, in milestone 1: it fetches the text,
+  opens the file read-only as Blorp, sends `didOpen` under that URI, and gets
+  tokens. Its own highlighting pass asking for them is checked by hand in
+  CLion.
+- **Ceiling.**
+  - The sketch of −80 predates the spike, which measured the URI and content
+    handling at +153.
+  - The first pass came to +2, because the coordinator over-specified typed
+    URI errors and path checks that the exact lookup makes redundant. Cut
+    back, it came to −56.
+  - The ceiling is corrected to −40 under the standing delegation.
+- **Tests.**
+  - The URI pair; the exact `initialize` reply with and without the
+    capability; and the content request's text and both errors, including
+    `..`, `.` and empty paths.
+  - Library locations, and a client that cannot fetch them; a library
+    document's tokens and its dropped edits; and `shutdown` at once.
+  - An e2e session, and the plugin's `blorp-library:` target.
+  - Each oracle was proven by mutation.
+- **Review.** 0 blockers, 1 major (a dead `library_path`), 3 minors and 2
+  nits, all fixed.
 
 ## Testing
 

@@ -1,6 +1,5 @@
 package com.blorp.intellij
 
-import com.intellij.openapi.vfs.newvfs.impl.VfsRootAccess
 import com.intellij.testFramework.PlatformTestUtil
 import com.intellij.testFramework.fixtures.BasePlatformTestCase
 import com.intellij.testFramework.fixtures.TempDirTestFixture
@@ -18,12 +17,6 @@ import java.nio.file.Path
 abstract class BlorpServerTestCase : BasePlatformTestCase() {
     // The server reads imports and the library from disk, so the files must be real.
     override fun createTempDirTestFixture(): TempDirTestFixture = TempDirTestFixtureImpl()
-
-    override fun setUp() {
-        super.setUp()
-        // The server writes the library it serves under /tmp (a link to /private/tmp on macOS).
-        VfsRootAccess.allowRootAccess(testRootDisposable, "/tmp", "/private/tmp")
-    }
 
     override fun tearDown() {
         try {

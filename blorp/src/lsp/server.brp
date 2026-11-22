@@ -22,9 +22,8 @@ import:
             SourcePathEmpty,
             LoadingFailed
         ),
-        library_path,
-        library_relative_path,
-        module_role
+        embedded_library_text,
+        library_relative_path
     ../common/syntax/source:
         ModuleKind(UserModule, LibraryModule, FoundationTypesModule, FoundationPreludeModule),
         ModuleSource,
@@ -47,12 +46,15 @@ import:
     ./protocol:
         Call,
         ClientMessage(Request, Notification, ClientResponse, InvalidMessage),
-        ErrorCode(ParseError, InvalidRequest, MethodNotFound, ServerNotInitialized),
+        ErrorCode(ParseError, InvalidRequest, MethodNotFound, InvalidParams, ServerNotInitialized),
+        LIBRARY_SCHEME_NAME,
         RequestId(NumberId),
         client_message,
         error_response,
         field,
         file_uri,
+        library_uri,
+        library_uri_file,
         notification,
         request,
         response,
@@ -150,32 +152,21 @@ private record OpenDocument {
 }
 
 
--- The library a session serves, as two layouts of the same files. Every
--- analysis reads the embedded library, as `blorp compile` does; the transport
--- wrote a copy of it to a folder for an editor to open, and nothing loads from
--- there.
-record ServedLibrary {
-    -- The embedded library's layout, which gives a library file's path below
-    -- its root.
-    analysed: LibraryLayout,
-    -- The folder's layout, which places that path in the folder and tells the
-    -- library files a client opens.
-    view: LibraryLayout
-}
-
-
 private record Session {
     encoding: PositionEncoding,
-    library: ServedLibrary,
+    -- The embedded library's layout, which gives a library file's path below
+    -- its root. Every analysis reads the embedded library, as `blorp compile`
+    -- does.
+    library: LibraryLayout,
     -- Each open document, by its normalized absolute path. An open document is
     -- the root of its own program (the v1 limitation), and every analysis
     -- reads these texts instead of the disk.
     documents: Dict[Path, OpenDocument],
-    -- The text of each open file of the library's view, which a definition led
-    -- to. The view is not the library any analysis reads, so these are neither
-    -- roots nor snapshots: they get the lexer's tokens, no definition and no
-    -- references. Edits to them, saved or not, are never read.
-    library_documents: Dict[Path, String],
+    -- The text of each open library file the client fetched, by its path below
+    -- the library root. They are neither roots nor snapshots: they get the
+    -- lexer's tokens, no definition and no references. Edits to them, saved or
+    -- not, are never read.
+    library_documents: Dict[String, String],
     -- Each root's last analysis, current or stale, and what it published, in
     -- the order the roots were last analysed, so that a file several roots
     -- report in shows the latest analysis's diagnostics. Requests are answered
@@ -188,9 +179,10 @@ private record Session {
     -- Whether the client accepts `workspace/semanticTokens/refresh`, which asks
     -- it for the tokens of its visible files again.
     refreshes_tokens: Bool,
-    -- Whether the client takes `LocationLink`s for definitions, which carry the
-    -- range of the name asked about, so that it can underline and click it.
-    links_definitions: Bool,
+    -- Whether the client fetches library files with
+    -- `workspace/textDocumentContent`, so that a definition may lead into the
+    -- library.
+    serves_library_documents: Bool,
     -- How many requests the server has sent; each takes the next number as
     -- its id.
     requests_sent: Int
@@ -200,12 +192,8 @@ private record Session {
 private union Lifecycle:
     -- Requests other than `initialize` get -32002, and notifications other
     -- than `exit` are dropped. The session starts with the library it serves.
-    AwaitingInitialize(ServedLibrary)
+    AwaitingInitialize(LibraryLayout)
     Serving(Session)
-    -- `shutdown` has arrived. Its reply, which the request's id names, is held
-    -- until the transport has removed the library's folder, so that an editor
-    -- that ends the server right after the reply finds the folder gone.
-    LeavingLibrary(RequestId)
     -- After `shutdown`, requests get -32600 and `exit` ends with status 0.
     ShutDown
     -- `exit` has arrived; the process ends with this status.
@@ -267,7 +255,7 @@ private FULL_SYNC: Int = 1
 private ERROR_SEVERITY: Int = 1
 
 
-pure func start_server(library: ServedLibrary) -> Server:
+pure func start_server(library: LibraryLayout) -> Server:
     into_opaque Server(AwaitingInitialize(library))
 
 
@@ -275,25 +263,7 @@ pure func start_server(library: ServedLibrary) -> Server:
 pure func exit_status(server: Server) -> Option[Int]:
     match from_opaque Server(server):
         Exited(status): Some(status)
-        AwaitingInitialize(_) | Serving(_) | LeavingLibrary(_) | ShutDown: None
-
-
--- The reply to `shutdown`, and the server once it is written.
-record ShutdownAnswer {
-    reply: Json,
-    server: Server
-}
-
-
--- Some while the server waits for the transport to remove the library's folder
--- before it writes the reply to `shutdown`. The server it holds is shut down:
--- requests get -32600 and `exit` ends with status 0.
-pure func shutdown_answer(server: Server) -> Option[ShutdownAnswer]:
-    match from_opaque Server(server):
-        LeavingLibrary(id):
-            Some({ reply = response(id, Null), server = into_opaque Server(ShutDown) })
-        AwaitingInitialize(_) | Serving(_) | ShutDown | Exited(_):
-            None
+        AwaitingInitialize(_) | Serving(_) | ShutDown: None
 
 
 -- The open documents, which an analysis reads instead of the disk.
@@ -308,7 +278,7 @@ pure func snapshots(server: Server) -> List[SourceFile]:
                         contents = document[1].text
                     }
                 )
-        AwaitingInitialize(_) | LeavingLibrary(_) | ShutDown | Exited(_):
+        AwaitingInitialize(_) | ShutDown | Exited(_):
             []
 
 
@@ -357,10 +327,12 @@ pure func receive(server: Server, message: Json) -> Step:
                     roots = {},
                     registers_watchers = call.params.watches_files(),
                     refreshes_tokens = call.params.refreshes_tokens(),
-                    links_definitions = call.params.links_definitions(),
+                    serves_library_documents = call.params.fetches_documents(),
                     requests_sent = 0
                 }
-                replying(Serving(session), [response(id, initialize_result(encoding))])
+                replying(Serving(session), [
+                    response(id, initialize_result(encoding, session.serves_library_documents))
+                ])
             else:
                 lifecycle.replying([
                     error_response(
@@ -369,14 +341,16 @@ pure func receive(server: Server, message: Json) -> Step:
                         "the server has not been initialized"
                     )
                 ])
-        (LeavingLibrary(_) | ShutDown, Request(id, _)):
+        (ShutDown, Request(id, _)):
             lifecycle.replying([
                 error_response(Some(id), InvalidRequest, "the server has shut down")
             ])
         (Serving(session), Request(id, call)):
             match call.method:
                 "shutdown":
-                    replying(LeavingLibrary(id), [])
+                    replying(ShutDown, [response(id, Null)])
+                "workspace/textDocumentContent":
+                    lifecycle.replying([content_response(id, call.params)])
                 "textDocument/semanticTokens/full":
                     session.document_requested(id, call.params, Some(TokensQuery))
                 "textDocument/definition":
@@ -419,7 +393,7 @@ pure func receive(server: Server, message: Json) -> Step:
                     lifecycle.replying([
                         error_response(Some(id), MethodNotFound, "unknown method `${call.method}`")
                     ])
-        (LeavingLibrary(_) | ShutDown, Notification(call)):
+        (ShutDown, Notification(call)):
             if call.method == "exit":
                 replying(Exited(EXIT_AFTER_SHUTDOWN), [])
             else:
@@ -484,39 +458,71 @@ private pure func refreshes_tokens(params: Option[Json]) -> Bool:
         _: False
 
 
--- Whether the client takes a `LocationLink` as the answer to a definition.
-private pure func links_definitions(params: Option[Json]) -> Bool:
+-- Whether the client can fetch the text of a document by its URI, which is
+-- LSP 3.18's `workspace/textDocumentContent`.
+private pure func fetches_documents(params: Option[Json]) -> Bool:
     match (
         params
             .field("capabilities")
-            .field("textDocument")
-            .field("definition")
-            .field("linkSupport")
+            .field("workspace")
+            .field("textDocumentContent")
     ):
-        Some(Boolean(True)): True
+        Some(Object(_)): True
         _: False
+
+
+-- The answer to `workspace/textDocumentContent`: the embedded text of the
+-- library file the URI names, else -32602 saying why not.
+private pure func content_response(id: RequestId, params: Option[Json]) -> Json:
+    match params.text_field("uri"):
+        None:
+            error_response(Some(id), InvalidParams, "the request names no uri")
+        Some(named):
+            match named.library_uri_file():
+                Some(relative):
+                    match embedded_library_text(relative):
+                        Some(text):
+                            response(id, Object({ "text" => Text(text) }))
+                        None:
+                            error_response(
+                                Some(id),
+                                InvalidParams,
+                                "the standard library has no file ${relative}"
+                            )
+                None:
+                    error_response(
+                        Some(id),
+                        InvalidParams,
+                        "${named} is not a ${LIBRARY_SCHEME_NAME}: URI"
+                    )
 
 
 -- What the server serves: the encoding chosen, the whole text on every
 -- change, every token of a document at once, definitions and references.
-private pure func initialize_result(encoding: PositionEncoding) -> Json:
-    Object(
-        {
-            "capabilities" => Object(
+private pure func initialize_result(encoding: PositionEncoding, serves_library: Bool) -> Json:
+    base: Dict[String, Json] = {
+        "positionEncoding" => Text(encoding.encoding_name()),
+        "textDocumentSync" => Object(
+            { "openClose" => Boolean(True), "change" => Number(integer(FULL_SYNC)) }
+        ),
+        "semanticTokensProvider" => Object({ "legend" => token_legend(), "full" => Boolean(True) }),
+        "definitionProvider" => Boolean(True),
+        "referencesProvider" => Boolean(True)
+    }
+    capabilities = if serves_library:
+        base.set(
+            "workspace",
+            Object(
                 {
-                    "positionEncoding" => Text(encoding.encoding_name()),
-                    "textDocumentSync" => Object(
-                        { "openClose" => Boolean(True), "change" => Number(integer(FULL_SYNC)) }
-                    ),
-                    "semanticTokensProvider" => Object(
-                        { "legend" => token_legend(), "full" => Boolean(True) }
-                    ),
-                    "definitionProvider" => Boolean(True),
-                    "referencesProvider" => Boolean(True)
+                    "textDocumentContent" => Object(
+                        { "schemes" => Array([Text(LIBRARY_SCHEME_NAME)]) }
+                    )
                 }
             )
-        }
-    )
+        )
+    else:
+        base
+    Object({ "capabilities" => Object(capabilities) })
 
 
 -- Whether a load read the file at `path`.
@@ -721,13 +727,8 @@ private pure func served(
             -- target, which `targets` leaves out for a defect, or for a span
             -- the editor's text has changed.
             match session.targets(sealed, latest_sources, { path => Some(root) }, declared):
-                [origin, target]:
-                    if session.links_definitions:
-                        Array([target.link_json(origin.range)])
-                    else:
-                        target.location_json()
-                _:
-                    Null
+                [origin, target]: target.location_json()
+                _: Null
         ReferencesQuery(asked):
             match named_at(asked.position):
                 Some(name):
@@ -838,13 +839,12 @@ private pure func references(
 
 
 -- The row of the file `span` indexes, with the path an editor opens it by: a
--- user file's own, or a library file's copy in the view, at its path below the
--- analysed library's root. None for a span in no file the load read, such as
--- one about blorp itself. The loader builds each row's path normalized, so it
+-- user file's own, or a library file's path below the library's root. None for
+-- a span in no file the load read, such as one about blorp itself. The loader builds each row's path normalized, so it
 -- is always a Path.
 private pure func span_file(
     sources: SourceInputs,
-    library: ServedLibrary,
+    library: LibraryLayout,
     span: Span
 ) -> Option[(Path, ModuleSource)]:
     row: Option[ModuleSource] = match span.source.source_module():
@@ -856,8 +856,8 @@ private pure func span_file(
                 (UserModule, Ok(path)):
                     Some((path, file))
                 (LibraryModule | FoundationTypesModule | FoundationPreludeModule, Ok(path)):
-                    match library.analysed.library_relative_path(path):
-                        Some(relative): Some((library.view.library_path(relative), file))
+                    match library.library_relative_path(path):
+                        Some(relative): Some((relative, file))
                         None: None
                 (_, Err(_)):
                     None
@@ -876,19 +876,6 @@ private record Target {
 
 private pure func location_json(target: Target) -> Json:
     Object({ "uri" => Text(target.uri), "range" => target.range })
-
-
--- A LocationLink from `origin`, the range of the name asked about, to the
--- target, whose name is all the server knows of the declaration.
-private pure func link_json(target: Target, origin: Json) -> Json:
-    Object(
-        {
-            "originSelectionRange" => origin,
-            "targetUri" => Text(target.uri),
-            "targetRange" => target.range,
-            "targetSelectionRange" => target.range
-        }
-    )
 
 
 -- A file as the editor shows it: its lines, and how the analysed text's spans
@@ -963,13 +950,19 @@ private pure func targets(
                             None: Some(span)
                         match shown:
                             Some(at):
-                                uri = match session.documents.get(path):
-                                    Some(open): open.uri
-                                    None: path.file_uri()
-                                found = found.append({
-                                    uri = uri,
-                                    range = seen.index.range_json(at, session.encoding)
-                                })
+                                range = seen.index.range_json(at, session.encoding)
+                                match file.role:
+                                    UserModule:
+                                        uri = match session.documents.get(path):
+                                            Some(open): open.uri
+                                            None: path.file_uri()
+                                        found = found.append({ uri = uri, range = range })
+                                    LibraryModule | FoundationTypesModule | FoundationPreludeModule:
+                                        if session.serves_library_documents:
+                                            found = found.append({
+                                                uri = path.library_uri(),
+                                                range = range
+                                            })
                             None:
                                 void
                     None:
@@ -988,26 +981,28 @@ private pure func document_requested(
     params: Option[Json],
     query: Option[DocumentQuery]
 ) -> Step:
-    document: Option[Path] = params
+    document: Option[DocumentUri] = params
         .field("textDocument")
         .text_field("uri")
-        .map(uri_path)
+        .map(document_uri)
         .get_or(None)
     match (document, query):
-        (Some(path), Some(asked)):
-            match (
-                session.library_documents.get(path),
-                session.roots
-                    .get(path)
-                    .map(pure func(row: AnalysedRoot) -> RootAnalysis: row.analysis)
-            ):
-                (Some(text), _):
+        (Some(LibraryFile(relative)), Some(asked)):
+            match session.library_documents.get(relative):
+                Some(text):
                     replying(Serving(session), [
                         response(id, text.unanalysed_answer(asked, session.encoding))
                     ])
-                (None, Some(Current(latest))):
+                None:
+                    replying(Serving(session), [response(id, Null)])
+        (Some(UserFile(path)), Some(asked)):
+            root: Option[RootAnalysis] = session.roots
+                .get(path)
+                .map(pure func(row: AnalysedRoot) -> RootAnalysis: row.analysis)
+            match root:
+                Some(Current(latest)):
                     replying(Serving(session), [response(id, session.answer(path, latest, asked))])
-                (None, Some(Stale(_)) | None):
+                Some(Stale(_)) | None:
                     if session.documents.contains(path):
                         {
                             server = into_opaque Server(Serving(session)),
@@ -1023,20 +1018,41 @@ private pure func document_requested(
             replying(Serving(session), [response(id, Null)])
 
 
+-- A document a client names, by the scheme of its URI. Open library files and
+-- open user files are kept apart, so a library path, which is relative, is
+-- never looked up among the user's absolute ones.
+private union DocumentUri:
+    -- A `file:` URI's normalized absolute path.
+    UserFile(Path)
+    -- A `blorp-library:` URI's file path below the library root, as text.
+    LibraryFile(String)
+
+
+-- None for a URI of another scheme.
+private pure func document_uri(uri: String) -> Option[DocumentUri]:
+    match uri.library_uri_file():
+        Some(relative):
+            Some(LibraryFile(relative))
+        None:
+            uri
+                .uri_path()
+                .map(pure func(path: Path) -> DocumentUri: UserFile(path))
+
+
 -- Notifications the server does not serve, `$/cancelRequest` among them, are
--- dropped, as are those about documents that are not `file://` URIs or are
--- not open. Only `didOpen` analyses; an open, a change, a close or a change on
--- disk stales the roots it affects, which analyse again at their next request,
+-- dropped, as are those about documents that are neither `file:` nor
+-- `blorp-library:` URIs, or are not open. Only `didOpen` analyses; an open, a
+-- change, a close or a change on disk stales the roots it affects, which analyse again at their next request,
 -- and when that stales a root other than the document's own the client is asked
--- to refresh its tokens. A file in the library folder is kept only for
--- its tokens.
+-- to refresh its tokens. A library file is kept only for its tokens, and its
+-- editor is read-only, so a change to it is dropped.
 private pure func notified(session: Session, call: Call) -> Step:
     document = call.params.field("textDocument")
     uri = document.text_field("uri")
     match (
         call.method,
         uri
-            .map(uri_path)
+            .map(document_uri)
             .get_or(None)
     ):
         ("exit", _):
@@ -1045,38 +1061,27 @@ private pure func notified(session: Session, call: Call) -> Step:
             session.registered()
         ("workspace/didChangeWatchedFiles", _):
             session.watched(call.params)
-        ("textDocument/didOpen", Some(path)):
-            match (uri, document.text_field("text")):
-                (Some(written), Some(text)):
-                    match session.library.view.module_role(path):
-                        LibraryModule | FoundationTypesModule | FoundationPreludeModule:
-                            replying(
-                                Serving(
-                                    { session |
-                                        library_documents = session.library_documents.set(
-                                            path,
-                                            text
-                                        )
-                                    }
-                                ),
-                                []
-                            )
-                        UserModule:
-                            opened = { session |
-                                documents = session.documents.set(path, {
-                                    uri = written,
-                                    text = text
-                                }),
-                                roots = session.roots.staled(path)
+        ("textDocument/didOpen", Some(named)):
+            match (uri, document.text_field("text"), named):
+                (Some(_), Some(text), LibraryFile(relative)):
+                    replying(
+                        Serving(
+                            { session |
+                                library_documents = session.library_documents.set(relative, text)
                             }
-                            refreshing = opened.replying_with_refresh(
-                                session.roots.remove(path),
-                                []
-                            )
-                            { refreshing | analyse = Some({ root = path, answering = None }) }
+                        ),
+                        []
+                    )
+                (Some(written), Some(text), UserFile(path)):
+                    opened = { session |
+                        documents = session.documents.set(path, { uri = written, text = text }),
+                        roots = session.roots.staled(path)
+                    }
+                    refreshing = opened.replying_with_refresh(session.roots.remove(path), [])
+                    { refreshing | analyse = Some({ root = path, answering = None }) }
                 _:
                     replying(Serving(session), [])
-        ("textDocument/didChange", Some(path)):
+        ("textDocument/didChange", Some(UserFile(path))):
             -- With full sync each change holds the whole text, so the last one wins.
             changed: Option[String] = match call.params.field("contentChanges"):
                 Some(Array(changes)):
@@ -1085,33 +1090,23 @@ private pure func notified(session: Session, call: Call) -> Step:
                         .text_field("text")
                 _:
                     None
-            match (session.documents.get(path), session.library_documents.contains(path), changed):
-                (Some(open), _, Some(text)):
+            match (session.documents.get(path), changed):
+                (Some(open), Some(text)):
                     { session |
                         documents = session.documents.set(path, { open | text = text }),
                         roots = session.roots.staled(path)
                     }.replying_with_refresh(session.roots.remove(path), [])
-                (None, True, Some(text)):
-                    replying(
-                        Serving(
-                            { session |
-                                library_documents = session.library_documents.set(path, text)
-                            }
-                        ),
-                        []
-                    )
                 _:
                     replying(Serving(session), [])
-        ("textDocument/didClose", Some(path)):
-            if session.library_documents.contains(path):
-                replying(
-                    Serving(
-                        { session | library_documents = session.library_documents.remove(path) }
-                    ),
-                    []
-                )
-            else:
-                session.closed(path)
+        ("textDocument/didClose", Some(UserFile(path))):
+            session.closed(path)
+        ("textDocument/didClose", Some(LibraryFile(relative))):
+            replying(
+                Serving(
+                    { session | library_documents = session.library_documents.remove(relative) }
+                ),
+                []
+            )
         (_, _):
             replying(Serving(session), [])
 
@@ -1293,7 +1288,7 @@ pure func analysed(server: Server, asked: AnalysisRequest, result: DocumentAnaly
                 None:
                     void
             replying(Serving(current), replies)
-        AwaitingInitialize(_) | LeavingLibrary(_) | ShutDown | Exited(_):
+        AwaitingInitialize(_) | ShutDown | Exited(_):
             lifecycle.replying([])
 
 
@@ -1307,12 +1302,12 @@ private record FileReport {
 -- Each user file the analysis reports in, with its diagnostics in report
 -- order. A diagnostic no user file can show goes at the start of the root:
 -- one about blorp itself, at no file; one in a file the load did not record;
--- and one in a library file, whose location in the view then leads its
+-- and one in a library file, whose path below the library root then leads its
 -- message, since library files are never published. Each file's lines are
 -- indexed once.
 private pure func publications(
     result: DocumentAnalysis,
-    library: ServedLibrary,
+    library: LibraryLayout,
     encoding: PositionEncoding,
     root: Path
 ) -> Dict[Path, List[Json]]:
