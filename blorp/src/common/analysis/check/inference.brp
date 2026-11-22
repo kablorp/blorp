@@ -4,16 +4,23 @@ admission and the pending value tree. Only complete types leave through
 publish_inference_type; temporary inference variables never become published TypeRefs.
 ---
 import:
+    ../../syntax/source: ModuleId
     ../../syntax/syntax: IntegerFormat(Int64Format), Purity, Span, WrittenName, ReceiverApplication
     ../../utils/results: translated_list
     ../../utils/stack: push_at
     ../ids: TraitMethodId, FunctionId, OpaqueId, RecordId, VariantId
     ../namespace/builtins: RuntimeOperation(ListAppend, ListSet, ListConcat)
+    ../namespace/namespace:
+        OfferedValue(OfferedFunction),
+        TypeHead(ListHead, OpaqueHead),
+        offered_value
     ./callables:
         FunctionContract,
         accepted_function,
+        listed_function,
         ResolutionContext,
         method_sites,
+        receiver_head,
         Caller,
         TraitAvailability methods
     ./errors:
@@ -21,6 +28,7 @@ import:
         GenericConflict,
         LiteralBinding,
         MethodError(NoApplicableMethod, MethodReceiverNeedsType),
+        MissingMethod,
         method_error,
         ExpectedTypeSite(SourceAnnotation),
         ValueError(ExpressionTypeMismatch),
@@ -75,11 +83,11 @@ import:
             IntegerType
         ),
         CanonicalOperation,
-        NominalId,
+        NominalId(AggregateNominal, OpaqueNominal),
         TypeUse,
+        aggregate_head,
         CallTarget(RuntimeFunction, TraitMethod, UserFunction, CallableParameter, ValueCall)
     ./name_uses: NameUse, Referent(FunctionReferent), name_use
-    ./signatures: AcceptedFunction
     ./traits: TraitAvailability
 
 
@@ -2256,6 +2264,94 @@ pure func types_overlap(
         )
 
 
+-- Whether a receiver of type `actual`, as far as it is known, can still have
+-- the head of `declared`'s first parameter. An unsolved receiver and a bare
+-- generic parameter always can. Comparing heads needs no inference work, so
+-- the common call that reaches one function pays almost nothing for it; a
+-- receiver that differs only in its type arguments is the argument's mismatch,
+-- reported when the call is solved.
+pure func receiver_can_fit(
+    declared: FunctionSignature,
+    actual: InferenceType,
+    slots: List[InferenceSlot],
+    span: Span
+) -> Result[Bool, CheckError]:
+    resolved ?= actual.inference_head(slots, span)
+    declared_head = declared.receiver_head()
+    match declared_head:
+        None:
+            Ok(True)
+        Some(head):
+            match resolved:
+                CallVariable(_):
+                    Ok(True)
+                AcceptedType(value):
+                    Ok(value.type_head() == declared_head)
+                InferredList(_):
+                    Ok(head == ListHead)
+                InferredNominal(AggregateNominal(aggregate), _):
+                    Ok(aggregate.aggregate_head() == head)
+                InferredNominal(OpaqueNominal(id), _):
+                    Ok(head == OpaqueHead(id))
+                InferredTuple(_) | InferredCallable(_, _, _):
+                    Ok(False)
+
+
+-- What a receiver call that no candidate fits reports. A provider is a module
+-- that offers a function of the callee's name, not already a candidate, whose
+-- first parameter has the receiver's head and could take the receiver, so that
+-- the module's methods import of that head would bring it into scope. Functions
+-- are numbered module by module, and a module offers one function per name, so
+-- providers follow module order and each appears once.
+pure func missing_method(
+    context: ResolutionContext,
+    callee: WrittenName,
+    candidates: List[ReceiverFunction],
+    actual: InferenceUse,
+    slots: List[InferenceSlot]
+) -> Result[MissingMethod, CheckError]:
+    sites ?= candidates.method_sites(context.signatures, callee.span)
+    receiver ?= actual.value_type.publish_inference_type(slots, DiagnosticInference, actual.span)
+    var providers: List[ModuleId] = []
+    var failure: Option[CheckError] = None
+    head = receiver.type_head()
+    if head.is_some():
+        for function in context.signatures:
+            module = function.declaration.module
+            offered = match context.namespace.offered_value(module, callee.id):
+                Ok(OfferedFunction(id)): id == function.id
+                _: False
+            if (
+                offered
+                    .and(function.signature.receiver_head() == head)
+                    .and(
+                        candidates
+                            .listed_function(function.id)
+                            .not()
+                    )
+            ):
+                match function.signature.parameters.get(0):
+                    Some(parameter):
+                        match parameter.value_type.admits(
+                            function.signature.type_parameters,
+                            actual.value_type,
+                            slots,
+                            actual.span
+                        ):
+                            Err(invariant): failure = Some(invariant)
+                            Ok(True): providers = providers.append(module)
+                            Ok(False): void
+                    None:
+                        void
+            if failure.is_some():
+                break
+    match failure:
+        Some(invariant):
+            Err(invariant)
+        None:
+            Ok({ name = callee.id, receiver = receiver, candidates = sites, providers = providers })
+
+
 -- The one candidate whose receiver the receiver's type, as far as it is known,
 -- can still fit. Its unsolved variables stay open, as `values.map(f)`'s element
 -- type is before `f`'s body is checked; the caller's type parameters stay rigid.
@@ -2266,8 +2362,9 @@ private pure func choose_receiver(
     candidates: List[ReceiverFunction],
     actual: InferenceUse,
     slots: List[InferenceSlot],
-    signatures: List[AcceptedFunction]
+    context: ResolutionContext
 ) -> Result[ReceiverFunction, CheckError]:
+    signatures = context.signatures
     var compatible: List[ReceiverFunction] = []
     var failure: Option[CheckError] = None
     for candidate in candidates:
@@ -2296,24 +2393,9 @@ private pure func choose_receiver(
         None:
             match compatible:
                 []:
-                    match candidates.method_sites(signatures, callee.span):
-                        Err(error):
-                            Err(error)
-                        Ok(sites):
-                            match actual.value_type.publish_inference_type(
-                                slots,
-                                DiagnosticInference,
-                                actual.span
-                            ):
-                                Err(error):
-                                    Err(error)
-                                Ok(receiver):
-                                    Err(
-                                        method_error(
-                                            callee.span,
-                                            NoApplicableMethod(callee.id, receiver, sites)
-                                        )
-                                    )
+                    match context.missing_method(callee, candidates, actual, slots):
+                        Ok(missing): Err(method_error(callee.span, NoApplicableMethod(missing)))
+                        Err(invariant): Err(invariant)
                 [selected]:
                     Ok(selected)
                 _:
@@ -2344,7 +2426,7 @@ pure func select_receiver_contract(
     slots: List[InferenceSlot],
     context: ResolutionContext
 ) -> Result[SelectedReceiver, CheckError]:
-    selected ?= application.callee.choose_receiver(candidates, actual, slots, context.signatures)
+    selected ?= application.callee.choose_receiver(candidates, actual, slots, context)
     contract ?= context.caller.function_contract(
         application.callee,
         True,

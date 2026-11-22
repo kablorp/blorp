@@ -65,6 +65,9 @@ private FOO: String =
 private UNKNOWN_HELP: String = "declare the function locally or import it by name; type selections enable receiver calls only"
 
 
+private NO_METHOD_HELP: String = "use a value of a declared receiver type, or import a function accepting this type"
+
+
 private ZERO_HELP: String = "call zero() directly, or choose a function with one parameter"
 
 
@@ -180,8 +183,8 @@ private pure func missing(prefix: String, name: String, suffix: String, targets:
         span = site(0, prefix, name),
         kind = ProgramProblem,
         note = None,
-        message = "unknown function",
-        help = UNKNOWN_HELP
+        message = "no method ${name} for Int is in scope",
+        help = NO_METHOD_HELP
     })
 
 
@@ -632,8 +635,8 @@ private pure func test_method_only_import_excludes_zero_parameter_provider() -> 
             span = site(0, prefix, "zero"),
             kind = ProgramProblem,
             note = None,
-            message = "unknown function",
-            help = UNKNOWN_HELP
+            message = "no method zero for Int is in scope",
+            help = NO_METHOD_HELP
         }
     )
 
@@ -653,8 +656,8 @@ private pure func test_private_provider_is_excluded_from_method_import() -> Bool
             span = site(0, prefix, "measure"),
             kind = ProgramProblem,
             note = None,
-            message = "unknown function",
-            help = UNKNOWN_HELP
+            message = "no method measure for Int is in scope",
+            help = NO_METHOD_HELP
         }
     )
 
@@ -863,8 +866,8 @@ private pure func test_a_receiver_still_being_inferred_can_fit_no_function() -> 
                     site(0, foo_import + "Foo methods\n    ./int_join: ", "Int")
                 ])
             ),
-            message = "no method accepts this receiver type",
-            help = "use a value of a declared receiver type, or import a function accepting this type"
+            message = "no method join for List[U] is in scope",
+            help = NO_METHOD_HELP
         }
     )
 
@@ -958,8 +961,212 @@ private pure func test_a_callers_type_parameter_stays_rigid_in_receiver_selectio
                     site(0, "import:\n    ./strings: List methods\n    ./numbers: ", "List")
                 ])
             ),
-            message = "no method accepts this receiver type",
-            help = "use a value of a declared receiver type, or import a function accepting this type"
+            message = "no method describe for List[Element] is in scope",
+            help = NO_METHOD_HELP
+        }
+    )
+
+
+-- A type whose module declares its methods too. Selecting the type brings them
+-- in; a module that selects only `empty_table` has none of them in scope, as
+-- `path: to_path` brings in no Path methods.
+private TABLE: String =
+    |union Table:
+    |    Rows(List[Int])
+    |pure func empty_table() -> Table:
+    |    Rows([])
+    |pure func map[U](table: Table, transform: pure (Int) -> U) -> List[U]:
+    |    []
+    |pure func keys(table: Table) -> List[Int]:
+    |    []
+    |
+
+
+-- The caller reaches Table only through `find`, whose module writes the path to
+-- Table's module.
+private FIND_KEYS: String =
+    |import:
+    |    ./lookup: find
+    |pure func first_keys() -> List[Int]:
+    |    find().
+
+
+-- `map` reaches only the List function, so the call names it alone; its first
+-- parameter cannot take a Table. The call is rejected at `map` before the
+-- lambda is checked, whose constructor would otherwise lack an expected type.
+-- The caller's own library path to Table's module names its methods import.
+private pure func test_a_receiver_only_another_types_function_accepts_names_the_import() -> Bool:
+    prefix =
+        |import:
+        |    ./lists: List methods
+        |    table: empty_table
+        |union Shape:
+        |    Round(Int)
+        |pure func wrap() -> List[Shape]:
+        |    empty_table().
+    rejects(
+        parse_modules([
+            {
+                source = prefix + "map(pure func(number: Int): Round(number))\n" + EMPTY_MAIN,
+                targets = [1, 2]
+            },
+            { source = MAP, targets = [] },
+            { source = TABLE, targets = [] }
+        ]),
+        {
+            span = site(0, prefix, "map"),
+            kind = ProgramProblem,
+            note = Some(
+                CompetingDeclarations([
+                    site(1, "pure func ", "map"),
+                    site(0, "import:\n    ./lists: ", "List")
+                ])
+            ),
+            message = "no method map for Table is in scope",
+            help = "import table: Table methods"
+        }
+    )
+
+
+-- List's `append` is a runtime operation rather than a declared call, and its
+-- first parameter must still fit: a Shape receiver is rejected at `append`,
+-- before its argument is checked against the List's element.
+private pure func test_a_runtime_operation_reached_alone_must_fit_its_receiver() -> Bool:
+    prefix =
+        |import:
+        |    ./lists: List methods
+        |union Shape:
+        |    Round(Int)
+        |pure func unit() -> Shape:
+        |    Round(1)
+        |pure func grown() -> List[Shape]:
+        |    unit().
+    append =
+        |pure func append[Element](values: List[Element], value: Element) -> List[Element]:
+        |    builtin("list.append")
+        |
+    rejects(
+        parse_modules([
+            { source = prefix + "append(Round(2))\n" + EMPTY_MAIN, targets = [1] },
+            { source = append, targets = [] }
+        ]),
+        {
+            span = site(0, prefix, "append"),
+            kind = ProgramProblem,
+            note = Some(
+                CompetingDeclarations([
+                    site(1, "pure func ", "append"),
+                    site(0, "import:\n    ./lists: ", "List")
+                ])
+            ),
+            message = "no method append for Shape is in scope",
+            help = NO_METHOD_HELP
+        }
+    )
+
+
+-- No function named `keys` is in scope at all, so the call waits for its
+-- receiver's type. Only `./lookup` writes a path to Table's module, a library
+-- path, which names that module from the caller too.
+private pure func test_a_receiver_call_no_function_reaches_names_the_import() -> Bool:
+    lookup =
+        |import:
+        |    table: Table, empty_table
+        |pure func find() -> Table:
+        |    empty_table()
+        |
+    rejects(
+        parse_modules([
+            { source = FIND_KEYS + "keys()\n" + EMPTY_MAIN, targets = [1] },
+            { source = lookup, targets = [2] },
+            { source = TABLE, targets = [] }
+        ]),
+        {
+            span = site(0, FIND_KEYS, "keys"),
+            kind = ProgramProblem,
+            note = None,
+            message = "no method keys for Table is in scope",
+            help = "import table: Table methods"
+        }
+    )
+
+
+-- The caller already imports the module that declares `perimeter`, by name,
+-- so its own path for that module names the methods import.
+private pure func test_a_receiver_call_names_the_methods_import_of_a_module_the_caller_imports() -> Bool:
+    prefix =
+        |import:
+        |    ./shapes: unit
+        |func main() -> Int:
+        |    unit().
+    shapes =
+        |union Shape:
+        |    Square(Int)
+        |pure func unit() -> Shape:
+        |    Square(1)
+        |pure func perimeter(shape: Shape) -> Int:
+        |    4
+        |
+    rejects(
+        parse_modules([
+            { source = prefix + "perimeter()\n", targets = [1] },
+            { source = shapes, targets = [] }
+        ]),
+        {
+            span = site(0, prefix, "perimeter"),
+            kind = ProgramProblem,
+            note = None,
+            message = "no method perimeter for Shape is in scope",
+            help = "import ./shapes: Shape methods"
+        }
+    )
+
+
+-- Only `./lookup` writes a path to Table's module, relative to itself, which
+-- does not name that module from the caller.
+private pure func test_a_relative_path_another_module_writes_is_not_offered_as_the_import() -> Bool:
+    lookup =
+        |import:
+        |    ./tables: Table, empty_table
+        |pure func find() -> Table:
+        |    empty_table()
+        |
+    rejects(
+        parse_modules([
+            { source = FIND_KEYS + "keys()\n" + EMPTY_MAIN, targets = [1] },
+            { source = lookup, targets = [2] },
+            { source = TABLE, targets = [] }
+        ]),
+        {
+            span = site(0, FIND_KEYS, "keys"),
+            kind = ProgramProblem,
+            note = None,
+            message = "no method keys for Table is in scope",
+            help = NO_METHOD_HELP
+        }
+    )
+
+
+-- `Only` takes its union from an expected type, which only a function's first
+-- parameter could give it, and no function named `absent` is in scope: the
+-- call is an unknown function, not a constructor that lacks a type.
+private pure func test_a_receiver_that_only_a_parameter_could_type_reaches_no_function() -> Bool:
+    prefix =
+        |import:
+        |    ./types: Foo(Only)
+        |func main() -> Int:
+        |    Only.
+    rejects(
+        parse_modules([
+            { source = prefix + "absent()\n", targets = [1] },
+            { source = FOO, targets = [] }
+        ]),
+        {
+            span = site(0, prefix, "absent"),
+            kind = ProgramProblem,
+            note = None,
+            message = "unknown function",
+            help = UNKNOWN_HELP
         }
     )
 
@@ -1061,6 +1268,30 @@ TESTS: TestSuite = {
         (
             "a caller's type parameter stays rigid in receiver selection",
             test_a_callers_type_parameter_stays_rigid_in_receiver_selection
+        ),
+        (
+            "a receiver only another type's function accepts names the import",
+            test_a_receiver_only_another_types_function_accepts_names_the_import
+        ),
+        (
+            "a runtime operation reached alone must fit its receiver",
+            test_a_runtime_operation_reached_alone_must_fit_its_receiver
+        ),
+        (
+            "a receiver call no function reaches names the import",
+            test_a_receiver_call_no_function_reaches_names_the_import
+        ),
+        (
+            "a receiver call names the methods import of a module the caller imports",
+            test_a_receiver_call_names_the_methods_import_of_a_module_the_caller_imports
+        ),
+        (
+            "a relative path another module writes is not offered as the import",
+            test_a_relative_path_another_module_writes_is_not_offered_as_the_import
+        ),
+        (
+            "a receiver that only a parameter could type reaches no function",
+            test_a_receiver_that_only_a_parameter_could_type_reaches_no_function
         )
     ]
 }

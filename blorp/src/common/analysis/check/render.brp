@@ -5,7 +5,7 @@ import:
         ImportOrigin(RelativeImport, LibraryImport),
         ImportSelection(NamedSelection, ConstructorSelection, MethodsSelection),
         ModulePath
-    ../../syntax/source: ModuleKind(UserModule), module_number
+    ../../syntax/source: ModuleId, ModuleKind(UserModule), module_number, source_module
     ../../syntax/syntax:
         IntegerFormat(Int64Format, UInt8Format),
         Purity(Pure, Impure),
@@ -1378,13 +1378,10 @@ private pure func render_method_error(
             match render_receiver_overlap(span, name, overlap, context):
                 Ok(clash): clash
                 Err(invariant): invariant
-        errors.NoApplicableMethod(_, _, sites):
-            method_diagnostic(
-                span,
-                sites,
-                "no method accepts this receiver type",
-                "use a value of a declared receiver type, or import a function accepting this type"
-            )
+        errors.NoApplicableMethod(missing):
+            match context.render_missing_method(span, missing):
+                Ok(diagnostic): diagnostic
+                Err(invariant): invariant
         errors.MethodReceiverNeedsType(_, sites):
             method_diagnostic(
                 span,
@@ -2128,6 +2125,95 @@ private pure func render_recursion_error(
                 "recursive calls grow type arguments without bound",
                 "pass recursive type arguments unchanged, permute them, or reset them to concrete types"
             )
+
+
+-- A receiver call that reaches no function for its receiver's type. The help
+-- names a provider's methods import when the caller can write one; the note
+-- shows the functions the name does reach, if any.
+private pure func render_missing_method(
+    context: RenderContext,
+    span: Span,
+    missing: errors.MissingMethod
+) -> Result[Diagnostic, Diagnostic]:
+    name ?= missing.name.parsed_spelling(context.parsed.names, span)
+    receiver ?= missing.receiver.type_spelling(context, span)
+    suggested ?= context.methods_import(span, missing)
+    message = "no method ${name} for ${receiver} is in scope"
+    help = suggested.get_or(
+        "use a value of a declared receiver type, or import a function accepting this type"
+    )
+    if missing.candidates.is_empty():
+        Ok(rendered(span, message, help))
+    else:
+        Ok(method_diagnostic(span, missing.candidates, message, help))
+
+
+-- `module: T methods` for the first provider whose path names it from the
+-- caller's module.
+private pure func methods_import(
+    context: RenderContext,
+    span: Span,
+    missing: errors.MissingMethod
+) -> Result[Option[String], Diagnostic]:
+    head ?= missing.receiver.head_spelling(context, span)
+    caller = source_module(span.source)
+    var path: Option[ModulePath] = None
+    for provider in missing.providers:
+        path = context.caller_path(caller, provider)
+        if path.is_some():
+            break
+    match (path, head):
+        (Some(found), Some(type_name)):
+            found
+                .module_path_spelling(context, span)
+                .map(pure func(module): Some("import ${module}: ${type_name} methods"))
+        _:
+            Ok(None)
+
+
+-- A path to `provider` that is valid in the caller's module: one the caller
+-- writes itself, or a library path, which resolves the same from every module.
+-- A relative path another module writes is relative to that module.
+private pure func caller_path(
+    context: RenderContext,
+    caller: Option[ModuleId],
+    provider: ModuleId
+) -> Option[ModulePath]:
+    var found: Option[ModulePath] = None
+    for row in context.parsed.modules:
+        for written in row.imports:
+            if (
+                found
+                    .is_none()
+                    .and(written.target == provider)
+            ):
+                valid_here: Bool = match written.path.origin:
+                    LibraryImport: True
+                    RelativeImport(_): caller == Some(row.module)
+                if valid_here:
+                    found = Some(written.path)
+    found
+
+
+-- The type a methods import names for `receiver`: its head without arguments.
+-- A receiver without a head, such as a tuple, has none.
+private pure func head_spelling(
+    receiver: check.TypeRef,
+    context: RenderContext,
+    span: Span
+) -> Result[Option[String], Diagnostic]:
+    match receiver:
+        check.NominalType(owner, _):
+            head: check.TypeRef = check.NominalType(owner, [])
+            head
+                .type_spelling(context, span)
+                .map(pure func(name): Some(name))
+        check.ListType(_) | check.IntegerType(_) | check.FloatType | check.VoidType | check.StringType:
+            receiver
+                .builtin_spelling(context, span)
+                .map(pure func(name): Some(name))
+        check.ParameterType(_) | check.CallableType(_, _, _) | check.TupleType(_):
+            Ok(None)
 
 
 private pure func method_diagnostic(

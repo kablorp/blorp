@@ -82,6 +82,7 @@ import:
         ResolutionContext,
         ResolvedReceiver(ReceiverCandidates, UniqueReceiver),
         method_sites,
+        unique_receiver_rows,
         TraitAvailability methods,
         WrittenName methods,
         Caller,
@@ -162,7 +163,7 @@ import:
             DictLiteralRequiresDict,
             IntegerLiteralOutOfRange
         ),
-        MethodError(MethodReceiverNeedsType),
+        MethodError(NoApplicableMethod, MethodReceiverNeedsType),
         CheckerInvariant(
             InvalidFunctionContract,
             InvalidConstantDeclaration,
@@ -185,6 +186,8 @@ import:
         or_checker_invariant
     ./inference:
         SelectedReceiver,
+        missing_method,
+        receiver_can_fit,
         PendingBase(
             PendingContext,
             PendingInterpolatedString,
@@ -1757,6 +1760,15 @@ private pure func plan_expression(
 
             if context_error:
                 match contracts.get(0):
+                    -- A name no function reaches cannot wait for a receiver
+                    -- whose type only a function's parameter could supply.
+                    Some(PendingOverloadInvocation(application, [])):
+                        Err(
+                            call_error(
+                                application.callee.span,
+                                UnknownFunction(application.callee.id)
+                            )
+                        )
                     Some(PendingOverloadInvocation(application, candidates)):
                         match candidates.method_sites(
                             site.site_signatures(),
@@ -1789,16 +1801,54 @@ private pure func pending_receiver_contract(
     slots: List[InferenceSlot]
 ) -> Result[SelectedReceiver, CheckError]:
     context ?= site.body_context(application.span)
-    application.select_receiver_contract(
+    application.select_receiver_contract(candidates, current.pending_receiver_use(), slots, context)
+
+
+-- A call that reaches one function is rejected as one of several candidates
+-- would be when the receiver cannot have its first parameter's head: at the
+-- call's name, before the arguments are checked against that parameter. A
+-- trait method needs no check: implementation search proves its receiver.
+private pure func unique_receiver_fit(
+    current: PendingValue,
+    application: ReceiverApplication,
+    call: PendingCall,
+    site: ExpressionSite,
+    slots: List[InferenceSlot]
+) -> Result[Void, CheckError]:
+    match call.target:
+        PendingMethod(_):
+            Ok(void)
+        PendingRuntime(_) | PendingDeclared(_) | PendingParameter(_) | PendingStored(_):
+            match call.signature.receiver_can_fit(current.pending_type(), slots, current.base_span):
+                Err(invariant): Err(invariant)
+                Ok(True): Ok(void)
+                Ok(False): current.unfit_receiver(application, site, slots)
+
+
+-- The rejection of a call whose one function cannot take its receiver.
+private pure func unfit_receiver(
+    current: PendingValue,
+    application: ReceiverApplication,
+    site: ExpressionSite,
+    slots: List[InferenceSlot]
+) -> Result[Void, CheckError]:
+    context ?= site.body_context(application.span)
+    candidates ?= context.unique_receiver_rows(application.callee)
+    missing ?= context.missing_method(
+        application.callee,
         candidates,
-        {
-            value_type = current.pending_type(),
-            span = current.base_span,
-            literal = current.read_literal()
-        },
-        slots,
-        context
+        current.pending_receiver_use(),
+        slots
     )
+    Err(method_error(application.callee.span, NoApplicableMethod(missing)))
+
+
+private pure func pending_receiver_use(current: PendingValue) -> InferenceUse:
+    {
+        value_type = current.pending_type(),
+        span = current.base_span,
+        literal = current.read_literal()
+    }
 
 
 private pure func tuple_hints(
@@ -3373,24 +3423,33 @@ private pure func elaborate_value(
                                                     )
                                                     operand_count = operand_count + 1
                                         Some(PendingReceiverInvocation(application, call)):
-                                            work = work.push_at(
-                                                work_count,
-                                                Some(
-                                                    StartCall(
-                                                        call,
-                                                        application.arguments,
-                                                        ReceiverPlacement(current, {
-                                                            source = base_span.source,
-                                                            start = base_span.start,
-                                                            end = application.span.end
-                                                        }),
-                                                        hints
-                                                            .get(position)
-                                                            .get_or(None)
+                                            match current.unique_receiver_fit(
+                                                application,
+                                                call,
+                                                site,
+                                                slots
+                                            ):
+                                                Err(error):
+                                                    failure = Some(error)
+                                                Ok(_):
+                                                    work = work.push_at(
+                                                        work_count,
+                                                        Some(
+                                                            StartCall(
+                                                                call,
+                                                                application.arguments,
+                                                                ReceiverPlacement(current, {
+                                                                    source = base_span.source,
+                                                                    start = base_span.start,
+                                                                    end = application.span.end
+                                                                }),
+                                                                hints
+                                                                    .get(position)
+                                                                    .get_or(None)
+                                                            )
+                                                        )
                                                     )
-                                                )
-                                            )
-                                            work_count = work_count + 1
+                                                    work_count = work_count + 1
                                         Some(PendingOverloadInvocation(application, candidates)):
                                             match current.pending_receiver_contract(
                                                 application,

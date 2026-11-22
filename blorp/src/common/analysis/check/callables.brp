@@ -30,7 +30,7 @@ import:
         Entry
     ./declarations: ResolvedType, TypeScope
     ./errors:
-        CallError(ArgumentCountMismatch, ImpureCall, ImpureCallableCall, UnknownFunction),
+        CallError(ArgumentCountMismatch, ImpureCall, ImpureCallableCall),
         ImpureCallee(CalledFunction, CalledMethod),
         CheckError,
         CheckerInvariant(InvalidResolvedFunction, InvalidFunctionContract, InvalidReceiverScope),
@@ -222,20 +222,21 @@ pure func resolve_body_type(
 
 
 -- A receiver call whose name reaches one function or method, with that use, or
--- several candidates that the receiver's inferred type chooses between.
+-- the candidates, perhaps none, that the receiver's inferred type chooses
+-- between.
 union ResolvedReceiver:
     UniqueReceiver(FunctionContract, NameUse)
     ReceiverCandidates(List[ReceiverFunction])
 
 
--- The head of `function`'s first parameter type, which UFCS dispatches on.
-private pure func receiver_head(function: AcceptedFunction) -> Option[TypeHead]:
-    match function.signature.parameters.get(0):
+-- The head of a signature's first parameter type, which UFCS dispatches on.
+pure func receiver_head(signature: FunctionSignature) -> Option[TypeHead]:
+    match signature.parameters.get(0):
         Some(parameter): parameter.value_type.type_head()
         None: None
 
 
-private pure func listed_function(candidates: List[ReceiverFunction], id: FunctionId) -> Bool:
+pure func listed_function(candidates: List[ReceiverFunction], id: FunctionId) -> Bool:
     var present: Bool = False
     for candidate in candidates:
         if candidate.id == id:
@@ -282,7 +283,7 @@ pure func receiver_functions(
                 Some(id):
                     match signatures.get(id.function_number()):
                         Some(function):
-                            match function.receiver_head():
+                            match function.signature.receiver_head():
                                 Some(head):
                                     if head == imported.receiver:
                                         key = entry.name.id
@@ -386,6 +387,17 @@ pure func classify_receiver(
             application.classify_function_receiver(context, [])
 
 
+-- The one function a unique receiver call reached, read again from the scope
+-- row `classify_receiver` found it in, for that call's rejection.
+pure func unique_receiver_rows(
+    context: ResolutionContext,
+    name: WrittenName
+) -> Result[List[ReceiverFunction], CheckError]:
+    match context.receiver_scope.names.get(name.id):
+        Some(VisibleFunctions(candidates)): Ok(candidates)
+        Some(VisibleMethod(_)) | None: Err(checker_invariant(name.span, InvalidReceiverScope))
+
+
 private pure func classify_function_receiver(
     application: ReceiverApplication,
     context: ResolutionContext,
@@ -393,8 +405,6 @@ private pure func classify_function_receiver(
 ) -> Result[ResolvedReceiver, CheckError]:
     name = application.callee
     match candidates:
-        []:
-            Err(call_error(name.span, UnknownFunction(name.id)))
         [candidate]:
             match context.caller.function_contract(
                 name,
@@ -408,6 +418,8 @@ private pure func classify_function_receiver(
                 Err(error):
                     Err(error)
         _:
+            -- With no candidate, the rejection names the receiver's type, which
+            -- is known only once the receiver is checked.
             Ok(ReceiverCandidates(candidates))
 
 

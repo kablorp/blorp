@@ -1097,7 +1097,15 @@ known to be a List before the lambda's result is, which chooses List's `join`.
 When the known part still fits several, as a List whose element type is not
 yet known fits both `List[String]` and `List[Int]`, the call reports
 `method receiver needs an explicit type`; bind the receiver to a local with a
-declared type.
+declared type. When no function the name reaches can take the receiver, the
+call is rejected at the name, before its arguments are checked. In a module
+that imports only `path: to_path`, the prelude's `join` reaches List's, so a
+Path receiver gets `no method join for Path is in scope`. If a loaded module
+declares a `join` that fits and the calling module can name it, by its own
+import of it or by a library path, the help names its methods import, here
+`import path: Path methods`. A module is loaded only when some module imports
+it; where none does, the help is the general one, to use a value of a declared
+receiver type or import a function accepting it.
 
 The [prelude](standard_library/prelude.brp) is the only implicit import. User
 modules receive its selections: the base types, `Bool`, `Option` and `Result`
