@@ -364,9 +364,11 @@ everywhere. Its operations wrap and never fail, like Int's:
 A sequence of bytes is `Bytes`, in the [`bytes` module](standard_library/README.md#bytes).
 
 `Bool` is a `fixed union` of `True` and `False`. There are no Boolean
-operators: the `bool` module's ordinary functions `not`, `and` and `or` are
-selected with `bool: not, and, or` (or `bool: Bool methods` for UFCS), and
-they evaluate every argument. Use `match` or `if` to skip work.
+operators. The `bool` module's ordinary functions `not`, `and` and `or` come
+from the prelude as methods, as in `done.not()` and `left.and(right)`. A
+direct call such as `and(left, right)` needs them selected with
+`bool: not, and, or`. They evaluate every argument; use `match` or `if` to
+skip work.
 
 `Void` has one value, `void`. It may be a parameter, result, field or payload
 type, and it needs no storage or ownership.
@@ -1102,19 +1104,20 @@ modules receive its selections: the base types, `Bool`, `Option` and `Result`
 with their constructors, the operator traits, `Equatable`, `Hashable`,
 `Stringable`, `Dict`, the console functions `print` and `print_error`, the
 generic `max` and `min` of any `Orderable`, the conversions
-`to_uint8` and `parse_uint8`, and the methods of Int, UInt8, Float, String,
-List, Option and Result. So `(42 + 1).to_string().length()` and
-`args.get(1).get_or("none")` need no import. Other direct calls need named
-imports: console text output is in the prelude, while byte console I/O, files,
-processes and the environment are explicit imports. A user module cannot
-declare `print`, `print_error`, `max` or `min` ("max is provided by the
-prelude", with the help "give this function another name"). Selecting what the
-prelude supplies, such as `print` from `io/console/output` or
-`option: Option methods`, is redundant but accepted: an import of a name
-already in scope enters once. A function is rejected as well when its name is
-a method the prelude provides and its first parameter could be that method's
-receiver. Examples are `lines` or `parse_uint8` on a String, `get_or` on an
-`Option[T]`, and a generic `is_ok[T](value: T)`, whose `T` could be a Result.
+`to_uint8` and `parse_uint8`, and the methods of Bool, Int, UInt8, Float,
+String, List, Option and Result. So `(42 + 1).to_string().length()`,
+`args.get(1).get_or("none")` and `done.not()` need no import. Other direct
+calls need named imports: console text output is in the prelude, while byte
+console I/O, files, processes and the environment are explicit imports. A user
+module cannot declare `print`, `print_error`, `max` or `min` ("max is provided
+by the prelude", with the help "give this function another name"). Selecting
+what the prelude supplies, such as `print` from `io/console/output` or
+`list: List methods`, is redundant but accepted: an import of a name already
+in scope enters once. A function is rejected as well when its name is a method
+the prelude provides and its first parameter could be that method's receiver.
+Examples are `lines` or `parse_uint8` on a String, `not` on a Bool, `get_or`
+on an `Option[T]`, and a generic `is_ok[T](value: T)`, whose `T` could be a
+Result.
 The error is "two functions named lines can accept the same receiver"; give
 the function another name. Library modules receive nothing implicitly and
 cannot import user modules. Any module may import the foundation module as

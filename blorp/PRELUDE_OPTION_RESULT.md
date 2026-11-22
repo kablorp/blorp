@@ -4,6 +4,11 @@ A proposal for Keith, measured on 2026-11-21 on unpushed scratch branches.
 Keith chose A on 2026-11-21 ("Yes, add both"); [Landing](#landing) records
 the change and its ceilings.
 
+**Historical.** This records the 2026-11-21 decision, and the import rows it
+quotes are as they were then. On 2026-11-22 the prelude also gained
+`Bool`'s methods, and that change removed these rows from user modules
+everywhere, fixtures included. See [Bool](#bool).
+
 ## Problem
 
 The prelude's methods return Options (`get`, `find`, `parse_int`, …) and
@@ -18,7 +23,7 @@ func main(args: List[String]) -> Int:
 Today this fails with `error: no method accepts this receiver type`, whose
 notes point at List's and Dict's `get_or`. A `.map_err(...)` call fails with
 `unknown function`. Neither error names the fix. 86 rows in 55 user modules,
-including `src/main.brp`'s `result: Result methods`, exist only for this.
+including `src/main.brp`'s `result: Result methods`, existed only for this.
 
 ## Options
 
@@ -162,3 +167,75 @@ are as in [Cost](#cost).
     e2e allocation or instruction ceiling was exceeded, so none moved.
 
 Logs and samples are in `blorp/build/prelude-option-result/landing-rebased/`.
+
+## Bool
+
+On 2026-11-22 Keith asked that `option: Option methods`,
+`result: Result methods` and `bool: Bool methods` all be "unneeded and
+removed". The prelude gains `bool: Bool methods`. Every compile already loads
+`bool.brp`, through `dict.brp`.
+
+### Cost of the prelude row
+
+Scratch commit `295f2f430` adds only the row; base is `265366b37`. Host and
+recipe are as in [Cost](#cost).
+
+| Workload | allocations | peak heap, bytes | instructions |
+| --- | --- | --- | --- |
+| `return/zero` at `-O2` | +49 (+0.085%) | +1,287 (+0.10%) | +0.30% (spread about 0.4%) |
+| self-compile, fixed input | +0 | +0 | +0.035%, noise; C identical |
+| self-compile, own source, rows kept | +234 (+0.0018%) | +990 | −0.055%, noise |
+
+### The change
+
+Every user module loses its `Option methods`, `Result methods` and
+`Bool methods` selections: `src`, `scripts`, tests and now fixtures. It also
+loses every by-name `option:`, `result:` or `bool:` selection it uses only as
+a method. Names called directly, as in `and(left, right)`, or passed as values
+stay. In all, 171 rows go and 29 are trimmed, in 197 files, and two import
+blocks empty.
+
+Other changes:
+
+- `README.md` covers Bool's section, the prelude list, and a redundant-import
+  example, now `list: List methods`.
+- The library README is updated, and the decision records that quote these
+  rows are labelled historical.
+- The suite is renamed `test_prelude_methods.brp`. It adds Bool calls and a
+  `not` overlap, and its redundant-import case uses `list: List methods`.
+  Against main's prelude its two Bool cases fail.
+
+Library modules keep their 27 rows: they receive no prelude. How they could
+drop them is a separate proposal for Keith.
+
+Lines against `265366b37`:
+
+- production: +8 −41 (net −33);
+- test code: +47 −149 (net −102);
+- fixtures: +25 −38 (net −13).
+
+### Ceilings
+
+| Measure | Ceiling | Final |
+| --- | --- | --- |
+| self-compile fixed input: allocations, peak heap | +0 | +0, +0 |
+| self-compile fixed input: instructions | +0.15% | −0.083% |
+| self-compile own source: allocations, peak heap | +0 | −912, −15,246 bytes |
+| `return/zero` at `-O2`: allocations | +80 | +49 |
+| `return/zero` at `-O2`: peak heap | +2,000 bytes | +1,287 bytes |
+| `return/zero` at `-O2`: instructions | +0.6% | −0.06%, noise |
+| production lines | net −30 or fewer | net −33 |
+
+The final column measures commit `3a2281bb8` against `265366b37`:
+
+- **Self-compile:** `self-compile-cost 265366b37 3a2281bb8 --rounds 3`. The
+  fixed-input C is identical (`adada6d84d4b7d19`).
+- **One-module:** `return/zero`, 11 rounds, emitted C identical. Base median
+  69,713,105, landing 69,671,341.
+- **Gates, all exit 0:**
+  - `make -C blorp test`: 3,342 PASS, 0 FAIL;
+  - `make -C blorp test-e2e INSTRUCTION_CHECK=on`: 1,166 PASS, 0 FAIL. No
+    e2e ceiling was exceeded, so none moved.
+
+Logs and samples are in `blorp/build/prelude-bool/final/`. This record
+amends the commit, and the amendment changes only this file.

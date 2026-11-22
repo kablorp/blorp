@@ -51,11 +51,13 @@ each returns `Self`. The prelude's selection makes them the canonical traits of
 arithmetic and ordering; trait definitions and direct member delegation call
 members through UFCS, as in `left.equals(right)`.
 
-`bool.brp` defines pure, ordinary `not`, `and` and `or`. Select them by name,
-as in `bool: not, and, or`, for direct calls, or use `bool: Bool methods` for
-UFCS (`done.not()`, `left.and(right)`), as the compiler source does. Both
-binary arguments are eager; use an explicit `match` to skip evaluation. The prelude leaves these names available
-for user helper declarations and selections of their own ordinary functions.
+`bool.brp` defines pure, ordinary `not`, `and` and `or`. The prelude selects
+their methods, so a user module writes `done.not()` and `left.and(right)`
+without an import. A direct call needs them selected by name, as in
+`bool: not, and, or`. Both binary arguments are eager; use an explicit `match`
+to skip evaluation. A user function named `not`, `and` or `or` whose first
+parameter could be a Bool is rejected as an overlap with the prelude's
+method. On other receivers the names stay available.
 They import only other library modules and `_base`, never user modules.
 
 For example, `(42 + 1).to_string().length()` needs no imports. Direct calls
@@ -328,10 +330,10 @@ prelude. `option.brp` provides `is_some`, `is_none`, eager `get_or`, eager
 `to_result` and `map`; `result.brp` provides `is_ok`, `map`, `map_err` and
 `and_then`. These are ordinary generic pure functions over the existing base
 unions. The prelude selects both modules' methods, so a user module calls them
-as methods, as in `args.get(1).get_or("none")`, without an import. A direct call
-such as `is_some(value)` still needs them imported by name, and a library module
-imports `option: Option methods` or `result: Result methods` itself. Bool
-operations use explicit named imports.
+as methods, as in `args.get(1).get_or("none")`, without an import. A direct
+call such as `is_some(value)` still needs the function imported by name. A
+library module receives no prelude, so it imports these modules' methods, and
+Bool's, itself.
 
 The four callback signatures keep their type parameters independent:
 

@@ -652,7 +652,9 @@ P7 says. The same compiler showed that the approved `current_commit` example
 did not compile: without `result: Result methods`, `map_err` is unknown, and
 with it, an unannotated `?=` leaves `GitMissing` without an expected union.
 This change annotates `git: Path` and adds the import, here and in the
-library README, and that form compiles. A user module that binds
+library README, and that form compiles. (Historical: since 2026-11-21 the
+prelude supplies Result's methods, and the examples no longer import them.)
+A user module that binds
 `builtin("process.fault")` compiles too.
 
 Both cores cost the same: 500 runs of `/usr/bin/true` took 1.9 to 2.8 ms
