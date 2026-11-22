@@ -238,7 +238,8 @@ Logs are in `blorp/build/foundation-methods/final2/`.
 ## The seed rotation
 
 `blorp/bootstrap.env` pins `blorp-seed-8eb8e16546b3`, which main's CI built
-from landing 1 (`8eb8e1654`). Every target emitted identical compiler C. This
+from landing 1 (`8eb8e1654`). Every target emitted identical compiler C (SHA-256
+`613ec0f15860bdfe9b92789a28a7f1aabfb1f1894fb4ed0ef1210964a0c2d21e`). This
 seed knows the foundation methods role, so the library can rely on it and the
 27 rows can go.
 
@@ -251,3 +252,64 @@ seed knows the foundation methods role, so the library can rely on it and the
 - `bash blorp/test/test_bootstrap/test_bootstrap.sh`: exit 0, 38 PASS.
 
 Logs are in `blorp/build/seed-rotation/`.
+
+## Landing 3: the removal
+
+This landing comes after the seed rotation, which pins a seed that knows the
+foundation methods role. It removes 27 selections from 19 library modules:
+
+- 26 rows go;
+- `path.brp`'s row is trimmed, not deleted: it keeps `bool: and, or`, which
+  it calls directly.
+
+The prelude's three rows and `_methods.brp` itself stay. Lines: +1 −27, net
+−26.
+
+Before the rotation landed, this was checked with main's compiler, which
+already knows the role:
+
+- every library body checks, through `test_whole_library`;
+- both foundation-methods suites pass;
+- the compiler's own C is byte-identical whether compiled with the swept
+  library or with main's (`613ec0f15860bdfe`).
+
+**Results on `260fa51bd`,** rebased onto the rotation `3454e2e49`:
+
+- `make -C blorp compiler`: exit 0, built by `blorp-seed-8eb8e16546b3`.
+- `make -C blorp test`: exit 0, 3,360 PASS, 0 FAIL.
+- `self-compile-cost 3454e2e49 260fa51bd --rounds 3`:
+
+  | Row | Allocations | Peak heap | Instructions |
+  | --- | --- | --- | --- |
+  | fixed input | +0 | +0 | −0.10% |
+  | own source | −476 | −7,153 bytes | −0.06% |
+
+  The fixed-input C is identical (`613ec0f15860bdfe`).
+- **`make -C blorp test-e2e INSTRUCTION_CHECK=on`, first run:** one case
+  failed. `generic/managed/both_variants` retired 470,376,488 instructions
+  against its ceiling of 469,019,004 (+0.29%).
+
+  Measured directly with each side's `-O0` test compiler, seven runs each,
+  this landing compiles that fixture more cheaply than the rotation does:
+
+  | | Rotation | This landing |
+  | --- | --- | --- |
+  | median instructions | 436,997,869 | 432,997,746 (−0.9%) |
+  | allocations | 61,914 | 61,854 |
+
+  Run-to-run spread is about 0.8%, so the ceiling breach was noise.
+- **Second run:** another single case failed. `mortal_string/identity` retired
+  472,579,745 instructions against 455,976,420, a case that passed in the
+  first run. Measured directly, this landing is again cheaper:
+
+  | | Rotation | This landing |
+  | --- | --- | --- |
+  | median instructions | 424,396,492 | 421,451,273 (−0.7%) |
+  | highest run | 452,747,364 | 423,644,826 |
+
+  The rotation's highest run, 6.7% over its median, shows the size of a
+  one-off high sample. The host was loaded by other sessions (load average
+  about 5 to 6). No ceiling moved.
+- **Third run:** exit 0, 1,167 PASS, 0 FAIL.
+
+Logs are in `blorp/build/library-methods-removal/`.
