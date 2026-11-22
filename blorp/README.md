@@ -1422,7 +1422,9 @@ implementation's type parameter across the implementation's methods, and lists
 every use of a built-in type. Both cover only the open file's program, so uses
 in a module that imports the file are not found, nor are uses in library code
 the program does not call, which is not checked. While a file's program fails
-to load or check, a definition is `null` and references are `[]`. A library
+to load or check, it is served from the last analysis of that program that
+checked, as described below; a program that never checked has no
+definitions (`null`) and no references (`[]`). A library
 file the editor opens, after a definition led there, is not the root of a
 program: it gets the lexer's tokens and no diagnostics, no definitions and no
 references.
@@ -1438,11 +1440,27 @@ A declaration has the modifier `declaration`, an immutable binding or a
 constant `readonly`, anything the standard library declares or the language
 builds in `defaultLibrary`, and a `---` block `documentation`. A string with
 values in it is coloured in pieces around each `${…}`, and a token that spans
-lines is sent once per line. While a file's program fails to load or check,
-the file gets only the lexer's tokens; a file that does not lex gets those
-before its first error. The names in an import path (its `..` and `/` are
+lines is sent once per line. A file whose program never checked gets only the lexer's tokens, and a file
+that does not lex gets those before its first error. The names in an import path (its `..` and `/` are
 operators), a module alias where it is declared, the words `fixed` and
 `methods`, and a trait requirement's parameters are not coloured.
+
+While a file's program fails to load or check, the server keeps answering from
+the last analysis of that program that checked, so editing a file does not
+turn its colours off or stop definition requests. The diagnostics are always
+the latest analysis's. The file's lines are compared with their text in that
+analysis by a line diff (Myers' algorithm, after the common first and last
+lines are trimmed): a name on an unchanged line keeps its colour, and its
+definition and references move to where the line is now; a name on a line that
+was inserted, deleted or edited is plain, and a definition or reference there
+is `null` or left out. This holds for every file the analysis read, each by
+its own text: an open document's, else the text the latest analysis read, else
+the text of the checked analysis, unless the server has been told that the
+file changed on disk since, when nothing is answered into it. Library files
+never change. When more than 512 lines are inserted and deleted at once (an
+edited line counts as two), the diff gives up and every line between the
+unchanged first and last lines counts as changed until the program checks
+again, which replaces what was kept.
 
 ## Compiler architecture
 

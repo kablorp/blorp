@@ -217,12 +217,14 @@ modifiers are used. String pieces are separate lexer tokens that stop at
 
 **Broken files.** In landing 9, while a root fails to analyse, its files
 get only the lexer's tokens (the prefix, if lexing failed), definition
-returns `null` and references `[]`. Landing 11 then keeps the last
-successful analysis sealed, with each file's text then. Each file's edits
-since form one window, between the longest common prefix and the longest
-non-overlapping common suffix: positions before it hold, positions after
-shift by the length change, and positions inside find nothing. Requests map
-back through their file's window, and answers forward through theirs.
+returns `null` and references `[]`. Landing 11 then keeps the root's
+last analysis that checked, sealed with the texts it read. A line diff (Keith,
+2026-11-21, in place of one edit window) matches each file's lines then and
+now: a position on an unchanged line moves with its line, and one on an
+inserted, deleted or edited line finds nothing. Requests map back through
+their file's diff, and answers forward through theirs. A file's text now is
+its open document's, else the latest analysis's, else the sealed one's,
+unless a change to it was reported since.
 
 **Definition** returns the declaration of the use at the position, or
 `null`. A position at an identifier's end counts as inside it.
@@ -579,7 +581,7 @@ lines counted apart. Compile cost must also fit the e2e instruction ceilings'
 | 9b semantic tokens, fixed input | ≤ +0.1% | ≤ +0.01% | ≤ +0.1% | ≤ +780 net |
 | 9c navigation, fixed input | ≤ +0.1% | ≤ +0.01% | ≤ +0.1% | ≤ +470 net |
 | 10 the CLion plugin | not compiled | not compiled | not compiled | ≤ 580 Kotlin and XML |
-| 11 broken files | ≤ +0.5% (more source to compile) | ≤ +0.5% | ≤ +0.5% | ≤ +300 |
+| 11 broken files, fixed input | ≤ +0.1% | ≤ +0.01% | ≤ +0.1% | ≤ +460 net |
 
 **Latency.** Per request after one change, on this host: ≤ 1.0 s for
 `blorp/src/main.brp`, and ≤ 50 ms for a one-module program. Landing 1
@@ -1247,6 +1249,47 @@ server, and a path that cannot start shows a balloon.
   Keith's call. Cmd-click finds nothing until the server has started. No CI
   builds or tests the plugin.
 
+**Landing 11, broken files** (against `0cdfe13ae`). `self-compile-cost`, `-O2`,
+3 rounds, on the final commit:
+
+| Measure | Base | Candidate | Change |
+| --- | ---: | ---: | ---: |
+| Fixed input, allocations | 12,877,571 | 12,877,571 | unchanged |
+| Fixed input, instructions (median) | 12,985,811,064 | 12,991,023,360 | +0.040% |
+| Fixed input, peak heap (requested bytes) | 183,265,630 | 183,265,630 | unchanged |
+| Own source, allocations | 12,877,571 | 12,974,188 | +0.75% |
+| Own source, instructions (median) | 13,012,309,333 | 13,100,592,392 | +0.68% |
+| Own source, peak heap (requested bytes) | 183,265,629 | 184,295,575 | +0.56% |
+| Lines, production and tests | | | +448 and about +650 net |
+
+- **What landed.**
+  - A root's state is one union: `Current` with the latest outcome
+    (`Checked`, or `Failed` with the sealed analysis if any), or `Stale` with
+    the sealed analysis if any. The sealed analysis owns `changed_since`, the
+    files reported changed since it checked.
+  - `src/lsp/line_map.brp` trims the common first and last lines, then runs
+    Myers' O(ND) on the rest. Past 512 inserted and deleted lines
+    (`DIFF_LIMIT`) the untrimmed middle counts as changed.
+  - A line's ending is part of its identity.
+- **Ceilings.**
+  - **Lines.** The sketch of +300 assumed one window. It was corrected to +460
+    under the standing delegation after milestone 1 (+443), since the line diff
+    adds about 250 lines with comments.
+  - **Cost.** The row's old ≤ +0.5% bound own source, which
+    `blorp/AGENTS.md` reports and does not hold. The row now binds fixed
+    input, and that is met with identical C. Own source grew with the 448
+    lines it compiles.
+- **Latency** at `-O2`:
+  - `blorp/src/main.brp`, tokens after an edit that fails to check: median
+    128 ms (128–133);
+  - definition there: 1 ms;
+  - a one-module program: 2.3 ms;
+  - the diff on `parse.brp` (6,808 lines): about 6 ms.
+- **Tests.** Each mutation, run alone, failed its tests (the records are under
+  the worktree's `blorp/build/lsp-broken-files/`). The CLion plugin's tests
+  pass against this server.
+- **Review.** 0 blockers, 0 majors, 4 minors and 3 nits, all fixed.
+
 ## Testing
 
 Each landing starts with a failing test.
@@ -1264,7 +1307,7 @@ Each landing starts with a failing test.
 | 9b | Token splitting; a broken file's lexer tokens; staleness after a new import, a late open, a shared file's edit and a close. |
 | 9c | Each request through `receive`. |
 | 10 | Gradle tests in `editor/intellij/`, one running the repository's server, and the manual checklist in the plugin's README. |
-| 11 | `test/test_lsp/`: edit windows, with positions before, inside and after one, and two distant edits. |
+| 11 | `test/test_lsp/`: the line diff (edited, interleaved and distant lines, a moved block, line ends, the limit, both directions) and serving a failed root (tokens, definition above and below an edit, other open documents, references, UTF-16, a close or reported change). An e2e session in `cli.brp`. |
 
 **Commands:** those in `blorp/AGENTS.md`, `scripts/blorp-fixpoint --prove`
 for compiler landings, and `make -C blorp test-e2e INSTRUCTION_CHECK=on`

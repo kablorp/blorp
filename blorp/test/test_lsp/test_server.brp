@@ -1014,7 +1014,7 @@ func test_tokens_of_a_current_root_are_sent_at_once() -> Bool:
     )
 
 
-func test_a_root_that_does_not_check_gets_only_lexer_tokens() -> Bool:
+func test_a_root_that_never_checked_gets_only_lexer_tokens() -> Bool:
     loading(func(server: Server) -> Bool:
         server
             .after([INITIALIZE, did_open(ROOT_URI, BROKEN_TEXT)]).server
@@ -1824,8 +1824,9 @@ func test_a_request_on_a_stale_document_waits_for_its_analysis() -> Bool:
     )
 
 
--- While the root does not check, a definition is null and references are none.
-func test_a_root_that_does_not_check_has_no_definitions_or_references() -> Bool:
+-- A root that never checked has nothing to serve from: a definition is null
+-- and references are none.
+func test_a_root_that_never_checked_has_no_definitions_or_references() -> Bool:
     loading(func(server: Server) -> Bool:
         broken = server
             .after([INITIALIZE, did_open(ROOT_URI, BROKEN_TEXT)]).server
@@ -1923,6 +1924,392 @@ func test_a_library_file_the_client_opens_gets_only_lexer_tokens() -> Bool:
             checks.all(pure func(check: Bool) -> Bool: check)
         _:
             False
+
+
+-- serving a root that no longer checks from its last analysis that did
+
+-- A program that checks. `helper` is declared on line 6 and used on lines 1
+-- and 3.
+private SEALED_TEXT: String =
+    |func main() -> Int:
+    |    a = helper(1)
+    |    print("hi")
+    |    a + helper(2)
+    |
+    |
+    |func helper(value: Int) -> Int:
+    |    value * 2
+    |
+
+
+-- The same with a line that does not check inserted after line 2, so the
+-- call on line 1 is above the edit, the call that was on line 3 is below it
+-- on line 4, and the declaration moves to line 7.
+private INSERTED_TEXT: String =
+    |func main() -> Int:
+    |    a = helper(1)
+    |    print("hi")
+    |    x: Int = "nothing here checks"
+    |    a + helper(2)
+    |
+    |
+    |func helper(value: Int) -> Int:
+    |    value * 2
+    |
+
+
+-- The same with the call on line 3 edited into a type error.
+private EDITED_CALL_TEXT: String =
+    |func main() -> Int:
+    |    a = helper(1)
+    |    print("hi")
+    |    a + helper(2) + "a"
+    |
+    |
+    |func helper(value: Int) -> Int:
+    |    value * 2
+    |
+
+
+-- A program that checks, whose declaration line is not SEALED_TEXT's.
+private RENAMED_TEXT: String =
+    |func main() -> Int:
+    |    a = helper(1)
+    |    print("hi")
+    |    a + helper(2)
+    |
+    |
+    |func helper(amount: Int) -> Int:
+    |    amount * 2
+    |
+
+
+private INSERTED_AFTER_RENAME_TEXT: String =
+    |func main() -> Int:
+    |    a = helper(1)
+    |    print("hi")
+    |    x: Int = "nothing here checks"
+    |    a + helper(2)
+    |
+    |
+    |func helper(amount: Int) -> Int:
+    |    amount * 2
+    |
+
+
+-- The semantic tokens of INSERTED_TEXT: the names off line 3 keep the classes
+-- SEALED_TEXT gave them, shifted a line down where they are below the edit,
+-- and the edited line has the lexer's tokens alone: `=` (operator) and the
+-- string; `x` and `Int` are plain.
+private INSERTED_TOKENS: String = "0,0,4,10,0,0,5,4,8,1,0,7,2,14,0,0,3,3,1,4,1,4,1,6,3,0,2,1,14,0,0,2,6,8,0,0,7,1,13,0,1,4,5,8,4,0,6,4,12,0,1,11,1,14,0,0,2,21,12,0,1,4,1,6,2,0,2,1,14,0,0,2,6,8,0,0,7,1,13,0,3,0,4,10,0,0,5,6,8,1,0,7,5,5,3,0,7,3,1,4,0,5,2,14,0,0,3,3,1,4,1,4,5,5,2,0,6,1,14,0,0,2,1,13,0"
+
+
+private func sealed_server(server: Server) -> Server:
+    server
+        .after([INITIALIZE, did_open(ROOT_URI, SEALED_TEXT.escaped())]).server
+        .analysed_root(analysis_of(SEALED_TEXT)).server
+
+
+-- `server` after `messages`, a request for ROOT's tokens, which analyses it,
+-- and `result`, which that analysis finds.
+private func failing(server: Server, messages: List[String], result: DocumentAnalysis) -> Server:
+    requested = server
+        .after(messages).server
+        .receive(json(tokens_request(6, ROOT_URI)))
+    requested.server.analysed_as_asked(requested, result).server
+
+
+private func broken_by_insertion(server: Server) -> Server:
+    server
+        .sealed_server()
+        .failing([did_change(ROOT_URI, INSERTED_TEXT.escaped())], analysis_of(INSERTED_TEXT))
+
+
+func test_the_tokens_of_a_failed_root_keep_their_classes_off_the_changed_lines() -> Bool:
+    loading(func(server: Server) -> Bool:
+        server
+            .broken_by_insertion()
+            .receive(json(tokens_request(7, ROOT_URI)))
+            .answers([tokens_reply(7, INSERTED_TOKENS)])
+    )
+
+
+-- The call on line 1 is above the edit and the call on line 4 below it; both
+-- reach the declaration, which is on line 7 now.
+func test_definition_works_above_and_below_an_edit_of_a_failed_root() -> Bool:
+    loading(func(server: Server) -> Bool:
+        broken = server.broken_by_insertion()
+        declaration = location(ROOT_URI, 7, 5, 11)
+        and(
+            broken.definition_at(1, 9) == [result_reply(7, declaration)],
+            broken.definition_at(4, 9) == [result_reply(7, declaration)]
+        )
+    )
+
+
+func test_definition_on_a_changed_line_of_a_failed_root_is_null() -> Bool:
+    loading(func(server: Server) -> Bool:
+        (
+            server
+                .broken_by_insertion()
+                .definition_at(3, 10)
+            == [result_reply(7, "null")]
+        )
+    )
+
+
+-- The declaration's line is unchanged but moved; the edited call is dropped.
+func test_references_of_a_failed_root_drop_spans_on_changed_lines() -> Bool:
+    loading(func(server: Server) -> Bool:
+        server
+            .sealed_server()
+            .failing(
+                [did_change(ROOT_URI, EDITED_CALL_TEXT.escaped())],
+                analysis_of(EDITED_CALL_TEXT)
+            )
+            .references_at(1, 9, True)
+            .lists([location(ROOT_URI, 6, 5, 11), location(ROOT_URI, 1, 8, 14)])
+    )
+
+
+-- A success replaces the sealed analysis: the declaration's line was edited
+-- between the first program and the second, so only the second can serve it.
+func test_a_success_replaces_the_sealed_analysis() -> Bool:
+    loading(func(server: Server) -> Bool:
+        renamed = server
+            .sealed_server()
+            .changed(did_change(ROOT_URI, RENAMED_TEXT.escaped()))
+        requested = renamed.receive(json(tokens_request(6, ROOT_URI)))
+        checked = requested.server.analysed_as_asked(requested, analysis_of(RENAMED_TEXT)).server
+        broken = checked.failing(
+            [did_change(ROOT_URI, INSERTED_AFTER_RENAME_TEXT.escaped())],
+            analysis_of(INSERTED_AFTER_RENAME_TEXT)
+        )
+        broken.definition_at(4, 9) == [result_reply(7, location(ROOT_URI, 7, 5, 11))]
+    )
+
+
+-- A root that checked, was closed and was opened again has no sealed analysis.
+func test_closing_a_root_drops_its_sealed_analysis() -> Bool:
+    loading(func(server: Server) -> Bool:
+        reopened = server
+            .sealed_server()
+            .changed(did_close(ROOT_URI))
+            .failing([did_open(ROOT_URI, INSERTED_TEXT.escaped())], analysis_of(INSERTED_TEXT))
+        reopened.definition_at(4, 9) == [result_reply(7, "null")]
+    )
+
+
+-- Closing a dependency that was open reverts it to the disk, where the text
+-- is unknown: the failed load did not read it, so nothing maps into it.
+func test_closing_an_open_dependency_stops_answers_into_it() -> Bool:
+    loading(func(server: Server) -> Bool:
+        (
+            server
+                .importing_helpers(True)
+                .failing(
+                    [
+                        did_close(HELPERS_URI),
+                        did_change(ROOT_URI, TWO_FILES_UNPARSED_TEXT.escaped())
+                    ],
+                    analysis_with_helpers(TWO_FILES_UNPARSED_TEXT, HELPERS_TEXT)
+                )
+                .one_defined()
+            == [result_reply(7, "null")]
+        )
+    )
+
+
+-- `size` is called on line 1 after an e acute and an emoji, which UTF-16
+-- counts as one unit and two: the position and the link's origin range are in
+-- UTF-16 units, and the line is unchanged.
+private WIDE_TEXT: String =
+    |func main() -> Int:
+    |    total = size("é😀") + size("x")
+    |    total
+    |
+    |
+    |func size(value: String) -> Int:
+    |    1
+    |
+
+
+private WIDE_INSERTED_TEXT: String =
+    |func main() -> Int:
+    |    total = size("é😀") + size("x")
+    |    total
+    |    x: Int = "no"
+    |
+    |
+    |func size(value: String) -> Int:
+    |    1
+    |
+
+
+func test_a_failed_root_converts_positions_in_utf16_around_wide_characters() -> Bool:
+    loading(func(server: Server) -> Bool:
+        broken = server
+            .after([INITIALIZE_LINKING, did_open(ROOT_URI, WIDE_TEXT.escaped())]).server
+            .analysed_root(analysis_of(WIDE_TEXT)).server
+            .failing(
+                [did_change(ROOT_URI, WIDE_INSERTED_TEXT.escaped())],
+                analysis_of(WIDE_INSERTED_TEXT)
+            )
+        (
+            broken.definition_at(1, 28)
+            == [result_reply(7, "[${location_link(1, 26, 30, ROOT_URI, 6, 5, 9)}]")]
+        )
+    )
+
+
+-- A root that imports HELPERS, whose `one` is declared on line 0.
+private TWO_FILES_TEXT: String =
+    |import:
+    |    ./helpers as helpers: one
+    |
+    |
+    |func main() -> Int:
+    |    helpers.one()
+    |
+
+
+private TWO_FILES_BROKEN_TEXT: String = "import:\n    ./helpers as helpers: one\n\n\nfunc main() -> Int:\n    helpers.one()\n\n\nfunc oops() -> Int:\n    \"a\"\n"
+
+
+-- A syntax error, which stops the load before it reads HELPERS.
+private TWO_FILES_UNPARSED_TEXT: String = "import:\n    ./helpers as helpers: one\n\n\nfunc main() -> Int:\n    helpers.one()\n$\n"
+
+
+-- HELPERS with a line above `one`, and with `one`'s own line edited.
+private HELPERS_SHIFTED_TEXT: String = "-- note\npure func one() -> Int:\n    1\n"
+
+private HELPERS_EDITED_DECLARATION_TEXT: String = "pure func one() -> Int: -- note\n    1\n"
+
+
+private func analysis_with_helpers(root_text: String, helpers_text: String) -> DocumentAnalysis:
+    document_analysis(
+        load_program_with_sources(ROOT, EmbeddedLibrary, [
+            snapshot(ROOT, root_text),
+            snapshot(HELPERS, helpers_text)
+        ])
+    )
+
+
+-- A server with ROOT, which imports HELPERS, open and analysed, and HELPERS
+-- open too when `helpers_open`.
+private func importing_helpers(server: Server, helpers_open: Bool) -> Server:
+    opened = if helpers_open:
+        [
+            INITIALIZE,
+            did_open(ROOT_URI, TWO_FILES_TEXT.escaped()),
+            did_open(HELPERS_URI, HELPERS_TEXT.escaped())
+        ]
+    else:
+        [INITIALIZE, did_open(ROOT_URI, TWO_FILES_TEXT.escaped())]
+    server
+        .after(opened).server
+        .analysed_root(analysis_with_helpers(TWO_FILES_TEXT, HELPERS_TEXT)).server
+
+
+-- `one` in `helpers.one()` on line 5.
+private pure func one_defined(server: Server) -> List[String]:
+    server.definition_at(5, 13)
+
+
+-- HELPERS is open and has its own edit above `one`: the declaration is in
+-- the open document's lines.
+func test_a_declaration_in_another_open_document_maps_through_its_own_edit() -> Bool:
+    loading(func(server: Server) -> Bool:
+        (
+            server
+                .importing_helpers(True)
+                .failing(
+                    [
+                        did_change(HELPERS_URI, HELPERS_SHIFTED_TEXT.escaped()),
+                        did_change(ROOT_URI, TWO_FILES_BROKEN_TEXT.escaped())
+                    ],
+                    analysis_with_helpers(TWO_FILES_BROKEN_TEXT, HELPERS_SHIFTED_TEXT)
+                )
+                .one_defined()
+            == [result_reply(7, location(HELPERS_URI, 1, 10, 13))]
+        )
+    )
+
+
+-- The edit is on the declaration's own line: its span is dropped.
+func test_a_declaration_on_a_changed_line_of_another_open_document_is_null() -> Bool:
+    loading(func(server: Server) -> Bool:
+        (
+            server
+                .importing_helpers(True)
+                .failing(
+                    [
+                        did_change(HELPERS_URI, HELPERS_EDITED_DECLARATION_TEXT.escaped()),
+                        did_change(ROOT_URI, TWO_FILES_BROKEN_TEXT.escaped())
+                    ],
+                    analysis_with_helpers(TWO_FILES_BROKEN_TEXT, HELPERS_EDITED_DECLARATION_TEXT)
+                )
+                .one_defined()
+            == [result_reply(7, "null")]
+        )
+    )
+
+
+-- HELPERS is not open and no change to it has been reported, and the failed
+-- load stopped before it: the sealed text is the file's text.
+func test_a_file_the_failed_load_did_not_read_maps_through_the_sealed_text() -> Bool:
+    loading(func(server: Server) -> Bool:
+        (
+            server
+                .importing_helpers(False)
+                .failing(
+                    [did_change(ROOT_URI, TWO_FILES_UNPARSED_TEXT.escaped())],
+                    analysis_with_helpers(TWO_FILES_UNPARSED_TEXT, HELPERS_TEXT)
+                )
+                .one_defined()
+            == [result_reply(7, location(HELPERS_URI, 0, 10, 13))]
+        )
+    )
+
+
+-- A change to HELPERS on disk was reported, and the failed load did not read
+-- it: its current text is unknown, so nothing maps into it.
+func test_a_reported_change_to_a_file_the_failed_load_did_not_read_stops_answers_into_it() -> Bool:
+    loading(func(server: Server) -> Bool:
+        (
+            server
+                .importing_helpers(False)
+                .failing(
+                    [
+                        watched_change(HELPERS_URI),
+                        did_change(ROOT_URI, TWO_FILES_UNPARSED_TEXT.escaped())
+                    ],
+                    analysis_with_helpers(TWO_FILES_UNPARSED_TEXT, HELPERS_TEXT)
+                )
+                .one_defined()
+            == [result_reply(7, "null")]
+        )
+    )
+
+
+-- The change was reported and the failed analysis read the file after it: its
+-- text is the one the failed analysis read.
+func test_a_changed_file_the_failed_analysis_read_maps_through_that_text() -> Bool:
+    loading(func(server: Server) -> Bool:
+        (
+            server
+                .importing_helpers(False)
+                .failing(
+                    [
+                        watched_change(HELPERS_URI),
+                        did_change(ROOT_URI, TWO_FILES_BROKEN_TEXT.escaped())
+                    ],
+                    analysis_with_helpers(TWO_FILES_BROKEN_TEXT, HELPERS_SHIFTED_TEXT)
+                )
+                .one_defined()
+            == [result_reply(7, location(HELPERS_URI, 1, 10, 13))]
+        )
+    )
 
 
 TESTS: TestSuite = {
@@ -2041,8 +2428,8 @@ TESTS: TestSuite = {
             test_tokens_of_a_current_root_are_sent_at_once
         ),
         (
-            "a root that does not check gets only lexer tokens",
-            test_a_root_that_does_not_check_gets_only_lexer_tokens
+            "a root that never checked gets only lexer tokens",
+            test_a_root_that_never_checked_gets_only_lexer_tokens
         ),
         (
             "an edit refreshes tokens and diagnostics at the next request",
@@ -2162,13 +2549,59 @@ TESTS: TestSuite = {
             test_a_request_on_a_stale_document_waits_for_its_analysis
         ),
         (
-            "a root that does not check has no definitions or references",
-            test_a_root_that_does_not_check_has_no_definitions_or_references
+            "a root that never checked has no definitions or references",
+            test_a_root_that_never_checked_has_no_definitions_or_references
         ),
         ("a request without a position gets null", test_a_request_without_a_position_gets_null),
         (
             "closing a document while its request waits answers null",
             test_closing_a_document_while_its_request_waits_answers_null
+        ),
+        (
+            "the tokens of a failed root keep their classes off the changed lines",
+            test_the_tokens_of_a_failed_root_keep_their_classes_off_the_changed_lines
+        ),
+        (
+            "definition works above and below an edit of a failed root",
+            test_definition_works_above_and_below_an_edit_of_a_failed_root
+        ),
+        (
+            "definition on a changed line of a failed root is null",
+            test_definition_on_a_changed_line_of_a_failed_root_is_null
+        ),
+        (
+            "references of a failed root drop spans on changed lines",
+            test_references_of_a_failed_root_drop_spans_on_changed_lines
+        ),
+        ("a success replaces the sealed analysis", test_a_success_replaces_the_sealed_analysis),
+        ("closing a root drops its sealed analysis", test_closing_a_root_drops_its_sealed_analysis),
+        (
+            "a declaration in another open document maps through its own edit",
+            test_a_declaration_in_another_open_document_maps_through_its_own_edit
+        ),
+        (
+            "closing an open dependency stops answers into it",
+            test_closing_an_open_dependency_stops_answers_into_it
+        ),
+        (
+            "a failed root converts positions in UTF-16 around wide characters",
+            test_a_failed_root_converts_positions_in_utf16_around_wide_characters
+        ),
+        (
+            "a declaration on a changed line of another open document is null",
+            test_a_declaration_on_a_changed_line_of_another_open_document_is_null
+        ),
+        (
+            "a file the failed load did not read maps through the sealed text",
+            test_a_file_the_failed_load_did_not_read_maps_through_the_sealed_text
+        ),
+        (
+            "a reported change to a file the failed load did not read stops answers into it",
+            test_a_reported_change_to_a_file_the_failed_load_did_not_read_stops_answers_into_it
+        ),
+        (
+            "a changed file the failed analysis read maps through that text",
+            test_a_changed_file_the_failed_analysis_read_maps_through_that_text
         ),
         (
             "a library file the client opens gets only lexer tokens",

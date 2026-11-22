@@ -849,6 +849,64 @@ private pure func lsp_location(uri: String, line: Int, start: Int, end: Int) -> 
     "{\"uri\":\"${uri}\",\"range\":{\"start\":{\"line\":${line},\"character\":${start}},\"end\":{\"line\":${line},\"character\":${end}}}}"
 
 
+-- The editor opens a program that checks, then edits it so that it does not:
+-- a line inserted between a call and the call below it. The failed file is
+-- served from the last analysis that checked: the names off the edited line
+-- keep their classes, and both calls reach `helper`, now one line lower. A
+-- position on the edited line gets `null`.
+private func lsp_serves_a_failed_file_from_its_last_checked_analysis(
+    compiler: String,
+    work_directory: String
+) -> Result[Void, String]:
+    uri = "file:///work/broken.brp"
+    program = "func main() -> Int:\\n    a = helper(1)\\n    print(\\\"hi\\\")\\n"
+    declaration = "\\n\\nfunc helper(value: Int) -> Int:\\n    value * 2\\n"
+    opened = "${program}    a + helper(2)${declaration}"
+    edited = "${program}    x: Int = \\\"nothing here checks\\\"\\n    a + helper(2)${declaration}"
+    tokens = pure func(id: Int) -> String:
+        "{\"jsonrpc\":\"2.0\",\"id\":${id},\"method\":\"textDocument/semanticTokens/full\",\"params\":{\"textDocument\":{\"uri\":\"${uri}\"}}}"
+    definition = pure func(id: Int, line: Int, character: Int) -> String:
+        "{\"jsonrpc\":\"2.0\",\"id\":${id},\"method\":\"textDocument/definition\",\"params\":{\"textDocument\":{\"uri\":\"${uri}\"},\"position\":{\"line\":${line},\"character\":${character}}}}"
+    input = [
+        LSP_INITIALIZE,
+        "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":{\"textDocument\":{\"uri\":\"${uri}\",\"languageId\":\"blorp\",\"version\":1,\"text\":\"${opened}\"}}}",
+        tokens(2),
+        "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didChange\",\"params\":{\"textDocument\":{\"uri\":\"${uri}\",\"version\":2},\"contentChanges\":[{\"text\":\"${edited}\"}]}}",
+        tokens(3),
+        definition(4, 1, 9),
+        definition(5, 4, 9),
+        definition(6, 3, 10),
+        "{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"shutdown\"}",
+        LSP_EXIT
+    ]
+    helper = lsp_location(uri, 6, 5, 11)
+    expected = [
+        LSP_INITIALIZED_REPLY,
+        "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"data\":[0,0,4,10,0,0,5,4,8,1,0,7,2,14,0,0,3,3,1,4,1,4,1,6,3,0,2,1,14,0,0,2,6,8,0,0,7,1,13,0,1,4,5,8,4,0,6,4,12,0,1,4,1,6,2,0,2,1,14,0,0,2,6,8,0,0,7,1,13,0,2,0,4,10,0,0,5,6,8,1,0,7,5,5,3,0,7,3,1,4,0,5,2,14,0,0,3,3,1,4,1,4,5,5,2,0,6,1,14,0,0,2,1,13,0]}}",
+        "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/publishDiagnostics\",\"params\":{\"uri\":\"${uri}\",\"diagnostics\":[{\"range\":{\"start\":{\"line\":3,\"character\":13},\"end\":{\"line\":3,\"character\":34}},\"severity\":1,\"message\":\"expression does not match the expected type\\nhelp: use an expression of type Int here\"}]}}",
+        "{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"data\":[0,0,4,10,0,0,5,4,8,1,0,7,2,14,0,0,3,3,1,4,1,4,1,6,3,0,2,1,14,0,0,2,6,8,0,0,7,1,13,0,1,4,5,8,4,0,6,4,12,0,1,11,1,14,0,0,2,21,12,0,1,4,1,6,2,0,2,1,14,0,0,2,6,8,0,0,7,1,13,0,2,0,4,10,0,0,5,6,8,1,0,7,5,5,3,0,7,3,1,4,0,5,2,14,0,0,3,3,1,4,1,4,5,5,2,0,6,1,14,0,0,2,1,13,0]}}",
+        "{\"jsonrpc\":\"2.0\",\"id\":4,\"result\":${helper}}",
+        "{\"jsonrpc\":\"2.0\",\"id\":5,\"result\":${helper}}",
+        "{\"jsonrpc\":\"2.0\",\"id\":6,\"result\":null}",
+        "{\"jsonrpc\":\"2.0\",\"id\":7,\"result\":null}"
+    ]
+    output ?= lsp_session(
+        compiler,
+        input
+            .map(framed)
+            .join(""),
+        "${work_directory}/cli_lsp_broken",
+        0
+    )
+    expect_output(
+        output,
+        expected
+            .map(framed)
+            .join(""),
+        ""
+    )
+
+
 -- The editor goes to the definition of a local call, then of `print`, which
 -- is in the library the server wrote to its own folder, and lists the
 -- references to a parameter with and without its declaration. After `exit`
@@ -1461,6 +1519,15 @@ func suite(compiler: String, work_directory: String) -> TestSuite:
                 "lsp goes to definitions in the library and lists references",
                 func(): reported(
                     lsp_goes_to_definitions_in_the_library_and_lists_references(
+                        compiler,
+                        work_directory
+                    )
+                )
+            ),
+            (
+                "lsp serves a failed file from its last checked analysis",
+                func(): reported(
+                    lsp_serves_a_failed_file_from_its_last_checked_analysis(
                         compiler,
                         work_directory
                     )

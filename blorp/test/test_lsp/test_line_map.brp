@@ -1,0 +1,247 @@
+---
+How the lines of a sealed text correspond to those of the current one: equal
+texts, an insertion, a deletion, an edited line, distant edits that leave the
+lines between mapped, each line ending, empty texts, a last line without an
+ending, the limit on the diff, spans and both directions.
+---
+import:
+    bool: and
+    option: Option methods
+    test: TestSuite
+    ../../src/common/syntax/syntax: Span, compiler_span
+    ../../src/lsp/line_map: current_offset, current_span, line_map, sealed_offset
+
+
+-- Whether `offset` of `sealed` is `expected` in `current`, and when it is
+-- somewhere, `offset` is where that goes in the other direction.
+private pure func maps(sealed: String, current: String, offset: Int, expected: Option[Int]) -> Bool:
+    map = line_map(sealed, current)
+    forward = map.current_offset(offset) == expected
+    match expected:
+        Some(shown): and(forward, map.sealed_offset(shown) == Some(offset))
+        None: forward
+
+
+-- Whether the current text's `offset` has no counterpart in the sealed text.
+private pure func unmatched_back(sealed: String, current: String, offset: Int) -> Bool:
+    line_map(sealed, current)
+        .sealed_offset(offset)
+        .is_none()
+
+
+pure func test_equal_texts_map_every_offset_to_itself() -> Bool:
+    text = "a\nbb\nccc\n"
+    and(
+        and(maps(text, text, 0, Some(0)), maps(text, text, 3, Some(3))),
+        maps(text, text, 9, Some(9))
+    )
+
+
+pure func test_an_inserted_line_shifts_the_lines_after_it() -> Bool:
+    sealed = "a\nb\nc\n"
+    current = "a\nNEW\nb\nc\n"
+    and(
+        and(maps(sealed, current, 0, Some(0)), maps(sealed, current, 2, Some(6))),
+        and(maps(sealed, current, 4, Some(8)), unmatched_back(sealed, current, 2))
+    )
+
+
+pure func test_a_deleted_line_maps_to_nothing_and_shifts_the_lines_after_it() -> Bool:
+    sealed = "a\nb\nc\n"
+    current = "a\nc\n"
+    and(
+        and(maps(sealed, current, 0, Some(0)), maps(sealed, current, 2, None)),
+        maps(sealed, current, 4, Some(2))
+    )
+
+
+pure func test_an_edited_line_maps_to_nothing_in_either_direction() -> Bool:
+    sealed = "a\nb\nc\n"
+    current = "a\nB\nc\n"
+    and(
+        and(maps(sealed, current, 2, None), unmatched_back(sealed, current, 2)),
+        and(maps(sealed, current, 0, Some(0)), maps(sealed, current, 4, Some(4)))
+    )
+
+
+-- Lines 1 and 3 are edited, and a line is inserted between them, so the diff
+-- itself, not the trimming of the ends, finds that lines 2 and 4 are kept.
+pure func test_two_distant_edits_keep_the_lines_between_them() -> Bool:
+    sealed = "a\nb\nc\nd\ne\nf\n"
+    current = "a\nB\nc\nNEW\nd\nE\nf\n"
+    and(
+        and(maps(sealed, current, 2, None), maps(sealed, current, 4, Some(4))),
+        and(
+            and(maps(sealed, current, 6, Some(10)), maps(sealed, current, 8, None)),
+            maps(sealed, current, 10, Some(14))
+        )
+    )
+
+
+pure func test_crlf_and_a_lone_cr_end_lines_as_the_line_index_does() -> Bool:
+    and(
+        maps("a\r\nb\r\nc\r\n", "a\r\nX\r\nb\r\nc\r\n", 3, Some(6)),
+        maps("a\rb\rc", "a\rX\rb\rc", 2, Some(4))
+    )
+
+
+-- A line whose ending changed is a different line: conservative, and the
+-- lines after it still map.
+pure func test_a_changed_line_ending_changes_its_line() -> Bool:
+    and(maps("a\r\nb", "a\nb", 0, None), maps("a\r\nb", "a\nb", 3, Some(2)))
+
+
+pure func test_empty_texts_have_one_empty_line() -> Bool:
+    and(and(maps("", "", 0, Some(0)), maps("", "a", 0, None)), maps("a", "", 0, None))
+
+
+-- `b` ends the sealed text with no line ending, and still ends it.
+pure func test_a_last_line_without_an_ending_maps() -> Bool:
+    and(maps("a\nb", "x\na\nb", 2, Some(4)), maps("a\nb", "a\nc\nb", 2, Some(4)))
+
+
+-- Five lines are each edited among unchanged ones: ten edits, so the diff
+-- takes ten rounds, and the walk back through them must find each unchanged
+-- line.
+pure func test_interleaved_edits_keep_every_unchanged_line() -> Bool:
+    sealed = "a\nb\nc\nd\ne\nf\ng\nh\ni\nj\nk\nl\n"
+    current = "a\nB\nc\nD\ne\nF\ng\nH\ni\nJ\nk\nl\n"
+    unchanged = [0, 4, 8, 12, 16, 20, 22]
+    edited = [2, 6, 10, 14, 18]
+    and(
+        unchanged.all(pure func(offset: Int) -> Bool: maps(sealed, current, offset, Some(offset))),
+        edited.all(pure func(offset: Int) -> Bool: maps(sealed, current, offset, None))
+    )
+
+
+-- `c` and `d` move after `g`: the shortest edit script keeps the three lines
+-- `e`, `f` and `g` that the move passes over, and deletes and inserts the two
+-- that moved, in the same rounds.
+pure func test_a_moved_block_keeps_the_lines_the_shortest_script_keeps() -> Bool:
+    sealed = "a\nb\nc\nd\ne\nf\ng\nh\n"
+    current = "a\nb\ne\nf\ng\nc\nd\nh\n"
+    and(
+        and(maps(sealed, current, 2, Some(2)), maps(sealed, current, 4, None)),
+        and(
+            and(maps(sealed, current, 6, None), maps(sealed, current, 8, Some(4))),
+            and(maps(sealed, current, 12, Some(8)), maps(sealed, current, 14, Some(14)))
+        )
+    )
+
+
+-- `count` lines `<prefix>0`, `<prefix>1` and so on, each ending in LF.
+private pure func numbered(prefix: String, count: Int) -> String:
+    var text = ""
+    for line in 0..count:
+        text = text + "${prefix}${line}\n"
+    text
+
+
+-- The byte offset of the start of line `line` of `numbered("s", ...)`: lines 0
+-- to 9 take 3 bytes, then 10 to 99 take 4 and 100 to 999 take 5.
+private pure func start_of(line: Int) -> Int:
+    if line < 10:
+        line * 3
+    else if line < 100:
+        30 + (line - 10) * 4
+    else:
+        390 + (line - 100) * 5
+
+
+-- Every line of 1,200 differs but line 600, in a text whose ends differ too,
+-- so nothing is trimmed: 2,398 lines are edited, past the limit, and the whole
+-- middle counts as changed, line 600 with it.
+pure func test_past_the_limit_the_middle_counts_as_changed() -> Bool:
+    sealed = numbered("s", 1200)
+    var current = ""
+    for line in 0..1200:
+        if line == 600:
+            current = current + "s600\n"
+        else:
+            current = current + "t${line}\n"
+    maps(sealed, current, start_of(600), None)
+
+
+-- Every tenth of 1,200 lines is edited: 240 lines, inside the limit.
+pure func test_within_the_limit_the_unedited_lines_map() -> Bool:
+    sealed = numbered("s", 1200)
+    var current = ""
+    for line in 0..1200:
+        if line % 10 == 0:
+            current = current + "t${line}\n"
+        else:
+            current = current + "s${line}\n"
+    and(
+        maps(sealed, current, start_of(605), Some(start_of(605))),
+        maps(sealed, current, start_of(600), None)
+    )
+
+
+private pure func span_at(start: Int, end: Int) -> Span:
+    { compiler_span() | start = start, end = end }
+
+
+-- A span maps only when it lies on one unchanged line.
+pure func test_a_span_maps_only_on_one_unchanged_line() -> Bool:
+    map = line_map("a\nbb\nc\n", "a\nNEW\nbb\nc\n")
+    and(
+        and(
+            map.current_span(span_at(2, 4)) == Some(span_at(6, 8)),
+            map
+                .current_span(span_at(0, 4))
+                .is_none()
+        ),
+        map.current_span(span_at(0, 1)) == Some(span_at(0, 1))
+    )
+
+
+pure func test_a_span_on_an_edited_line_maps_to_nothing() -> Bool:
+    line_map("a\nb\nc\n", "a\nB\nc\n")
+        .current_span(span_at(2, 3))
+        .is_none()
+
+
+TESTS: TestSuite = {
+    description = "LSP line map",
+    tests = [
+        ("equal texts map every offset to itself", test_equal_texts_map_every_offset_to_itself),
+        (
+            "an inserted line shifts the lines after it",
+            test_an_inserted_line_shifts_the_lines_after_it
+        ),
+        (
+            "a deleted line maps to nothing and shifts the lines after it",
+            test_a_deleted_line_maps_to_nothing_and_shifts_the_lines_after_it
+        ),
+        (
+            "an edited line maps to nothing in either direction",
+            test_an_edited_line_maps_to_nothing_in_either_direction
+        ),
+        (
+            "two distant edits keep the lines between them",
+            test_two_distant_edits_keep_the_lines_between_them
+        ),
+        (
+            "CRLF and a lone CR end lines as the line index does",
+            test_crlf_and_a_lone_cr_end_lines_as_the_line_index_does
+        ),
+        ("a changed line ending changes its line", test_a_changed_line_ending_changes_its_line),
+        (
+            "interleaved edits keep every unchanged line",
+            test_interleaved_edits_keep_every_unchanged_line
+        ),
+        (
+            "a moved block keeps the lines the shortest script keeps",
+            test_a_moved_block_keeps_the_lines_the_shortest_script_keeps
+        ),
+        ("empty texts have one empty line", test_empty_texts_have_one_empty_line),
+        ("a last line without an ending maps", test_a_last_line_without_an_ending_maps),
+        (
+            "past the limit the middle counts as changed",
+            test_past_the_limit_the_middle_counts_as_changed
+        ),
+        ("within the limit the unedited lines map", test_within_the_limit_the_unedited_lines_map),
+        ("a span maps only on one unchanged line", test_a_span_maps_only_on_one_unchanged_line),
+        ("a span on an edited line maps to nothing", test_a_span_on_an_edited_line_maps_to_nothing)
+    ]
+}

@@ -35,6 +35,7 @@ import:
         root_module_id,
         source_module
     ../common/syntax/syntax: Diagnostic, Diagnostics, Span, compiler_span, internal_error
+    ./line_map: LineMap, current_span, line_map, sealed_offset
     ./positions:
         LineIndex,
         Position,
@@ -102,18 +103,39 @@ pure func document_analysis(loaded: Result[LoadedProgram, SourceLoadFailure]) ->
             }
 
 
--- Whether a root's last analysis still holds.
+-- A root's last analysis that succeeded, with the texts it read. Later
+-- analyses of the root may fail while its files are served from it.
+private record SealedAnalysis {
+    analysis: Analysis,
+    sources: SourceInputs,
+    -- The files a change has been reported to since, without a later analysis
+    -- having read them: their current text is unknown unless a document is open.
+    -- The one place that records it.
+    changed_since: List[Path]
+}
+
+
+-- A root's latest analysis, still holding: no file it read has changed since.
+private union LatestAnalysis:
+    -- It checked, and requests are answered from it.
+    Checked(SealedAnalysis)
+    -- It failed. Requests are served from the last analysis that checked, if
+    -- there was one, and otherwise get the lexer's tokens alone.
+    Failed(DocumentAnalysis, Option[SealedAnalysis])
+
+
+-- Whether a root's latest analysis still holds.
 private union RootAnalysis:
-    -- No file it read has changed since, so requests are answered from it.
-    Current(DocumentAnalysis)
+    Current(LatestAnalysis)
     -- A file it read has changed, or its load failed and some file has. The
-    -- root's next request analyses it again.
-    Stale
+    -- root's next request analyses it again. The last analysis that checked,
+    -- if any, is kept.
+    Stale(Option[SealedAnalysis])
 
 
--- A root's last analysis, and what it published: the diagnostics of each user
--- file it reports in, so that when it stops reporting in a file another root's
--- can be shown there again.
+-- A root's latest analysis, and what it published: the diagnostics of each
+-- user file it reports in, so that when it stops reporting in a file another
+-- root's can be shown there again.
 private record AnalysedRoot {
     analysis: RootAnalysis,
     published: Dict[Path, List[Json]]
@@ -497,32 +519,66 @@ private pure func initialize_result(encoding: PositionEncoding) -> Json:
     )
 
 
+-- Whether a load read the file at `path`.
+private pure func reads(sources: SourceInputs, path: Path) -> Bool:
+    sources.modules.any(pure func(row: ModuleSource) -> Bool: row.is_at(path))
+
+
+private pure func is_at(row: ModuleSource, path: Path) -> Bool:
+    match row.path.to_path():
+        Ok(read): read == path
+        Err(_): False
+
+
 -- Whether a change to `path` can change what `result` found: its analysis read
 -- the file, or its load failed, and a file it could not find may now exist.
 private pure func depends_on(result: DocumentAnalysis, path: Path) -> Bool:
     match result.outcome:
-        LoadFailed(_):
-            True
-        CheckFailed(_) | Analysed(_):
-            result.sources.modules.any(pure func(row: ModuleSource) -> Bool:
-                match row.path.to_path():
-                    Ok(read): read == path
-                    Err(_): False
-            )
+        LoadFailed(_): True
+        CheckFailed(_) | Analysed(_): result.sources.reads(path)
 
 
--- Every root whose analysis a change to `path` affects, marked stale. A stale
--- root keeps what it published until its next request analyses it again, so a
--- burst of edits costs one analysis.
+-- The last analysis that checked, which a root keeps through failures.
+private pure func last_checked(analysis: RootAnalysis) -> Option[SealedAnalysis]:
+    match analysis:
+        Current(Checked(sealed)): Some(sealed)
+        Current(Failed(_, sealed)) | Stale(sealed): sealed
+
+
+-- `sealed`, told that a change to `path` has been reported if it read the file.
+private pure func noted(sealed: Option[SealedAnalysis], path: Path) -> Option[SealedAnalysis]:
+    match sealed:
+        Some(last):
+            if and(last.sources.reads(path), not(last.changed_since.contains(path))):
+                Some({ last | changed_since = last.changed_since.append(path) })
+            else:
+                sealed
+        None:
+            None
+
+
+-- Every root whose analysis a change to `path` affects, marked stale, and
+-- every sealed analysis that read the file told of the change. A stale root
+-- keeps what it published until its next request analyses it again, so a burst
+-- of edits costs one analysis.
 private pure func staled(roots: Dict[Path, AnalysedRoot], path: Path) -> Dict[Path, AnalysedRoot]:
     var marked = roots
     for (root, row) in roots.entries():
         match row.analysis:
-            Current(result):
+            Current(Checked(sealed)):
+                if sealed.sources.reads(path):
+                    marked = marked.set(root, { row | analysis = Stale(Some(sealed).noted(path)) })
+            Current(Failed(result, sealed)):
                 if result.depends_on(path):
-                    marked = marked.set(root, { row | analysis = Stale })
-            Stale:
-                void
+                    marked = marked.set(root, { row | analysis = Stale(sealed.noted(path)) })
+                else if sealed.is_some():
+                    marked = marked.set(
+                        root,
+                        { row | analysis = Current(Failed(result, sealed.noted(path))) }
+                    )
+            Stale(sealed):
+                if sealed.is_some():
+                    marked = marked.set(root, { row | analysis = Stale(sealed.noted(path)) })
     marked
 
 
@@ -543,7 +599,7 @@ private pure func went_stale(
                     .get(row[0])
                     .map(pure func(before: AnalysedRoot) -> RootAnalysis: before.analysis)
             ):
-                (Stale, Some(Current(_))): True
+                (Stale(_), Some(Current(_))): True
                 _: False
         )
 
@@ -581,65 +637,112 @@ private pure func requested_position(params: Option[Json]) -> Option[Position]:
 
 
 -- The answer to `query` about the open document `path`, whose root's analysis
--- is `result`. While the root fails to analyse, only the lexer's tokens are
--- sent, a definition is `null` and references are `[]`. `null` for a document
--- that is not open.
+-- `latest` still holds. While the root fails to analyse, the last analysis that
+-- checked answers if there is one, its spans mapped through a line diff to the
+-- text the editor shows; otherwise only the lexer's tokens are sent, a
+-- definition is `null` and references are `[]`. `null` for a document that is
+-- not open.
 private pure func answer(
     session: Session,
     path: Path,
-    result: DocumentAnalysis,
+    latest: LatestAnalysis,
     query: DocumentQuery
 ) -> Json:
-    match (session.documents.get(path), result.outcome):
+    match (session.documents.get(path), latest):
         (None, _):
             Null
-        (Some(open), Analysed(analysis)):
-            index = line_index(open.text)
-            offset = pure func(at: Position) -> Int: index.offset_of(at, session.encoding)
-            match query:
-                TokensQuery:
-                    open.text.tokens_json(
-                        analysis.analysed_identifiers(result.sources, root_module_id()),
-                        session.encoding
-                    )
-                DefinitionQuery(at):
-                    named = analysis.name_at(offset(at))
-                    declared: List[Span] = match named:
-                        Some(name):
-                            match analysis.declaration_span(name.referent):
-                                Some(span): [span]
-                                None: []
-                        None:
-                            []
-                    -- A built-in type is declared nowhere. A declaration has one
-                    -- target, which `targets` leaves out only for a defect.
-                    match (named, session.targets(result.sources, declared)):
-                        (Some(name), [target]):
-                            if session.links_definitions:
-                                origin = index.range_json(name.span, session.encoding)
-                                Array([target.link_json(origin)])
-                            else:
-                                target.location_json()
-                        _:
-                            Null
-                ReferencesQuery(asked):
-                    match analysis.name_at(offset(asked.position)):
-                        Some(name):
-                            Array(
-                                session
-                                    .targets(
-                                        result.sources,
-                                        analysis.references(
-                                            name.referent,
-                                            asked.includes_declaration
-                                        )
-                                    )
-                                    .map(location_json)
-                            )
-                        None:
-                            Array([])
-        (Some(open), LoadFailed(_) | CheckFailed(_)):
+        (Some(open), Checked(checked)):
+            root: FileView = { index = line_index(open.text), map = None }
+            session.served(path, open.text, root, checked, None, query)
+        (Some(open), Failed(result, Some(last))):
+            match last.sources.modules.get(root_module_id().module_number()):
+                Some(before):
+                    root: FileView = {
+                        index = line_index(open.text),
+                        map = Some(line_map(before.contents, open.text))
+                    }
+                    session.served(path, open.text, root, last, Some(result.sources), query)
+                None:
+                    -- A defect, not an expected case: every analysis that checked
+                    -- read the root, which is open. Nothing is guessed.
+                    Null
+        (Some(open), Failed(_, None)):
             open.text.unanalysed_answer(query, session.encoding)
+
+
+-- The answer to `query` about the root at `path`, whose text in the editor is
+-- `text` and whose view is `root`, from the analysis `sealed`. When it is older
+-- than the editor's text, `latest_sources` are the files the root's failed
+-- latest analysis read: every offset into the text goes back through the root's
+-- line diff, and every span comes forward through its file's.
+private pure func served(
+    session: Session,
+    path: Path,
+    text: String,
+    root: FileView,
+    sealed: SealedAnalysis,
+    latest_sources: Option[SourceInputs],
+    query: DocumentQuery
+) -> Json:
+    analysis = sealed.analysis
+    sources = sealed.sources
+    -- The name at a position in the editor's text: None when its line is not
+    -- one the analysis read.
+    named_at = pure func(at: Position) -> Option[NameAt]:
+        shown = root.index.offset_of(at, session.encoding)
+        offset_read: Option[Int] = match root.map:
+            Some(map): map.sealed_offset(shown)
+            None: Some(shown)
+        match offset_read:
+            Some(offset): analysis.name_at(offset)
+            None: None
+    match query:
+        TokensQuery:
+            identifiers = analysis.analysed_identifiers(sources, root_module_id())
+            var shown: Dict[Int, TokenClass] = {}
+            for (offset, name) in identifiers.entries():
+                match root.map:
+                    Some(map):
+                        match map.current_offset(offset):
+                            Some(moved): shown = shown.set(moved, name)
+                            None: void
+                    None:
+                        shown = shown.set(offset, name)
+            text.tokens_json(shown, session.encoding)
+        DefinitionQuery(at):
+            declared: List[Span] = match named_at(at):
+                Some(name):
+                    match analysis.declaration_span(name.referent):
+                        Some(span): [name.span, span]
+                        None: []
+                None:
+                    []
+            -- A built-in type is declared nowhere. A declaration has one
+            -- target, which `targets` leaves out for a defect, or for a span
+            -- the editor's text has changed.
+            match session.targets(sealed, latest_sources, { path => Some(root) }, declared):
+                [origin, target]:
+                    if session.links_definitions:
+                        Array([target.link_json(origin.range)])
+                    else:
+                        target.location_json()
+                _:
+                    Null
+        ReferencesQuery(asked):
+            match named_at(asked.position):
+                Some(name):
+                    Array(
+                        session
+                            .targets(
+                                sealed,
+                                latest_sources,
+                                { path => Some(root) },
+                                analysis.references(name.referent, asked.includes_declaration)
+                            )
+                            .map(location_json)
+                    )
+                None:
+                    Array([])
 
 
 -- The answer to `query` about a text with no analysis: the lexer's tokens, no
@@ -788,31 +891,89 @@ private pure func link_json(target: Target, origin: Json) -> Json:
     )
 
 
--- The targets of `spans`, with each file's lines indexed once. Every span
--- comes from the analysis that read `sources`, so a span in no file it read is
--- a defect in the analysis, not an expected case: it is left out rather than
--- guessed.
+-- A file as the editor shows it: its lines, and how the analysed text's spans
+-- move into them, none when the analysis read the text shown.
+private record FileView {
+    index: LineIndex,
+    map: Option[LineMap]
+}
+
+
+-- The view of the file `file`, which `sealed` read at `path`, or None when the
+-- text the editor shows is unknown: an open document's, else the one the
+-- latest analysis read, else the sealed text unless the file has been reported
+-- changed since. A library file never changes.
+private pure func file_view(
+    session: Session,
+    sealed: SealedAnalysis,
+    latest_sources: Option[SourceInputs],
+    path: Path,
+    file: ModuleSource
+) -> Option[FileView]:
+    match (latest_sources, file.role):
+        (Some(read), UserModule):
+            shown: Option[String] = match (
+                session.documents.get(path),
+                read.modules.find(pure func(row: ModuleSource) -> Bool: row.is_at(path))
+            ):
+                (Some(open), _):
+                    Some(open.text)
+                (None, Some(row)):
+                    Some(row.contents)
+                (None, None):
+                    if sealed.changed_since.contains(path):
+                        None
+                    else:
+                        Some(file.contents)
+            shown.map(
+                pure func(text: String) -> FileView: {
+                    index = line_index(text),
+                    map = Some(line_map(file.contents, text))
+                }
+            )
+        _:
+            Some({ index = line_index(file.contents), map = None })
+
+
+-- The targets of `spans`, with each file's view built once, but for those
+-- already `known`. Every span comes from `sealed`'s analysis, which read
+-- `sealed.sources`, so a span in no file it read is a defect in the analysis,
+-- not an expected case: it is left out rather than guessed, as is a span that
+-- is not on one unchanged line of the file as the editor shows it.
 private pure func targets(
     session: Session,
-    sources: SourceInputs,
+    sealed: SealedAnalysis,
+    latest_sources: Option[SourceInputs],
+    known: Dict[Path, Option[FileView]],
     spans: List[Span]
 ) -> List[Target]:
-    var indexes: Dict[Path, LineIndex] = {}
+    var views = known
     var found: List[Target] = []
     for span in spans:
-        match sources.span_file(session.library, span):
+        match sealed.sources.span_file(session.library, span):
             Some((path, file)):
-                index = match indexes.get(path):
+                view = match views.get(path):
                     Some(built): built
-                    None: line_index(file.contents)
-                indexes = indexes.set(path, index)
-                uri = match session.documents.get(path):
-                    Some(open): open.uri
-                    None: path.file_uri()
-                found = found.append({
-                    uri = uri,
-                    range = index.range_json(span, session.encoding)
-                })
+                    None: session.file_view(sealed, latest_sources, path, file)
+                views = views.set(path, view)
+                match view:
+                    Some(seen):
+                        shown: Option[Span] = match seen.map:
+                            Some(map): map.current_span(span)
+                            None: Some(span)
+                        match shown:
+                            Some(at):
+                                uri = match session.documents.get(path):
+                                    Some(open): open.uri
+                                    None: path.file_uri()
+                                found = found.append({
+                                    uri = uri,
+                                    range = seen.index.range_json(at, session.encoding)
+                                })
+                            None:
+                                void
+                    None:
+                        void
             None:
                 void
     found
@@ -844,9 +1005,9 @@ private pure func document_requested(
                     replying(Serving(session), [
                         response(id, text.unanalysed_answer(asked, session.encoding))
                     ])
-                (None, Some(Current(result))):
-                    replying(Serving(session), [response(id, session.answer(path, result, asked))])
-                (None, Some(Stale) | None):
+                (None, Some(Current(latest))):
+                    replying(Serving(session), [response(id, session.answer(path, latest, asked))])
+                (None, Some(Stale(_)) | None):
                     if session.documents.contains(path):
                         {
                             server = into_opaque Server(Serving(session)),
@@ -1099,6 +1260,15 @@ pure func analysed(server: Server, asked: AnalysisRequest, result: DocumentAnaly
         Serving(session):
             var current = session
             var replies: List[Json] = []
+            -- A success is sealed; a failure keeps the last success.
+            kept: Option[SealedAnalysis] = match session.roots.get(root):
+                Some(last): last.analysis.last_checked()
+                None: None
+            latest: LatestAnalysis = match result.outcome:
+                Analysed(analysis):
+                    Checked({ analysis = analysis, sources = result.sources, changed_since = [] })
+                LoadFailed(_) | CheckFailed(_):
+                    Failed(result, kept)
             if session.documents.contains(root):
                 published = result.publications(session.library, session.encoding, root)
                 previous: List[Path] = match session.roots.get(root):
@@ -1113,12 +1283,12 @@ pure func analysed(server: Server, asked: AnalysisRequest, result: DocumentAnaly
                 current = { session |
                     roots = session.roots
                         .remove(root)
-                        .set(root, { analysis = Current(result), published = published })
+                        .set(root, { analysis = Current(latest), published = published })
                 }
             match asked.answering:
                 Some(waiting):
                     replies = replies.append(
-                        response(waiting.id, current.answer(root, result, waiting.query))
+                        response(waiting.id, current.answer(root, latest, waiting.query))
                     )
                 None:
                     void

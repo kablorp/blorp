@@ -1,0 +1,250 @@
+---
+How the lines of a text correspond to the lines of a later version of it: the
+lines the two share, found by a line diff, so that a byte offset in the earlier
+text can be found in the later one, and the reverse, wherever its line did not
+change. An offset on an inserted, deleted or edited line corresponds to
+nothing; the map never guesses. Lines split as `LineIndex` splits them, and a
+line's ending is part of it.
+---
+import:
+    bool: and, or
+    list: repeat
+    option: Option methods
+    order: min
+    ../common/syntax/syntax: Span
+    ./positions: LineIndex, line_count, line_index, line_of, line_start, line_text
+
+
+-- The most lines the diff may insert plus delete between the two texts after
+-- their common leading and trailing lines are trimmed. A larger edit makes
+-- every line of the middle count as changed, which bounds the diff's time by
+-- the middle's length times this.
+private DIFF_LIMIT: Int = 512
+
+
+-- `length` lines match: from line `from_line` of one text and from line
+-- `to_line` of the other.
+private fixed record LineRun {
+    from_line: Int,
+    to_line: Int,
+    length: Int
+}
+
+
+-- Both texts' lines, and the runs of matching lines in both directions, each
+-- in order of its own texts' lines. A line in no run changed.
+private record MatchedLines {
+    sealed_lines: LineIndex,
+    current_lines: LineIndex,
+    sealed_to_current: List[LineRun],
+    current_to_sealed: List[LineRun]
+}
+
+
+opaque type LineMap = MatchedLines
+
+
+-- The id of each line of `lines`, equal exactly when the lines' texts are, so
+-- that the diff compares integers. A line's ending is part of its text, so a
+-- line whose ending alone changed counts as changed: conservative, never wrong.
+-- `known` holds the ids already given.
+private pure func line_ids(
+    lines: LineIndex,
+    known: Dict[String, Int]
+) -> (List[Int], Dict[String, Int]):
+    var ids = known
+    var found: List[Int] = []
+    for line in 0..lines.line_count():
+        content = lines.line_text(line)
+        id = match ids.get(content):
+            Some(given): given
+            None: ids.length()
+        ids = ids.set(content, id)
+        found = found.append(id)
+    (found, ids)
+
+
+-- The runs of equal lines of `before` and `after` that a shortest edit script
+-- keeps, by Myers' O(ND) greedy algorithm: round `d` finds, for each diagonal
+-- `k` of the edit graph, how far along `before` a path of `d` edits reaches.
+-- `rounds` keeps each round's reach so that the path can be walked back. None
+-- are found when the texts differ by more than DIFF_LIMIT edits.
+private pure func shared_runs(before: List[Int], after: List[Int]) -> List[LineRun]:
+    n = before.length()
+    m = after.length()
+    limit = min(n + m, DIFF_LIMIT)
+    -- Diagonal `k` lives at `reach[middle + k]`; round `d` reads `k - 1` and
+    -- `k + 1` for k in -d..d, so the list spans -limit - 1..limit + 1.
+    middle = limit + 1
+    var reach: List[Int] = repeat(0, 2 * limit + 3)
+    var rounds: List[List[Int]] = []
+    var found: Option[Int] = None
+    var round = 0
+    while and(found.is_none(), round <= limit):
+        rounds = rounds.append(reach)
+        var k = -round
+        while and(found.is_none(), k <= round):
+            below = reach.get_or(middle + k - 1, 0)
+            above = reach.get_or(middle + k + 1, 0)
+            var x = if or(k == -round, and(k != round, below < above)):
+                above
+            else:
+                below + 1
+            var y = x - k
+            while and(and(x < n, y < m), before.get_or(x, 0) == after.get_or(y, 0)):
+                x = x + 1
+                y = y + 1
+            reach = reach.set(middle + k, x)
+            if and(x >= n, y >= m):
+                found = Some(round)
+            k = k + 2
+        round = round + 1
+    var runs: List[LineRun] = []
+    match found:
+        None:
+            void
+        Some(last):
+            var x = n
+            var y = m
+            for back in 0..last:
+                round = last - back
+                earlier = rounds.get_or(round, reach)
+                k = x - y
+                below = earlier.get_or(middle + k - 1, 0)
+                above = earlier.get_or(middle + k + 1, 0)
+                came_down = or(k == -round, and(k != round, below < above))
+                previous_x = if came_down:
+                    above
+                else:
+                    below
+                snake_start = if came_down:
+                    previous_x
+                else:
+                    previous_x + 1
+                if x > snake_start:
+                    runs = runs.append({
+                        from_line = snake_start,
+                        to_line = snake_start - k,
+                        length = x - snake_start
+                    })
+                previous_k = if came_down:
+                    k + 1
+                else:
+                    k - 1
+                x = previous_x
+                y = previous_x - previous_k
+            -- Round 0 has no edit: the path starts on the diagonal at the origin.
+            if x > 0:
+                runs = runs.append({ from_line = 0, to_line = 0, length = x })
+    runs.reverse()
+
+
+-- How the lines of `sealed` correspond to those of `current`: the common
+-- leading and trailing lines are trimmed, and the middle is diffed.
+pure func line_map(sealed: String, current: String) -> LineMap:
+    sealed_lines = line_index(sealed)
+    current_lines = line_index(current)
+    (sealed_ids, known) = line_ids(sealed_lines, {})
+    (current_ids, _) = line_ids(current_lines, known)
+    n = sealed_ids.length()
+    m = current_ids.length()
+    var leading = 0
+    while and(leading < min(n, m), sealed_ids.get_or(leading, 0) == current_ids.get_or(leading, 0)):
+        leading = leading + 1
+    var trailing = 0
+    while and(
+        trailing < min(n, m) - leading,
+        sealed_ids.get_or(n - 1 - trailing, 0) == current_ids.get_or(m - 1 - trailing, 0)
+    ):
+        trailing = trailing + 1
+    trimmed = leading
+    between = shared_runs(
+        sealed_ids.slice(trimmed, n - trailing),
+        current_ids.slice(trimmed, m - trailing)
+    ).map(
+        pure func(run: LineRun) -> LineRun: {
+            from_line = run.from_line + trimmed,
+            to_line = run.to_line + trimmed,
+            length = run.length
+        }
+    )
+    runs = [{ from_line = 0, to_line = 0, length = leading }]
+        .concat(between)
+        .concat([{ from_line = n - trailing, to_line = m - trailing, length = trailing }])
+        .filter(pure func(run: LineRun) -> Bool: run.length > 0)
+    into_opaque LineMap({
+        sealed_lines = sealed_lines,
+        current_lines = current_lines,
+        sealed_to_current = runs,
+        current_to_sealed = runs.map(
+            pure func(run: LineRun) -> LineRun: { run |
+                from_line = run.to_line,
+                to_line = run.from_line
+            }
+        )
+    })
+
+
+-- The offset in `to_lines` of `offset` in `from_lines`, or None when its line
+-- is in no of the `runs` from one to the other.
+private pure func counterpart(
+    from_lines: LineIndex,
+    to_lines: LineIndex,
+    runs: List[LineRun],
+    offset: Int
+) -> Option[Int]:
+    line = from_lines.line_of(offset)
+    -- The runs start in increasing order: the last that starts at or before
+    -- the line is the only one that can hold it.
+    var low = 0
+    var high = runs.length()
+    while low < high:
+        probe = (low + high) / 2
+        match runs.get(probe):
+            Some(run):
+                if run.from_line <= line:
+                    low = probe + 1
+                else:
+                    high = probe
+            None:
+                break
+    match runs.get(low - 1):
+        Some(run):
+            if line < run.from_line + run.length:
+                Some(
+                    (
+                        to_lines.line_start(run.to_line + line - run.from_line)
+                        + offset
+                        - from_lines.line_start(line)
+                    )
+                )
+            else:
+                None
+        None:
+            None
+
+
+-- The offset in the current text of `offset` in the sealed text, or None when
+-- its line changed.
+pure func current_offset(map: LineMap, offset: Int) -> Option[Int]:
+    lines = from_opaque LineMap(map)
+    counterpart(lines.sealed_lines, lines.current_lines, lines.sealed_to_current, offset)
+
+
+-- The offset in the sealed text of `offset` in the current text, or None when
+-- its line changed.
+pure func sealed_offset(map: LineMap, offset: Int) -> Option[Int]:
+    lines = from_opaque LineMap(map)
+    counterpart(lines.current_lines, lines.sealed_lines, lines.current_to_sealed, offset)
+
+
+-- `span`, of the sealed text, in the current text, or None unless it lies on
+-- one line that did not change.
+pure func current_span(map: LineMap, span: Span) -> Option[Span]:
+    lines = from_opaque LineMap(map).sealed_lines
+    if lines.line_of(span.start) != lines.line_of(span.end):
+        None
+    else:
+        match (map.current_offset(span.start), map.current_offset(span.end)):
+            (Some(start), Some(end)): Some({ span | start = start, end = end })
+            _: None
