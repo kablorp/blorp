@@ -1,7 +1,8 @@
 # Language server: `blorp lsp`
 
 **Status: plan, 2026-11-10; Keith settled its decisions and asked for a byte
-console on 2026-11-11. Landings 1–8 and 9a–9c have landed; 10 is next.**
+console on 2026-11-11. Landings 1–11 have landed; 12, the plugin on LSP4IJ,
+is in progress; 13 is planned and awaits Keith's approval.**
 
 ## Problem
 
@@ -40,16 +41,12 @@ the byte console as below, with read flushing and the closed-pipe rule.
 library; byte-range spans on every token (`syntax/syntax.brp:8`); and
 process `capture`, which can feed standard input.
 
-**What is missing:**
+**What was missing**, which landings 1–8 supplied: analysis without `main`,
+recorded name uses, comments as lexer tokens, a failed lex's prefix, and a
+console that reads and writes without a newline.
 
-- **`check` requires `main`**, failing with `MissingMain`
-  (`common/analysis/check/signatures.brp:189`).
-- **Name uses go unrecorded.**
-- **The lexer skips comments**, and the formatter finds them again
-  (`format/trivia.brp:185`).
-- **A failed lex keeps no tokens**, because names are interned only after a
-  successful scan (`common/syntax/lex.brp:1954`).
-- **The console cannot read**, and `print` always adds a newline.
+**On 2026-11-21:** a line diff for broken files, and the plugin on LSP4IJ,
+whose `workspace/textDocumentContent` lets landing 13 drop the folder.
 
 **Related plans:** `STRING_PLAN.md` moves byte work to `byte_*` functions,
 and the README's naming rules and the library's exact-error convention apply here.
@@ -70,9 +67,9 @@ and the README's naming rules and the library's exact-error convention apply her
   The layer suite (`test/test_layout/test_dependencies.brp`) gains an
   `lsp/` layer that imports itself and `common/`. `main.brp` dispatches
   `lsp` there.
-- **CLion plugin** (`editor/intellij/`): it launches `blorp lsp`, as the
-  old plugin's launcher did (`ee9e001c6de8:editor/intellij/`). JetBrains
-  supports `semanticTokens/full` from 2024.2.2.
+- **CLion plugin** (`editor/intellij/`): it launches `blorp lsp` through
+  LSP4IJ (landing 12). Landing 10's plugin used CLion's own LSP API, which
+  needed three workarounds.
 
 ### Analysis without an entry point
 
@@ -203,11 +200,27 @@ and `[]` to every file it reported in last time but not now. A shared file
 shows the latest analysis's. Library files are never published; URIs are
 percent-encoded.
 
-**The library on disk.** The server runs inside
-`fs.with_temporary_directory("/tmp", "blorp-lsp-", …)` and writes each module
-in `EMBEDDED_LIBRARY_PATHS` there as a view: analyses read the embedded
-library, and library locations map to the view, so an edit there is never
-read. `/tmp` is a named constant.
+**Library files.** Analyses read the embedded library. Landing 9c wrote it to
+a folder in `/tmp` for an editor to open; landing 13 drops the folder, its
+shutdown order and 9c's open folder items.
+- **URIs.** A library location is a hierarchical URI with no authority, such
+  as `blorp-library:///io/console/output.brp`: the file's path below the
+  library root, percent-encoded as `file_uri` does. `uri_path` reads only
+  `file:` URIs, so a decoder joins it, and open library files are keyed by
+  that path. `didOpen` tells a library file by its scheme, and `targets`
+  picks the URI by the module's role. A diagnostic about a library file names
+  that path.
+- **Capability.** When the client's `workspace.textDocumentContent` object is
+  present, `initialize` answers `capabilities.workspace.textDocumentContent =
+  { schemes: ["blorp-library"] }`. Otherwise library entries are left out of
+  definitions and references, and the README names the LSP 3.18 client this
+  needs.
+- **Content.** `workspace/textDocumentContent` answers the embedded file's
+  text, found by table lookup, so `..` reaches nothing; any other URI gets
+  -32602. The text never changes, so no refresh is sent, and ranges index the
+  embedded text.
+- A library file the client opens gets the lexer's tokens and nothing else.
+  `shutdown` replies at once.
 
 **Semantic tokens.** Keywords, comments, strings, numbers and operators
 come from the lexer. Identifier tokens take their type and modifiers from
@@ -227,7 +240,8 @@ its open document's, else the latest analysis's, else the sealed one's,
 unless a change to it was reported since.
 
 **Definition** returns the declaration of the use at the position, or
-`null`. A position at an identifier's end counts as inside it.
+`null`. A position at an identifier's end counts as inside it. From landing
+13 it is a plain `Location`: only CLion's own client read a link's origin.
 
 **References** returns every use with that referent. It includes the
 declaration only on request. Analysis checks a library body only when the
@@ -535,13 +549,14 @@ the other's `length` and `slice` uses.
 
 ## Risks and unknowns
 
-- **Do semantic tokens alone colour a file in CLion?** The plugin landing
-  probes it first with a stub server, with `null` and error replies too.
-- **Latency.** Analysing `blorp/src/main.brp` may be slow.
+- **Does LSP4IJ open a `blorp-library:` file as Blorp?** Landing 13 checks
+  that first, through the plugin's headless tests: the editor's file type,
+  its tokens and its `didOpen`.
 
 ## Dependencies
 
-- Landing 11 follows 10.
+- Landing 11 follows 10, and 13 follows 12, since only LSP4IJ opens a
+  `blorp-library:` file.
 
 ## Release strategy
 
@@ -562,6 +577,9 @@ backs it out; for landing 7, re-pinning the previous seed does.
    references and the library on disk.
 10. **The CLion plugin.**
 11. **Broken files** served from the last good analysis.
+12. **The plugin on LSP4IJ** (Keith, 2026-11-21).
+13. **Library files through `workspace/textDocumentContent`**, and plain
+    `Location`s.
 
 **Ceilings** are against the parent commit, on
 `blorp/scripts/self-compile-cost`'s own-source rows unless stated, with test
@@ -582,6 +600,8 @@ lines counted apart. Compile cost must also fit the e2e instruction ceilings'
 | 9c navigation, fixed input | ≤ +0.1% | ≤ +0.01% | ≤ +0.1% | ≤ +470 net |
 | 10 the CLion plugin | not compiled | not compiled | not compiled | ≤ 580 Kotlin and XML |
 | 11 broken files, fixed input | ≤ +0.1% | ≤ +0.01% | ≤ +0.1% | ≤ +460 net |
+| 12 the plugin on LSP4IJ | not compiled | not compiled | not compiled | ≤ 500 Kotlin and XML |
+| 13 library files, fixed input | ≤ +0.1% (noise) | no increase | no increase | ≤ −80 net |
 
 **Latency.** Per request after one change, on this host: ≤ 1.0 s for
 `blorp/src/main.brp`, and ≤ 50 ms for a one-module program. Landing 1
@@ -1308,6 +1328,8 @@ Each landing starts with a failing test.
 | 9c | Each request through `receive`. |
 | 10 | Gradle tests in `editor/intellij/`, one running the repository's server, and the manual checklist in the plugin's README. |
 | 11 | `test/test_lsp/`: the line diff (edited, interleaved and distant lines, a moved block, line ends, the limit, both directions) and serving a failed root (tokens, definition above and below an edit, other open documents, references, UTF-16, a close or reported change). An e2e session in `cli.brp`. |
+| 12 | The Gradle tests against the repository's server: Go to Declaration under the C/C++ engine's action id, and LSP4IJ's usage search from a name in a hole. |
+| 13 | `test/test_lsp/`: library locations are `blorp-library:` URIs, and the `initialize` reply is exact; `workspace/textDocumentContent` answers the embedded text, with -32602 and its message for a wrong scheme, a bad escape and an unknown path; without the capability only library entries go; a library document gets lexer tokens; definition is a `Location`; `shutdown` replies at once. The e2e session leaves no folder, and the README drops the folder. |
 
 **Commands:** those in `blorp/AGENTS.md`, `scripts/blorp-fixpoint --prove`
 for compiler landings, and `make -C blorp test-e2e INSTRUCTION_CHECK=on`
@@ -1334,6 +1356,10 @@ when compile cost changes.
   into the library too.
 - [ ] **11.** CLion colours a file while it has an error, and definition
   works above and below the edit.
+- [ ] **12.** With LSP4IJ, CLion colours a file, Cmd-click and Cmd-B work
+  into the library, and Find Usages lists usages.
+- [ ] **13.** Cmd-click on `print` opens it read-only, coloured, and no
+  `blorp-lsp-` folder is made.
 - [ ] **Every landing** meets its ceilings, passes `make -C blorp test`, and
   is reviewed and test-run.
 
