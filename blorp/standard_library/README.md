@@ -10,7 +10,7 @@ The directory was renamed from `standard_library_temp` on 2026-10-18. Dated
 benchmark reports and retained raw evidence keep the historical path to preserve
 measurement provenance; current commands use `blorp/standard_library`.
 
-The library root contains two designated foundation modules:
+The library root contains three designated foundation modules:
 
 - `_base.brp` owns Int, UInt8, Float, String, Void, List, Bool, Option, Result, the
   `Equatable`, `Orderable`, `Hashable` and `Stringable` traits and the arithmetic traits
@@ -19,8 +19,12 @@ The library root contains two designated foundation modules:
   module that may declare builtin types. Any module may import it as `_base`.
 - `prelude.brp` imports the base types, the operation modules' methods and
   `io/console/output`'s `print` and `print_error`. It
-  is the only implicit import: application roots and ordinary user helper
-  modules receive its selections, and it cannot be imported explicitly.
+  is the implicit import of user modules: application roots and ordinary user
+  helper modules receive its selections, and it cannot be imported explicitly.
+- `_methods.brp` imports the methods of Option, Result and Bool. It is the
+  implicit import of library modules: every library module except `option`,
+  `result` and `bool`, which it imports, receives its `methods` selections,
+  and it cannot be imported explicitly.
 
 A library module may live in a folder, as `io/environment.brp` imported
 as `io/environment`. A module file may not sit beside a folder of the same name; the
@@ -28,7 +32,8 @@ loader rejects an import that passes through such a name. On disk any folder
 counts, but the embedded library records only `.brp` files, so a folder with none
 (a README alone) does not count there.
 
-Library modules receive nothing implicitly. Each one imports what it uses,
+Library modules receive no prelude. Apart from the methods of Option, Result
+and Bool, which `_methods.brp` supplies, each one imports what it uses,
 including base types, for example `_base: Int, Bool(True, False)` in `int.brp`.
 `_base.brp` owns canonical Equatable beside the other core traits. The prelude
 selects that trait; operation modules provide written
@@ -332,8 +337,8 @@ prelude. `option.brp` provides `is_some`, `is_none`, eager `get_or`, eager
 unions. The prelude selects both modules' methods, so a user module calls them
 as methods, as in `args.get(1).get_or("none")`, without an import. A direct
 call such as `is_some(value)` still needs the function imported by name. A
-library module receives no prelude, so it imports these modules' methods, and
-Bool's, itself.
+library module receives no prelude, but it receives these methods and Bool's
+from `_methods.brp`, except in the three modules `_methods` imports.
 
 The four callback signatures keep their type parameters independent:
 

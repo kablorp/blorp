@@ -1107,8 +1107,9 @@ import of it or by a library path, the help names its methods import, here
 it; where none does, the help is the general one, to use a value of a declared
 receiver type or import a function accepting it.
 
-The [prelude](standard_library/prelude.brp) is the only implicit import. User
-modules receive its selections: the base types, `Bool`, `Option` and `Result`
+The [prelude](standard_library/prelude.brp) is the implicit import of user
+modules; library modules have their own, below. User modules receive its
+selections: the base types, `Bool`, `Option` and `Result`
 with their constructors, the operator traits, `Equatable`, `Hashable`,
 `Stringable`, `Dict`, the console functions `print` and `print_error`, the
 generic `max` and `min` of any `Orderable`, the conversions
@@ -1127,9 +1128,17 @@ Examples are `lines` or `parse_uint8` on a String, `not` on a Bool, `get_or`
 on an `Option[T]`, and a generic `is_ok[T](value: T)`, whose `T` could be a
 Result.
 The error is "two functions named lines can accept the same receiver"; give
-the function another name. Library modules receive nothing implicitly and
-cannot import user modules. Any module may import the foundation module as
-`_base`.
+the function another name.
+
+Library modules receive no prelude, and cannot import user modules. Instead,
+every library module receives the `methods` selections of
+[`_methods`](standard_library/_methods.brp): the methods of Option, Result and
+Bool, without their names. The modules `_methods` imports (`option`, `result`
+and `bool`) do not receive it, since it is built from them. If one of them
+imported another library module, it would close a cycle through `_methods`,
+which is rejected like any other. No module may import `_methods` ("_methods cannot be
+imported explicitly"), and it cannot be an application root. Any module may
+import the foundation module as `_base`.
 
 ### Dict
 
@@ -1312,7 +1321,8 @@ The library is ordinary Blorp under [`standard_library/`](standard_library/).
 `_base.brp` declares the builtin types `Int`, `UInt8`, `Float`, `String`, `Void` and
 `List`, the unions `Bool`, `Option`, `Result` and `MathError`, and the
 `Equatable`, `Orderable`, `Hashable`, `Stringable` and arithmetic traits; only
-it may declare builtin types. `prelude.brp` is the implicit import, and the operation modules
+it may declare builtin types. `prelude.brp` is the implicit import of user modules,
+`_methods.brp` that of library modules, and the operation modules
 implement the traits and provide functions, some with `builtin("label")` bodies
 that name a compiler-known operation. The
 [standard library README](standard_library/README.md) owns every contract.
@@ -1556,7 +1566,7 @@ the output may already be new.
    records, unions and owner-qualified variants) and fixes the module
    dependency order, rejecting import cycles.
 3. **Load** ([`load`](src/common/analysis/load/load.brp)) reads the root, `_base.brp`, the
-   prelude and every imported module once per logically normalized path
+   prelude, `_methods.brp` and every imported module once per logically normalized path
    (symlinks are not resolved), lexes and parses each, and publishes the
    `ParsedProgram` with the source inventory diagnostics render from.
    `load_program_with_sources(root_path, library, sources)` accepts frozen
@@ -1573,7 +1583,8 @@ the output may already be new.
    or for a module nothing imports, is accepted and unused.
 4. **Namespace** ([`namespace`](src/common/analysis/namespace/namespace.brp)), the first step
    of checking, gives each module one frozen scope in dependency order: its
-   declarations, its imports and, for a user module, the prelude. A spelling
+   declarations, its imports and its implicit source: the prelude for a user
+   module, and `_methods.brp`'s methods for a library module. A spelling
    denotes at most one entity per space: functions and constructors share the
    value space, types have their own, and an alias claims both.
    [`builtins.brp`](src/common/analysis/namespace/builtins.brp) validates the foundation and

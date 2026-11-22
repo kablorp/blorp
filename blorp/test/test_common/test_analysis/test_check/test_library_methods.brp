@@ -1,0 +1,264 @@
+import:
+    test: TestSuite
+    ../../../../src/common/analysis/check/check: check
+    ../../../../src/common/analysis/check/render: render_failure
+    ../../../../src/common/analysis/load/load:
+        LibrarySource(LibraryDirectory),
+        load_program_with_sources
+    ../../../../src/common/syntax/source: ModuleId, SourceFile
+    ../../../support/loader_rows: absolute, module_of
+
+
+-- Library modules receive no prelude, but every one except those `_methods`
+-- imports receives `_methods`' selections: the methods of Option, Result and
+-- Bool. Each probe is an unsaved library module beside the real library. A
+-- library function's body is checked only when the program reaches it, so
+-- each body test's root calls one probe; receiver admission covers every
+-- loaded module, so an overlap needs only an import.
+private LIBRARY_ROOT: String = "blorp/standard_library"
+
+
+private ROOT: String = "build/library-methods/main.brp"
+
+
+private PROBE: String = "blorp/standard_library/methods_probe.brp"
+
+
+private PROBE_SOURCE: String =
+    |import:
+    |    _base: Int, Bool(True, False), Option(Some, None), Result(Ok, Err)
+    |
+    |
+    |pure func option_probe(value: Option[Int]) -> Result[Int, Bool]:
+    |    match value.is_some():
+    |        True: value.map(pure func(number: Int): number).to_result(value.is_none())
+    |        False: Ok(value.get_or(0))
+    |
+    |
+    |pure func result_probe(value: Result[Int, Int]) -> Result[Int, Int]:
+    |    match value.is_ok():
+    |        True:
+    |            value
+    |                .map(pure func(number: Int): number)
+    |                .and_then(pure func(number: Int) -> Result[Int, Int]: Ok(number))
+    |        False: value.map_err(pure func(error: Int): error)
+    |
+    |
+    |pure func bool_probe(flag: Bool) -> Bool:
+    |    flag.not().and(flag).or(flag)
+    |
+
+
+-- A module `_methods` imports, here `option`, does not receive it, so a Bool
+-- method needs an import there.
+private MEMBER_SOURCE: String =
+    |import:
+    |    _base: Bool(True, False), Option(Some, None)
+    |
+    |
+    |pure func is_some[T](self: Option[T]) -> Bool:
+    |    match self:
+    |        Some(_): True
+    |        None: False
+    |
+    |
+    |pure func is_none[T](self: Option[T]) -> Bool:
+    |    self.is_some().not()
+    |
+
+
+-- Where `not` starts in MEMBER_SOURCE.
+private MEMBER_NOT_START: Int = 232
+
+
+-- A library module's own `get_or` on Option overlaps the received one.
+private DECLARES_SOURCE: String =
+    |import:
+    |    _base: Int, Option(Some, None)
+    |
+    |
+    |pure func get_or(self: Option[Int], fallback: Int) -> Int:
+    |    match self:
+    |        Some(value): value
+    |        None: fallback
+    |
+
+
+-- Where `get_or` starts in DECLARES_SOURCE.
+private DECLARES_NAME_START: Int = 55
+
+
+private BOX_SOURCE: String =
+    |import:
+    |    _base: Int
+    |
+    |
+    |record Box { content: Int }
+    |
+
+
+private DESCRIBE_SOURCE: String =
+    |import:
+    |    _base: Int
+    |    box_probe: Box
+    |
+    |
+    |pure func describe(box: Box) -> Int:
+    |    box.content
+    |
+
+
+-- Two written `methods` imports overlap each other after the method imports
+-- the module receives. Admission skips the received ones as proven; if it
+-- skipped the written ones too, this overlap would go unreported.
+private IMPORTS_SOURCE: String =
+    |import:
+    |    _base: Int
+    |    box_probe: Box
+    |    left_probe: Box methods
+    |    right_probe: Box methods
+    |
+    |
+    |pure func probe(box: Box) -> Int:
+    |    box.describe()
+    |
+
+
+-- Where `Box` starts in IMPORTS_SOURCE's `right_probe` row.
+private RIGHT_SELECTION_START: Int = 87
+
+
+-- Whether a root that matches on `call`, a Bool, checks.
+private func probe_checks(call: String) -> Bool:
+    root = "import:\n    methods_probe as probe\n\n\nfunc main() -> Int:\n    match ${call}:\n        True: 0\n        False: 1\n"
+    match load_program_with_sources(ROOT, LibraryDirectory(LIBRARY_ROOT), [
+        { path = ROOT, contents = root },
+        { path = PROBE, contents = PROBE_SOURCE }
+    ]):
+        Err(_): False
+        Ok(loaded): check(loaded.program).is_ok()
+
+
+-- The single diagnostic, in the unsaved library module at `path`, compared
+-- exactly.
+private func rejects_in(
+    root: String,
+    library: List[SourceFile],
+    path: String,
+    start: Int,
+    end: Int,
+    message: String,
+    help: String
+) -> Bool:
+    match load_program_with_sources(
+        ROOT,
+        LibraryDirectory(LIBRARY_ROOT),
+        [{ path = ROOT, contents = root }].concat(library)
+    ):
+        Err(_):
+            False
+        Ok(loaded):
+            match (check(loaded.program), loaded.sources.modules.module_of(absolute(path))):
+                (Err(failure), Some(id)):
+                    diagnostics = render_failure(failure)
+                    first = diagnostics.first
+                    (first.message == message)
+                        .and(first.help == help)
+                        .and(
+                            first.span == { source = id.module_source(), start = start, end = end }
+                        )
+                        .and(diagnostics.remaining.is_empty())
+                _:
+                    False
+
+
+-- A root that imports the library module `module` and does nothing else.
+private pure func importing_root(module: String) -> String:
+    "import:\n    ${module} as probe\n\n\nfunc main() -> Int:\n    0\n"
+
+
+func test_a_library_module_calls_option_methods_without_an_import() -> Bool:
+    probe_checks("probe.option_probe(Some(1)).is_ok()")
+
+
+func test_a_library_module_calls_result_methods_without_an_import() -> Bool:
+    probe_checks("probe.result_probe(Ok(1)).is_ok()")
+
+
+func test_a_library_module_calls_bool_methods_without_an_import() -> Bool:
+    probe_checks("probe.bool_probe(True)")
+
+
+func test_a_module_the_methods_module_imports_does_not_receive_it() -> Bool:
+    option = LIBRARY_ROOT + "/option.brp"
+    rejects_in(
+        "func main() -> Int:\n    match Some(1).is_none():\n        True: 1\n        False: 0\n",
+        [{ path = option, contents = MEMBER_SOURCE }],
+        option,
+        MEMBER_NOT_START,
+        MEMBER_NOT_START + 3,
+        "no method not for Bool is in scope",
+        "import bool: Bool methods"
+    )
+
+
+func test_a_library_function_overlapping_a_received_method_is_rejected() -> Bool:
+    path = LIBRARY_ROOT + "/declares_probe.brp"
+    rejects_in(
+        importing_root("declares_probe"),
+        [{ path = path, contents = DECLARES_SOURCE }],
+        path,
+        DECLARES_NAME_START,
+        DECLARES_NAME_START + 6,
+        "two functions named get_or can accept the same receiver",
+        "rename one of them, or change a first parameter so that no value fits both receivers, Option[Int] and Option[T]"
+    )
+
+
+func test_written_method_imports_after_the_received_ones_are_checked() -> Bool:
+    path = LIBRARY_ROOT + "/imports_probe.brp"
+    rejects_in(
+        importing_root("imports_probe"),
+        [
+            { path = LIBRARY_ROOT + "/box_probe.brp", contents = BOX_SOURCE },
+            { path = LIBRARY_ROOT + "/left_probe.brp", contents = DESCRIBE_SOURCE },
+            { path = LIBRARY_ROOT + "/right_probe.brp", contents = DESCRIBE_SOURCE },
+            { path = path, contents = IMPORTS_SOURCE }
+        ],
+        path,
+        RIGHT_SELECTION_START,
+        RIGHT_SELECTION_START + 3,
+        "two functions named describe can accept the same receiver",
+        "rename one of them, or change a first parameter so that no value fits both receivers, Box and Box"
+    )
+
+
+TESTS: TestSuite = {
+    description = "the foundation methods in library modules",
+    tests = [
+        (
+            "a library module calls Option methods without an import",
+            test_a_library_module_calls_option_methods_without_an_import
+        ),
+        (
+            "a library module calls Result methods without an import",
+            test_a_library_module_calls_result_methods_without_an_import
+        ),
+        (
+            "a library module calls Bool methods without an import",
+            test_a_library_module_calls_bool_methods_without_an_import
+        ),
+        (
+            "a module the methods module imports does not receive it",
+            test_a_module_the_methods_module_imports_does_not_receive_it
+        ),
+        (
+            "a library function overlapping a received method is rejected",
+            test_a_library_function_overlapping_a_received_method_is_rejected
+        ),
+        (
+            "written method imports after the received ones are checked",
+            test_written_method_imports_after_the_received_ones_are_checked
+        )
+    ]
+}

@@ -18,8 +18,17 @@ import:
     ../../../../src/common/syntax/parse: parse_module
     ../../../../src/common/syntax/source:
         ModuleId,
-        ModuleKind(UserModule, LibraryModule, FoundationTypesModule, FoundationPreludeModule),
+        ModuleKind(
+            UserModule,
+            LibraryModule,
+            FoundationTypesModule,
+            FoundationPreludeModule,
+            FoundationMethodsModule
+        ),
         SourceId,
+        foundation_methods_module_id,
+        foundation_prelude_module_id,
+        foundation_types_module_id,
         module_id,
         module_source,
         root_module_id
@@ -30,19 +39,30 @@ import:
         Span,
         ValueExpression,
         source_bundle_error
+    ../../../support/loader_rows: first_discovered_module_number
 
 
 private SUITE_HELP: String = "TESTS: TestSuite = { description = ..., tests = [...] }"
 
 
--- The loader's order: the first root at 0, the base at 1, the prelude at 2,
--- then the later root at 3, and the configured test library after them.
-private LATER_ROOT_ORDINAL: Int = 3
-private LIBRARY_ORDINAL: Int = 4
--- The bundle has five modules, so no row has this ordinal.
-private ABSENT_ORDINAL: Int = 9
--- The first root, the base, the prelude, the later root and the library.
-private BUNDLE_MODULES: Int = 5
+-- The loader's order: the first root, the foundation inputs at their own
+-- numbers, then the later root and the configured test library after them.
+private pure func later_root_ordinal() -> Int:
+    first_discovered_module_number()
+
+
+private pure func library_ordinal() -> Int:
+    later_root_ordinal() + 1
+
+
+-- The first root, the foundation inputs, the later root and the library.
+private pure func bundle_modules() -> Int:
+    library_ordinal() + 1
+
+
+-- Past the bundle's last row, so no row has this ordinal.
+private pure func absent_ordinal() -> Int:
+    bundle_modules() + 3
 
 
 private pure func ordinal_module(ordinal: Int) -> ModuleId:
@@ -72,11 +92,17 @@ private pure func prepared(
     grouped: List[ModuleId]
 ) -> Result[ParsedContents, Diagnostic]:
     first ?= append_source(begin_program(), root, root_module_id(), targets, UserModule)
-    second ?= append_source(first, "", ordinal_module(1), [], FoundationTypesModule)
-    third ?= append_source(second, "", ordinal_module(2), [], FoundationPreludeModule)
-    fourth ?= append_source(third, later, ordinal_module(LATER_ROOT_ORDINAL), [], UserModule)
-    fifth ?= append_source(fourth, "", ordinal_module(LIBRARY_ORDINAL), [], LibraryModule)
-    ready ?= prepare_test_entry(fifth, grouped, ordinal_module(LIBRARY_ORDINAL), ordinal_module(1))
+    second ?= append_source(first, "", foundation_types_module_id(), [], FoundationTypesModule)
+    third ?= append_source(second, "", foundation_prelude_module_id(), [], FoundationPreludeModule)
+    methods ?= append_source(third, "", foundation_methods_module_id(), [], FoundationMethodsModule)
+    fourth ?= append_source(methods, later, ordinal_module(later_root_ordinal()), [], UserModule)
+    fifth ?= append_source(fourth, "", ordinal_module(library_ordinal()), [], LibraryModule)
+    ready ?= prepare_test_entry(
+        fifth,
+        grouped,
+        ordinal_module(library_ordinal()),
+        foundation_types_module_id()
+    )
     match seal_program(ready):
         Ok(program): Ok(parsed_contents(program))
         Err(MalformedBundle(error)): Err(error)
@@ -134,7 +160,7 @@ private pure func suite_run(
 pure func test_two_roots_run_both_suites_in_order() -> Bool:
     root = "TESTS: Int = 1\n"
     later = "TESTS: Int = 2\n\n"
-    match prepared(root, [], later, [ordinal_module(LATER_ROOT_ORDINAL)]):
+    match prepared(root, [], later, [ordinal_module(later_root_ordinal())]):
         Err(_):
             False
         Ok(parsed):
@@ -154,7 +180,7 @@ pure func test_two_roots_run_both_suites_in_order() -> Bool:
                                         suite_run(
                                             parsed.names,
                                             grouped,
-                                            module_source(ordinal_module(LATER_ROOT_ORDINAL)),
+                                            module_source(ordinal_module(later_root_ordinal())),
                                             later.length()
                                         )
                                     ):
@@ -163,7 +189,7 @@ pure func test_two_roots_run_both_suites_in_order() -> Bool:
                                                 pure func(request): and(
                                                     (
                                                         request.target
-                                                        == ordinal_module(LATER_ROOT_ORDINAL)
+                                                        == ordinal_module(later_root_ordinal())
                                                     ),
                                                     aliased(request, qualified.module.id)
                                                 )
@@ -235,8 +261,8 @@ pure func test_one_root_runs_a_list_of_one() -> Bool:
 pure func test_an_imported_later_root_keeps_the_root_alias() -> Bool:
     root = "import:\n    ./fixture as other\nTESTS: Int = 1\n"
     later = "TESTS: Int = 2\n"
-    match prepared(root, [ordinal_module(LATER_ROOT_ORDINAL)], later, [
-        ordinal_module(LATER_ROOT_ORDINAL)
+    match prepared(root, [ordinal_module(later_root_ordinal())], later, [
+        ordinal_module(later_root_ordinal())
     ]):
         Err(_):
             False
@@ -244,7 +270,7 @@ pure func test_an_imported_later_root_keeps_the_root_alias() -> Bool:
             later_imports = match parsed.modules.get(0):
                 Some(root_row):
                     root_row.imports.filter(
-                        pure func(request): request.target == ordinal_module(LATER_ROOT_ORDINAL)
+                        pure func(request): request.target == ordinal_module(later_root_ordinal())
                     )
                 None:
                     []
@@ -257,7 +283,7 @@ pure func test_an_imported_later_root_keeps_the_root_alias() -> Bool:
                                     match suite_run(
                                         parsed.names,
                                         grouped,
-                                        module_source(ordinal_module(LATER_ROOT_ORDINAL)),
+                                        module_source(ordinal_module(later_root_ordinal())),
                                         later.length()
                                     ):
                                         Some(QualifiedName(qualified)):
@@ -285,7 +311,7 @@ private pure func rejects(
     message: String,
     help: String
 ) -> Bool:
-    match prepared(root, targets, later, [ordinal_module(LATER_ROOT_ORDINAL)]):
+    match prepared(root, targets, later, [ordinal_module(later_root_ordinal())]):
         Ok(_):
             False
         Err(error):
@@ -304,7 +330,7 @@ pure func test_a_later_root_without_tests_is_rejected_at_its_end() -> Bool:
         "TESTS: Int = 1\n",
         [],
         later,
-        module_source(ordinal_module(LATER_ROOT_ORDINAL)),
+        module_source(ordinal_module(later_root_ordinal())),
         later.length(),
         later.length(),
         "test suite file declares no TESTS constant",
@@ -317,7 +343,7 @@ pure func test_an_imported_tests_is_not_a_suite() -> Bool:
     root = "import:\n    ./fixture: TESTS\n"
     rejects(
         root,
-        [ordinal_module(LATER_ROOT_ORDINAL)],
+        [ordinal_module(later_root_ordinal())],
         "TESTS: Int = 2\n",
         module_source(root_module_id()),
         root.length(),
@@ -331,7 +357,7 @@ pure func test_an_imported_tests_is_not_a_suite() -> Bool:
 -- user-facing discovery error already found at the first root.
 pure func test_a_root_discovery_error_survives_a_missing_later_root() -> Bool:
     root = "pure func helper() -> Int:\n    1\n"
-    match prepared(root, [], "", [ordinal_module(ABSENT_ORDINAL)]):
+    match prepared(root, [], "", [ordinal_module(absent_ordinal())]):
         Ok(_):
             False
         Err(error):
@@ -367,7 +393,7 @@ pure func test_the_entry_follows_the_root_functions_and_is_the_entrypoint() -> B
                         ),
                         and(
                             entry.declaration.module == root_module_id(),
-                            parsed.modules.length() == BUNDLE_MODULES
+                            parsed.modules.length() == bundle_modules()
                         )
                     )
                 _:

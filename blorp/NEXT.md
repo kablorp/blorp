@@ -8,6 +8,13 @@ done.
 
 ## Workstreams
 
+- **Foundation methods for library modules:**
+  [`LIBRARY_METHODS_PROPOSAL.md`](LIBRARY_METHODS_PROPOSAL.md).
+  - **Status:** Keith chose design 2 on 2026-11-22. Landing 1 adds
+    `_methods.brp`, which every library module receives except the modules it
+    imports. The 27 library rows stay for now.
+  - **Next:** a seed rotation that pins a seed knowing the new role, then a
+    landing that removes the 27 rows (about −27 lines).
 - **Equality derivation:** [`EQUALITY_PLAN.md`](EQUALITY_PLAN.md).
   - **Status:** opaque types and tuples derive `==` from their constituents
     (landings 1 and 2, landed 2026-11-17).

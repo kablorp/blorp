@@ -19,9 +19,7 @@ import:
     ../../syntax/parse:
         ImportSelection(NamedSelection, ConstructorSelection, MethodsSelection),
         ModulePath
-    ../../syntax/source:
-        ModuleId,
-        ModuleKind(UserModule, LibraryModule, FoundationTypesModule, FoundationPreludeModule)
+    ../../syntax/source: ModuleId
     ../../syntax/syntax:
         ParsedBuiltinType(IntegerBuiltin, FloatBuiltin, StringBuiltin, VoidBuiltin, ListBuiltin),
         ParsedQualified,
@@ -29,7 +27,12 @@ import:
         TypeSyntax(AtomicType, QualifiedType),
         Visibility(Public, Private),
         WrittenName
-    ../assemble: ModuleImport, ParsedContents, ParsedModuleRow, ParsedProgram
+    ../assemble:
+        ImplicitSource(NoSource, PreludeSource, MethodsSource),
+        ModuleImport,
+        ParsedContents,
+        ParsedModuleRow,
+        ParsedProgram
     ../ids:
         TraitId,
         ImplId,
@@ -878,7 +881,9 @@ private pure func publish_implementations(
 
 
 -- Host `get` defaults are unreachable: every index is a sealed module number,
--- and the prelude precedes every user module in dependency order.
+-- and an implicit source precedes each module that receives it in dependency
+-- order. A library module receives only the methods module's `methods`
+-- selections, never its names.
 pure func build_namespace(program: ParsedProgram) -> Result[Namespace, NamespaceProblem]:
     parsed = program.parsed_contents()
     declared ?= parsed.declared_entries()
@@ -888,20 +893,20 @@ pure func build_namespace(program: ParsedProgram) -> Result[Namespace, Namespace
     var scopes: List[ModuleScope] = repeat(empty, parsed.modules.length())
     var prelude_entries = nothing
     var prelude_methods = none
+    var library_methods = none
     var failure: Option[NamespaceProblem] = None
     for row in parsed.dependency_order:
         number = row.module.module_number()
-        var built = match row.role:
-            UserModule:
-                scopes.build_module(
-                    empty,
-                    row,
-                    declared.get_or(number, nothing),
-                    prelude_entries,
-                    prelude_methods
-                )
-            FoundationTypesModule | FoundationPreludeModule | LibraryModule:
-                scopes.build_module(empty, row, declared.get_or(number, nothing), nothing, none)
+        received = parsed.implicit_sources.get_or(number, NoSource)
+        received_entries = match received:
+            PreludeSource: prelude_entries
+            MethodsSource | NoSource: nothing
+        received_methods = match received:
+            PreludeSource: prelude_methods
+            MethodsSource: library_methods
+            NoSource: none
+        own = declared.get_or(number, nothing)
+        var built = scopes.build_module(empty, row, own, received_entries, received_methods)
         built = built.publish_implementations(scopes, row.module, parsed)
         failure = built.problem
         scope: ModuleScope = {
@@ -914,6 +919,8 @@ pure func build_namespace(program: ParsedProgram) -> Result[Namespace, Namespace
         if row.module == parsed.foundation.prelude:
             prelude_entries = scope.provided()
             prelude_methods = scope.methods
+        if row.module == parsed.foundation.methods:
+            library_methods = scope.methods
         if failure.is_some():
             break
     match failure:

@@ -1,16 +1,19 @@
 ---
 Admit complete receiver scopes before bodies are elaborated. Transient name-keyed
 groups preserve rejection order and use introduction-route upper bounds. Each
-unordered pair is checked once; only the exact inherited prelude subset reuses a proof.
+unordered pair is checked once; only an implicit source's exact subset reuses a proof.
 ---
 import:
     dict as dict_ops
     list: repeat
     ../../syntax/names: NameId
     ../../syntax/parse: ImportSelection(NamedSelection)
-    ../../syntax/source: ModuleId, ModuleKind(UserModule, FoundationPreludeModule)
+    ../../syntax/source: ModuleId, ModuleKind(FoundationPreludeModule, FoundationMethodsModule)
     ../../syntax/syntax: Span, WrittenName, compiler_span
-    ../assemble: ModuleImport, ParsedModuleRow
+    ../assemble:
+        ImplicitSource(NoSource, PreludeSource, MethodsSource),
+        ModuleImport,
+        ParsedModuleRow
     ../ids: FunctionId
     ../namespace/namespace: Namespace, MethodImport, Entry, Entity(Method)
     ./callables: accepted_function, Namespace methods, ReceiverFunction methods
@@ -71,7 +74,7 @@ private pure func name_counts(signatures: List[AcceptedFunction]) -> Dict[NameId
 
 
 -- Explicit function selections and the written suffix of the namespace's method
--- edges introduce candidates. The prelude prefix is already validated.
+-- edges introduce candidates. The implicit source's prefix is already validated.
 private pure func selected_receiver(
     request: ModuleImport,
     accepted: AcceptedFunction,
@@ -305,6 +308,13 @@ private pure func reject_group(
         None: Ok(void)
 
 
+-- An implicit source's functions by name, and the method imports it leads with.
+private record SuppliedReceivers {
+    names: Dict[NameId, List[FunctionId]],
+    leading_methods: Int
+}
+
+
 -- Dependency order proves inherited overlap pairs first; the published table
 -- uses module ordinals, which need not follow that order.
 pure func admit_receivers(
@@ -312,12 +322,14 @@ pure func admit_receivers(
     signatures: List[AcceptedFunction],
     module_count: Int,
     modules: List[ParsedModuleRow],
+    sources: List[ImplicitSource],
     traits: AcceptedTraits
 ) -> Result[List[AdmittedReceiverScope], CheckError]:
     counts = signatures.name_counts()
     unprovided: Dict[NameId, List[FunctionId]] = {}
-    var supplied = unprovided
-    var supplied_methods = 0
+    nothing_supplied: SuppliedReceivers = { names = unprovided, leading_methods = 0 }
+    var prelude_supplied = nothing_supplied
+    var methods_supplied = nothing_supplied
     var pending: List[Option[AdmittedReceiverScope]] = repeat(None, module_count)
     var failure: Option[CheckError] = None
     for row in modules:
@@ -345,22 +357,23 @@ pure func admit_receivers(
                 Ok(names): admitted = names
             if failure.is_some():
                 break
-        first_method = match row.role:
-            UserModule: supplied_methods
-            _: 0
-        inherited_names = match row.role:
-            UserModule: supplied
-            _: unprovided
+        received = match sources.get_or(position, NoSource):
+            PreludeSource: prelude_supplied
+            MethodsSource: methods_supplied
+            NoSource: nothing_supplied
+        first_method = received.leading_methods
+        inherited_names = received.names
+        publishes: Bool = match row.role:
+            FoundationPreludeModule | FoundationMethodsModule: True
+            _: False
+        var supplied = unprovided
         match namespace.introduced_names(signatures, counts, row, first_method, inherited_names):
             Err(invariant):
                 failure = Some(invariant)
             Ok(names):
                 for introduction in names.values():
-                    publishes_prelude: Bool = match row.role:
-                        FoundationPreludeModule: True
-                        _: False
                     if (
-                        publishes_prelude
+                        publishes
                             .not()
                             .and(introduction.candidate_bound == 1)
                     ):
@@ -376,15 +389,12 @@ pure func admit_receivers(
                             match reject_group(written, candidates, inherited, signatures):
                                 Err(clash): failure = Some(clash)
                                 Ok(_): void
-                            match row.role:
-                                FoundationPreludeModule:
-                                    var provided_ids: List[FunctionId] = []
-                                    for candidate in candidates:
-                                        if candidate.import_site.is_some():
-                                            provided_ids = provided_ids.append(candidate.id)
-                                    supplied = supplied.set(key, provided_ids)
-                                _:
-                                    void
+                            if publishes:
+                                var provided_ids: List[FunctionId] = []
+                                for candidate in candidates:
+                                    if candidate.import_site.is_some():
+                                        provided_ids = provided_ids.append(candidate.id)
+                                supplied = supplied.set(key, provided_ids)
                         Some(VisibleMethod(_)) | None:
                             void
                     if failure.is_some():
@@ -392,11 +402,14 @@ pure func admit_receivers(
         if failure.is_some():
             break
         pending = pending.set(position, Some({ names = admitted }))
+        leading = namespace
+            .method_imports(row.module)
+            .length()
         match row.role:
             FoundationPreludeModule:
-                supplied_methods = namespace
-                    .method_imports(row.module)
-                    .length()
+                prelude_supplied = { names = supplied, leading_methods = leading }
+            FoundationMethodsModule:
+                methods_supplied = { names = supplied, leading_methods = leading }
             _:
                 void
         if failure.is_some():

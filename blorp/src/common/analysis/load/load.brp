@@ -17,11 +17,18 @@ import:
         parse_module
     ../../syntax/source:
         ModuleId,
-        ModuleKind(UserModule, LibraryModule, FoundationTypesModule, FoundationPreludeModule),
+        ModuleKind(
+            UserModule,
+            LibraryModule,
+            FoundationTypesModule,
+            FoundationPreludeModule,
+            FoundationMethodsModule
+        ),
         ModuleSource,
         SourceFile,
         SourceInputs,
         foundation_prelude_module_id,
+        foundation_methods_module_id,
         foundation_types_module_id,
         module_id,
         root_module_id
@@ -47,6 +54,8 @@ private LIBRARY_SUFFIX: String = ".brp"
 private FOUNDATION_TYPES_PATH: String = "_base.brp"
 
 private FOUNDATION_PRELUDE_PATH: String = "prelude.brp"
+
+private FOUNDATION_METHODS_PATH: String = "_methods.brp"
 
 private LIBRARY_TEST_PATH: String = "test.brp"
 
@@ -124,6 +133,7 @@ private record LibraryContents {
     prefix: String,
     types_path: Path,
     prelude_path: Path,
+    methods_path: Path,
     test_path: Path
 }
 
@@ -139,8 +149,8 @@ private union LibraryChoice:
 
 
 -- The configured library is the only authority for module roles: the
--- foundation inputs are its two designated files, and every other file under it
--- is library code. Only library_layout builds one, so these paths always agree.
+-- foundation inputs are its three designated files, and every other file under
+-- it is library code. Only library_layout builds one, so these paths always agree.
 opaque type LibraryLayout = LibraryChoice
 
 
@@ -159,6 +169,7 @@ private pure func resolved_path(working_directory: Path, written: Path) -> Path:
 private pure func root_contents(root: Path) -> Result[LibraryContents, PathError]:
     types_file ?= FOUNDATION_TYPES_PATH.to_path()
     prelude_file ?= FOUNDATION_PRELUDE_PATH.to_path()
+    methods_file ?= FOUNDATION_METHODS_PATH.to_path()
     test_file ?= LIBRARY_TEST_PATH.to_path()
     root_text = root.to_string()
     prefix = if root_text == ROOT_DIRECTORY:
@@ -170,6 +181,7 @@ private pure func root_contents(root: Path) -> Result[LibraryContents, PathError
         prefix = prefix,
         types_path = path_ops.join(root, types_file),
         prelude_path = path_ops.join(root, prelude_file),
+        methods_path = path_ops.join(root, methods_file),
         test_path = path_ops.join(root, test_file)
     })
 
@@ -209,6 +221,8 @@ pure func module_role(layout: LibraryLayout, path: Path) -> ModuleKind:
         FoundationTypesModule
     else if path == contents.prelude_path:
         FoundationPreludeModule
+    else if path == contents.methods_path:
+        FoundationMethodsModule
     else if (
         path
             .to_string()
@@ -417,7 +431,7 @@ private pure func module_store(
             match role:
                 UserModule:
                     Ok(DiskFile)
-                FoundationTypesModule | FoundationPreludeModule | LibraryModule:
+                FoundationTypesModule | FoundationPreludeModule | FoundationMethodsModule | LibraryModule:
                     match layout.library_relative_path(path):
                         Some(inside):
                             Ok(EmbeddedFile(inside.to_string()))
@@ -447,7 +461,7 @@ private pure func unreadable(reason: String, site: Option[Span], role: ModuleKin
             help = match role:
                 UserModule:
                     "check the path and provide a readable .brp file"
-                FoundationTypesModule | FoundationPreludeModule | LibraryModule:
+                FoundationTypesModule | FoundationPreludeModule | FoundationMethodsModule | LibraryModule:
                     "check that --library-root names a directory that holds the standard library"
             path_error(compiler_span(), message, help)
 
@@ -513,8 +527,9 @@ private record ImportCursor {
 }
 
 
--- User modules receive the prelude implicitly, so it is reserved, and a module
--- under the library root importing a user module would close a cycle through it.
+-- User modules receive the prelude implicitly and library modules the
+-- foundation methods, so both are reserved, and a module under the library root
+-- importing a user module would close a cycle through the prelude.
 -- Nested matches, not a tuple, so the host checks that every role is covered.
 private pure func import_diagnostic(
     importer: ModuleKind,
@@ -530,13 +545,21 @@ private pure func import_diagnostic(
                     "remove this import; user modules receive the prelude automatically"
                 )
             )
+        FoundationMethodsModule:
+            Some(
+                diagnostic(
+                    span,
+                    "_methods cannot be imported explicitly",
+                    "remove this import; library modules receive its methods automatically"
+                )
+            )
         FoundationTypesModule | LibraryModule:
             None
         UserModule:
             match importer:
                 UserModule:
                     None
-                FoundationTypesModule | FoundationPreludeModule | LibraryModule:
+                FoundationTypesModule | FoundationPreludeModule | FoundationMethodsModule | LibraryModule:
                     Some(
                         diagnostic(
                             span,
@@ -920,7 +943,7 @@ private func load_input(
     root_file = working_directory.resolved_path(root)
     -- Only the foundation inputs are barred from being the application root.
     _: Void ?= match layout.module_role(root_file):
-        FoundationTypesModule | FoundationPreludeModule:
+        FoundationTypesModule | FoundationPreludeModule | FoundationMethodsModule:
             Err(
                 failure(
                     [{ path = root_path, contents = "", role = UserModule }],
@@ -940,6 +963,11 @@ private func load_input(
             foundation_prelude_module_id(),
             foundation.prelude_path,
             FoundationPreludeModule
+        ),
+        designated(
+            foundation_methods_module_id(),
+            foundation.methods_path,
+            FoundationMethodsModule
         )
     ]
     later: List[RequestedModule] ?= match mode:

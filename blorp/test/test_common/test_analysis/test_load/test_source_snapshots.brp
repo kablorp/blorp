@@ -1,7 +1,6 @@
 import:
     bool: and, not
-    io/environment: CurrentDirectoryError, get_current_directory
-    path: join, normalize, to_path
+    io/environment: CurrentDirectoryError
     test: TestSuite
     ../../../../build/generated/embedded_library: embedded_library_file
     ../../../../src/common/analysis/assemble: parsed_contents
@@ -19,13 +18,22 @@ import:
         load_program_with_sources,
         working_directory_result
     ../../../../src/common/syntax/source:
-        ModuleKind(UserModule, LibraryModule, FoundationTypesModule, FoundationPreludeModule),
+        ModuleKind(
+            UserModule,
+            LibraryModule,
+            FoundationTypesModule,
+            FoundationPreludeModule,
+            FoundationMethodsModule
+        ),
         ModuleSource,
         SourceFile,
         compiler_source,
+        ModuleId,
+        foundation_types_module_id,
         module_id,
         module_source,
         root_module_id
+    ../../../support/loader_rows: absolute, first_discovered_module_number
 
 
 private MISSING_ROOT: String = "build/lsp-source-snapshots/not_on_disk.brp"
@@ -44,11 +52,13 @@ private LIBRARY_ROOT: String = "blorp/standard_library"
 private CHARACTER_HELP: String = "use ASCII function declarations and numeric literals, parameter names, or calls; keep -> adjacent"
 
 
-private func absolute(path: String) -> String:
-    match (get_current_directory(), path.to_path()):
-        (Ok(directory), Ok(relative)): "${directory.join(relative).normalize()}"
-        (Err(error), _): "${error}"
-        (_, Err(error)): "${error}"
+-- The rows the loader gives the root and the base.
+private pure func root_row() -> Int:
+    root_module_id().module_number()
+
+
+private pure func base_row() -> Int:
+    foundation_types_module_id().module_number()
 
 
 private pure func row_is(
@@ -85,16 +95,17 @@ func test_unsaved_root_supplies_exact_source_bytes_without_a_disk_file() -> Bool
             False
         Ok(loaded):
             and(
-                row_is(loaded.sources.modules, 0, MISSING_ROOT, ROOT_CONTENTS),
+                row_is(loaded.sources.modules, root_row(), MISSING_ROOT, ROOT_CONTENTS),
                 check(loaded.program).is_ok()
             )
 
 
--- The root, the two foundation inputs, then the root's one import.
+-- The root, the three foundation inputs, then the root's one import.
 private FIRST_ROLES: List[ModuleKind] = [
     UserModule,
     FoundationTypesModule,
     FoundationPreludeModule,
+    FoundationMethodsModule,
     UserModule
 ]
 
@@ -110,11 +121,11 @@ func test_each_row_carries_the_role_the_loader_gave_it() -> Bool:
             False
         Ok(loaded):
             rows = loaded.sources.modules
-            library = rows.drop(4)
+            library = rows.drop(FIRST_ROLES.length())
             and(
                 (
                     rows
-                        .take(4)
+                        .take(FIRST_ROLES.length())
                         .map(pure func(row: ModuleSource) -> ModuleKind: row.role)
                     == FIRST_ROLES
                 ),
@@ -144,7 +155,7 @@ func test_existing_root_is_overridden() -> Bool:
         { path = DISK_ROOT, contents = ROOT_CONTENTS }
     ]):
         Err(_): False
-        Ok(loaded): row_is(loaded.sources.modules, 0, DISK_ROOT, ROOT_CONTENTS)
+        Ok(loaded): row_is(loaded.sources.modules, root_row(), DISK_ROOT, ROOT_CONTENTS)
 
 
 func test_unsaved_dependency_and_root_form_one_checked_program() -> Bool:
@@ -159,7 +170,7 @@ func test_unsaved_dependency_and_root_form_one_checked_program() -> Bool:
         Ok(loaded):
             and(
                 and(
-                    row_is(loaded.sources.modules, 0, MISSING_ROOT, IMPORTING_ROOT),
+                    row_is(loaded.sources.modules, root_row(), MISSING_ROOT, IMPORTING_ROOT),
                     loaded.sources.modules.any(
                         pure func(row): and(
                             row.path == dependency_path,
@@ -180,7 +191,7 @@ func test_normalized_absolute_override_preserves_root_display_path() -> Bool:
         { path = absolute(MISSING_ROOT), contents = ROOT_CONTENTS }
     ]):
         Err(_): False
-        Ok(loaded): row_is(loaded.sources.modules, 0, written, ROOT_CONTENTS)
+        Ok(loaded): row_is(loaded.sources.modules, root_row(), written, ROOT_CONTENTS)
 
 
 private func duplicate_is_rejected(first: String, second: String, second_contents: String) -> Bool:
@@ -206,8 +217,8 @@ func test_invalid_override_is_authoritative_and_retained_before_parse() -> Bool:
     ]):
         Err(LoadingFailed(failure)):
             and(
-                character_failure(failure, 0, "$"),
-                row_is(failure.sources.modules, 0, DISK_ROOT, "$")
+                character_failure(failure, root_row(), "$"),
+                row_is(failure.sources.modules, root_row(), DISK_ROOT, "$")
             )
         _:
             False
@@ -220,8 +231,13 @@ func test_invalid_dependency_retains_exact_unsaved_bytes() -> Bool:
     ]):
         Err(LoadingFailed(failure)):
             and(
-                character_failure(failure, 3, "$"),
-                row_is(failure.sources.modules, 3, absolute(DEPENDENCY), "$")
+                character_failure(failure, first_discovered_module_number(), "$"),
+                row_is(
+                    failure.sources.modules,
+                    first_discovered_module_number(),
+                    absolute(DEPENDENCY),
+                    "$"
+                )
             )
         _:
             False
@@ -231,7 +247,7 @@ func test_empty_override_is_authoritative() -> Bool:
     match load_program_with_sources(DISK_ROOT, EmbeddedLibrary, [
         { path = DISK_ROOT, contents = "" }
     ]):
-        Ok(loaded): row_is(loaded.sources.modules, 0, DISK_ROOT, "")
+        Ok(loaded): row_is(loaded.sources.modules, root_row(), DISK_ROOT, "")
         Err(_): False
 
 
@@ -302,7 +318,7 @@ func test_nul_in_contents_remains_a_lexer_failure() -> Bool:
     match load_program_with_sources(MISSING_ROOT, EmbeddedLibrary, [
         { path = MISSING_ROOT, contents = "\0" }
     ]):
-        Err(LoadingFailed(failure)): character_failure(failure, 0, "\0")
+        Err(LoadingFailed(failure)): character_failure(failure, root_row(), "\0")
         _: False
 
 
@@ -316,7 +332,12 @@ func test_embedded_library_ignores_caller_files() -> Bool:
         Ok(loaded):
             match embedded_library_file("_base.brp"):
                 Some(contents):
-                    row_is(loaded.sources.modules, 1, "<standard library>/_base.brp", contents)
+                    row_is(
+                        loaded.sources.modules,
+                        base_row(),
+                        "<standard library>/_base.brp",
+                        contents
+                    )
                 None:
                     False
 
@@ -329,8 +350,8 @@ func test_directory_foundation_uses_authoritative_override() -> Bool:
     ]):
         Err(LoadingFailed(failure)):
             and(
-                character_failure(failure, 1, "$"),
-                row_is(failure.sources.modules, 1, absolute(path), "$")
+                character_failure(failure, base_row(), "$"),
+                row_is(failure.sources.modules, base_row(), absolute(path), "$")
             )
         _:
             False
@@ -372,7 +393,7 @@ func test_paths_differing_only_in_case_are_distinct_keys() -> Bool:
     ]):
         Ok(loaded):
             and(
-                row_is(loaded.sources.modules, 0, MISSING_ROOT, ROOT_CONTENTS),
+                row_is(loaded.sources.modules, root_row(), MISSING_ROOT, ROOT_CONTENTS),
                 loaded.sources.modules.all(pure func(row): row.contents != "$")
             )
         Err(_):
@@ -409,7 +430,7 @@ func test_cycles_keep_normal_paths_and_import_diagnostic() -> Bool:
     ]):
         Err(LoadingFailed(failure)):
             error = failure.diagnostic
-            match module_id(3):
+            match module_id(first_discovered_module_number()):
                 Some(id):
                     and(
                         and(
@@ -427,7 +448,12 @@ func test_cycles_keep_normal_paths_and_import_diagnostic() -> Bool:
                                 error.span.source == id.module_source(),
                                 and(error.span.start == 12, error.span.end == 31)
                             ),
-                            row_is(failure.sources.modules, 3, absolute(DEPENDENCY), dependency)
+                            row_is(
+                                failure.sources.modules,
+                                first_discovered_module_number(),
+                                absolute(DEPENDENCY),
+                                dependency
+                            )
                         )
                     )
                 None:
@@ -472,7 +498,12 @@ func test_existing_import_is_overridden_during_normal_checking() -> Bool:
             False
         Ok(loaded):
             and(
-                row_is(loaded.sources.modules, 3, absolute(dependency), replacement),
+                row_is(
+                    loaded.sources.modules,
+                    first_discovered_module_number(),
+                    absolute(dependency),
+                    replacement
+                ),
                 check(loaded.program).is_ok()
             )
 
@@ -497,7 +528,7 @@ func test_explicit_prelude_import_keeps_role_rejection() -> Bool:
                         error.span
                         == { source = root_module_id().module_source(), start = 12, end = 27 }
                     ),
-                    row_is(failure.sources.modules, 0, MISSING_ROOT, contents)
+                    row_is(failure.sources.modules, root_row(), MISSING_ROOT, contents)
                 )
             )
         _:
