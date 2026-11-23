@@ -313,3 +313,34 @@ already knows the role:
 - **Third run:** exit 0, 1,167 PASS, 0 FAIL.
 
 Logs are in `blorp/build/library-methods-removal/`.
+
+## The e2e instruction ceiling reset
+
+The prelude's Option, Result and Bool methods (`265366b37`) raised every e2e
+compile by about 2.6%, and `_methods.brp` (`8eb8e1654`) raised it by about
+3.5% more. No ceiling was exceeded, so none moved, and the headroom fell from
+the designed 15% to as little as 6.3%. A compile charged with kernel work,
+such as paging the test compiler back in, can cost 6% to 8% more than usual,
+so the gate failed at random: twice during the removal, each time on a
+different case.
+
+The coordinator reset the ceilings under the standing budget delegation, by
+the rule of `72d65fd7a`. Keith chose a reset over a harness change that
+reruns a compile that exceeds its ceiling ("Let's just re-measure.").
+
+- **Readings:** three serial `make -C blorp test-e2e INSTRUCTION_CHECK=on`
+  runs on `923c91986`, with no other gates running. A temporary harness patch
+  printed each compile's ceiling and its reading. The runs differed by at
+  most 1.87%.
+- **Rule:** every e2e instruction ceiling became the largest of its three
+  readings plus 15%, rounded up.
+- **Result:**
+  - all 659 ceilings rose: by +0.3% at least, +6.5% at the median and +8.2%
+    at most;
+  - the sum of all ceilings rose 5.8%;
+  - before the reset, the headroom over the largest reading was +6.3% at the
+    least and +8.0% at the median.
+- **Allocation ceilings** are unchanged.
+
+The readings, the rewrite script and its table (old and new figures for each
+ceiling) are in `blorp/build/ceilings-2026-11-22/`.
