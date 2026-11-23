@@ -1396,7 +1396,9 @@ Each open file is the root of its own program: the file, the modules it
 imports and the standard library built into blorp, which every analysis reads,
 as `blorp compile` does. A library declaration is a `blorp-library:` location,
 such as `blorp-library:///io/console/output.brp`: the file's path below the
-library root, percent-encoded, with no host. The server serves these files with
+library root, percent-encoded, with no host. A client may leave out the empty
+authority, as in `blorp-library:/io/console/output.brp`, which names the same
+file. The server serves these files with
 LSP 3.18's `workspace/textDocumentContent`, so it needs a client that sends the
 `workspace.textDocumentContent` capability in `initialize`; it then answers
 `capabilities.workspace.textDocumentContent` with the scheme `blorp-library`.
