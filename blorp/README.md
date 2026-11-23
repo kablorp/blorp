@@ -1386,7 +1386,8 @@ text. A language server reads its headers with `read_line` and its body with
 ### The language server
 
 `blorp lsp` serves the Language Server Protocol on standard input and output,
-for an editor to start; it takes no arguments, not even `--stdio`. It
+for an editor to start; it takes no arguments, not even `--stdio`. The VS Code
+extension in [`editor/vscode`](../editor/vscode/README.md) starts it. It
 publishes each analysis's errors as diagnostics, as `blorp compile` would
 report them, without needing `main`. Positions count UTF-8 bytes when the
 editor offers them and UTF-16 units otherwise, and LF, CRLF and a lone CR each

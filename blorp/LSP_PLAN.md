@@ -1,7 +1,7 @@
 # Language server: `blorp lsp`
 
 **Status: plan, 2026-11-10; Keith settled its decisions and asked for a byte
-console on 2026-11-11. Landings 1–13 have landed.**
+console on 2026-11-11. Landings 1–14 have landed.**
 
 ## Problem
 
@@ -19,7 +19,7 @@ $ echo $?
 (`src/common/cli/usage.brp:18`; 2 is `EXIT_USAGE`.)
 
 We want a `blorp lsp` that speaks the Language Server Protocol over standard
-input and output, launched by a minimal editor plugin. Keith's priorities
+input and output, launched by a minimal editor extension. Keith's priorities
 are highlighting, then go-to-definition, then find-references.
 
 ## Background
@@ -47,6 +47,11 @@ console that reads and writes without a newline.
 **On 2026-11-21:** a line diff for broken files, and the plugin on LSP4IJ,
 whose `workspace/textDocumentContent` lets landing 13 drop the folder.
 
+**On 2026-11-22:** a trace showed CLion losing answers the server gave, so
+Keith dropped the CLion plugin for a VS Code extension ("Let's just go with
+pure LSP and VSCode for now"), and asked that no CLion crutches enter the
+server. The server implements the LSP specification only.
+
 **Related plans:** `STRING_PLAN.md` moves byte work to `byte_*` functions,
 and the README's naming rules and the library's exact-error convention apply here.
 
@@ -66,9 +71,11 @@ and the README's naming rules and the library's exact-error convention apply her
   The layer suite (`test/test_layout/test_dependencies.brp`) gains an
   `lsp/` layer that imports itself and `common/`. `main.brp` dispatches
   `lsp` there.
-- **CLion plugin** (`editor/intellij/`): it launches `blorp lsp` through
-  LSP4IJ (landing 12). Landing 10's plugin used CLion's own LSP API, which
-  needed three workarounds.
+- **VS Code extension** (`editor/vscode/`, landing 14): it starts `blorp lsp`
+  through Microsoft's `vscode-languageclient` and adds nothing to the
+  protocol. Landings 10 and 12's CLion plugin is gone.
+- **The server implements the LSP specification only.** A client's quirk is
+  handled in that client's extension or upstream, never in `src/lsp/`.
 
 ### Analysis without an entry point
 
@@ -258,7 +265,7 @@ ignored.
 
 Go-to and references cover the open file's program: the file, its imports
 and the library, not importers. The README documents this. A later
-landing has the plugin pass the workspace's roots in
+landing has the extension pass the workspace's roots in
 `initializationOptions.roots`, and once packages exist a manifest does.
 
 ### Later
@@ -548,14 +555,13 @@ the other's `length` and `slice` uses.
 
 ## Risks and unknowns
 
-- **Does LSP4IJ open a `blorp-library:` file as Blorp?** Landing 13 checks
-  that first, through the plugin's headless tests: the editor's file type,
-  its tokens and its `didOpen`.
+- **A client without LSP 3.18's `workspace/textDocumentContent`** gets no
+  library locations. VS Code's client has it from 11.0.1.
 
 ## Dependencies
 
-- Landing 11 follows 10, and 13 follows 12, since only LSP4IJ opens a
-  `blorp-library:` file.
+- Landing 11 follows 10, 13 follows 12, since only LSP4IJ opened a
+  `blorp-library:` file then, and 14 follows 13.
 
 ## Release strategy
 
@@ -574,11 +580,14 @@ backs it out; for landing 7, re-pinning the previous seed does.
    command, transport, lifecycle, positions, open documents and diagnostics;
    **9b** semantic tokens, staleness and watched files; **9c** definition,
    references and the library on disk.
-10. **The CLion plugin.**
+10. **The CLion plugin**, removed in 14.
 11. **Broken files** served from the last good analysis.
-12. **The plugin on LSP4IJ** (Keith, 2026-11-21).
+12. **The plugin on LSP4IJ** (Keith, 2026-11-21), removed in 14.
 13. **Library files through `workspace/textDocumentContent`**, and plain
     `Location`s.
+14. **VS Code** (Keith, 2026-11-22), in two commits: the server accepts a
+    library URI without its empty authority, the form VS Code writes; then
+    `editor/vscode/` replaces `editor/intellij/`.
 
 **Ceilings** are against the parent commit, on
 `blorp/scripts/self-compile-cost`'s own-source rows unless stated, with test
@@ -601,6 +610,7 @@ lines counted apart. Compile cost must also fit the e2e instruction ceilings'
 | 11 broken files, fixed input | ≤ +0.1% | ≤ +0.01% | ≤ +0.1% | ≤ +460 net |
 | 12 the plugin on LSP4IJ | not compiled | not compiled | not compiled | ≤ 570 Kotlin and XML |
 | 13 library files, fixed input | ≤ +0.1% (noise) | no increase | no increase | ≤ −40 net |
+| 14 VS Code, fixed input | ≤ +0.1% (noise) | no increase | no increase | ≤ +20 net in `blorp/src`; ≤ 150 JavaScript and JSON |
 
 **Latency.** Per request after one change, on this host: ≤ 1.0 s for
 `blorp/src/main.brp`, and ≤ 50 ms for a one-module program. Landing 1
@@ -1399,6 +1409,52 @@ shortcuts that later features need.
 - **Review.** 0 blockers, 1 major (a dead `library_path`), 3 minors and 2
   nits, all fixed.
 
+**Landing 14, VS Code** (against `9e7e19dd5`). Keith chose it on 2026-11-22.
+
+- **The CLion trace.** A wrapper recorded the traffic between CLion and the
+  server:
+  - The server answered every request correctly, and the faults were CLion's.
+  - LSP4IJ 0.30.1 fetched a library file and sent `didOpen`, but never asked
+    for its tokens. That is LSP4IJ issue 2026, fixed for its unreleased 0.30.2.
+  - Find Usages sent `textDocument/references`, and the server answered the
+    declaration and both uses. CLion's Find window showed only the
+    declaration.
+- **The spike** ran the installed VS Code 1.135 against the server, and all
+  eight checks passed once one server bug was fixed. VS Code writes
+  `blorp-library:///io/x.brp` as `blorp-library:/io/x.brp`, which the decoder
+  refused. RFC 3986 lets a scheme say whether an empty authority matters, and
+  this one now says it does not.
+- **Lines.**
+  - `blorp/src`: +28 −10, net +18 against a ceiling of +20. Tests: +12.
+  - The extension: 147 lines of JavaScript and JSON against a ceiling of 150.
+    Tests: 224 lines, plus a 7-line fixture.
+  - `editor/intellij/`'s 27 files and 1,857 lines are deleted.
+- **Cost** of the server commit, `self-compile-cost --rounds 3`:
+
+  | Row | Allocations | Peak heap | Instructions |
+  | --- | --- | --- | --- |
+  | fixed input | +0.0000% | +0.0000% | +0.0246% |
+  | own source | +0.0177% | +0.0111% | +0.1535% |
+
+  The fixed-input C is identical.
+- **Latency** of one cross-file definition in `blorp/src/main.brp`:
+
+  | Step | `-O0` | `-O2` |
+  | --- | --- | --- |
+  | first definition | 3,087 ms | 344 ms |
+  | a definition after `compile_command.brp` opens | 5,603 ms | 589 ms |
+  | any other request | ≤ 17 ms | ≤ 2 ms |
+
+  The default build is `-O0`, so the extension's README asks for `-O2`. An
+  open whose text is unchanged still stales the programs that read the file.
+  That is a separate change.
+- **Review.** No blockers. The minors and nits are fixed: the restart is
+  serialized and survives a failed start, which a ninth check now covers, and
+  the oracles are exact.
+- **A flake.** One run of the VS Code test in five failed. Every request on
+  `main.brp` answered nothing, though diagnostics arrived. Four runs passed,
+  two of them right after. If it recurs, trace that run.
+
 ## Testing
 
 Each landing starts with a failing test.
@@ -1419,6 +1475,7 @@ Each landing starts with a failing test.
 | 11 | `test/test_lsp/`: the line diff (edited, interleaved and distant lines, a moved block, line ends, the limit, both directions) and serving a failed root (tokens, definition above and below an edit, other open documents, references, UTF-16, a close or reported change). An e2e session in `cli.brp`. |
 | 12 | The Gradle tests against the repository's server: Go to Declaration under the C/C++ engine's action id, and LSP4IJ's usage search from a name in a hole. |
 | 13 | `test/test_lsp/`: library locations are `blorp-library:` URIs, and the `initialize` reply is exact; `workspace/textDocumentContent` answers the embedded text, with -32602 and its message for a wrong scheme, a bad escape and an unknown path; without the capability only library entries go; a library document gets lexer tokens; definition is a `Location`; `shutdown` replies at once. The e2e session leaves no folder, and the README drops the folder. |
+| 14 | `test/test_lsp/`: a library URI without its empty authority names the same file, and one with an authority names none. `npm test` in `editor/vscode/` runs the installed VS Code against the repository's server: colours in a user file and a library file, Go to Definition locally and into the library, the library text, Find All References, a declaration's own definition, and a diagnostic. |
 
 **Commands:** those in `blorp/AGENTS.md`, `scripts/blorp-fixpoint --prove`
 for compiler landings, and `make -C blorp test-e2e INSTRUCTION_CHECK=on`
@@ -1449,6 +1506,9 @@ when compile cost changes.
   into the library, and Find Usages lists usages.
 - [ ] **13.** Cmd-click on `print` opens it read-only, coloured, and no
   `blorp-lsp-` folder is made.
+- [ ] **14.** In VS Code a file is coloured; Cmd-click on `print` opens the
+  library file read-only and coloured; Find All References lists every use;
+  and Cmd-click on a declaration lists its references.
 - [ ] **Every landing** meets its ceilings, passes `make -C blorp test`, and
   is reviewed and test-run.
 
@@ -1459,7 +1519,7 @@ raw-sample paths, and anything found but not fixed.
 
 Stop and ask if:
 - a ceiling is exceeded;
-- CLion shows no colour;
+- the editor shows no colour;
 - a name use needs information the checker has discarded;
 - the console errors conflict with `UINT8_BYTES_PLAN.md`.
 

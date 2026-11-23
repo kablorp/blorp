@@ -65,21 +65,17 @@ done.
     library folder at `shutdown`, asks the client to refresh an importer's
     tokens, and answers definition with `LocationLink`s, which CLion's Cmd-click
     needs.
-  - **Landed:** landing 10, the CLion plugin (`editor/intellij/`): colours,
-    diagnostics, Cmd-click and Cmd-B into the library, Find Usages and
-    scratch files. It asks the server for Go to Declaration itself, because
-    CLion's C/C++ engine hides those shortcuts from its LSP support.
   - **Landed:** landing 11: while a file fails to check, it is served from
     its program's last analysis that checked, through a line diff.
-  - **Landed:** landing 12, the CLion plugin on LSP4IJ (Keith, 2026-11-21).
-    Known limits: Alt+F7 and Cmd-click on a declaration list no usages in
-    Keith's CLion.
   - **Landed:** landing 13: library files through
     `workspace/textDocumentContent`, with no folder in `/tmp`, and plain
     `Location`s.
-  - **Next:** not chosen yet. The candidates are formatting, hover,
-    project-wide references, or a simplification audit of `src/lsp/`. Each
-    starts by checking that CLion's path reaches the server.
+  - **Landed:** landing 14, VS Code (Keith, 2026-11-22): `editor/vscode/`
+    replaces the CLion plugin of landings 10 and 12, and the server
+    implements the LSP specification only.
+  - **Next:** not chosen yet. The candidates are definitions for built-in
+    types; keeping analyses when a file opens or closes unchanged; formatting;
+    hover; project-wide references; or a simplification audit of `src/lsp/`.
 - **String code points:** [`STRING_PLAN.md`](STRING_PLAN.md).
   - **Status:** approved on 2026-11-10: `length` counts code points, from a
     count stored in each String, and byte work uses `byte_*` functions. L1
