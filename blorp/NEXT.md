@@ -76,9 +76,11 @@ done.
   - **Landed:** landing 15: an open or close that leaves a file's text as a
     program read it keeps that program's analysis; a close reads the saved
     text from the disk.
-  - **Next:** not chosen yet. The candidates are definitions for built-in
-    types; formatting; hover; project-wide references; or a simplification
-    audit of `src/lsp/`.
+  - **Landed:** landing 16: definition on a built-in type such as `Int`
+    answers its `type X = builtin` line in `_base.brp`.
+  - **Next:** not chosen yet. The candidates are formatting; hover;
+    project-wide references; reusing the name-use lookup for `render.brp`'s
+    `declaration_span`; or a simplification audit of `src/lsp/`.
 - **String code points:** [`STRING_PLAN.md`](STRING_PLAN.md).
   - **Status:** approved on 2026-11-10: `length` counts code points, from a
     count stored in each String, and byte work uses `byte_*` functions. L1

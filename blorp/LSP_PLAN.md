@@ -1,7 +1,7 @@
 # Language server: `blorp lsp`
 
 **Status: plan, 2026-11-10; Keith settled its decisions and asked for a byte
-console on 2026-11-11. Landings 1–14 have landed.**
+console on 2026-11-11. Landings 1–16 have landed.**
 
 ## Problem
 
@@ -610,6 +610,10 @@ backs it out; for landing 7, re-pinning the previous seed does.
 14. **VS Code** (Keith, 2026-11-22), in two commits: the server accepts a
     library URI without its empty authority, the form VS Code writes; then
     `editor/vscode/` replaces `editor/intellij/`.
+15. **Unchanged opens and closes** stale no program. A close reads the saved
+    text (Keith, 2026-11-22).
+16. **Built-in type definitions:** definition on `Int`, `String` or `List`
+    answers its `type X = builtin` line in `_base.brp`.
 
 **Ceilings** are against the parent commit, on
 `blorp/scripts/self-compile-cost`'s own-source rows unless stated, with test
@@ -633,6 +637,8 @@ lines counted apart. Compile cost must also fit the e2e instruction ceilings'
 | 12 the plugin on LSP4IJ | not compiled | not compiled | not compiled | ≤ 570 Kotlin and XML |
 | 13 library files, fixed input | ≤ +0.1% (noise) | no increase | no increase | ≤ −40 net |
 | 14 VS Code, fixed input | ≤ +0.1% (noise) | no increase | no increase | ≤ +20 net in `blorp/src`; ≤ 150 JavaScript and JSON |
+| 15 unchanged opens and closes, fixed input | ≤ +0.1% | ≤ +0.1% | not set | not set |
+| 16 built-in type definitions, fixed input | ≤ +0.3% | ≤ +0.3% | not set | not set |
 
 **Latency.** Per request after one change, on this host: ≤ 1.0 s for
 `blorp/src/main.brp`, and ≤ 50 ms for a one-module program. Landing 1
@@ -1625,6 +1631,7 @@ Each landing starts with a failing test.
 | 13 | `test/test_lsp/`: library locations are `blorp-library:` URIs, and the `initialize` reply is exact; `workspace/textDocumentContent` answers the embedded text, with -32602 and its message for a wrong scheme, a bad escape and an unknown path; without the capability only library entries go; a library document gets lexer tokens; definition is a `Location`; `shutdown` replies at once. The e2e session leaves no folder, and the README drops the folder. |
 | 14 | `test/test_lsp/`: a library URI without its empty authority names the same file, and one with an authority names none. `npm test` in `editor/vscode/` runs the installed VS Code against the repository's server: colours in a user file and a library file, Go to Definition locally and into the library, the library text, Find All References, a declaration's own definition, and a diagnostic. |
 | 15 | `test/test_lsp/`: an open or close as the text a root read stales none of them, other text and an unreadable close stale them, no refresh goes for an unchanged open or close, and an unchanged close keeps answers into the file. An e2e session in `cli.brp` opens and closes an imported file on the disk. |
+| 16 | `test/test_lsp/`: definition on `Int` is its library location, references list its declaration only on request, and without the capability definition is `null`. `test_name_uses`: `Int`, `Float`, `List`, `String` and `Void` each resolve to their own declaration. |
 
 **Commands:** those in `blorp/AGENTS.md`, `scripts/blorp-fixpoint --prove`
 for compiler landings, and `make -C blorp test-e2e INSTRUCTION_CHECK=on`
@@ -1658,6 +1665,9 @@ when compile cost changes.
 - [ ] **14.** In VS Code a file is coloured; Cmd-click on `print` opens the
   library file read-only and coloured; Find All References lists every use;
   and Cmd-click on a declaration lists its references.
+- [ ] **15.** A Cmd-click into another file and back analyses neither
+  program again.
+- [ ] **16.** Cmd-click on `String` opens `_base.brp` at its declaration.
 - [ ] **Every landing** meets its ceilings, passes `make -C blorp test`, and
   is reviewed and test-run.
 
