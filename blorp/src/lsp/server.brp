@@ -5,7 +5,7 @@ change stales, and the replies each message earns: tokens, definitions and
 references among them. Pure: the transport reads, analyses and writes.
 ---
 import:
-    bool: and, not
+    bool: and, not, or
     bytes: Bytes
     json: Json(Null, Boolean, Number, Text, Array, Object), as_int, integer, parse
     path: Path, to_path
@@ -240,10 +240,23 @@ record AnalysisRequest {
 }
 
 
+-- What a step leaves the transport to do once its replies are written. The
+-- server is pure, so the transport reads the disk for it and hands back what
+-- it read.
+union Followup:
+    -- Nothing: the transport reads the next message.
+    Idle
+    -- Load and analyse a root, and hand the result to `analysed`.
+    Analyse(AnalysisRequest)
+    -- Read the saved text of the document at the path, which the client has
+    -- closed, and hand it to `reverted`.
+    ReadSaved(Path)
+
+
 record Step {
     server: Server,
     replies: List[Json],
-    analyse: Option[AnalysisRequest]
+    followup: Followup
 }
 
 
@@ -288,7 +301,7 @@ pure func snapshots(server: Server) -> List[SourceFile]:
 
 
 private pure func replying(lifecycle: Lifecycle, replies: List[Json]) -> Step:
-    { server = into_opaque Server(lifecycle), replies = replies, analyse = None }
+    { server = into_opaque Server(lifecycle), replies = replies, followup = Idle }
 
 
 -- A body that is not UTF-8 JSON gets -32700 with a null id in any state:
@@ -530,9 +543,11 @@ private pure func initialize_result(encoding: PositionEncoding, serves_library: 
     Object({ "capabilities" => Object(capabilities) })
 
 
--- Whether a load read the file at `path`.
-private pure func reads(sources: SourceInputs, path: Path) -> Bool:
-    sources.modules.any(pure func(row: ModuleSource) -> Bool: row.is_at(path))
+-- The contents a load read for the file at `path`, if it read the file.
+private pure func contents_read(sources: SourceInputs, path: Path) -> Option[String]:
+    sources.modules
+        .find(pure func(row: ModuleSource) -> Bool: row.is_at(path))
+        .map(pure func(row: ModuleSource) -> String: row.contents)
 
 
 private pure func is_at(row: ModuleSource, path: Path) -> Bool:
@@ -541,12 +556,40 @@ private pure func is_at(row: ModuleSource, path: Path) -> Bool:
         Err(_): False
 
 
--- Whether a change to `path` can change what `result` found: its analysis read
--- the file, or its load failed, and a file it could not find may now exist.
-private pure func depends_on(result: DocumentAnalysis, path: Path) -> Bool:
+-- Whether a load read the file at `path` as a text other than `supplied`, the
+-- file's text from now on when the change gives it: with None, whether it read
+-- the file at all.
+private pure func reads_otherwise(
+    sources: SourceInputs,
+    path: Path,
+    supplied: Option[String]
+) -> Bool:
+    match (sources.contents_read(path), supplied):
+        (Some(read), Some(text)): read != text
+        (Some(_), None): True
+        (None, _): False
+
+
+-- Whether a change to `path`, whose text from now on is `supplied` when the
+-- change gives it, can change what `result` found: its analysis read other
+-- text for the file, or its load failed without reading the file, which may be
+-- a module it could not find.
+private pure func depends_on(
+    result: DocumentAnalysis,
+    path: Path,
+    supplied: Option[String]
+) -> Bool:
+    reads_other_text = result.sources.reads_otherwise(path, supplied)
     match result.outcome:
-        LoadFailed(_): True
-        CheckFailed(_) | Analysed(_): result.sources.reads(path)
+        LoadFailed(_):
+            or(
+                result.sources
+                    .contents_read(path)
+                    .is_none(),
+                reads_other_text
+            )
+        CheckFailed(_) | Analysed(_):
+            reads_other_text
 
 
 -- The last analysis that checked, which a root keeps through failures.
@@ -556,11 +599,19 @@ private pure func last_checked(analysis: RootAnalysis) -> Option[SealedAnalysis]
         Current(Failed(_, sealed)) | Stale(sealed): sealed
 
 
--- `sealed`, told that a change to `path` has been reported if it read the file.
-private pure func noted(sealed: Option[SealedAnalysis], path: Path) -> Option[SealedAnalysis]:
+-- `sealed`, told that a change to `path` has been reported if it read other
+-- text for the file than `supplied`.
+private pure func noted(
+    sealed: Option[SealedAnalysis],
+    path: Path,
+    supplied: Option[String]
+) -> Option[SealedAnalysis]:
     match sealed:
         Some(last):
-            if and(last.sources.reads(path), not(last.changed_since.contains(path))):
+            if and(
+                last.sources.reads_otherwise(path, supplied),
+                not(last.changed_since.contains(path))
+            ):
                 Some({ last | changed_since = last.changed_since.append(path) })
             else:
                 sealed
@@ -569,27 +620,43 @@ private pure func noted(sealed: Option[SealedAnalysis], path: Path) -> Option[Se
 
 
 -- Every root whose analysis a change to `path` affects, marked stale, and
--- every sealed analysis that read the file told of the change. A stale root
--- keeps what it published until its next request analyses it again, so a burst
--- of edits costs one analysis.
-private pure func staled(roots: Dict[Path, AnalysedRoot], path: Path) -> Dict[Path, AnalysedRoot]:
+-- every sealed analysis that read the file told of the change. `supplied` is
+-- the file's text from now on when the server compares it, as for an open or
+-- a close: an analysis that read that very text is unaffected. With None, every
+-- analysis that read the file is affected. A stale root keeps what it published
+-- until its next request analyses it again, so a burst of edits costs one
+-- analysis.
+private pure func staled(
+    roots: Dict[Path, AnalysedRoot],
+    path: Path,
+    supplied: Option[String]
+) -> Dict[Path, AnalysedRoot]:
     var marked = roots
     for (root, row) in roots.entries():
         match row.analysis:
             Current(Checked(sealed)):
-                if sealed.sources.reads(path):
-                    marked = marked.set(root, { row | analysis = Stale(Some(sealed).noted(path)) })
+                if sealed.sources.reads_otherwise(path, supplied):
+                    marked = marked.set(
+                        root,
+                        { row | analysis = Stale(Some(sealed).noted(path, supplied)) }
+                    )
             Current(Failed(result, sealed)):
-                if result.depends_on(path):
-                    marked = marked.set(root, { row | analysis = Stale(sealed.noted(path)) })
+                if result.depends_on(path, supplied):
+                    marked = marked.set(
+                        root,
+                        { row | analysis = Stale(sealed.noted(path, supplied)) }
+                    )
                 else if sealed.is_some():
                     marked = marked.set(
                         root,
-                        { row | analysis = Current(Failed(result, sealed.noted(path))) }
+                        { row | analysis = Current(Failed(result, sealed.noted(path, supplied))) }
                     )
             Stale(sealed):
                 if sealed.is_some():
-                    marked = marked.set(root, { row | analysis = Stale(sealed.noted(path)) })
+                    marked = marked.set(
+                        root,
+                        { row | analysis = Stale(sealed.noted(path, supplied)) }
+                    )
     marked
 
 
@@ -1012,7 +1079,7 @@ private pure func document_requested(
                         {
                             server = into_opaque Server(Serving(session)),
                             replies = [],
-                            analyse = Some({
+                            followup = Analyse({
                                 root = path,
                                 answering = Some({ id = id, query = asked })
                             })
@@ -1046,9 +1113,11 @@ private pure func document_uri(uri: String) -> Option[DocumentUri]:
 
 -- Notifications the server does not serve, `$/cancelRequest` among them, are
 -- dropped, as are those about documents that are neither `file:` nor
--- `blorp-library:` URIs, or are not open. Only `didOpen` analyses; an open, a
--- change, a close or a change on disk stales the roots it affects, which analyse again at their next request,
--- and when that stales a root other than the document's own the client is asked
+-- `blorp-library:` URIs, or are not open. Only `didOpen` analyses. An edit or a
+-- change on disk stales the roots that read the file. An open, or a close once
+-- the transport has read the saved text, stales those that read other text for
+-- it than the text it now has. A stale root analyses again at its next request,
+-- and when a root other than the document's own goes stale the client is asked
 -- to refresh its tokens. A library file is kept only for its tokens, and its
 -- editor is read-only, so a change to it is dropped.
 private pure func notified(session: Session, call: Call) -> Step:
@@ -1080,10 +1149,10 @@ private pure func notified(session: Session, call: Call) -> Step:
                 (Some(written), Some(text), UserFile(path)):
                     opened = { session |
                         documents = session.documents.set(path, { uri = written, text = text }),
-                        roots = session.roots.staled(path)
+                        roots = session.roots.staled(path, Some(text))
                     }
                     refreshing = opened.replying_with_refresh(session.roots.remove(path), [])
-                    { refreshing | analyse = Some({ root = path, answering = None }) }
+                    { refreshing | followup = Analyse({ root = path, answering = None }) }
                 _:
                     replying(Serving(session), [])
         ("textDocument/didChange", Some(UserFile(path))):
@@ -1099,12 +1168,21 @@ private pure func notified(session: Session, call: Call) -> Step:
                 (Some(open), Some(text)):
                     { session |
                         documents = session.documents.set(path, { open | text = text }),
-                        roots = session.roots.staled(path)
+                        roots = session.roots.staled(path, None)
                     }.replying_with_refresh(session.roots.remove(path), [])
                 _:
                     replying(Serving(session), [])
         ("textDocument/didClose", Some(UserFile(path))):
-            session.closed(path)
+            -- The document reverts to its saved text, which `reverted` compares
+            -- with the text each root read.
+            if session.documents.contains(path):
+                {
+                    server = into_opaque Server(Serving(session)),
+                    replies = [],
+                    followup = ReadSaved(path)
+                }
+            else:
+                replying(Serving(session), [])
         ("textDocument/didClose", Some(LibraryFile(relative))):
             replying(
                 Serving(
@@ -1166,7 +1244,7 @@ private pure func watched(session: Session, params: Option[Json]) -> Step:
                 ):
                     Some(path):
                         if not(session.documents.contains(path)):
-                            roots = roots.staled(path)
+                            roots = roots.staled(path, None)
                     None:
                         void
         _:
@@ -1210,13 +1288,25 @@ private pure func handed_over(session: Session, leaving: Path, files: List[Path]
     replies
 
 
--- The file reverts to the disk and stops being a root, and every root that
--- read its unsaved text is stale. Each file it reported in shows what another
--- root reports there, if any does. The server forgets the client's URI for the
--- file and publishes to it under its own from now on, so when the two differ
--- the client's is cleared, and what other roots report in the file is
+-- Closes the document at `path` once the transport has read the saved text
+-- it reverts to, `saved`, which is None when the file could not be read.
+pure func reverted(server: Server, path: Path, saved: Option[String]) -> Step:
+    lifecycle = from_opaque Server(server)
+    match lifecycle:
+        Serving(session): session.closed(path, saved)
+        -- Only a serving server asks for a read, and the transport hands it
+        -- back before it reads another message, so no other state gets here.
+        AwaitingInitialize(_) | ShutDown | Exited(_): lifecycle.replying([])
+
+
+-- The file reverts to its saved text, `saved`, and stops being a root. The
+-- roots that read other text for it are stale, which is every root that read
+-- it when the file could not be read. Each file it reported in shows what
+-- another root reports there, if any does. The server forgets the client's URI
+-- for the file and publishes to it under its own from now on, so when the two
+-- differ the client's is cleared, and what other roots report in the file is
 -- published again under the server's.
-private pure func closed(session: Session, path: Path) -> Step:
+private pure func closed(session: Session, path: Path, saved: Option[String]) -> Step:
     reported: List[Path] = match session.roots.get(path):
         Some(last): last.published.keys()
         None: []
@@ -1224,7 +1314,7 @@ private pure func closed(session: Session, path: Path) -> Step:
         documents = session.documents.remove(path),
         roots = session.roots
             .remove(path)
-            .staled(path)
+            .staled(path, saved)
     }
     respelled: Option[String] = match session.documents.get(path):
         Some(open):

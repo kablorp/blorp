@@ -27,6 +27,7 @@ import:
         AnalysisOutcome(LoadFailed, CheckFailed, Analysed),
         AnalysisRequest,
         DocumentAnalysis,
+        Followup(Idle, Analyse, ReadSaved),
         Server,
         Step,
         analysed,
@@ -34,6 +35,7 @@ import:
         exit_status,
         receive,
         receive_body,
+        reverted,
         snapshots,
         start_server
     ../driver/file_access: read_file
@@ -54,10 +56,29 @@ private pure func path(text: String) -> Option[Path]:
 
 -- The step the last message gives, after the ones before it, from `server`.
 private pure func after(server: Server, messages: List[String]) -> Step:
-    var step: Step = { server = server, replies = [], analyse = None }
+    var step: Step = { server = server, replies = [], followup = Idle }
     for message in messages:
-        step = step.server.receive(json(message))
+        step = step.server.received(message)
     step
+
+
+-- The step `message` gives, with a close completed as the transport completes
+-- it for a file it cannot read: the files these tests name are not on the
+-- disk.
+private pure func received(server: Server, message: String) -> Step:
+    step = server.receive(json(message))
+    match step.followup:
+        ReadSaved(closed): step.server.reverted(closed, None)
+        Idle | Analyse(_): step
+
+
+-- The step a close of `uri` ends with once the transport hands back the
+-- file's saved text, `saved`.
+private pure func closing(server: Server, uri: String, saved: Option[String]) -> Step:
+    step = server.receive(json(did_close(uri)))
+    match step.followup:
+        ReadSaved(closed): step.server.reverted(closed, saved)
+        Idle | Analyse(_): step
 
 
 -- Where a load would resolve a relative library root. The embedded root is
@@ -95,14 +116,26 @@ private pure func replies(step: Step) -> List[String]:
     step.replies.map(render)
 
 
+-- The analysis a step asks the transport for.
+private pure func asked_analysis(step: Step) -> Option[AnalysisRequest]:
+    match step.followup:
+        Analyse(asked): Some(asked)
+        Idle | ReadSaved(_): None
+
+
 -- The root a step asks the transport to analyse.
 private pure func analysed_path(step: Step) -> Option[Path]:
-    step.analyse.map(pure func(asked: AnalysisRequest) -> Path: asked.root)
+    step
+        .asked_analysis()
+        .map(pure func(asked: AnalysisRequest) -> Path: asked.root)
 
 
--- Whether the step answers with exactly `expected` and asks for no analysis.
+-- Whether the step answers with exactly `expected` and leaves the transport
+-- nothing to do.
 private pure func answers(step: Step, expected: List[String]) -> Bool:
-    and(step.replies.map(render) == expected, step.analyse.is_none())
+    match step.followup:
+        Idle: step.replies.map(render) == expected
+        Analyse(_) | ReadSaved(_): False
 
 
 private INITIALIZE: String = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"capabilities\":{\"general\":{\"positionEncodings\":[\"utf-16\",\"utf-8\"]}}}}"
@@ -445,9 +478,9 @@ private pure func snapshot(path_text: String, contents: String) -> SourceFile:
 pure func test_did_open_asks_to_analyse_its_document() -> Bool:
     serving(pure func(server: Server) -> Bool:
         step = server.after([INITIALIZE, did_open(ROOT_URI, "x = 1")])
-        answers_nothing = step.analyse.map(
-            pure func(asked: AnalysisRequest) -> Bool: asked.answering.is_none()
-        )
+        answers_nothing = step
+            .asked_analysis()
+            .map(pure func(asked: AnalysisRequest) -> Bool: asked.answering.is_none())
         and(
             and(step.replies.is_empty(), step.analysed_path() == path(ROOT)),
             and(
@@ -478,15 +511,41 @@ pure func test_a_change_to_a_document_not_open_is_ignored() -> Bool:
     )
 
 
+-- The close asks the transport for the file's saved text, and the document
+-- stays open until it comes back.
 pure func test_did_close_reverts_the_document_to_the_disk() -> Bool:
     serving(pure func(server: Server) -> Bool:
-        step = server.after([
-            INITIALIZE,
-            did_open(ROOT_URI, "x = 1"),
-            did_open(OTHER_URI, "y = 1"),
-            did_close(ROOT_URI)
-        ])
-        and(step.answers([]), step.server.snapshots() == [snapshot(OTHER, "y = 1")])
+        both = [snapshot(ROOT, "x = 1"), snapshot(OTHER, "y = 1")]
+        asked = server
+            .after([INITIALIZE, did_open(ROOT_URI, "x = 1"), did_open(OTHER_URI, "y = 1")]).server
+            .receive(json(did_close(ROOT_URI)))
+        match (asked.followup, path(ROOT)):
+            (ReadSaved(closed), Some(root)):
+                closed_step = asked.server.reverted(closed, Some("x = 0"))
+                and(
+                    and(closed == root, asked.replies.is_empty()),
+                    and(
+                        asked.server.snapshots() == both,
+                        and(
+                            closed_step.answers([]),
+                            closed_step.server.snapshots() == [snapshot(OTHER, "y = 1")]
+                        )
+                    )
+                )
+            _:
+                False
+    )
+
+
+-- ROOT read OTHER from the disk, and OTHER was never opened: its close is
+-- dropped, with no read of its saved text.
+pure func test_a_close_of_a_document_not_open_is_dropped() -> Bool:
+    serving(pure func(server: Server) -> Bool:
+        reads_other = server
+            .with_root_open(INITIALIZE)
+            .analysed_root(reading(ROOT, [OTHER])).server
+        closed = reads_other.receive(json(did_close(OTHER_URI)))
+        and(closed.answers([]), not(closed.server.stale(ROOT_URI)))
     )
 
 
@@ -560,21 +619,21 @@ private func clean(root: String) -> DocumentAnalysis:
 private pure func analysed_root(server: Server, result: DocumentAnalysis) -> Step:
     match path(ROOT):
         Some(present): server.analysed({ root = present, answering = None }, result)
-        None: { server = server, replies = [], analyse = None }
+        None: { server = server, replies = [], followup = Idle }
 
 
 private pure func analysed_at(server: Server, root: String, result: DocumentAnalysis) -> Step:
     match root.to_path():
         Ok(present): server.analysed({ root = present, answering = None }, result)
-        Err(_): { server = server, replies = [], analyse = None }
+        Err(_): { server = server, replies = [], followup = Idle }
 
 
 -- What `server` steps to when the analysis that `asked` requested comes back
 -- as `result`.
 private pure func analysed_as_asked(server: Server, asked: Step, result: DocumentAnalysis) -> Step:
-    match asked.analyse:
+    match asked.asked_analysis():
         Some(request): server.analysed(request, result)
-        None: { server = server, replies = [], analyse = None }
+        None: { server = server, replies = [], followup = Idle }
 
 
 private pure func published(uri: String, diagnostics: List[String]) -> String:
@@ -750,7 +809,7 @@ pure func test_closing_a_root_shows_what_another_root_reports_in_a_shared_file()
         and(
             server
                 .other_then_root()
-                .receive(json(did_close(ROOT_URI)))
+                .received(did_close(ROOT_URI))
                 .answers([
                     published(ROOT_URI, []),
                     published(OTHER_URI, [reported(1, 0, 1, 3, OWN)])
@@ -758,14 +817,14 @@ pure func test_closing_a_root_shows_what_another_root_reports_in_a_shared_file()
             and(
                 server
                     .root_then_other()
-                    .receive(json(did_close(ROOT_URI)))
+                    .received(did_close(ROOT_URI))
                     .answers([
                         published(ROOT_URI, []),
                         published(OTHER_URI, [reported(1, 0, 1, 3, OWN)])
                     ]),
                 server
                     .root_then_other()
-                    .receive(json(did_close(OTHER_URI)))
+                    .received(did_close(OTHER_URI))
                     .answers([published(OTHER_URI, [reported(0, 0, 0, 1, SECOND)])])
             )
         )
@@ -824,7 +883,7 @@ pure func test_the_most_recently_analysed_root_wins_a_shared_file() -> Bool:
             .analysed_at("/work/z.brp", reports_in_shared("/work/z.brp", "z")).server
             .analysed_at("/work/x.brp", reports_in_shared("/work/x.brp", "x again")).server
         reported_by_all
-            .receive(json(did_close("file:///work/z.brp")))
+            .received(did_close("file:///work/z.brp"))
             .answers([
                 published("file:///work/shared.brp", [reported(0, 0, 0, 1, "x again\\nhelp: h")])
             ])
@@ -882,12 +941,13 @@ private pure func tokens_request(id: Int, uri: String) -> String:
 -- Whether a token request on `uri` must first analyse its root.
 private pure func stale(server: Server, uri: String) -> Bool:
     server
-        .receive(json(tokens_request(9, uri))).analyse
+        .receive(json(tokens_request(9, uri)))
+        .asked_analysis()
         .is_some()
 
 
 private pure func changed(server: Server, message: String) -> Server:
-    server.receive(json(message)).server
+    server.received(message).server
 
 
 -- A rejected analysis of `root` that read `files` too.
@@ -923,6 +983,28 @@ pure func test_opening_a_file_stales_the_roots_that_read_it() -> Bool:
             reads_other
                 .changed(did_open(OTHER_URI, "y"))
                 .stale(ROOT_URI)
+        )
+    )
+
+
+-- ROOT read OTHER from the disk as "". Opened as "", OTHER leaves ROOT's next
+-- analysis reading what its last one read; opened as "y", it does not. That
+-- holds for a rejected analysis and for a load that failed after it read OTHER.
+pure func test_opening_a_file_stales_only_the_roots_that_read_other_text_for_it() -> Bool:
+    serving(pure func(server: Server) -> Bool:
+        check_failed = reading(ROOT, [OTHER])
+        load_failed: DocumentAnalysis = {
+            sources = check_failed.sources,
+            outcome = LoadFailed(diagnostic(in_module(0, 0, 0), "missing", "h"))
+        }
+        staled_by = pure func(result: DocumentAnalysis, opened: String) -> Bool: server
+            .with_root_open(INITIALIZE)
+            .analysed_root(result).server
+            .changed(did_open(OTHER_URI, opened))
+            .stale(ROOT_URI)
+        and(
+            and(not(staled_by(check_failed, "")), staled_by(check_failed, "y")),
+            and(not(staled_by(load_failed, "")), staled_by(load_failed, "y"))
         )
     )
 
@@ -964,15 +1046,44 @@ pure func test_editing_a_shared_file_stales_every_root_that_read_it() -> Bool:
     )
 
 
--- ROOT read OTHER's unsaved text, which closing OTHER discards.
-pure func test_closing_a_file_stales_the_roots_that_read_its_unsaved_text() -> Bool:
+-- ROOT read OTHER's open text as "". Closing OTHER reverts it to its saved
+-- text: as "", ROOT's next analysis would read what its last one read; as
+-- "y", it would not.
+pure func test_closing_a_file_stales_only_the_roots_that_read_other_text_than_its_saved_text() -> Bool:
     serving(pure func(server: Server) -> Bool:
-        server
+        read_open = server
             .both_open()
             .analysed_root(reading(ROOT, [OTHER])).server
             .analysed_at(OTHER, reading(OTHER, [])).server
-            .changed(did_close(OTHER_URI))
+        and(
+            not(
+                read_open
+                    .closing(OTHER_URI, Some("")).server
+                    .stale(ROOT_URI)
+            ),
+            read_open
+                .closing(OTHER_URI, Some("y")).server
+                .stale(ROOT_URI)
+        )
+    )
+
+
+-- The saved text of OTHER could not be read, so no analysis would read what
+-- ROOT's read: ROOT is stale whatever text it read, whether its analysis was
+-- rejected or its load failed after it read OTHER.
+pure func test_closing_a_file_that_cannot_be_read_stales_every_root_that_read_it() -> Bool:
+    serving(pure func(server: Server) -> Bool:
+        check_failed = reading(ROOT, [OTHER])
+        load_failed: DocumentAnalysis = {
+            sources = check_failed.sources,
+            outcome = LoadFailed(diagnostic(in_module(0, 0, 0), "missing", "h"))
+        }
+        staled_by = pure func(result: DocumentAnalysis) -> Bool: server
+            .both_open()
+            .analysed_root(result).server
+            .closing(OTHER_URI, None).server
             .stale(ROOT_URI)
+        and(staled_by(check_failed), staled_by(load_failed))
     )
 
 
@@ -1094,7 +1205,11 @@ func test_a_burst_of_edits_costs_one_analysis() -> Bool:
         var analyses = 0
         for text in ["ONE: Int = 2", "ONE: Int = 3", CLEAN_TEXT]:
             step = edited.receive(json(did_change(ROOT_URI, text)))
-            if step.analyse.is_some():
+            if (
+                step
+                    .asked_analysis()
+                    .is_some()
+            ):
                 analyses = analyses + 1
             edited = step.server
         requested = edited.receive(json(tokens_request(7, ROOT_URI)))
@@ -1102,7 +1217,12 @@ func test_a_burst_of_edits_costs_one_analysis() -> Bool:
             .analysed_as_asked(requested, clean(ROOT)).server
             .receive(json(tokens_request(8, ROOT_URI)))
         and(
-            and(analyses == 0, requested.analyse.is_some()),
+            and(
+                analyses == 0,
+                requested
+                    .asked_analysis()
+                    .is_some()
+            ),
             answered.answers([tokens_reply(8, CLEAN_TOKENS)])
         )
     )
@@ -1244,13 +1364,23 @@ pure func test_opening_an_imported_file_asks_the_client_to_refresh() -> Bool:
     )
 
 
--- Closing OTHER discards the unsaved text ROOT read.
+-- Closing OTHER reverts it to a saved text other than the "" ROOT read.
 pure func test_closing_an_imported_file_asks_the_client_to_refresh() -> Bool:
     serving(pure func(server: Server) -> Bool:
         server
             .with_importer(INITIALIZE_REFRESHING)
-            .receive(json(did_close(OTHER_URI)))
+            .closing(OTHER_URI, Some("saved"))
             .answers([published(OTHER_URI, []), refresh_request(1)])
+    )
+
+
+-- OTHER's saved text is the "" ROOT read, so no program went stale.
+pure func test_closing_an_imported_file_unchanged_asks_for_no_refresh() -> Bool:
+    serving(pure func(server: Server) -> Bool:
+        server
+            .with_importer(INITIALIZE_REFRESHING)
+            .closing(OTHER_URI, Some(""))
+            .answers([published(OTHER_URI, [])])
     )
 
 
@@ -1350,7 +1480,7 @@ func test_closing_a_file_by_another_spelling_moves_what_others_report_there() ->
         and(
             imported.answers([published(written, [in_main])]),
             imported.server
-                .receive(json(did_close(written)))
+                .received(did_close(written))
                 .answers([published(written, []), published(ROOT_URI, [in_main])])
         )
     )
@@ -1366,7 +1496,7 @@ pure func test_closing_a_file_opened_by_another_spelling_clears_that_spelling() 
             .analysed_root(
                 rejected(ROOT_TEXT, diagnostic(in_module(0, 0, 1), "first", "fix it"), [])
             ).server
-            .receive(json(did_close(written)))
+            .received(did_close(written))
             .answers([published(written, []), published(ROOT_URI, [])])
     )
 
@@ -1869,7 +1999,9 @@ func test_closing_a_document_while_its_request_waits_answers_null() -> Bool:
             .changed(did_change(ROOT_URI, CLEAN_TEXT))
             .receive(json(tokens_request(7, ROOT_URI)))
         and(
-            waiting.analyse.is_some(),
+            waiting
+                .asked_analysis()
+                .is_some(),
             waiting.server
                 .changed(did_close(ROOT_URI))
                 .analysed_as_asked(waiting, clean(ROOT))
@@ -1892,7 +2024,7 @@ func test_a_library_file_the_client_opens_gets_only_lexer_tokens() -> Bool:
             opened = ready.receive(json(did_open(uri, "x = 1")))
             library = opened.server
             edited = library.receive(json(did_change(uri, "y = 2")))
-            closed = edited.server.receive(json(did_close(uri)))
+            closed = edited.server.received(did_close(uri))
             checks = [
                 opened.answers([]),
                 library.snapshots() == [snapshot(ROOT, navigated_text())],
@@ -2118,6 +2250,26 @@ func test_closing_an_open_dependency_stops_answers_into_it() -> Bool:
     )
 
 
+-- ROOT's edit stales it, keeping its sealed analysis, which read HELPERS's open
+-- text. HELPERS then closes to the same saved text, so the sealed text is the
+-- file's text, and the failed load, which did not read HELPERS, answers into
+-- it. Closed to other text, HELPERS's text is unknown, so nothing maps into it.
+func test_closing_an_open_dependency_unchanged_keeps_answers_into_it() -> Bool:
+    loading(func(server: Server) -> Bool:
+        edited = server
+            .importing_helpers(True)
+            .changed(did_change(ROOT_URI, TWO_FILES_UNPARSED_TEXT.escaped()))
+        failed_after = func(saved: String) -> List[String]: edited
+            .closing(HELPERS_URI, Some(saved)).server
+            .failing([], analysis_with_helpers(TWO_FILES_UNPARSED_TEXT, HELPERS_TEXT))
+            .one_defined()
+        and(
+            failed_after(HELPERS_TEXT) == [result_reply(7, location(HELPERS_URI, 0, 10, 13))],
+            failed_after(HELPERS_SHIFTED_TEXT) == [result_reply(7, "null")]
+        )
+    )
+
+
 -- `size` is called on line 1 after an e acute and an emoji, which UTF-16
 -- counts as one unit and two: the position is in
 -- UTF-16 units, and the line is unchanged.
@@ -2209,6 +2361,54 @@ private func importing_helpers(server: Server, helpers_open: Bool) -> Server:
 -- `one` in `helpers.one()` on line 5.
 private pure func one_defined(server: Server) -> List[String]:
     server.definition_at(5, 13)
+
+
+-- An editor opens HELPERS after a jump to `one`, with the text ROOT's analysis
+-- read: only HELPERS is analysed, and ROOT answers from the analysis it has.
+-- Opened with other text, HELPERS stales ROOT.
+func test_opening_an_imported_file_unchanged_keeps_its_importers_analysis() -> Bool:
+    loading(func(server: Server) -> Bool:
+        importing = server.importing_helpers(False)
+        unchanged = importing.receive(json(did_open(HELPERS_URI, HELPERS_TEXT.escaped())))
+        and(
+            and(unchanged.replies.is_empty(), unchanged.analysed_path() == path(HELPERS)),
+            and(
+                (
+                    unchanged.server.one_defined()
+                    == [result_reply(7, location(HELPERS_URI, 0, 10, 13))]
+                ),
+                importing
+                    .changed(did_open(HELPERS_URI, HELPERS_SHIFTED_TEXT.escaped()))
+                    .stale(ROOT_URI)
+            )
+        )
+    )
+
+
+-- An editor closes HELPERS, unedited, after a look at `one`: its saved text is
+-- the text ROOT's analysis read, so ROOT answers from the analysis it has.
+func test_closing_an_imported_file_unchanged_keeps_its_importers_analysis() -> Bool:
+    loading(func(server: Server) -> Bool:
+        (
+            server
+                .importing_helpers(True)
+                .closing(HELPERS_URI, Some(HELPERS_TEXT)).server
+                .one_defined()
+            == [result_reply(7, location(HELPERS_URI, 0, 10, 13))]
+        )
+    )
+
+
+-- No program went stale, so a client that can refresh its tokens is not asked
+-- to.
+func test_opening_an_imported_file_unchanged_asks_for_no_refresh() -> Bool:
+    loading(func(server: Server) -> Bool:
+        server
+            .after([INITIALIZE_REFRESHING, did_open(ROOT_URI, TWO_FILES_TEXT.escaped())]).server
+            .analysed_root(analysis_with_helpers(TWO_FILES_TEXT, HELPERS_TEXT)).server
+            .receive(json(did_open(HELPERS_URI, HELPERS_TEXT.escaped()))).replies
+            .is_empty()
+    )
 
 
 -- HELPERS is open and has its own edit above `one`: the declaration is in
@@ -2363,6 +2563,10 @@ TESTS: TestSuite = {
             "didClose reverts the document to the disk",
             test_did_close_reverts_the_document_to_the_disk
         ),
+        (
+            "a close of a document not open is dropped",
+            test_a_close_of_a_document_not_open_is_dropped
+        ),
         ("a document without a file URI is ignored", test_a_document_without_a_file_uri_is_ignored),
         (
             "a percent-encoded URI names its decoded path",
@@ -2412,6 +2616,10 @@ TESTS: TestSuite = {
             test_opening_a_file_stales_the_roots_that_read_it
         ),
         (
+            "opening a file stales only the roots that read other text for it",
+            test_opening_a_file_stales_only_the_roots_that_read_other_text_for_it
+        ),
+        (
             "a newly imported file stales its importer after the next analysis",
             test_a_newly_imported_file_stales_its_importer_after_the_next_analysis
         ),
@@ -2420,8 +2628,12 @@ TESTS: TestSuite = {
             test_editing_a_shared_file_stales_every_root_that_read_it
         ),
         (
-            "closing a file stales the roots that read its unsaved text",
-            test_closing_a_file_stales_the_roots_that_read_its_unsaved_text
+            "closing a file stales only the roots that read other text than its saved text",
+            test_closing_a_file_stales_only_the_roots_that_read_other_text_than_its_saved_text
+        ),
+        (
+            "closing a file that cannot be read stales every root that read it",
+            test_closing_a_file_that_cannot_be_read_stales_every_root_that_read_it
         ),
         (
             "a root whose load failed is stale after any change",
@@ -2467,6 +2679,10 @@ TESTS: TestSuite = {
         (
             "closing an imported file asks the client to refresh",
             test_closing_an_imported_file_asks_the_client_to_refresh
+        ),
+        (
+            "closing an imported file unchanged asks for no refresh",
+            test_closing_an_imported_file_unchanged_asks_for_no_refresh
         ),
         (
             "an edit that stales only its own root asks for no refresh",
@@ -2585,8 +2801,24 @@ TESTS: TestSuite = {
             test_closing_an_open_dependency_stops_answers_into_it
         ),
         (
+            "closing an open dependency unchanged keeps answers into it",
+            test_closing_an_open_dependency_unchanged_keeps_answers_into_it
+        ),
+        (
             "a failed root converts positions in UTF-16 around wide characters",
             test_a_failed_root_converts_positions_in_utf16_around_wide_characters
+        ),
+        (
+            "opening an imported file unchanged keeps its importer's analysis",
+            test_opening_an_imported_file_unchanged_keeps_its_importers_analysis
+        ),
+        (
+            "opening an imported file unchanged asks for no refresh",
+            test_opening_an_imported_file_unchanged_asks_for_no_refresh
+        ),
+        (
+            "closing an imported file unchanged keeps its importer's analysis",
+            test_closing_an_imported_file_unchanged_keeps_its_importers_analysis
         ),
         (
             "a declaration on a changed line of another open document is null",

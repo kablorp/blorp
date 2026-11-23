@@ -10,6 +10,7 @@ import:
     io/console/read_exact: ReadExactError(EndedEarly), read_exact
     io/console/read_line: read_line
     io/environment: get_current_directory
+    io/files/read: read_text
     path: PathError
     ../common/analysis/load/load:
         LibraryLayout,
@@ -27,12 +28,14 @@ import:
         framed
     ./server:
         EXIT_ABANDONED,
+        Followup(Idle, Analyse, ReadSaved),
         Server,
         Step,
         analysed,
         document_analysis,
         exit_status,
         receive_body,
+        reverted,
         snapshots,
         start_server
 
@@ -111,21 +114,31 @@ private func read_message() -> Result[Option[Bytes], FramingError]:
                 .map(pure func(body: Bytes): Some(body))
 
 
--- Writes the step's replies, then analyses the root it asks for, with the open
--- documents as snapshots, and performs the step that answers.
+-- Writes the step's replies, then does what it asks: analyses a root, with the
+-- open documents as snapshots, or reads a closed document's saved text, and
+-- performs the step that follows.
 private func perform(step: Step) -> Server:
     for reply in step.replies:
         write(framed(reply))
         flush()
-    match step.analyse:
-        None:
+    match step.followup:
+        Idle:
             step.server
-        Some(request):
+        Analyse(request):
             loaded = request.root
                 .to_string()
                 .load_program_with_sources(ANALYSED_LIBRARY, step.server.snapshots())
             step.server
                 .analysed(request, document_analysis(loaded))
+                .perform()
+        ReadSaved(path):
+            -- `read_text` is how a load reads a user module no snapshot
+            -- supplies, so this is the text the next analysis would read.
+            saved: Option[String] = match path.read_text():
+                Ok(text): Some(text)
+                Err(_): None
+            step.server
+                .reverted(path, saved)
                 .perform()
 
 

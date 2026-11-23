@@ -1411,15 +1411,22 @@ writes no files. If the working directory cannot be read, it says so on standard
 error and ends with status 3.
 A file is analysed when it is opened, with the other open files' unsaved text
 in place of their saved text. Edits are not analysed as they are typed.
-Editing, opening or closing a file makes every program that read it stale,
-and a stale program is analysed again at its file's next request, so a burst
-of edits costs one analysis.
+Editing a file makes every program that read it stale. Opening or closing a
+file makes stale only the programs that read other text for it than the text
+it now has: the text it opens with, which replaces the saved text, or on a
+close the saved text, which the server reads from the disk. A file that
+cannot be read then stales every program that read it. So opening a file a
+program read and closing it unedited, as an editor does around a jump to a
+definition, costs only the opened file's own analysis. A stale program is
+analysed again at its file's next request, so a burst of edits costs one
+analysis.
 When the editor can report files changed on disk, the server asks it to for
 `**/*.brp`; such a change stales the programs that read the file, unless the
 file is open, since its open text wins. A program that failed to load is
-stale after any change, since a missing module may now exist. Every analysis
-publishes its diagnostics again, so an edit's errors refresh at the next
-request, which editors make as they colour the file. An open, edit, close or
+stale after any change, since a missing module may now exist, but not after
+an open or close that leaves a file it read with the text it read. Every
+analysis publishes its diagnostics again, so an edit's errors refresh at the
+next request, which editors make as they colour the file. An open, edit, close or
 change on disk that stales an open program other than the document's own makes
 the server send the editor one `workspace/semanticTokens/refresh` request,
 when the editor supports it, so that the importer's colours and errors update

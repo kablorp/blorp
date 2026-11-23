@@ -66,7 +66,8 @@ and the README's naming rules and the library's exact-error convention apply her
   - `tokens`: semantic-token encoding;
   - `server`: open documents, one step per message;
   - `lsp_command.brp`: the help text and the transport, the only impure code
-    (read, step, analyse on request, write).
+    (read, step, analyse or read a closed file's saved text on request,
+    write).
 
   The layer suite (`test/test_layout/test_dependencies.brp`) gains an
   `lsp/` layer that imports itself and `common/`. `main.brp` dispatches
@@ -193,9 +194,15 @@ accepts `\n`, `\r\n` and a lone `\r`, as the protocol requires.
 **Analysis on demand.**
 - The server keeps, per root, the files its analysis read (the loader's
   `SourceInputs`).
-- `didOpen`, `didChange`, `didClose` (reverting to disk) and watched
-  `**/*.brp` changes stale every root that read the file, and every root
-  whose load failed, since a missing file may now exist.
+- `didChange` and watched `**/*.brp` changes stale every root that read the
+  file, and every root whose load failed, since a missing file may now
+  exist.
+- `didOpen` and `didClose` stale only the roots that read other text for the
+  file than the text it now has, and the failed loads that did not read it as
+  that text. An open's text replaces the saved text. A close reverts to the
+  saved text, which the transport reads with `read_text`, as a load reads a
+  user module; a file it cannot read stales every root that read it. The
+  texts compare exactly, against the `SourceInputs` each analysis read.
 - `didOpen` analyses at once. A request on a stale document first analyses
   its program, with open documents as snapshots, so a burst of edits costs
   one analysis.
@@ -513,20 +520,30 @@ func main() -> Int:
 
 **The server step** is pure. When a request needs an analysis, the server
 holds it pending; the transport analyses, then calls `analysed`, which
-answers it:
+answers it. A close needs the file's saved text, which the transport reads
+and hands to `reverted`:
 
 ```blorp
 -- src/lsp/server.brp
+union Followup:
+    Idle
+    -- The root to analyse, and the request that waits for it, if any.
+    Analyse(AnalysisRequest)
+    -- The closed document whose saved text to read.
+    ReadSaved(Path)
+
 record Step {
     server: Server,
     replies: List[Json],
-    -- The open document to analyse before the pending request can be answered.
-    analyse: Option[Path],
+    followup: Followup
 }
 
 pure func receive(server: Server, message: Json) -> Step
 
-pure func analysed(server: Server, root: Path, result: DocumentAnalysis) -> Step
+pure func analysed(server: Server, asked: AnalysisRequest, result: DocumentAnalysis) -> Step
+
+-- None when the saved text could not be read.
+pure func reverted(server: Server, path: Path, saved: Option[String]) -> Step
 ```
 
 **`Command`** (`src/main.brp:15`) gains a case, and the overview text
@@ -1455,6 +1472,78 @@ shortcuts that later features need.
   `main.brp` answered nothing, though diagnostics arrived. Four runs passed,
   two of them right after. If it recurs, trace that run.
 
+**Landing 15, unchanged opens and closes** (against `a21669be2`).
+`self-compile-cost`, `-O2`, 3 rounds, on the final commit:
+
+| Measure | Base | Candidate | Change |
+| --- | ---: | ---: | ---: |
+| Fixed input, allocations | 12,984,954 | 12,984,954 | unchanged |
+| Fixed input, instructions (median) | 13,082,029,241 | 13,087,465,399 | +0.042% |
+| Fixed input, peak heap (requested bytes) | 184,334,939 | 184,334,939 | unchanged |
+| Own source, allocations | 12,984,954 | 12,993,723 | +0.068% |
+| Own source, instructions (median) | 13,080,950,473 | 13,080,857,561 | −0.001% |
+| Own source, peak heap (requested bytes) | 184,334,938 | 184,422,154 | +0.047% |
+| Lines, production and tests | | | +103 and +315 net |
+
+The fixed-input C is identical (`add626b105c49f1f`), so the instruction
+change is noise. Own source grows with the lines it compiles.
+
+- **Why.** An editor opens a file after a jump to a definition there, with
+  the text on the disk, and closes it unedited. Each stale-marked every
+  program that read the file, so the importer was analysed again in full.
+- **What changed.**
+  - `didOpen` and `didClose` stale only the roots that read other text for
+    the file than the text it now has, compared exactly against the
+    `SourceInputs` each analysis read. Edits and watched changes stale as
+    before.
+  - `didClose` carries no text, so its step asks the transport to read the
+    saved text (`Followup.ReadSaved`), with `read_text`, as a load reads a
+    user module. `reverted` then closes the document. An unreadable file
+    stales every root that read it. Keith approved this read as a new
+    mechanism on 2026-11-22.
+  - A step's work for the transport is one union, `Followup` (`Idle`,
+    `Analyse`, `ReadSaved`), not an optional analysis beside an optional
+    read.
+  - A sealed analysis notes a file only when it read other text for it, so
+    an unchanged close keeps answers into the file.
+- **Latency** at `-O2`, `latency.py` with a close step added, 3 runs each,
+  macOS ARM64, binaries linked from the `blorp/build/blorp.c` of `9e7e19dd5`
+  and of this change before its rebase onto `a21669be2`, whose URI change the
+  script does not reach:
+
+  | Step, in `blorp/src/main.brp` | Base | Candidate |
+  | --- | ---: | ---: |
+  | First definition (open and analyse) | 320–324 ms | 322–329 ms |
+  | Definition after opening `compile_command.brp` unedited | 595–598 ms | 279–281 ms |
+  | Definition after closing it unedited | 318–324 ms | 1 ms |
+
+  The step after the open is now `compile_command.brp`'s own analysis,
+  which alone takes 280–282 ms.
+
+- **Tests.** `test/test_lsp/`: an open or a close as the text a root read
+  stales none of them, for a checked root, a rejected one and a failed load;
+  other text stales them; an unreadable close stales every reader; no
+  refresh goes when nothing went stale; an unchanged close keeps answers into
+  the closed file; a close of a document not open is dropped. An e2e session
+  in `cli.brp` opens and closes an imported file on the disk and counts the
+  importer's publications. Each oracle was
+  proven by mutation: nine in `server.brp`, run one at a time, and one in
+  the transport, which the e2e session catches. The session also fails
+  against `9e7e19dd5`.
+- **Found, not fixed.**
+  - Edits are still not compared, as briefed: an edit back to the text a
+    root read stales it.
+  - When the client spells an opened file's URI differently from
+    `file_uri(path)`, the current importers' diagnostics in it stay under
+    the server's spelling until they are next analysed. `didClose` already
+    republishes under the server's spelling; an open could do the reverse.
+- **Review.** 0 blockers, 0 majors, 3 minors and 3 nits. Fixed: the
+  load-failed comparison reuses `reads_otherwise`; `reverted` says why its
+  other states cannot arrive; a close of a document that is not open is
+  dropped without a read. Kept: `noted` repeats the check `staled` made, as
+  it did before, and `supplied` stays an `Option`, whose None means one
+  thing, that every reader is affected.
+
 ## Testing
 
 Each landing starts with a failing test.
@@ -1476,6 +1565,7 @@ Each landing starts with a failing test.
 | 12 | The Gradle tests against the repository's server: Go to Declaration under the C/C++ engine's action id, and LSP4IJ's usage search from a name in a hole. |
 | 13 | `test/test_lsp/`: library locations are `blorp-library:` URIs, and the `initialize` reply is exact; `workspace/textDocumentContent` answers the embedded text, with -32602 and its message for a wrong scheme, a bad escape and an unknown path; without the capability only library entries go; a library document gets lexer tokens; definition is a `Location`; `shutdown` replies at once. The e2e session leaves no folder, and the README drops the folder. |
 | 14 | `test/test_lsp/`: a library URI without its empty authority names the same file, and one with an authority names none. `npm test` in `editor/vscode/` runs the installed VS Code against the repository's server: colours in a user file and a library file, Go to Definition locally and into the library, the library text, Find All References, a declaration's own definition, and a diagnostic. |
+| 15 | `test/test_lsp/`: an open or close as the text a root read stales none of them, other text and an unreadable close stale them, no refresh goes for an unchanged open or close, and an unchanged close keeps answers into the file. An e2e session in `cli.brp` opens and closes an imported file on the disk. |
 
 **Commands:** those in `blorp/AGENTS.md`, `scripts/blorp-fixpoint --prove`
 for compiler landings, and `make -C blorp test-e2e INSTRUCTION_CHECK=on`

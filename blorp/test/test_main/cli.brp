@@ -9,6 +9,7 @@ import:
     path: Path, to_path
     test: TestSuite
     ../../src/common/cli/usage: EXIT_PATH, EXIT_REJECTED, EXIT_USAGE
+    ../../src/lsp/protocol: file_uri
     ../../src/lsp/server: EXIT_ABANDONED
     ../driver/file_access: read_file, write_file, make_directories
     ../driver/harness: COMPILATION_TIMEOUT_MS, LIBRARY_ROOT, isolated, reported, run_expecting
@@ -883,6 +884,79 @@ private func lsp_serves_a_failed_file_from_its_last_checked_analysis(
     )
 
 
+-- main.brp imports helpers.brp and does not check, so each analysis of it
+-- publishes its diagnostic, which shows when it is analysed again; its
+-- definitions are `null`. The editor opens helpers.brp and closes it
+-- unedited, as after a look at a definition there: the text main.brp's
+-- analysis read stays the file's, and the next request is answered at once.
+-- Opened again and edited, helpers.brp stales main.brp, whose next request
+-- analyses it with the edited text; closed without saving, it reverts to the
+-- text on the disk, which stales main.brp again.
+private func lsp_keeps_an_analysis_across_an_unchanged_open_and_close(
+    compiler: String,
+    work_directory: String
+) -> Result[Void, String]:
+    folder = "${work_directory}/cli_lsp_unchanged"
+    main_text = "import:\n    ./helpers as helpers: one\n\n\nfunc main() -> Int:\n    x: Int = \"a\"\n    x + helpers.one()\n"
+    helpers_text = "pure func one() -> Int:\n    1\n"
+    _ ?= make_directories(folder)
+    _ ?= written("${folder}/main.brp", main_text)
+    _ ?= written("${folder}/helpers.brp", helpers_text)
+    uri_of = pure func(file: String) -> Result[String, String]: file
+        .to_path()
+        .map(file_uri)
+        .map_err(pure func(error) -> String: "${file}: ${error}")
+    main_uri ?= uri_of("${folder}/main.brp")
+    helpers_uri ?= uri_of("${folder}/helpers.brp")
+    opened = pure func(uri: String, text: String) -> String:
+        "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":{\"textDocument\":{\"uri\":\"${uri}\",\"languageId\":\"blorp\",\"version\":1,\"text\":${render(Text(text))}}}}"
+    closed = "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didClose\",\"params\":{\"textDocument\":{\"uri\":\"${helpers_uri}\"}}}"
+    edited = "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didChange\",\"params\":{\"textDocument\":{\"uri\":\"${helpers_uri}\",\"version\":2},\"contentChanges\":[{\"text\":${render(Text("-- note\n" + helpers_text))}}]}}"
+    definition = pure func(id: Int) -> String:
+        "{\"jsonrpc\":\"2.0\",\"id\":${id},\"method\":\"textDocument/definition\",\"params\":{\"textDocument\":{\"uri\":\"${main_uri}\"},\"position\":{\"line\":6,\"character\":17}}}"
+    answered = pure func(id: Int) -> String: "{\"jsonrpc\":\"2.0\",\"id\":${id},\"result\":null}"
+    published = "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/publishDiagnostics\",\"params\":{\"uri\":\"${main_uri}\",\"diagnostics\":[{\"range\":{\"start\":{\"line\":5,\"character\":13},\"end\":{\"line\":5,\"character\":16}},\"severity\":1,\"message\":\"expression does not match the expected type\\nhelp: use an expression of type Int here\"}]}}"
+    input = [
+        LSP_INITIALIZE,
+        opened(main_uri, main_text),
+        opened(helpers_uri, helpers_text),
+        closed,
+        definition(2),
+        opened(helpers_uri, helpers_text),
+        edited,
+        definition(3),
+        closed,
+        definition(4),
+        "{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"shutdown\"}",
+        LSP_EXIT
+    ]
+    expected = [
+        LSP_INITIALIZED_REPLY,
+        published,
+        answered(2),
+        published,
+        answered(3),
+        published,
+        answered(4),
+        answered(5)
+    ]
+    output ?= lsp_session(
+        compiler,
+        input
+            .map(framed)
+            .join(""),
+        "${folder}/session",
+        0
+    )
+    expect_output(
+        output,
+        expected
+            .map(framed)
+            .join(""),
+        ""
+    )
+
+
 -- A client with LSP 3.18's `workspace.textDocumentContent`, which the server
 -- answers by offering the `blorp-library` scheme.
 private LSP_INITIALIZE_FETCHING: String = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"capabilities\":{\"general\":{\"positionEncodings\":[\"utf-8\"]},\"workspace\":{\"textDocumentContent\":{}}}}}"
@@ -1318,6 +1392,15 @@ func suite(compiler: String, work_directory: String) -> TestSuite:
                 "lsp serves a failed file from its last checked analysis",
                 func(): reported(
                     lsp_serves_a_failed_file_from_its_last_checked_analysis(
+                        compiler,
+                        work_directory
+                    )
+                )
+            ),
+            (
+                "lsp keeps an analysis across an unchanged open and close",
+                func(): reported(
+                    lsp_keeps_an_analysis_across_an_unchanged_open_and_close(
                         compiler,
                         work_directory
                     )
