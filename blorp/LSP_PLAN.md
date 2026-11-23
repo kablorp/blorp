@@ -613,7 +613,9 @@ backs it out; for landing 7, re-pinning the previous seed does.
 15. **Unchanged opens and closes** stale no program. A close reads the saved
     text (Keith, 2026-11-22).
 16. **Built-in type definitions:** definition on `Int`, `String` or `List`
-    answers its `type X = builtin` line in `_base.brp`.
+    answers its `type X = builtin` line in `_base.brp`. A follow-up commit
+    has `render`'s import notes reuse `referent_declaration` (Keith,
+    2026-11-23).
 
 **Ceilings** are against the parent commit, on
 `blorp/scripts/self-compile-cost`'s own-source rows unless stated, with test
@@ -639,6 +641,7 @@ lines counted apart. Compile cost must also fit the e2e instruction ceilings'
 | 14 VS Code, fixed input | ≤ +0.1% (noise) | no increase | no increase | ≤ +20 net in `blorp/src`; ≤ 150 JavaScript and JSON |
 | 15 unchanged opens and closes, fixed input | ≤ +0.1% | ≤ +0.1% | not set | not set |
 | 16 built-in type definitions, fixed input | ≤ +0.3% | ≤ +0.3% | not set | not set |
+| 16 follow-up, notes reuse `referent_declaration`, fixed input | ≤ +0.1%, C identical | ≤ +0.1% | not set | ≤ −90 net |
 
 **Latency.** Per request after one change, on this host: ≤ 1.0 s for
 `blorp/src/main.brp`, and ≤ 50 ms for a one-module program. Landing 1
@@ -1603,11 +1606,58 @@ change is noise.
   README names the definition a library location. The nit, that
   `defaultLibrary` on built-ins now follows the declaration span, is
   covered by `test_tokens.brp`, which fails when the lookup finds nothing.
-- **Proposed, not done.** `check/render.brp`'s entity `declaration_span`
-  (about 100 lines) repeats `referent_declaration` case by case. Mapping an
-  entity to its referent would let notes reuse it, at the price of the
-  render fault for a trait method without a header, a defect path, and with
-  an `Alias`'s note pointing at its module's start, where today it has none.
+- **Follow-up.** `check/render.brp`'s entity `declaration_span` repeated
+  `referent_declaration` case by case; the follow-up below removes it.
+
+**Landing 16 follow-up, import notes reuse `referent_declaration`**
+(against `3d7bbe195`). Keith approved it on 2026-11-23 after an
+investigation. Ceilings: fixed-input allocations and instructions ≤ +0.1%
+with the C identical, production lines ≤ −90 net. `self-compile-cost`,
+`-O2`, 7 rounds on an idle machine. Raw samples are under
+`blorp/build/self-compile-cost/3d7bbe195-606eeb492-r7/`.
+
+| Measure | Base | Candidate | Change |
+| --- | ---: | ---: | ---: |
+| Fixed input, allocations | 12,981,492 | 12,981,492 | unchanged |
+| Fixed input, instructions (median) | 13,043,946,794 | 13,055,475,952 | +0.088% |
+| Fixed input, peak heap (requested bytes) | 184,244,653 | 184,244,653 | unchanged |
+| Own source, allocations | 12,981,492 | 12,963,961 | −0.135% |
+| Own source, instructions (median) | 13,044,616,007 | 13,040,212,610 | −0.034% |
+| Own source, peak heap (requested bytes) | 184,244,652 | 184,074,401 | −0.092% |
+| Lines, production and tests | | | −98 and +35 net |
+
+The fixed-input C is identical (`acb3355377d8451a`). A first run of 3
+rounds read +0.204% while an e2e run shared the machine; the base's own 7
+rounds spread 0.12%. On the success path only `resolved_name_use` changed,
+now calling `entity_referent`, a small switch.
+
+- **Why.** The note on "X is imported by M, not declared there" found X's
+  declaration with its own 106-line `declaration_span` in `render.brp`, one
+  arm per entity, the same lookups `referent_declaration` makes.
+- **What changed.** `name_uses.brp` gains `entity_referent`, taken out of
+  `resolved_name_use`. The note's one caller asks
+  `entity.entity_referent().referent_declaration(…)`, passing no checked
+  functions or lambdas, which only a binding needs: no entity is one. A
+  narrower lookup by entity was weighed and dropped: it would only move the
+  empty lists, or make `referent_declaration` answer `None` for bindings.
+- **What the old code guarded.**
+  - Its fault for a trait method without a header cannot fire.
+    `issue_inventory` issues each default method with its body's row, and
+    `build_namespace` runs `declared_entries`, which rejects a missing
+    header as `InvalidTraitInventory`, before any selection resolves; a
+    `Method` entry exists only when its header was found.
+  - Its `Alias` arm was dead: `offer` reports an alias as an unknown name,
+    so `ImportedThere` never holds one.
+- **Output.** Probe programs that select, from a module that imports it, a
+  required trait method, a default one, a record and an alias give
+  byte-identical diagnostics before and after; the first three keep their
+  `note: declared here` at the declaring module.
+- **Test.** A surface e2e case, `a module does not reexport an imported
+  trait method`, pins the note at the method's header name. Mapping a
+  method to its trait in `entity_referent` fails it and no other case.
+- **Review.** 0 blockers, majors or minors; all four claims above
+  confirmed. Taken: the comment at the call names `declared_entries`'s
+  guarantee, and the trait method case above.
 
 ## Testing
 
@@ -1632,6 +1682,7 @@ Each landing starts with a failing test.
 | 14 | `test/test_lsp/`: a library URI without its empty authority names the same file, and one with an authority names none. `npm test` in `editor/vscode/` runs the installed VS Code against the repository's server: colours in a user file and a library file, Go to Definition locally and into the library, the library text, Find All References, a declaration's own definition, and a diagnostic. |
 | 15 | `test/test_lsp/`: an open or close as the text a root read stales none of them, other text and an unreadable close stale them, no refresh goes for an unchanged open or close, and an unchanged close keeps answers into the file. An e2e session in `cli.brp` opens and closes an imported file on the disk. |
 | 16 | `test/test_lsp/`: definition on `Int` is its library location, references list its declaration only on request, and without the capability definition is `null`. `test_name_uses`: `Int`, `Float`, `List`, `String` and `Void` each resolve to their own declaration. |
+| 16 follow-up | No oracle changes. A surface e2e case pins the note for an imported trait method, beside the `Box` one for a union. |
 
 **Commands:** those in `blorp/AGENTS.md`, `scripts/blorp-fixpoint --prove`
 for compiler landings, and `make -C blorp test-e2e INSTRUCTION_CHECK=on`
