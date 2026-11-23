@@ -1444,13 +1444,14 @@ The server ends with status 0 after `shutdown` then `exit`, and 1 for an
 declared, a position at a name's end counting as inside it: a local, a
 parameter, a field, a variant, a type, a function, a trait's method, or the
 start of the module an alias names. On a declaration's own name it answers
-that declaration, and on a type built into the language, such as `Int`, it
-answers `null`. A call of a trait's method, its default or an
-implementation's, goes to the trait's method. The answer is one `Location`.
+that declaration, and on a type built into the language, such as `Int`, the
+library location of the name in its `type Int = builtin` in `_base.brp`. A
+call of a trait's method, its default or an implementation's, goes to the
+trait's method. The answer is one `Location`.
 `textDocument/references` lists every use of the name at the position, and its
 declaration too when the editor asks; it groups the uses of an
-implementation's type parameter across the implementation's methods, and lists
-every use of a built-in type. Both cover only the open file's program, so uses
+implementation's type parameter across the implementation's methods. Both
+cover only the open file's program, so uses
 in a module that imports the file are not found, nor are uses in library code
 the program does not call, which is not checked. While a file's program fails
 to load or check, it is served from the last analysis of that program that

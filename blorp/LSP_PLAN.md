@@ -132,9 +132,12 @@ and construction; variants, traits and module aliases; import-list
 entries; and names inside `${…}`. Synthesised names (derived equality, the
 test wrapper) get none.
 
-**Declarations without a written name.** A built-in type such as `Int` has
-none, so go-to returns `null`. A module's declaration is the start of its
-file. A trait's `Self` resolves to the trait's name.
+**Declarations outside the inventory.** A built-in type such as `Int` is
+declared by `type Int = builtin` in `_base.brp`, which
+`ParsedContents.builtin_types` holds rather than the declaration inventory.
+Go-to returned `null` for it until landing 16, which joins it to that name.
+A module's declaration is the start of its file. A trait's `Self` resolves
+to the trait's name.
 
 **Where.** `check`'s body walk always records uses, in a new
 `check/name_uses.brp`, because fields, type parameters and bindings are
@@ -255,6 +258,8 @@ unless a change to it was reported since.
 **Definition** returns the declaration of the use at the position, or
 `null`. A position at an identifier's end counts as inside it. From landing
 13 it is a plain `Location`: only CLion's own client read a link's origin.
+From landing 16 a built-in type's is its name in `_base.brp`'s
+`type X = builtin`, a `blorp-library:` location.
 
 **References** returns every use with that referent. It includes the
 declaration only on request. Analysis checks a library body only when the
@@ -1543,6 +1548,60 @@ change is noise. Own source grows with the lines it compiles.
   dropped without a read. Kept: `noted` repeats the check `staled` made, as
   it did before, and `supplied` stays an `Option`, whose None means one
   thing, that every reader is affected.
+
+**Landing 16, built-in type definitions** (against `e65b646b5`).
+`self-compile-cost`, `-O2`, 3 rounds, ceiling +0.3% on the fixed-input
+allocations and instructions. Raw samples are under
+`blorp/build/self-compile-cost/e65b646b5-cf09e38a3/`.
+
+| Measure | Base | Candidate | Change |
+| --- | ---: | ---: | ---: |
+| Fixed input, allocations | 12,993,723 | 12,993,723 | unchanged |
+| Fixed input, instructions (median) | 13,062,109,166 | 13,056,188,294 | −0.045% |
+| Fixed input, peak heap (requested bytes) | 184,421,650 | 184,421,650 | unchanged |
+| Own source, allocations | 12,993,723 | 12,981,492 | −0.094% |
+| Own source, instructions (median) | 13,063,202,061 | 13,043,384,211 | −0.152% |
+| Own source, peak heap (requested bytes) | 184,421,649 | 184,245,154 | −0.096% |
+| Lines, production and tests | | | +15 and +94 net |
+
+The fixed-input C is identical (`0cd7de0ab1d61716`), so the instruction
+change is noise.
+
+- **Why.** Cmd-click on `List` or `String` in VS Code did nothing.
+  Definition answered `null` on a built-in type, since `Analysis` kept no
+  span for the base's `type X = builtin` declarations, though
+  `ParsedContents.builtin_types` held them.
+- **What changed.**
+  - `Analysis` shares `builtin_types` with the parsed program, and
+    `referent_declaration` joins a built-in head to its name through
+    `builtin_declaration` in `namespace`, which `render`'s notes now share
+    in place of their own loop.
+  - With every written name declared, two special cases go. `references`
+    no longer groups an undeclared referent by identity, so a defect
+    answers `[]`. `tokens`' `library_declared` drops its built-in case:
+    `_base.brp` is a library file.
+  - References with `includeDeclaration` lead with the `_base.brp`
+    declaration, as for any type. `declarations()` still leaves built-in
+    types out: only the base declares them, and it is never a root.
+- **Tests.** `test/test_lsp/`: definition of `Int` is its `_base.brp`
+  location; references list it only when asked; a client that cannot
+  fetch library files gets `null`. `test_name_uses.brp`: `Int`, `Float`,
+  `List`, `String` and `Void` each resolve to their own declaration, and
+  every built-in use renders its declaration. Each new oracle failed
+  before the change and was proven by mutation, one at a time: a lookup
+  that ignores the head, one that finds nothing, a zero-width span, the
+  declaration always or last in references, and library locations for
+  every client.
+- **Review.** 0 blockers, 0 majors, 2 minors and 1 nit. Fixed: the
+  non-fetching client's `null` and `Float` and `Void` are now tested; the
+  README names the definition a library location. The nit, that
+  `defaultLibrary` on built-ins now follows the declaration span, is
+  covered by `test_tokens.brp`, which fails when the lookup finds nothing.
+- **Proposed, not done.** `check/render.brp`'s entity `declaration_span`
+  (about 100 lines) repeats `referent_declaration` case by case. Mapping an
+  entity to its referent would let notes reuse it, at the price of the
+  render fault for a trait method without a header, a defect path, and with
+  an `Alias`'s note pointing at its module's start, where today it has none.
 
 ## Testing
 
