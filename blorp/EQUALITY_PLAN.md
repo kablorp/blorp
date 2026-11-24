@@ -1,7 +1,8 @@
 # Equality derivation plan
 
-Status: landings 1 (opaque types) and 2 (tuples) landed on 2026-11-17; landing 3
-waits for a seed rotation.
+Status: landings 1 (opaque types) and 2 (tuples) landed on 2026-11-17. Landing
+3 is unblocked, and runs as landing 0 of
+[`PRIVATE_VARIANTS_PLAN.md`](PRIVATE_VARIANTS_PLAN.md).
 
 ## Decision
 
@@ -108,12 +109,19 @@ theirs on older bases came back under after library-cost (b).
 
 ## Landing 3: delete the 28 hand-written identity implementations
 
-Waits for a seed rotation, because the seed compiles the compiler source.
-After landing 1 a seed pin that contains it, delete the 28 blocks
+It needed a seed that carries landing 1, because the seed compiles the
+compiler source. The pinned seed, `blorp-seed-8eb8e16546b3`, does. Delete the
+28 blocks
 (`ids.brp`, `model.brp`, `inference.brp`, `specialize.brp`, `list.brp`,
 `own.brp`, `lower.brp`, `source.brp`, `names.brp`). The pilot measured the
 conversion: -84/+28 production lines, the converted compiler compiles itself
 to identical C and runs -0.36% instructions on the same input.
+
+Ceilings, against its parent with `self-compile-cost --rounds 3` on the
+fixed-input row: instructions and allocations no higher than the parent's,
+peak heap +0.05%, production −40 net or fewer, and no test growth. It runs
+first in the private variants plan, so that the migration has 28 fewer blocks
+to carry.
 
 ## Measurements
 
