@@ -127,7 +127,14 @@ The layout rules:
   not exceed its own, so it keeps the nesting its author gave it.
 - Two blank lines separate top-level declarations, except that a run of
   one-line constants keeps the one or no blank line it was written with.
-  Inside a body at most one blank line stays.
+  Inside a body, a statement or final value that spans more than one line
+  (an `if`, `match`, `for` or `while`, a binding or call that breaks, or a
+  pipe String) has one blank line above it and one below, except at the start
+  or the end of its block. A comment above it does not make it span lines,
+  but the blank line goes above that comment; a comment at the end of a block
+  stays directly below the last statement. An `else` continues its `if` and
+  gets none. Between one-line statements the blank lines you wrote stay, at
+  most one in a row.
 - An `else:` block holding only an `if` is not rewritten to `else if`: the
   two are different trees and compile to different C.
 - The formatter lexes and parses with the compiler's front end and prints the

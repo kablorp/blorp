@@ -1550,23 +1550,70 @@ pure func statement_start(statement: ParsedStatement) -> Int:
         Continue(span): span.start
 
 
+fixed union PreviousItem:
+    FirstItem
+    AfterOneLineItem
+    AfterMultiLineItem
+
+
+-- A block's output so far and the item last printed in it.
+record BlockProgress {
+    printer: Printer,
+    previous: PreviousItem
+}
+
+
+-- Prints one item of a block, a statement or the final value, at `start`.
+-- A multi-line item has one blank line above and below, except at its block's
+-- ends. The line above is owed up front when the previous item spanned lines.
+-- Whether this one does is known only once it is printed, since the chain
+-- rule, the width rule and pipe Strings decide that; the blank line then goes
+-- in above its leading comments, unless the source's is already there.
+pure func with_spaced_item(
+    progress: BlockProgress,
+    start: Int,
+    indent: Int,
+    emit: pure (Printer) -> Printer
+) -> BlockProgress:
+    owing = match progress.previous:
+        AfterMultiLineItem: progress.printer.owing_blank_lines(1)
+        FirstItem | AfterOneLineItem: progress.printer
+    gap = owing.written_lines()
+    opened = owing
+        .flush(start)
+        .newline(indent)
+    code_start = opened.written_lines()
+    printed = emit(opened)
+    if printed.written_lines() == code_start:
+        { printer = printed, previous = AfterOneLineItem }
+    else:
+        spaced = match progress.previous:
+            FirstItem: printed
+            AfterOneLineItem | AfterMultiLineItem: printed.with_blank_line_unless_present(gap)
+        { printer = spaced, previous = AfterMultiLineItem }
+
+
 pure func emit_block(printer: Printer, block: ParsedBlock, indent: Int) -> Printer:
     source = printer.source
-    var lines = printer.open_block(source.block_level(block.span.start), indent, BODY_BLANK_LINES)
+    inside = printer.open_block(source.block_level(block.span.start), indent, BODY_BLANK_LINES)
+    var progress: BlockProgress = { printer = inside, previous = FirstItem }
     for statement in block.statements:
-        lines = lines
-            .flush(statement.statement_start())
-            .newline(indent)
-            .emit_statement(statement, indent)
-    lines = match block.value:
+        progress = progress.with_spaced_item(
+            statement.statement_start(),
+            indent,
+            pure func(opened: Printer) -> Printer: opened.emit_statement(statement, indent)
+        )
+    match block.value:
         Some(value):
-            lines
-                .flush(value.span.start)
-                .newline(indent)
-                .emit_value(value, WholeValue, StatementLine, indent, 0)
+            progress = progress.with_spaced_item(
+                value.span.start,
+                indent,
+                pure func(opened: Printer) -> Printer:
+                    opened.emit_value(value, WholeValue, StatementLine, indent, 0)
+            )
         None:
-            lines
-    lines
+            void
+    progress.printer
         .flush_block_end(source.next_code_start(block.span.end))
         .close_block()
 
