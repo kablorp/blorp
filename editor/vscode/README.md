@@ -9,7 +9,9 @@ Microsoft's language client
 - colours, from semantic tokens;
 - diagnostics;
 - Go to Definition, into the standard library too;
-- Find All References.
+- Find All References;
+- completion of the names a module can write and its keywords, and after a dot
+  the names of a module alias or the variants of a union.
 
 Library files open read-only under `blorp-library:` URIs, with their colours.
 Editors built on VS Code, such as VSCodium or Cursor, run the extension the
@@ -63,8 +65,8 @@ server", apply:
 
 - definitions inside a library file go nowhere, since a library file gets
   colours only;
-- Go to Definition on a type built into the language, such as `Int`, goes
-  nowhere;
+- completion does not offer a value's members, such as the functions after
+  `name.`, nor the locals and parameters at the cursor;
 - uses in a module that imports the open file are not found.
 
 ## Test
@@ -82,6 +84,10 @@ and extensions folders, and a VS Code window opens while it runs. It checks:
 - the library file's text;
 - Find All References;
 - the definition on a declaration, which makes Cmd-click list references;
+- completion on a blank line of a body, which lists the file's functions,
+  `print` and `match`;
+- completion after `Option.` while the file does not check, which lists
+  `None` and `Some`;
 - a diagnostic, with its message and range;
 - a restart when the server path changes, also after a failed start.
 

@@ -1461,6 +1461,26 @@ library file the editor opens, after a definition led there, is not the root of 
 program: it gets the lexer's tokens and no diagnostics, no definitions and no
 references.
 
+`initialize` announces `textDocument/completion` with `.` as its trigger
+character. The answer is one complete list that the editor filters as the word
+grows, and each item replaces the word before the cursor. It holds:
+
+- at a name, the names the open file's module can write (its declarations,
+  its imports and aliases, and the names the prelude supplies) and the
+  keywords;
+- after `alias.`, the names that module offers, its types and traits among
+  them;
+- after `Union.`, its variants.
+
+While the program fails to load or check, these names come from its last
+analysis that checked, and a program that never checked offers nothing.
+Nothing is offered in a comment, a string, a number or an import block, after a
+word that declares a new name (`func`, `var`, `for`, `record`, `union`,
+`trait`, `type`, `opaque` or `as`), or past a place where the text stops
+lexing. Other places that declare a name, such as a parameter or a record's
+field, get the list anyway. A value's members and the locals at the cursor are
+not offered yet.
+
 The server colours a file through `textDocument/semanticTokens/full`, with
 only the protocol's standard token types and modifiers. Keywords, comments,
 strings, numbers and operators are coloured by the lexer. A name is coloured

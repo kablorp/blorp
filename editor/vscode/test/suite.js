@@ -89,6 +89,18 @@ function diagnosticsOf(uri) {
     });
 }
 
+function labelsOf(list) {
+    return list.items.map((item) => (typeof item.label === 'string' ? item.label : item.label.label));
+}
+
+// Types `text` at the start of `line` of an open document, as an editor does,
+// and waits for the server to have the change.
+async function typeAtLineStart(document, line, text) {
+    const editor = await vscode.window.showTextDocument(document);
+    const applied = await editor.edit((builder) => builder.insert(new vscode.Position(line, 0), text));
+    assert.ok(applied, 'the edit was not applied');
+}
+
 async function run() {
     const folder = vscode.workspace.workspaceFolders[0].uri;
     const main = await openDocument(vscode.Uri.joinPath(folder, 'main.brp'));
@@ -176,6 +188,37 @@ async function run() {
             broken.positionAt(text.indexOf('missing_name')),
             broken.positionAt(text.indexOf('missing_name') + 'missing_name'.length),
         ));
+    });
+
+    // The fixture's body is line 4. The server answers from its last analysis
+    // that checked, so the file is analysed once before it is edited.
+    const completionUri = vscode.Uri.joinPath(folder, 'completion.brp');
+    const BODY_LINE = 4;
+    const BODY_INDENT = 4;
+
+    await check('Ctrl+Space on a blank line of a body lists the file\'s functions, print and match', async () => {
+        const document = await openDocument(completionUri);
+        await semanticTokens(completionUri);
+        await typeAtLineStart(document, BODY_LINE, ' '.repeat(BODY_INDENT) + '\n');
+        const list = await vscode.commands.executeCommand(
+            'vscode.executeCompletionItemProvider', completionUri, new vscode.Position(BODY_LINE, BODY_INDENT),
+        );
+        const labels = labelsOf(list);
+        for (const wanted of ['helper', 'print', 'match']) {
+            assert.ok(labels.includes(wanted), `${wanted} is not in ${labels.length} items`);
+        }
+    });
+
+    await check('typing a dot after Option lists None and Some, while the file does not check', async () => {
+        const document = await vscode.workspace.openTextDocument(completionUri);
+        // The blank line the check above left becomes `    Option.`.
+        const typed = '    Option.';
+        const editor = await vscode.window.showTextDocument(document);
+        await editor.edit((builder) => builder.insert(new vscode.Position(BODY_LINE, BODY_INDENT), 'Option.'));
+        const list = await vscode.commands.executeCommand(
+            'vscode.executeCompletionItemProvider', completionUri, new vscode.Position(BODY_LINE, typed.length), '.',
+        );
+        assert.deepEqual(labelsOf(list).sort(), ['None', 'Some']);
     });
 
     await check('a changed server path restarts the server, also after a failed start', async () => {

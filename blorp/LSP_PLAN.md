@@ -1,7 +1,9 @@
 # Language server: `blorp lsp`
 
 **Status: plan, 2026-11-10; Keith settled its decisions and asked for a byte
-console on 2026-11-11. Landings 1–16 have landed.**
+console on 2026-11-11. Landings 1–16 and 17a have landed. Landing 17,
+completion, was planned on 2026-11-23: 17a, names and qualifiers, is done,
+and Keith chose a completion hole for 17b, which a spike has tried.**
 
 ## Problem
 
@@ -52,6 +54,9 @@ Keith dropped the CLion plugin for a VS Code extension ("Let's just go with
 pure LSP and VSCode for now"), and asked that no CLion crutches enter the
 server. The server implements the LSP specification only.
 
+**On 2026-11-23:** completion, with a probe analysis for a member (landing
+17).
+
 **Related plans:** `STRING_PLAN.md` moves byte work to `byte_*` functions,
 and the README's naming rules and the library's exact-error convention apply here.
 
@@ -64,6 +69,8 @@ and the README's naming rules and the library's exact-error convention apply her
   - `protocol`: framing, and JSON-RPC to and from `Json`;
   - `positions`: byte offsets to and from LSP positions;
   - `tokens`: semantic-token encoding;
+  - `completion`: the site at the cursor and the items it allows (landing
+    17);
   - `server`: open documents, one step per message;
   - `lsp_command.brp`: the help text and the transport, the only impure code
     (read, step, analyse or read a closed file's saved text on request,
@@ -279,6 +286,885 @@ Go-to and references cover the open file's program: the file, its imports
 and the library, not importers. The README documents this. A later
 landing has the extension pass the workspace's roots in
 `initializationOptions.roots`, and once packages exist a manifest does.
+
+### Completion (landing 17)
+
+**Keith asked on 2026-11-23** for completion, "especially when starting from
+blank or after typing `.` after an entity". For a member he chose a probe
+(A): analyse a copy of the open text with the unfinished member removed, and
+read the receiver's type from the checked body. He rejected answering from
+the last good analysis alone (B), which knows a receiver's type only for a
+plain name, and error recovery in parser and checker (C), a large project
+because each phase stops at its first error.
+
+Landing **17a** completes names and qualifiers from facts the namespace
+already publishes. Landing **17b** completes a value's members and the
+locals at the cursor through a completion hole, which Keith chose on
+2026-11-23 because the cut does not check in most of the places a member is
+typed (17b below).
+
+#### The protocol
+
+- `initialize` announces `completionProvider: { triggerCharacters: ["."] }`
+  without `resolveProvider`, since every item is complete when sent.
+- `textDocument/completion` becomes `CompletionQuery(Position)` of
+  `DocumentQuery`, answered like a definition: from the root's analysis,
+  analysed first when stale. While the root fails, its last analysis that
+  checked answers. `context.triggerKind` is not read, because the text says
+  whether a dot comes before the cursor.
+- The answer is a `CompletionList` with `isIncomplete: false`. It holds every
+  name the site allows, unfiltered, so the client filters as the word grows
+  and asks again only at a new word. A site with nothing to offer, a program
+  that never checked and a library document get an empty list. A document
+  that is not open gets `null`.
+- Each item has `label`, `kind`, `sortText`, and a `textEdit` that replaces
+  the site's prefix with the label. The specification recommends `textEdit`
+  over `insertText`, which a client may reinterpret. `sortText` is a rank,
+  then the label, so the order is total. The ranks are 0 for locals (17b), 1
+  for the module's own declarations, 2 for its imports and aliases, 3 for the
+  prelude's names and 4 for keywords.
+- `kind` is the protocol's `CompletionItemKind`:
+  - Function for a function;
+  - Method for a trait's method, and for every member call;
+  - Constant, Field and Keyword for what they name;
+  - EnumMember for a variant;
+  - Struct for a record, Enum for a union, and Class for an opaque or
+    built-in type;
+  - Interface for a trait and Module for an alias;
+  - Variable for a local or a parameter.
+- A member call (17b) inserts the call, since `x.f` without parentheses is a
+  field read. It inserts `length()`, or the snippet `get($0)` when the
+  function takes more than its receiver and the client sets
+  `completionItem.snippetSupport`. Every other name inserts the name alone,
+  since a function's name is also a value.
+- `detail` is not sent. A type's text needs `render`'s private
+  `type_spelling` (`check/render.brp:2210`), which hover needs too, so both
+  come with hover.
+
+#### The site, read from the lexer's tokens
+
+The server lexes the editor's text with the analysis's name table, so a name
+the analysis knows keeps its id. The site comes from the lexer's output
+around the cursor, never from spellings. `completion_site` in the code below
+is the rule.
+
+- **Nothing** is offered at these places:
+  - inside a comment. Comments are the lexer's separate `comments` list, not
+    tokens; a comment's span stops before its LF;
+  - inside a string. A quoted string, a char literal and an interpolated
+    string's closing quote each close their string, so the cursor at their
+    end is outside. Any other piece holds the cursor at its end: an opening
+    quote, a text segment, a hole's closing `}`, and a pipe string's line;
+  - in a number or at its end;
+  - inside an import block: after an `import` at the margin, before the
+    Dedent that closes its rows. Import blocks come first in a module
+    (`grammar.ebnf:763-764`). Selecting from the imported module is
+    auto-import's work;
+  - right after a word that declares a new name: `func`, `var`, `for`,
+    `record`, `union`, `trait`, `type`, `opaque` or `as`. `for` also starts
+    an implementation's type (`implements Trait for Type`), and that gets
+    nothing too, since the word alone does not say which form it starts;
+  - at or past the first error of a text that does not lex. Before the
+    error, the failure's prefix tokens are read as usual.
+- **A name:** the prefix is the part before the cursor of the identifier or
+  keyword the cursor is in or ends. Otherwise the prefix is empty at the
+  cursor. `..` and `...` are their own symbols, so `0..` is a name site, not
+  a member.
+- **A member:** the token right before the prefix is a `.`. The qualifier is
+  the identifier right before the dot, when the dot's `Spacing` is
+  `Adjacent`. Newline and Indent are tokens, so a dot that starts the line of
+  an indented chain is a member site, and a dot that ends the line above is
+  not.
+- **Accepted noise.** A name that is being declared with no keyword before it
+  gets the name list, since telling these places apart needs the parser:
+  - a parameter or a lambda's parameter;
+  - a record's field or a union's variant line;
+  - a trait method's name or a type parameter;
+  - a binding's name before its `=`, and a match arm's capture.
+
+  An annotation's name after `@` gets the list too. A name site also offers
+  type names in expression position, and value names in type position.
+- **Not offered:** `fixed`, `methods` and `tail_recursive`. The parser
+  recognises them by seeded id (`syntax/lex.brp:775-777`); they are not
+  keywords. `methods` is written only in an import block, and the other two
+  only lead a declaration.
+
+#### 17a: names and qualifiers
+
+**Where names come from.** The namespace already holds every name a module
+can write (`module_entries`, `namespace/namespace.brp:1353`):
+- its declarations, private ones included;
+- its import selections and aliases;
+- the names the prelude supplies.
+
+`offer` (`:473`) is the one rule for what a module offers its importers.
+`Analysis` drops the namespace today. 17a keeps it, shared as
+`declarations` and `builtin_types` are, together with the parsed name table
+that spells it. A module's names hold everywhere in it, so they need no
+position in the analysed text. While the root fails they come from its last
+analysis that checked, and the line diff is not read. No `line_map` query is
+added.
+
+**Each entity once.** A scope's `names` are keyed by `space_key`
+(`namespace/namespace.brp:347`). `claimed` (`:397`) stores an alias at both
+its Values and its Types key, so `module_entries` returns an alias twice. A
+new namespace query, `module_names`, lists each entity once: it skips the
+entry at an alias's Types key, using `space_key` itself. The namespace owns
+`space_key`, so no consumer decodes keys.
+
+Two entries that remain can still share a spelling, as `union Box: Box(Int)`
+does. They are two entities, a type and a constructor, and both are listed,
+as Enum and EnumMember. So there is one item per label and kind. This
+follows from the scope rule, which lets a spelling name at most one entity
+in each space. Values become Function, Method, Constant or EnumMember items,
+and types become Struct, Enum, Class or Interface items. The two sets share
+only Module, which only an alias has. Keywords are never identifiers,
+variants are unique within their union, and `offer` never offers an alias.
+
+**What each site offers.**
+- **A name:** every entity `module_names` lists for the root. Also the
+  keywords of the forms the compiler reads, except `builtin` (the base's
+  alone) and the reserved words. `word_kind` (`syntax/lex.brp:779`) is the
+  one spelling map, so the server keeps a list of spellings, and a test
+  checks that each offered keyword lexes as a keyword. Locals and parameters
+  come in 17b.
+- **A member whose qualifier the root names as an alias** (`named_value`
+  gives `NamedAlias`): what that module offers, through a new
+  `offered_entries` that filters `module_names` through `offer`. That
+  includes its types and traits, as `alias.Type` is also written in
+  annotations. A member site does not know whether it is in a type or an
+  expression, so it offers both.
+- **A member whose qualifier the root names as a union** (`named_type` gives
+  `UnionHead`): its variants, read from the declaration inventory the
+  analysis already shares, and ordered by label like every other item.
+- **Any other member** gets nothing until 17b: one with no qualifier, or a
+  qualifier that names a value, a function or another type.
+
+This distinction comes from name resolution, and it is exact: a qualifier
+that the root's scope holds as an alias or a type is never a local.
+- A type, a union among them, is CapitalizedCamelCase by its declaration
+  role. A local or a parameter is lower_snake_case by its binding-name role
+  (`role_style`, `syntax/naming.brp:56`). So no local is spelled like a
+  union.
+- An alias is lower_snake_case like a local. But it claims its spelling in
+  the Values space, and `bind_data` (`check/scope.brp:94`) rejects a local
+  whose spelling the module's Values space holds. It finds the alias
+  through `value_binding` (`namespace/namespace.brp:1242`), which looks only
+  in that space.
+- The parser reads `alias.name` the same way: it makes a `ParsedQualified`
+  (`syntax/syntax.brp:298`) only for the import block's aliases.
+
+All labels are spelled from one read of the name table, because
+`name_spelling` (`syntax/names.brp:254`) copies the table's keys on every
+call.
+
+**Rejected:**
+- filtering by the prefix in the server, since the client filters a
+  complete list;
+- answering a stale root without analysing it, which would make 17a's
+  answers older than its definitions are.
+
+**Docs.**
+- `blorp/README.md`, "The language server", gains a paragraph after
+  references. It says that `initialize` announces completion with `.` as
+  its trigger, and that completion offers:
+  - the names the open file's module can write (its declarations, imports
+    and aliases, and the prelude's names) and the keywords, as one complete
+    list that the editor filters, each replacing the word before the
+    cursor;
+  - after `alias.`, the names that module offers, its types and traits
+    among them;
+  - after `Union.`, its variants.
+
+  The paragraph also says:
+  - while the program fails, these names come from its last analysis that
+    checked;
+  - nothing is offered in a comment, a string, a number or an import block,
+    or after a word that declares a new name;
+  - other places that declare a name, such as a parameter, get the list
+    anyway;
+  - until 17b, a value's members and the locals are not offered.
+- `editor/vscode/README.md`:
+  - the features list gains completion;
+  - Known limits drops "Go to Definition on a type built into the language,
+    such as `Int`, goes nowhere", which landing 16 fixed, and gains 17a's
+    missing locals and members;
+  - the test list gains the two completion checks.
+
+**Code.** `AnalysisContents` (`check/check.brp:80`) ends with:
+
+```blorp
+    -- The parsed program's own declaration inventory, shared rather than
+    -- copied, which joins a referent to its written name.
+    declarations: DeclarationInventory,
+    -- The base's `type X = builtin` declarations, shared likewise.
+    builtin_types: List[ParsedBuiltinDeclaration]
+}
+```
+
+It gains the namespace and the spelling table, which `analyze_program`
+(`:102`) already holds as `namespace` and `parsed.names`. `check` drops both,
+as it drops `uses`, so compilation pays only the reference counts of two
+shared fields:
+
+```blorp
+    builtin_types: List[ParsedBuiltinDeclaration],
+    -- Every module's scope, shared: the names each module can write, which an
+    -- editor offers.
+    namespace: Namespace,
+    -- The program's one spelling table, shared. It spells the namespace's
+    -- names, and lexes an editor's text to the same ids.
+    names: NameTable
+}
+
+
+-- The scopes the analysis resolved names in. Ids live for one analysis.
+pure func analysis_namespace(analysis: Analysis) -> Namespace:
+    from_opaque Analysis(analysis).namespace
+
+
+pure func analysis_names(analysis: Analysis) -> NameTable:
+    from_opaque Analysis(analysis).names
+
+
+-- The written names of `union_id`'s variants, in declaration order. The
+-- inventory issued the id, so its row is there; `get` is the host's Option.
+pure func variant_names(analysis: Analysis, union_id: UnionId) -> List[WrittenName]:
+    rows = from_opaque Analysis(analysis).declarations.inventory_unions()
+    match rows.get(union_id.union_number()):
+        Some(row): row.variants.map(pure func(variant: VariantRow) -> WrittenName: variant.declaration.name)
+        None: []
+```
+
+The namespace gains two queries beside `module_entries`
+(`namespace/namespace.brp:1353`). `module_names` is the dedupe, and the
+offer stays `offer`'s. The name table gains a bulk read
+(`syntax/names.brp`):
+
+```blorp
+-- The module's names, each entity once, in the order they entered. An alias
+-- claims its spelling in both spaces (`claimed`) and is listed by its Values
+-- entry; a type and a constructor spelled alike are two entities, both listed.
+pure func module_names(namespace: Namespace, module: ModuleId) -> List[Entry]:
+    scopes: List[ModuleScope] = from_opaque Namespace(namespace)
+    var listed: List[Entry] = []
+    match scopes.get(module.module_number()):
+        Some(scope):
+            for (key, entry) in scope.names.entries():
+                types_copy: Bool = match entry.entity:
+                    Alias(_): key == space_key(Types, entry.name.id)
+                    _: False
+                if not(types_copy):
+                    listed = listed.append(entry)
+        None:
+            void
+    listed
+
+
+-- What `target` offers its importers, by `offer`: its public declarations,
+-- each once, in the order they entered.
+pure func offered_entries(namespace: Namespace, target: ModuleId) -> List[Entry]:
+    namespace
+        .module_names(target)
+        .filter(pure func(entry: Entry) -> Bool: offer(Some(entry)).is_ok())
+
+
+-- Every spelling at its id's position, from one read of the table.
+pure func name_spellings(names: NameTable) -> List[String]:
+    from_opaque NameTable(names).by_spelling.keys()
+```
+
+`DocumentQuery` (`lsp/server.brp:212`) gains a case, which `receive`
+(`:366`) builds from `textDocument/completion` the way it builds
+`DefinitionQuery`:
+
+```blorp
+union DocumentQuery:
+    TokensQuery
+    DefinitionQuery(Position)
+    ReferencesQuery(ReferencesAt)
+    -- What may be written at the position.
+    CompletionQuery(Position)
+```
+
+`initialize_result` (`:520`) adds one capability:
+
+```blorp
+        "referencesProvider" => Boolean(True),
+        "completionProvider" => Object({ "triggerCharacters" => Array([Text(MEMBER_TRIGGER)]) })
+```
+
+```blorp
+-- The character after which an editor asks for completion unprompted: the
+-- dot before a member.
+private MEMBER_TRIGGER: String = "."
+```
+
+`served` (`:756`) answers from the editor's text and the analysis that
+answers its other queries. `completion.brp` returns data, the prefix and the
+items, as `tokens.brp` returns its integers. The server renders the range
+with the root's `LineIndex`, which `served` already holds, and with its own
+`range_json` (`:1457`), which stays where it is.
+
+`completion_json` is the one `CompletionList` shape. `unanalysed_answer`
+(`:823`) answers `completion_json([])`, so no `empty_completion` is needed:
+
+```blorp
+        CompletionQuery(at):
+            -- A module's names hold everywhere in it, so the editor's own text
+            -- gives the site, and no offset goes back through the line diff.
+            items: List[Json] = match text.completion(root.index.offset_of(at, session.encoding), analysis):
+                Some(offering):
+                    range = root.index.range_json(offering.prefix, session.encoding)
+                    offering.items.map(pure func(item: Offered) -> Json: item.offered_json(range))
+                None:
+                    []
+            completion_json(items)
+```
+
+```blorp
+-- The `textDocument/completion` result: a complete list, which the client
+-- filters as the word grows.
+private pure func completion_json(items: List[Json]) -> Json:
+    Object({ "isIncomplete" => Boolean(False), "items" => Array(items) })
+```
+
+The new `src/lsp/completion.brp` holds the site and the items. Below is the
+sketch the line ceiling counts, after `blorp format`. It leaves out the
+6-line module header, the 52 lines of imports and the 2 blank lines after
+them. It also packs the keyword list, which the formatter puts one string to
+a line (27 lines). `KEYWORD_ITEMS` cannot be
+a constant: a constant's initializer must be closed, with no call. So
+`completion` maps `OFFERED_KEYWORDS` itself.
+
+```blorp
+-- What the editor's text says is being written at the cursor, read from its
+-- tokens.
+union CompletionSite:
+    -- Nothing completes here: in a comment, a string, a number or an import
+    -- block, after a word that declares a new name, or at or past where
+    -- lexing stopped.
+    NoCompletion
+    -- A name. The span is the prefix an item replaces: the part before the
+    -- cursor of the identifier or keyword the cursor is in or ends, else empty
+    -- at the cursor.
+    NameSite(Span)
+    -- A member, after a `.`.
+    MemberSite(MemberAt)
+
+
+fixed record MemberAt {
+    -- The identifier written against the dot's left, if there is one: an
+    -- alias, a union or a value, as the namespace says.
+    qualifier: Option[WrittenName],
+    prefix: Span
+}
+
+
+-- What a site allows: the items, each replacing `prefix`.
+record Completion {
+    prefix: Span,
+    items: List[Offered]
+}
+
+
+-- One item: the label it shows and inserts, its kind and its rank.
+record Offered {
+    label: String,
+    kind: CompletionKind,
+    rank: ItemRank
+}
+
+
+-- Where an offered name comes from, nearest first. An item's sortText leads
+-- with its rank's digit, then its label, so the order is total.
+private union ItemRank:
+    DeclaredRank
+    ImportedRank
+    ProvidedRank
+    KeywordRank
+
+
+private pure func rank_digit(rank: ItemRank) -> String:
+    match rank:
+        DeclaredRank: "1"
+        ImportedRank: "2"
+        ProvidedRank: "3"
+        KeywordRank: "4"
+
+
+-- The protocol's CompletionItemKind of each item 17a offers.
+private union CompletionKind:
+    MethodItem
+    FunctionItem
+    ClassItem
+    InterfaceItem
+    ModuleItem
+    EnumItem
+    KeywordItem
+    EnumMemberItem
+    ConstantItem
+    StructItem
+
+
+-- Each kind's number in LSP 3.17.
+private pure func kind_number(kind: CompletionKind) -> Int:
+    match kind:
+        MethodItem: 2
+        FunctionItem: 3
+        ClassItem: 7
+        InterfaceItem: 8
+        ModuleItem: 9
+        EnumItem: 13
+        KeywordItem: 14
+        EnumMemberItem: 20
+        ConstantItem: 21
+        StructItem: 22
+
+
+-- The keywords of the forms the compiler reads, as a writer spells them; not
+-- `builtin`, which only the base writes, nor the words the lexer reserves for
+-- forms it does not read. `word_kind` is the one spelling map: a test checks
+-- that each lexes as a keyword. `fixed`, `methods` and `tail_recursive` are
+-- names the parser recognises by seeded id, not keywords, and are not offered.
+private OFFERED_KEYWORDS: List[String] = [
+    "as", "break", "continue", "else", "for", "from_opaque", "func", "if", "implements",
+    "import", "in", "into_opaque", "match", "opaque", "private", "pure", "record", "resource",
+    "scoped", "trait", "type", "union", "var", "void", "while"
+]
+
+
+-- What may be written at `offset` of `text`, the root as the editor shows it,
+-- from `analysis`, the root's latest analysis that checked. None where nothing
+-- completes.
+pure func completion(text: String, offset: Int, analysis: Analysis) -> Option[Completion]:
+    namespace = analysis.analysis_namespace()
+    names = analysis.analysis_names()
+    -- Spelled once: `name_spelling` copies the table's keys per call.
+    spellings = names.name_spellings()
+    root = root_module_id()
+    match text.completion_site(names, offset):
+        NoCompletion:
+            None
+        NameSite(prefix):
+            keywords = OFFERED_KEYWORDS.map(
+                pure func(word: String) -> Offered: {
+                    label = word,
+                    kind = KeywordItem,
+                    rank = KeywordRank
+                }
+            )
+            Some({
+                prefix = prefix,
+                items = namespace
+                    .module_names(root)
+                    .scope_items(spellings)
+                    .concat(keywords)
+            })
+        MemberSite(member):
+            items: List[Offered] = match member.qualifier:
+                Some(qualifier):
+                    match namespace.named_value(root, qualifier.id):
+                        Some(NamedAlias(aliased)):
+                            namespace
+                                .offered_entries(aliased.target)
+                                .scope_items(spellings)
+                        _:
+                            named: Option[TypeHead] = namespace
+                                .named_type(root, qualifier.id)
+                                .map(pure func(found: NamedType) -> TypeHead: found.head)
+                            match named:
+                                Some(UnionHead(id)):
+                                    analysis
+                                        .variant_names(id)
+                                        .variant_items(spellings)
+                                -- A value, a function or another type.
+                                _:
+                                    []
+                -- A value's members come in 17b.
+                None:
+                    []
+            Some({ prefix = member.prefix, items = items })
+
+
+-- The site at `offset`, from the tokens `names` lexes `text` to. `names` is
+-- the analysis's table, so a qualifier the analysis knows keeps its id.
+pure func completion_site(text: String, names: NameTable, offset: Int) -> CompletionSite:
+    source = module_source(root_module_id())
+    -- A text that does not lex keeps the tokens before its first error, which
+    -- say nothing about what follows it.
+    (lexed, stopped) = match lex(source, text, names):
+        Ok(whole): (whole, None)
+        Err(failure): (failure.prefix, Some(failure.error.span.start))
+    tokens = lexed.tokens
+    -- How many tokens start before the cursor: the last of them is the one the
+    -- cursor is in or follows.
+    var reached = 0
+    for token in tokens:
+        if token.span.start >= offset:
+            break
+        reached = reached + 1
+    beyond: Bool = match stopped:
+        Some(start): offset >= start
+        None: False
+    -- Comments are not tokens; a comment's span stops before its LF.
+    commented = lexed.comments.any(
+        pure func(comment: Comment) -> Bool: and(
+            comment.span.start < offset,
+            offset <= comment.span.end
+        )
+    )
+    if or(or(beyond, commented), tokens.in_import_block(reached)):
+        NoCompletion
+    else:
+        empty: Span = { source = source, start = offset, end = offset }
+        match tokens.get(reached - 1):
+            None:
+                NameSite(empty)
+            Some(last):
+                if last.span.end < offset:
+                    -- A space or a line break separates the cursor from `last`.
+                    tokens.site_after(reached - 1, empty)
+                else:
+                    match last.kind:
+                        IdentifierToken(_, _) | KeywordToken(_):
+                            tokens.site_after(reached - 2, { last.span | end = offset })
+                        IntegerLiteral(_) | FloatLiteral(_):
+                            NoCompletion
+                        _:
+                            if last.in_string(offset):
+                                NoCompletion
+                            else:
+                                -- A symbol, such as `.`, `..` or `${`, or a closing
+                                -- quote, ends at the cursor.
+                                tokens.site_after(reached - 1, empty)
+
+
+-- The site whose prefix is `prefix`, when `tokens[index]` is written right
+-- before it: a member after a dot, nothing after a word that declares a new
+-- name, else a name. Newline, Indent and Dedent are tokens, so a dot that ends
+-- the line above is not right before the prefix.
+private pure func site_after(tokens: List[Token], index: Int, prefix: Span) -> CompletionSite:
+    match tokens.get(index):
+        None:
+            NameSite(prefix)
+        Some(written):
+            match written.kind:
+                SymbolToken(Dot):
+                    qualifier: Option[WrittenName] = match tokens.get(index - 1):
+                        Some(left):
+                            match (left.kind, written.spacing):
+                                (IdentifierToken(id, _), Adjacent):
+                                    Some({ id = id, span = left.span })
+                                _:
+                                    None
+                        None:
+                            None
+                    MemberSite({ qualifier = qualifier, prefix = prefix })
+                KeywordToken(FunctionKeyword | VarKeyword | ForKeyword | RecordKeyword | UnionKeyword | TraitKeyword | TypeKeyword | OpaqueKeyword | AsKeyword):
+                    NoCompletion
+                _:
+                    NameSite(prefix)
+
+
+-- Whether `offset` is inside the string `token` is a piece of. A piece that
+-- closes its string ends before the cursor at its end; any other piece,
+-- including a hole's closing brace, holds the cursor at its end.
+private pure func in_string(token: Token, offset: Int) -> Bool:
+    after_start = token.span.start < offset
+    match token.kind:
+        QuotedString(_) | StringEnd | CharLiteral:
+            and(after_start, offset < token.span.end)
+        PipeString(_) | StringStart(_) | StringSegment(_) | InterpolationClose:
+            and(after_start, offset <= token.span.end)
+        _:
+            False
+
+
+-- Whether the first `reached` tokens end inside an import block: after an
+-- `import` at the margin, before the Dedent that closes its rows. Import
+-- blocks come first (`grammar.ebnf:763`); a block the text never closes runs
+-- to its end.
+private pure func in_import_block(tokens: List[Token], reached: Int) -> Bool:
+    var depth = 0
+    var inside = False
+    for position in 0..reached:
+        match tokens.get(position):
+            Some(token):
+                match token.kind:
+                    KeywordToken(ImportKeyword):
+                        if depth == 0:
+                            inside = True
+                    SymbolToken(Indent):
+                        depth = depth + 1
+                    SymbolToken(Dedent):
+                        depth = depth - 1
+                        if depth == 0:
+                            inside = False
+                    _:
+                        void
+            None:
+                void
+    inside
+
+
+-- An item for each entry, spelled from `spellings`, the analysis's names by id.
+-- `module_names` and `offered_entries` list each entity once, and a spelling
+-- names at most one entity per space, so each label and kind is one item.
+private pure func scope_items(entries: List[Entry], spellings: List[String]) -> List[Offered]:
+    var items: List[Offered] = []
+    for entry in entries:
+        match spellings.get(entry.name.id.name_number()):
+            Some(label):
+                items = items.append({
+                    label = label,
+                    kind = entry.entity.entity_kind(),
+                    rank = entry.origin.origin_rank()
+                })
+            -- The table issued the id, so its spelling is there.
+            None:
+                void
+    items
+
+
+-- An item for each of a union's variants.
+private pure func variant_items(
+    variants: List[WrittenName],
+    spellings: List[String]
+) -> List[Offered]:
+    var items: List[Offered] = []
+    for variant in variants:
+        match spellings.get(variant.id.name_number()):
+            Some(label):
+                items = items.append({ label = label, kind = EnumMemberItem, rank = DeclaredRank })
+            None:
+                void
+    items
+
+
+private pure func entity_kind(entity: Entity) -> CompletionKind:
+    match entity:
+        Function(_): FunctionItem
+        Method(_): MethodItem
+        Constant(_): ConstantItem
+        Constructor(_): EnumMemberItem
+        Type(RecordHead(_)): StructItem
+        Type(UnionHead(_)): EnumItem
+        Type(OpaqueHead(_) | PrimitiveHead(_) | ListHead): ClassItem
+        Trait(_): InterfaceItem
+        Alias(_): ModuleItem
+
+
+private pure func origin_rank(origin: Origin) -> ItemRank:
+    match origin:
+        Declared(_): DeclaredRank
+        Imported: ImportedRank
+        Implicit: ProvidedRank
+
+
+-- The protocol's CompletionItem for `item`, replacing the text at `range`.
+pure func offered_json(item: Offered, range: Json) -> Json:
+    Object(
+        {
+            "label" => Text(item.label),
+            "kind" => Number(integer(item.kind.kind_number())),
+            "sortText" => Text("${item.rank.rank_digit()}${item.label}"),
+            "textEdit" => Object({ "range" => range, "newText" => Text(item.label) })
+        }
+    )
+```
+
+#### 17b: a value's members and the locals at the cursor
+
+**What the cut meets.** Checking stops at its first error, so a probe
+answers only if its text checks. The cut puts the receiver where the
+member's value was, and most places constrain that value. Each row below is
+a small program with the cut already applied, compiled by an `-O2` build of
+main from 2026-11-22:
+
+| Where the member is typed | After the cut | Result |
+| --- | --- | --- |
+| the last line of a Void function | `name` | checks |
+| a statement in the middle of a body | `name` | `expression statement must return Void` |
+| bound without annotation, unused so far | `n = items` | checks |
+| bound, then used | `n = items` then `n + 1` | `argument type does not match the parameter type` |
+| bound with an annotation | `n: Int = items` | `expression does not match the expected type` |
+| a typed function's result | `name` in `-> Int` | `expression does not match the expected type` |
+| an argument | `size(items)` | `argument type does not match the parameter type` |
+| an `if` condition | `if items:` | `condition must have the designated Bool type` |
+| a `match` scrutinee | `match items:` | `pattern does not match the value's type` |
+| a typed lambda's result | `x` in `-> Int` | `expression does not match the expected type` |
+| a `for` iterable | `for x in items:` | checks |
+| interpolated | `"${name}"`, `"${items}"` | checks for a `String`; for a `List[Int]`, `interpolation hole has type List[Int], which does not implement Stringable` |
+
+`_ = name` is not a statement either (`expected a return expression`). So
+the cut fails on a new line in the middle of a body, which is the most common
+place to type `name.`. It also fails in typed results, arguments, conditions
+and `match` scrutinees. This is why Keith chose option 2 on 2026-11-23,
+"starting with a spike".
+
+The same programs with `.zzz()` in place of the cut show what a probe can
+rely on. The mid-body statement, the typed result, the condition, the
+scrutinee, the lambda's result and a chained call as an argument each fail
+first with `no method zzz for String is in scope` or `... for List[Int] ...`.
+The checker reaches a receiver's member before it compares the member's
+value with its place.
+
+**Option 1: the cut, as Keith chose it.** The probe text is the editor's
+text without the bytes from the dot's start to the prefix's end. The loader
+takes it as the root's snapshot, unchanged.
+- **The receiver** is the innermost `CheckedExpr` of the root whose span
+  ends at the cut. An enclosing expression that also ends there, such as
+  `total + name`, starts earlier. No expression ends there when the receiver
+  is a parenthesized group (`(a + b).`), since Check does not see groups.
+- **Its candidates** come from the root's receiver scope, which `Analysis`
+  would have to keep. Today the scopes end with body checking
+  (`check/model.brp:29`). A new
+  check query applies `admits` (`check/inference.brp:2221`) to a complete
+  type, which is the fitting rule `choose_receiver` (`:2360`) uses.
+- **Locals** need to know where each binding is visible, and nothing records
+  that today. There are two ways:
+  - check records an extent in each `BindingDefinition`
+    (`check/model.brp:958`). That is one fact at the phase that owns scope,
+    but every compile pays for it;
+  - the server walks `CheckedFunctionBody` and derives the scope rule again.
+    That is a second authority for matches, loops and captures, so it is
+    rejected.
+- **A line being written** is not in the root's last checked analysis, so
+  `line_map` would need an insertion point. The end of the previous
+  unchanged line can sit in a block the new line has left by its
+  indentation, so the query would need the cursor's indentation too.
+
+It answers in 3 of the table's 12 rows, and in a fourth when the
+interpolated value is Stringable.
+
+**Option 2: a completion hole (recommended).** The probe keeps the editor's
+text and names the prefix's span as the hole.
+- **Lexing** turns the hole into one `HoleToken` in place of the prefix, so
+  no later phase reads a position.
+- **Parsing** accepts the hole where it requires a name today: as an
+  expression's base (`NameHole`) and as a member after a value
+  (`MemberHole`, at `consume_postfix`, `syntax/parse.brp:1865`).
+- **Checking** checks the body that holds the hole first. When it reaches
+  the hole it stops with what it knows there:
+  - the bindings a read at the hole would accept, which is its own `scope`
+    (`check/scope.brp:44`) without an enclosing body's mutable bindings
+    inside a lambda, since a read there rejects them;
+  - for a member hole: the receiver's type as far as it is known; the names
+    in the module's receiver scope that have a function whose receiver
+    parameter admits it, by `choose_receiver`'s rule without the name; the
+    trait methods the type implements; and a record's fields.
+
+It should answer in every row of the table. The `.zzz()` programs show the
+checker reaching the member before the member's place in six of the rows,
+and the spike checks the others. `join` is offered on a `List[String]` and
+not on a `List[Int]`. The probe
+checks the signatures and only one body, and that body only up to the hole,
+so it may cost less than an analysis; a spike measures it. Locals come from
+the checker's own scope, so it needs no binding extents, no walk in the
+server and no `line_map` query.
+
+It fails only when checking stops before the hole: a load or declaration
+error, or an error earlier in the same body. Then a name site falls back to
+17a, and a member site offers nothing.
+
+It is not error recovery. No phase continues past an error, and the hole is
+a site the caller names, which compilation never does. Lean 4 is the
+closest precedent: its elaborator records completion information at the
+cursor (a dot's receiver and the local context) for the server to read.
+GHC's typed holes report a hole's type and the bindings in scope, and
+Merlin types its recovery holes at any type.
+
+It adds a mechanism to lex, parse and check, and to the loader's root
+snapshot, so `blorp/AGENTS.md` requires Keith's approval. One question
+remains open inside it: how checking stops at the hole. The cheapest way is
+one more `CheckError` case, `HoleReached(CompletionFacts)`. Only
+`analyze_completion` unwraps it, and `render` reports it as a checker
+invariant, since compilation never lexes a hole. The alternative threads a
+probe result through every checking function's return type.
+
+**Rejected: a member that cannot resolve.** Writing a call such as `.zzz()`
+in place of the prefix reaches `NoApplicableMethod`, whose
+`MissingMethod.receiver` (`check/errors.brp:119`) is the receiver's type, in
+each of the six places tested. But it reads a fact out of a failure, and it
+depends on that
+error being the first one checking reports. It also needs a name that no
+function can have. A member must be lower_snake (`syntax/parse.brp:1865`),
+so no spelling is guaranteed never to resolve.
+
+**What both options share.** A completion probe never disturbs the root. It
+is a fourth `Followup`, and the server answers its result without storing
+anything. The root keeps its analysis, its staleness and its published
+diagnostics, because the probe's text is not the document's. `Followup`
+(`lsp/server.brp:246`) gains:
+
+```blorp
+    -- Analyse a completion probe of an open root, with every other open
+    -- document as it is, and hand the result to `probed`.
+    Probe(ProbeRequest)
+
+
+-- A completion request that waits for its probe: the root, the request, and
+-- what the probe analyses in place of the root's text (option 1: the cut
+-- text; option 2: the text and its hole) with the prefix its items replace.
+record ProbeRequest {
+    root: Path,
+    id: RequestId,
+    probe: CompletionProbe
+}
+
+
+-- Answers `asked` from `result` and changes nothing else.
+pure func probed(server: Server, asked: ProbeRequest, result: ProbeResult) -> Step
+```
+
+`perform` (`lsp/lsp_command.brp:120`) gains its fourth arm. It is the only
+impure part of the probe:
+
+```blorp
+        Probe(request):
+            step.server
+                .probed(request, request.probe.probe_result(step.server.snapshots()))
+                .perform()
+```
+
+Under option 2, the syntax (`syntax/syntax.brp:214`, `:365`, `:415`) and
+check's boundary gain:
+
+```blorp
+union TokenKind:
+    ...
+    -- Where an editor asks what may be written. Only lexing that is given a
+    -- hole makes one, in place of the prefix; compilation never does.
+    HoleToken
+
+union ExpressionBase:
+    ...
+    NameHole(Span)
+
+union PostfixOperation:
+    ...
+    MemberHole(Span)
+```
+
+```blorp
+-- What checking knew at the hole, with the scopes that spell it.
+record CompletionFacts {
+    visible: List[VisibleBinding],
+    member: Option[MemberFacts],
+    namespace: Namespace,
+    names: NameTable
+}
+
+
+pure func analyze_completion(program: ParsedProgram) -> Result[CompletionFacts, CheckFailure]
+```
+
+With option 2, a completion request on the root probes and never analyses
+the root. A name site takes its locals and module names from the probe,
+which removes 17a's analysis of a stale root at each new word. A member
+call's snippet needs `completionItem.snippetSupport`, which `initialize`
+reads into the session, as it reads `refreshSupport`.
 
 ### Later
 
@@ -569,8 +1455,10 @@ union Command:
 `src/main.brp` (the `Command` case and overview), `io/console`, the runtime,
 the builtin tables, `editor/`, the README and the tests.
 
-**Not:** completion, hover, rename, formatting through the server, TextMate,
-threads, incremental analysis, or grammar changes.
+**Not:** hover, signature help, rename, formatting through the server,
+TextMate, threads, incremental analysis, or grammar changes. Landing 17 also
+leaves out snippets beyond a call's parentheses, completion inside library
+files, auto-import, and error recovery in the parser or checker.
 
 **Concurrent work:** of the String plan's breaking switch and this work, whichever lands second migrates
 the other's `length` and `slice` uses.
@@ -579,11 +1467,18 @@ the other's `length` and `slice` uses.
 
 - **A client without LSP 3.18's `workspace/textDocumentContent`** gets no
   library locations. VS Code's client has it from 11.0.1.
+- **Completion after an edit analyses the root first in 17a**, as a
+  definition does. VS Code asks once at each new word, so typing in
+  `main.brp` costs about one analysis per word, about 340 ms at `-O2`.
+  Option 2 of 17b replaces that analysis with the probe.
 
 ## Dependencies
 
 - Landing 11 follows 10, 13 follows 12, since only LSP4IJ opened a
   `blorp-library:` file then, and 14 follows 13.
+- 17b follows 17a. Option 2 adds a mechanism to lex, parse and check, which
+  Keith approved on 2026-11-23 with a spike first, which sets its line
+  ceiling.
 
 ## Release strategy
 
@@ -616,6 +1511,15 @@ backs it out; for landing 7, re-pinning the previous seed does.
     answers its `type X = builtin` line in `_base.brp`. A follow-up commit
     has `render`'s import notes reuse `referent_declaration` (Keith,
     2026-11-23).
+17. **Completion** (Keith, 2026-11-23), in two landings. 17a reads only
+    facts the namespace already publishes and changes no checking. 17b adds a
+    probe analysis and the transport's fourth followup, and with option 2 a
+    mechanism in three phases. Each is useful and reviewable alone.
+    - **17a, names and qualifiers:** `completionProvider`, the root's names
+      and keywords, `alias.` and `Union.`. It also fixes the VS Code README's
+      stale limit on built-in types, which landing 16 removed.
+    - **17b, a value's members and the locals at the cursor,** through a
+      completion hole (Keith, 2026-11-23).
 
 **Ceilings** are against the parent commit, on
 `blorp/scripts/self-compile-cost`'s own-source rows unless stated, with test
@@ -642,10 +1546,44 @@ lines counted apart. Compile cost must also fit the e2e instruction ceilings'
 | 15 unchanged opens and closes, fixed input | ≤ +0.1% | ≤ +0.1% | not set | not set |
 | 16 built-in type definitions, fixed input | ≤ +0.3% | ≤ +0.3% | not set | not set |
 | 16 follow-up, notes reuse `referent_declaration`, fixed input | ≤ +0.1%, C identical | ≤ +0.1% | not set | ≤ −90 net |
+| 17a names and qualifiers, fixed input | ≤ +0.1%, C identical | no increase | no increase | ≤ +590 net, from a 512-line sketch |
+| 17b members and locals, fixed input | set with the option; option 2 ≤ +0.1%, C identical | option 2 no increase | option 2 no increase | from a spike |
+
+**17a's line ceiling** comes from its sketch, written out in full with
+comments, blank lines and imports. `completion.brp` was run through
+`blorp format`, which parsed it and laid it out; the sketch was not compiled.
+It counts 512 lines:
+- the new `completion.brp`, 416:
+  - header and imports, 60;
+  - the site's types, 22;
+  - the item types, ranks and kinds, 60;
+  - the keyword list, 34;
+  - `completion`, 52;
+  - the site (`completion_site`, `site_after`, `in_string` and
+    `in_import_block`), 122;
+  - the items (`scope_items`, `variant_items`, `entity_kind`, `origin_rank`
+    and `offered_json`), 65;
+- `server.brp`, 34: the query and its request, the capability and its
+  constant, the `served` arm, the `unanalysed_answer` arm, and
+  `completion_json`;
+- `check.brp`, 29: imports, two fields and three queries;
+- `namespace.brp`, 28: `module_names` and `offered_entries`;
+- `names.brp`, 5: `name_spellings`.
+
+The ceiling, ≤ +590 net, leaves about 15% for what a sketch misses.
+Exceeding it stops the landing for a growth audit, and the coordinator then
+decides whether to cut, accept or rescope the landing.
+
+**Option 2's sketch** for 17b is about +300 in the compiler (lexing 25,
+parsing 40, syntax 15, the loader 25, assembly 15, checking 150, `render` 10,
+`check.brp` 20) and about +250 in the server, before a spike.
 
 **Latency.** Per request after one change, on this host: ≤ 1.0 s for
 `blorp/src/main.brp`, and ≤ 50 ms for a one-module program. Landing 1
-reports `analyze`'s one-shot time on `main.brp` as the baseline.
+reports `analyze`'s one-shot time on `main.brp` as the baseline. A completion
+is held to the same limits, and also to ≤ 50 ms on a current analysis of
+`blorp/src/common/syntax/parse.brp`, the largest compiler file, which it
+lexes in full.
 
 ## Measurements
 
@@ -1659,6 +2597,70 @@ now calling `entity_referent`, a small switch.
   confirmed. Taken: the comment at the call names `declared_entries`'s
   guarantee, and the trait method case above.
 
+**Landing 17a, completion of names and qualifiers** (against `0af133ca1`).
+`self-compile-cost`, `-O2`, 3 rounds, on a machine other sessions share.
+Ceilings: fixed-input instructions ≤ +0.1% with the C identical, no increase
+in allocations or peak heap, production lines ≤ +590 net. Raw samples are
+under `blorp/build/self-compile-cost/0af133ca1-22b15d0e7/`, the log is
+`blorp/build/self-compile-cost-17a.log`.
+
+| Measure | Base | Candidate | Change |
+| --- | ---: | ---: | ---: |
+| Fixed input, allocations | 12,963,961 | 12,963,961 | unchanged |
+| Fixed input, instructions (median) | 13,079,086,279 | 13,064,834,146 | −0.109% |
+| Fixed input, peak heap (requested bytes) | 184,078,076 | 184,078,076 | unchanged |
+| Own source, allocations | 12,963,961 | 13,041,693 | +0.600% |
+| Own source, instructions (median) | 13,072,314,118 | 13,131,097,197 | +0.450% |
+| Own source, peak heap (requested bytes) | 184,078,075 | 184,847,932 | +0.418% |
+| Lines, production and tests | | | +538 and +899 net |
+
+The fixed-input C is identical (`5eaf5a758c1277e3`), so the instruction
+change is noise. The own-source row grows with the 538 new lines and is
+reported, not held.
+
+- **Lines.** Production: `completion.brp` 433, `server.brp` +37, `check.brp`
+  +34, `namespace.brp` +29, `names.brp` +5. The sketch counted 416 for
+  `completion.brp`. Tests: `test_completion.brp` 645, `test_server.brp`
+  +253, the driver's list +1.
+- **Latency** at `-O2` (`blorp/build/blorp` linked with
+  `TEST_COMPILER_FLAGS=-O2`), a fresh `blorp lsp` per run, 3 runs each,
+  from `didOpen` to the reply (`blorp/build/lsp-completion/completion_latency.py`;
+  log `blorp/build/lsp-completion/latency.log`). The first completion waits
+  for the analysis the open staled:
+
+  | Program, cursor at a body's first line | First | Current analysis | Ceiling |
+  | --- | ---: | ---: | --- |
+  | one module (`editor/vscode/test/fixture/completion.brp`), 57 items | 6.0–13.4 ms | 0.3–0.6 ms | 50 ms |
+  | `blorp/src/main.brp`, 80 items | 318–331 ms | 0.3–0.8 ms | 1.0 s |
+  | `blorp/src/common/syntax/parse.brp`, 785 items | 45–48 ms | 5.1–5.5 ms | 50 ms (current) |
+
+- **What changed.** As designed: `Analysis` shares the namespace and the
+  name table; `module_names` lists each entity once and `offered_entries`
+  filters it through `offer`; `completion.brp` reads the site from the
+  lexer's tokens and returns data; the server renders ranges.
+- **Deviations from the sketch.** All found by compiling it.
+  - `ItemRank` and `CompletionKind` are public, because `Offered` is public
+    and holds them.
+  - `MemberAt` is a plain `record`: a `fixed record` field must be inline,
+    and `Option[WrittenName]` is not.
+  - `completion_site` binds the lexer's result once, as a typed tuple,
+    since `None` needs its union type.
+  - `in_import_block` also treats a cursor past the last row's line break,
+    with enough Dedents next to close it to its opening depth, as outside the block, at any nesting. The lexer makes that
+    Dedent at the next code line, so a blank line after the block, or the
+    margin of the next declaration, counted as inside and offered nothing.
+    A new row typed at the end of the block, with code after it, gets the
+    name list: accepted noise.
+- **Tests.** `test_completion.brp`: 27 cases for the sites and the items;
+  `test_server.brp`: ten from real analyses; the `initialize` replies in
+  `test_server.brp` and `cli.brp`; two VS Code checks in `suite.js`. Mutations,
+  one at a time, each failing only its own tests: no member site after a dot
+  (8 completion and server cases about a dot), an alias's Types copy kept
+  (the once-only and repeat cases), an alias target's imports offered (the
+  alias cases), a range that ends at the token's end (the cursor-inside-a-name
+  cases) and a hole's `}` closing its string (the hole case). Logs:
+  `blorp/build/mutation-*.log`.
+
 ## Testing
 
 Each landing starts with a failing test.
@@ -1683,6 +2685,8 @@ Each landing starts with a failing test.
 | 15 | `test/test_lsp/`: an open or close as the text a root read stales none of them, other text and an unreadable close stale them, no refresh goes for an unchanged open or close, and an unchanged close keeps answers into the file. An e2e session in `cli.brp` opens and closes an imported file on the disk. |
 | 16 | `test/test_lsp/`: definition on `Int` is its library location, references list its declaration only on request, and without the capability definition is `null`. `test_name_uses`: `Int`, `Float`, `List`, `String` and `Void` each resolve to their own declaration. |
 | 16 follow-up | No oracle changes. A surface e2e case pins the note for an imported trait method, beside the `Box` one for a union. |
+| 17a | `test/test_lsp/test_completion.brp`, a new suite, which must be added to the `private COMPONENT_SOURCES` list in `blorp/test/driver/driver.brp` (a full run fails on a suite it does not list; the Makefile's `TARGET_COMPONENT_SOURCES` only picks suites to run). Each site: a blank line; a partial name; a cursor inside a name; a comment; inside a quoted string and at its closing quote; after a hole's `}` in a string; a hole in a string; a number; an import block's row, and the first line after the block; `func `, `var ` and `for `; a text that stops lexing before and after the cursor; `"abc".`; `alias.`; `Union.Va`; an indented chain's `.ma`; a dot that ends the line above; `0..`. `test_server.brp`, from real analyses: the exact `initialize` reply. A name site lists a declared function, a private one, an imported one, `print`, a constant, a record, a union and its variant, a trait and the keywords, each with its kind and rank. Each item that is a keyword lexes as one, and `detach` and `builtin` are not offered. An alias is listed once, as a Module. `union Box: Box(Int)` lists `Box` twice, as an Enum and as an EnumMember. The `textEdit` range is correct in UTF-8, and in UTF-16 after an `é`. `alias.` lists the module's public names, its types among them, but not its private names or its imports; `Option.` lists `None` and `Some`; `Int.` and a value's dot list nothing. A failing root answers from its last checked analysis; a root that never checked and a library document get `[]`; a stale root is analysed first. Mutations: drop the dot test; keep an alias's Types copy; offer an alias target's imports; end the range at the token's end; treat a hole's `}` as closing its string. Each fails only its own tests. `editor/vscode`: completion on a blank line of a body lists `helper`, `print` and `match`, and after `Option.` it lists `None` and `Some`. |
+| 17b | Each row of the cut table lists the receiver's members. `join` is offered on a `List[String]` and not on a `List[Int]`. A record's fields come as fields and its functions as calls, with the snippet only for a client that sets `snippetSupport`. A trait method the receiver implements is offered. Locals: a parameter; an earlier local but not a later one; a match capture only inside its arm; a `for` item only inside its loop; inside a lambda, its parameters and the enclosing immutable bindings but not mutable ones. A probe leaves the root's analysis, staleness and diagnostics as they were. When a probe fails before the hole, a name site falls back and a member site offers nothing. An e2e session in `cli.brp` carries a probe through the transport. `editor/vscode`: `name.` typed on a new line in the middle of a body lists `length`. |
 
 **Commands:** those in `blorp/AGENTS.md`, `scripts/blorp-fixpoint --prove`
 for compiler landings, and `make -C blorp test-e2e INSTRUCTION_CHECK=on`
@@ -1719,6 +2723,20 @@ when compile cost changes.
 - [ ] **15.** A Cmd-click into another file and back analyses neither
   program again.
 - [ ] **16.** Cmd-click on `String` opens `_base.brp` at its declaration.
+- [ ] **17a.** This command passes, and each listed mutation fails only its
+  own tests:
+  `make -C blorp test-target-components TARGET_COMPONENT_SOURCES="blorp/test/test_lsp/test_completion.brp blorp/test/test_lsp/test_server.brp"`.
+  `cd editor/vscode && npm test` reports PASS for both completion checks.
+  `blorp/scripts/self-compile-cost` with `--rounds 3` meets 17a's row, with
+  the fixed-input C identical, and completion latency is within its
+  ceilings. In VS Code, Ctrl+Space on a blank line of a body lists the
+  file's functions, `print` and `match`, and `Option.` lists its variants.
+- [ ] **17b.** In VS Code, typing `name.` lists the receiver's members in
+  each of these places: a new line in the middle of a body, a typed
+  function's result, an argument, an `if` condition and a `match`
+  scrutinee. `join` is offered on a `List[String]` and not on a
+  `List[Int]`. Ctrl+Space lists the parameters and the locals declared above
+  the cursor. 17b's tests pass, and its row's ceilings are met.
 - [ ] **Every landing** meets its ceilings, passes `make -C blorp test`, and
   is reviewed and test-run.
 
@@ -1731,6 +2749,7 @@ Stop and ask if:
 - a ceiling is exceeded;
 - the editor shows no colour;
 - a name use needs information the checker has discarded;
-- the console errors conflict with `UINT8_BYTES_PLAN.md`.
+- the console errors conflict with `UINT8_BYTES_PLAN.md`;
+- 17b's probe gives no receiver in a row of the cut table.
 
 Console API changes go to Keith.

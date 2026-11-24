@@ -1,0 +1,645 @@
+---
+Completion: the site each text puts the cursor at, read from the lexer's
+tokens, and the items each site offers, from real analyses. The site tests
+mark the cursor with `¦`, which they remove before lexing.
+---
+import:
+    bool: and, not
+    json: Json(Null, Number, Object, Text), number_text
+    test: TestSuite
+    ../../src/common/analysis/check/check: Analysis, analyze
+    ../../src/common/analysis/load/load: LibrarySource(EmbeddedLibrary), load_program_with_sources
+    ../../src/common/syntax/lex: lex
+    ../../src/common/syntax/names: program_names
+    ../../src/common/syntax/source: SourceFile, module_source, root_module_id
+    ../../src/common/syntax/syntax: Span, TokenKind(KeywordToken)
+    ../../src/lsp/completion:
+        CompletionSite(NoCompletion, NameSite, MemberSite),
+        Completion,
+        Offered,
+        completion,
+        completion_site,
+        offered_json
+    ../support/text_search: find_text, replace_first
+
+
+private CURSOR: String = "¦"
+
+
+-- The offset of the cursor mark in `marked`, and the text without it.
+private pure func without_cursor(marked: String) -> (String, Int):
+    (
+        marked.replace_first(CURSOR, ""),
+        marked
+            .find_text(CURSOR, 0)
+            .get_or(0)
+    )
+
+
+private pure func spelled(text: String, span: Span) -> String:
+    text
+        .slice(span.start, span.end)
+        .get_or("outside the text")
+
+
+-- The site the cursor mark of `marked` is at: `none`, `name:` and the prefix,
+-- or `member`, the qualifier and the prefix.
+private pure func site_of(marked: String) -> String:
+    (text, offset) = marked.without_cursor()
+    match text.completion_site(program_names().names, offset):
+        NoCompletion:
+            "none"
+        NameSite(prefix):
+            "name:${text.spelled(prefix)}"
+        MemberSite(member):
+            qualifier = match member.qualifier:
+                Some(written): text.spelled(written.span)
+                None: "-"
+            "member ${qualifier}:${text.spelled(member.prefix)}"
+
+
+private pure func site_is(marked: String, expected: String) -> Bool:
+    marked.site_of() == expected
+
+
+-- The sites
+
+pure func test_a_blank_spot_and_a_partial_name_are_name_sites() -> Bool:
+    and(
+        and("¦".site_is("name:"), "func f() -> Int:\n    ¦\n".site_is("name:")),
+        and(
+            "func f() -> Int:\n    pri¦\n".site_is("name:pri"),
+            "func f() -> Int:\n    print¦\n".site_is("name:print")
+        )
+    )
+
+
+-- The prefix is the part before the cursor, so a cursor inside a word does
+-- not replace the rest.
+pure func test_a_cursor_inside_a_name_takes_the_part_before_it() -> Bool:
+    "func f() -> Int:\n    pr¦int(1)\n".site_is("name:pr")
+
+
+pure func test_a_keyword_is_a_prefix_too() -> Bool:
+    "func f() -> Int:\n    ma¦\n".site_is("name:ma")
+
+
+pure func test_a_comment_offers_nothing_up_to_its_line_end() -> Bool:
+    and(
+        and("-- note¦\n".site_is("none"), "-- no¦te\n".site_is("none")),
+        and("-- note\n¦".site_is("name:"), "x = 1 -- note¦\n".site_is("none"))
+    )
+
+
+pure func test_a_quoted_string_offers_nothing_inside_and_a_name_after() -> Bool:
+    and(
+        and("x = \"ab¦c\"\n".site_is("none"), "x = \"¦abc\"\n".site_is("none")),
+        and("x = \"abc\"¦\n".site_is("name:"), "x = 'a¦'\n".site_is("none"))
+    )
+
+
+-- A hole's closing brace holds the cursor in its string; a name inside the
+-- hole is a name site.
+pure func test_a_hole_in_a_string_is_a_name_site_and_its_closing_brace_is_in_the_string() -> Bool:
+    and(
+        and("x = \"a$\{b}¦c\"\n".site_is("none"), "x = \"a$\{pr¦}\"\n".site_is("name:pr")),
+        "x = \"a$\{b}c\"¦\n".site_is("name:")
+    )
+
+
+pure func test_a_number_offers_nothing_at_or_inside_it() -> Bool:
+    and(
+        and("x = 12¦\n".site_is("none"), "x = 1¦2\n".site_is("none")),
+        and("x = 1.5¦\n".site_is("none"), "x = 12 ¦\n".site_is("name:"))
+    )
+
+
+pure func test_an_import_block_offers_nothing_and_the_line_after_it_does() -> Bool:
+    block = "import:\n    ./helpers as helpers: one\n"
+    and(
+        and(
+            "import:\n    ./helpers as ¦helpers: one\n".site_is("none"),
+            "import:\n    ./helpers as helpers: one¦\n".site_is("none")
+        ),
+        and(
+            and(
+                "${block}\n\n¦func main() -> Int:\n    0\n".site_is("name:"),
+                "${block}\n¦\nfunc main() -> Int:\n    0\n".site_is("name:")
+            ),
+            and(
+                "${block}\n\nfunc main() -> Int:\n    pr¦\n".site_is("name:pr"),
+                "import:\n    ./helpers as helpers: one¦\nfunc main() -> Int:\n    0\n".site_is(
+                    "none"
+                )
+            )
+        )
+    )
+
+
+-- A row group written over several lines closes with one Dedent per level, so
+-- a cursor past its last line break is outside however deep it nested.
+pure func test_a_nested_import_block_is_closed_after_its_last_row() -> Bool:
+    block = "import:\n    list: repeat\n    ./helpers:\n        one,\n        two\n"
+    and(
+        and(
+            "${block}\n¦\nfunc main() -> Int:\n    0\n".site_is("name:"),
+            "${block}\n\n¦func main() -> Int:\n    0\n".site_is("name:")
+        ),
+        and(
+            "import:\n    ./helpers:\n        one,\n        tw¦o\n".site_is("none"),
+            "import:\n    ./helpers:\n        one,\n        two¦\nfunc main() -> Int:\n    0\n".site_is(
+                "none"
+            )
+        )
+    )
+
+
+-- `for` also starts an implementation's type, which gets nothing too.
+pure func test_a_word_that_declares_a_name_is_followed_by_nothing() -> Bool:
+    and(
+        and("func ¦".site_is("none"), "func f() -> Int:\n    var ¦\n".site_is("none")),
+        and(
+            "func f() -> Int:\n    for ¦\n".site_is("none"),
+            "implements Sized for ¦\n".site_is("none")
+        )
+    )
+
+
+pure func test_the_other_declaring_words_are_followed_by_nothing() -> Bool:
+    and(
+        and("record ¦".site_is("none"), "union ¦".site_is("none")),
+        and(
+            and("trait ¦".site_is("none"), "type ¦".site_is("none")),
+            and("opaque ¦".site_is("none"), "import:\n    a as ¦\n".site_is("none"))
+        )
+    )
+
+
+-- `in` does not declare the name that follows it.
+pure func test_a_word_that_does_not_declare_is_followed_by_a_name_site() -> Bool:
+    "func f() -> Int:\n    for x in ¦\n".site_is("name:")
+
+
+-- The first error is at the `$` of line 2. Before it the tokens are read as
+-- usual; at it and past it nothing is offered.
+pure func test_a_text_that_stops_lexing_offers_nothing_at_or_past_the_error() -> Bool:
+    and(
+        and("x = pr¦\ny = $\n".site_is("name:pr"), "x = 1\ny = ¦$\n".site_is("none")),
+        and("x = 1\ny = $\nz = ¦\n".site_is("none"), "x = 1\ny = $¦\n".site_is("none"))
+    )
+
+
+pure func test_a_dot_after_a_non_name_is_a_member_with_no_qualifier() -> Bool:
+    and("x = \"abc\".¦\n".site_is("member -:"), "x = (1).¦\n".site_is("member -:"))
+
+
+pure func test_a_dot_against_a_name_is_a_member_with_it_as_qualifier() -> Bool:
+    and(
+        and(
+            "x = helpers.¦\n".site_is("member helpers:"),
+            "x = Shape.Do¦\n".site_is("member Shape:Do")
+        ),
+        "x = helpers. ¦\n".site_is("member helpers:")
+    )
+
+
+-- Newline and Indent are tokens: a dot that starts an indented line is a
+-- member, and a dot that ends the line above is not right before the cursor.
+pure func test_a_chain_dot_at_a_line_start_is_a_member_and_one_ending_a_line_is_not() -> Bool:
+    and(
+        "func f() -> Int:\n    x\n        .ma¦\n".site_is("member -:ma"),
+        "x = y.\n¦".site_is("name:")
+    )
+
+
+-- `..` and `...` are symbols of their own, not a dot.
+pure func test_a_range_is_not_a_member() -> Bool:
+    and(
+        "func f() -> Int:\n    for i in 0..¦\n".site_is("name:"),
+        "func f() -> Int:\n    for i in 0...¦\n".site_is("name:")
+    )
+
+
+-- The items
+
+private ROOT: String = "/work/shapes.brp"
+
+private HELPERS: String = "/work/helpers.brp"
+
+
+private HELPERS_TEXT: String =
+    |import:
+    |    list: repeat
+    |
+    |
+    |pure func one() -> Int:
+    |    1
+    |
+    |
+    |pure func two() -> Int:
+    |    2
+    |
+    |
+    |private pure func secret() -> Int:
+    |    3
+    |
+    |
+    |record Pair {
+    |    left: Int
+    |}
+    |
+    |
+    |trait Named:
+    |    pure func label(value: Self) -> String
+    |
+    |
+    |NINE: Int = 9
+
+
+private ROOT_TEXT: String =
+    |import:
+    |    ./helpers as helpers: one
+    |
+    |
+    |record Point {
+    |    x: Int
+    |}
+    |
+    |
+    |union Shape:
+    |    Dot
+    |    Circle(Int)
+    |
+    |
+    |union Box:
+    |    Box(Int)
+    |
+    |
+    |trait Sized:
+    |    pure func size(value: Self) -> Int
+    |
+    |
+    |LIMIT: Int = 10
+    |
+    |
+    |private pure func hidden() -> Int:
+    |    1
+    |
+    |
+    |pure func area(shape: Shape) -> Int:
+    |    match shape:
+    |        Dot: 0
+    |        Circle(radius): radius
+    |
+    |
+    |func main() -> Int:
+    |    print("hi")
+    |    0
+
+
+private pure func source(path: String, contents: String) -> SourceFile:
+    { path = path, contents = contents }
+
+
+-- The root's analysis, beside HELPERS and the embedded library.
+private func analysed_root() -> Option[Analysis]:
+    sources = [source(ROOT, ROOT_TEXT), source(HELPERS, HELPERS_TEXT)]
+    match load_program_with_sources(ROOT, EmbeddedLibrary, sources):
+        Ok(loaded):
+            match analyze(loaded.program):
+                Ok(analysis): Some(analysis)
+                Err(_): None
+        Err(_):
+            None
+
+
+private pure func shown(field: Option[Json]) -> String:
+    match field:
+        Some(Text(text)): text
+        Some(Number(value)): value.number_text()
+        _: "missing"
+
+
+-- An item as a client reads its JSON: its label, kind and sortText.
+private pure func fields(item: Offered) -> (String, String, String):
+    match item.offered_json(Null):
+        Object(sent):
+            (shown(sent.get("label")), shown(sent.get("kind")), shown(sent.get("sortText")))
+        _:
+            ("not an object", "", "")
+
+
+private pure func row(item: Offered) -> String:
+    (label, kind, sort) = item.fields()
+    "${label} ${kind} ${sort}"
+
+
+-- The completion at the cursor mark of `marked`, the editor's text, from the
+-- root's analysis of ROOT_TEXT. None where nothing completes.
+private func completed(marked: String) -> Option[Completion]:
+    match analysed_root():
+        Some(analysis):
+            (text, offset) = marked.without_cursor()
+            text.completion(offset, analysis)
+        None:
+            None
+
+
+-- The items' rows, or `none` where nothing completes.
+private func rows_at(marked: String) -> List[String]:
+    match marked.completed():
+        Some(offering): offering.items.map(row)
+        None: ["none"]
+
+
+-- Whether `rows` holds exactly `expected`, in any order.
+private pure func holds_exactly(rows: List[String], expected: List[String]) -> Bool:
+    and(
+        rows.length() == expected.length(),
+        expected.all(pure func(wanted: String) -> Bool: rows.contains(wanted))
+    )
+
+
+private pure func labelled(rows: List[String], label: String) -> List[String]:
+    rows.filter(pure func(shown_row: String) -> Bool: shown_row.starts_with("${label} "))
+
+
+func test_a_name_site_lists_each_name_the_module_can_write_with_its_kind_and_rank() -> Bool:
+    rows = "func f() -> Int:\n    ¦\n".rows_at()
+    expected = [
+        "area 3 1area",
+        "hidden 3 1hidden",
+        "main 3 1main",
+        "LIMIT 21 1LIMIT",
+        "Point 22 1Point",
+        "Shape 13 1Shape",
+        "Circle 20 1Circle",
+        "Dot 20 1Dot",
+        "Sized 8 1Sized",
+        "size 2 1size",
+        "one 3 2one",
+        "helpers 9 2helpers",
+        "print 3 3print",
+        "Option 13 3Option",
+        "None 20 3None",
+        "Int 7 3Int",
+        "match 14 4match",
+        "func 14 4func"
+    ]
+    expected.all(pure func(wanted: String) -> Bool: rows.contains(wanted))
+
+
+-- The alias claims its spelling in both spaces, and is listed once. `Box` is a
+-- type and a constructor, two entities.
+func test_an_alias_is_listed_once_and_a_type_and_its_constructor_both() -> Bool:
+    rows = "¦".rows_at()
+    and(
+        rows.labelled("helpers") == ["helpers 9 2helpers"],
+        rows
+            .labelled("Box")
+            .holds_exactly(["Box 13 1Box", "Box 20 1Box"])
+    )
+
+
+-- An item for each entity: no row repeats.
+func test_no_item_repeats() -> Bool:
+    rows = "¦".rows_at()
+    rows.all(
+        pure func(shown_row: String) -> Bool: (
+            rows
+                .filter(pure func(other: String) -> Bool: other == shown_row)
+                .length()
+            == 1
+        )
+    )
+
+
+-- The labels of the keyword items at the cursor mark of `marked`.
+private func keywords_at(marked: String) -> List[String]:
+    match marked.completed():
+        Some(offering):
+            offering.items
+                .map(fields)
+                .filter(pure func(item: (String, String, String)) -> Bool: item[1] == KEYWORD_KIND)
+                .map(pure func(item: (String, String, String)) -> String: item[0])
+        None:
+            []
+
+
+-- LSP 3.17's CompletionItemKind.Keyword.
+private KEYWORD_KIND: String = "14"
+
+
+private pure func lexes_as_a_keyword(word: String) -> Bool:
+    match lex(module_source(root_module_id()), word, program_names().names):
+        Ok(lexed):
+            match lexed.tokens.get(0):
+                Some(first):
+                    match first.kind:
+                        KeywordToken(_): True
+                        _: False
+                None:
+                    False
+        Err(_):
+            False
+
+
+-- `detach` is reserved for a form the compiler does not read, `builtin` is the
+-- base's alone, and `fixed`, `methods` and `tail_recursive` are names the
+-- parser knows by id.
+func test_each_offered_keyword_lexes_as_one_and_the_rest_are_not_offered() -> Bool:
+    words = "¦".keywords_at()
+    withheld = ["detach", "builtin", "fixed", "methods", "tail_recursive"]
+    and(
+        and(not(words.is_empty()), words.all(lexes_as_a_keyword)),
+        and(
+            withheld.all(pure func(word: String) -> Bool: not(words.contains(word))),
+            and(words.contains("match"), words.contains("from_opaque"))
+        )
+    )
+
+
+func test_an_alias_offers_the_modules_public_names_each_once() -> Bool:
+    rows = "x = helpers.¦\n".rows_at()
+    rows.holds_exactly([
+        "one 3 1one",
+        "two 3 1two",
+        "Pair 22 1Pair",
+        "Named 8 1Named",
+        "label 2 1label",
+        "NINE 21 1NINE"
+    ])
+
+
+-- `secret` is private and `repeat` is imported there: neither is offered.
+func test_an_alias_does_not_offer_private_names_or_the_modules_imports() -> Bool:
+    rows = "x = helpers.¦\n".rows_at()
+    and(
+        rows
+            .labelled("secret")
+            .is_empty(),
+        rows
+            .labelled("repeat")
+            .is_empty()
+    )
+
+
+func test_a_union_offers_its_variants() -> Bool:
+    and(
+        "x = Option.¦\n"
+            .rows_at()
+            .holds_exactly(["None 20 1None", "Some 20 1Some"]),
+        "x = Shape.Ci¦\n"
+            .rows_at()
+            .holds_exactly(["Dot 20 1Dot", "Circle 20 1Circle"])
+    )
+
+
+-- The qualifier is a type that is not a union, a function, a value the scope
+-- does not hold, or nothing the namespace knows.
+func test_other_members_offer_nothing_until_values_are_known() -> Bool:
+    and(
+        and(
+            "x = Int.¦\n"
+                .rows_at()
+                .is_empty(),
+            "x = Point.¦\n"
+                .rows_at()
+                .is_empty()
+        ),
+        and(
+            and(
+                "x = print.¦\n"
+                    .rows_at()
+                    .is_empty(),
+                "x = LIMIT.¦\n"
+                    .rows_at()
+                    .is_empty()
+            ),
+            and(
+                "x = \"abc\".¦\n"
+                    .rows_at()
+                    .is_empty(),
+                "x = nothing.¦\n"
+                    .rows_at()
+                    .is_empty()
+            )
+        )
+    )
+
+
+func test_nowhere_to_complete_gives_none() -> Bool:
+    and(
+        "-- note¦\n"
+            .completed()
+            .is_none(),
+        "x = \"a¦b\"\n"
+            .completed()
+            .is_none()
+    )
+
+
+-- The items replace the word before the cursor.
+func test_the_items_replace_the_word_before_the_cursor() -> Bool:
+    marked = "func f() -> Int:\n    pr¦int(1)\n"
+    (text, _) = marked.without_cursor()
+    match marked.completed():
+        Some(offering): text.spelled(offering.prefix) == "pr"
+        None: False
+
+
+TESTS: TestSuite = {
+    description = "LSP completion",
+    tests = [
+        (
+            "a blank spot and a partial name are name sites",
+            test_a_blank_spot_and_a_partial_name_are_name_sites
+        ),
+        (
+            "a cursor inside a name takes the part before it",
+            test_a_cursor_inside_a_name_takes_the_part_before_it
+        ),
+        ("a keyword is a prefix too", test_a_keyword_is_a_prefix_too),
+        (
+            "a comment offers nothing up to its line end",
+            test_a_comment_offers_nothing_up_to_its_line_end
+        ),
+        (
+            "a quoted string offers nothing inside and a name after",
+            test_a_quoted_string_offers_nothing_inside_and_a_name_after
+        ),
+        (
+            "a hole in a string is a name site and its closing brace is in the string",
+            test_a_hole_in_a_string_is_a_name_site_and_its_closing_brace_is_in_the_string
+        ),
+        ("a number offers nothing at or inside it", test_a_number_offers_nothing_at_or_inside_it),
+        (
+            "an import block offers nothing and the line after it does",
+            test_an_import_block_offers_nothing_and_the_line_after_it_does
+        ),
+        (
+            "a nested import block is closed after its last row",
+            test_a_nested_import_block_is_closed_after_its_last_row
+        ),
+        (
+            "a word that declares a name is followed by nothing",
+            test_a_word_that_declares_a_name_is_followed_by_nothing
+        ),
+        (
+            "the other declaring words are followed by nothing",
+            test_the_other_declaring_words_are_followed_by_nothing
+        ),
+        (
+            "a word that does not declare is followed by a name site",
+            test_a_word_that_does_not_declare_is_followed_by_a_name_site
+        ),
+        (
+            "a text that stops lexing offers nothing at or past the error",
+            test_a_text_that_stops_lexing_offers_nothing_at_or_past_the_error
+        ),
+        (
+            "a dot after a non-name is a member with no qualifier",
+            test_a_dot_after_a_non_name_is_a_member_with_no_qualifier
+        ),
+        (
+            "a dot against a name is a member with it as qualifier",
+            test_a_dot_against_a_name_is_a_member_with_it_as_qualifier
+        ),
+        (
+            "a chain dot at a line start is a member and one ending a line is not",
+            test_a_chain_dot_at_a_line_start_is_a_member_and_one_ending_a_line_is_not
+        ),
+        ("a range is not a member", test_a_range_is_not_a_member),
+        (
+            "a name site lists each name the module can write with its kind and rank",
+            test_a_name_site_lists_each_name_the_module_can_write_with_its_kind_and_rank
+        ),
+        (
+            "an alias is listed once and a type and its constructor both",
+            test_an_alias_is_listed_once_and_a_type_and_its_constructor_both
+        ),
+        ("no item repeats", test_no_item_repeats),
+        (
+            "each offered keyword lexes as one and the rest are not offered",
+            test_each_offered_keyword_lexes_as_one_and_the_rest_are_not_offered
+        ),
+        (
+            "an alias offers the modules public names each once",
+            test_an_alias_offers_the_modules_public_names_each_once
+        ),
+        (
+            "an alias does not offer private names or the modules imports",
+            test_an_alias_does_not_offer_private_names_or_the_modules_imports
+        ),
+        ("a union offers its variants", test_a_union_offers_its_variants),
+        (
+            "other members offer nothing until values are known",
+            test_other_members_offer_nothing_until_values_are_known
+        ),
+        ("nowhere to complete gives none", test_nowhere_to_complete_gives_none),
+        (
+            "the items replace the word before the cursor",
+            test_the_items_replace_the_word_before_the_cursor
+        )
+    ]
+}

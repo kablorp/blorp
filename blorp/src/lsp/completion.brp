@@ -1,0 +1,433 @@
+---
+Completion: what may be written at a position of the root's text. The lexer's
+tokens around the cursor say what is being written, and the analysis's
+namespace says which names the module can write there. Pure: the server
+renders the items' ranges.
+---
+import:
+    bool: and, not, or
+    json: Json(Number, Object, Text), integer
+    ../common/analysis/check/check: Analysis, analysis_names, analysis_namespace, variant_names
+    ../common/analysis/namespace/namespace:
+        Entity(Alias, Constant, Constructor, Function, Method, Trait, Type),
+        Entry,
+        NamedType,
+        NamedValue(NamedAlias),
+        Origin(Declared, Imported, Implicit),
+        TypeHead(ListHead, OpaqueHead, PrimitiveHead, RecordHead, UnionHead),
+        module_names,
+        named_type,
+        named_value,
+        offered_entries
+    ../common/syntax/lex: lex
+    ../common/syntax/names: NameTable, name_number, name_spellings
+    ../common/syntax/source: module_source, root_module_id
+    ../common/syntax/syntax:
+        Comment,
+        Keyword(
+            AsKeyword,
+            ForKeyword,
+            FunctionKeyword,
+            ImportKeyword,
+            OpaqueKeyword,
+            RecordKeyword,
+            TraitKeyword,
+            TypeKeyword,
+            UnionKeyword,
+            VarKeyword
+        ),
+        LexedProgram,
+        Span,
+        Spacing(Adjacent),
+        Symbol(Dedent, Dot, Indent, Newline),
+        Token,
+        TokenKind(
+            IdentifierToken,
+            KeywordToken,
+            SymbolToken,
+            IntegerLiteral,
+            FloatLiteral,
+            QuotedString,
+            PipeString,
+            StringStart,
+            StringSegment,
+            InterpolationClose,
+            StringEnd,
+            CharLiteral
+        ),
+        WrittenName
+
+
+-- What the editor's text says is being written at the cursor, read from its
+-- tokens.
+union CompletionSite:
+    -- Nothing completes here: in a comment, a string, a number or an import
+    -- block, after a word that declares a new name, or at or past where
+    -- lexing stopped.
+    NoCompletion
+    -- A name. The span is the prefix an item replaces: the part before the
+    -- cursor of the identifier or keyword the cursor is in or ends, else empty
+    -- at the cursor.
+    NameSite(Span)
+    -- A member, after a `.`.
+    MemberSite(MemberAt)
+
+
+record MemberAt {
+    -- The identifier written against the dot's left, if there is one: an
+    -- alias, a union or a value, as the namespace says.
+    qualifier: Option[WrittenName],
+    prefix: Span
+}
+
+
+-- What a site allows: the items, each replacing `prefix`.
+record Completion {
+    prefix: Span,
+    items: List[Offered]
+}
+
+
+-- One item: the label it shows and inserts, its kind and its rank.
+record Offered {
+    label: String,
+    kind: CompletionKind,
+    rank: ItemRank
+}
+
+
+-- Where an offered name comes from, nearest first. An item's sortText leads
+-- with its rank's digit, then its label, so the order is total.
+union ItemRank:
+    DeclaredRank
+    ImportedRank
+    ProvidedRank
+    KeywordRank
+
+
+private pure func rank_digit(rank: ItemRank) -> String:
+    match rank:
+        DeclaredRank: "1"
+        ImportedRank: "2"
+        ProvidedRank: "3"
+        KeywordRank: "4"
+
+
+-- The protocol's CompletionItemKind of each item 17a offers.
+union CompletionKind:
+    MethodItem
+    FunctionItem
+    ClassItem
+    InterfaceItem
+    ModuleItem
+    EnumItem
+    KeywordItem
+    EnumMemberItem
+    ConstantItem
+    StructItem
+
+
+-- Each kind's number in LSP 3.17.
+private pure func kind_number(kind: CompletionKind) -> Int:
+    match kind:
+        MethodItem: 2
+        FunctionItem: 3
+        ClassItem: 7
+        InterfaceItem: 8
+        ModuleItem: 9
+        EnumItem: 13
+        KeywordItem: 14
+        EnumMemberItem: 20
+        ConstantItem: 21
+        StructItem: 22
+
+
+-- The keywords of the forms the compiler reads, as a writer spells them; not
+-- `builtin`, which only the base writes, nor the words the lexer reserves for
+-- forms it does not read. `word_kind` is the one spelling map: a test checks
+-- that each lexes as a keyword. `fixed`, `methods` and `tail_recursive` are
+-- names the parser recognises by seeded id, not keywords, and are not offered.
+private OFFERED_KEYWORDS: List[String] = [
+    "as",
+    "break",
+    "continue",
+    "else",
+    "for",
+    "from_opaque",
+    "func",
+    "if",
+    "implements",
+    "import",
+    "in",
+    "into_opaque",
+    "match",
+    "opaque",
+    "private",
+    "pure",
+    "record",
+    "resource",
+    "scoped",
+    "trait",
+    "type",
+    "union",
+    "var",
+    "void",
+    "while"
+]
+
+
+-- What may be written at `offset` of `text`, the root as the editor shows it,
+-- from `analysis`, the root's latest analysis that checked. None where nothing
+-- completes.
+pure func completion(text: String, offset: Int, analysis: Analysis) -> Option[Completion]:
+    namespace = analysis.analysis_namespace()
+    names = analysis.analysis_names()
+    -- Spelled once: `name_spelling` copies the table's keys per call.
+    spellings = names.name_spellings()
+    root = root_module_id()
+    match text.completion_site(names, offset):
+        NoCompletion:
+            None
+        NameSite(prefix):
+            keywords = OFFERED_KEYWORDS.map(
+                pure func(word: String) -> Offered: {
+                    label = word,
+                    kind = KeywordItem,
+                    rank = KeywordRank
+                }
+            )
+            Some({
+                prefix = prefix,
+                items = namespace
+                    .module_names(root)
+                    .scope_items(spellings)
+                    .concat(keywords)
+            })
+        MemberSite(member):
+            items: List[Offered] = match member.qualifier:
+                Some(qualifier):
+                    match namespace.named_value(root, qualifier.id):
+                        Some(NamedAlias(aliased)):
+                            namespace
+                                .offered_entries(aliased.target)
+                                .scope_items(spellings)
+                        _:
+                            named: Option[TypeHead] = namespace
+                                .named_type(root, qualifier.id)
+                                .map(pure func(found: NamedType) -> TypeHead: found.head)
+                            match named:
+                                Some(UnionHead(id)):
+                                    analysis
+                                        .variant_names(id)
+                                        .variant_items(spellings)
+                                -- A value, a function or another type.
+                                _:
+                                    []
+                -- A value's members come in 17b.
+                None:
+                    []
+            Some({ prefix = member.prefix, items = items })
+
+
+-- The site at `offset`, from the tokens `names` lexes `text` to. `names` is
+-- the analysis's table, so a qualifier the analysis knows keeps its id.
+pure func completion_site(text: String, names: NameTable, offset: Int) -> CompletionSite:
+    source = module_source(root_module_id())
+    -- A text that does not lex keeps the tokens before its first error, which
+    -- say nothing about what follows it.
+    read: (LexedProgram, Option[Int]) = match lex(source, text, names):
+        Ok(whole): (whole, None)
+        Err(failure): (failure.prefix, Some(failure.error.span.start))
+    (lexed, stopped) = read
+    tokens = lexed.tokens
+    -- How many tokens start before the cursor: the last of them is the one the
+    -- cursor is in or follows.
+    var reached = 0
+    for token in tokens:
+        if token.span.start >= offset:
+            break
+        reached = reached + 1
+    beyond: Bool = match stopped:
+        Some(start): offset >= start
+        None: False
+    -- Comments are not tokens; a comment's span stops before its LF.
+    commented = lexed.comments.any(
+        pure func(comment: Comment) -> Bool: and(
+            comment.span.start < offset,
+            offset <= comment.span.end
+        )
+    )
+    if or(or(beyond, commented), tokens.in_import_block(reached)):
+        NoCompletion
+    else:
+        empty: Span = { source = source, start = offset, end = offset }
+        match tokens.get(reached - 1):
+            None:
+                NameSite(empty)
+            Some(last):
+                if last.span.end < offset:
+                    -- A space or a line break separates the cursor from `last`.
+                    tokens.site_after(reached - 1, empty)
+                else:
+                    match last.kind:
+                        IdentifierToken(_, _) | KeywordToken(_):
+                            tokens.site_after(reached - 2, { last.span | end = offset })
+                        IntegerLiteral(_) | FloatLiteral(_):
+                            NoCompletion
+                        _:
+                            if last.in_string(offset):
+                                NoCompletion
+                            else:
+                                -- A symbol, such as `.`, `..` or `${`, or a closing
+                                -- quote, ends at the cursor.
+                                tokens.site_after(reached - 1, empty)
+
+
+-- The site whose prefix is `prefix`, when `tokens[index]` is written right
+-- before it: a member after a dot, nothing after a word that declares a new
+-- name, else a name. Newline, Indent and Dedent are tokens, so a dot that ends
+-- the line above is not right before the prefix.
+private pure func site_after(tokens: List[Token], index: Int, prefix: Span) -> CompletionSite:
+    match tokens.get(index):
+        None:
+            NameSite(prefix)
+        Some(written):
+            match written.kind:
+                SymbolToken(Dot):
+                    qualifier: Option[WrittenName] = match tokens.get(index - 1):
+                        Some(left):
+                            match (left.kind, written.spacing):
+                                (IdentifierToken(id, _), Adjacent):
+                                    Some({ id = id, span = left.span })
+                                _:
+                                    None
+                        None:
+                            None
+                    MemberSite({ qualifier = qualifier, prefix = prefix })
+                KeywordToken(FunctionKeyword | VarKeyword | ForKeyword | RecordKeyword | UnionKeyword | TraitKeyword | TypeKeyword | OpaqueKeyword | AsKeyword):
+                    NoCompletion
+                _:
+                    NameSite(prefix)
+
+
+-- Whether `offset` is inside the string `token` is a piece of. A piece that
+-- closes its string ends before the cursor at its end; any other piece,
+-- including a hole's closing brace, holds the cursor at its end.
+private pure func in_string(token: Token, offset: Int) -> Bool:
+    after_start = token.span.start < offset
+    match token.kind:
+        QuotedString(_) | StringEnd | CharLiteral:
+            and(after_start, offset < token.span.end)
+        PipeString(_) | StringStart(_) | StringSegment(_) | InterpolationClose:
+            and(after_start, offset <= token.span.end)
+        _:
+            False
+
+
+-- Whether the first `reached` tokens end inside an import block: after an
+-- `import` at the margin, before the Dedent that closes its rows. Import
+-- blocks come first (the grammar's `import_block` rule); a block the text
+-- never closes runs to its end.
+private pure func in_import_block(tokens: List[Token], reached: Int) -> Bool:
+    var depth = 0
+    var inside: Bool = False
+    for position in 0..reached:
+        match tokens.get(position):
+            Some(token):
+                match token.kind:
+                    KeywordToken(ImportKeyword):
+                        if depth == 0:
+                            inside = True
+                    SymbolToken(Indent):
+                        depth = depth + 1
+                    SymbolToken(Dedent):
+                        depth = depth - 1
+                        if depth == 0:
+                            inside = False
+                    _:
+                        void
+            None:
+                void
+    -- The Dedents that close the block are made at the next code line, which can
+    -- be below blank lines. A cursor past the last row's line break, with
+    -- enough Dedents next to bring the block back to its opening depth, is
+    -- already outside it.
+    var dedents = 0
+    for token in tokens.drop(reached):
+        match token.kind:
+            SymbolToken(Dedent): dedents = dedents + 1
+            _: break
+    closing: Bool = match tokens.get(reached - 1):
+        Some(previous):
+            match previous.kind:
+                SymbolToken(Newline): dedents >= depth
+                _: False
+        None:
+            False
+    and(inside, not(closing))
+
+
+-- An item for each entry, spelled from `spellings`, the analysis's names by id.
+-- `module_names` and `offered_entries` list each entity once, and a spelling
+-- names at most one entity per space, so each label and kind is one item.
+private pure func scope_items(entries: List[Entry], spellings: List[String]) -> List[Offered]:
+    var items: List[Offered] = []
+    for entry in entries:
+        match spellings.get(entry.name.id.name_number()):
+            Some(label):
+                items = items.append({
+                    label = label,
+                    kind = entry.entity.entity_kind(),
+                    rank = entry.origin.origin_rank()
+                })
+            -- The table issued the id, so its spelling is there.
+            None:
+                void
+    items
+
+
+-- An item for each of a union's variants.
+private pure func variant_items(
+    variants: List[WrittenName],
+    spellings: List[String]
+) -> List[Offered]:
+    var items: List[Offered] = []
+    for variant in variants:
+        match spellings.get(variant.id.name_number()):
+            Some(label):
+                items = items.append({ label = label, kind = EnumMemberItem, rank = DeclaredRank })
+            None:
+                void
+    items
+
+
+private pure func entity_kind(entity: Entity) -> CompletionKind:
+    match entity:
+        Function(_): FunctionItem
+        Method(_): MethodItem
+        Constant(_): ConstantItem
+        Constructor(_): EnumMemberItem
+        Type(RecordHead(_)): StructItem
+        Type(UnionHead(_)): EnumItem
+        Type(OpaqueHead(_) | PrimitiveHead(_) | ListHead): ClassItem
+        Trait(_): InterfaceItem
+        Alias(_): ModuleItem
+
+
+private pure func origin_rank(origin: Origin) -> ItemRank:
+    match origin:
+        Declared(_): DeclaredRank
+        Imported: ImportedRank
+        Implicit: ProvidedRank
+
+
+-- The protocol's CompletionItem for `item`, replacing the text at `range`.
+pure func offered_json(item: Offered, range: Json) -> Json:
+    Object(
+        {
+            "label" => Text(item.label),
+            "kind" => Number(integer(item.kind.kind_number())),
+            "sortText" => Text("${item.rank.rank_digit()}${item.label}"),
+            "textEdit" => Object({ "range" => range, "newText" => Text(item.label) })
+        }
+    )

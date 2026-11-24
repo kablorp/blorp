@@ -40,6 +40,7 @@ import:
         start_server
     ../driver/file_access: read_file
     ../driver/harness: LIBRARY_ROOT
+    ../support/text_search: has_text
 
 
 private pure func json(text: String) -> Json:
@@ -179,7 +180,7 @@ private pure func initialized_reply(encoding: String) -> String:
 
 -- The reply with `extra` capabilities after the references provider.
 private pure func initialized_reply_with(encoding: String, extra: String) -> String:
-    "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"capabilities\":{\"positionEncoding\":\"${encoding}\",\"textDocumentSync\":{\"openClose\":true,\"change\":1},\"semanticTokensProvider\":{\"legend\":{\"tokenTypes\":[\"namespace\",\"type\",\"interface\",\"enumMember\",\"typeParameter\",\"parameter\",\"variable\",\"property\",\"function\",\"method\",\"keyword\",\"comment\",\"string\",\"number\",\"operator\"],\"tokenModifiers\":[\"declaration\",\"readonly\",\"defaultLibrary\",\"documentation\"]},\"full\":true},\"definitionProvider\":true,\"referencesProvider\":true${extra}}}}"
+    "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"capabilities\":{\"positionEncoding\":\"${encoding}\",\"textDocumentSync\":{\"openClose\":true,\"change\":1},\"semanticTokensProvider\":{\"legend\":{\"tokenTypes\":[\"namespace\",\"type\",\"interface\",\"enumMember\",\"typeParameter\",\"parameter\",\"variable\",\"property\",\"function\",\"method\",\"keyword\",\"comment\",\"string\",\"number\",\"operator\"],\"tokenModifiers\":[\"declaration\",\"readonly\",\"defaultLibrary\",\"documentation\"]},\"full\":true},\"definitionProvider\":true,\"referencesProvider\":true,\"completionProvider\":{\"triggerCharacters\":[\".\"]}${extra}}}}"
 
 
 private pure func error_reply(id: String, code: Int, message: String) -> String:
@@ -2572,6 +2573,224 @@ func test_a_changed_file_the_failed_analysis_read_maps_through_that_text() -> Bo
     )
 
 
+-- completion: from the editor's text and the root's analysis
+
+-- The root of NAVIGATED_START with `last` as the line after it, the text an
+-- editor shows while a name is being typed.
+private pure func typing(last: String) -> String:
+    "${NAVIGATED_START}\n${last}\n"
+
+
+-- `server` initialized by `initialize`, with the root open as `typed` and the
+-- analysis of the program before the typing.
+private func completing_as(server: Server, initialize: String, typed: String) -> Server:
+    server
+        .after([initialize, did_open(ROOT_URI, typed.escaped())]).server
+        .analysed_root(navigated(navigated_text())).server
+
+
+private func completing(server: Server, typed: String) -> Server:
+    server.completing_as(INITIALIZE, typed)
+
+
+private pure func completion_request(id: Int, uri: String, line: Int, character: Int) -> String:
+    "{\"jsonrpc\":\"2.0\",\"id\":${id},\"method\":\"textDocument/completion\",\"params\":{${position_params(uri, line, character)},\"context\":{\"triggerKind\":1}}}"
+
+
+-- The reply to a completion request at `line` and `character` of the root.
+private pure func completion_at(server: Server, line: Int, character: Int) -> String:
+    server
+        .receive(json(completion_request(7, ROOT_URI, line, character))).replies
+        .map(render)
+        .join("")
+
+
+-- One item, as it is sent, replacing `start` to `end` of line 32.
+private pure func item(label: String, kind: Int, rank: Int, start: Int, end: Int) -> String:
+    "{\"label\":\"${label}\",\"kind\":${kind},\"sortText\":\"${rank}${label}\",\"textEdit\":{\"range\":{\"start\":{\"line\":32,\"character\":${start}},\"end\":{\"line\":32,\"character\":${end}}},\"newText\":\"${label}\"}}"
+
+
+private EMPTY_LIST: String = "{\"jsonrpc\":\"2.0\",\"id\":7,\"result\":{\"isIncomplete\":false,\"items\":[]}}"
+
+
+-- Every name the module can write, with its kind and rank, and the keywords,
+-- each replacing the `pri` before the cursor.
+func test_a_name_site_sends_every_name_and_keyword_replacing_the_prefix() -> Bool:
+    loading(func(server: Server) -> Bool:
+        sent = server
+            .completing(typing("    pri"))
+            .completion_at(32, 7)
+        wanted = [
+            item("print", 3, 3, 4, 7),
+            item("area", 3, 1, 4, 7),
+            item("main", 3, 1, 4, 7),
+            item("Point", 22, 1, 4, 7),
+            item("Shape", 13, 1, 4, 7),
+            item("Circle", 20, 1, 4, 7),
+            item("Sized", 8, 1, 4, 7),
+            item("one", 3, 2, 4, 7),
+            item("helpers", 9, 2, 4, 7),
+            item("match", 14, 4, 4, 7)
+        ]
+        and(
+            sent.starts_with(
+                "{\"jsonrpc\":\"2.0\",\"id\":7,\"result\":{\"isIncomplete\":false,\"items\":["
+            ),
+            wanted.all(pure func(one_item: String) -> Bool: sent.has_text(one_item))
+        )
+    )
+
+
+-- The range counts in the agreed encoding: `pri` follows an accented letter, two bytes and
+-- one UTF-16 unit.
+func test_the_range_counts_in_the_agreed_encoding() -> Bool:
+    loading(func(server: Server) -> Bool:
+        typed = typing("    \"é\" + pri")
+        and(
+            server
+                .completing_as(INITIALIZE, typed)
+                .completion_at(32, 14)
+                .has_text(item("print", 3, 3, 11, 14)),
+            server
+                .completing_as(INITIALIZE_UTF16, typed)
+                .completion_at(32, 13)
+                .has_text(item("print", 3, 3, 10, 13))
+        )
+    )
+
+
+func test_an_alias_dot_sends_what_the_module_offers() -> Bool:
+    loading(func(server: Server) -> Bool:
+        sent = server
+            .completing(typing("    helpers."))
+            .completion_at(32, 12)
+        and(
+            sent.has_text(item("one", 3, 1, 12, 12)),
+            and(not(sent.has_text("\"print\"")), not(sent.has_text("\"match\"")))
+        )
+    )
+
+
+func test_a_union_dot_sends_its_variants() -> Bool:
+    loading(func(server: Server) -> Bool:
+        ready = server.completing(typing("    Shape.Ci"))
+        sent = ready.completion_at(32, 12)
+        and(
+            and(
+                sent.has_text(item("Dot", 20, 1, 10, 12)),
+                sent.has_text(item("Circle", 20, 1, 10, 12))
+            ),
+            and(
+                not(sent.has_text("\"print\"")),
+                server
+                    .completing(typing("    Option."))
+                    .completion_at(32, 11)
+                    .has_text(item("Some", 20, 1, 11, 11))
+            )
+        )
+    )
+
+
+-- A built-in type, a record, a value and an unknown name qualify nothing until
+-- 17b knows values.
+func test_other_members_send_an_empty_list() -> Bool:
+    loading(func(server: Server) -> Bool:
+        cases: List[(String, Int)] = [
+            ("    Int.", 8),
+            ("    Point.", 10),
+            ("    point.", 10),
+            ("    nowhere.", 12)
+        ]
+        var empty: Bool = True
+        for case in cases:
+            sent = server
+                .completing(typing(case[0]))
+                .completion_at(32, case[1])
+            if sent != EMPTY_LIST:
+                empty = False
+        empty
+    )
+
+
+func test_a_comment_and_a_string_send_an_empty_list() -> Bool:
+    loading(func(server: Server) -> Bool:
+        and(
+            (
+                server
+                    .completing(typing("    -- pri"))
+                    .completion_at(32, 10)
+                == EMPTY_LIST
+            ),
+            (
+                server
+                    .completing(typing("    \"pri\""))
+                    .completion_at(32, 8)
+                == EMPTY_LIST
+            )
+        )
+    )
+
+
+-- The root fails to analyse, so its last analysis that checked answers.
+func test_a_failing_root_completes_from_its_last_checked_analysis() -> Bool:
+    loading(func(server: Server) -> Bool:
+        typed = typing("    pri")
+        broken = server
+            .completing(navigated_text())
+            .failing([did_change(ROOT_URI, typed.escaped())], analysis_of(typed))
+        sent = broken.completion_at(32, 7)
+        and(sent.has_text(item("print", 3, 3, 4, 7)), sent.has_text(item("area", 3, 1, 4, 7)))
+    )
+
+
+func test_a_root_that_never_checked_sends_an_empty_list() -> Bool:
+    loading(func(server: Server) -> Bool:
+        broken = server
+            .after([INITIALIZE, did_open(ROOT_URI, BROKEN_TEXT)]).server
+            .analysed_root(analysis_of(BROKEN_TEXT)).server
+        broken.completion_at(0, 1) == EMPTY_LIST
+    )
+
+
+-- The edit stales the root, so the request waits for the analysis, which
+-- answers it.
+func test_a_stale_root_is_analysed_before_it_completes() -> Bool:
+    loading(func(server: Server) -> Bool:
+        typed = typing("    pri")
+        waiting = server
+            .navigating(navigated_text())
+            .changed(did_change(ROOT_URI, typed.escaped()))
+            .receive(json(completion_request(7, ROOT_URI, 32, 7)))
+        answered = waiting.server.analysed_as_asked(waiting, navigated(typed))
+        and(
+            and(waiting.replies.is_empty(), waiting.analysed_path() == path(ROOT)),
+            answered.replies
+                .map(render)
+                .join("")
+                .has_text(item("print", 3, 3, 4, 7))
+        )
+    )
+
+
+func test_a_library_file_gets_an_empty_list_and_a_closed_document_null() -> Bool:
+    match (new_server(), "list.brp".to_path()):
+        (Some(server), Ok(list)):
+            uri = list.library_uri()
+            ready = server
+                .completing(navigated_text())
+                .receive(json(did_open(uri, "x = 1"))).server
+            and(
+                ready
+                    .receive(json(completion_request(7, uri, 0, 0)))
+                    .answers([result_reply(7, "{\"isIncomplete\":false,\"items\":[]}")]),
+                ready
+                    .receive(json(completion_request(8, OTHER_URI, 0, 0)))
+                    .answers([result_reply(8, "null")])
+            )
+        _:
+            False
+
+
 TESTS: TestSuite = {
     description = "LSP server",
     tests = [
@@ -2909,6 +3128,40 @@ TESTS: TestSuite = {
         (
             "a library file the client opens gets only lexer tokens",
             test_a_library_file_the_client_opens_gets_only_lexer_tokens
+        ),
+        (
+            "a name site sends every name and keyword replacing the prefix",
+            test_a_name_site_sends_every_name_and_keyword_replacing_the_prefix
+        ),
+        (
+            "the completion range counts in the agreed encoding",
+            test_the_range_counts_in_the_agreed_encoding
+        ),
+        (
+            "an alias dot sends what the module offers",
+            test_an_alias_dot_sends_what_the_module_offers
+        ),
+        ("a union dot sends its variants", test_a_union_dot_sends_its_variants),
+        ("other members send an empty list", test_other_members_send_an_empty_list),
+        (
+            "a comment and a string send an empty list",
+            test_a_comment_and_a_string_send_an_empty_list
+        ),
+        (
+            "a failing root completes from its last checked analysis",
+            test_a_failing_root_completes_from_its_last_checked_analysis
+        ),
+        (
+            "a root that never checked sends an empty list",
+            test_a_root_that_never_checked_sends_an_empty_list
+        ),
+        (
+            "a stale root is analysed before it completes",
+            test_a_stale_root_is_analysed_before_it_completes
+        ),
+        (
+            "a library file gets an empty list and a closed document null",
+            test_a_library_file_gets_an_empty_list_and_a_closed_document_null
         )
     ]
 }

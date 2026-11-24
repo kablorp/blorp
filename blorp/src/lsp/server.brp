@@ -39,6 +39,7 @@ import:
         root_module_id,
         source_module
     ../common/syntax/syntax: Diagnostic, Diagnostics, Span, compiler_span, internal_error
+    ./completion: Offered, completion, offered_json
     ./line_map: LineMap, current_span, line_map, sealed_offset
     ./positions:
         LineIndex,
@@ -215,6 +216,8 @@ union DocumentQuery:
     DefinitionQuery(Position)
     -- Every use of the name at the position.
     ReferencesQuery(ReferencesAt)
+    -- What may be written at the position.
+    CompletionQuery(Position)
 
 
 fixed record ReferencesAt {
@@ -268,6 +271,11 @@ private EXIT_AFTER_SHUTDOWN: Int = 0
 
 -- TextDocumentSyncKind.Full: every change sends the whole text.
 private FULL_SYNC: Int = 1
+
+
+-- The character after which an editor asks for completion unprompted: the
+-- dot before a member.
+private MEMBER_TRIGGER: String = "."
 
 -- DiagnosticSeverity.Error: every diagnostic stops compilation.
 private ERROR_SEVERITY: Int = 1
@@ -399,6 +407,14 @@ pure func receive(server: Server, message: Json) -> Step:
                                 })
                             )
                     )
+                "textDocument/completion":
+                    session.document_requested(
+                        id,
+                        call.params,
+                        call.params
+                            .requested_position()
+                            .map(pure func(at: Position) -> DocumentQuery: CompletionQuery(at))
+                    )
                 "initialize":
                     lifecycle.replying([
                         error_response(
@@ -525,7 +541,8 @@ private pure func initialize_result(encoding: PositionEncoding, serves_library: 
         ),
         "semanticTokensProvider" => Object({ "legend" => token_legend(), "full" => Boolean(True) }),
         "definitionProvider" => Boolean(True),
-        "referencesProvider" => Boolean(True)
+        "referencesProvider" => Boolean(True),
+        "completionProvider" => Object({ "triggerCharacters" => Array([Text(MEMBER_TRIGGER)]) })
     }
     capabilities = if serves_library:
         base.set(
@@ -816,6 +833,25 @@ private pure func served(
                     )
                 None:
                     Array([])
+        CompletionQuery(at):
+            -- A module's names hold everywhere in it, so the editor's own text
+            -- gives the site, and no offset goes back through the line diff.
+            items: List[Json] = match text.completion(
+                root.index.offset_of(at, session.encoding),
+                analysis
+            ):
+                Some(offering):
+                    range = root.index.range_json(offering.prefix, session.encoding)
+                    offering.items.map(pure func(item: Offered) -> Json: item.offered_json(range))
+                None:
+                    []
+            completion_json(items)
+
+
+-- The `textDocument/completion` result: a complete list, which the client
+-- filters as the word grows.
+private pure func completion_json(items: List[Json]) -> Json:
+    Object({ "isIncomplete" => Boolean(False), "items" => Array(items) })
 
 
 -- The answer to `query` about a text with no analysis: the lexer's tokens, no
@@ -829,6 +865,7 @@ private pure func unanalysed_answer(
         TokensQuery: text.tokens_json({}, encoding)
         DefinitionQuery(_): Null
         ReferencesQuery(_): Array([])
+        CompletionQuery(_): completion_json([])
 
 
 -- The `semanticTokens/full` result for a document's text.
