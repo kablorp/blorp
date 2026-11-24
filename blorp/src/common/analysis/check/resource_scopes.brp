@@ -63,11 +63,13 @@ pure func resource_defaults(
 ) -> Result[List[ResourceDefault], CheckError]:
     var rows: List[ResourceDefault] = []
     var failure: Option[CheckError] = None
+
     for implementation in implementations:
         lent: Result[Option[OpaqueId], CheckError] = match implementation.receiver_head:
             model.NamedHead(OpaqueHead(id)): id.declared_resource(opaques, implementation.span)
             model.NamedHead(PrimitiveHead(_) | ListHead | UnionHead(_) | RecordHead(_)): Ok(None)
             model.TupleHead(_): Ok(None)
+
         match lent:
             Ok(Some(resource_type)):
                 for member in implementation.methods:
@@ -89,6 +91,7 @@ pure func resource_defaults(
             Err(error):
                 failure = Some(error)
                 break
+
     match failure:
         Some(error): Err(error)
         None: Ok(rows)
@@ -106,6 +109,7 @@ pure func admit_resource_body(
     inherited: List[ResourceDefault]
 ) -> Result[Void, CheckError]:
     var admitted = body.admit_body_loans(signature, functions, opaques, None)
+
     for row in inherited:
         if (
             admitted
@@ -116,9 +120,11 @@ pure func admit_resource_body(
                 owner = model.FunctionDeclaration(id),
                 values = [model.NominalType(model.OpaqueNominal(row.resource_type), [])]
             }
+
             admitted = match body.admit_body_loans(signature, functions, opaques, Some(lent)):
                 Ok(_): Ok(void)
                 Err(error): Err(error.as_lent_default(row))
+
     admitted
 
 
@@ -152,6 +158,7 @@ private pure func admit_body_loans(
         lambdas = body.lambdas,
         lent_self = lent_self
     }
+
     _: Void ?= admission.admit_lent_types(body.bindings, signature.purity, signature.return_type)
     bindings ?= admission.seed_parameters(body.bindings)
     facts: Facts = { bindings = bindings, definitions = body.bindings, captures = [] }
@@ -181,17 +188,22 @@ private pure func admit_lent_types(
     result: TypeUse
 ) -> Result[Void, CheckError]:
     var admitted: Result[Void, CheckError] = Ok(void)
+
     if admission.lent_self.is_some():
         admitted = admission.admit_written(result.value_type, result.span, None)
+
         pure_parameter: Option[ResourceUse] = match purity:
             Pure: Some(errors.ResourcePureParameter)
             Impure: None
+
         for definition in bindings:
             whole: Option[ResourceUse] = match definition.origin:
                 model.ParameterBinding(_) | model.CallableParameterBinding(_): pure_parameter
                 model.BodyLocal | model.MatchCapture: None
+
             if admitted.is_ok():
                 admitted = admission.admit_written(definition.value_type, definition.span, whole)
+
     admitted
 
 
@@ -213,6 +225,7 @@ private pure func seed_parameters(
     var bindings: List[Bool] = repeat(False, definitions.length())
     var failure: Option[CheckError] = None
     var position = 0
+
     for definition in definitions:
         match definition.origin:
             model.CallableParameterBinding(parameter):
@@ -221,9 +234,12 @@ private pure func seed_parameters(
                     Err(error): failure = Some(error)
             model.ParameterBinding(_) | model.BodyLocal | model.MatchCapture:
                 void
+
         if failure.is_some():
             break
+
         position = position + 1
+
     match failure:
         Some(error): Err(error)
         None: Ok(bindings)
@@ -237,12 +253,15 @@ private pure func promised(
     span: Span
 ) -> Result[Bool, CheckError]:
     owner = parameter.callable_owner()
+
     function ?= admission.functions
         .get(owner.function_number())
         .or_checker_invariant(span, errors.InvalidFunctionContract)
+
     written ?= function.declaration.parameters
         .get(parameter.callable_position())
         .or_checker_invariant(span, errors.InvalidFunctionContract)
+
     Ok(written.scoped_qualifier.is_some())
 
 
@@ -252,10 +271,12 @@ private pure func admit_statements(
     facts: Facts
 ) -> Result[Facts, CheckError]:
     var admitted: Result[Facts, CheckError] = Ok(facts)
+
     for statement in statements:
         match admitted:
             Ok(current): admitted = admission.admit_statement(statement, current)
             Err(_): break
+
     admitted
 
 
@@ -280,6 +301,7 @@ private pure func admit_statement(
             values: List[model.CheckedExpr] = match loop.iteration:
                 model.ListIteration(value, _, _): [value]
                 model.AscendingIntRange(start, end, _): [start, end]
+
             admission
                 .admit_storage(values, facts)
                 .and_then(pure func(_): admission.admit_statements(loop.body, facts))
@@ -296,11 +318,14 @@ private pure func admit_binding(
     facts: Facts
 ) -> Result[Facts, CheckError]:
     scoped_callable ?= admission.admit_expression(value, facts)
+
     definition ?= facts.definitions
         .get(id.binding_number())
         .or_checker_invariant(value.span, errors.InvalidInferenceWorklist)
+
     stored ?= admission.viewed(value.value_type, value.span)
     _: Void ?= stored.refuse_resource(admission.opaques, value.span, errors.ResourceStorage)
+
     if scoped_callable.and(definition.mutable):
         Err(scoped_error(value.span, errors.ScopedStorage))
     else:
@@ -318,6 +343,7 @@ private pure func admit_body(
             admission.admit_exit(exit, facts, discard)
         model.CheckedMatchBody(matched):
             var admitted = admission.admit_match_root(matched.scrutinee, facts)
+
             for arm in matched.arms:
                 if admitted.is_ok():
                     admitted = admission
@@ -329,6 +355,7 @@ private pure func admit_body(
                                 discard
                             )
                         )
+
             admitted
 
 
@@ -355,6 +382,7 @@ private pure func admit_return(
 ) -> Result[Void, CheckError]:
     scoped_callable ?= admission.admit_expression(value, facts)
     returned ?= admission.viewed(value.value_type, value.span)
+
     if discard:
         Ok(void)
     else if scoped_callable:
@@ -374,6 +402,7 @@ private pure func admit_match_root(
     scoped_callable ?= admission.admit_expression(scrutinee, facts)
     matched ?= admission.viewed(scrutinee.value_type, scrutinee.span)
     held ?= matched.mentioned_resource(admission.opaques, scrutinee.span)
+
     if scoped_callable.or(held.is_some()):
         Err(errors.checker_invariant(scrutinee.span, errors.LoanInMatchRoot))
     else:
@@ -387,6 +416,7 @@ private pure func admit_join(
 ) -> Result[Bool, CheckError]:
     _: Void ?= admission.admit_match_root(joined.scrutinee, facts)
     var admitted: Result[Bool, CheckError] = Ok(False)
+
     for arm in joined.arms:
         match admitted:
             Ok(scoped_callable):
@@ -398,6 +428,7 @@ private pure func admit_join(
                     .map(pure func(value): scoped_callable.or(value))
             Err(_):
                 break
+
     admitted
 
 
@@ -407,9 +438,11 @@ private pure func admit_storage(
     facts: Facts
 ) -> Result[Void, CheckError]:
     var admitted: Result[Void, CheckError] = Ok(void)
+
     for value in values:
         if admitted.is_ok():
             admitted = admission.admit_stored(value, facts)
+
     admitted
 
 
@@ -421,6 +454,7 @@ private pure func admit_stored(
     scoped_callable ?= admission.admit_expression(value, facts)
     stored ?= admission.viewed(value.value_type, value.span)
     _: Void ?= stored.refuse_resource(admission.opaques, value.span, errors.ResourceStorage)
+
     if scoped_callable:
         Err(scoped_error(value.span, errors.ScopedStorage))
     else:
@@ -435,6 +469,7 @@ private pure func admit_type_arguments(
     span: Span
 ) -> Result[Void, CheckError]:
     var admitted: Result[Void, CheckError] = Ok(void)
+
     for argument in arguments:
         if admitted.is_ok():
             admitted = admission
@@ -444,6 +479,7 @@ private pure func admit_type_arguments(
                         .mentioned_resource(admission.opaques, span)
                         .refuse(span, errors.ResourceInferredType(seen))
                 )
+
     admitted
 
 
@@ -456,6 +492,7 @@ private pure func admit_receiver(
 ) -> Result[Void, CheckError]:
     seen ?= admission.viewed(receiver, span)
     whole ?= seen.as_resource(admission.opaques, span)
+
     match whole:
         Some(_): Ok(void)
         None: admission.admit_type_arguments([receiver], span)
@@ -495,6 +532,7 @@ private pure func admit_closure(
     var scoped_capture: Bool = False
     var captured_resource: Option[OpaqueId] = None
     var failure: Option[CheckError] = None
+
     for value in environment:
         match admission.admit_expression(value, facts):
             Err(error):
@@ -504,6 +542,7 @@ private pure func admit_closure(
                 whole = admission
                     .viewed(value.value_type, value.span)
                     .and_then(pure func(seen): seen.as_resource(admission.opaques, value.span))
+
                 match whole:
                     Err(error):
                         failure = Some(error)
@@ -511,24 +550,30 @@ private pure func admit_closure(
                     Ok(held):
                         captures = captures.append(captured)
                         scoped_capture = scoped_capture.or(captured)
+
                         if captured_resource.is_none():
                             captured_resource = held
+
     _: Void ?= match failure:
         Some(error): Err(error)
         None: Ok(void)
+
     row ?= admission.lambdas
         .get(id.lambda_number())
         .or_checker_invariant(span, errors.InvalidInferenceWorklist)
+
     lambda: model.CheckedLambda ?= match row:
         model.CheckedLambdaRow(value):
             Ok(value)
         model.CollectingLambda(_):
             Err(errors.checker_invariant(span, errors.InvalidInferenceWorklist))
+
     _: Void ?= match (lambda.purity, captured_resource):
         (Pure, Some(captured)):
             Err(resource_error(span, errors.MisusedResource(captured, errors.ResourcePureCapture)))
         (Impure, _) | (Pure, None):
             Ok(void)
+
     _: Void ?= admission.admit_lambda(lambda, captures)
     Ok(scoped_capture.or(captured_resource.is_some()))
 
@@ -542,11 +587,13 @@ private pure func admit_lambda(
     returned ?= admission.viewed(result.value_type, result.span)
     _: Void ?= returned.refuse_resource(admission.opaques, result.span, errors.ResourceResult)
     _: Void ?= admission.admit_lent_types(lambda.bindings, lambda.purity, result)
+
     facts: Facts = {
         bindings = repeat(False, lambda.bindings.length()),
         definitions = lambda.bindings,
         captures = captures
     }
+
     completed ?= admission.admit_statements(lambda.statements, facts)
     admission.admit_body(lambda.body, completed, lambda.return_type.value_type == model.VoidType)
 
@@ -569,9 +616,11 @@ private pure func admit_call(
         -- only values; the loop below admits their operands.
         model.CallableParameter(_) | model.RuntimeFunction(_):
             Ok(void)
+
     for operand in call.operands:
         if admitted.is_ok():
             admitted = admission.admit_operand(operand, facts)
+
     admitted.map(pure func(_): False)
 
 
@@ -594,6 +643,7 @@ private pure func admit_operand(
                     value.span
                 model.MethodCallable(_) | model.NamedCallable(_, _) | model.ForwardedCallable(_) | model.LambdaCallable(_, _):
                     span
+
             match admission.admit_choice(choice, span, facts):
                 Ok(True):
                     match admission.promised(parameter, span):
@@ -662,9 +712,11 @@ private pure func admit_construction(
     facts: Facts
 ) -> Result[Bool, CheckError]:
     constructed ?= admission.viewed(value.value_type, value.span)
+
     _: Void ?= constructed
         .type_children()
         .first_mentioned(admission.opaques, value.span)
         .refuse(value.span, errors.ResourceInferredType(constructed))
+
     _: Void ?= admission.admit_storage(children, facts)
     Ok(False)

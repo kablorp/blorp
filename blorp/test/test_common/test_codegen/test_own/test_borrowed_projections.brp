@@ -25,19 +25,23 @@ BAG_DECLARATIONS: String =
 -- Every operation of a block and the blocks nested in it, outer first.
 private pure func flatten(operations: List[own.OwnershipOperation]) -> List[own.OwnershipOperation]:
     var all: List[own.OwnershipOperation] = []
+
     for operation in operations:
         all = all.append(operation)
+
         match operation:
             own.ExecuteLoop(loop):
                 all = all.concat(flatten_loop_block(loop.body))
             own.ExecuteJoin(join):
                 for arm in join.arms:
                     all = all.concat(flatten(arm.operations))
+
                     match arm.exit:
                         own.TransferLoop(_, tail): all = all.concat(flatten_loop_tail(tail))
                         own.Yield(_): void
             _:
                 void
+
     all
 
 
@@ -47,12 +51,14 @@ private pure func flatten_loop_block(block: own.OwnedLoopBlock) -> List[own.Owne
 
 private pure func flatten_loop_tail(tail: own.OwnedLoopTail) -> List[own.OwnershipOperation]:
     var all: List[own.OwnershipOperation] = []
+
     match tail:
         own.ExitLoop(_):
             void
         own.MatchLoop(matched):
             for arm in matched.arms:
                 all = all.concat(flatten_loop_block(arm.body))
+
     all
 
 
@@ -68,6 +74,7 @@ private pure func counted(operations: List[own.OwnershipOperation]) -> Projectio
     var acquired = 0
     var borrowed = 0
     var pending: Option[lower.ValueId] = None
+
     for operation in operations:
         match operation:
             own.AcquireOwner(_, borrow, _):
@@ -78,9 +85,11 @@ private pure func counted(operations: List[own.OwnershipOperation]) -> Projectio
                             borrowed = borrowed - 1
                     None:
                         void
+
                 pending = None
             own.DefineValue(definition):
                 pending = None
+
                 match (definition.operation, definition.result):
                     (own.ReadRecordFieldDefinition(_, _), own.BorrowedResult(_)):
                         borrowed = borrowed + 1
@@ -89,6 +98,7 @@ private pure func counted(operations: List[own.OwnershipOperation]) -> Projectio
                         void
             _:
                 pending = None
+
     { acquired = acquired, borrowed = borrowed }
 
 
@@ -125,6 +135,7 @@ private pure func field_acquisitions(body: String, name: String) -> Option[Int]:
                     operations = flatten(function.operations)
                     var fields: List[Int] = []
                     var acquired = 0
+
                     for operation in operations:
                         match operation:
                             own.DefineValue(definition):
@@ -138,6 +149,7 @@ private pure func field_acquisitions(body: String, name: String) -> Option[Int]:
                                     acquired = acquired + 1
                             _:
                                 void
+
                     Some(acquired)
                 _:
                     None
@@ -166,6 +178,7 @@ private pure func owner_transfers(body: String, name: String) -> Option[OwnerTra
                 (Ok(_), Some(function)):
                     var acquired = 0
                     var consumed = 0
+
                     for operation in flatten(function.operations):
                         match operation:
                             own.AcquireOwner(_, borrow, _):
@@ -183,6 +196,7 @@ private pure func owner_transfers(body: String, name: String) -> Option[OwnerTra
                                         void
                             _:
                                 void
+
                     Some({ acquired = acquired, consumed = consumed })
                 _:
                     None
@@ -201,6 +215,7 @@ pure func test_a_borrowed_parameter_lends_its_fields() -> Bool:
         |func main() -> Int:
         |    total(make())
         |
+
     expects(body, "total", 0, 2)
 
 
@@ -210,6 +225,7 @@ pure func test_an_unread_projection_neither_acquires_nor_drops() -> Bool:
         |    unused = make().items
         |    0
         |
+
     expects(body, "main", 0, 1)
 
 
@@ -222,6 +238,7 @@ pure func test_only_the_projection_outliving_its_parent_acquires() -> Bool:
         |    first = length(bag.items)
         |    add(first, length(bag.extra))
         |
+
     expects(body, "main", 1, 1)
 
 
@@ -231,6 +248,7 @@ pure func test_a_projection_outliving_its_dying_parent_acquires() -> Bool:
         |    items = make().items
         |    length(items)
         |
+
     expects(body, "main", 1, 0)
 
 
@@ -241,6 +259,7 @@ pure func test_a_nested_projection_borrows_through_its_borrowed_parent() -> Bool
         |func main() -> Int:
         |    nested({ bag = make() })
         |
+
     expects(body, "nested", 0, 2)
 
 
@@ -253,6 +272,7 @@ pure func test_a_record_update_stores_borrowed_fields() -> Bool:
         |func main() -> Int:
         |    length(refill(make()).extra)
         |
+
     expects(body, "refill", 0, 1)
 
 
@@ -267,9 +287,11 @@ pure func test_a_projection_read_before_its_parent_moves_into_a_store_borrows() 
         |    holder: Holder = { bag = bag }
         |    add(count, length(holder.bag.extra))
         |
+
     moved = match owner_transfers(body, "main"):
         Some(transfers): transfers.acquired == 0
         None: False
+
     moved.and(expects(body, "main", 2, 1))
 
 
@@ -283,9 +305,11 @@ pure func test_a_projection_read_before_its_parent_moves_into_a_call_borrows() -
         |    count = length(bag.items)
         |    add(count, length(grow(bag, []).items))
         |
+
     moved = match owner_transfers(body, "main"):
         Some(transfers): (transfers.acquired == 0).and(transfers.consumed == 1)
         None: False
+
     moved.and(expects(body, "main", 1, 1))
 
 
@@ -304,9 +328,11 @@ pure func test_a_projection_read_in_an_arm_that_moves_its_parent_acquires() -> B
         |        0
         |    total
         |
+
     moved = match owner_transfers(body, "main"):
         Some(transfers): (transfers.acquired == 0).and(transfers.consumed == 1)
         None: False
+
     moved.and(expects(body, "main", 2, 0))
 
 
@@ -321,9 +347,11 @@ pure func test_a_loop_condition_field_of_a_local_acquires() -> Bool:
         |        bag = grow(bag, [])
         |    length(bag.extra)
         |
+
     moved = match owner_transfers(body, "main"):
         Some(transfers): (transfers.acquired == 0).and(transfers.consumed == 1)
         None: False
+
     moved.and(expects(body, "main", 2, 0))
 
 
@@ -339,6 +367,7 @@ pure func test_a_loop_condition_field_of_a_parameter_borrows() -> Bool:
         |func main() -> Int:
         |    count_up(make())
         |
+
     expects(body, "count_up", 0, 1)
 
 
@@ -351,6 +380,7 @@ pure func test_a_projection_stored_beside_its_moving_parent_acquires() -> Bool:
         |    both: Both = { bag = bag, items = bag.items }
         |    length(both.items)
         |
+
     expects(body, "main", 2, 0)
 
 
@@ -370,6 +400,7 @@ pure func test_a_loop_edge_acquires_a_projection_of_the_parent_it_moves() -> Boo
         |        items = bag.items
         |    add(total, length(items))
         |
+
     field_acquisitions(body, "main") == Some(1)
 
 
@@ -387,6 +418,7 @@ pure func test_a_yield_acquires_a_projection_of_the_parent_it_moves() -> Bool:
         |        bag = make()
         |    add(length(items), length(bag.extra))
         |
+
     field_acquisitions(body, "main") == Some(2)
 
 
@@ -399,6 +431,7 @@ pure func test_a_returned_projection_acquires_at_the_return() -> Bool:
         |func main() -> Int:
         |    length(first_items(make()))
         |
+
     match lowered(UPDATE_DECLARATIONS + BAG_DECLARATIONS + body).and_then(own.own):
         Err(_):
             False
