@@ -1,8 +1,8 @@
 # Private variants plan
 
 **Status: plan, 2026-11-23.** Keith approved the design and asked for this
-plan. Implementation starts on his go-ahead. Landing 0 belongs to
-[`EQUALITY_PLAN.md`](EQUALITY_PLAN.md).
+plan, then started it with landing 0, which has landed. Landing 0 belongs
+to [`EQUALITY_PLAN.md`](EQUALITY_PLAN.md), which records its results.
 
 **The direction.** Keith chose it in discussion:
 
@@ -393,11 +393,10 @@ Deleting it also removes:
 - **Evaluation order.** A read moved out of an argument list must keep its
   place in evaluation order: reads are hoisted in the order the arguments
   evaluate.
-- **Hand-written equality.** 28 `implements Equatable` blocks on identity
-  types repeat what derived equality already gives, among them the six in
-  `ids.brp:83-108`. Landing 0, which is `EQUALITY_PLAN.md`'s landing 3,
-  deletes them first. Its pilot measured −84/+28 production lines. The
-  migration then neither rewrites them nor reads through them.
+- **Hand-written equality.** 29 `implements Equatable` blocks on identity
+  types repeated what derived equality already gives. Landing 0, which is
+  `EQUALITY_PLAN.md`'s landing 3, deleted them first, for −149 lines. The
+  migration neither rewrites them nor reads through them.
 
 ### Also changed
 
@@ -466,8 +465,8 @@ Production means `src` and `standard_library`, give or take about 150 lines.
 | Union features, rules 1-9 | | 836 | +836 |
 | Migrated declarations and reads | | 285 | +285 |
 | **Production, landings 1 to 7** | | | **about −275** |
-| With landing 0, the equality blocks (pilot) | 84 | 28 | **about −330** |
-| With landing 8, the `NominalId` collapse | ~30 | | **about −360** |
+| With landing 0, the 29 equality blocks (landed) | 149 | | **about −425** |
+| With landing 8, the `NominalId` collapse | ~30 | | **about −455** |
 
 Landing 0 also removes the reads inside those blocks, so landing 4 may add up
 to about 50 lines fewer than its estimate.
@@ -488,8 +487,9 @@ delete. The seed rotates once.
 0. **Landing 0: delete the hand-written identity equality.** This is
    `EQUALITY_PLAN.md`'s landing 3, and that plan owns it. Its condition is
    met: the pinned seed, `blorp-seed-8eb8e16546b3`, carries derived opaque
-   equality (`90e3f7753`). It goes first, so that the migration has 28 fewer
-   blocks to carry.
+   equality (`90e3f7753`). It went first, so that the migration has no
+   blocks to carry, and landed on 2026-11-23 with 29 blocks, one more than
+   counted.
 1. **Landing 1: private variants.** Rules 1-6, all their diagnostics, and
    the 34 same-name fixture renames, plus formatter, LSP, README and grammar
    support. Opaque types still work. Under rule 2, variants may share a
@@ -536,7 +536,7 @@ delete. The seed rotates once.
      `blorp_f_N` numbering, since one new function renumbers every later
      one.
    - **Equality functions.** The functions that differ belong to types that
-     used derived opaque equality, which after landing 0 includes the 28
+     used derived opaque equality, which after landing 0 includes the 29
      identity types. Each commit lists them.
 5. **Landing 5: delete the conversions.** The two keywords, their syntax, the formatter's
    printing of them, the inference path and the errors (about 480 lines).

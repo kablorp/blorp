@@ -8,20 +8,14 @@ done.
 
 ## Workstreams
 
-- **Equality derivation:** [`EQUALITY_PLAN.md`](EQUALITY_PLAN.md).
-  - **Status:** opaque types and tuples derive `==` from their constituents
-    (landings 1 and 2, landed 2026-11-17).
-  - **Next:** landing 3 deletes the 28 hand-written identity
-    implementations. The pinned seed (`blorp-seed-8eb8e16546b3`) carries
-    landing 1, so nothing blocks it. It runs as landing 0 of the private
-    variants plan.
 - **Private variants:** [`PRIVATE_VARIANTS_PLAN.md`](PRIVATE_VARIANTS_PLAN.md).
   - **Status:** planned on 2026-11-23. Opaque types become unions with private
     variants (`union UserId: private Init(Int)`) in nine landings: enable
     private variants, rotate the seed, migrate every opaque use, then delete
     the opaque machinery, for about −275 production lines.
-  - **Next:** landing 0, `EQUALITY_PLAN.md`'s landing 3, on Keith's
-    go-ahead.
+  - **Landed:** landing 0, `EQUALITY_PLAN.md`'s landing 3: the 29
+    hand-written identity equalities are gone, −149 lines (2026-11-23).
+  - **Next:** landing 1, private variants.
 - **UInt8 and Bytes:** [`UINT8_BYTES_PLAN.md`](UINT8_BYTES_PLAN.md).
   - **Status:** U1 to U9 and B1 to B3 are decided. L0, the
     `IntegerType(Int64Format)` refactor, and L1, the compiler's `UInt8` with
