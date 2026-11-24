@@ -1,8 +1,9 @@
 # Private variants plan
 
-**Status: plan, 2026-11-23.** Keith approved the design and asked for this
-plan, then started it with landing 0, which has landed. Landing 0 belongs
-to [`EQUALITY_PLAN.md`](EQUALITY_PLAN.md), which records its results.
+**Status: in progress, 2026-11-23.** Keith approved the design and asked for
+this plan, then started it with landing 0. Landings 0 and 1 have landed;
+landing 2 is next. Landing 0 belongs to [`EQUALITY_PLAN.md`](EQUALITY_PLAN.md),
+which records its results.
 
 **The direction.** Keith chose it in discussion:
 
@@ -56,8 +57,8 @@ match from_opaque DeclarationInventory(inventory).functions.get(id.function_numb
 union UserId:
     private Init(Int)
 
-private pure func user_id(number: Int) -> UserId:
-    Init(number)                    -- build
+private pure func user_id(value: Int) -> UserId:
+    Init(value)                     -- build
 
 pure func number(id: UserId) -> Int:
     Init(value) = id                -- read: one variant, so the binding always matches
@@ -89,7 +90,11 @@ pure func number(id: UserId) -> Int:
    them with `_`. No diagnostic that another module sees may name a private
    variant the user did not write: not "did you mean" suggestions, the
    unimported-pattern help, the list of a union's variants, or an
-   exhaustiveness witness.
+   exhaustiveness witness. The rule governs a message's text, not its
+   locations: a note may point into the declaring module, a private
+   payload's line among them, as the automatic-equality note does when a
+   private payload holds a closure. That source is the reader's to open, and
+   the location is the error's cause.
 4. **Redundant marks.** In a `private union`, `private` on a variant is an
    error: its variants are already private. `private` on a variant means
    only access (decision 4).
@@ -126,7 +131,7 @@ union Email:
     Unchecked(String)               -- anyone may make one
 
 pure func parse(text: String) -> Email:
-    if text.contains("@"):
+    if text.starts_with("mailto:"):
         Email.Checked(text)
     else:
         Unchecked(text)
@@ -143,7 +148,7 @@ pure func label(address: Email) -> String:
         _: "verified"               -- `_` covers the private variants
 
 pure func forged() -> Email:
-    Email.Checked("x@y")            -- error: Email.Checked is private to module email
+    Email.Checked("x@y")            -- error: Email.Checked is private to module ./email
 ```
 
 At run time a private variant falls through the public variants' tests into
@@ -154,17 +159,20 @@ crate.
 
 Each rejection checks its exact message, help and span (`blorp/AGENTS.md`).
 "Example function" means the first public function, in declaration order,
-whose result type is the union. That choice is deterministic. Where no such
+whose result type is the union; a trait method never counts. That choice is
+deterministic. A module is named by the path its importer wrote, as older
+qualified-name messages do. Where no such
 function exists, the help is the generic form.
 
 | Case | Message | Help |
 | --- | --- | --- |
-| A private variant used outside its module | `Email.Checked is private to module email` | `build an Email with a function email exports, such as email.parse` |
-| A private variant named through an alias | `email.Checked is private to module email` | the same |
-| An import selection of a private variant, bare (`email: Checked`) or under its union (`Email(Checked)`) | `Email.Checked is private to module email` | `select Email, and use the functions email exports` |
+| A private variant used outside its module | `Email.Checked is private to module ./email` | `build the Email with a function ./email exports, such as parse` |
+| A private variant named through an alias | `email.Checked is private to module ./email` | the same |
+| A variant of a private union, from another module | today's private-name message, `Secret is private to ./email` | today's help |
+| An import selection of a private variant, bare (`email: Checked`) or under its union (`Email(Checked)`) | `Email.Checked is private to module ./email` | `select Email, and use the functions ./email exports` |
 | A bare name that several variants in scope share, merged with today's `UnimportedVariantValue` | `Init is a variant of several unions in scope: UserId, TypeId` | `write it through one of them: UserId.Init, TypeId.Init` |
-| `email.Unchecked`, when `email` declares several public `Unchecked` variants | `Unchecked is a variant of several unions in module email: Email, Draft` | `select the union, and write Email.Unchecked` |
-| An outside `match` with no `_` | `this match on Email is not exhaustive: Email has variants private to module email` | `add a _ arm to cover them`, naming the position in nested patterns, as in `Some(_)` |
+| `email.Unchecked`, when `email` declares several public `Unchecked` variants | `Unchecked is a variant of several unions in module ./email: Email, Draft` | `select the union, and write Email.Unchecked` |
+| An outside `match` with no `_` | `this match on Email is not exhaustive: Email has variants private to module ./email` | `add a _ arm to cover them`, naming the position in nested patterns, as in `Some(_)` |
 | A duplicate variant in one union | `UserId already has a variant named Init` | `rename one of them` |
 | `private` on a variant of a `private union` | `Step is private, so its variants already are` | `remove private from Shift` |
 | A variant spelled like its union | `variant UserId shares its union's name` | `name the variant, for example UserId.Init, so that UserId always means the type` |
@@ -186,8 +194,9 @@ function exists, the help is the generic form.
   module a private variant never is (rule 3).
 - A variant that meets an imported or prelude variant of its spelling gets
   today's conflict, once, at the import or declaration (decision 5). Only an
-  ambiguity among the module's own variants is reported at each bare use,
-  because sharing a spelling is legal until a bare use.
+  ambiguity among the module's own variants is reported at a bare use,
+  because sharing a spelling is legal until a bare use. A module reports its
+  first problem in source order, so the first such use is the one reported.
 - A resource union that breaks several shape rules gets one shape error.
 
 ### Layout, equality and recursion
@@ -501,6 +510,21 @@ delete. The seed rotates once.
    - **Docs.** It updates the namespace docstrings that state the rule of one
      entry per spelling (`namespace.brp:3-4, 354, 410-412, 1212-1213`) and
      the README's rule (`README.md:579-581`).
+   - **Results.** It landed on 2026-11-24 with +651 production lines and
+     +1,303 test lines against its parent, `6918684fb`. Of those, 39 and 59
+     are blank lines that main's body spacing rule, which landed while it
+     was in CI, adds to its code. Without blank lines it is +599 and +1,094,
+     the same before and after the merge.
+     - **Cost.** `self-compile-cost --rounds 5`, because the three-round run
+       read within 0.05% of the instruction ceiling. On the fixed-input row,
+       instructions moved −0.03%, allocations +0.014% and peak heap +0.08%,
+       and the C was identical. The own-source row rose 1.1% in
+       instructions, which is the compiler's own new code.
+     - **Rules.** Breaking each of 30 rules and behaviours fails only its own
+       tests.
+     - **Probes.** About 80 programs found no bugs. Their diagnostic findings
+       became the review fixes, the deferred fixes under
+       [Ceilings](#ceilings), and the clarification of rule 3's locations.
 2. **Landing 2: destructuring, layout and resource unions.** Rules 7, 8 and 9
    go together, because a resource union can be read only by destructuring.
    Rule 7 covers erased unions only.
@@ -591,7 +615,7 @@ Upper bounds, measured with `blorp/scripts/self-compile-cost PARENT CANDIDATE
 | Landing | Instructions | Allocations | Peak heap | Production lines | Test lines |
 | --- | --- | --- | --- | --- | --- |
 | 0 | `EQUALITY_PLAN.md`, landing 3 | | | | |
-| 1 | +0.1% | +0.05% | +0.1% | +420 | +550 |
+| 1 | +0.1% | +0.05% | +0.1% | +655 | +1,310 |
 | 2 | +0.15% | +0.1% | +0.1% | +480 | +450 |
 | 3 | reported | reported | reported | 0 | 0 |
 | 4 | +0.1% | +0.01% | +0.1% | +320 | +230 |
@@ -600,8 +624,14 @@ Upper bounds, measured with `blorp/scripts/self-compile-cost PARENT CANDIDATE
 | 7 | +0.1% | +0.05% | +0.1% | +140 | +320 |
 | 8 | +0.05% | +0.0% | +0.05% | −20 | 0 |
 
-**The stack.** Landings 1 to 7 together come to −150 production lines or
-fewer. The estimate is about −275, give or take 150.
+**The stack.** Landings 1 to 7 together come to 0 production lines or fewer:
+the plan must not grow the compiler. After landing 1's +651 the estimate is
+about +46, give or take 150: landings 2, 4 and 7 add about +790, and
+landings 5 and 6 remove about −1,395 if landing 6 reaches its −915. The
+deletions decide it, and the deferred review fixes below count against it.
+The estimates predate main's body spacing rule, which lengthens the code
+landings 5 and 6 delete as well as the code the others add, so landing 5
+re-surveys them before it starts.
 
 **Corrections.** On 2026-11-23, before implementation, the rule-2 review
 re-estimated rule 2 at about 150 lines, not 45. The coordinator raised
@@ -610,6 +640,58 @@ landing 1's production ceiling from +300 to +420 and its test ceiling from
 saved about 20 lines, it moved the stack's from −130 to −150. The per-landing
 ceilings carry margins that would add up to growth, so this one keeps the
 promise.
+
+Landing 1 then stopped at its ceiling with +566 production lines. Rule 2's
+shared spellings came to about 220 lines (estimate 130), and rule 3's
+messages to about 240 (estimate 130). The later corrections:
+- **Keith accepted +566 as is** on 2026-11-23, with no wording cuts. The
+  coordinator set landing 1's production ceiling to +580, a margin of 14
+  for review fixes.
+- **The test ceiling** went from +550 to +700, a routine correction for
+  necessary test growth: a test per diagnostics row and the completion tests.
+- **The rebase onto `f9423ade5`,** which added LSP completion, needed the
+  three completion functions adapted to the `variants` table. The
+  coordinator raised the production ceiling to +600, a routine correction for
+  integrating with a concurrent landing.
+- **The stack's ceiling** moved from −150 to 0 when Keith accepted +566. It
+  no longer promises a line reduction, only no growth.
+- **The review fixes** reached about +747 as first written. The coordinator
+  deferred three help refinements of its own (below) and dropped a fourth
+  that needed a data-model change, then raised the production ceiling from
+  +600 to +615 for the fixes the review asked for: one error for an outside
+  `match` missing public and private variants, one reader of the value
+  space, a dead field, two helps, docstrings and the parser's mark.
+- **The test ceiling** went from +700 to +1,250 (measured +1,244), a
+  routine correction for necessary test growth under the root `AGENTS.md`.
+  The review asked for the tests the implementer had compressed to fit the
+  ceiling to be restored: aligned multiline programs, one behaviour per test,
+  the completion test split in four, and the dropped parser and payload
+  tests back. The two new suites, one test per diagnostics row and per scope
+  case, are 788 of the lines.
+- **Main's body spacing rule** (`ddb348dd5`) and its reformat of the tree
+  landed while landing 1 was in CI. The merge added 39 blank production
+  lines and 59 blank test lines to landing 1's code, and no other line. The
+  coordinator raised the production ceiling from +615 to +655 and the test
+  ceiling from +1,250 to +1,310, a routine correction for integrating with
+  a concurrent landing.
+
+**Deferred review fixes.** These refine landing 1's helps, which match the
+plan's table as they stand. They are one follow-up with its own ceiling of
++110, counted against the stack:
+
+- **A private variant in an outside pattern** (`Email.Checked(_)`) gets
+  "cover it with _, which matches the variants private to ./email" instead
+  of the build help. About +35.
+- **A public spelling several unions share, through an alias**
+  (`mail.Unchecked`) gets "write Email.Unchecked or Letter.Unchecked",
+  instead of help that repeats the selection. About +50.
+- **A private spelling several unions share** (`mail.Init`) gets the generic
+  "use the functions ./email exports" instead of naming the first union.
+  About +25.
+
+A fourth, dropped: the namespace would carry whether a variant is private by
+its mark or through its union, so render need not read `UnionRow.visibility`.
+That is a data-model change, and the wording it buys is the same.
 
 The estimates behind the line ceilings:
 
@@ -666,14 +748,14 @@ The gates follow `blorp/AGENTS.md` ("Which gates a change runs"):
 
 ## Acceptance criteria
 
-- [ ] **Landing 0:** as `EQUALITY_PLAN.md`, landing 3.
-- [ ] **Landing 1:**
+- [x] **Landing 0:** as `EQUALITY_PLAN.md`, landing 3.
+- [x] **Landing 1:**
   - the `UserId` and `Email` examples compile and run;
   - every diagnostics row for rules 1 to 6 has a test of its message, help
     and span, which fails when its rule is removed;
   - another module's `hidden.Secret`, an unmarked variant of a private
     union, is rejected;
-  - in a module where two unions have an `Init`, each bare use reports the
+  - in a module where two unions have an `Init`, a bare use reports the
     ambiguity, and `UserId.Init` resolves;
   - the fixed-input C is byte-identical;
   - the ceilings hold, and the gates pass.

@@ -5,7 +5,11 @@ import:
     ../../../../src/common/syntax/names: name_spelling, program_names
     ../../../../src/common/syntax/parse: ParsedModule, module_contents, module_names, parse_module
     ../../../../src/common/syntax/source: module_source, root_module_id
-    ../../../../src/common/syntax/syntax: Diagnostic, ParsedUnion, Visibility(Public, Private)
+    ../../../../src/common/syntax/syntax:
+        Diagnostic,
+        DiagnosticNote(PreviousDeclaration),
+        ParsedUnion,
+        Visibility(Public, Private)
 
 
 private pure func parsed(source: String) -> Result[ParsedModule, Diagnostic]:
@@ -149,6 +153,72 @@ pure func test_union_header_requires_colon() -> Bool:
     )
 
 
+-- `private` before a variant is read as its mark, keeping the keyword's
+-- span; an unmarked variant is public as written.
+pure func test_a_variant_may_be_marked_private() -> Bool:
+    match parsed("union UserId:\n    private Init(Int)\n    Other\n"):
+        Err(_):
+            False
+        Ok(module):
+            match module_contents(module).unions:
+                [declaration]:
+                    match declaration.variants:
+                        [marked, unmarked]:
+                            marked_at: Bool = match marked.visibility:
+                                Private(mark): and(mark.start == 18, mark.end == 25)
+                                Public: False
+
+                            unmarked_public: Bool = match unmarked.visibility:
+                                Public: True
+                                Private(_): False
+
+                            and(and(marked_at, unmarked_public), marked.fields.length() == 1)
+                        _:
+                            False
+                _:
+                    False
+
+
+-- The second variant of one name is reported, with a note at the first.
+pure func test_a_union_rejects_a_duplicate_variant() -> Bool:
+    match parsed("union UserId:\n    Init(Int)\n    Init\n"):
+        Ok(_):
+            False
+        Err(error):
+            noted_first: Bool = match error.note:
+                Some(PreviousDeclaration(first)): and(first.start == 18, first.end == 22)
+                _: False
+
+            and(
+                and(and(error.span.start == 32, error.span.end == 36), noted_first),
+                and(
+                    error.message == "UserId already has a variant named Init",
+                    error.help == "rename one of them"
+                )
+            )
+
+
+pure func test_a_variant_cannot_share_its_unions_name() -> Bool:
+    rejects(
+        "union UserId:\n    UserId(Int)\n",
+        18,
+        24,
+        "variant UserId shares its union's name",
+        "name the variant, for example UserId.Init, so that UserId always means the type"
+    )
+
+
+-- A private union's variants are already private, so the mark is reported.
+pure func test_a_private_unions_variant_carries_no_private_mark() -> Bool:
+    rejects(
+        "private union Step:\n    Stay\n    private Shift\n",
+        33,
+        40,
+        "Step is private, so its variants already are",
+        "remove private from Shift"
+    )
+
+
 TESTS: TestSuite = {
     description = "Blorp union declarations",
     tests = [
@@ -162,6 +232,13 @@ TESTS: TestSuite = {
         ),
         ("private fixed requires record or union", test_private_fixed_requires_record_or_union),
         ("fixed requires record or union", test_fixed_requires_record_or_union),
-        ("union header requires a colon", test_union_header_requires_colon)
+        ("union header requires a colon", test_union_header_requires_colon),
+        ("a variant may be marked private", test_a_variant_may_be_marked_private),
+        ("a union rejects a duplicate variant", test_a_union_rejects_a_duplicate_variant),
+        ("a variant cannot share its union's name", test_a_variant_cannot_share_its_unions_name),
+        (
+            "a private union's variant carries no private mark",
+            test_a_private_unions_variant_carries_no_private_mark
+        )
     ]
 }

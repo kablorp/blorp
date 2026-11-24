@@ -1,0 +1,484 @@
+---
+Private variants and shared variant spellings in check. A private variant is
+named only in its module; another module's `match` covers it with `_`, and no
+diagnostic it sees names a private variant it did not write. A bare name that
+several of a module's own variants share is reported at each use. Each root
+marks the span its one diagnostic covers with `[[` and `]]`.
+---
+import:
+    test: TestSuite
+    ../../../support/variant_inputs: compiles, rejects
+
+
+-- The module the roots import as `./email`. A private function returning
+-- Email precedes the public `parse`, so `parse` is the example function.
+private EMAIL: String =
+    |union Email:
+    |    private Checked(String)
+    |    Unchecked(String)
+    |    Blank
+    |union Token:
+    |    private Init(Int)
+    |private pure func forge(text: String) -> Email:
+    |    Email.Checked(text)
+    |pure func size(address: Email) -> Int:
+    |    match address:
+    |        Checked(_): 1
+    |        Email.Unchecked(_): 0
+    |        Blank: 0
+    |pure func parse(text: String) -> Email:
+    |    forge(text)
+    |
+
+
+-- A module whose only public function returning Email is a trait method.
+private FRESH: String =
+    |trait Fresh:
+    |    pure func fresh(value: Self) -> Self
+    |union Email:
+    |    private Checked(String)
+    |    Unchecked(String)
+    |implements Fresh for Email:
+    |    pure func fresh(value: Self) -> Self:
+    |        value
+    |
+
+
+-- Two unions of this module share `Init`, and two share `Empty`.
+private SHARED: String =
+    |union FunctionId:
+    |    Init(Int)
+    |union TypeId:
+    |    Init(Int)
+    |union First:
+    |    Empty
+    |union Second:
+    |    Empty
+    |
+
+
+-- Another module's union with an `Empty`, which roots import without it: only
+-- a module's own variants are candidates for a bare name it holds.
+private THIRD: String =
+    |union Third:
+    |    Empty
+    |
+
+
+private IMPORT_THIRD: String =
+    |import:
+    |    ./third: Third
+    |
+
+
+private INIT_AMBIGUOUS: String = "Init is a variant of several unions in scope: FunctionId, TypeId"
+private INIT_HELP: String = "write it through one of them: FunctionId.Init, TypeId.Init"
+private EMPTY_AMBIGUOUS: String = "Empty is a variant of several unions in scope: First, Second"
+private EMPTY_HELP: String = "write it through one of them: First.Empty, Second.Empty"
+private CHECKED_PRIVATE: String = "Email.Checked is private to module ./email"
+private BUILD_HELP: String = "build the Email with a function ./email exports, such as parse"
+
+
+private NOT_EXHAUSTIVE: String = "this match on Email is not exhaustive: Email has variants private to module ./email"
+
+
+private WILDCARD_HELP: String = "add a _ arm to cover them"
+
+
+-- Each shared variant is reached through its union, and a name no other
+-- variant shares, private or not, resolves bare.
+func test_unions_of_one_module_share_a_variant_spelling() -> Bool:
+    uses: String =
+        |union UserId:
+        |    private Guest(Int)
+        |func main() -> Int:
+        |    first: First = First.Empty
+        |    guest: UserId = Guest(2)
+        |    id = TypeId.Init(1)
+        |    0
+        |
+
+    compiles(SHARED + uses, "")
+
+
+func test_a_bare_shared_name_is_ambiguous_as_a_value() -> Bool:
+    uses: String =
+        |func main() -> Int:
+        |    first: First = [[Empty]]
+        |    0
+        |
+
+    rejects(THIRD, IMPORT_THIRD + SHARED + uses, EMPTY_AMBIGUOUS, EMPTY_HELP)
+
+
+func test_a_bare_shared_name_is_ambiguous_as_a_call_head() -> Bool:
+    uses: String =
+        |func main() -> Int:
+        |    id: TypeId = [[Init]](1)
+        |    0
+        |
+
+    rejects("", SHARED + uses, INIT_AMBIGUOUS, INIT_HELP)
+
+
+func test_a_bare_shared_name_is_ambiguous_in_a_pattern() -> Bool:
+    uses: String =
+        |pure func code(id: TypeId) -> Int:
+        |    match id:
+        |        [[Init]](value): value
+        |func main() -> Int:
+        |    0
+        |
+
+    rejects("", SHARED + uses, INIT_AMBIGUOUS, INIT_HELP)
+
+
+func test_a_bare_shared_name_is_ambiguous_in_a_constant() -> Bool:
+    uses: String =
+        |FIRST: First = [[Empty]]
+        |func main() -> Int:
+        |    0
+        |
+
+    rejects(THIRD, IMPORT_THIRD + SHARED + uses, EMPTY_AMBIGUOUS, EMPTY_HELP)
+
+
+func test_a_bare_shared_name_is_ambiguous_called_in_a_constant() -> Bool:
+    uses: String =
+        |ID: TypeId = [[Init]](1)
+        |func main() -> Int:
+        |    0
+        |
+
+    rejects("", SHARED + uses, INIT_AMBIGUOUS, INIT_HELP)
+
+
+-- In its own module a private variant is built and matched like any other,
+-- and its payload may mention a private type.
+func test_a_private_variant_is_used_in_its_module_with_a_private_payload() -> Bool:
+    source: String =
+        |private record Secret { number: Int }
+        |union UserId:
+        |    private Init(Secret)
+        |    Guest
+        |pure func number(id: UserId) -> Int:
+        |    match id:
+        |        Init(secret): secret.number
+        |        Guest: 0
+        |func main() -> Int:
+        |    number(Init({ number = 4 }))
+        |
+
+    compiles(source, "")
+
+
+-- Only a private variant's payload is exempt: a public one still may not
+-- mention a private type.
+func test_a_public_variants_payload_may_not_mention_a_private_type() -> Bool:
+    source: String =
+        |private record Secret { number: Int }
+        |union UserId:
+        |    Guest([[Secret]])
+        |func main() -> Int:
+        |    0
+        |
+
+    rejects(
+        "",
+        source,
+        "Secret is private but appears in public declaration UserId",
+        "make Secret public, or make UserId private"
+    )
+
+
+func test_a_private_variant_is_not_built_in_another_module() -> Bool:
+    root: String =
+        |import:
+        |    ./email: Email(Unchecked), parse
+        |func main() -> Int:
+        |    x = Email.[[Checked]]("x")
+        |    0
+        |
+
+    rejects(EMAIL, root, CHECKED_PRIVATE, BUILD_HELP)
+
+
+func test_a_private_variant_is_not_matched_in_another_module() -> Bool:
+    root: String =
+        |import:
+        |    ./email: Email(Unchecked), parse
+        |pure func code(address: Email) -> Int:
+        |    match address:
+        |        Email.[[Checked]](_): 1
+        |        _: 0
+        |func main() -> Int:
+        |    0
+        |
+
+    rejects(EMAIL, root, CHECKED_PRIVATE, BUILD_HELP)
+
+
+func test_a_private_variant_is_not_named_through_an_alias() -> Bool:
+    root: String =
+        |import:
+        |    ./email as mail
+        |func main() -> Int:
+        |    x = mail.[[Checked]]("x")
+        |    0
+        |
+
+    rejects(EMAIL, root, "mail.Checked is private to module ./email", BUILD_HELP)
+
+
+-- No public function of ./email returns a Token, so the help names none.
+func test_the_build_help_is_generic_without_an_exported_function() -> Bool:
+    root: String =
+        |import:
+        |    ./email: Token
+        |func main() -> Int:
+        |    token = Token.[[Init]](1)
+        |    0
+        |
+
+    rejects(
+        EMAIL,
+        root,
+        "Token.Init is private to module ./email",
+        "build the Token with a function ./email exports"
+    )
+
+
+-- A trait method is reached as a method, not as a function the module
+-- exports, so the help does not name it.
+func test_the_build_help_names_no_trait_method() -> Bool:
+    root: String =
+        |import:
+        |    ./email: Email
+        |func main() -> Int:
+        |    x = Email.[[Checked]]("x")
+        |    0
+        |
+
+    rejects(FRESH, root, CHECKED_PRIVATE, "build the Email with a function ./email exports")
+
+
+-- Outside the declaring module only `_` covers the private variants.
+func test_another_modules_match_covers_private_variants_with_a_wildcard() -> Bool:
+    root: String =
+        |import:
+        |    ./email: Email(Unchecked), parse
+        |pure func code(address: Email) -> Int:
+        |    match address:
+        |        Unchecked(_): 0
+        |        _: 1
+        |func main() -> Int:
+        |    code(parse("x"))
+        |
+
+    compiles(root, EMAIL)
+
+
+func test_another_modules_match_without_a_wildcard_is_not_exhaustive() -> Bool:
+    root: String =
+        |import:
+        |    ./email: Email(Unchecked, Blank)
+        |pure func code(address: Email) -> Int:
+        |    [[match]] address:
+        |        Unchecked(_): 0
+        |        Blank: 1
+        |func main() -> Int:
+        |    0
+        |
+
+    rejects(EMAIL, root, NOT_EXHAUSTIVE, WILDCARD_HELP)
+
+
+-- One `_` covers the private variants and the public one missing with them,
+-- so the match reports them once.
+func test_a_match_missing_public_and_private_variants_reports_them_once() -> Bool:
+    root: String =
+        |import:
+        |    ./email: Email(Unchecked)
+        |pure func code(address: Email) -> Int:
+        |    [[match]] address:
+        |        Unchecked(_): 0
+        |func main() -> Int:
+        |    0
+        |
+
+    rejects(EMAIL, root, NOT_EXHAUSTIVE, WILDCARD_HELP)
+
+
+-- The witness names the position of the private variants, never one of them.
+func test_a_nested_witness_names_only_the_position() -> Bool:
+    root: String =
+        |import:
+        |    ./email: Email(Unchecked, Blank)
+        |pure func code(address: Option[Email]) -> Int:
+        |    [[match]] address:
+        |        Some(Unchecked(_)): 0
+        |        Some(Blank): 1
+        |        None: 2
+        |func main() -> Int:
+        |    0
+        |
+
+    rejects(
+        EMAIL,
+        root,
+        "this match on Option[Email] is not exhaustive: Email has variants private to module ./email",
+        "add a Some(_) arm to cover them"
+    )
+
+
+-- The unimported-variant suggestion offers no private variant.
+func test_an_unknown_value_suggests_no_private_variant() -> Bool:
+    root: String =
+        |import:
+        |    ./email: Email(Unchecked), parse
+        |func main() -> Int:
+        |    x = [[Checked]]
+        |    0
+        |
+
+    rejects(
+        EMAIL,
+        root,
+        "unknown value",
+        "use this function's parameter name, a declared variant, or a call"
+    )
+
+
+func test_an_unknown_pattern_suggests_no_private_variant() -> Bool:
+    root: String =
+        |import:
+        |    ./email: Email(Unchecked), parse
+        |pure func code(address: Email) -> Int:
+        |    match address:
+        |        [[Checked(_)]]: 1
+        |        _: 0
+        |func main() -> Int:
+        |    0
+        |
+
+    rejects(
+        EMAIL,
+        root,
+        "unknown constructor pattern",
+        "a capitalized name in a pattern must be a variant of the matched union; to bind a value, write it in lower_snake_case"
+    )
+
+
+func test_a_missing_variant_lists_only_public_variants() -> Bool:
+    root: String =
+        |import:
+        |    ./email: Email(Unchecked), parse
+        |func main() -> Int:
+        |    x = Email.[[Missing]]("x")
+        |    0
+        |
+
+    rejects(EMAIL, root, "Email has no variant Missing", "its variants are Unchecked, Blank")
+
+
+-- Every variant of Token is private, so the help names its module instead.
+func test_a_missing_variant_of_a_union_with_none_public_names_its_module() -> Bool:
+    root: String =
+        |import:
+        |    ./email: Token
+        |func main() -> Int:
+        |    token = Token.[[Missing]](1)
+        |    0
+        |
+
+    rejects(
+        EMAIL,
+        root,
+        "Token has no variant Missing",
+        "its variants are private; use the functions ./email exports"
+    )
+
+
+TESTS: TestSuite = {
+    description = "Blorp private variants and shared variant spellings",
+    tests = [
+        (
+            "unions of one module share a variant spelling",
+            test_unions_of_one_module_share_a_variant_spelling
+        ),
+        (
+            "a bare shared name is ambiguous as a value",
+            test_a_bare_shared_name_is_ambiguous_as_a_value
+        ),
+        (
+            "a bare shared name is ambiguous as a call head",
+            test_a_bare_shared_name_is_ambiguous_as_a_call_head
+        ),
+        (
+            "a bare shared name is ambiguous in a pattern",
+            test_a_bare_shared_name_is_ambiguous_in_a_pattern
+        ),
+        (
+            "a bare shared name is ambiguous in a constant",
+            test_a_bare_shared_name_is_ambiguous_in_a_constant
+        ),
+        (
+            "a bare shared name is ambiguous called in a constant",
+            test_a_bare_shared_name_is_ambiguous_called_in_a_constant
+        ),
+        (
+            "a private variant is used in its module with a private payload",
+            test_a_private_variant_is_used_in_its_module_with_a_private_payload
+        ),
+        (
+            "a public variant's payload may not mention a private type",
+            test_a_public_variants_payload_may_not_mention_a_private_type
+        ),
+        (
+            "a private variant is not built in another module",
+            test_a_private_variant_is_not_built_in_another_module
+        ),
+        (
+            "a private variant is not matched in another module",
+            test_a_private_variant_is_not_matched_in_another_module
+        ),
+        (
+            "a private variant is not named through an alias",
+            test_a_private_variant_is_not_named_through_an_alias
+        ),
+        (
+            "the build help is generic without an exported function",
+            test_the_build_help_is_generic_without_an_exported_function
+        ),
+        ("the build help names no trait method", test_the_build_help_names_no_trait_method),
+        (
+            "another module's match covers private variants with a wildcard",
+            test_another_modules_match_covers_private_variants_with_a_wildcard
+        ),
+        (
+            "another module's match without a wildcard is not exhaustive",
+            test_another_modules_match_without_a_wildcard_is_not_exhaustive
+        ),
+        (
+            "a match missing public and private variants reports them once",
+            test_a_match_missing_public_and_private_variants_reports_them_once
+        ),
+        ("a nested witness names only the position", test_a_nested_witness_names_only_the_position),
+        (
+            "an unknown value suggests no private variant",
+            test_an_unknown_value_suggests_no_private_variant
+        ),
+        (
+            "an unknown pattern suggests no private variant",
+            test_an_unknown_pattern_suggests_no_private_variant
+        ),
+        (
+            "a missing variant lists only public variants",
+            test_a_missing_variant_lists_only_public_variants
+        ),
+        (
+            "a missing variant of a union with none public names its module",
+            test_a_missing_variant_of_a_union_with_none_public_names_its_module
+        )
+    ]
+}

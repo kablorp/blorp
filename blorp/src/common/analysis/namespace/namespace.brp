@@ -1,8 +1,10 @@
 ---
 The namespace: every module's scope, built once from the sealed parsed program
 before checking. In one module a spelling denotes at most one entity per space,
-and `enter` is the only place that rule is checked; `offer` is the only place
-it is decided what a module offers its importers. Modules are built in
+except that the module's own variants may share one, and `enter` is the only
+place that rule is checked; `held_value` is the one reader of the value space.
+`offer`, and for variants `variant_offer` and `offer_variant`, alone decide
+what a module offers its importers. Modules are built in
 dependency order, so each import reads a finished scope. Building stops at the
 first module with a problem: every later module depends on it or would be
 reported after it, and checking reports one problem.
@@ -192,9 +194,29 @@ pure func referenced_trait(reference: TraitReference) -> TraitId:
         QualifiedTrait(_, _, id): id
 
 
--- One module's names, in the order they entered, keyed by `space_key`.
+-- One variant a module holds under its spelling: declared there, imported, or
+-- supplied by the prelude.
+private record VariantEntry {
+    name: WrittenName,
+    variant: VariantId,
+    origin: Origin
+}
+
+
+-- The variants one spelling holds: one, or several the module declares, in
+-- declaration order. Most spellings hold one, which needs no list.
+private record HeldVariants {
+    first: VariantEntry,
+    later: List[VariantEntry]
+}
+
+
+-- One module's names, in the order they entered. Variants are keyed by
+-- spelling in `variants`, because the module's own variants may share one;
+-- every other name is keyed by `space_key` in `names`.
 private record ModuleScope {
     names: Dict[Int, Entry],
+    variants: Dict[NameId, HeldVariants],
     methods: List[MethodImport],
     implementations: List[ResolvedImplementation],
     resolved: List[ResolvedName]
@@ -206,6 +228,9 @@ private record ModuleScope {
 union Unoffered:
     UnknownName
     PrivateName
+    PrivateVariant(VariantId)
+    -- The public variants the module declares under one spelling, in order.
+    SeveralVariants(VariantId, List[VariantId])
     ImportedThere(Entity)
     ProvidedThere(Entity)
 
@@ -214,6 +239,8 @@ union Unoffered:
 -- in the selecting module's scope, through the prelude or an earlier import.
 union SelectionProblem:
     NotOffered(Unoffered)
+    -- `Union(Variant)` lists a variant private to the target.
+    PrivateListedVariant(WrittenName, VariantId)
     AlreadyFromPrelude(Entity)
     AlreadyImported(Entity)
     AmbiguousFunction
@@ -241,6 +268,7 @@ union NamespaceProblem:
 -- Its fields are flat so that each update can reuse them in place.
 private record BuiltScope {
     names: Dict[Int, Entry],
+    variants: Dict[NameId, HeldVariants],
     methods: List[MethodImport],
     implementations: List[ResolvedImplementation],
     resolved: List[ResolvedName],
@@ -259,12 +287,15 @@ fixed union FunctionSource:
     ImportedAt(Span)
 
 
--- What a name denotes in the value space.
+-- What a name denotes in the value space. `NamedVariants` is a spelling the
+-- module's own variants share, in declaration order, which a bare use cannot
+-- choose between.
 union NamedValue:
     NamedMethod(TraitMethodId)
     NamedFunction(FunctionId, FunctionSource)
     NamedConstant(ConstantId)
     NamedConstructor(VariantId)
+    NamedVariants(VariantId, List[VariantId])
     NamedAlias(AliasedModule)
 
 
@@ -342,7 +373,7 @@ pure func builtin_declaration(
 
 private pure func empty_scope() -> ModuleScope:
     none: List[MethodImport] = []
-    { names = {}, methods = none, implementations = [], resolved = [] }
+    { names = {}, variants = {}, methods = none, implementations = [], resolved = [] }
 
 
 -- A spelling's entry in each space has its own key: 2n for values and 2n + 1
@@ -358,6 +389,41 @@ private pure func space_key(space: Space, name: NameId) -> Int:
 -- The entry `names` holds for `name` in `space`; the rule leaves at most one.
 private pure func holder(names: Dict[Int, Entry], space: Space, name: NameId) -> Option[Entry]:
     names.get(space_key(space, name))
+
+
+-- What a scope holds under a value-space name: one entry, or a spelling's variants.
+private union HeldValue:
+    ValueEntry(Entry)
+    VariantSpelling(HeldVariants)
+
+
+-- The one reader of a scope's value space: a value, or else the variants of
+-- the spelling. Every query and rule that reads the space reads it here.
+private pure func held_value(
+    names: Dict[Int, Entry],
+    variants: Dict[NameId, HeldVariants],
+    name: NameId
+) -> Option[HeldValue]:
+    match names.holder(Values, name):
+        Some(entry):
+            Some(ValueEntry(entry))
+        None:
+            variants
+                .get(name)
+                .map(pure func(held: HeldVariants) -> HeldValue: VariantSpelling(held))
+
+
+-- The entry a held value reads as where entries are compared: a variant
+-- spelling reads as its first variant.
+private pure func held_entry(held: HeldValue) -> Entry:
+    match held:
+        ValueEntry(entry): entry
+        VariantSpelling(spelling): spelling.first.listed_entry()
+
+
+-- The entry a variant reads as where scopes list or compare entries.
+private pure func listed_entry(variant: VariantEntry) -> Entry:
+    { name = variant.name, entity = Constructor(variant.variant), origin = variant.origin }
 
 
 -- A module reports its first problem in source order. Names do not enter in
@@ -377,48 +443,72 @@ private pure func first_problem(
             Some(later)
 
 
--- What `names` already holds in a space that `entity` named `name` claims.
-private pure func claimant(names: Dict[Int, Entry], name: NameId, entity: Entity) -> Option[Entry]:
+-- What a scope already holds in a space that `entity` named `name` claims.
+private pure func claimant(
+    names: Dict[Int, Entry],
+    variants: Dict[NameId, HeldVariants],
+    name: NameId,
+    entity: Entity
+) -> Option[Entry]:
     match entity:
         Method(_) | Function(_) | Constant(_) | Constructor(_):
-            names.holder(Values, name)
+            held_value(names, variants, name).map(held_entry)
         Type(_) | Trait(_):
             names.holder(Types, name)
         Alias(_):
-            match names.holder(Values, name):
-                Some(held): Some(held)
+            match held_value(names, variants, name):
+                Some(held): Some(held.held_entry())
                 None: names.holder(Types, name)
 
 
--- `names` with `incoming` in each space it claims. This is a scope's only
--- writer, so a value key never holds a type, a type key never holds a function,
--- constant or constructor, and an alias, entered only by `import_row`, is always
--- `Imported`. The arms that read those states (in `named_value`, `named_type`,
+-- `built` with `incoming` in each space it claims, and a variant after the
+-- others of its spelling. This is a scope's only writer, so a value key never
+-- holds a type or a variant, a type key never holds a function, constant or
+-- variant, and an alias, entered only by `import_row`, is always `Imported`.
+-- The arms that read those states (in `named_value`, `named_type`,
 -- `offered_value`, `offered_type`, `select_methods` and render) are
--- unreachable. Typed per-space entries would remove them, but measured they
--- cost a second copy of `enter` per space, about 37 more lines, and about 80
--- more allocations on a one-line program, so one `Entity` serves both spaces.
-private pure func claimed(names: Dict[Int, Entry], incoming: Entry) -> Dict[Int, Entry]:
+-- unreachable. Typed per-space entries would remove them, but
+-- measured they cost a second copy of `enter` per space, about 37 more lines,
+-- and about 80 more allocations on a one-line program, so one `Entity` serves
+-- both spaces.
+private pure func claimed(built: BuiltScope, incoming: Entry) -> BuiltScope:
     name = incoming.name.id
 
     match incoming.entity:
-        Method(_) | Function(_) | Constant(_) | Constructor(_):
-            names.set(space_key(Values, name), incoming)
+        Constructor(variant):
+            entry: VariantEntry = {
+                name = incoming.name,
+                variant = variant,
+                origin = incoming.origin
+            }
+
+            held: HeldVariants = match built.variants.get(name):
+                Some(earlier): { earlier | later = earlier.later.append(entry) }
+                None: { first = entry, later = [] }
+
+            { built | variants = built.variants.set(name, held) }
+        Method(_) | Function(_) | Constant(_):
+            { built | names = built.names.set(space_key(Values, name), incoming) }
         Type(_) | Trait(_):
-            names.set(space_key(Types, name), incoming)
+            { built | names = built.names.set(space_key(Types, name), incoming) }
         Alias(_):
-            names
-                .set(space_key(Values, name), incoming)
-                .set(space_key(Types, name), incoming)
+            { built |
+                names = built.names
+                    .set(space_key(Values, name), incoming)
+                    .set(space_key(Types, name), incoming)
+            }
 
 
 -- The scope rule. An import of an entity the module already sees (the
--- prelude's, and an explicit import of it) enters once; a declaration always
--- claims its spelling, so a second declaration of anything is a conflict.
+-- prelude's, and an explicit import of it) enters once. A declared variant
+-- joins the variants this module declares under its spelling, which only a
+-- bare use reports as ambiguous. Any other declaration claims its spelling, so
+-- a second declaration of anything else, or a variant meeting an imported or
+-- prelude variant or a constant, is a conflict, reported once, here.
 private pure func enter(built: BuiltScope, incoming: Entry) -> BuiltScope:
-    match built.names.claimant(incoming.name.id, incoming.entity):
+    match claimant(built.names, built.variants, incoming.name.id, incoming.entity):
         None:
-            { built | names = built.names.claimed(incoming) }
+            built.claimed(incoming)
         Some(held):
             family_again = match held.entity:
                 Method(first):
@@ -432,6 +522,10 @@ private pure func enter(built: BuiltScope, incoming: Entry) -> BuiltScope:
                 Declared(_): False
                 Imported | Implicit: held.entity.same_entity(incoming.entity)
 
+            shares: Bool = match (held.entity, held.origin, incoming.entity, incoming.origin):
+                (Constructor(_), Declared(_), Constructor(_), Declared(_)): True
+                _: False
+
             if family_again:
                 match held.origin:
                     Declared(Public):
@@ -439,9 +533,11 @@ private pure func enter(built: BuiltScope, incoming: Entry) -> BuiltScope:
                     _:
                         match incoming.origin:
                             Imported | Implicit: built
-                            Declared(_): { built | names = built.names.claimed(incoming) }
+                            Declared(_): built.claimed(incoming)
             else if arrives_again:
                 built
+            else if shares:
+                built.claimed(incoming)
             else:
                 { built |
                     problem = built.problem.first_problem(
@@ -494,10 +590,54 @@ private pure func offer(found: Option[Entry]) -> Result[Entity, Unoffered]:
             Err(UnknownName)
 
 
+-- What one variant offers importers: itself, when it is a public declaration.
+private pure func variant_offer(entry: VariantEntry) -> Result[VariantEntry, Unoffered]:
+    match entry.origin:
+        Declared(Public): Ok(entry)
+        Declared(Private(_)): Err(PrivateVariant(entry.variant))
+        Imported: Err(ImportedThere(Constructor(entry.variant)))
+        Implicit: Err(ProvidedThere(Constructor(entry.variant)))
+
+
+-- What one spelling's variants offer importers: the one public variant the
+-- module declares under it. Several public ones make the spelling ambiguous;
+-- with none, the first says why it is not offered.
+private pure func offer_variant(held: HeldVariants) -> Result[VariantEntry, Unoffered]:
+    match held.later:
+        []:
+            held.first.variant_offer()
+        _:
+            public = [held.first]
+                .concat(held.later)
+                .filter(pure func(entry): entry.origin == Declared(Public))
+
+            match public:
+                []:
+                    held.first.variant_offer()
+                [only]:
+                    Ok(only)
+                [one, ...rest]:
+                    Err(SeveralVariants(one.variant, rest.map(pure func(entry): entry.variant)))
+
+
+-- What a module offers for what it holds under a value-space name.
+private pure func offer_value(held: Option[HeldValue]) -> Result[Entity, Unoffered]:
+    match held:
+        Some(ValueEntry(entry)):
+            offer(Some(entry))
+        Some(VariantSpelling(spelling)):
+            spelling
+                .offer_variant()
+                .map(pure func(offered) -> Entity: Constructor(offered.variant))
+        None:
+            Err(UnknownName)
+
+
 -- Building, in dependency order.
 
 
--- `entries` with a union's type, then each constructor with the union's visibility.
+-- `entries` with a union's type, then each constructor with its own
+-- effective visibility.
 private pure func with_union(entries: List[Entry], row: UnionRow) -> List[Entry]:
     var grown: List[Entry] = entries.append({
         name = row.type_name,
@@ -509,7 +649,7 @@ private pure func with_union(entries: List[Entry], row: UnionRow) -> List[Entry]
         grown = grown.append({
             name = variant.declaration.name,
             entity = Constructor(variant.id),
-            origin = Declared(row.visibility)
+            origin = Declared(variant.visibility)
         })
 
     grown
@@ -762,6 +902,11 @@ private pure func provided(prelude: ModuleScope) -> List[Entry]:
                     Imported: entries = entries.append({ entry | origin = Implicit })
                     Declared(_) | Implicit: void
 
+    -- Only a spelling's first variant can be imported: later ones are declared.
+    for held in prelude.variants.values():
+        if held.first.origin == Imported:
+            entries = entries.append({ held.first.listed_entry() | origin = Implicit })
+
     entries
 
 
@@ -783,6 +928,7 @@ private pure func build_module(
 
     var built: BuiltScope = {
         names = dict_ops.dict(expected),
+        variants = {},
         methods = methods,
         implementations = [],
         resolved = [],
@@ -981,6 +1127,7 @@ pure func build_namespace(program: ParsedProgram) -> Result[Namespace, Namespace
 
         scope: ModuleScope = {
             names = built.names,
+            variants = built.variants,
             methods = built.methods,
             implementations = built.implementations,
             resolved = built.resolved
@@ -1017,7 +1164,7 @@ private pure func seen_here(
 ) -> SelectionProblem:
     match problem:
         NotOffered(ImportedThere(entity)):
-            match built.names.claimant(name, entity):
+            match claimant(built.names, built.variants, name, entity):
                 Some(entry):
                     if entry.entity.same_entity(entity):
                         match entry.origin:
@@ -1069,11 +1216,7 @@ private pure func bare_selection(
     target: ModuleScope,
     name: NameId
 ) -> Result[Entity, SelectionProblem]:
-    value: Result[Entity, SelectionProblem] = match (
-        target.names
-            .holder(Values, name)
-            .offer()
-    ):
+    value: Result[Entity, SelectionProblem] = match (held_value(target.names, target.variants, name).offer_value()):
         Ok(Constructor(variant)): Err(BareConstructor(variant))
         Ok(selected): Ok(selected)
         Err(reason): Err(NotOffered(reason))
@@ -1151,32 +1294,41 @@ private pure func select_union(
                             var next = built.bind(request, name, union_type)
 
                             for constructor in listed:
-                                next = match (
-                                    target.names
-                                        .holder(Values, constructor.id)
-                                        .offer()
-                                ):
-                                    Ok(Constructor(variant)):
-                                        if variant.variant_owner() == owner:
-                                            listed_constructor: ResolvedName = {
-                                                name = constructor,
-                                                entity = Constructor(variant)
-                                            }
+                                -- The union's own variant of this spelling, among any others.
+                                var owned: Result[VariantEntry, Unoffered] = Err(UnknownName)
 
-                                            { next |
-                                                resolved = next.resolved.append(listed_constructor)
-                                            }.enter({
-                                                name = constructor,
-                                                entity = Constructor(variant),
-                                                origin = Imported
-                                            })
-                                        else:
-                                            next.fail(
-                                                request,
-                                                selection,
-                                                NotAConstructor(constructor)
-                                            )
-                                    _:
+                                match held_value(target.names, target.variants, constructor.id):
+                                    Some(VariantSpelling(held)):
+                                        if held.first.variant.variant_owner() == owner:
+                                            owned = held.first.variant_offer()
+
+                                        for later in held.later:
+                                            if later.variant.variant_owner() == owner:
+                                                owned = later.variant_offer()
+                                    Some(ValueEntry(_)) | None:
+                                        void
+
+                                next = match owned:
+                                    Ok(offered):
+                                        listed_constructor: ResolvedName = {
+                                            name = constructor,
+                                            entity = Constructor(offered.variant)
+                                        }
+
+                                        { next |
+                                            resolved = next.resolved.append(listed_constructor)
+                                        }.enter({
+                                            name = constructor,
+                                            entity = Constructor(offered.variant),
+                                            origin = Imported
+                                        })
+                                    Err(PrivateVariant(variant)):
+                                        next.fail(
+                                            request,
+                                            selection,
+                                            PrivateListedVariant(constructor, variant)
+                                        )
+                                    Err(_):
                                         next.fail(request, selection, NotAConstructor(constructor))
 
                             next
@@ -1272,27 +1424,54 @@ private pure func select_methods(
 -- Queries: the checker reads the namespace only through these.
 
 
--- What `module` holds for `name` in `space`. Host `get` returns an Option even
--- for a sealed module number, which always has a scope.
+-- What `module` holds for `name` in the value space. Host `get` returns an
+-- Option even for a sealed module number, which always has a scope.
+private pure func value_at(
+    namespace: Namespace,
+    module: ModuleId,
+    name: NameId
+) -> Option[HeldValue]:
+    match from_opaque Namespace(namespace).get(module.module_number()):
+        Some(scope): held_value(scope.names, scope.variants, name)
+        None: None
+
+
+-- What `module` holds for `name` in `space`, a variant spelling read as its
+-- first variant.
 private pure func held_in(
     namespace: Namespace,
     module: ModuleId,
     space: Space,
     name: NameId
 ) -> Option[Entry]:
-    scopes: List[ModuleScope] = from_opaque Namespace(namespace)
-
-    match scopes.get(module.module_number()):
-        Some(scope): scope.names.holder(space, name)
-        None: None
+    match space:
+        Values:
+            value_at(namespace, module, name).map(held_entry)
+        Types:
+            match from_opaque Namespace(namespace).get(module.module_number()):
+                Some(scope): scope.names.holder(Types, name)
+                None: None
 
 
 -- What `name` denotes as a value in `module`. The scope rule leaves one entry,
--- so no caller chooses.
+-- or several variants this module declares, which `NamedVariants` lists for
+-- the caller to report; no caller chooses.
 pure func named_value(namespace: Namespace, module: ModuleId, name: NameId) -> Option[NamedValue]:
-    match namespace.held_in(module, Values, name):
-        Some(entry): entry.entry_value()
-        None: None
+    match value_at(namespace, module, name):
+        Some(ValueEntry(entry)):
+            entry.entry_value()
+        Some(VariantSpelling(held)):
+            if held.later.is_empty():
+                Some(NamedConstructor(held.first.variant))
+            else:
+                Some(
+                    NamedVariants(
+                        held.first.variant,
+                        held.later.map(pure func(entry): entry.variant)
+                    )
+                )
+        None:
+            None
 
 
 -- A namespace entry's value and original function introduction. Bulk consumers
@@ -1383,11 +1562,7 @@ pure func offered_value(
     target: ModuleId,
     name: NameId
 ) -> Result[OfferedValue, Unoffered]:
-    match (
-        namespace
-            .held_in(target, Values, name)
-            .offer()
-    ):
+    match offer_value(value_at(namespace, target, name)):
         Ok(Method(id)): Ok(OfferedMethod(id))
         Ok(Function(id)): Ok(OfferedFunction(id))
         Ok(Constant(id)): Ok(OfferedConstant(id))
@@ -1432,8 +1607,9 @@ pure func resolved_names(namespace: Namespace) -> List[ResolvedName]:
     names
 
 
--- The sealed scope's existing entries in namespace insertion order. The list
--- has value semantics; consumers project through the function queries below.
+-- The sealed scope's entries but its variants, in insertion order: consumers
+-- read functions and methods. The list has value semantics; consumers project
+-- through the function queries below.
 pure func module_entries(namespace: Namespace, module: ModuleId) -> List[Entry]:
     scopes: List[ModuleScope] = from_opaque Namespace(namespace)
 
@@ -1442,35 +1618,60 @@ pure func module_entries(namespace: Namespace, module: ModuleId) -> List[Entry]:
         None: []
 
 
--- The module's names, each entity once, in the order they entered. An alias
--- claims its spelling in both spaces (`claimed`) and is listed by its Values
--- entry; a type and a constructor spelled alike are two entities, both listed.
-pure func module_names(namespace: Namespace, module: ModuleId) -> List[Entry]:
-    scopes: List[ModuleScope] = from_opaque Namespace(namespace)
+-- A scope's names but its variants, each entity once, in the order they
+-- entered. An alias claims its spelling in both spaces (`claimed`) and is
+-- listed by its Values entry.
+private pure func value_and_type_entries(scope: ModuleScope) -> List[Entry]:
     var listed: List[Entry] = []
 
-    match scopes.get(module.module_number()):
-        Some(scope):
-            for (key, entry) in scope.names.entries():
-                types_copy: Bool = match entry.entity:
-                    Alias(_): key == space_key(Types, entry.name.id)
-                    _: False
+    for (key, entry) in scope.names.entries():
+        types_copy: Bool = match entry.entity:
+            Alias(_): key == space_key(Types, entry.name.id)
+            _: False
 
-                if not(types_copy):
-                    listed = listed.append(entry)
-        -- The namespace issued the module's id, so its scope is there.
-        None:
-            void
+        if not(types_copy):
+            listed = listed.append(entry)
 
     listed
 
 
--- What `target` offers its importers, by `offer`: its public declarations,
--- each once, in the order they entered.
+-- The module's names, each entity once, then each variant spelling once, in
+-- the order they entered: a bare use of a spelling the module's own variants
+-- share reports the ambiguity. A type and a variant spelled alike are two
+-- entities, both listed.
+pure func module_names(namespace: Namespace, module: ModuleId) -> List[Entry]:
+    match from_opaque Namespace(namespace).get(module.module_number()):
+        Some(scope):
+            var listed = scope.value_and_type_entries()
+
+            for held in scope.variants.values():
+                listed = listed.append(held.first.listed_entry())
+
+            listed
+        -- The namespace issued the module's id, so its scope is there.
+        None:
+            []
+
+
+-- What `target` offers its importers: its declarations by `offer`, and its
+-- variants by `offer_variant`, so no private variant and no spelling several
+-- public variants share. Each once, in the order they entered.
 pure func offered_entries(namespace: Namespace, target: ModuleId) -> List[Entry]:
-    namespace
-        .module_names(target)
-        .filter(pure func(entry: Entry) -> Bool: offer(Some(entry)).is_ok())
+    match from_opaque Namespace(namespace).get(target.module_number()):
+        Some(scope):
+            var offered = scope
+                .value_and_type_entries()
+                .filter(pure func(entry: Entry) -> Bool: offer(Some(entry)).is_ok())
+
+            for held in scope.variants.values():
+                match held.offer_variant():
+                    Ok(variant): offered = offered.append(variant.listed_entry())
+                    Err(_): void
+
+            offered
+        -- The namespace issued the module's id, so its scope is there.
+        None:
+            []
 
 
 -- One of this module's declarations, including its private functions.
@@ -1501,6 +1702,7 @@ pure func namespace_problem_span(problem: NamespaceProblem) -> Span:
         InvalidTraitInventory(span): span
         NameConflict(conflict): conflict.incoming.name.span
         SelectionFailure(_, _, NotAConstructor(constructor)): constructor.span
+        SelectionFailure(_, _, PrivateListedVariant(constructor, _)): constructor.span
         SelectionFailure(_, selection, _): selection.selection_name().span
 
 

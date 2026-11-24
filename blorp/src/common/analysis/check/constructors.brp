@@ -19,7 +19,7 @@ import:
     ../namespace/namespace:
         AliasedModule,
         Namespace,
-        NamedValue(NamedConstant, NamedConstructor),
+        NamedValue(NamedConstant, NamedConstructor, NamedVariants),
         OfferedValue(OfferedConstructor),
         TypeHead(ListHead, OpaqueHead, PrimitiveHead, RecordHead, UnionHead)
     ./callables: FunctionContract, ResolutionContext
@@ -50,6 +50,7 @@ import:
             QualifierNotUnion,
             UnknownUnion,
             UnionHasNoVariant,
+            ForeignPrivateVariant,
             VariantNotInExpectedType,
             PayloadFreeVariantCalled,
             ConstructorFieldCountMismatch
@@ -66,7 +67,7 @@ import:
         ValueError(
             EmptyListNeedsElementType,
             ListElementTypeMismatch,
-            UnimportedVariantValue,
+            VariantNeedsUnion,
             UnknownValue
         ),
         ListElementReference(EarlierElement, ExpectedElement),
@@ -108,13 +109,15 @@ import:
         CheckedUnion,
         CheckedOpaque,
         CheckedField,
+        CheckedVariant,
         TypeParameterId,
         TypeRef(NominalType, ListType),
         AggregateId(RecordAggregate, UnionAggregate),
         NominalId(AggregateNominal),
         TypeUse,
         CheckedExpr,
-        UnionOccurrence
+        UnionOccurrence,
+        visible_variants
     ./name_uses:
         NameUse,
         Referent(VariantReferent),
@@ -199,8 +202,16 @@ private pure func find_declared_variant(
     match context.namespace.named_value(context.module, name.id):
         Some(NamedConstructor(variant)):
             context.declared_variant_contract(owner, variant, name.span)
+        Some(NamedVariants(first, rest)):
+            Err(ambiguous_variant(name.span, first, rest))
         _:
             Ok(None)
+
+
+-- A bare name that several variants in scope share is reported at each use;
+-- `Union.Variant` names one of them.
+pure func ambiguous_variant(span: Span, first: VariantId, rest: List[VariantId]) -> CheckError:
+    value_error(span, VariantNeedsUnion(first, rest))
 
 
 pure func find_variant(
@@ -216,14 +227,18 @@ pure func find_variant(
                 None:
                     Err(checker_invariant(name.span, InvalidCheckedUnion(occurrence.owner)))
                 Some(declaration):
-                    match declaration.variant_named(name.id):
+                    match (
+                        declaration
+                            .visible_variants(context.module)
+                            .variant_named(name.id)
+                    ):
                         Some(variant):
                             in_scope = context.union_in_scope(declaration)
 
                             Err(
                                 match_error(
                                     name.span,
-                                    UnimportedConstructorPattern(variant, in_scope)
+                                    UnimportedConstructorPattern(variant.id, in_scope)
                                 )
                             )
                         None:
@@ -269,13 +284,16 @@ pure func find_qualified_variant(
                 Err(error): Err(error)
 
 
--- The variant of `declaration` written `name`.
-private pure func variant_named(declaration: CheckedUnion, name: NameId) -> Option[VariantId]:
-    var found: Option[VariantId] = None
+-- The variant among `variants` written `name`.
+private pure func variant_named(
+    variants: List[CheckedVariant],
+    name: NameId
+) -> Option[CheckedVariant]:
+    var found: Option[CheckedVariant] = None
 
-    for variant in declaration.variants:
+    for variant in variants:
         if variant.name.id == name:
-            found = Some(variant.id)
+            found = Some(variant)
 
     found
 
@@ -317,20 +335,25 @@ private pure func union_in_scope(context: ConstructionContext, declaration: Chec
 
 -- The rejection of a bare name that no value answers to. A variant of that name
 -- in a union `Union.Variant` reaches, whether or not the variant itself was
--- imported, is written through its union; only this error path asks.
+-- imported, is written through its union; only this error path asks, and it
+-- offers only variants this module may name.
 pure func unknown_value_error(context: ConstructionContext, name: WrittenName) -> CheckError:
     var reached: List[VariantId] = []
 
     for declaration in context.unions:
-        match declaration.variant_named(name.id):
+        match (
+            declaration
+                .visible_variants(context.module)
+                .variant_named(name.id)
+        ):
             Some(variant):
                 if context.union_in_scope(declaration):
-                    reached = reached.append(variant)
+                    reached = reached.append(variant.id)
             None:
                 void
 
     match reached:
-        [first, ...rest]: value_error(name.span, UnimportedVariantValue(first, rest))
+        [first, ...rest]: value_error(name.span, VariantNeedsUnion(first, rest))
         []: value_error(name.span, UnknownValue(name.id))
 
 
@@ -343,16 +366,26 @@ private pure func variant_of_union(
         .get(owner.union_number())
         .or_checker_invariant(written.union_name.span, InvalidCheckedUnion(owner))
 
-    match declaration.variant_named(written.variant.id):
+    visible = declaration.visible_variants(context.module)
+
+    match visible.variant_named(written.variant.id):
         Some(variant):
-            Ok(variant)
+            Ok(variant.id)
         None:
-            Err(
-                constructor_error(
-                    written.variant.span,
-                    UnionHasNoVariant(owner, written.variant.id)
-                )
-            )
+            match declaration.variants.variant_named(written.variant.id):
+                Some(hidden):
+                    Err(constructor_error(written.variant.span, ForeignPrivateVariant(hidden.id)))
+                None:
+                    Err(
+                        constructor_error(
+                            written.variant.span,
+                            UnionHasNoVariant(
+                                owner,
+                                written.variant.id,
+                                visible.map(pure func(variant): variant.id)
+                            )
+                        )
+                    )
 
 
 -- `X.Y` names variant `Y` of the union type `X` visible in this module.

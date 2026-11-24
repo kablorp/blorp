@@ -48,6 +48,7 @@ import:
             PatternTypeMismatch,
             NonExhaustiveMatch,
             NonExhaustiveStructuralMatch,
+            PrivateVariantsUncovered,
             TuplePatternRequiresTuple,
             TuplePatternArityMismatch
         ),
@@ -55,6 +56,7 @@ import:
         UnsupportedForm(CharPattern),
         PatternWitness(
             AnyWitness,
+            HiddenWitness,
             VariantWitness,
             EmptyListWitness,
             ConsListWitness,
@@ -68,6 +70,7 @@ import:
         TypeRef(ListType, StringType, TupleType, IntegerType),
         TypeUse,
         UnionOccurrence,
+        visible_variants,
         CheckedPatternPlace,
         CheckedPatternRoute(MatchRoot, UnionField, ListElement, RecordField),
         CheckedPatternArgument(BorrowPlace, CopyListSuffix),
@@ -968,8 +971,12 @@ private union PatternCursor:
     ListCursor(CheckedPatternPlace, Int)
 
 
+-- `HiddenVariants` stands for a union's variants private to another module:
+-- only `_` or a binder covers it, and no test selects it, as rustc treats a
+-- `#[non_exhaustive]` enum from another crate.
 private union Head:
     UnionHead(VariantId, List[TypeRef])
+    HiddenVariants(UnionId)
     TupleHead(List[TypeRef])
     NilHead
     ConsHead(TypeRef)
@@ -1043,23 +1050,28 @@ private pure func union_column(
         .get(occurrence.owner.union_number())
         .or_checker_invariant(span, InvalidCheckedUnion(occurrence.owner))
 
-    declaration.variants
-        .translated_list(pure func(variant) -> Result[Head, CheckError]:
-            variant.fields
-                .occurrence_fields(occurrence)
-                .map(
-                    pure func(fields: List[TypeUse]) -> Head: UnionHead(
-                        variant.id,
-                        fields.map(pure func(field): field.value_type)
-                    )
+    visible = declaration.visible_variants(context.module)
+
+    heads ?= visible.translated_list(pure func(variant) -> Result[Head, CheckError]:
+        variant.fields
+            .occurrence_fields(occurrence)
+            .map(
+                pure func(fields: List[TypeUse]) -> Head: UnionHead(
+                    variant.id,
+                    fields.map(pure func(field): field.value_type)
                 )
-        )
-        .map(
-            pure func(heads: List[Head]) -> Column: {
-                cursor = cursor,
-                domain = ClosedDomain(heads)
-            }
-        )
+            )
+    )
+
+    -- The hidden head comes first, so the first missing case is it whenever it is
+    -- uncovered: one `_` covers it and any public variant missing with it, so
+    -- such a match reports the private variants once.
+    domain = if visible.length() < declaration.variants.length():
+        [HiddenVariants(declaration.id)].concat(heads)
+    else:
+        heads
+
+    Ok({ cursor = cursor, domain = ClosedDomain(domain) })
 
 
 private pure func same_head(left: Head, right: Head) -> Bool:
@@ -1067,6 +1079,10 @@ private pure func same_head(left: Head, right: Head) -> Bool:
         UnionHead(id, _):
             match right:
                 UnionHead(other, _): id == other
+                _: False
+        HiddenVariants(_):
+            match right:
+                HiddenVariants(_): True
                 _: False
         TupleHead(_):
             match right:
@@ -1091,7 +1107,7 @@ private pure func arity(head: Head) -> Int:
         UnionHead(_, fields): fields.length()
         TupleHead(fields): fields.length()
         ConsHead(_): 2
-        NilHead | LiteralHead(_): 0
+        HiddenVariants(_) | NilHead | LiteralHead(_): 0
 
 
 private pure func pattern_head(pattern: Pattern, domain: ColumnDomain) -> Option[Head]:
@@ -1242,7 +1258,7 @@ private pure func child_columns(
             )
         ConsHead(element):
             place.list_child_columns(parent.cursor.list_skip(), element, context, span)
-        NilHead | LiteralHead(_):
+        HiddenVariants(_) | NilHead | LiteralHead(_):
             Ok([])
 
 
@@ -1301,6 +1317,8 @@ private pure func wrap_witness(head: Head, witnesses: List[PatternWitness]) -> L
     witness: PatternWitness = match head:
         UnionHead(id, _):
             VariantWitness(id, fields)
+        HiddenVariants(owner):
+            HiddenWitness(owner)
         TupleHead(_):
             TupleWitness(fields)
         NilHead:
@@ -1833,7 +1851,8 @@ private pure func compile_split(
     place = current.cursor.root_place()
 
     test: CheckedDecisionNode ?= match head:
-        TupleHead(_):
+        -- No pattern names a hidden variant, so none selects its head.
+        TupleHead(_) | HiddenVariants(_):
             Err(checker_invariant(span, UnsupportedPatternReachedResolution))
         UnionHead(variant, _):
             Ok(TestVariant(place, variant, yes.entry, no.entry))
@@ -1861,9 +1880,38 @@ private pure func missing_error(
     context: ResolutionContext,
     span: Span
 ) -> Result[CheckError, CheckError]:
-    match root.domain:
-        ClosedDomain(heads): rows.missing_finite_error(root, heads, witness, context, span)
-        OpenDomain | ScalarDomain: Ok(match_error(span, NonExhaustiveStructuralMatch(witness)))
+    match witness.hidden_union():
+        Some(owner):
+            scrutinee = root.cursor.root_place().value_type
+            Ok(match_error(span, PrivateVariantsUncovered(scrutinee, owner, witness)))
+        None:
+            match root.domain:
+                ClosedDomain(heads):
+                    rows.missing_finite_error(root, heads, witness, context, span)
+                OpenDomain | ScalarDomain:
+                    Ok(match_error(span, NonExhaustiveStructuralMatch(witness)))
+
+
+-- The union whose hidden variants a witness's first `_` stands for.
+private pure func hidden_union(witness: PatternWitness) -> Option[UnionId]:
+    var found: Option[UnionId] = None
+
+    match witness:
+        HiddenWitness(owner):
+            found = Some(owner)
+        VariantWitness(_, fields) | TupleWitness(fields):
+            for field in fields:
+                if found.is_none():
+                    found = field.hidden_union()
+        ConsListWitness(parts):
+            found = parts.head.hidden_union()
+
+            if found.is_none():
+                found = parts.tail.hidden_union()
+        AnyWitness | EmptyListWitness | OtherValueWitness:
+            void
+
+    found
 
 
 private pure func missing_finite_error(
@@ -1902,6 +1950,9 @@ private pure func missing_finite_error(
                             flat = False
                     Ok(None):
                         void
+            -- Covered: an uncovered hidden head is the first witness, reported before.
+            HiddenVariants(_):
+                void
             _:
                 flat = False
 

@@ -1,0 +1,87 @@
+-- A root module checked with the module it imports as `./email`, for the
+-- namespace and check suites of variant scopes and private variants.
+import:
+    bool: and
+    ../../src/common/analysis/check/check: check
+    ../../src/common/analysis/check/render: render_failure
+    ../../src/common/syntax/source: module_source, root_module_id
+    ../../src/common/syntax/syntax: Diagnostics
+    ./module_input: ModuleInput, parse_modules
+    ./text_search: find_text
+
+
+-- `root` checked alone when `email` is empty, else with `email` as its one import.
+pure func checked(root: String, email: String) -> Result[Void, Diagnostics]:
+    inputs: List[ModuleInput] = if email == "":
+        [{ source = root, targets = [] }]
+    else:
+        [{ source = root, targets = [1] }, { source = email, targets = [] }]
+
+    match parse_modules(inputs):
+        Err(error):
+            Err({ first = error, remaining = [] })
+        Ok(parsed):
+            check(parsed)
+                .map(pure func(_): void)
+                .map_err(render_failure)
+
+
+func compiles(root: String, email: String) -> Bool:
+    match checked(root, email):
+        Ok(_):
+            True
+        Err(diagnostics):
+            print_error("${diagnostics.first.message} / ${diagnostics.first.help}")
+            False
+
+
+-- `marked` writes the root with its expected span between `[[` and `]]`, which
+-- the checked source omits. Its one diagnostic spans exactly that text, with
+-- this message and help; a mismatch prints what was reported.
+func rejects(email: String, marked: String, message: String, help: String) -> Bool:
+    open = find_text(marked, "[[", 0).get_or(0)
+    close = find_text(marked, "]]", open).get_or(0)
+
+    prefix = marked
+        .slice(0, open)
+        .get_or("")
+
+    span_text = marked
+        .slice(open + 2, close)
+        .get_or("")
+
+    root = (
+        prefix
+        + span_text
+        + marked
+            .slice(close + 2, marked.length())
+            .get_or("")
+    )
+
+    match checked(root, email):
+        Ok(_):
+            print_error("checked without a diagnostic")
+            False
+        Err(diagnostics):
+            first = diagnostics.first
+
+            exact = and(
+                and(
+                    first.span.source == module_source(root_module_id()),
+                    and(
+                        first.span.start == prefix.length(),
+                        first.span.end == prefix.length() + span_text.length()
+                    )
+                ),
+                and(
+                    and(diagnostics.remaining.is_empty(), first.message == message),
+                    first.help == help
+                )
+            )
+
+            if exact.not():
+                print_error(
+                    "reported ${first.span.start}..${first.span.end} ${first.message} / ${first.help}"
+                )
+
+            exact

@@ -1,0 +1,345 @@
+---
+Which variants enter a module's scope, and what a module offers its
+importers. A module's own variants may share a spelling; an imported or
+prelude variant still conflicts with any other variant of its spelling, and so
+does a constant. Another module is offered only public variants. Each root
+marks the span its one diagnostic covers with `[[` and `]]`.
+---
+import:
+    bool: and
+    test: TestSuite
+    ../../../../src/common/analysis/assemble: parsed_contents
+    ../../../../src/common/analysis/ids: union_number, variant_owner
+    ../../../../src/common/analysis/namespace/namespace:
+        Entity(Constructor),
+        Entry,
+        NamedValue(NamedConstructor, NamedVariants),
+        build_namespace,
+        module_names,
+        named_value,
+        offered_entries
+    ../../../../src/common/syntax/names: NameId
+    ../../../../src/common/syntax/source: module_id, root_module_id
+    ../../../support/input: existing_name
+    ../../../support/module_input: parse_modules
+    ../../../support/variant_inputs: compiles, rejects
+
+
+-- The module the roots import as `./email`. Hidden is private, so its
+-- variant is too.
+private EMAIL: String =
+    |union Email:
+    |    private Checked(String)
+    |    Unchecked(String)
+    |private union Hidden:
+    |    Secret
+    |pure func parse(text: String) -> Email:
+    |    Email.Checked(text)
+    |
+
+
+-- With EMAIL, two of the module's unions declare a public `Unchecked`.
+private LETTER: String =
+    |union Letter:
+    |    Unchecked(String)
+    |    Sent
+    |
+
+
+private CHECKED_PRIVATE: String = "Email.Checked is private to module ./email"
+private SELECT_HELP: String = "select Email, and use the functions ./email exports"
+
+
+private SHARED_UNCHECKED: String = "Unchecked is a variant of several unions in module ./email: Email, Letter"
+
+
+-- The namespace keeps every variant this module declares under one spelling,
+-- in declaration order, for a bare use to report; a spelling no other variant
+-- shares names its one variant.
+pure func test_declared_variants_share_a_spelling_in_declaration_order() -> Bool:
+    source: String =
+        |union FunctionId:
+        |    Init(Int)
+        |    Missing
+        |union TypeId:
+        |    Init(Int)
+        |func main() -> Int:
+        |    0
+        |
+
+    match parse_modules([{ source = source, targets = [] }]):
+        Err(_):
+            False
+        Ok(parsed):
+            names = parsed_contents(parsed).names
+
+            match (
+                build_namespace(parsed),
+                existing_name(names, "Init"),
+                existing_name(names, "Missing")
+            ):
+                (Ok(namespace), Some(init), Some(missing)):
+                    shared: Bool = match namespace.named_value(root_module_id(), init):
+                        Some(NamedVariants(first, [second])):
+                            and(
+                                (
+                                    first
+                                        .variant_owner()
+                                        .union_number()
+                                    == 0
+                                ),
+                                (
+                                    second
+                                        .variant_owner()
+                                        .union_number()
+                                    == 1
+                                )
+                            )
+                        _:
+                            False
+
+                    alone: Bool = match namespace.named_value(root_module_id(), missing):
+                        Some(NamedConstructor(_)): True
+                        _: False
+
+                    and(shared, alone)
+                _:
+                    False
+
+
+-- The spellings of the variants among `entries`, in order.
+private pure func variant_spellings(entries: List[Entry]) -> List[NameId]:
+    var spellings: List[NameId] = []
+
+    for entry in entries:
+        match entry.entity:
+            Constructor(_): spellings = spellings.append(entry.name.id)
+            _: void
+
+    spellings
+
+
+-- A module lists each variant spelling once, and offers its importers only a
+-- spelling one public variant holds: not `Checked`, private by its mark, not
+-- `Secret`, private by its union, and not `Unchecked`, which two public
+-- variants share.
+pure func test_an_importer_is_offered_only_a_spelling_one_public_variant_holds() -> Bool:
+    root: String =
+        |import:
+        |    ./email: parse
+        |func main() -> Int:
+        |    0
+        |
+
+    match parse_modules([
+        { source = root, targets = [1] },
+        { source = EMAIL + LETTER, targets = [] }
+    ]):
+        Err(_):
+            False
+        Ok(parsed):
+            names = parsed_contents(parsed).names
+
+            spelled = ["Checked", "Unchecked", "Secret", "Sent"].map(
+                pure func(spelling: String) -> Option[NameId]: existing_name(names, spelling)
+            )
+
+            match (build_namespace(parsed), module_id(1), spelled):
+                (Ok(namespace), Some(email), [Some(checked), Some(unchecked), Some(secret), Some(sent)]):
+                    declared = [checked, unchecked, secret, sent]
+
+                    -- The module also lists the prelude's variants, which it receives.
+                    listed = namespace
+                        .module_names(email)
+                        .variant_spellings()
+                        .filter(pure func(id: NameId) -> Bool: declared.contains(id))
+
+                    and(
+                        listed == declared,
+                        (
+                            namespace
+                                .offered_entries(email)
+                                .variant_spellings()
+                            == [sent]
+                        )
+                    )
+                _:
+                    False
+
+
+func test_a_declared_variant_conflicts_with_the_preludes() -> Bool:
+    source: String =
+        |union Maybe:
+        |    [[None]]
+        |func main() -> Int:
+        |    0
+        |
+
+    rejects(
+        "",
+        source,
+        "None is provided by the prelude",
+        "give this constructor another name; the prelude's constructor None is always in scope"
+    )
+
+
+func test_a_variant_conflicts_with_a_constant_of_its_spelling() -> Bool:
+    source: String =
+        |MAX: Int = 3
+        |union Limit:
+        |    [[MAX]]
+        |func main() -> Int:
+        |    0
+        |
+
+    rejects(
+        "",
+        source,
+        "constructor name conflicts with a constant",
+        "functions and constructors share one name space; give them distinct names"
+    )
+
+
+-- Only a module's own variants share: an imported one still conflicts,
+-- reported once at the declaration.
+func test_a_declared_variant_conflicts_with_an_imported_one() -> Bool:
+    root: String =
+        |import:
+        |    ./email: Email(Unchecked)
+        |union Mail:
+        |    [[Unchecked]]
+        |func main() -> Int:
+        |    0
+        |
+
+    rejects(
+        EMAIL,
+        root,
+        "Unchecked is already imported",
+        "rename this constructor, or remove Unchecked from the import"
+    )
+
+
+-- A selection under its union finds that union's variant among the module's others.
+func test_a_listed_variant_is_found_by_its_union() -> Bool:
+    root: String =
+        |import:
+        |    ./email: Letter(Unchecked)
+        |func main() -> Int:
+        |    letter: Letter = Unchecked("x")
+        |    0
+        |
+
+    compiles(root, EMAIL + LETTER)
+
+
+func test_a_qualified_name_several_public_variants_share_is_ambiguous() -> Bool:
+    root: String =
+        |import:
+        |    ./email as mail
+        |func main() -> Int:
+        |    letter = mail.[[Unchecked]]("x")
+        |    0
+        |
+
+    rejects(EMAIL + LETTER, root, SHARED_UNCHECKED, "select the union, and write Email.Unchecked")
+
+
+-- Inside an import the variant is selected with its union, not written through it.
+func test_a_bare_selection_several_public_variants_share_is_ambiguous() -> Bool:
+    root: String =
+        |import:
+        |    ./email: [[Unchecked]]
+        |func main() -> Int:
+        |    0
+        |
+
+    rejects(
+        EMAIL + LETTER,
+        root,
+        SHARED_UNCHECKED,
+        "select it with its union, as in Email(Unchecked)"
+    )
+
+
+func test_a_private_variant_is_not_selected_alone() -> Bool:
+    root: String =
+        |import:
+        |    ./email: [[Checked]]
+        |func main() -> Int:
+        |    0
+        |
+
+    rejects(EMAIL, root, CHECKED_PRIVATE, SELECT_HELP)
+
+
+func test_a_private_variant_is_not_selected_with_its_union() -> Bool:
+    root: String =
+        |import:
+        |    ./email: Email([[Checked]])
+        |func main() -> Int:
+        |    0
+        |
+
+    rejects(EMAIL, root, CHECKED_PRIVATE, SELECT_HELP)
+
+
+-- An unmarked variant of a private union is private through its union, and
+-- reads as any other private name.
+func test_a_private_unions_variant_is_not_offered() -> Bool:
+    root: String =
+        |import:
+        |    ./email as mail
+        |func main() -> Int:
+        |    secret = mail.[[Secret]]
+        |    0
+        |
+
+    rejects(
+        EMAIL,
+        root,
+        "Secret is private to ./email",
+        "remove private or qualify a public declaration"
+    )
+
+
+TESTS: TestSuite = {
+    description = "Blorp variant scopes and offers",
+    tests = [
+        (
+            "declared variants share a spelling in declaration order",
+            test_declared_variants_share_a_spelling_in_declaration_order
+        ),
+        (
+            "an importer is offered only a spelling one public variant holds",
+            test_an_importer_is_offered_only_a_spelling_one_public_variant_holds
+        ),
+        (
+            "a declared variant conflicts with the prelude's",
+            test_a_declared_variant_conflicts_with_the_preludes
+        ),
+        (
+            "a variant conflicts with a constant of its spelling",
+            test_a_variant_conflicts_with_a_constant_of_its_spelling
+        ),
+        (
+            "a declared variant conflicts with an imported one",
+            test_a_declared_variant_conflicts_with_an_imported_one
+        ),
+        ("a listed variant is found by its union", test_a_listed_variant_is_found_by_its_union),
+        (
+            "a qualified name several public variants share is ambiguous",
+            test_a_qualified_name_several_public_variants_share_is_ambiguous
+        ),
+        (
+            "a bare selection several public variants share is ambiguous",
+            test_a_bare_selection_several_public_variants_share_is_ambiguous
+        ),
+        ("a private variant is not selected alone", test_a_private_variant_is_not_selected_alone),
+        (
+            "a private variant is not selected with its union",
+            test_a_private_variant_is_not_selected_with_its_union
+        ),
+        ("a private union's variant is not offered", test_a_private_unions_variant_is_not_offered)
+    ]
+}

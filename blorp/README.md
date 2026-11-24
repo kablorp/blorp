@@ -583,10 +583,17 @@ are not forms. Write `read.Empty` for a variant through a module alias. A
 pattern's union must be the matched value's: matching a `Shape` with
 `Other.Empty` reports that `Other.Empty` is a variant of `Other`.
 
-Variant names share one namespace with the module's functions and are unique
-across its unions; a user module cannot declare a prelude constructor ("True
-is provided by the prelude"). Types have a separate namespace, so a function
-may share a type's name; a type name is unique and cannot replace a base type.
+Variant names share one namespace with the module's functions and constants.
+In one union each variant name is unique, and none is spelled like its union:
+`union Box: Box(Int)` is rejected, because `Box` should always mean the type.
+A module's own variants may share a name across its unions. A bare name
+resolves where only one variant in scope has it; each bare use of a shared
+name is reported as ambiguous, and `Union.Variant` always works. An imported
+or prelude variant still conflicts with any other variant of its name, and the
+conflict is reported once, at the import or declaration: a user module cannot
+declare a prelude constructor ("True is provided by the prelude"). Types have
+a separate namespace, so a function may share a type's name; a type name is
+unique and cannot replace a base type.
 
 `union Result[T, E]:` declares type parameters, and an application such as
 `Result[Box[Int], Int]` supplies all of them in order. A union of bare
@@ -610,6 +617,38 @@ record's release does.
 
 `fixed union` is a union with the `fixed record` rules; its payloads may also
 be `Void`. `Bool` is declared this way.
+
+### Private variants
+
+```blorp
+union UserId:
+    private Init(Int)
+private pure func user_id(value: Int) -> UserId:
+    Init(value)
+pure func number(id: UserId) -> Int:
+    match id:
+        Init(value): value
+func main() -> Int:
+    number(user_id(7))
+```
+
+This exits 7. A variant marked `private` is built and matched only in the
+module that declares it. `Init` is the convention for a type's one private
+variant; the language does not require the name. A private variant's payload
+may mention private types, since no other module sees it. In a `private
+union` every variant is private already, so a variant there takes no mark:
+`private` on one is rejected.
+
+A module's own variants may share a name, as when several unions each have a
+private `Init`. A bare name works wherever it is unambiguous; where two
+variants in scope share it, each bare use is reported and `UserId.Init` names
+the one meant.
+
+Other modules build the union with the functions its module exports, and
+cannot name a private variant to build it, match it or import it. Their
+`match` covers the private variants with `_`, as in the [two-file
+example](test/test_compile/fixtures/variants/signup.brp); without one it is
+not exhaustive, and the diagnostic names no private variant.
 
 ### Opaque and private types
 
@@ -1477,7 +1516,8 @@ grows, and each item replaces the word before the cursor. It holds:
   keywords;
 - after `alias.`, the names that module offers, its types and traits among
   them;
-- after `Union.`, its variants.
+- after `Union.`, the variants the module may name: all of its own, and
+  another module's public ones.
 
 While the program fails to load or check, these names come from its last
 analysis that checked, and a program that never checked offers nothing.
