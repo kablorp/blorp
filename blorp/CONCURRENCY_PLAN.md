@@ -1249,10 +1249,8 @@ review measured it with stage-2 C files:
 | Four threads allocating and releasing | — | 0.23–0.26 s, against 1.09–1.20 s for the spin lock |
 
 The e2e instruction ceilings measure `blorp-test`, which runs the seed's
-runtime. So they will absorb about +2.5% at the next seed rotation; that
-cost belongs to this landing, not to whichever landing rotates. Before that
-rotation, landing 1b should also try a lock that is cheap when uncontended,
-such as test-and-test-and-set with backoff, against this mutex.
+runtime, so they would have absorbed about +2.5% at the next seed rotation.
+Landing 1b replaced the mutex before any rotation; see its results.
 
 **Measuring a runtime change.** `self-compile-cost` builds both compilers from
 the pinned seed, so the compiler it measures runs the seed's runtime: its
@@ -1287,8 +1285,8 @@ Allocations were identical in every variant, at 13,189,121.
 | --- | --- | --- |
 | Literal sites | `emit.brp:356` | fixed: an atomic pointer, published under the lock |
 | The literal registry | `string.brp:247` | fixed: pushed under the literal lock, and read at exit after every task |
-| Literal counts | `string.brp` | atomic as before; not writing them is landing 1b |
-| Memory counts, peak heap, the allocation-site table | `memory.brp:22, 25, 64, 65` | fixed: under the diagnostics lock, now a mutex. Peak heap becomes order-dependent under threads, and its README note is deferred to landing 3 |
+| Literal counts | `string.brp` | fixed in landing 1b: a normal build never writes them |
+| Memory counts, peak heap, the allocation-site table | `memory.brp:22, 25, 64, 65` | fixed: under the diagnostics lock, a mutex in landing 1 and test-and-test-and-set from landing 1b. Peak heap becomes order-dependent under threads, and its README note is deferred to landing 3 |
 | `blorp_memory_strict`, the image base | `memory.brp:28, 66` | safe: written once at start |
 | Allocation-sites output | `memory.brp:63, 140` | safe: written at start and finish. Landing 2 must stop pool workers allocating before the program finishes |
 | The release state | `memory.brp:266` | safe: `_Thread_local` |
@@ -1300,6 +1298,189 @@ Allocations were identical in every variant, at 13,189,121.
 
 The inventory covers every writable data symbol in the objects of all 790 e2e
 fixtures, in both builds, plus a scan of the runtime.
+
+### Landing 1b results
+
+**What landed:**
+- **A normal build never writes a literal's count.** The literal base is now
+  the count's top bit. Retain and release return at once for a String whose
+  count is at or above it, and the site no longer retains. Diagnostic builds
+  count literals as before, and keep the balance check at exit.
+- **Release is split.** It inlines as the one-bit test and a call to its
+  counted half, `blorp_string_release_counted`, which is kept out of line.
+  Diagnostic builds release through the counted half alone. It is out of
+  line there too, so a diagnostics `-O2` build no longer inlines String
+  release; at `-O0` their code is unchanged (−0.001% instructions).
+- **The diagnostics allocator's lock is test-and-test-and-set.** Taking it
+  when it is free costs one exchange. A waiting thread reads the lock, and
+  yields after 100 reads.
+- **No emit change.**
+
+**Why this form.** To clang's inliner, the test and a call cost about what
+the decrement, compare and call to `free` cost before. So the drop helpers
+inline as they did, and what is left is the test itself. Lean 4 splits
+`lean_dec_ref` the same way. Its inline part tests for a persistent object
+and decrements a single-threaded count with a plain store. The atomic
+decrement of an object shared between threads, and the free, are out of
+line in `lean_dec_ref_cold`. Every Blorp count is atomic, so the whole
+decrement is out of line.
+
+**The forms tried.** Stage-2 `-O2` self-compile, normal build, fixed input
+(`b366e2a17`), against base. Each figure is a median of 7 alternating rounds
+unless noted.
+
+| Form | Instructions | Cycles | Load average |
+| --- | ---: | ---: | --- |
+| Checks inline, base `SIZE_MAX/2` (landing 1's form) | +2.93% | +2.00% | 7 to 10 |
+| 1. Lean-style cold free path | +2.93% | +1.92% | 7 to 10 |
+| Checks inline, top-bit base | +2.61% | +3.46% | 6 to 7 |
+| 2. Release out of line only in drop helpers | +1.02% | +0.35% | 7 to 10 |
+| 2, top-bit base | +0.82% | +1.60% | 6 to 7 |
+| 3. Test inline, counted half out of line | +0.55%, +0.61% | −0.34%, +0.68% | 5 to 10 |
+| 3, top-bit base (prototype) | +0.34%, +0.28% | +0.75%, +0.81% | 5 to 7 |
+| 3, top-bit, release test only | +0.06%, −0.03% | +1.08%, +0.21% | 3 to 6 |
+| 3, top-bit, with a unique-owner shortcut (11 rounds) | +0.40% | +0.30% | 3 |
+| **What landed: 3, top-bit** | **+0.28%** | **+0.36%** | 2.5 to 3.5 |
+
+- **The landed row** pools the 65 rounds of five runs, and compares the two
+  sides' medians (`stage2/samples.jsonl`); pairing each round instead gives
+  +0.26 to +0.27% instructions and +0.26 to +0.48% cycles. The runs alone
+  gave:
+  - +0.24% instructions and +0.43% cycles (7 rounds);
+  - +0.26% and +1.24% (15 rounds);
+  - +0.25% and +0.34% (21 rounds);
+  - +0.29% and +0.40% (11 rounds);
+  - +0.27% and +0.19% (11 rounds).
+- **Instruction counts vary.** One binary's retired instructions vary by up
+  to 0.6% between runs on this loaded machine, so single runs of 7 differ
+  by about 0.1%.
+- **Form 1 is form "checks inline" in a normal build.** There the free
+  branch is already one call to `free`.
+- **Form 2** makes drop helpers smaller than before, so they inline in
+  different places: 269 helpers changed call sites.
+- **The release-only test** leaves retain unchecked, so a literal's count
+  still grows when the literal is duplicated. That writes its line, and the
+  count would wrap after 2^63 duplications. It saves about 0.25%
+  instructions but no cycles, so the landed form tests both.
+- **The unique-owner shortcut** frees at a count of 1 without decrementing.
+  It did not pay.
+- **Allocations** were 13,307,464 for both sides. Peak heap differed by 2
+  bytes, which is the longer output path the measurement names.
+- **Output was identical** in every run.
+- **Diagnostics at `-O0`:** −0.001% instructions against base (5 rounds), so
+  `blorp-test` pays nothing for part 1.
+
+**Inlining, from the `-O2` assembly.** A record's release body keeps its
+shape: each String field's `ldaddal`, compare and call to `free` becomes a
+load, a `tbnz` on the top bit and a call to the counted half. These are the
+call sites of the drop helpers that checking inline de-inlines most. Landing 1's
+`blorp_union_drop_225` is `blorp_union_drop_229` here, the same
+`Option` of the same record shape.
+
+| Helper | Base | Checks inline, top bit | Landed |
+| --- | ---: | ---: | ---: |
+| `blorp_union_drop_229` | 62 | 589 | 62 |
+| `blorp_union_drop_254` | 36 | 274 | 35 |
+| `blorp_list_release_0_r269` | 1 | 135 | 1 |
+| `blorp_union_drop_246` | 10 | 120 | 10 |
+| `blorp_union_drop_358` | 0 | 105 | 0 |
+| `blorp_union_drop_at_350` | 0 | 91 | 0 |
+| `blorp_union_drop_245` | 5 | 63 | 5 |
+| `blorp_union_drop_257` | 5 | 58 | 5 |
+
+Of 1,695 helpers, 1,663 keep their call sites exactly.
+`blorp_union_drop_199` gains 44 call sites, from the retain test.
+
+**GCC 13** (`-O2`, arm64 image) inlines differently, but the same way round:
+- checking inline moved 2,862 call sites;
+- the landed form moved 1,108, with 3,231 fewer direct calls than base;
+- `blorp_record_drop_at_58` is called from 246 sites in base, 433 with checks
+  inline, and 197 landed;
+- user CPU time, which is all the VM measures, was −0.63% landed and +0.86%
+  with checks inline (7 rounds);
+- GCC on arm64 calls an outline-atomics helper for every atomic
+  read-modify-write, in base as well.
+
+**The benefit.** This is Spike P's shared-literal map (w7). The output was
+identical in every run.
+
+| Runtime | 1 thread (21 rounds) | 4 threads, median and range (11 rounds) |
+| --- | ---: | ---: |
+| Base | 34.9 ms | 75.5 ms (47–84) |
+| Landed | 35.2 ms | 14.2 ms (12–96) |
+
+- **Four threads ran 5.3× faster** than base, at a load average of 4.
+- **One of the 11** four-thread runs took 96 ms. Landing 1's prototype ran
+  that slowly in most runs; the cause is not isolated.
+- **One thread** differs by noise.
+
+**The lock.** Diagnostics builds, against the old spin lock for one thread
+and the mutex for four. The one-thread figures are 7 alternating rounds at
+a load average of 3 to 10. The probe allocates and releases a million
+64-byte blocks per thread.
+
+One-thread cells give instructions, then cycles, against the spin lock.
+Four-thread cells give the time against the mutex's in the same run.
+
+| Lock | One thread, `-O0` | One thread, `-O2` | Four threads, `-O0` | Four threads, `-O2` |
+| --- | ---: | ---: | ---: | ---: |
+| Spin lock | 0, 0 | 0, 0 | 3.1× | 5.0× |
+| Mutex (landing 1) | +2.54%, +0.92% | +14.1%, +8.3% | 1 (620 ms) | 1 (444 ms) |
+| Test-and-test-and-set | +0.11%, +0.18% | +0.56%, +0.58% | 0.55× | 0.36× |
+| The same, with a CPU pause | +0.11%, +0.27% | +0.81%, +0.47% | 0.54× | 0.40× |
+| `os_unfair_lock` | +0.46%, +0.30% | +3.65%, +2.56% | 1.44× | 1.42× |
+| **What landed** | **+0.11%, +0.08%** | **+0.54%, +0.66%** | **0.65×** | **0.43×** |
+
+- **The criteria:** within +0.5% of the spin lock at `-O0`, and within 1.5×
+  of the mutex on four threads. The landed lock meets both, and is the
+  simplest that does. The pause needs a platform `#if` and bought nothing.
+- **The spin count:** 10 and 100 reads before yielding ran alike, and 1,000
+  ran slower.
+- **More threads than cores** (`-O0`, 3 runs):
+
+  | Threads | Mutex | Landed | Spin lock |
+  | ---: | ---: | ---: | ---: |
+  | 8 | 1.3–2.0 s | 0.55–0.71 s | 6.0–9.6 s |
+  | 16 | 2.3–3.6 s | 1.13–1.30 s | 28–35 s |
+
+- **This mutex ran slower** than in landing 1's review (0.41–0.62 s against
+  0.23–0.26 s), under a different load.
+
+**Tests:**
+- `string_literal_suite` has its uncounted case back. In a normal build,
+  after three evaluations, two retains and six releases, a literal is still
+  at its base, and an ordinary String is still counted.
+- **It fails when its fix is broken:**
+  - with a site that writes the count directly, at the assert after
+    evaluation;
+  - without the retain skip, after the retains;
+  - without the release skip, after the releases.
+
+  `threaded_publish` also fails in the normal build without the site or
+  release skip.
+- **The peak heap suite's `threads` case** fails 20 of 20 runs without the
+  lock, and passes 20 of 20 with it.
+- **ThreadSanitizer** found 0 reports in 5 runs of the threaded probes.
+- **Linux, with GCC 13 and Clang 18 on amd64 and arm64,** built and passed
+  every probe. The flags were `-Werror -pedantic -pthread` with the
+  sanitizers, and a sample program ran in both modes.
+
+**Measures:**
+
+| Measure | Change |
+| --- | --- |
+| Stage-2 `-O2` self-compile, instructions | +0.28% |
+| Stage-2 `-O2` self-compile, cycles | +0.36% |
+| Stage-2 diagnostics, `-O0`, against the mutex | −2.4% instructions |
+| w7 on four threads | 5.3× faster |
+| `self-compile-cost 1fa321907`, fixed input, allocations | 0.0000% |
+| `self-compile-cost 1fa321907`, fixed input, peak heap | +0.0018% |
+| `self-compile-cost 1fa321907`, fixed input, instructions | −0.07% (this row runs the seed's runtime) |
+| Production lines | +35 net |
+| Test lines | +29 net |
+
+The raw samples and scripts are in `build/landing1b/`, ignored, in the
+landing's worktree.
 
 ### Spike K: the concurrency kernel
 
@@ -1376,6 +1557,8 @@ compiled code.
      out-of-line release only in drop helpers, or a release with a cold
      free path. It lands before landing 3, where shared literals would
      otherwise contend.
+   - **Done** with no emit change, together with a test-and-test-and-set
+     diagnostics lock: see "Landing 1b results".
 2. **Compiler support:**
    - `concurrent:` syntax and its checks, accepting only pure tasks for now.
      Until landing 4, an impure task is rejected with `concurrent tasks must

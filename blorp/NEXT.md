@@ -15,12 +15,11 @@ done.
     - Keith made 19 decisions.
     - Spike P's verdict was continue: 0.99 of linear on 4 threads for
       CPU-bound work, and about 0.7 for allocation-heavy work.
-  - **Landed:** landing 1 (2026-11-24): literals are published once under a
-    lock, and the diagnostics allocator has a mutex.
-  - **Next:**
-    - landing 1b: stop writing literal counts, and try a lock that is cheap
-      when uncontended;
-    - landing 2: the pool and `join`.
+  - **Landed:**
+    - landing 1 (2026-11-24): literals are published once under a lock;
+    - landing 1b (2026-11-25): a normal build never writes a literal's
+      count, and the diagnostics allocator has a test-and-test-and-set lock.
+  - **Next:** landing 2, the pool and `join`.
   - **Overlap:** `CTFE_PLAN.md`'s L1 replaces landing 1's lazy literal site
     with static literals. Keep the threaded literal test when it does.
 - **Compile-time evaluation:** [`CTFE_PLAN.md`](CTFE_PLAN.md).
