@@ -109,6 +109,13 @@ The costs are therefore acyclic, and the passes settle within one per layout,
 plus a last that changes nothing. Because the fixpoint is unique, storage
 does not depend on which layout specialization meets first.
 
+A union slot holds its copy cost from publication (`union_copy_cost`), as a
+record slot holds its representation. A holder reads that cost instead of
+costing the union's payloads again, and the re-derivation updates it with
+the union's storage. Costing the payloads on every read recursed into each
+child union, so a nest of unions whose two variants both hold the child cost
+2^depth reads.
+
 **Verify** accepts `Void` among an inline record's fields. **Emit** gives an
 inline record whose fields are all `Void` one unused byte, since C has no
 empty struct. Lower, own and emit already handled `ValueFields` for any
@@ -291,6 +298,73 @@ landing 2, gave the same picture: allocations +0.0029%, instructions -0.03%.
 
 **Lines.** Production: +279, -121. Tests: +266.
 
+### Union copy costs stored once, 2026-11-25
+
+**Problem.** `generic/managed/deep.brp` with a second variant
+(`union Box[T]: Boxed(T) | Spare(T)`, and a `Spare` arm in `unbox`) cost
+10,576,850 compile allocations at depth 20 on main. At depth 16, 71% of them
+were in `known_partial_types`, and 131,038 (about 2^17) were `list.map`
+calls: each read of a complete owning union re-costed its payloads,
+recursing into the child once per variant.
+
+**Setup.**
+- Host: Apple M4, 32 GB, macOS 26.7.1, Apple clang 21.0.0.
+- Seed: `blorp-seed-aad181bcdc73`.
+- Base: `eb2edd2cc`, main. Candidate: `c2962aaef`, whose `blorp/src` the
+  landing commit keeps.
+- Command: `blorp/scripts/self-compile-cost eb2edd2cc c2962aaef --rounds 3`.
+- Raw samples: the ignored `blorp/build/self-compile-cost/eb2edd2cc-c2962aaef/`
+  and `blorp/build/union-copy-cost/` of the change's worktree.
+
+| Measure | Base | Candidate | Change |
+| --- | ---: | ---: | ---: |
+| Fixed-input allocations | 13,332,882 | 13,323,564 | -0.0699% |
+| Fixed-input peak heap, bytes | 188,776,847 | 188,776,847 | +0.0000% |
+| Fixed-input instructions, median of 3 | 13,532,069,484 | 13,513,742,734 | -0.1354% |
+| Own-source allocations | 13,332,882 | 13,325,540 | -0.0551% |
+| Own-source instructions, median of 3 | 13,541,982,400 | 13,544,177,149 | +0.0162% |
+
+**Output.** The fixed-input C is identical on both sides
+(`a5955e4b7b25260e`).
+
+**Compile allocations by depth.** These are generated single-line nests,
+compiled by `-O0 -DBLORP_MEMORY_DIAGNOSTICS=1` builds with
+`BLORP_LEAK_CHECK=strict`. Main is `eb2edd2cc`, linked from the cost run's
+`fixed-input-base.c`. The emitted C is byte-identical at every depth main
+finishes. A one-variant nest is erased to its payload and costs the same on
+both.
+
+| Depth | Main, two variants | Candidate, two variants | One variant, both |
+| ---: | ---: | ---: | ---: |
+| 5 | 65,475 | 65,215 | 63,701 |
+| 10 | 82,290 | 72,160 | 71,266 |
+| 16 | 737,994 | 82,804 | 88,550 |
+| 20 | 10,576,850 | 91,300 | 107,046 |
+| 40 | not run (about 2^40 reads) | 150,580 | 331,206 |
+
+Doubling the depth multiplies the two-variant cost by 1.27 (10 to 20) and
+1.65 (20 to 40). The rest of its growth is `ensure_union`,
+`concrete_type` and `prepare_arguments`, which walk each instance's nested
+type once per level. The one-variant nest's faster growth is in the erasure
+of single-variant unions; both are follow-ups below.
+
+**E2e.** `generic/managed/deep_two_variants` holds the depth-20 nest: 91,388
+allocations and 551,706,285 instructions (median of three, on `76ba30370`),
+so the ceilings are 105,097 and 634,462,228.
+
+**Tests.** `test_record_storage.brp` gains four orders of cycles in which a
+union's stored cost must be derived again:
+- Holder reaching an in-progress Shape through two unions;
+- a union still pending on an outer record after the inner union completes;
+- a union published before the inner layout it refers back to, in both
+  first-use orders.
+
+Main's recursive costing passes all four. With `rederived_union_slot`
+comparing storage only, they fail, along with the existing
+beside-a-cycle test.
+
+**Lines.** Production: +55, -31. Tests: +227.
+
 ## Raising the bound later
 
 The bound is one because the compiler copies records far more often than it
@@ -316,6 +390,17 @@ the bound needs a count in `CopyCost` beyond one, which the closed type
 makes a visible change rather than a constant to edit.
 
 ## Follow-ups
+
+- `prepare_union` costs each payload for its `owning` flag and again in
+  `union_copy_cost`. For an inline union, owning is exactly a widest case
+  above no count, so one costing could choose the storage.
+- A union slot's copy cost repeats its storage tag for plain (no count) and
+  boxed (one count) unions. Carrying the cost only on the owning case would
+  let the two never disagree.
+- Each function instance's nested type is translated level by level
+  (`ensure_union`, `concrete_type`), so nested generic instances cost the sum
+  of their type sizes. Erasing single-variant unions grows faster still: a
+  one-variant `Box` nest costs 3.1 times as much at depth 40 as at depth 20.
 
 - Check's classification walk is the new work's whole compile cost (0.45%
   of a seed-built self-compile's allocations, above): each walk rebuilds a
