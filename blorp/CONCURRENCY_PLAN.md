@@ -1092,14 +1092,24 @@ the reference it is checked against under `simulate`.
    accessors, since a compiler may cache a thread-local's address across the
    switch.
 
-**Seed rotations.** The fixpoint proof requires the seed and the new
-compiler to agree on every fixture, and the seed rejects an unknown builtin
-label at parse time. So each half follows the UInt8 and LSP plans' order:
-compiler support, then a seed rotation, then library code and fixtures. The
-compiler's own source still uses none of this (`blorp/AGENTS.md`). But
-moving natives onto helper threads changes the compiler's C, since `src`
-imports `io/files` and `io/console`, so that landing measures the
-self-compile cost.
+**Seed rotations.** The pinned seed builds only the compiler, stage A, from
+`src`. Every fixture is compiled by A and by B, which are both built from the
+current source (`scripts/blorp-fixpoint`). The seed rejects an unknown
+builtin label at parse time, but it reads only the library modules that
+`src` imports. So:
+- **No rotation for a new module that `src` never imports.** `concurrency`
+  is one, and the compiler's own source uses no concurrency
+  (`blorp/AGENTS.md`). Landings 2, 3, 5 and 6 add their syntax, natives,
+  library code and fixtures together.
+- **A rotation before a module `src` imports uses a new label.** Moving
+  natives onto helper threads changes `io/files` and `io/console`, which
+  `src` imports, so landing 4's new labels reach the seed before those
+  modules use them. That landing also measures the self-compile cost, since
+  the compiler's own C changes.
+
+The first draft of this plan put a rotation after every compiler landing, as
+the UInt8 and LSP plans had. Those needed one because `src` used their new
+features.
 
 ## Spikes
 
@@ -1559,18 +1569,24 @@ compiled code.
      otherwise contend.
    - **Done** with no emit change, together with a test-and-test-and-set
      diagnostics lock: see "Landing 1b results".
-2. **Compiler support:**
+2. **`concurrent:` for pure tasks,** end to end, with no seed rotation (see
+   "What the compiler needs"):
    - `concurrent:` syntax and its checks, accepting only pure tasks for now.
      Until landing 4, an impure task is rejected with `concurrent tasks must
      be pure until the concurrency runtime lands`;
-   - the designated module kind;
-   - callable-parameter natives and their trampolines;
-   - the `join` native and the pool, with stack sizes and guards.
+   - the designated `concurrency` module, loaded when a module uses the
+     block, and the only module that may declare `concurrency.*` labels;
+   - a private `join` native, with callable parameters and per-instance
+     trampolines;
+   - the README section, grammar and fixtures.
 
-   Then a seed rotation.
-3. **The library:** `join`; a native `parallel_map`, specialized per callback
-   and splitting adaptively; and `concurrent:` for pure tasks, with their
-   README section, grammar and fixtures.
+   `join` runs its two tasks one after the other here, so the compiler work
+   and the pool are reviewed apart.
+
+   **Landing 2b: the pool.** A work-stealing pool replaces the serial
+   `join`, with thread counts, stack sizes and guards. It is runtime C only.
+3. **`parallel_map`:** native, specialized per callback, and splitting
+   adaptively on the pool.
 
 **Concurrency, after Spike K:**
 
