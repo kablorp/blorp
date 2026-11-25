@@ -28,8 +28,24 @@ printf 'secret' > "$root/locked.txt"
 chmod 000 "$root/locked.txt"
 mkfifo "$root/pipe"
 
-# Valid short lines of well over 100 KiB, so that the bad line falls in a later
-# read, then a line holding byte 0377, which a Blorp String cannot hold, then
-# one more line. The line before the bad one is the example's LAST_VALID_LINE.
-awk 'BEGIN { for (number = 0; number < 20000; number++) print "short line " number }' > "$root/long_not_utf8.txt"
+# Valid lines of about 100 KB, more than the first read's 64 KiB, so that the
+# bad line falls in a later read, then a line holding byte 0377, which a Blorp
+# String cannot hold, then one more line. The line before the bad one is the
+# example's LAST_VALID_LINE.
+#
+# The lines are long so that they are few: lines.brp folds this file 300 times,
+# in a sanitized -O0 build that counts every allocation, and each line it steps
+# costs an allocation. With 20,000 short lines those folds took most of the
+# harness's limit for a native run on a slow CI runner (FILESYSTEM_DECISIONS.md,
+# "fold_lines e2e timeout on macOS CI"). Each line is line_bytes characters and
+# its newline.
+valid_lines=100
+line_bytes=1000
+awk -v count="$valid_lines" -v bytes="$line_bytes" 'BEGIN {
+    for (number = 0; number < count; number++) {
+        line = "long line " number " "
+        while (length(line) < bytes) line = line "x"
+        print line
+    }
+}' > "$root/long_not_utf8.txt"
 printf 'last valid line\nbad \377 line\nafter\n' >> "$root/long_not_utf8.txt"

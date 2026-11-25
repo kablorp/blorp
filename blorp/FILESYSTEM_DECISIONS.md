@@ -1603,3 +1603,40 @@ Costs, measured against `4fee244ad` with `blorp/scripts/self-compile-cost`
 (the plan's "Landing 2 results" has the full record): compiling the base's
 source, allocations and peak heap are unchanged and instructions rise
 0.047%; the emitted C is identical.
+
+## fold_lines e2e timeout on macOS CI, 2026-11-25
+
+The e2e case "fs fold_lines reads every line ending, block boundary and
+failure, and closes its file on every path" failed on the macOS ARM64 job of
+main's run 45136016643 and of branch run 45541887657 (attempt 1), each time
+with `fs_lines.strict.run: expected exit 0; timed out after 10000 ms`, the
+harness's limit for one native run. The program was not stuck: its run sat
+too close to that limit.
+
+- **Where the time went.** `lines.brp` folds `long_not_utf8.txt` 300 times to
+  show that a fold that fails with InvalidUtf8 closes its file. The prepared
+  file held 20,000 short lines (329 KB), so each fold stepped about 20,000
+  lines before the failing read. The runs are sanitized `-O0` builds, and the
+  strict build counts every allocation; the folds of that file made about
+  6.0 million of the run's 6,136,168 allocations, and the 300 folds about 87%
+  of its time (3.15 s for the whole strict run, 0.41 s without them, on an
+  M-series Mac).
+- **On the runner.** A dispatched probe (run 45666337355, macOS-15, Apple M1
+  Virtual, 15 runs each, nothing else running) measured 4.5 to 7.2 s for the
+  normal run and 5.5 to 6.9 s for the strict one, against the 10 s limit,
+  and 0.37 to 0.80 s without the 300 folds. Locally, with 25 busy loops on
+  10 cores, the strict run took 13.8 to 15.6 s in 6 of 6 runs, past the
+  limit, which reproduces the CI failure.
+- **Change.** `prepare.sh` builds the file from 100 lines of 1,000
+  characters and a newline each (100,133 bytes in all), still more than the first read's 64 KiB, so the bad line
+  still falls in a later read and the example's output is byte for byte the
+  same. The run's allocations fall to 148,489 and its strict run to about
+  0.4 s locally. The 300 failing folds still run under the 256-descriptor
+  limit: with the C changed so that a descriptor whose read failed is never
+  closed, both the old and the new file give "251 InvalidUtf8, 49 otherwise",
+  so the check is as strong as before.
+- **Evidence.** 200 normal and 200 strict runs of the fixed case, unloaded:
+  no failure, median 0.41 s, maximum 0.92 s. 50 of each under 25 busy loops:
+  no failure, maximum 3.63 s. With a 2 s limit, one full local e2e run had
+  only two cases over it: this one and "a million-deep left spine of a record
+  tree is released", which takes 0.5 to 0.8 s unloaded.
