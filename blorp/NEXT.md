@@ -8,6 +8,17 @@ done.
 
 ## Workstreams
 
+- **Compile-time evaluation:** [`CTFE_PLAN.md`](CTFE_PLAN.md).
+  - **Status:** planned on 2026-11-23. Constants become computed values that
+    the compiler evaluates once, by interpreting the lowered program with
+    each primitive delegated to its own compiled runtime, and emits as static
+    C data. Sizes in types (principle 14) follow, as a closed size language
+    in `check`. Keith settled the direction, the delegation and the LSP gap
+    on 2026-11-23, and accepted every recommendation for K2 to K6, K8, K9 and
+    T1 to T6 on 2026-11-24, after both reviews' fixes.
+  - **Next:** L1, static string literals (1,520 fewer allocations in a
+    self-compile, measured on a prototype). The sizes half moves to its own
+    plan before T1 (T6).
 - **Private variants:** [`PRIVATE_VARIANTS_PLAN.md`](PRIVATE_VARIANTS_PLAN.md).
   - **Status:** planned on 2026-11-23. Opaque types become unions with private
     variants (`union UserId: private Init(Int)`) in nine landings: enable
@@ -195,6 +206,7 @@ None of these is planned yet. Each wants its own short design or brief.
     use. The typed-error witness measures one temporary allocation per positive
     error decode; see the accepted debt in FILESYSTEM_DECISIONS. No compiler
     workaround or cache is part of the library refactor.
+    [`CTFE_PLAN.md`](CTFE_PLAN.md)'s L2 makes such constants static data.
   - **An opaque `DeclaredName`,** so a declaring site cannot skip its naming
     check even by calling the token reader directly. It needs the syntax
     tree's declaration fields (about 12 in `syntax.brp`, read in 22 files) to
@@ -258,7 +270,8 @@ None of these is planned yet. Each wants its own short design or brief.
   `src/common/codegen/runtime/system.brp`. A default, or one grouped constructor,
   could remove them.
 - **Constants cannot call functions,** so a `Bytes` constant such as a file
-  signature must be written as a function.
+  signature must be written as a function. [`CTFE_PLAN.md`](CTFE_PLAN.md)'s L3
+  lifts the restriction.
 
 - **The e2e driver prints a ceiling failure mid-line,** interleaved with the
   next PASS line, so a gate log hides it; search the raw log for "exceed the
