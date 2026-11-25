@@ -15,12 +15,22 @@ private STRICT_LEAK_EXIT_STATUS: Int = 99
 -- The probe creates two literal Strings, one per site; teardown frees both.
 private STRICT_TOTAL: String = "blorp: leak check: 2 allocs, 2 releases, 0 leaked, 0 bytes\n"
 private UNBALANCED_LINE: String = "blorp: leak check: unbalanced string literals: 1\n"
+-- The threaded probe's 64 sites make one String each, however many threads race.
+private THREADED_TOTAL: String = "blorp: leak check: 64 allocs, 64 releases, 0 leaked, 0 bytes\n"
 
 
-private func ready(c_compiler: String, directory: String) -> Result[String, String]:
-    _ ?= write_file(directory + "/memory_runtime.c", MEMORY_RUNTIME)
-    _ ?= write_file(directory + "/string_runtime.c", string_runtime())
-    executable = directory + "/string_literal_probe"
+-- Builds the probe from the runtime files in `directory`, with memory
+-- diagnostics when `diagnostics`.
+private func build_probe(
+    c_compiler: String,
+    directory: String,
+    executable: String,
+    diagnostics: Bool
+) -> Result[String, String]:
+    definition = if diagnostics:
+        "-DBLORP_MEMORY_DIAGNOSTICS=1"
+    else:
+        "-DBLORP_MEMORY_DIAGNOSTICS=0"
 
     build ?= isolated(
         c_compiler,
@@ -31,9 +41,10 @@ private func ready(c_compiler: String, directory: String) -> Result[String, Stri
             "-Wextra",
             "-Werror",
             "-pedantic",
+            "-pthread",
             "-fsanitize=address,undefined",
             "-fno-sanitize-recover=all",
-            "-DBLORP_MEMORY_DIAGNOSTICS=1",
+            definition,
             "-I",
             directory,
             "blorp/test/test_common/test_codegen/test_runtime/fixtures/string_literal_test.c",
@@ -51,7 +62,17 @@ private func ready(c_compiler: String, directory: String) -> Result[String, Stri
         Err("string literal native build: " + built.stderr)
 
 
--- Strict runs set BLORP_LEAK_CHECK; the others are diagnostic builds without it.
+-- The probe built with memory diagnostics, which count every allocation and
+-- check each literal's balance at exit, and without them.
+private func ready(c_compiler: String, directory: String) -> Result[(String, String), String]:
+    _ ?= write_file(directory + "/memory_runtime.c", MEMORY_RUNTIME)
+    _ ?= write_file(directory + "/string_runtime.c", string_runtime())
+    diagnostic ?= build_probe(c_compiler, directory, directory + "/string_literal_probe", True)
+    normal ?= build_probe(c_compiler, directory, directory + "/string_literal_probe_normal", False)
+    Ok((diagnostic, normal))
+
+
+-- Strict runs set BLORP_LEAK_CHECK; the others run without it.
 private func run_probe(
     executable: String,
     mode: String,
@@ -120,18 +141,18 @@ func suite(c_compiler: String, directory: String) -> TestSuite:
                 description = "String literal setup",
                 tests = [("native probe builds", func(): False)]
             }
-        Ok(executable):
+        Ok((diagnostic, normal)):
             {
                 description = "Shared String literals",
                 tests = [
                     (
                         "balanced literals are freed once at exit",
-                        func(): outcome(executable, "balanced", True, 0, STRICT_TOTAL)
+                        func(): outcome(diagnostic, "balanced", True, 0, STRICT_TOTAL)
                     ),
                     (
                         "an over-released literal fails the strict check",
                         func(): outcome(
-                            executable,
+                            diagnostic,
                             "over_release",
                             True,
                             STRICT_LEAK_EXIT_STATUS,
@@ -141,7 +162,7 @@ func suite(c_compiler: String, directory: String) -> TestSuite:
                     (
                         "an under-released literal fails the strict check",
                         func(): outcome(
-                            executable,
+                            diagnostic,
                             "under_release",
                             True,
                             STRICT_LEAK_EXIT_STATUS,
@@ -150,7 +171,15 @@ func suite(c_compiler: String, directory: String) -> TestSuite:
                     ),
                     (
                         "without the strict check an unbalanced literal still exits 0",
-                        func(): outcome(executable, "under_release", False, 0, "")
+                        func(): outcome(diagnostic, "under_release", False, 0, "")
+                    ),
+                    (
+                        "threads racing each site's first use make one String per site",
+                        func(): outcome(diagnostic, "threaded_publish", True, 0, THREADED_TOTAL)
+                    ),
+                    (
+                        "without diagnostics threads racing a site's first use share one String",
+                        func(): outcome(normal, "threaded_publish", False, 0, "")
                     )
                 ]
             }
