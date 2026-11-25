@@ -1331,7 +1331,8 @@ private record UnionKey {
 
 private record UnionInstance {
     key: UnionKey,
-    layout: ConcreteUnion
+    layout: ConcreteUnion,
+    copy_cost: CopyCost
 }
 
 
@@ -1363,6 +1364,8 @@ private record PartialRecordKey {
 -- (its index) and representation; only references to layouts that were still
 -- in progress when it completed remain unresolved, and every one of them is
 -- filled when that layout completes. Sealing accepts complete slots only.
+-- Either slot holds what copying one of its values costs (union_copy_cost),
+-- which a holder reads instead of costing the payloads again.
 private union UnionSlot:
     CompleteUnion(UnionInstance)
     PendingUnion(PendingUnionInstance)
@@ -1371,7 +1374,8 @@ private union UnionSlot:
 private record PendingUnionInstance {
     key: PartialUnionKey,
     variants: List[List[PartialType]],
-    representation: UnionRepresentation
+    representation: UnionRepresentation,
+    copy_cost: CopyCost
 }
 
 
@@ -1511,6 +1515,12 @@ private pure func slot_has_record_key(slot: RecordSlot, key: PartialRecordKey) -
                 False: False
         PendingRecord(instance):
             instance.key == key
+
+
+private pure func slot_copy_cost(slot: UnionSlot) -> CopyCost:
+    match slot:
+        CompleteUnion(instance): instance.copy_cost
+        PendingUnion(instance): instance.copy_cost
 
 
 private pure func slot_record_representation(slot: RecordSlot) -> RecordRepresentation:
@@ -1795,7 +1805,8 @@ private pure func settle_union(
                                     declaration = instance.key.declaration,
                                     arguments = arguments
                                 },
-                                layout = instance.representation.union_layout(variants)
+                                layout = instance.representation.union_layout(variants),
+                                copy_cost = instance.copy_cost
                             })
                         )
             Err(error):
@@ -1853,6 +1864,8 @@ private pure func record_layout(
 -- to. Only slots published while it was in progress, from `first` on, can
 -- hold such a reference, so earlier slots are not revisited.
 -- Resolving partial arguments preserves the slot digest, so the index stays valid.
+-- A slot keeps its cost, which counted the completed layout as one count;
+-- complete_referenced_layout derives it again when that was wrong.
 private pure func resolve_union_slots(
     slots: IndexedList[UnionSlot],
     first: Int,
@@ -1875,7 +1888,8 @@ private pure func resolve_union_slots(
                         arguments = instance.key.arguments.resolve_partials(completed)
                     },
                     variants = instance.variants.resolve_variants(completed),
-                    representation = instance.representation
+                    representation = instance.representation,
+                    copy_cost = instance.copy_cost
                 }
 
                 match filled.settle_union(span):
@@ -2016,6 +2030,22 @@ private pure func cases_cost(
         None: Ok(cost)
 
 
+-- What copying a union's value costs: nothing for plain data, one count for
+-- a box, and its widest case for an owning union. Its slot holds the cost
+-- from publication, and rederived_union_slot derives it again.
+private pure func union_copy_cost(
+    representation: UnionRepresentation,
+    variants: List[List[PartialType]],
+    unions: IndexedList[UnionSlot],
+    records: IndexedList[RecordSlot],
+    span: Span
+) -> Result[CopyCost, Diagnostic]:
+    match representation:
+        InlineUnmanaged: Ok(NoCount)
+        BoxedRecursive: Ok(OneCount)
+        InlineOwningPayload: variants.cases_cost(unions, records, span)
+
+
 -- A String, a List, a callable, a boxed union and any record that is not
 -- inline each cost one count: a value record holds one counted pointer, and
 -- a counted record or boxed union is one. A layout still in progress counts
@@ -2047,26 +2077,8 @@ private pure func copy_cost(
                                 ValueRecord | CountedRecord: Ok(OneCount)
                 UnionType(child):
                     match unions.entries.get(child.union_number()):
-                        None:
-                            Err(internal_error(span, "missing concrete child layout"))
-                        Some(CompleteUnion(instance)):
-                            match instance.layout:
-                                PlainCases(_):
-                                    Ok(NoCount)
-                                BoxedCases(_):
-                                    Ok(OneCount)
-                                OwningCases(variants):
-                                    variants
-                                        .map(known_partial_types)
-                                        .cases_cost(unions, records, span)
-                        Some(PendingUnion(instance)):
-                            match instance.representation:
-                                InlineUnmanaged:
-                                    Ok(NoCount)
-                                BoxedRecursive:
-                                    Ok(OneCount)
-                                InlineOwningPayload:
-                                    instance.variants.cases_cost(unions, records, span)
+                        None: Err(internal_error(span, "missing concrete child layout"))
+                        Some(slot): Ok(slot.slot_copy_cost())
 
 
 private pure func ensure_union(
@@ -2232,7 +2244,13 @@ private pure func prepare_union(
     -- next identity; only references back to layouts still on the
     -- path, including its own self payloads, remain to fill.
     id: UnionInstanceId = into_opaque UnionInstanceId(dependencies.entries.length())
-    slot ?= settle_union({ key = key, variants = variants, representation = representation }, span)
+    cost ?= representation.union_copy_cost(variants, dependencies, record_dependencies, span)
+
+    slot ?= settle_union(
+        { key = key, variants = variants, representation = representation, copy_cost = cost },
+        span
+    )
+
     digest ?= key.slot_union_digest(dependencies, record_dependencies, span)
     published = dependencies.append_entry(slot, digest)
     left ?= layouts.leave_layout(span)
@@ -2384,9 +2402,10 @@ private pure func rederive_layouts(
         None: Ok({ unions = unions, records = records })
 
 
--- The slot with its inline storage derived again from its payloads' current
--- costs, or None when that leaves it as it is. A boxed union stays boxed
--- whatever its payloads cost.
+-- The slot with its inline storage and copy cost derived again from its
+-- payloads' current costs, or None when that leaves both as they are. An
+-- owning union's cost can change without its storage changing. A boxed
+-- union stays boxed, at one count, whatever its payloads cost.
 private pure func rederived_union_slot(
     slot: UnionSlot,
     unions: IndexedList[UnionSlot],
@@ -2421,7 +2440,7 @@ private pure func rederived_union_slot(
                         NoCount: InlineUnmanaged
                         OneCount | SeveralCounts: InlineOwningPayload
 
-                    if derived == current:
+                    if (derived == current).and(cost == slot.slot_copy_cost()):
                         None
                     else:
                         match slot:
@@ -2431,12 +2450,17 @@ private pure func rederived_union_slot(
                                         { instance |
                                             layout = derived.union_layout(
                                                 instance.layout.union_variants()
-                                            )
+                                            ),
+                                            copy_cost = cost
                                         }
                                     )
                                 )
                             PendingUnion(instance):
-                                Some(PendingUnion({ instance | representation = derived }))
+                                Some(
+                                    PendingUnion(
+                                        { instance | representation = derived, copy_cost = cost }
+                                    )
+                                )
                 )
 
 
