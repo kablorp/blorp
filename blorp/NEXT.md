@@ -8,6 +8,21 @@ done.
 
 ## Workstreams
 
+- **Concurrency:** [`CONCURRENCY_PLAN.md`](CONCURRENCY_PLAN.md).
+  - **Status:** planned on 2026-11-24, after two rounds of review and Spike P.
+    - The design: `concurrent:` and `first:` blocks on virtual threads, with
+      pure tasks on a pool of OS threads.
+    - Keith made 19 decisions.
+    - Spike P's verdict was continue: 0.99 of linear on 4 threads for
+      CPU-bound work, and about 0.7 for allocation-heavy work.
+  - **Landed:** landing 1 (2026-11-24): literals are published once under a
+    lock, and the diagnostics allocator has a mutex.
+  - **Next:**
+    - landing 1b: stop writing literal counts, and try a lock that is cheap
+      when uncontended;
+    - landing 2: the pool and `join`.
+  - **Overlap:** `CTFE_PLAN.md`'s L1 replaces landing 1's lazy literal site
+    with static literals. Keep the threaded literal test when it does.
 - **Compile-time evaluation:** [`CTFE_PLAN.md`](CTFE_PLAN.md).
   - **Status:** planned on 2026-11-23. Constants become computed values that
     the compiler evaluates once, by interpreting the lowered program with
