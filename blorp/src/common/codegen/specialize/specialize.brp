@@ -1337,9 +1337,8 @@ private record UnionInstance {
 
 -- A type named while a layout on the current path is still being built. A
 -- pending reference carries the in-progress layout's key; it is resolved to
--- that layout's identity when the layout completes. A reader of a pending
--- reference needs only its ownership class, which membership in a recursive
--- layout group fixes: a pending union is owning, a pending record managed.
+-- that layout's identity when the layout completes. Until then its cost is
+-- not known, and a reader counts it as one (copy_cost).
 private union PartialType:
     KnownType(TypeRef)
     PendingUnionType(PartialUnionKey)
@@ -1790,22 +1789,27 @@ private pure func settle_union(
                     Err(error):
                         Err(error)
                     Ok(variants):
-                        layout: ConcreteUnion = match instance.representation:
-                            InlineUnmanaged: PlainCases(variants)
-                            InlineOwningPayload: OwningCases(variants)
-                            BoxedRecursive: BoxedCases(variants)
-
                         Ok(
                             CompleteUnion({
                                 key = {
                                     declaration = instance.key.declaration,
                                     arguments = arguments
                                 },
-                                layout = layout
+                                layout = instance.representation.union_layout(variants)
                             })
                         )
             Err(error):
                 Err(error)
+
+
+private pure func union_layout(
+    representation: UnionRepresentation,
+    variants: List[List[TypeRef]]
+) -> ConcreteUnion:
+    match representation:
+        InlineUnmanaged: PlainCases(variants)
+        InlineOwningPayload: OwningCases(variants)
+        BoxedRecursive: BoxedCases(variants)
 
 
 private pure func settle_record(
@@ -1823,21 +1827,26 @@ private pure func settle_record(
             Ok(arguments):
                 match instance.fields.known_types(span):
                     Ok(fields):
-                        layout: ConcreteRecord = match instance.representation:
-                            InlineRecord: InlineFields(fields)
-                            ValueRecord: ValueFields(fields)
-                            CountedRecord: CountedFields(fields)
-
                         Ok(
                             CompleteRecord({
                                 key = { origin = instance.key.origin, arguments = arguments },
-                                layout = layout
+                                layout = instance.representation.record_layout(fields)
                             })
                         )
                     Err(error):
                         Err(error)
             Err(error):
                 Err(error)
+
+
+private pure func record_layout(
+    representation: RecordRepresentation,
+    fields: List[TypeRef]
+) -> ConcreteRecord:
+    match representation:
+        InlineRecord: InlineFields(fields)
+        ValueRecord: ValueFields(fields)
+        CountedRecord: CountedFields(fields)
 
 
 -- Fills every reference to a completed layout that a child referred back
@@ -2009,10 +2018,9 @@ private pure func cases_cost(
 
 -- A String, a List, a callable, a boxed union and any record that is not
 -- inline each cost one count: a value record holds one counted pointer, and
--- a counted record or boxed union is one. A layout still in progress lies on
--- a cycle of layouts, which passes through a pointer, so it costs at least
--- one, and counts as one. That is exact but for an owning union whose widest
--- case holds more, which recount_value_records corrects when it completes.
+-- a counted record or boxed union is one. A layout still in progress counts
+-- as one until it completes, when complete_referenced_layout derives its
+-- readers again if that was wrong.
 private pure func copy_cost(
     value: PartialType,
     unions: IndexedList[UnionSlot],
@@ -2238,106 +2246,259 @@ private pure func prepare_union(
                 in_progress = left.remaining
             })
         ReferencedBack:
-            completed: CompletedLayout = CompletedUnion(key, id)
-            first_record = records.entries.length()
-
-            match published.resolve_union_slots(unions.entries.length(), completed, span):
-                Ok(resolved_unions):
-                    match (
-                        record_dependencies
-                            .resolve_record_slots(first_record, completed, span)
-                            .and_then(
-                                pure func(resolved): resolved.recount_value_records(
-                                    first_record,
-                                    resolved_unions,
-                                    span
-                                )
-                            )
-                    ):
-                        Ok(resolved_records):
-                            Ok({
-                                value_type = KnownType(UnionType(id)),
-                                unions = resolved_unions,
-                                records = resolved_records,
-                                in_progress = left.remaining
-                            })
-                        Err(error):
-                            Err(error)
+            match complete_referenced_layout(
+                CompletedUnion(key, id),
+                { unions = published, records = record_dependencies },
+                unions.entries.length(),
+                records.entries.length(),
+                checked.records,
+                span
+            ):
+                Ok(settled):
+                    Ok({
+                        value_type = KnownType(UnionType(id)),
+                        unions = settled.unions,
+                        records = settled.records,
+                        in_progress = left.remaining
+                    })
                 Err(error):
                     Err(error)
 
 
--- An owning union in progress counts as one count (copy_cost), which
--- undercounts one whose widest case holds more. Every record whose cost read
--- it, as a field or in another union's payload, was published while it was in
--- progress, so when it completes, each value record published since is costed
--- again and becomes a counted cell if a copy would cost more than one count.
--- Value and counted records both cost a holder one count and make a union
--- payload owning, so this moves no other layout, and a record's storage does
--- not depend on which layout of a cycle specialization meets first.
-private pure func recount_value_records(
-    slots: IndexedList[RecordSlot],
-    first: Int,
+-- The builder's slot tables.
+private record LayoutTables {
     unions: IndexedList[UnionSlot],
+    records: IndexedList[RecordSlot]
+}
+
+
+-- A layout that a child referred back to has completed: every reference to
+-- it is filled, and its readers are derived again when it does not cost the
+-- one count they counted it as (copy_cost). A cycle through a pointer makes
+-- that count right, except for an owning union whose widest case holds more.
+-- A cycle through a type argument that its declaration never stores can
+-- leave the layout costing nothing. Its readers, and every layout that holds
+-- one, were published while it was in progress, from `first_union` and
+-- `first_record` on; the layouts further up the path have read none of them.
+private pure func complete_referenced_layout(
+    completed: CompletedLayout,
+    tables: LayoutTables,
+    first_union: Int,
+    first_record: Int,
+    record_declarations: List[model.CheckedRecord],
     span: Span
-) -> Result[IndexedList[RecordSlot], Diagnostic]:
-    var recounted = slots.entries
-    var position = first
+) -> Result[LayoutTables, Diagnostic]:
+    unions ?= tables.unions.resolve_union_slots(first_union, completed, span)
+    records ?= tables.records.resolve_record_slots(first_record, completed, span)
+
+    completed_type: TypeRef = match completed:
+        CompletedUnion(_, id): UnionType(id)
+        CompletedRecord(_, id): RecordType(id)
+
+    cost ?= KnownType(completed_type).copy_cost(unions, records, span)
+    resolved: LayoutTables = { unions = unions, records = records }
+
+    match cost:
+        OneCount:
+            Ok(resolved)
+        NoCount | SeveralCounts:
+            resolved.rederive_layouts(first_union, first_record, record_declarations, span)
+
+
+-- Derives every layout from `first_union` and `first_record` on again from
+-- its payloads' or fields' current costs, until a pass changes none. Every
+-- by-value cycle passes through a layout that contains itself, whose cost
+-- its contents do not change, so each pass settles one more holder on every
+-- chain of holders: one pass per layout, and a last that changes nothing,
+-- always suffice. The result is the one fixed point, so a layout's storage
+-- does not depend on which layout of a cycle specialization meets first.
+private pure func rederive_layouts(
+    tables: LayoutTables,
+    first_union: Int,
+    first_record: Int,
+    record_declarations: List[model.CheckedRecord],
+    span: Span
+) -> Result[LayoutTables, Diagnostic]:
+    var unions = tables.unions
+    var records = tables.records
+    window = unions.entries.length() - first_union + records.entries.length() - first_record
+    var passes_left = window + 1
+    var changed: Bool = True
     var failure: Option[Diagnostic] = None
 
-    while (position < recounted.length()).and(failure.is_none()):
-        match recounted.get(position):
-            Some(slot):
-                match slot.recounted_slot(unions, slots, span):
-                    Ok(Some(counted)): recounted = recounted.set(position, counted)
-                    Ok(None): void
-                    Err(error): failure = Some(error)
-            None:
-                failure = Some(internal_error(span, "record slot left its builder"))
+    while changed.and(failure.is_none()):
+        if passes_left == 0:
+            failure = Some(internal_error(span, "layout storage did not settle"))
+        else:
+            passes_left = passes_left - 1
+            changed = False
+            var position = first_union
 
-        position = position + 1
+            while (position < unions.entries.length()).and(failure.is_none()):
+                match unions.entries.get(position):
+                    Some(slot):
+                        match slot.rederived_union_slot(unions, records, span):
+                            Ok(Some(derived)):
+                                unions = { unions |
+                                    entries = unions.entries.set(position, derived)
+                                }
+
+                                changed = True
+                            Ok(None):
+                                void
+                            Err(error):
+                                failure = Some(error)
+                    None:
+                        failure = Some(internal_error(span, "union slot left its builder"))
+
+                position = position + 1
+
+            position = first_record
+
+            while (position < records.entries.length()).and(failure.is_none()):
+                match records.entries.get(position):
+                    Some(slot):
+                        match slot.rederived_record_slot(
+                            unions,
+                            records,
+                            record_declarations,
+                            span
+                        ):
+                            Ok(Some(derived)):
+                                records = { records |
+                                    entries = records.entries.set(position, derived)
+                                }
+
+                                changed = True
+                            Ok(None):
+                                void
+                            Err(error):
+                                failure = Some(error)
+                    None:
+                        failure = Some(internal_error(span, "record slot left its builder"))
+
+                position = position + 1
 
     match failure:
         Some(error): Err(error)
-        None: Ok({ slots | entries = recounted })
+        None: Ok({ unions = unions, records = records })
 
 
--- A value record's slot as a counted cell when a copy of its fields now
--- costs more than one count; None when the slot stays as it is.
-private pure func recounted_slot(
-    slot: RecordSlot,
+-- The slot with its inline storage derived again from its payloads' current
+-- costs, or None when that leaves it as it is. A boxed union stays boxed
+-- whatever its payloads cost.
+private pure func rederived_union_slot(
+    slot: UnionSlot,
     unions: IndexedList[UnionSlot],
     records: IndexedList[RecordSlot],
     span: Span
-) -> Result[Option[RecordSlot], Diagnostic]:
-    match slot.slot_record_representation():
-        InlineRecord | CountedRecord:
-            Ok(None)
-        ValueRecord:
-            fields: List[PartialType] = match slot:
-                CompleteRecord(instance): known_partial_types(record_fields(instance.layout))
-                PendingRecord(instance): instance.fields
+) -> Result[Option[UnionSlot], Diagnostic]:
+    current: UnionRepresentation = match slot:
+        CompleteUnion(instance):
+            match instance.layout:
+                PlainCases(_): InlineUnmanaged
+                OwningCases(_): InlineOwningPayload
+                BoxedCases(_): BoxedRecursive
+        PendingUnion(instance):
+            instance.representation
 
-            match fields.fields_cost(unions, records, span):
-                Ok(OneCount):
-                    Ok(None)
-                Ok(SeveralCounts):
-                    counted: RecordSlot = match slot:
-                        CompleteRecord(instance):
+    match current:
+        BoxedRecursive:
+            Ok(None)
+        InlineUnmanaged | InlineOwningPayload:
+            payloads: List[List[PartialType]] = match slot:
+                CompleteUnion(instance):
+                    instance.layout
+                        .union_variants()
+                        .map(known_partial_types)
+                PendingUnion(instance):
+                    instance.variants
+
+            payloads
+                .cases_cost(unions, records, span)
+                .map(pure func(cost) -> Option[UnionSlot]:
+                    derived: UnionRepresentation = match cost:
+                        NoCount: InlineUnmanaged
+                        OneCount | SeveralCounts: InlineOwningPayload
+
+                    if derived == current:
+                        None
+                    else:
+                        match slot:
+                            CompleteUnion(instance):
+                                Some(
+                                    CompleteUnion(
+                                        { instance |
+                                            layout = derived.union_layout(
+                                                instance.layout.union_variants()
+                                            )
+                                        }
+                                    )
+                                )
+                            PendingUnion(instance):
+                                Some(PendingUnion({ instance | representation = derived }))
+                )
+
+
+-- The slot with its storage derived again from its fields' current costs, or
+-- None when that leaves it as it is.
+private pure func rederived_record_slot(
+    slot: RecordSlot,
+    unions: IndexedList[UnionSlot],
+    records: IndexedList[RecordSlot],
+    record_declarations: List[model.CheckedRecord],
+    span: Span
+) -> Result[Option[RecordSlot], Diagnostic]:
+    origin: RecordOrigin = match slot:
+        CompleteRecord(instance): instance.key.origin
+        PendingRecord(instance): instance.key.origin
+
+    needs_cell ?= origin.record_needs_cell(record_declarations, span)
+
+    fields: List[PartialType] = match slot:
+        CompleteRecord(instance): known_partial_types(record_fields(instance.layout))
+        PendingRecord(instance): instance.fields
+
+    fields
+        .record_representation(needs_cell, unions, records, span)
+        .map(pure func(derived) -> Option[RecordSlot]:
+            if derived == slot.slot_record_representation():
+                None
+            else:
+                match slot:
+                    CompleteRecord(instance):
+                        Some(
                             CompleteRecord(
                                 { instance |
-                                    layout = CountedFields(record_fields(instance.layout))
+                                    layout = derived.record_layout(record_fields(instance.layout))
                                 }
                             )
-                        PendingRecord(instance):
-                            PendingRecord({ instance | representation = CountedRecord })
+                        )
+                    PendingRecord(instance):
+                        Some(PendingRecord({ instance | representation = derived }))
+        )
 
-                    Ok(Some(counted))
-                -- A recount replaces an in-progress layout's one count with its own.
-                Ok(NoCount):
-                    Err(internal_error(span, "a recounted value record holds no counted value"))
-                Err(error):
-                    Err(error)
+
+-- Whether every instance of a record needs a counted cell, whatever its
+-- fields cost: a declared record that contains itself, as Check classified
+-- it, and a capture environment, which sealed_record_layout stores by value
+-- unless a runtime closure holds it. A tuple names no declaration, so it
+-- cannot contain itself.
+private pure func record_needs_cell(
+    origin: RecordOrigin,
+    record_declarations: List[model.CheckedRecord],
+    span: Span
+) -> Result[Bool, Diagnostic]:
+    match origin:
+        StructuralTuple:
+            Ok(False)
+        DeclaredRecord(id):
+            record_declarations
+                .get(id.record_number())
+                .or_internal_error(span, "unknown record declaration")
+                .map(pure func(declaration) -> Bool: declaration.contains_itself)
+        CaptureEnvironment(_):
+            Ok(True)
 
 
 -- A record that contains itself, or that a runtime closure may hold as
@@ -2400,8 +2561,7 @@ private pure func ensure_record(
 private record SelectedRecord {
     type_parameters: List[TypeParameterId],
     parameter_owner: model.TypeParameterOwner,
-    fields: List[model.TypeUse],
-    needs_cell: Bool
+    fields: List[model.TypeUse]
 }
 
 
@@ -2415,10 +2575,9 @@ private pure func prepare_record(
 ) -> Result[PreparedType, Diagnostic]:
     match key.origin:
         StructuralTuple:
-            -- A tuple names no declaration, so it cannot contain itself.
             key.publish_record(
                 key.arguments,
-                False,
+                checked.records,
                 unions,
                 span,
                 records,
@@ -2448,8 +2607,7 @@ private pure func prepare_source_record(
     selected: SelectedRecord = {
         type_parameters = declaration.type_parameters,
         parameter_owner = model.RecordDeclaration(id),
-        fields = declaration.fields.map(pure func(field): field.value_type),
-        needs_cell = declaration.contains_itself
+        fields = declaration.fields.map(pure func(field): field.value_type)
     }
 
     key.prepare_declared_record(selected, checked, unions, span, records, in_progress)
@@ -2475,10 +2633,7 @@ private pure func prepare_capture_record(
     selected: SelectedRecord = {
         type_parameters = root.signature.type_parameters,
         parameter_owner = model.FunctionDeclaration(lambda.root),
-        fields = lambda.captures.map(pure func(capture): capture.value_type),
-        -- sealed_record_layout stores the environment by value unless a
-        -- runtime closure holds it.
-        needs_cell = True
+        fields = lambda.captures.map(pure func(capture): capture.value_type)
     }
 
     key.prepare_declared_record(selected, checked, unions, span, records, in_progress)
@@ -2533,7 +2688,7 @@ private pure func prepare_declared_record(
 
     key.publish_record(
         fields,
-        declaration.needs_cell,
+        checked.records,
         dependencies,
         span,
         record_dependencies,
@@ -2547,7 +2702,7 @@ private pure func prepare_declared_record(
 private pure func publish_record(
     key: PartialRecordKey,
     fields: List[PartialType],
-    needs_cell: Bool,
+    record_declarations: List[model.CheckedRecord],
     dependencies: IndexedList[UnionSlot],
     span: Span,
     record_dependencies: IndexedList[RecordSlot],
@@ -2555,6 +2710,8 @@ private pure func publish_record(
     first_union: Int,
     first_record: Int
 ) -> Result[PreparedType, Diagnostic]:
+    needs_cell ?= key.origin.record_needs_cell(record_declarations, span)
+
     representation ?= fields.record_representation(
         needs_cell,
         dependencies,
@@ -2581,20 +2738,21 @@ private pure func publish_record(
                 in_progress = left.remaining
             })
         ReferencedBack:
-            completed: CompletedLayout = CompletedRecord(key, instance)
-
-            match dependencies.resolve_union_slots(first_union, completed, span):
-                Ok(resolved_unions):
-                    match published.resolve_record_slots(first_record, completed, span):
-                        Ok(resolved_records):
-                            Ok({
-                                value_type = KnownType(RecordType(instance)),
-                                unions = resolved_unions,
-                                records = resolved_records,
-                                in_progress = left.remaining
-                            })
-                        Err(error):
-                            Err(error)
+            match complete_referenced_layout(
+                CompletedRecord(key, instance),
+                { unions = dependencies, records = published },
+                first_union,
+                first_record,
+                record_declarations,
+                span
+            ):
+                Ok(settled):
+                    Ok({
+                        value_type = KnownType(RecordType(instance)),
+                        unions = settled.unions,
+                        records = settled.records,
+                        in_progress = left.remaining
+                    })
                 Err(error):
                     Err(error)
 

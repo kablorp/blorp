@@ -87,22 +87,27 @@ fact has one source. `inline_record_field`, the three-way storage policy
 (`InlineEligible`, `DeclaredInline`, `AlwaysManaged`) and the fixed-record
 assertion are deleted.
 
-A field whose layout is still in progress is a back reference: it lies on a
-cycle of layouts, which passes through a pointer, so it costs at least one,
-and counts as one. That is exact for a record (one that is not inline costs
-a holder one) and a boxed union, but undercounts an owning union whose
-widest case holds more. A record that holds such a union, directly or inside
-another union's payload, would then be a value whose copy acquires two
-counts, and which it was would depend on whether specialization met the
-union or the record first (`union Shape: Pair(String, String) |
-Many(List[Wrapper])` with `record Wrapper { shape: Shape }`).
-`recount_value_records` removes the undercount: every record that read the
-union's one count was published while the union was in progress, so when a
-union that was referred back to completes, each value record published since
-it began is costed again from completed layouts, and one over the bound
-becomes a counted cell. A value and a counted record both cost a holder one
-count and both make a union payload owning, so the change moves no other
-layout, and the result is the same in either order.
+A field whose layout is still in progress is a back reference, and counts
+as one until that layout completes. When the cycle passes through a pointer,
+the count is exact for a record (one that is not inline costs a holder one)
+and for a boxed union. It undercounts an owning union whose widest case holds
+more: a record holding such a union would be a value whose copy acquires two
+counts (`union Shape: Pair(String, String) | Many(List[Wrapper])` with
+`record Wrapper { shape: Shape }`). A cycle can also pass through a type
+argument that its declaration never stores, as in `union Q[U]: Init(Int)`,
+`union A: MkA(Q[B])` and `union B: MkB(A)`. The layout in progress may then
+cost nothing, and B would be an owning union over a plain payload, which
+verify rejects.
+
+`complete_referenced_layout` removes both errors. Every layout that read the
+one count was published while the referred layout was in progress. So when
+that layout completes with any other cost, each union and record published
+since it began is derived again from its payloads' current costs, pass after
+pass until none changes. Every by-value cycle passes through a layout that
+contains itself, and such a layout's cost does not change with its contents.
+The costs are therefore acyclic, and the passes settle within one per layout,
+plus a last that changes nothing. Because the fixpoint is unique, storage
+does not depend on which layout specialization meets first.
 
 **Verify** accepts `Void` among an inline record's fields. **Emit** gives an
 inline record whose fields are all `Void` one unused byte, since C has no
@@ -254,6 +259,33 @@ ceiling. Tests (`blorp/test`, suites, fixtures and C probes): +1,406, -405.
 cases, no ceiling exceeded (`make_test_final_2.log`), on `d95f6b770`, which
 differs from the landing commit only in this line. The fixpoint runs in
 branch CI.
+
+### Phantom-argument cycles, 2026-11-24
+
+**Change.** The completion-time re-derivation above replaced
+`recount_value_records`, which handled only the undercount.
+
+**Setup.**
+- Host: Apple M4, 32 GB, macOS 26.7.1, Apple clang 21.0.0.
+- Seed: `blorp-seed-8eb8e16546b3`.
+- Base: `9823919fa`. Candidate: tree `5e91a3f9a`, whose `blorp/src` the
+  landing commit keeps.
+- Command: `blorp/scripts/self-compile-cost 9823919fa 5e91a3f9a --rounds 3`.
+- Raw samples: the ignored `blorp/build/phantom-cycle/cost/` of the fix's
+  worktree.
+
+| Measure | Base | Candidate | Change |
+| --- | ---: | ---: | ---: |
+| Fixed-input allocations | 13,189,121 | 13,189,498 | +0.0029% |
+| Fixed-input peak heap, bytes | 186,505,103 | 186,505,168 | +0.0000% |
+| Fixed-input instructions, median of 3 | 13,391,720,043 | 13,387,986,735 | -0.0279% |
+| Own-source allocations | 13,189,121 | 13,214,482 | +0.1923% |
+| Own-source instructions, median of 3 | 13,393,954,793 | 13,418,238,166 | +0.1813% |
+
+**Output.** The fixed-input C is identical on both sides
+(`dab8ca09cec266cb`).
+
+**Lines.** Production: +280, -121. Tests: +266.
 
 ## Raising the bound later
 
