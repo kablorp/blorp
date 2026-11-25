@@ -172,9 +172,10 @@ work is linear in the output bytes and the C stack is constant.
 
 ### Dict
 
-`dict.brp` declares the opaque `Dict[K: Hashable, V]`, an insertion-ordered map
-over parallel Lists and an open-addressing index. Int, String, Bool and Lists of
-keys are keys; a record or opaque key writes its own `Hashable` and
+`dict.brp` declares `Dict[K: Hashable, V]`, a union with one private variant:
+an insertion-ordered map over parallel Lists and an open-addressing index. Int,
+String, Bool and Lists of keys are keys; a record or private-variant union key
+writes its own `Hashable` and
 `Equatable` first, except that a record or union whose fields are all Equatable
 already has `==` and writes only `Hashable`. A key with several parts hashes them
 with `combine_hash(seed, value) = (seed + value) * 1099511628211`, wrapping:
@@ -271,8 +272,9 @@ There are no bit operations or shifts yet; a big-endian 16-bit value is
 
 ### Bytes
 
-`bytes.brp` declares `opaque type Bytes = List[UInt8]`, a byte sequence that is
-not a list of small numbers to the checker. It is not in the prelude. Import it
+`bytes.brp` declares `Bytes`, a union with one private variant over
+`List[UInt8]`: a byte sequence that is not a list of small numbers to the
+checker. It is not in the prelude. Import it
 as `bytes: Bytes, from_list, String methods`: selecting `Bytes` gives its
 functions through UFCS, `from_list` takes a List so it is imported by name, and
 `String methods` reaches `text.to_bytes()`. A module alias also works: `bytes as
@@ -436,7 +438,7 @@ accepts one complete JSON value with optional JSON whitespace. `Json` carries
 
 `number(text) -> Result[JsonNumber, ParseError]` validates an entire number
 lexeme without whitespace. `number_text(number) -> String` returns its exact
-spelling; `integer(Int) -> JsonNumber` constructs one infallibly. The opaque
+spelling; `integer(Int) -> JsonNumber` constructs one infallibly. The
 number retains every decimal digit, exponent spelling and negative zero;
 parsing and rendering never convert it to Float. Thus `9007199254740993` and
 `1E400` survive unchanged.
@@ -706,8 +708,8 @@ most 256 open descriptors, so a fold that left its file open would fail its
 
 ### Paths
 
-`Path` is an opaque type over a String spelling: never empty and never holding
-NUL. `to_path(text)` is the only way to make one and returns `Err(Empty)` or
+`Path` is a union with one private variant over a String spelling: never empty
+and never holding NUL. `to_path(text)` is the only way to make one and returns `Err(Empty)` or
 `Err(ContainsNul)` (`PathError`, with fixed text) otherwise; nothing else is
 checked and nothing is normalized. Only ASCII `/` separates components, and
 these functions do no filesystem access, symlink resolution, case folding or

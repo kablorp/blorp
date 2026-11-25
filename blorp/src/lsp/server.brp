@@ -207,7 +207,8 @@ private union Lifecycle:
     Exited(Int)
 
 
-opaque type Server = Lifecycle
+union Server:
+    private Init(Lifecycle)
 
 
 -- What a request asks of an open document, answered from its root's analysis.
@@ -283,19 +284,23 @@ private ERROR_SEVERITY: Int = 1
 
 
 pure func start_server(library: LibraryLayout) -> Server:
-    into_opaque Server(AwaitingInitialize(library))
+    Server.Init(AwaitingInitialize(library))
 
 
 -- Some once `exit` has arrived.
 pure func exit_status(server: Server) -> Option[Int]:
-    match from_opaque Server(server):
+    Server.Init(lifecycle) = server
+
+    match lifecycle:
         Exited(status): Some(status)
         AwaitingInitialize(_) | Serving(_) | ShutDown: None
 
 
 -- The open documents, which an analysis reads instead of the disk.
 pure func snapshots(server: Server) -> List[SourceFile]:
-    match from_opaque Server(server):
+    Server.Init(lifecycle) = server
+
+    match lifecycle:
         Serving(session):
             session.documents
                 .entries()
@@ -310,13 +315,13 @@ pure func snapshots(server: Server) -> List[SourceFile]:
 
 
 private pure func replying(lifecycle: Lifecycle, replies: List[Json]) -> Step:
-    { server = into_opaque Server(lifecycle), replies = replies, followup = Idle }
+    { server = Server.Init(lifecycle), replies = replies, followup = Idle }
 
 
 -- A body that is not UTF-8 JSON gets -32700 with a null id in any state:
 -- nothing in it says what was asked.
 pure func receive_body(server: Server, body: Bytes) -> Step:
-    lifecycle = from_opaque Server(server)
+    Server.Init(lifecycle) = server
 
     match body.to_text():
         None:
@@ -332,7 +337,7 @@ pure func receive_body(server: Server, body: Bytes) -> Step:
 
 
 pure func receive(server: Server, message: Json) -> Step:
-    lifecycle = from_opaque Server(server)
+    Server.Init(lifecycle) = server
 
     match (lifecycle, client_message(message)):
         (Exited(_), _) | (_, ClientResponse):
@@ -1151,7 +1156,7 @@ private pure func document_requested(
                 Some(Stale(_)) | None:
                     if session.documents.contains(path):
                         {
-                            server = into_opaque Server(Serving(session)),
+                            server = Server.Init(Serving(session)),
                             replies = [],
                             followup = Analyse({
                                 root = path,
@@ -1253,11 +1258,7 @@ private pure func notified(session: Session, call: Call) -> Step:
             -- The document reverts to its saved text, which `reverted` compares
             -- with the text each root read.
             if session.documents.contains(path):
-                {
-                    server = into_opaque Server(Serving(session)),
-                    replies = [],
-                    followup = ReadSaved(path)
-                }
+                { server = Server.Init(Serving(session)), replies = [], followup = ReadSaved(path) }
             else:
                 replying(Serving(session), [])
         ("textDocument/didClose", Some(LibraryFile(relative))):
@@ -1378,7 +1379,7 @@ private pure func handed_over(session: Session, leaving: Path, files: List[Path]
 -- Closes the document at `path` once the transport has read the saved text
 -- it reverts to, `saved`, which is None when the file could not be read.
 pure func reverted(server: Server, path: Path, saved: Option[String]) -> Step:
-    lifecycle = from_opaque Server(server)
+    Server.Init(lifecycle) = server
 
     match lifecycle:
         Serving(session): session.closed(path, saved)
@@ -1437,7 +1438,7 @@ private pure func closed(session: Session, path: Path, saved: Option[String]) ->
 -- analysis came back is no longer a root: the result is dropped, and the
 -- request gets `null`.
 pure func analysed(server: Server, asked: AnalysisRequest, result: DocumentAnalysis) -> Step:
-    lifecycle = from_opaque Server(server)
+    Server.Init(lifecycle) = server
     root = asked.root
 
     match lifecycle:

@@ -1,8 +1,8 @@
 # Private variants plan
 
 **Status: in progress, 2026-11-25.** Keith approved the design and asked for
-this plan, then started it with landing 0. Landings 0 to 3 have landed;
-landing 4, the migration, is next. Landing 0 belongs to [`EQUALITY_PLAN.md`](EQUALITY_PLAN.md),
+this plan, then started it with landing 0. Landings 0 to 4 have landed;
+landing 5, deleting the conversions, is next. Landing 0 belongs to [`EQUALITY_PLAN.md`](EQUALITY_PLAN.md),
 which records its results.
 
 **The direction.** Keith chose it in discussion:
@@ -593,6 +593,27 @@ delete. The seed rotates once.
    - **Equality functions.** The functions that differ belong to types that
      used derived opaque equality, which after landing 0 includes the 29
      identity types. Each commit lists them.
+   - **Results.** It landed on 2026-11-25 with +191 production lines and +30
+     test lines, against an estimate of +285 and +180.
+     - **The oracle.** The fixed-input C was identical for every area. The
+       own-source C differed only in 28 derived-equality functions, each
+       wrapping `int.equals` or its payload record's equality, and in the
+       embedded library text. That normalized check compares function
+       bodies, not type declarations or static data. The identical
+       fixed-input C and the flat cost are the stronger evidence for erasure.
+       The coordinator read the wrappers' C, and each delegates once.
+     - **Erasure.** Every migrated union was erased: no new union type and no
+       renumbering.
+     - **Cost.** Fixed-input allocations and peak heap were unchanged, and
+       instructions read −0.01%.
+     - **`fixed` holders.** 25 identity types became `fixed union`s because
+       a `fixed` record or union holds them.
+     - **Restructured reads.** Eleven reads needed restructuring by hand. Each
+       read's operand was a name or a field, so no evaluation order changed.
+     - **Seed.** The seed accepted every form.
+     - **Tests left for landings 5 and 6.** The tests of the opaque machinery
+       stay. So does `test_check/test_resource_scopes.brp`, which tests the
+       `resource type` form; `test_resource_unions.brp` covers the union form.
 5. **Landing 5: delete the conversions.** The two keywords, their syntax, the formatter's
    printing of them, the inference path and the errors (about 480 lines).
    Conversions refer to declarations, so they go first.
@@ -642,6 +663,12 @@ Upper bounds, measured with `blorp/scripts/self-compile-cost PARENT CANDIDATE
   landing for a growth audit (root `AGENTS.md`).
 - **Corrections.** The coordinator makes routine ones and records each here,
   with the old and new figures and the reason. Anything larger is Keith's.
+- **Callgrind settles a close instruction reading.** From landing 4, when a
+  macOS reading falls within 0.1% of an instruction ceiling, callgrind in
+  the Linux Docker image (`blorp-test-linux-arm64`) settles it. It counts
+  each side's compile of the base's source deterministically. On macOS the
+  base alone spreads 14M to 30M instructions between rounds, so nine rounds
+  could not resolve landing 2's 0.1%, and callgrind could.
 
 | Landing | Instructions | Allocations | Peak heap | Production lines | Test lines |
 | --- | --- | --- | --- | --- | --- |
@@ -657,10 +684,10 @@ Upper bounds, measured with `blorp/scripts/self-compile-cost PARENT CANDIDATE
 
 **The stack.** Landings 1 to 7 no longer promise to shrink the compiler or
 to leave it the same size: Keith dropped the promise of 0 or fewer on
-2026-11-24, when he accepted landing 2 at about +680. After landing 2 the
-estimate is about +400: landing 1's +651, landing 2's +747, landings 4 and 7
-at +395 by their estimates, and landings 5 and 6 removing about −1,395 if
-landing 6 reaches its −915. Additions have run 1.5 to 2.6 times their
+2026-11-24, when he accepted landing 2 at about +680. After landing 4 the
+estimate is about +300: landing 1's +651, landing 2's +747, landing 4's
++191, landing 7 at +110 by its estimate, and landings 5 and 6 removing about
+−1,395 if landing 6 reaches its −915. Additions have run 1.5 to 2.6 times their
 estimates, and the deferred fixes below count against it.
 The estimates predate main's body spacing rule, which lengthens the code
 landings 5 and 6 delete as well as the code the others add, so landing 5
@@ -875,9 +902,12 @@ The gates follow `blorp/AGENTS.md` ("Which gates a change runs"):
 - [x] **Landing 3:**
   - `bootstrap.env` pins a seed built from landing 2;
   - all three gates and the Seed job pass.
-- [ ] **Landing 4:**
-  - `grep -rn -E 'into_opaque|from_opaque|opaque type|resource type'
-    blorp/src blorp/standard_library` finds nothing;
+- [x] **Landing 4:**
+  - no opaque or resource type declaration and no conversion remains in
+    `src` or the library. The plan first asked for a grep of the four
+    spellings to find nothing, but the machinery itself names them in its
+    keywords, parser, formatter and messages until landings 5 and 6 delete
+    it;
   - the fixed-input C is byte-identical;
   - the own-source C differs only in the equality functions each commit
     lists, under a diff that ignores `blorp_f_N`;

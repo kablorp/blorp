@@ -45,8 +45,9 @@ done.
     (2026-11-24). Landing 2, destructuring, unions stored as their payload,
     and resource unions, +747 lines (2026-11-24). Landing 3, the rotation
     to `blorp-seed-aad181bcdc73`, so `src` and the library may use the new
-    forms (2026-11-25).
-  - **Next:** landing 4, migrating every opaque type. Waiting as follow-ups: the
+    forms (2026-11-25). Landing 4, every opaque type in `src` and the
+    library migrated, +191 lines (2026-11-25).
+  - **Next:** landing 5, deleting the conversions. Waiting as follow-ups: the
     deferred help and alias-destructuring fixes, memoized erasure, and the
     cost follow-ups the plan lists.
 - **UInt8 and Bytes:** [`UINT8_BYTES_PLAN.md`](UINT8_BYTES_PLAN.md).

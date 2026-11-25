@@ -17,7 +17,7 @@ A function earns its place when it does at least one of these:
 
 - names a concept that is used in more than one place;
 - is a recursion boundary or a unit you test directly;
-- hides a representation behind an opaque type;
+- hides a representation behind a union with a private variant;
 - is part of a module's public interface.
 
 If its name tells the reader no more than a comment would, delete it. Write
@@ -69,6 +69,6 @@ of [`blorp/README.md`](../blorp/README.md).
 
 ## Where these rules do not apply
 
-- Accessors and constructors of opaque types: they exist to hold the boundary.
+- Accessors and constructors of unions with a private variant: they exist to hold the boundary.
 - Test helpers.
 - A stage's public interface.
