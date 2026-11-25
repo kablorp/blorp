@@ -44,8 +44,10 @@ done.
     hand-written identity equalities are gone, −149 lines (2026-11-23).
     Landing 1, private variants and bare names when unambiguous, +651 lines
     (2026-11-24). Landing 2, destructuring, unions stored as their payload,
-    and resource unions, +747 lines (2026-11-24).
-  - **Next:** landing 3, the seed rotation. Waiting as follow-ups: the
+    and resource unions, +747 lines (2026-11-24). Landing 3, the rotation
+    to `blorp-seed-aad181bcdc73`, so `src` and the library may use the new
+    forms (2026-11-25).
+  - **Next:** landing 4, migrating every opaque type. Waiting as follow-ups: the
     deferred help and alias-destructuring fixes, memoized erasure, and the
     cost follow-ups the plan lists.
 - **UInt8 and Bytes:** [`UINT8_BYTES_PLAN.md`](UINT8_BYTES_PLAN.md).

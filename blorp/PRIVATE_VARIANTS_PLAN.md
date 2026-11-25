@@ -1,8 +1,8 @@
 # Private variants plan
 
-**Status: in progress, 2026-11-24.** Keith approved the design and asked for
-this plan, then started it with landing 0. Landings 0, 1 and 2 have landed;
-landing 3, the seed rotation, is next. Landing 0 belongs to [`EQUALITY_PLAN.md`](EQUALITY_PLAN.md),
+**Status: in progress, 2026-11-25.** Keith approved the design and asked for
+this plan, then started it with landing 0. Landings 0 to 3 have landed;
+landing 4, the migration, is next. Landing 0 belongs to [`EQUALITY_PLAN.md`](EQUALITY_PLAN.md),
 which records its results.
 
 **The direction.** Keith chose it in discussion:
@@ -570,6 +570,18 @@ delete. The seed rotates once.
    The rotation is judged by the `-O2` self-compile and the small compiles
    (`AUDIT_CLEANUP_PLAN.md`, change 6). If e2e instruction ceilings fail only
    through the rotation, the landing stops for Keith, as on 2026-11-18.
+   - **Results.** It landed on 2026-11-25. It pins `blorp-seed-aad181bcdc73`,
+     built from landing 2's commit.
+     - **Cost.** It was a plain rotation. `self-compile-cost b366e2a17
+       7776ec62f --rounds 9` showed the fixed-input allocations and peak heap
+       unchanged, instructions −0.04%, and the C identical.
+     - **Ceilings.** No e2e ceiling moved.
+     - **Gates.** The fixpoint proof and `test_bootstrap.sh` passed, and so
+       did the dispatched Seed job on all three targets (run 45671313877).
+       The first gate run failed only the intermittent `fs fold_lines` case,
+       which also failed on main's CI (run 45136016643) and has its own
+       session. A rerun of the e2e suite, `make -C blorp test-e2e
+       INSTRUCTION_CHECK=on`, passed.
 4. **Landing 4: migrate.** This covers `src`, the library, and the tests that use opaque
    types, as opposed to those that test them, area by area. The oracle:
    - **The fixed-input row's C is identical,** since it compiles the base's
@@ -860,7 +872,7 @@ The gates follow `blorp/AGENTS.md` ("Which gates a change runs"):
   - the stress fixture's allocations grow no worse than linearly;
   - the fixed-input C is byte-identical;
   - the ceilings hold, and the gates pass.
-- [ ] **Landing 3:**
+- [x] **Landing 3:**
   - `bootstrap.env` pins a seed built from landing 2;
   - all three gates and the Seed job pass.
 - [ ] **Landing 4:**
