@@ -24,7 +24,7 @@ MEMORY_RUNTIME: String =
         |#define BLORP_NOINLINE
         |#endif
         |#if BLORP_MEMORY_DIAGNOSTICS
-        |#include <pthread.h>
+        |#include <sched.h>
         |enum {BLORP_STRICT_LEAK_EXIT_STATUS=99};
         |union blorp_memory_header {max_align_t alignment;size_t requested;};
         |struct blorp_memory_counts {size_t allocations,releases,live,bytes;};
@@ -32,8 +32,12 @@ MEMORY_RUNTIME: String =
         |/* The most requested bytes live at once, without the header or the allocator's rounding, which vary by platform. Guarded by the lock.
         |   Not a fifth counts field: -O0 builds would then copy the counts through memcpy on every allocation and release. */
         |static size_t blorp_memory_peak_bytes;
-        |/* A mutex, not a spin lock: threads that allocate at once wait in the kernel instead of spinning on one cache line. */
-        |static pthread_mutex_t blorp_memory_lock=PTHREAD_MUTEX_INITIALIZER;
+        |/* A test-and-test-and-set lock. Taking it when it is free costs one exchange, as a spin lock does, where a pthread mutex costs
+        |   about 2.5% of a one-thread -O0 self-compile. A waiting thread reads the lock instead of writing it, so the holder keeps the
+        |   cache line, and after BLORP_MEMORY_LOCK_SPINS reads it yields the processor: four threads allocating at once took about half
+        |   the mutex's time, where a spin lock took three times as long (CONCURRENCY_PLAN.md, landing 1b). */
+        |static atomic_int blorp_memory_lock;
+        |enum {BLORP_MEMORY_LOCK_SPINS=100};
         |static int blorp_memory_strict;
         |static void blorp_memory_fail(const char *message){fputs(message,stderr);abort();}
         |static size_t blorp_memory_add(size_t left,size_t right){
@@ -44,8 +48,15 @@ MEMORY_RUNTIME: String =
         |if(right>left)blorp_memory_fail("error: target memory accounting underflow\n");
         |return left-right;
         |}
-        |static void blorp_memory_enter(void){if(pthread_mutex_lock(&blorp_memory_lock)!=0)blorp_memory_fail("error: target memory lock failed\n");}
-        |static void blorp_memory_leave(void){if(pthread_mutex_unlock(&blorp_memory_lock)!=0)blorp_memory_fail("error: target memory unlock failed\n");}
+        |static void blorp_memory_enter(void){
+        |while(atomic_exchange_explicit(&blorp_memory_lock,1,memory_order_acquire)){
+        |int spins=0;
+        |while(atomic_load_explicit(&blorp_memory_lock,memory_order_relaxed)){
+        |if(spins<BLORP_MEMORY_LOCK_SPINS){spins++;}else{sched_yield();}
+        |}
+        |}
+        |}
+        |static void blorp_memory_leave(void){atomic_store_explicit(&blorp_memory_lock,0,memory_order_release);}
         |#if defined(__APPLE__)&&defined(__has_include)
         |#if __has_include(<execinfo.h>)&&__has_include(<mach-o/dyld.h>)
         |#include <execinfo.h>
