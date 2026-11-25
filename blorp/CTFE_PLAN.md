@@ -176,9 +176,12 @@ with two gaps. Its estimates overlap.
 - **Specialization has one root.** It expands from `main` alone
   (`src/common/codegen/specialize/specialize.brp:5938`).
 - **Static-ish storage exists twice.**
-  - A string literal's site builds its String on first use, with a count that
-    starts at `BLORP_STRING_LITERAL_REFERENCES` (`SIZE_MAX/2`), so retain and
-    release need no special case (`src/common/codegen/runtime/string.brp:221-270`).
+  - A string literal's site builds its String on first use, published once
+    under a lock, with a count that starts at `BLORP_STRING_LITERAL_REFERENCES`,
+    the count's top bit. A normal build never writes that count again: retain
+    and release skip a String at or above the base. This is the literal section
+    of `src/common/codegen/runtime/string.brp`, after the concurrency plan's
+    landings 1 and 1b.
   - `[]` is one `const` root per layout, recognised by its address
     (`src/common/codegen/runtime/list.brp:287-296,358,372-374`).
 
@@ -825,6 +828,15 @@ adds syntax.
 - **What changes.** Each literal becomes a writable static String at the
   literal base. The lazy site, its first-use test and its first-use
   allocation go. Ownership is unchanged.
+- **What it inherits from the concurrency plan's landings 1 and 1b.**
+  - **A normal build** already skips a literal in retain and release, so a
+    static String at the base needs no change there, and could even be
+    `const`.
+  - **A diagnostics build** still counts literals, so the static String stays
+    writable there and each read still retains.
+  - **`blorp_string_literals_finish`** must stop releasing static objects.
+  - **The publish lock** goes with the lazy site. Keep the threaded literal
+    test, which then checks static literals.
 - **Oracle.** Every e2e fixture's output is unchanged. A compiler built from
   L1's own C writes the same C as L1's compiler.
 

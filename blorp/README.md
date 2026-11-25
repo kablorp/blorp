@@ -1773,7 +1773,9 @@ the output may already be new.
   value; counted records, Lists and Strings are counted heap objects.
 - A String literal is a static byte array plus a
   `struct blorp_string_literal_site`, from which the runtime makes the shared
-  String on first use, once even when threads race it.
+  String on first use, once even when threads race it. Its count starts at a
+  base with the top bit set; without memory diagnostics nothing writes it
+  again, since retain and release skip a String whose count is at or above it.
 - Floating-point contraction is off (`#pragma STDC FP_CONTRACT OFF` for Clang,
   GCC's `fp-contract=off` pragma), so each operation rounds separately.
 - A wrapper calls the entrypoint as `int main(void)` or

@@ -74,9 +74,32 @@ static int release_shared(int releases) {
 
 /* Each diagnostic mode releases the shared site's two evaluations this many times. */
 enum { BALANCED_RELEASES = 2, OVER_RELEASES = 3, UNDER_RELEASES = 1 };
+#else
+/* Without diagnostics no evaluation, retain or release writes a literal's
+ * count, however unbalanced, while any other String is still counted. */
+static int uncounted(void) {
+    enum { EVALUATIONS = 3, RETAINS = 2 };
+    static const unsigned char other_bytes[] = {'o', 't', 'h', 'e', 'r'};
+    static struct blorp_string_literal_site site;
+    struct blorp_string *literal = NULL;
+    for (int index = 0; index < EVALUATIONS; index++) literal = evaluate(&site, shared_bytes, sizeof shared_bytes);
+    assert(reference_count(literal) == BLORP_STRING_LITERAL_REFERENCES);
+    for (int index = 0; index < RETAINS; index++) blorp_string_retain(literal);
+    assert(reference_count(literal) == BLORP_STRING_LITERAL_REFERENCES);
+    for (int index = 0; index < EVALUATIONS + RETAINS + 1; index++) blorp_string_release(literal);
+    assert(reference_count(literal) == BLORP_STRING_LITERAL_REFERENCES);
+    struct blorp_string *made = blorp_string_from_bytes((const char *)other_bytes, (int64_t)sizeof other_bytes);
+    blorp_string_retain(made);
+    assert(reference_count(made) == 2);
+    blorp_string_release(made);
+    assert(reference_count(made) == 1);
+    blorp_string_release(made);
+    return blorp_memory_finish(blorp_string_literals_finish(0));
+}
 #endif
 
-/* "threaded_publish" runs in both memory modes; the others need diagnostics. */
+/* "threaded_publish" runs in both memory modes, "uncounted" only without
+ * diagnostics, and the others only with them. */
 int main(int argc, char **argv) {
     blorp_memory_start();
     assert(argc == 2);
@@ -86,6 +109,8 @@ int main(int argc, char **argv) {
     if (strcmp(mode, "balanced") == 0) return release_shared(BALANCED_RELEASES);
     if (strcmp(mode, "over_release") == 0) return release_shared(OVER_RELEASES);
     if (strcmp(mode, "under_release") == 0) return release_shared(UNDER_RELEASES);
+#else
+    if (strcmp(mode, "uncounted") == 0) return uncounted();
 #endif
     return 2;
 }

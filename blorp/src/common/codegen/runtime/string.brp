@@ -197,7 +197,24 @@ pure func string_runtime() -> String:
         |*result=blorp_string_from_counted_bytes(bytes,length,1);
         |return (uint8_t)1;
         |}
+        |/* A literal's String is shared by every evaluation of its site and lives for
+        | * the whole run. Its count starts at this base, the count's top bit, so one
+        | * bit test finds it, and no other String's count reaches it: no program
+        | * holds half the address space
+        | * in references. So copy-on-write copies a literal and release never frees
+        | * one. Diagnostic builds count each live reference above the base, for
+        | * blorp_string_literals_finish to check. Normal builds never write the
+        | * count again, so threads that share a literal never write its cache line:
+        | * the site does not retain, and retain and release skip an uncounted
+        | * String, one whose count is at or above the base. */
+        |#define BLORP_STRING_LITERAL_REFERENCES (SIZE_MAX/2+1)
+        |#if BLORP_MEMORY_DIAGNOSTICS
+        |#define blorp_string_is_uncounted(value) 0
+        |#else
+        |#define blorp_string_is_uncounted(value) (atomic_load_explicit(&(value)->references,memory_order_relaxed)>=BLORP_STRING_LITERAL_REFERENCES)
+        |#endif
         |void blorp_string_retain(struct blorp_string *value) {
+        |if(blorp_string_is_uncounted(value)){return;}
         |atomic_fetch_add_explicit(&value->references,1,memory_order_relaxed);
         |}
         |#if BLORP_MEMORY_DIAGNOSTICS
@@ -213,20 +230,26 @@ pure func string_runtime() -> String:
         |#else
         |#define blorp_string_check_code_points(value) ((void)0)
         |#endif
-        |void blorp_string_release(struct blorp_string *value) {
+        |/* Drops one count, and frees the String if it was the last. A normal build
+        | * keeps this out of line, so that its release inlines as the uncounted test
+        | * and a call: no larger than this decrement and its call to free, so the
+        | * emitted drop helpers that inline a release still inline where they are
+        | * used (CONCURRENCY_PLAN.md, landing 1b). Diagnostics count every String,
+        | * so there this is the whole release. */
+        |BLORP_NOINLINE void blorp_string_release_counted(struct blorp_string *value) {
         |if(atomic_fetch_sub_explicit(&value->references,1,memory_order_acq_rel)==1){
         |blorp_string_check_code_points(value);
         |blorp_memory_release(value);
         |}
         |}
-        |/* A literal's String is shared by every evaluation of its site and lives for
-        | * the whole run. Its count starts at this base and each live reference adds
-        | * one; no program holds half the address space in references, so the count
-        | * never reaches 1 (copy-on-write copies) or 0 (release frees) and never
-        | * overflows. Retain, release and uniqueness tests need no special case.
-        | * Skipping a literal's count is deferred to CONCURRENCY_PLAN.md, landing
-        | * 1b: its test in retain and release defeated drop-helper inlining. */
-        |#define BLORP_STRING_LITERAL_REFERENCES (SIZE_MAX/2)
+        |#if BLORP_MEMORY_DIAGNOSTICS
+        |#define blorp_string_release blorp_string_release_counted
+        |#else
+        |void blorp_string_release(struct blorp_string *value) {
+        |if(blorp_string_is_uncounted(value)){return;}
+        |blorp_string_release_counted(value);
+        |}
+        |#endif
         |/* One per emitted literal site, zero-initialized: no String yet. */
         |struct blorp_string_literal_site {
         |_Atomic(struct blorp_string *) value;
@@ -263,7 +286,11 @@ pure func string_runtime() -> String:
         |struct blorp_string *blorp_string_literal(struct blorp_string_literal_site *site,const char *bytes,int64_t length) {
         |struct blorp_string *value=atomic_load_explicit(&site->value,memory_order_acquire);
         |if(value==NULL){value=blorp_string_literal_publish(site,bytes,length);}
+        |/* A normal build would skip this retain anyway; leaving it out saves that
+        | * test on every evaluation. */
+        |#if BLORP_MEMORY_DIAGNOSTICS
         |blorp_string_retain(value);
+        |#endif
         |return value;
         |}
         |#if BLORP_MEMORY_DIAGNOSTICS
