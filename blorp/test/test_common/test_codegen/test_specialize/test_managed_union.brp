@@ -202,6 +202,116 @@ func test_phantom_string_argument_creates_no_stored_obligation() -> Bool:
                     False
 
 
+-- Outer reaches Inner only through Tag's argument, which Tag never stores, so
+-- no layout on the cycle owns anything. A second variant keeps each union a
+-- tagged layout of its own, whatever single-payload unions become.
+private PHANTOM_CYCLE: String =
+    |union Tag[T]:
+    |	Marked(Int)
+    |	Unmarked
+    |union Outer:
+    |	Wrap(Tag[Inner])
+    |	Bare
+    |union Inner:
+    |	Hold(Outer)
+    |	Loose
+    |pure func keep_outer(value: Outer) -> Int:
+    |	0
+    |pure func keep_inner(value: Inner) -> Int:
+    |	0
+    |pure func keep_tag(value: Tag[Inner]) -> Int:
+    |	0
+    |
+
+
+private pure func every_layout_plain(layouts: List[specialized.ConcreteUnion]) -> Bool:
+    var plain: Bool = True
+
+    for layout in layouts:
+        match layout:
+            specialized.PlainCases(_): void
+            specialized.OwningCases(_) | specialized.BoxedCases(_): plain = False
+
+    plain
+
+
+-- Whether `main` specializes to `count` unions, none of which owns anything.
+private func specializes_plain(main: String, count: Int) -> Bool:
+    match specialized_source(PHANTOM_CYCLE + main):
+        Err(error): report(error)
+        Ok(program): (program.unions.length() == count).and(program.unions.every_layout_plain())
+
+
+-- Building Outer first prepares Inner while Outer is still in progress, so
+-- Inner's payload is read before Outer's payloads are known.
+func test_a_cycle_through_a_phantom_argument_owns_nothing_whichever_layout_comes_first() -> Bool:
+    outer_first: String =
+        |func main() -> Int:
+        |	keep_outer(Wrap(Marked(2)))
+        |
+
+    inner_first: String =
+        |func main() -> Int:
+        |	keep_inner(Hold(Wrap(Marked(2))))
+        |
+
+    tag_first: String =
+        |func main() -> Int:
+        |	keep_tag(Marked(2))
+        |
+
+    specializes_plain(outer_first, 3)
+        .and(specializes_plain(inner_first, 3))
+        .and(specializes_plain(tag_first, 3))
+
+
+-- Middle is first read as owning while Root is in progress; once Root is
+-- plain, Middle is, and so is Leaf, which holds Middle.
+func test_a_union_holding_a_union_on_a_phantom_cycle_is_plain() -> Bool:
+    source: String =
+        |union Tag[T]:
+        |	Marked(Int)
+        |	Unmarked
+        |union Root:
+        |	Grow(Tag[Middle])
+        |	Seed
+        |union Middle:
+        |	Join(Root, Tag[Leaf])
+        |union Leaf:
+        |	Hang(Middle)
+        |	Fall
+        |pure func keep(value: Root) -> Int:
+        |	0
+        |func main() -> Int:
+        |	keep(Grow(Marked(1)))
+        |
+
+    match specialized_source(source):
+        Err(error): report(error)
+        Ok(program): (program.unions.length() == 5).and(program.unions.every_layout_plain())
+
+
+-- Wrapped is an inline record, so Holder, which holds it, owns nothing.
+func test_a_union_holding_a_record_on_a_phantom_cycle_is_plain() -> Bool:
+    source: String =
+        |union Tag[T]:
+        |	Marked(Int)
+        |	Unmarked
+        |record Wrapped { tag: Tag[Holder] }
+        |union Holder:
+        |	Hold(Wrapped)
+        |	Empty
+        |pure func keep(value: Wrapped) -> Int:
+        |	0
+        |func main() -> Int:
+        |	keep({ tag = Marked(1) })
+        |
+
+    match specialized_source(source):
+        Err(error): report(error)
+        Ok(program): (program.unions.length() == 2).and(program.unions.every_layout_plain())
+
+
 TESTS: TestSuite = {
     description = "Blorp managed union specialization",
     tests = [
@@ -220,6 +330,18 @@ TESTS: TestSuite = {
         (
             "phantom String argument creates no stored obligation",
             test_phantom_string_argument_creates_no_stored_obligation
+        ),
+        (
+            "a cycle through a phantom argument owns nothing whichever layout comes first",
+            test_a_cycle_through_a_phantom_argument_owns_nothing_whichever_layout_comes_first
+        ),
+        (
+            "a union holding a union on a phantom cycle is plain",
+            test_a_union_holding_a_union_on_a_phantom_cycle_is_plain
+        ),
+        (
+            "a union holding a record on a phantom cycle is plain",
+            test_a_union_holding_a_record_on_a_phantom_cycle_is_plain
         )
     ]
 }
