@@ -40,6 +40,7 @@ import:
             WhereKeyword
         ),
         Comment,
+        CompletionHole,
         LexFailure,
         LexedProgram,
         Spacing(Adjacent, Spaced),
@@ -92,7 +93,8 @@ import:
             InterpolationOpen,
             InterpolationClose,
             StringEnd,
-            CharLiteral
+            CharLiteral,
+            CompletionHoleToken
         ),
         StringForm(QuotedStringForm, PipeStringForm),
         UTF8_CONTINUATION_END,
@@ -101,6 +103,8 @@ import:
 
 
 -- The bytes being lexed and the source identity of every span made from them.
+-- A completion hole travels apart, to the scans that place it, so this record,
+-- which every byte test receives, stays two words.
 private record SourceText {
     origin: SourceId,
     bytes: String
@@ -471,6 +475,25 @@ private pure func token(text: SourceText, kind: TokenKind, start: Int, end: Int)
         Adjacent
 
     { kind = kind, span = { source = text.origin, start = start, end = end }, spacing = spacing }
+
+
+-- The completion hole, when it starts at `position`.
+private pure func hole_at(
+    completion_hole: Option[CompletionHole],
+    position: Int
+) -> Option[CompletionHole]:
+    match completion_hole:
+        Some(hole):
+            if hole.start == position:
+                completion_hole
+            else:
+                None
+        None:
+            None
+
+
+private pure func completion_hole_token(text: SourceText, hole: CompletionHole) -> ScannedToken:
+    ReadyToken(token(text, CompletionHoleToken, hole.start, hole.end))
 
 
 private pure func symbol(text: SourceText, value: Symbol, start: Int, end: Int) -> Token:
@@ -1082,7 +1105,8 @@ private pure func literal_or_symbol(text: SourceText, cursor: Int) -> Result[Tok
 -- Quoted/Char tokens are scanned atomically, so their braces cannot close it.
 private pure func interpolation_tokens(
     text: SourceText,
-    opening: Int
+    opening: Int,
+    completion_hole: Option[CompletionHole]
 ) -> Result[ScannedCode, Diagnostic]:
     var tokens: List[ScannedToken] = [
         ReadyToken(token(text, InterpolationOpen, opening, opening + 2))
@@ -1090,50 +1114,66 @@ private pure func interpolation_tokens(
 
     var scan: Result[Int, Diagnostic] = Ok(opening + 2)
     var braces = 0
+    var waiting = completion_hole
 
     while True:
         match scan:
             Err(_):
                 break
             Ok(cursor):
-                if (cursor == text.bytes.length()).or(text.byte_is(cursor, ASCII_LF)):
-                    scan = Err(error_at(text, opening, opening + 2, UNCLOSED_INTERPOLATION))
-                else if text.byte_is(cursor, ASCII_SPACE):
-                    scan = Ok(cursor + 1)
-                else if text.comment_starts(cursor):
-                    scan = text.code_comment_end(tokens.last(), cursor)
-                else if (
-                    text
-                        .byte_is(cursor, ASCII_RIGHT_BRACE)
-                        .and(braces == 0)
-                ):
-                    end = cursor + 1
-                    tokens = tokens.append(ReadyToken(token(text, InterpolationClose, cursor, end)))
-                    scan = Ok(end)
-                    break
-                else:
-                    scan = match text.code_token(cursor):
-                        Err(error):
-                            Err(error)
-                        Ok(scanned):
-                            tokens = tokens.append(scanned)
+                -- An empty hole ends where it starts, so the next turn scans on.
+                match hole_at(waiting, cursor):
+                    Some(hole):
+                        tokens = tokens.append(text.completion_hole_token(hole))
+                        waiting = None
+                        scan = Ok(hole.end)
+                    None:
+                        if (cursor == text.bytes.length()).or(text.byte_is(cursor, ASCII_LF)):
+                            scan = Err(error_at(text, opening, opening + 2, UNCLOSED_INTERPOLATION))
+                        else if text.byte_is(cursor, ASCII_SPACE):
+                            scan = Ok(cursor + 1)
+                        else if text.comment_starts(cursor):
+                            scan = text.code_comment_end(tokens.last(), cursor)
+                        else if (
+                            text
+                                .byte_is(cursor, ASCII_RIGHT_BRACE)
+                                .and(braces == 0)
+                        ):
+                            end = cursor + 1
 
-                            match scanned:
-                                WordToken(_, _, end, _):
-                                    Ok(end)
-                                ReadyToken(ready):
-                                    match ready.kind:
-                                        SymbolToken(LeftBrace): braces = braces + 1
-                                        SymbolToken(RightBrace): braces = braces - 1
-                                        _: void
+                            tokens = tokens.append(
+                                ReadyToken(token(text, InterpolationClose, cursor, end))
+                            )
 
-                                    Ok(ready.span.end)
+                            scan = Ok(end)
+                            break
+                        else:
+                            scan = match text.code_token(cursor):
+                                Err(error):
+                                    Err(error)
+                                Ok(scanned):
+                                    tokens = tokens.append(scanned)
+
+                                    match scanned:
+                                        WordToken(_, _, end, _):
+                                            Ok(end)
+                                        ReadyToken(ready):
+                                            match ready.kind:
+                                                SymbolToken(LeftBrace): braces = braces + 1
+                                                SymbolToken(RightBrace): braces = braces - 1
+                                                _: void
+
+                                            Ok(ready.span.end)
 
     end ?= scan
     Ok({ tokens = tokens, end = end })
 
 
-private pure func quoted_tokens(text: SourceText, opening: Int) -> Result[ScannedCode, Diagnostic]:
+private pure func quoted_tokens(
+    text: SourceText,
+    opening: Int,
+    completion_hole: Option[CompletionHole]
+) -> Result[ScannedCode, Diagnostic]:
     contents = opening + 1
     var scan: Result[Int, Diagnostic] = Ok(contents)
     var start = contents
@@ -1188,7 +1228,7 @@ private pure func quoted_tokens(text: SourceText, opening: Int) -> Result[Scanne
                             ReadyToken(token(text, StringSegment(bytes), start, cursor))
                         )
 
-                    scan = match text.interpolation_tokens(cursor):
+                    scan = match text.interpolation_tokens(cursor, completion_hole):
                         Err(error):
                             Err(error)
                         Ok(hole):
@@ -1364,7 +1404,11 @@ private pure func line_prefix(text: SourceText, start: Int) -> LinePrefix:
 
 -- Skips blank, whitespace-only and comment-only lines from the line at `start`
 -- to the next code line, with its indentation level and the comments skipped.
-private pure func next_code_line(text: SourceText, start: Int) -> SkippedLines:
+private pure func next_code_line(
+    text: SourceText,
+    start: Int,
+    completion_hole: Option[CompletionHole]
+) -> SkippedLines:
     -- One Result carries the line past trivia lines, or the first error.
     var scan: Result[LinePrefix, Diagnostic] = Ok(text.line_prefix(start))
     var skipped: List[Comment] = []
@@ -1378,6 +1422,10 @@ private pure func next_code_line(text: SourceText, start: Int) -> SkippedLines:
                         .or(text.comment_starts(line.end))
                         .not()
                 ):
+                    break
+
+                -- A blank line is a code line when the completion hole starts it.
+                if hole_at(completion_hole, line.end).is_some():
                     break
 
                 starts_doc_block = if line.start == line.end:
@@ -1408,7 +1456,7 @@ private pure func next_code_line(text: SourceText, start: Int) -> SkippedLines:
 
     line: Result[CodeLine, Diagnostic] = match scan:
         Ok(prefix):
-            if prefix.end == end:
+            if (prefix.end == end).and(hole_at(completion_hole, end).is_none()):
                 Ok({ prefix = { start = end, end = end }, level = 0 })
             else:
                 match text.indentation_level(prefix):
@@ -1574,7 +1622,8 @@ private pure func pipe_block(
 -- and code tokens retain original source offsets rather than joined offsets.
 private pure func pipe_tokens(
     text: SourceText,
-    first: LinePrefix
+    first: LinePrefix,
+    completion_hole: Option[CompletionHole]
 ) -> Result[ScannedCode, Diagnostic]:
     contents = first.end + 1
     var scan: Result[Int, Diagnostic] = Ok(contents)
@@ -1633,7 +1682,7 @@ private pure func pipe_tokens(
 
                                 prefix = []
 
-                            scan = match text.interpolation_tokens(stop):
+                            scan = match text.interpolation_tokens(stop, completion_hole):
                                 Err(error):
                                     Err(error)
                                 Ok(hole):
@@ -1706,9 +1755,13 @@ private union LineCode:
 
 -- The code of the line with `prefix`: a pipe String starts at a `|` first on
 -- the line, on any line including a continuation line inside brackets.
-private pure func line_code(text: SourceText, prefix: LinePrefix) -> Result[LineCode, Diagnostic]:
+private pure func line_code(
+    text: SourceText,
+    prefix: LinePrefix,
+    completion_hole: Option[CompletionHole]
+) -> Result[LineCode, Diagnostic]:
     if text.byte_is(prefix.end, ASCII_BAR):
-        match text.pipe_tokens(prefix):
+        match text.pipe_tokens(prefix, completion_hole):
             Ok(block): Ok(PipeLine(block))
             Err(error): Err(error)
     else:
@@ -1897,7 +1950,8 @@ private pure func lexed_program(
         comments = comments,
         end = { source = text.origin, start = text.bytes.length(), end = text.bytes.length() },
         base_names = names,
-        names = interned.names
+        names = interned.names,
+        completion_hole = None
     }
 
     match missing:
@@ -1923,7 +1977,62 @@ pure func lex(
     source: String,
     names: NameTable
 ) -> Result[LexedProgram, LexFailure]:
+    lex_text({ origin = origin, bytes = source }, names, None)
+
+
+-- Lexes `source` as `lex` does, with `hole` lexed as one completion hole
+-- token in place of its bytes. The hole must be empty or a whole word, and start
+-- where a token can: at a line's code, after a token, or in an interpolation.
+pure func lex_with_completion_hole(
+    origin: SourceId,
+    source: String,
+    names: NameTable,
+    hole: CompletionHole
+) -> Result[LexedProgram, Diagnostic]:
     text: SourceText = { origin = origin, bytes = source }
+
+    word = (hole.start == hole.end).or(
+        text
+            .byte_in(hole.start, IdentifierStart)
+            .and(text.run_end(hole.start, IdentifierByte) == hole.end)
+    )
+
+    _: Void ?= if (
+        (0 <= hole.start)
+            .and(hole.end <= source.length())
+            .and(word)
+    ):
+        Ok(void)
+    else:
+        Err(internal_error(compiler_span(), "the completion hole is not a word"))
+
+    lexed ?= text
+        .lex_text(names, Some(hole))
+        .map_err(pure func(failure): failure.error)
+
+    var position = 0
+    var at: Option[Int] = None
+
+    for lexed_token in lexed.tokens:
+        match lexed_token.kind:
+            CompletionHoleToken:
+                at = Some(position)
+                break
+            _:
+                position = position + 1
+
+    if at.is_some():
+        Ok({ lexed | completion_hole = at })
+    else:
+        Err(internal_error(compiler_span(), "the completion hole is not where a token can start"))
+
+
+private pure func lex_text(
+    text: SourceText,
+    names: NameTable,
+    completion_hole: Option[CompletionHole]
+) -> Result[LexedProgram, LexFailure]:
+    source = text.bytes
     var tokens: List[ScannedToken] = []
     var comments: List[Comment] = []
     -- The open indentation levels, innermost last; host `levels`.
@@ -1931,8 +2040,17 @@ pure func lex(
     -- Bracket depth and the open bracketed blocks persist across code lines.
     var brackets: Int = 0
     var bodies: List[BracketedBlock] = []
+    -- Where a line's scan stops: the end of the source, or first the completion
+    -- hole's start while the hole waits to be lexed. The scans still take the
+    -- hole once it is placed: each starts past it, so it never matches again.
+    var pending: Option[CompletionHole] = completion_hole
+
+    var stop: Int = match completion_hole:
+        Some(hole): hole.start
+        None: source.length()
+
     -- One Result carries each code line to lay out, or the first error.
-    first = text.next_code_line(0)
+    first = text.next_code_line(0, completion_hole)
     var lines: Result[CodeLine, Diagnostic] = first.line
 
     for item in first.comments:
@@ -1975,11 +2093,17 @@ pure func lex(
 
                     bodies = bodies.blocks_open_below(target)
 
-                if line.prefix.end == source.length():
-                    break
+                -- Only the end of the source starts a line there, and it ends
+                -- the scan unless the completion hole waits there.
+                if line.prefix.start == source.length():
+                    if pending.is_none():
+                        break
 
                 -- One Result carries the cursor across the line to its LF or EOF, or the first error.
-                var code: Result[Int, Diagnostic] = match text.line_code(line.prefix):
+                var code: Result[Int, Diagnostic] = match text.line_code(
+                    line.prefix,
+                    completion_hole
+                ):
                     Ok(PipeLine(pipe)):
                         for item in pipe.tokens:
                             tokens = tokens.append(item)
@@ -1994,111 +2118,137 @@ pure func lex(
                 var last_colon: Bool = False
 
                 while True:
-                    match code:
-                        Ok(cursor):
-                            if cursor == source.length():
-                                break
+                    while True:
+                        match code:
+                            Ok(cursor):
+                                if cursor >= stop:
+                                    break
 
-                            -- A LF ends the code line at depth zero, when it opens a
-                            -- bracketed block, or when it is inside the one open at
-                            -- this depth; any other LF inside brackets is trivia.
-                            line_ends: Bool = if (
-                                text
-                                    .byte_is(cursor, ASCII_LF)
-                                    .not()
-                            ):
-                                False
-                            else if brackets == 0:
-                                True
-                            else if brackets.opens_bracketed_block(last_colon, bodies):
-                                bodies = bodies.append({
-                                    group = brackets,
-                                    base = levels.top_level()
-                                })
-
-                                True
-                            else:
-                                brackets
-                                    .insignificant_break(bodies)
-                                    .not()
-
-                            if line_ends:
-                                break
-
-                            code = if text.byte_is(cursor, ASCII_LF):
-                                -- A continuation line inside brackets: its indentation is
-                                -- trivia, a column-1 fence is an error, and its code may be
-                                -- a pipe String as on any line.
-                                continued = text.line_prefix(cursor + 1)
-
-                                bracketed_doc_block = if continued.start == continued.end:
-                                    text.fence_at(continued.end)
-                                else:
+                                -- A LF ends the code line at depth zero, when it opens a
+                                -- bracketed block, or when it is inside the one open at
+                                -- this depth; any other LF inside brackets is trivia.
+                                line_ends: Bool = if (
+                                    text
+                                        .byte_is(cursor, ASCII_LF)
+                                        .not()
+                                ):
                                     False
+                                else if brackets == 0:
+                                    True
+                                else if brackets.opens_bracketed_block(last_colon, bodies):
+                                    bodies = bodies.append({
+                                        group = brackets,
+                                        base = levels.top_level()
+                                    })
 
-                                if bracketed_doc_block:
-                                    Err(
-                                        error_at(
-                                            text,
-                                            continued.end,
-                                            continued.end + DOC_FENCE_WIDTH,
-                                            DOC_BLOCK_IN_BRACKETS
-                                        )
-                                    )
+                                    True
                                 else:
-                                    match text.line_code(continued):
-                                        Ok(PipeLine(pipe)):
-                                            for item in pipe.tokens:
+                                    brackets
+                                        .insignificant_break(bodies)
+                                        .not()
+
+                                if line_ends:
+                                    break
+
+                                code = if text.byte_is(cursor, ASCII_LF):
+                                    -- A continuation line inside brackets: its indentation is
+                                    -- trivia, a column-1 fence is an error, and its code may be
+                                    -- a pipe String as on any line.
+                                    continued = text.line_prefix(cursor + 1)
+
+                                    bracketed_doc_block = if continued.start == continued.end:
+                                        text.fence_at(continued.end)
+                                    else:
+                                        False
+
+                                    if bracketed_doc_block:
+                                        Err(
+                                            error_at(
+                                                text,
+                                                continued.end,
+                                                continued.end + DOC_FENCE_WIDTH,
+                                                DOC_BLOCK_IN_BRACKETS
+                                            )
+                                        )
+                                    else:
+                                        match text.line_code(continued, completion_hole):
+                                            Ok(PipeLine(pipe)):
+                                                for item in pipe.tokens:
+                                                    tokens = tokens.append(item)
+
+                                                last_colon = False
+                                                Ok(pipe.end)
+                                            Ok(OrdinaryCode):
+                                                Ok(continued.end)
+                                            Err(error):
+                                                Err(error)
+                                else if text.byte_is(cursor, ASCII_SPACE):
+                                    Ok(cursor + 1)
+                                else if text.comment_starts(cursor):
+                                    match text.code_comment_end(tokens.last(), cursor):
+                                        Ok(end):
+                                            comments = comments.append(
+                                                text.comment(cursor, end, False)
+                                            )
+
+                                            Ok(end)
+                                        Err(error):
+                                            Err(error)
+                                else if text.byte_is(cursor, ASCII_DOUBLE_QUOTE):
+                                    match text.quoted_tokens(cursor, completion_hole):
+                                        Err(error):
+                                            Err(error)
+                                        Ok(quoted):
+                                            for item in quoted.tokens:
                                                 tokens = tokens.append(item)
 
                                             last_colon = False
-                                            Ok(pipe.end)
-                                        Ok(OrdinaryCode):
-                                            Ok(continued.end)
+                                            Ok(quoted.end)
+                                else:
+                                    match text.code_token(cursor):
+                                        Ok(scanned):
+                                            tokens = tokens.append(scanned)
+
+                                            match scanned:
+                                                WordToken(_, _, end, _):
+                                                    last_colon = False
+                                                    Ok(end)
+                                                ReadyToken(ready):
+                                                    brackets = brackets.bracket_depth(ready.kind)
+                                                    last_colon = ready.kind.is_colon()
+                                                    Ok(ready.span.end)
                                         Err(error):
                                             Err(error)
-                            else if text.byte_is(cursor, ASCII_SPACE):
-                                Ok(cursor + 1)
-                            else if text.comment_starts(cursor):
-                                match text.code_comment_end(tokens.last(), cursor):
-                                    Ok(end):
-                                        comments = comments.append(text.comment(cursor, end, False))
-                                        Ok(end)
-                                    Err(error):
-                                        Err(error)
-                            else if text.byte_is(cursor, ASCII_DOUBLE_QUOTE):
-                                match text.quoted_tokens(cursor):
-                                    Err(error):
-                                        Err(error)
-                                    Ok(quoted):
-                                        for item in quoted.tokens:
-                                            tokens = tokens.append(item)
+                            Err(_):
+                                break
 
-                                        last_colon = False
-                                        Ok(quoted.end)
-                            else:
-                                match text.code_token(cursor):
-                                    Ok(scanned):
-                                        tokens = tokens.append(scanned)
-
-                                        match scanned:
-                                            WordToken(_, _, end, _):
-                                                last_colon = False
-                                                Ok(end)
-                                            ReadyToken(ready):
-                                                brackets = brackets.bracket_depth(ready.kind)
-                                                last_colon = ready.kind.is_colon()
-                                                Ok(ready.span.end)
-                                    Err(error):
-                                        Err(error)
-                        Err(_):
+                    -- The scan stopped where the line or the source ends, or, in a probe,
+                    -- at the completion hole's start. There it lexes the hole, unless a
+                    -- token held that byte, and scans on. Compilation has no hole, so
+                    -- this runs once per line, not once per token.
+                    match pending:
+                        None:
                             break
+                        Some(hole):
+                            match code:
+                                Ok(cursor):
+                                    if cursor < stop:
+                                        break
+
+                                    pending = None
+                                    stop = source.length()
+
+                                    if cursor == hole.start:
+                                        tokens = tokens.append(text.completion_hole_token(hole))
+                                        code = Ok(hole.end)
+                                Err(_):
+                                    break
 
                 lines = match code:
                     Ok(line_end):
                         next = (line_end + 1).min(source.length())
                         tokens = tokens.append(ReadyToken(symbol(text, Newline, line_end, next)))
-                        following = text.next_code_line(next)
+                        following = text.next_code_line(next, completion_hole)
 
                         for item in following.comments:
                             comments = comments.append(item)

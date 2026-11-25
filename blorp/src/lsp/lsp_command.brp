@@ -22,18 +22,20 @@ import:
     ../common/cli/report: kind_status
     ../common/cli/usage: error_message, unknown_option
     ../common/syntax/syntax: Diagnostic, compiler_span, internal_error
+    ./completion: ProbeOutcome(Faulted, Reached, Stopped), probe_hole, probe_outcome
     ./protocol:
         FramingError(HeaderUnfinished, LineUnreadable, BodyUnreadable),
         content_length,
         framed
     ./server:
         EXIT_ABANDONED,
-        Followup(Idle, Analyse, ReadSaved),
+        Followup(Idle, Analyse, ReadSaved, Probe),
         Server,
         Step,
         analysed,
         document_analysis,
         exit_status,
+        probed,
         receive_body,
         reverted,
         snapshots,
@@ -118,9 +120,9 @@ private func read_message() -> Result[Option[Bytes], FramingError]:
                 .map(pure func(body: Bytes): Some(body))
 
 
--- Writes the step's replies, then does what it asks: analyses a root, with the
--- open documents as snapshots, or reads a closed document's saved text, and
--- performs the step that follows.
+-- Writes the step's replies, then does what it asks: analyses a root, or probes
+-- it for a completion, with the open documents as snapshots, or reads a closed
+-- document's saved text, and performs the step that follows.
 private func perform(step: Step) -> Server:
     for reply in step.replies:
         write(framed(reply))
@@ -132,7 +134,7 @@ private func perform(step: Step) -> Server:
         Analyse(request):
             loaded = request.root
                 .to_string()
-                .load_program_with_sources(ANALYSED_LIBRARY, step.server.snapshots())
+                .load_program_with_sources(ANALYSED_LIBRARY, step.server.snapshots(), None)
 
             step.server
                 .analysed(request, document_analysis(loaded))
@@ -146,6 +148,26 @@ private func perform(step: Step) -> Server:
 
             step.server
                 .reverted(path, saved)
+                .perform()
+        Probe(request):
+            loaded = request.root
+                .to_string()
+                .load_program_with_sources(
+                    ANALYSED_LIBRARY,
+                    step.server.snapshots(),
+                    Some(request.site.probe_hole())
+                )
+
+            outcome = loaded.probe_outcome()
+
+            -- A fault in blorp is reported, as `serve` reports one; the editor
+            -- still gets the fallback.
+            match outcome:
+                Faulted(fault): print_error(error_message(fault.message, fault.help))
+                Reached(_, _) | Stopped: void
+
+            step.server
+                .probed(request, outcome)
                 .perform()
 
 

@@ -10,8 +10,9 @@ Microsoft's language client
 - diagnostics;
 - Go to Definition, into the standard library too;
 - Find All References;
-- completion of the names a module can write and its keywords, and after a dot
-  the names of a module alias or the variants of a union.
+- completion of the locals and parameters at the cursor, the names a module
+  can write and its keywords, and after a dot a value's fields and calls, the
+  names of a module alias or the variants of a union.
 
 Library files open read-only under `blorp-library:` URIs, with their colours.
 Editors built on VS Code, such as VSCodium or Cursor, run the extension the
@@ -65,8 +66,11 @@ server", apply:
 
 - definitions inside a library file go nowhere, since a library file gets
   colours only;
-- completion does not offer a value's members, such as the functions after
-  `name.`, nor the locals and parameters at the cursor;
+- completion offers no locals and no members where checking stops before
+  the cursor, as it does at an error earlier in the same function;
+- inside a pure lambda or a concurrent task, completion may offer a resource
+  or, in a task, a scoped callable that the closure may not capture, and its
+  members; compiling reports it;
 - uses in a module that imports the open file are not found.
 
 ## Test
@@ -88,6 +92,11 @@ and extensions folders, and a VS Code window opens while it runs. It checks:
   `print` and `match`;
 - completion after `Option.` while the file does not check, which lists
   `None` and `Some`;
+- completion on a blank line of a body, which lists a parameter and an
+  earlier local before the module's functions;
+- typing `name.` on a new line in the middle of a pure function, where `name`
+  is a `String`, which lists `length` as the snippet `length($0)` and no
+  `print` call;
 - a diagnostic, with its message and range;
 - a restart when the server path changes, also after a failed start.
 

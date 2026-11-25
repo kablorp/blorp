@@ -1,0 +1,567 @@
+import:
+    bool: and
+    list: join
+    test: TestSuite
+    ../../../../src/common/analysis/assemble: parsed_contents
+    ../../../../src/common/analysis/check/check: analyze_completion
+    ../../../../src/common/analysis/check/completion_facts: CompletionFacts(NameFacts, MemberFacts)
+    ../../../../src/common/analysis/check/errors: completion_hole_reached
+    ../../../../src/common/analysis/check/render: render_check_error, render_failure
+    ../../../../src/common/analysis/load/load:
+        LibrarySource(LibraryDirectory),
+        SourceLoadFailure(LoadingFailed),
+        load_program_with_sources
+    ../../../../src/common/syntax/names: NameId, NameTable, name_spelling
+    ../../../../src/common/syntax/syntax: DiagnosticKind(CompilerFault), compiler_span
+
+
+-- Each probe's root is an unsaved file; the library is the one on disk.
+private LIBRARY_ROOT: String = "blorp/standard_library"
+
+
+private ROOT: String = "build/completion-probe/main.brp"
+
+
+-- `@` marks the cursor in a probe's text; the hole is the identifier prefix
+-- before it. No probe text needs an `@` of its own.
+private CURSOR: UInt8 = 64
+
+
+private pure func is_word_byte(byte: UInt8) -> Bool:
+    (byte >= 97)
+        .and(byte <= 122)
+        .or((byte >= 65).and(byte <= 90))
+        .or((byte >= 48).and(byte <= 57))
+        .or(byte == 95)
+
+
+private pure func spelled(names: NameTable, id: NameId) -> String:
+    names
+        .name_spelling(id)
+        .get_or("?")
+
+
+-- What the probe of `marked` found: the visible locals as `locals: a, b`, the
+-- receiver's members one per entry (`length` or `field x`), or
+-- the first diagnostic that stopped it.
+private func probe(marked: String) -> List[String]:
+    var cursor = 0
+
+    while (
+        marked
+            .byte_at(cursor)
+            .get_or(CURSOR)
+        != CURSOR
+    ):
+        cursor = cursor + 1
+
+    text = (
+        marked
+            .slice(0, cursor)
+            .get_or("")
+        + marked
+            .slice(cursor + 1, marked.length())
+            .get_or("")
+    )
+
+    var start = cursor
+
+    while (
+        text
+            .byte_at(start - 1)
+            .get_or(0)
+            .is_word_byte()
+    ):
+        start = start - 1
+
+    match load_program_with_sources(
+        ROOT,
+        LibraryDirectory(LIBRARY_ROOT),
+        [{ path = ROOT, contents = text }],
+        Some({ start = start, end = cursor })
+    ):
+        Err(LoadingFailed(failure)):
+            ["stopped: ${failure.diagnostic.message}"]
+        Err(_):
+            ["the path was refused"]
+        Ok(loaded):
+            names = loaded.program.parsed_contents().names
+
+            match analyze_completion(loaded.program):
+                Err(failure):
+                    ["stopped: ${render_failure(failure).first.message}"]
+                Ok(NameFacts(visible)):
+                    [
+                        (
+                            "locals: "
+                            + visible.locals
+                                .map(pure func(name): names.spelled(name))
+                                .join(", ")
+                        )
+                    ]
+                Ok(MemberFacts(members)):
+                    members.fields
+                        .map(pure func(name): "field ${names.spelled(name)}")
+                        .concat(members.calls.map(pure func(name): names.spelled(name)))
+
+
+func test_a_dot_on_a_line_in_the_middle_of_a_body_offers_the_receiver_members() -> Bool:
+    members = probe(
+        |func main():
+        |    name = "abc"
+        |    name.le@
+        |    print(name)
+        |
+    )
+
+    members
+        .contains("length")
+        .and(members.contains("to_string"))
+
+
+func test_join_is_offered_on_a_list_of_strings_and_not_on_a_list_of_ints() -> Bool:
+    words = probe("func main():\n    words = [\"a\"]\n    print(words.@)\n")
+    numbers = probe("func main():\n    numbers = [1]\n    print(numbers.@)\n")
+
+    words
+        .contains("join")
+        .and(
+            numbers
+                .contains("join")
+                .not()
+        )
+        .and(numbers.contains("length"))
+
+
+func test_a_typed_result_offers_members_before_its_type_is_compared() -> Bool:
+    probe("pure func size(name: String) -> Int:\n    name.@\n\nfunc main():\n    print(\"x\")\n").contains(
+        "length"
+    )
+
+
+func test_an_argument_condition_scrutinee_and_annotated_binding_offer_members() -> Bool:
+    argument = probe("func main():\n    items = [1]\n    print(items.@)\n")
+
+    condition = probe(
+        "func main():\n    items = [1]\n    if items.@:\n        print(\"x\")\n    print(\"y\")\n"
+    )
+
+    scrutinee = probe(
+        |func main():
+        |    items = [1]
+        |    match items.@:
+        |        True: print("x")
+        |        False: print("y")
+        |
+    )
+
+    annotated = probe("func main():\n    items = [1]\n    n: Int = items.@\n    print(\"x\")\n")
+    [argument, condition, scrutinee, annotated].all(pure func(found): found.contains("is_empty"))
+
+
+func test_a_record_offers_its_fields() -> Bool:
+    probe(
+        |record Point {
+        |    x: Int
+        |}
+        |
+        |
+        |func main():
+        |    p: Point = { x = 1 }
+        |    print(p.@)
+        |
+    ).contains("field x")
+
+
+func test_a_lambda_body_offers_the_parameter_members() -> Bool:
+    probe(
+        |func main():
+        |    items = ["a"]
+        |    sizes = items.map(pure func(x): x.@)
+        |    print("x")
+        |
+    ).contains("length")
+
+
+func test_a_name_hole_sees_parameters_and_earlier_locals_only() -> Bool:
+    (
+        probe(
+            |pure func size(text: String, extra: Int) -> Int:
+            |    first = 1
+            |    second = @
+            |    third = 3
+            |    first
+            |
+            |
+            |func main():
+            |    print("x")
+            |
+        )
+        == ["locals: first, text, extra"]
+    )
+
+
+func test_a_name_hole_on_a_blank_line_sees_the_earlier_locals() -> Bool:
+    probe("func main():\n    name = \"abc\"\n    @\n    print(name)\n") == ["locals: name"]
+
+
+func test_a_match_capture_is_visible_only_inside_its_arm() -> Bool:
+    inside = probe(
+        |func main():
+        |    value: Option[String] = None
+        |    match value:
+        |        Some(inner): print(@)
+        |        None: print("none")
+        |
+    )
+
+    after = probe(
+        |func main():
+        |    value: Option[String] = None
+        |    match value:
+        |        Some(inner): print(inner)
+        |        None: print("none")
+        |    print(@)
+        |
+    )
+
+    (inside == ["locals: value, inner"]).and(after == ["locals: value"])
+
+
+func test_a_loop_item_is_visible_only_inside_its_loop() -> Bool:
+    inside = probe("func main():\n    for item in [\"a\"]:\n        print(@)\n    print(\"x\")\n")
+    after = probe("func main():\n    for item in [\"a\"]:\n        print(item)\n    print(@)\n")
+    (inside == ["locals: item"]).and(after == ["locals: "])
+
+
+func test_a_lambda_sees_its_parameters_and_the_enclosing_immutable_bindings() -> Bool:
+    (
+        probe(
+            |func main():
+            |    var count = 0
+            |    limit = 3
+            |    count = count + limit
+            |    sizes = [1].map(pure func(x: Int) -> Int: x + @)
+            |    print("x")
+            |
+        )
+        == ["locals: limit, x"]
+    )
+
+
+func test_the_body_with_the_hole_is_checked_before_an_earlier_broken_body() -> Bool:
+    probe(
+        |func broken():
+        |    missing()
+        |
+        |
+        |func main():
+        |    name = "a"
+        |    name.@
+        |
+    ).contains("length")
+
+
+func test_an_error_before_the_hole_stops_the_probe() -> Bool:
+    (
+        probe("func main():\n    x = missing\n    name = \"a\"\n    name.@\n")
+        == ["stopped: unknown value"]
+    )
+
+
+-- More of the places a member is typed: a bound value used later, the last
+-- line of a Void function, a chain after a typed lambda, an interpolation, a
+-- `for` iterable and an untyped lambda's parameter.
+func test_more_places_offer_the_receiver_members() -> Bool:
+    [
+        probe("func main():\n    items = [1]\n    n = items.@\n    print(n + 1)\n"),
+        probe("func helper():\n    name = \"a\"\n    name.@\n\n\nfunc main():\n    helper()\n"),
+        probe("func main():\n    [1].map(pure func(x: Int) -> Int: x + 1).@\n"),
+        probe("func main():\n    items = [1]\n    print(\"$" + "{items.@}\")\n"),
+        probe("func main():\n    for x in [1].@:\n        print(\"x\")\n    print(\"y\")\n"),
+        probe("func main():\n    sizes = [\"a\"].map(pure func(x): x.@)\n    print(\"x\")\n")
+    ].all(pure func(found): found.contains("length"))
+
+
+-- A bounded function's receiver must meet its bound: Int is Orderable and a
+-- record without an implementation is not.
+func test_a_bounded_function_is_offered_only_where_its_bound_holds() -> Bool:
+    number = probe("func main():\n    n = 1\n    print(n.@)\n")
+
+    point = probe(
+        "record Point {\n    x: Int\n}\n\n\nfunc main():\n    p: Point = { x = 1 }\n    print(p.@)\n"
+    )
+
+    number
+        .contains("max")
+        .and(number.contains("min"))
+        .and(
+            point
+                .contains("max")
+                .not()
+        )
+        .and(point.contains("field x"))
+
+
+-- A lambda in the receiver fixes the receiver's type, so it is checked before
+-- the members are read: an identity map of a List[Int] is a List[Int].
+func test_a_lambda_in_the_receiver_is_checked_before_its_members_are_read() -> Bool:
+    found = probe("func main():\n    [1].map(pure func(x): x).@\n")
+
+    found
+        .contains("length")
+        .and(found.contains("equals"))
+        .and(
+            found
+                .contains("join")
+                .not()
+        )
+
+
+-- A receiver whose type is still unsolved offers no call: whether checking
+-- accepts one depends on the part that is not known.
+func test_a_receiver_still_unsolved_offers_no_call() -> Bool:
+    probe("pure func nothing[T]() -> List[T]:\n    []\n\n\nfunc main():\n    nothing().@\n").is_empty()
+
+
+-- Shout's method is impure, as `print` is.
+private SHOUT: String =
+    |trait Shout:
+    |    func shout(value: Self) -> Void
+    |
+    |
+    |implements Shout for String:
+    |    func shout(value: Self) -> Void:
+    |        print(value)
+    |
+    |
+
+
+-- A pure body cannot call an impure function or trait method, so it is
+-- offered none; a pure lambda inside an impure body is pure too.
+func test_a_pure_body_is_offered_no_impure_call() -> Bool:
+    pure_body = probe(
+        (
+            SHOUT
+            + "pure func size(name: String) -> Int:\n    name.@\n\n\nfunc main():\n    print(\"x\")\n"
+        )
+    )
+
+    lambda_body = probe(
+        "func main():\n    sizes = [\"a\"].map(pure func(x): x.@)\n    print(\"x\")\n"
+    )
+
+    impure_body = probe(
+        SHOUT + "func yell(name: String):\n    name.@\n\n\nfunc main():\n    print(\"x\")\n"
+    )
+
+    and(
+        and(
+            and(
+                pure_body.contains("length"),
+                pure_body
+                    .contains("print")
+                    .not()
+            ),
+            and(
+                pure_body
+                    .contains("shout")
+                    .not(),
+                lambda_body
+                    .contains("print")
+                    .not()
+            )
+        ),
+        and(impure_body.contains("print"), impure_body.contains("shout"))
+    )
+
+
+-- The annotation fixes the record literal's type, so the field's value is
+-- checked where it is written.
+func test_a_literal_whose_type_its_annotation_fixes_offers_its_field_values_members() -> Bool:
+    probe(
+        |record Point {
+        |    x: Int
+        |}
+        |
+        |
+        |func main():
+        |    point: Point = { x = "abc".@ }
+        |    print("x")
+        |
+    ).contains("length")
+
+
+func test_a_type_parameter_offers_the_methods_of_its_bounds() -> Bool:
+    probe(
+        "pure func show[T: Stringable](value: T) -> String:\n    value.@\n\n\nfunc main():\n    print(\"x\")\n"
+    ).contains("to_string")
+
+
+-- An implementation's method and a trait's default hold the hole too.
+func test_a_method_and_a_default_with_the_hole_are_checked_first() -> Bool:
+    method = probe(
+        |func broken():
+        |    missing()
+        |
+        |
+        |record Box {
+        |    value: Int
+        |}
+        |
+        |
+        |implements Stringable for Box:
+        |    pure func to_string(box: Self) -> String:
+        |        box.@
+        |
+        |
+        |func main():
+        |    print("x")
+        |
+    )
+
+    default = probe(
+        |func broken():
+        |    missing()
+        |
+        |
+        |trait Named:
+        |    pure func name(value: Self) -> String
+        |    pure func shout(value: Self) -> String:
+        |        value.@
+        |
+        |
+        |func main():
+        |    print("x")
+        |
+    )
+
+    method
+        .contains("field value")
+        .and(default.contains("name"))
+
+
+-- The hole covers the whole word, so a call already written after it parses.
+func test_a_word_already_called_is_the_hole() -> Bool:
+    member = probe("func main():\n    name = \"a\"\n    name.length@()\n")
+    named = probe("func main():\n    name = \"a\"\n    print@(name)\n")
+
+    member
+        .contains("length")
+        .and(named == ["locals: name"])
+
+
+func test_where_checking_stops_before_the_hole() -> Bool:
+    and(
+        (
+            probe("func main():\n    items = []\n    items.@\n")
+            == ["stopped: cannot infer the element type of an empty list literal"]
+        ),
+        (
+            probe("LIMIT: Int = @\n\n\nfunc main():\n    print(\"x\")\n")
+            == ["stopped: constant initializer is not a closed value"]
+        )
+    )
+
+
+func test_rendering_a_reached_hole_is_a_compiler_fault() -> Bool:
+    match load_program_with_sources(
+        ROOT,
+        LibraryDirectory(LIBRARY_ROOT),
+        [{ path = ROOT, contents = "func main():\n    \n" }],
+        Some({ start = 17, end = 17 })
+    ):
+        Ok(loaded):
+            rendered = loaded.program.render_check_error(
+                completion_hole_reached(compiler_span(), MemberFacts({ fields = [], calls = [] }))
+            )
+
+            fault: Bool = match rendered.kind:
+                CompilerFault: True
+                _: False
+
+            fault.and(rendered.message == "a completion hole reached rendering")
+        Err(_):
+            False
+
+
+TESTS: TestSuite = {
+    description = "completion probes",
+    tests = [
+        (
+            "a dot on a line in the middle of a body offers the receiver's members",
+            test_a_dot_on_a_line_in_the_middle_of_a_body_offers_the_receiver_members
+        ),
+        (
+            "join is offered on a List[String] and not on a List[Int]",
+            test_join_is_offered_on_a_list_of_strings_and_not_on_a_list_of_ints
+        ),
+        (
+            "a typed result offers members before its type is compared",
+            test_a_typed_result_offers_members_before_its_type_is_compared
+        ),
+        (
+            "an argument, condition, scrutinee and annotated binding offer members",
+            test_an_argument_condition_scrutinee_and_annotated_binding_offer_members
+        ),
+        ("a record offers its fields", test_a_record_offers_its_fields),
+        (
+            "a lambda body offers the parameter's members",
+            test_a_lambda_body_offers_the_parameter_members
+        ),
+        (
+            "a name hole sees parameters and earlier locals only",
+            test_a_name_hole_sees_parameters_and_earlier_locals_only
+        ),
+        (
+            "a name hole on a blank line sees the earlier locals",
+            test_a_name_hole_on_a_blank_line_sees_the_earlier_locals
+        ),
+        (
+            "a match capture is visible only inside its arm",
+            test_a_match_capture_is_visible_only_inside_its_arm
+        ),
+        (
+            "a loop item is visible only inside its loop",
+            test_a_loop_item_is_visible_only_inside_its_loop
+        ),
+        (
+            "a lambda sees its parameters and the enclosing immutable bindings",
+            test_a_lambda_sees_its_parameters_and_the_enclosing_immutable_bindings
+        ),
+        (
+            "the body with the hole is checked before an earlier broken body",
+            test_the_body_with_the_hole_is_checked_before_an_earlier_broken_body
+        ),
+        ("an error before the hole stops the probe", test_an_error_before_the_hole_stops_the_probe),
+        ("more places offer the receiver's members", test_more_places_offer_the_receiver_members),
+        (
+            "a bounded function is offered only where its bound holds",
+            test_a_bounded_function_is_offered_only_where_its_bound_holds
+        ),
+        (
+            "a lambda in the receiver is checked before its members are read",
+            test_a_lambda_in_the_receiver_is_checked_before_its_members_are_read
+        ),
+        ("a receiver still unsolved offers no call", test_a_receiver_still_unsolved_offers_no_call),
+        ("a pure body is offered no impure call", test_a_pure_body_is_offered_no_impure_call),
+        (
+            "a literal whose type its annotation fixes offers its field value's members",
+            test_a_literal_whose_type_its_annotation_fixes_offers_its_field_values_members
+        ),
+        (
+            "a type parameter offers the methods of its bounds",
+            test_a_type_parameter_offers_the_methods_of_its_bounds
+        ),
+        (
+            "a method and a default with the hole are checked first",
+            test_a_method_and_a_default_with_the_hole_are_checked_first
+        ),
+        ("a word already called is the hole", test_a_word_already_called_is_the_hole),
+        ("where checking stops before the hole", test_where_checking_stops_before_the_hole),
+        (
+            "rendering a reached hole is a compiler fault",
+            test_rendering_a_reached_hole_is_a_compiler_fault
+        )
+    ]
+}

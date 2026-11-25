@@ -1,0 +1,125 @@
+import:
+    test: TestSuite
+    ../../../../src/common/syntax/lex: lex, lex_with_completion_hole
+    ../../../../src/common/syntax/names: program_names
+    ../../../../src/common/syntax/source: module_source, root_module_id
+    ./test_lex: program_trace
+
+
+-- The tokens of `source` lexed with the hole from `start` to `end`, with the
+-- hole's token index; or the error's message.
+private pure func holed(source: String, start: Int, end: Int) -> String:
+    match lex_with_completion_hole(module_source(root_module_id()), source, program_names().names, {
+        start = start,
+        end = end
+    }):
+        Err(error):
+            "error: " + error.message
+        Ok(program):
+            index = match program.completion_hole:
+                Some(position): "${position}"
+                None: "none"
+
+            "hole=${index}\n${program.program_trace()}"
+
+
+pure func test_a_hole_replaces_the_prefix_after_a_dot() -> Bool:
+    holed("a.le\n", 2, 4) == "hole=2\nname=a@0:1\n.@1:2\ncompletion-hole@2:4\nLF@4:5\nEOF@5:5"
+
+
+pure func test_an_empty_hole_after_a_dot_ends_its_line() -> Bool:
+    holed("a.\n", 2, 2) == "hole=2\nname=a@0:1\n.@1:2\ncompletion-hole@2:2\nLF@2:3\nEOF@3:3"
+
+
+pure func test_an_empty_hole_between_brackets() -> Bool:
+    holed("f()\n", 2, 2) == "hole=2\nname=f@0:1\n(@1:2\ncompletion-hole@2:2\n)@2:3\nLF@3:4\nEOF@4:4"
+
+
+pure func test_a_hole_makes_a_blank_line_a_code_line_at_its_indentation() -> Bool:
+    expected = "hole=6\nname=a@0:1\n:@1:2\nLF@2:3\nINDENT@3:7\nname=b@7:8\nLF@8:9\ncompletion-hole@13:13\nLF@13:14\nname=c@18:19\nLF@19:20\nDEDENT@20:20\nEOF@20:20"
+    holed("a:\n    b\n    \n    c\n", 13, 13) == expected
+
+
+pure func test_a_hole_on_a_last_line_without_a_line_feed() -> Bool:
+    expected = "hole=4\nname=a@0:1\n:@1:2\nLF@2:3\nINDENT@3:7\ncompletion-hole@7:7\nLF@7:7\nDEDENT@7:7\nEOF@7:7"
+    holed("a:\n    ", 7, 7) == expected
+
+
+pure func test_a_hole_on_an_empty_last_line() -> Bool:
+    holed("a\n", 2, 2) == "hole=2\nname=a@0:1\nLF@1:2\ncompletion-hole@2:2\nLF@2:2\nEOF@2:2"
+
+
+pure func test_a_hole_inside_an_interpolation() -> Bool:
+    expected = "hole=4\nstring-start@0:1\nhole-open@1:3\nname=a@3:4\n.@4:5\ncompletion-hole@5:5\nhole-close@5:6\nstring-end@6:7\nLF@7:8\nEOF@8:8"
+    holed("\"$" + "{a.}\"\n", 5, 5) == expected
+
+
+pure func test_a_hole_in_a_comment_is_rejected() -> Bool:
+    (
+        holed("-- a\nb\n", 3, 3)
+        == "error: internal compiler error: the completion hole is not where a token can start"
+    )
+
+
+pure func test_a_hole_inside_a_word_is_rejected() -> Bool:
+    (
+        holed("abc\n", 1, 1)
+        == "error: internal compiler error: the completion hole is not where a token can start"
+    )
+
+
+-- A hole is a whole word inside the text, or empty.
+pure func test_a_hole_over_other_bytes_is_rejected() -> Bool:
+    [holed("f(b)\n", 1, 3), holed("abc\n", 0, 2), holed("ab", 5, 5)].all(
+        pure func(found: String) -> Bool: (
+            found
+            == "error: internal compiler error: the completion hole is not a word"
+        )
+    )
+
+
+pure func test_a_hole_over_a_whole_word_leaves_what_follows_it() -> Bool:
+    expected = "hole=2\nname=a@0:1\n.@1:2\ncompletion-hole@2:8\n(@8:9\n)@9:10\nLF@10:11\nEOF@11:11"
+    holed("a.length()\n", 2, 8) == expected
+
+
+pure func test_a_hole_that_ends_before_it_starts_is_rejected() -> Bool:
+    holed("abc\n", 2, 1) == "error: internal compiler error: the completion hole is not a word"
+
+
+pure func test_lexing_without_a_hole_makes_none() -> Bool:
+    match lex(module_source(root_module_id()), "a.\n", program_names().names):
+        Ok(program): program.completion_hole.is_none()
+        Err(_): False
+
+
+TESTS: TestSuite = {
+    description = "lexing a completion hole",
+    tests = [
+        ("a hole replaces the prefix after a dot", test_a_hole_replaces_the_prefix_after_a_dot),
+        ("an empty hole after a dot ends its line", test_an_empty_hole_after_a_dot_ends_its_line),
+        ("an empty hole between brackets", test_an_empty_hole_between_brackets),
+        (
+            "a hole makes a blank line a code line at its indentation",
+            test_a_hole_makes_a_blank_line_a_code_line_at_its_indentation
+        ),
+        (
+            "a hole on a last line without a line feed",
+            test_a_hole_on_a_last_line_without_a_line_feed
+        ),
+        ("a hole on an empty last line", test_a_hole_on_an_empty_last_line),
+        ("a hole inside an interpolation", test_a_hole_inside_an_interpolation),
+        ("a hole in a comment is rejected", test_a_hole_in_a_comment_is_rejected),
+        ("a hole inside a word is rejected", test_a_hole_inside_a_word_is_rejected),
+        ("a hole over other bytes is rejected", test_a_hole_over_other_bytes_is_rejected),
+        (
+            "a hole over a whole word leaves what follows it",
+            test_a_hole_over_a_whole_word_leaves_what_follows_it
+        ),
+        (
+            "a hole that ends before it starts is rejected",
+            test_a_hole_that_ends_before_it_starts_is_rejected
+        ),
+        ("lexing without a hole makes none", test_lexing_without_a_hole_makes_none)
+    ]
+}

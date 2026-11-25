@@ -8,7 +8,7 @@ import:
     -- directory by Make and never tracked, so a library edit shows once in a diff.
     -- Build it first with `make -C blorp compiler`.
     ../../../../build/generated/embedded_library: EMBEDDED_LIBRARY_PATHS, embedded_library_file
-    ../../syntax/lex: lex
+    ../../syntax/lex: lex, lex_with_completion_hole
     ../../syntax/names: NameId, NameTable
     ../../syntax/parse:
         ParsedModule,
@@ -35,6 +35,7 @@ import:
         module_id,
         root_module_id
     ../../syntax/syntax:
+        CompletionHole,
         Diagnostic,
         Span,
         compiler_span,
@@ -549,6 +550,8 @@ private func read_module(
 private record LoadState {
     layout: LibraryLayout,
     overrides: SourceOverrides,
+    -- The root's completion hole, when the load is an editor's probe.
+    completion_hole: Option[CompletionHole],
     root_path: String,
     requests: List[RequestedModule],
     assembly: ParsedAssembly,
@@ -669,9 +672,17 @@ private func link_module(
     current: RequestedModule,
     contents: String
 ) -> Result[LoadState, Diagnostic]:
-    lexed ?= lex(current.id.module_source(), contents, state.assembly.assembly_names()).map_err(
-        pure func(rejected): rejected.error
-    )
+    origin = current.id.module_source()
+    names = state.assembly.assembly_names()
+
+    hole = if current.id == root_module_id():
+        state.completion_hole
+    else:
+        None
+
+    lexed ?= match hole:
+        Some(root_hole): lex_with_completion_hole(origin, contents, names, root_hole)
+        None: lex(origin, contents, names).map_err(pure func(rejected): rejected.error)
 
     parsed ?= lexed.parse_module(current.id)
 
@@ -869,7 +880,7 @@ pure func working_directory_result(
 func load_program(root_path: String, library: LibrarySource) -> Result[LoadedProgram, LoadFailure]:
     root ?= usable_root(root_path)
     directory ?= get_current_directory().working_directory_result()
-    root_path.load_input(root, library, ApplicationInput, directory, no_source_overrides())
+    root_path.load_input(root, library, ApplicationInput, directory, no_source_overrides(), None)
 
 
 func load_test_program(
@@ -885,7 +896,8 @@ func load_test_program(
         library,
         TestSuiteInput(grouped_paths),
         directory,
-        no_source_overrides()
+        no_source_overrides(),
+        None
     )
 
 
@@ -966,10 +978,14 @@ private pure func source_overrides(
     Ok(SourceOverrides.Init(admitted))
 
 
+-- Loads `root_path` with `sources` in place of the disk's text. With a
+-- `completion_hole`, the load is an editor's completion probe: the root's text
+-- is lexed with that hole.
 func load_program_with_sources(
     root_path: String,
     library: LibrarySource,
-    sources: List[SourceFile]
+    sources: List[SourceFile],
+    completion_hole: Option[CompletionHole]
 ) -> Result[LoadedProgram, SourceLoadFailure]:
     root ?= written_path(root_path)
 
@@ -979,7 +995,14 @@ func load_program_with_sources(
 
     overrides ?= directory.source_overrides(sources)
 
-    match root_path.load_input(root, library, ApplicationInput, directory, overrides):
+    match root_path.load_input(
+        root,
+        library,
+        ApplicationInput,
+        directory,
+        overrides,
+        completion_hole
+    ):
         Ok(loaded): Ok(loaded)
         Err(error): Err(LoadingFailed(error))
 
@@ -1033,7 +1056,8 @@ private func load_input(
     library: LibrarySource,
     mode: LoadMode,
     working_directory: Path,
-    overrides: SourceOverrides
+    overrides: SourceOverrides,
+    completion_hole: Option[CompletionHole]
 ) -> Result[LoadedProgram, LoadFailure]:
     layout ?= library_layout(library, working_directory).map_err(
         pure func(error: PathError) -> LoadFailure: unusable_path(LIBRARY_ROOT_NAME, error)
@@ -1084,6 +1108,7 @@ private func load_input(
     initial ?= load_queue({
         layout = layout,
         overrides = overrides,
+        completion_hole = completion_hole,
         root_path = root_path,
         requests = designated_inputs.concat(later),
         assembly = begin_program(),

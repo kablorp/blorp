@@ -1,13 +1,24 @@
 ---
 Completion: what may be written at a position of the root's text. The lexer's
 tokens around the cursor say what is being written, and the analysis's
-namespace says which names the module can write there. Pure: the server
-renders the items' ranges.
+namespace says which names the module can write there. A value's members and
+the locals come from a completion probe: the editor's text checked up to a
+hole at the cursor. Pure: the transport runs the probe, and the server renders
+the items' ranges.
 ---
 import:
     bool: and, not, or
     json: Json(Number, Object, Text), integer
-    ../common/analysis/check/check: Analysis, analysis_names, analysis_namespace, variant_names
+    ../common/analysis/assemble: parsed_contents
+    ../common/analysis/check/check:
+        Analysis,
+        analysis_names,
+        analysis_namespace,
+        analyze_completion,
+        variant_names
+    ../common/analysis/check/completion_facts: CompletionFacts(NameFacts, MemberFacts)
+    ../common/analysis/check/render: render_failure
+    ../common/analysis/load/load: LoadedProgram, SourceLoadFailure(LoadingFailed)
     ../common/analysis/namespace/namespace:
         Entity(Alias, Constant, Constructor, Function, Method, Trait, Type),
         Entry,
@@ -19,11 +30,14 @@ import:
         named_type,
         named_value,
         offered_entries
-    ../common/syntax/lex: lex
-    ../common/syntax/names: NameTable, name_number, name_spellings
+    ../common/syntax/lex: lex, lex_with_completion_hole
+    ../common/syntax/names: NameId, NameTable, name_number, name_spellings, program_names
     ../common/syntax/source: module_source, root_module_id
     ../common/syntax/syntax:
         Comment,
+        CompletionHole,
+        Diagnostic,
+        DiagnosticKind(CompilerFault),
         Keyword(
             AsKeyword,
             ForKeyword,
@@ -38,7 +52,7 @@ import:
         LexedProgram,
         Span,
         Spacing(Adjacent),
-        Symbol(Dedent, Dot, Indent, Newline),
+        Symbol(Dedent, Dot, Indent, LeftParen, Newline),
         Token,
         TokenKind(
             IdentifierToken,
@@ -54,7 +68,9 @@ import:
             StringEnd,
             CharLiteral
         ),
-        WrittenName
+        WrittenName,
+        compiler_span,
+        internal_error
 
 
 -- What the editor's text says is being written at the cursor, read from its
@@ -64,20 +80,42 @@ union CompletionSite:
     -- block, after a word that declares a new name, or at or past where
     -- lexing stopped.
     NoCompletion
-    -- A name. The span is the prefix an item replaces: the part before the
-    -- cursor of the identifier or keyword the cursor is in or ends, else empty
-    -- at the cursor.
-    NameSite(Span)
+    NameSite(Prefix)
     -- A member, after a `.`.
     MemberSite(MemberAt)
+
+
+-- The prefix an item replaces: the part before the cursor of the identifier
+-- or keyword the cursor is in or ends, else empty at the cursor. A probe's
+-- hole covers the whole word, to `word_end`, so no rest of it is left to parse.
+fixed record Prefix {
+    span: Span,
+    word_end: Int
+}
 
 
 record MemberAt {
     -- The identifier written against the dot's left, if there is one: an
     -- alias, a union or a value, as the namespace says.
     qualifier: Option[WrittenName],
-    prefix: Span
+    prefix: Prefix,
+    -- Whether an argument list already follows the word, as in `name.le()`.
+    called: Bool
 }
+
+
+-- A site that a probe of the editor's text answers: a name, whose locals it
+-- finds, or a value's member.
+union ProbedSite:
+    ProbedName(Prefix)
+    ProbedMember(MemberAt)
+
+
+-- What answers a completion: the analysis alone, or a probe.
+union CompletionPlan:
+    -- Nothing completes, or an alias's or a type's members, from the analysis.
+    Answered(Option[Completion])
+    Probing(ProbedSite)
 
 
 -- What a site allows: the items, each replacing `prefix`.
@@ -87,35 +125,45 @@ record Completion {
 }
 
 
--- One item: the label it shows and inserts, its kind and its rank.
+-- One item: the label it shows and inserts, its kind and its rank. A member
+-- call inserts the call, since `x.f` without parentheses reads a field.
 record Offered {
     label: String,
     kind: CompletionKind,
-    rank: ItemRank
+    rank: ItemRank,
+    inserts_call: Bool
 }
 
 
 -- Where an offered name comes from, nearest first. An item's sortText leads
 -- with its rank's digit, then its label, so the order is total.
 union ItemRank:
+    LocalRank
     DeclaredRank
     ImportedRank
     ProvidedRank
     KeywordRank
 
 
+-- The protocol's InsertTextFormat.Snippet.
+private SNIPPET_TEXT_FORMAT: Int = 2
+
+
 private pure func rank_digit(rank: ItemRank) -> String:
     match rank:
+        LocalRank: "0"
         DeclaredRank: "1"
         ImportedRank: "2"
         ProvidedRank: "3"
         KeywordRank: "4"
 
 
--- The protocol's CompletionItemKind of each item 17a offers.
+-- The protocol's CompletionItemKind of each item offered.
 union CompletionKind:
     MethodItem
     FunctionItem
+    FieldItem
+    VariableItem
     ClassItem
     InterfaceItem
     ModuleItem
@@ -131,6 +179,8 @@ private pure func kind_number(kind: CompletionKind) -> Int:
     match kind:
         MethodItem: 2
         FunctionItem: 3
+        FieldItem: 5
+        VariableItem: 6
         ClassItem: 7
         InterfaceItem: 8
         ModuleItem: 9
@@ -172,61 +222,207 @@ private OFFERED_KEYWORDS: List[String] = [
 ]
 
 
--- What may be written at `offset` of `text`, the root as the editor shows it,
--- from `analysis`, the root's latest analysis that checked. None where nothing
--- completes.
-pure func completion(text: String, offset: Int, analysis: Analysis) -> Option[Completion]:
-    namespace = analysis.analysis_namespace()
-    names = analysis.analysis_names()
-    -- Spelled once: `name_spelling` copies the table's keys per call.
-    spellings = names.name_spellings()
-    root = root_module_id()
+-- What answers a completion at `offset` of `text`, the root as the editor
+-- shows it, given `analysis`, the root's latest that checked, if any. A
+-- qualifier the analysis names as an alias or a type is answered from it; a
+-- name, and any other member, waits for a probe.
+pure func completion_plan(text: String, offset: Int, analysis: Option[Analysis]) -> CompletionPlan:
+    names = match analysis:
+        Some(checked): checked.analysis_names()
+        None: program_names().names
 
     match text.completion_site(names, offset):
         NoCompletion:
-            None
+            Answered(None)
         NameSite(prefix):
+            text.probing(names, ProbedName(prefix))
+        MemberSite(member):
+            qualified: Option[List[Offered]] = match (analysis, member.qualifier):
+                (Some(checked), Some(qualifier)): checked.qualified_items(qualifier.id)
+                _: None
+
+            match qualified:
+                Some(items): Answered(Some({ prefix = member.prefix.span, items = items }))
+                None: text.probing(names, ProbedMember(member))
+
+
+-- A probe of `site`, where the lexer places its hole: it is the one judge of
+-- that. It reads a line's indentation, a symbol and a pipe String whole, so it
+-- refuses a hole inside them, and nothing completes there.
+private pure func probing(text: String, names: NameTable, site: ProbedSite) -> CompletionPlan:
+    match lex_with_completion_hole(module_source(root_module_id()), text, names, site.probe_hole()):
+        Err(refused):
+            match refused.kind:
+                CompilerFault: Answered(None)
+                _: Probing(site)
+        Ok(_):
+            Probing(site)
+
+
+-- What follows `alias.` or `Type.`: the names the module offers, a union's
+-- variants, or nothing for another type. None for a qualifier that is neither.
+private pure func qualified_items(analysis: Analysis, qualifier: NameId) -> Option[List[Offered]]:
+    namespace = analysis.analysis_namespace()
+
+    -- Spelled once: `name_spelling` copies the table's keys per call.
+    spellings = analysis
+        .analysis_names()
+        .name_spellings()
+
+    root = root_module_id()
+
+    match namespace.named_value(root, qualifier):
+        Some(NamedAlias(aliased)):
+            Some(
+                namespace
+                    .offered_entries(aliased.target)
+                    .scope_items(spellings)
+            )
+        _:
+            match namespace.named_type(root, qualifier):
+                Some(named):
+                    match named.head:
+                        UnionHead(id):
+                            Some(
+                                analysis
+                                    .variant_names(id, root)
+                                    .map(pure func(variant: WrittenName) -> NameId: variant.id)
+                                    .named_items(spellings, EnumMemberItem, DeclaredRank, False)
+                            )
+                        _:
+                            Some([])
+                None:
+                    None
+
+
+-- The hole a probe of `site` lexes: the whole word at the cursor, or nothing.
+pure func probe_hole(site: ProbedSite) -> CompletionHole:
+    prefix = match site:
+        ProbedName(written): written
+        ProbedMember(member): member.prefix
+
+    { start = prefix.span.start, end = prefix.word_end }
+
+
+-- What a probe found. A probe stops at an error in the program and leaves the
+-- fallbacks; a fault in blorp leaves them too, and the transport reports it.
+union ProbeOutcome:
+    -- The facts at the hole, and the probe's names that spell them.
+    Reached(CompletionFacts, List[String])
+    Stopped
+    Faulted(Diagnostic)
+
+
+-- What checking `loaded`, a probe, found at its hole.
+pure func probe_outcome(loaded: Result[LoadedProgram, SourceLoadFailure]) -> ProbeOutcome:
+    match loaded:
+        Ok(probe):
+            match analyze_completion(probe.program):
+                Ok(facts):
+                    names = probe.program.parsed_contents().names
+                    Reached(facts, names.name_spellings())
+                Err(failure):
+                    render_failure(failure).first.stop_or_fault()
+        Err(LoadingFailed(failure)):
+            failure.diagnostic.stop_or_fault()
+        -- The server names every path the probe loads.
+        Err(_):
+            Faulted(
+                internal_error(
+                    compiler_span(),
+                    "the language server gave a probe an unusable path"
+                )
+            )
+
+
+private pure func stop_or_fault(diagnostic: Diagnostic) -> ProbeOutcome:
+    match diagnostic.kind:
+        CompilerFault: Faulted(diagnostic)
+        _: Stopped
+
+
+-- The completion at a probed site from what the probe found and from
+-- `analysis`, the root's latest that checked: a name offers the locals first,
+-- then the module's names and the keywords; a member offers what follows the
+-- value's dot. A probe that stopped before its hole leaves a name the rest and
+-- a member nothing.
+pure func probed_completion(
+    site: ProbedSite,
+    outcome: ProbeOutcome,
+    analysis: Option[Analysis]
+) -> Completion:
+    probed: (Option[CompletionFacts], List[String]) = match outcome:
+        Reached(found, names): (Some(found), names)
+        Stopped | Faulted(_): (None, [])
+
+    (facts, spellings) = probed
+
+    match site:
+        ProbedName(prefix):
+            -- A probe at its hole has the module's names as the text has them;
+            -- else they come from the last analysis that checked.
+            named: (List[Offered], List[Offered]) = match facts:
+                Some(NameFacts(found)):
+                    (
+                        found.locals.named_items(spellings, VariableItem, LocalRank, False),
+                        found.namespace
+                            .module_names(root_module_id())
+                            .scope_items(spellings)
+                    )
+                _:
+                    ([], analysis.checked_module_items())
+
+            (locals, module_items) = named
+
             keywords = OFFERED_KEYWORDS.map(
                 pure func(word: String) -> Offered: {
                     label = word,
                     kind = KeywordItem,
-                    rank = KeywordRank
+                    rank = KeywordRank,
+                    inserts_call = False
                 }
             )
 
-            Some({
-                prefix = prefix,
-                items = namespace
-                    .module_names(root)
-                    .scope_items(spellings)
+            {
+                prefix = prefix.span,
+                items = locals
+                    .concat(module_items)
                     .concat(keywords)
-            })
-        MemberSite(member):
-            items: List[Offered] = match member.qualifier:
-                Some(qualifier):
-                    match namespace.named_value(root, qualifier.id):
-                        Some(NamedAlias(aliased)):
-                            namespace
-                                .offered_entries(aliased.target)
-                                .scope_items(spellings)
-                        _:
-                            named: Option[TypeHead] = namespace
-                                .named_type(root, qualifier.id)
-                                .map(pure func(found: NamedType) -> TypeHead: found.head)
-
-                            match named:
-                                Some(UnionHead(id)):
-                                    analysis
-                                        .variant_names(id, root)
-                                        .variant_items(spellings)
-                                -- A value, a function or another type.
-                                _:
-                                    []
-                -- A value's members come in 17b.
-                None:
+            }
+        ProbedMember(member):
+            -- A call inserts its parentheses unless they are written already.
+            items: List[Offered] = match facts:
+                Some(MemberFacts(members)):
+                    members.fields
+                        .named_items(spellings, FieldItem, DeclaredRank, False)
+                        .concat(
+                            members.calls.named_items(
+                                spellings,
+                                MethodItem,
+                                DeclaredRank,
+                                member.called.not()
+                            )
+                        )
+                _:
                     []
 
-            Some({ prefix = member.prefix, items = items })
+            { prefix = member.prefix.span, items = items }
+
+
+-- The module's names from `analysis`, the root's last that checked, if any.
+private pure func checked_module_items(analysis: Option[Analysis]) -> List[Offered]:
+    match analysis:
+        Some(checked):
+            checked
+                .analysis_namespace()
+                .module_names(root_module_id())
+                .scope_items(
+                    checked
+                        .analysis_names()
+                        .name_spellings()
+                )
+        None:
+            []
 
 
 -- The site at `offset`, from the tokens `names` lexes `text` to. `names` is
@@ -269,17 +465,52 @@ pure func completion_site(text: String, names: NameTable, offset: Int) -> Comple
     else:
         empty: Span = { source = source, start = offset, end = offset }
 
+        -- The whole word at the cursor, which a probe's hole covers: the one the
+        -- cursor is in or ends, or one that starts at it; then what follows.
+        starts_word: Bool = match tokens.get(reached):
+            Some(next): and(next.span.start == offset, next.kind.is_word())
+            None: False
+
+        after = if starts_word:
+            reached + 1
+        else:
+            reached
+
+        word_end: Int = match tokens.get(after - 1):
+            Some(word):
+                if and(word.kind.is_word(), word.span.end >= offset):
+                    word.span.end
+                else:
+                    offset
+            None:
+                offset
+
+        called: Bool = match tokens.get(after):
+            Some(next):
+                match next.kind:
+                    SymbolToken(LeftParen): True
+                    _: False
+            None:
+                False
+
+        -- The prefix when the cursor follows no word.
+        at_cursor: Prefix = { span = empty, word_end = word_end }
+
         match tokens.get(reached - 1):
             None:
-                NameSite(empty)
+                NameSite(at_cursor)
             Some(last):
                 if last.span.end < offset:
                     -- A space or a line break separates the cursor from `last`.
-                    tokens.site_after(reached - 1, empty)
+                    tokens.site_after(reached - 1, at_cursor, called)
                 else:
                     match last.kind:
                         IdentifierToken(_, _) | KeywordToken(_):
-                            tokens.site_after(reached - 2, { last.span | end = offset })
+                            tokens.site_after(
+                                reached - 2,
+                                { span = { last.span | end = offset }, word_end = word_end },
+                                called
+                            )
                         IntegerLiteral(_) | FloatLiteral(_):
                             NoCompletion
                         _:
@@ -288,14 +519,19 @@ pure func completion_site(text: String, names: NameTable, offset: Int) -> Comple
                             else:
                                 -- A symbol, such as `.`, `..` or `${`, or a closing
                                 -- quote, ends at the cursor.
-                                tokens.site_after(reached - 1, empty)
+                                tokens.site_after(reached - 1, at_cursor, called)
 
 
 -- The site whose prefix is `prefix`, when `tokens[index]` is written right
 -- before it: a member after a dot, nothing after a word that declares a new
 -- name, else a name. Newline, Indent and Dedent are tokens, so a dot that ends
 -- the line above is not right before the prefix.
-private pure func site_after(tokens: List[Token], index: Int, prefix: Span) -> CompletionSite:
+private pure func site_after(
+    tokens: List[Token],
+    index: Int,
+    prefix: Prefix,
+    called: Bool
+) -> CompletionSite:
     match tokens.get(index):
         None:
             NameSite(prefix)
@@ -312,11 +548,17 @@ private pure func site_after(tokens: List[Token], index: Int, prefix: Span) -> C
                         None:
                             None
 
-                    MemberSite({ qualifier = qualifier, prefix = prefix })
+                    MemberSite({ qualifier = qualifier, prefix = prefix, called = called })
                 KeywordToken(FunctionKeyword | VarKeyword | ForKeyword | RecordKeyword | UnionKeyword | TraitKeyword | TypeKeyword | AsKeyword):
                     NoCompletion
                 _:
                     NameSite(prefix)
+
+
+private pure func is_word(kind: TokenKind) -> Bool:
+    match kind:
+        IdentifierToken(_, _) | KeywordToken(_): True
+        _: False
 
 
 -- Whether `offset` is inside the string `token` is a piece of. A piece that
@@ -396,7 +638,8 @@ private pure func scope_items(entries: List[Entry], spellings: List[String]) -> 
                 items = items.append({
                     label = label,
                     kind = entry.entity.entity_kind(),
-                    rank = entry.origin.origin_rank()
+                    rank = entry.origin.origin_rank(),
+                    inserts_call = False
                 })
             -- The table issued the id, so its spelling is there.
             None:
@@ -405,17 +648,27 @@ private pure func scope_items(entries: List[Entry], spellings: List[String]) -> 
     items
 
 
--- An item for each of a union's variants.
-private pure func variant_items(
-    variants: List[WrittenName],
-    spellings: List[String]
+-- An item for each name, spelled from `spellings`: the probe's, or the
+-- analysis's. A call inserts its parentheses.
+private pure func named_items(
+    names: List[NameId],
+    spellings: List[String],
+    kind: CompletionKind,
+    rank: ItemRank,
+    inserts_call: Bool
 ) -> List[Offered]:
     var items: List[Offered] = []
 
-    for variant in variants:
-        match spellings.get(variant.id.name_number()):
+    for name in names:
+        match spellings.get(name.name_number()):
             Some(label):
-                items = items.append({ label = label, kind = EnumMemberItem, rank = DeclaredRank })
+                items = items.append({
+                    label = label,
+                    kind = kind,
+                    rank = rank,
+                    inserts_call = inserts_call
+                })
+            -- The table issued the id, so its spelling is there.
             None:
                 void
 
@@ -442,13 +695,27 @@ private pure func origin_rank(origin: Origin) -> ItemRank:
         Implicit: ProvidedRank
 
 
--- The protocol's CompletionItem for `item`, replacing the text at `range`.
-pure func offered_json(item: Offered, range: Json) -> Json:
-    Object(
-        {
-            "label" => Text(item.label),
-            "kind" => Number(integer(item.kind.kind_number())),
-            "sortText" => Text("${item.rank.rank_digit()}${item.label}"),
-            "textEdit" => Object({ "range" => range, "newText" => Text(item.label) })
-        }
-    )
+-- The protocol's CompletionItem for `item`, replacing the text at `range`. For
+-- a client that reads `snippets`, a call is a snippet with the cursor between
+-- its parentheses; otherwise the cursor ends after them.
+pure func offered_json(item: Offered, range: Json, snippets: Bool) -> Json:
+    snippet = and(item.inserts_call, snippets)
+
+    inserted = if snippet:
+        "${item.label}($0)"
+    else if item.inserts_call:
+        "${item.label}()"
+    else:
+        item.label
+
+    fields: Dict[String, Json] = {
+        "label" => Text(item.label),
+        "kind" => Number(integer(item.kind.kind_number())),
+        "sortText" => Text("${item.rank.rank_digit()}${item.label}"),
+        "textEdit" => Object({ "range" => range, "newText" => Text(inserted) })
+    }
+
+    if snippet:
+        Object(fields.set("insertTextFormat", Number(integer(SNIPPET_TEXT_FORMAT))))
+    else:
+        Object(fields)

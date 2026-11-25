@@ -89,8 +89,12 @@ function diagnosticsOf(uri) {
     });
 }
 
+function labelOf(item) {
+    return typeof item.label === 'string' ? item.label : item.label.label;
+}
+
 function labelsOf(list) {
-    return list.items.map((item) => (typeof item.label === 'string' ? item.label : item.label.label));
+    return list.items.map(labelOf);
 }
 
 // Types `text` at the start of `line` of an open document, as an editor does,
@@ -219,6 +223,53 @@ async function run() {
             'vscode.executeCompletionItemProvider', completionUri, new vscode.Position(BODY_LINE, typed.length), '.',
         );
         assert.deepEqual(labelsOf(list).sort(), ['None', 'Some']);
+    });
+
+    // A value's members and the locals come from a probe of the editor's text,
+    // checked up to the cursor. The new line is line 2 of `greeting`'s body,
+    // between its local `suffix` and its result. The module's names still come
+    // from the last analysis that checked, so the file is analysed first.
+    const membersUri = vscode.Uri.joinPath(folder, 'members.brp');
+    const NEW_LINE = 2;
+
+    await check('Ctrl+Space on a blank line of a body lists a parameter and an earlier local before the module\'s functions', async () => {
+        const document = await openDocument(membersUri);
+        await semanticTokens(membersUri);
+        await typeAtLineStart(document, NEW_LINE, ' '.repeat(BODY_INDENT) + '\n');
+        const list = await vscode.commands.executeCommand(
+            'vscode.executeCompletionItemProvider', membersUri, new vscode.Position(NEW_LINE, BODY_INDENT),
+        );
+        const items = new Map(list.items.map((item) => [labelOf(item), item]));
+        for (const local of ['name', 'suffix']) {
+            assert.equal(items.get(local)?.kind, vscode.CompletionItemKind.Variable, `${local} is not a local`);
+            for (const declared of ['greeting', 'main']) {
+                assert.ok(
+                    items.get(local).sortText < items.get(declared).sortText,
+                    `${local} does not sort before ${declared}`,
+                );
+            }
+        }
+    });
+
+    await check('typing name. on a new line in the middle of a pure body lists length as a call snippet, and not print', async () => {
+        const document = await vscode.workspace.openTextDocument(membersUri);
+        // The blank line the check above left becomes `    name.`.
+        const typed = '    name.';
+        const editor = await vscode.window.showTextDocument(document);
+        await editor.edit((builder) => builder.insert(new vscode.Position(NEW_LINE, BODY_INDENT), 'name.'));
+        const list = await vscode.commands.executeCommand(
+            'vscode.executeCompletionItemProvider', membersUri, new vscode.Position(NEW_LINE, typed.length), '.',
+        );
+        const length = list.items.find((item) => labelOf(item) === 'length');
+        assert.ok(length, `length is not in ${list.items.length} items`);
+        // VS Code reads snippets, so the cursor lands between the parentheses.
+        assert.ok(length.insertText instanceof vscode.SnippetString, 'length is not a snippet');
+        assert.equal(length.insertText.value, 'length($0)');
+        // VS Code adds the document's words as Text items, so only a call counts.
+        const printCall = list.items.find(
+            (item) => labelOf(item) === 'print' && item.kind === vscode.CompletionItemKind.Method,
+        );
+        assert.ok(!printCall, 'a pure body is offered print');
     });
 
     await check('a changed server path restarts the server, also after a failed start', async () => {

@@ -13,6 +13,7 @@ import:
     ../../src/lsp/server: EXIT_ABANDONED
     ../driver/file_access: read_file, write_file, make_directories
     ../driver/harness: COMPILATION_TIMEOUT_MS, LIBRARY_ROOT, isolated, reported, run_expecting
+    ../support/text_search: occurrences
 
 
 private FORMATTED: String = "func main() -> Int:\n    x = 1\n    x + 1\n"
@@ -860,6 +861,104 @@ private func lsp_refreshes_tokens_and_diagnostics_after_an_edit(
     )
 
 
+-- The editor types `name.` on a new line in the middle of a body, then a word
+-- on a blank line, and asks for completion at each: the transport probes the
+-- editor's text, so the first lists the String's `length` as a call and the
+-- second the local `name` first. The open program checks and publishes
+-- nothing, and a probe never publishes, though the edited text does not check.
+private func lsp_completes_members_and_locals_through_a_probe(
+    compiler: String,
+    work_directory: String
+) -> Result[Void, String]:
+    uri = "file:///work/probe.brp"
+    document = "{\"uri\":\"${uri}\",\"languageId\":\"blorp\",\"version\":1,\"text\":\"func main():\\n    name = \\\"abc\\\"\\n    print(name)\\n\"}"
+
+    changed = pure func(version: Int, line: String) -> String:
+        "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didChange\",\"params\":{\"textDocument\":{\"uri\":\"${uri}\",\"version\":${version}},\"contentChanges\":[{\"text\":\"func main():\\n    name = \\\"abc\\\"\\n${line}\\n    print(name)\\n\"}]}}"
+
+    completion = pure func(id: Int, character: Int) -> String:
+        "{\"jsonrpc\":\"2.0\",\"id\":${id},\"method\":\"textDocument/completion\",\"params\":{\"textDocument\":{\"uri\":\"${uri}\"},\"position\":{\"line\":2,\"character\":${character}}}}"
+
+    input = [
+        LSP_INITIALIZE,
+        "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":{\"textDocument\":${document}}}",
+        changed(2, "    name."),
+        completion(2, 9),
+        changed(3, "    na"),
+        completion(3, 6),
+        "{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"shutdown\"}",
+        LSP_EXIT
+    ]
+
+    output ?= lsp_session(
+        compiler,
+        input
+            .map(framed)
+            .join(""),
+        "${work_directory}/cli_lsp_completion",
+        0
+    )
+
+    length_call = "{\"label\":\"length\",\"kind\":2,\"sortText\":\"1length\",\"textEdit\":{\"range\":{\"start\":{\"line\":2,\"character\":9},\"end\":{\"line\":2,\"character\":9}},\"newText\":\"length()\"}}"
+    local = "{\"label\":\"name\",\"kind\":6,\"sortText\":\"0name\",\"textEdit\":{\"range\":{\"start\":{\"line\":2,\"character\":4},\"end\":{\"line\":2,\"character\":6}},\"newText\":\"name\"}}"
+    published = output.stdout.occurrences("publishDiagnostics")
+
+    if and(and(output.stdout.has_text(length_call), output.stdout.has_text(local)), published == 0):
+        Ok(void)
+    else:
+        Err(
+            "expected `length()` after the dot, the local `name` and no publication:\n${output.stdout}"
+        )
+
+
+-- A probe gets this long, so that one that loops fails the run instead of
+-- filling memory up to the suite's own limit.
+private PROBE_TIMEOUT_MS: Int = 20000
+
+
+-- A member hole inside a record and a variant literal that each wait for their
+-- type: checking resumes the literal, reaches the hole again and answers then.
+private func lsp_answers_a_member_hole_in_a_literal_waiting_for_its_type(
+    compiler: String,
+    work_directory: String
+) -> Result[Void, String]:
+    uri = "file:///work/waiting.brp"
+    record_text = "record Point {\\n    x: Int\\n}\\n\\n\\nfunc main():\\n    points: List[Point] = []\\n    more = points.append({ x = \\\"abc\\\". })\\n    print(\\\"x\\\")\\n"
+    variant_text = "func main():\\n    results: List[Result[Int, String]] = []\\n    more = results.append(Ok(\\\"abc\\\".))\\n    print(\\\"x\\\")\\n"
+
+    completion = pure func(id: Int, line: Int, character: Int) -> String:
+        "{\"jsonrpc\":\"2.0\",\"id\":${id},\"method\":\"textDocument/completion\",\"params\":{\"textDocument\":{\"uri\":\"${uri}\"},\"position\":{\"line\":${line},\"character\":${character}}}}"
+
+    input = [
+        LSP_INITIALIZE,
+        "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":{\"textDocument\":{\"uri\":\"${uri}\",\"languageId\":\"blorp\",\"version\":1,\"text\":\"${record_text}\"}}}",
+        completion(2, 7, 37),
+        "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didChange\",\"params\":{\"textDocument\":{\"uri\":\"${uri}\",\"version\":2},\"contentChanges\":[{\"text\":\"${variant_text}\"}]}}",
+        completion(3, 2, 35),
+        "{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"shutdown\"}",
+        LSP_EXIT
+    ]
+
+    invocation ?= isolated(compiler, ["lsp"], PROBE_TIMEOUT_MS)
+
+    output ?= run_expecting(
+        "${work_directory}/cli_lsp_waiting_literal",
+        { invocation |
+            stdin = Some(
+                input
+                    .map(framed)
+                    .join("")
+            )
+        },
+        0
+    )
+
+    if output.stdout.occurrences("\"label\":\"length\"") == 2:
+        Ok(void)
+    else:
+        Err("expected `length` after both dots:\n${output.stdout}")
+
+
 -- The line, counted from 0, of the library's io/console/output.brp that
 -- declares `print`.
 private func print_declaration_line() -> Result[Int, String]:
@@ -1509,6 +1608,21 @@ func suite(compiler: String, work_directory: String) -> TestSuite:
                             work_directory
                         )
                     )
+            ),
+            (
+                "lsp completes members and locals through a probe",
+                func(): reported(
+                    lsp_completes_members_and_locals_through_a_probe(compiler, work_directory)
+                )
+            ),
+            (
+                "lsp answers a member hole in a literal waiting for its type",
+                func(): reported(
+                    lsp_answers_a_member_hole_in_a_literal_waiting_for_its_type(
+                        compiler,
+                        work_directory
+                    )
+                )
             ),
             (
                 "lsp answers shutdown, then exits 1 when input ends",

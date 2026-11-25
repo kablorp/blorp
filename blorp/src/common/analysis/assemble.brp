@@ -1,5 +1,5 @@
 import:
-    list: repeat
+    list: find, repeat
     path: to_path
     ../syntax/names: NameId, NameTable, program_names
     ../syntax/parse:
@@ -42,7 +42,7 @@ import:
         compiler_span,
         diagnostic,
         source_bundle_error
-    ./ids: DeclarationInventory, issue_inventory
+    ./ids: DeclarationInventory, FunctionId, FunctionRow, inventory_functions, issue_inventory
 
 
 -- Program assembly: the loader appends each parsed module in inventory order,
@@ -104,6 +104,9 @@ record ParsedContents {
     -- By module number, what each module receives implicitly.
     implicit_sources: List[ImplicitSource],
     declarations: DeclarationInventory,
+    -- The function whose body holds a probe's completion hole, which checking
+    -- reaches first. Compilation has none.
+    completion_body: Option[FunctionId],
     end: Span
 }
 
@@ -118,7 +121,9 @@ private record ProgramBuilder {
     traits: List[ParsedTrait],
     unions: List[ParsedUnion],
     records: List[ParsedRecord],
-    constants: List[ParsedConstant]
+    constants: List[ParsedConstant],
+    -- The root's function whose body holds the completion hole.
+    completion_function: Option[WrittenName]
 }
 
 
@@ -149,7 +154,8 @@ pure func begin_program() -> ParsedAssembly:
         traits = [],
         unions = [],
         records = [],
-        constants = []
+        constants = [],
+        completion_function = None
     })
 
 
@@ -545,6 +551,11 @@ pure func append_module(
             declaration = declaration.kind
         })
 
+    -- Only the root's text, lexed with the probe's hole, names one.
+    completion_function = match contents.completion_function:
+        Some(_): contents.completion_function
+        None: builder.completion_function
+
     Ok(
         ParsedAssembly.Init({
             names = contents.names,
@@ -562,7 +573,8 @@ pure func append_module(
             traits = builder.traits.concat(contents.traits),
             unions = builder.unions.concat(contents.unions),
             records = builder.records.concat(contents.records),
-            constants = builder.constants.concat(contents.constants)
+            constants = builder.constants.concat(contents.constants),
+            completion_function = completion_function
         })
     )
 
@@ -813,6 +825,27 @@ pure func seal_program(assembly: ParsedAssembly) -> Result[ParsedProgram, SealFa
     -- deterministically, at the import that closes it.
     ordered ?= builder.modules.ordered_rows(sources, foundation)
 
+    declarations = issue_inventory(
+        builder.functions,
+        builder.records,
+        builder.unions,
+        builder.constants,
+        builder.traits
+    )
+
+    -- A written name's span identifies its declaration in the root. The parser
+    -- named a function it read, so a miss is a fault, not a probe without a hole.
+    holder: Option[Option[FunctionRow]] = builder.completion_function.map(
+        pure func(name: WrittenName) -> Option[FunctionRow]: declarations
+            .inventory_functions()
+            .find(pure func(row: FunctionRow) -> Bool: row.declaration.function_name == name)
+    )
+
+    completion_body: Option[FunctionId] ?= match holder:
+        Some(Some(row)): Ok(Some(row.id))
+        Some(None): Err(MalformedBundle(source_bundle_error("the completion hole has no function")))
+        None: Ok(None)
+
     Ok(
         ParsedProgram.Init({
             names = builder.names,
@@ -823,13 +856,8 @@ pure func seal_program(assembly: ParsedAssembly) -> Result[ParsedProgram, SealFa
             modules = builder.modules,
             dependency_order = ordered,
             implicit_sources = sources,
-            declarations = issue_inventory(
-                builder.functions,
-                builder.records,
-                builder.unions,
-                builder.constants,
-                builder.traits
-            ),
+            declarations = declarations,
+            completion_body = completion_body,
             end = root.end
         })
     )

@@ -161,12 +161,11 @@ done.
   - **Landed:** landing 17a: completion of names and qualifiers. At a
     name, the module's names and keywords; after `alias.`, what that module
     offers; after `Union.`, its variants.
-  - **Next:** landing 17b, a value's members after `.` and the locals at the
-    cursor, through a completion hole that Keith chose on 2026-11-23. A
-    spike, `a86ad4f83` on `claude/lsp-completion-hole-spike`, answers in every
-    place the cut failed; its ceiling waits for Keith.
-  - **Later candidates:** formatting, hover, project-wide references, or a
-    simplification audit of `src/lsp/`.
+  - **Landed:** landing 17b: a value's members after `.` and the locals at
+    the cursor, through a completion hole that Keith chose on 2026-11-23.
+    Its limits are in `LSP_PLAN.md`.
+  - **Next:** one of the later candidates: formatting, hover, project-wide
+    references, or a simplification audit of `src/lsp/`.
 - **String code points:** [`STRING_PLAN.md`](STRING_PLAN.md).
   - **Status:** approved on 2026-11-10: `length` counts code points, from a
     count stored in each String, and byte work uses `byte_*` functions. L1

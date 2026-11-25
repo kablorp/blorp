@@ -40,7 +40,15 @@ import:
         root_module_id,
         source_module
     ../common/syntax/syntax: Diagnostic, Diagnostics, Span, compiler_span, internal_error
-    ./completion: Offered, completion, offered_json
+    ./completion:
+        Completion,
+        CompletionPlan(Answered, Probing),
+        Offered,
+        ProbeOutcome,
+        ProbedSite,
+        completion_plan,
+        offered_json,
+        probed_completion
     ./line_map: LineMap, current_span, line_map, sealed_offset
     ./positions:
         LineIndex,
@@ -187,6 +195,8 @@ private record Session {
     -- Whether the client accepts `workspace/semanticTokens/refresh`, which asks
     -- it for the tokens of its visible files again.
     refreshes_tokens: Bool,
+    -- Whether the client reads a completion's snippets.
+    inserts_snippets: Bool,
     -- Whether the client fetches library files with
     -- `workspace/textDocumentContent`, so that a definition may lead into the
     -- library.
@@ -219,8 +229,6 @@ union DocumentQuery:
     DefinitionQuery(Position)
     -- Every use of the name at the position.
     ReferencesQuery(ReferencesAt)
-    -- What may be written at the position.
-    CompletionQuery(Position)
 
 
 fixed record ReferencesAt {
@@ -257,6 +265,19 @@ union Followup:
     -- Read the saved text of the document at the path, which the client has
     -- closed, and hand it to `reverted`.
     ReadSaved(Path)
+    -- Load an open root with a completion probe's hole in its text, every open
+    -- document as it is, check it to the hole, and hand what it found to
+    -- `probed`.
+    Probe(ProbeRequest)
+
+
+-- A completion request that waits for a probe of its root: the root, the
+-- request and the site the probe answers.
+record ProbeRequest {
+    root: Path,
+    id: RequestId,
+    site: ProbedSite
+}
 
 
 record Step {
@@ -364,6 +385,7 @@ pure func receive(server: Server, message: Json) -> Step:
                     registers_watchers = call.params.watches_files(),
                     refreshes_tokens = call.params.refreshes_tokens(),
                     serves_library_documents = call.params.fetches_documents(),
+                    inserts_snippets = call.params.reads_snippets(),
                     requests_sent = 0
                 }
 
@@ -420,13 +442,7 @@ pure func receive(server: Server, message: Json) -> Step:
                             )
                     )
                 "textDocument/completion":
-                    session.document_requested(
-                        id,
-                        call.params,
-                        call.params
-                            .requested_position()
-                            .map(pure func(at: Position) -> DocumentQuery: CompletionQuery(at))
-                    )
+                    session.completion_requested(id, call.params)
                 "initialize":
                     lifecycle.replying([
                         error_response(
@@ -501,6 +517,20 @@ private pure func refreshes_tokens(params: Option[Json]) -> Bool:
             .field("workspace")
             .field("semanticTokens")
             .field("refreshSupport")
+    ):
+        Some(Boolean(True)): True
+        _: False
+
+
+-- Whether the client reads a completion item's snippet.
+private pure func reads_snippets(params: Option[Json]) -> Bool:
+    match (
+        params
+            .field("capabilities")
+            .field("textDocument")
+            .field("completion")
+            .field("completionItem")
+            .field("snippetSupport")
     ):
         Some(Boolean(True)): True
         _: False
@@ -862,26 +892,102 @@ private pure func served(
                     )
                 None:
                     Array([])
-        CompletionQuery(at):
-            -- A module's names hold everywhere in it, so the editor's own text
-            -- gives the site, and no offset goes back through the line diff.
-            items: List[Json] = match text.completion(
-                root.index.offset_of(at, session.encoding),
-                analysis
-            ):
-                Some(offering):
-                    range = root.index.range_json(offering.prefix, session.encoding)
-                    offering.items.map(pure func(item: Offered) -> Json: item.offered_json(range))
-                None:
-                    []
-
-            completion_json(items)
 
 
--- The `textDocument/completion` result: a complete list, which the client
--- filters as the word grows.
-private pure func completion_json(items: List[Json]) -> Json:
+-- The `textDocument/completion` result for the editor's `text`: a complete
+-- list, which the client filters as the word grows.
+private pure func completion_json(
+    text: String,
+    offering: Option[Completion],
+    session: Session
+) -> Json:
+    items: List[Json] = match offering:
+        Some(completion):
+            range = line_index(text).range_json(completion.prefix, session.encoding)
+            snippets = session.inserts_snippets
+
+            completion.items.map(
+                pure func(item: Offered) -> Json: item.offered_json(range, snippets)
+            )
+        None:
+            []
+
     Object({ "isIncomplete" => Boolean(False), "items" => Array(items) })
+
+
+-- A completion is answered from the root's latest analysis that checked,
+-- current or stale, and never analyses the root: the module's names hold
+-- everywhere in it, and the editor's own text gives the site. A name or a
+-- value's member waits for a probe of that text. A library document gets an
+-- empty list, and a document that is not open `null`.
+private pure func completion_requested(
+    session: Session,
+    id: RequestId,
+    params: Option[Json]
+) -> Step:
+    match (params.requested_document(), params.requested_position()):
+        (Some(UserFile(path)), Some(at)):
+            match session.documents.get(path):
+                Some(open):
+                    offset = line_index(open.text).offset_of(at, session.encoding)
+
+                    match open.text.completion_plan(offset, session.checked_analysis(path)):
+                        Answered(offering):
+                            replying(Serving(session), [
+                                response(id, open.text.completion_json(offering, session))
+                            ])
+                        Probing(site):
+                            {
+                                server = Server.Init(Serving(session)),
+                                replies = [],
+                                followup = Probe({ root = path, id = id, site = site })
+                            }
+                None:
+                    replying(Serving(session), [response(id, Null)])
+        (Some(LibraryFile(relative)), Some(_)):
+            answered: Json = if session.library_documents.contains(relative):
+                "".completion_json(None, session)
+            else:
+                Null
+
+            replying(Serving(session), [response(id, answered)])
+        _:
+            replying(Serving(session), [response(id, Null)])
+
+
+-- The root's latest analysis that checked, current or stale, if any.
+private pure func checked_analysis(session: Session, root: Path) -> Option[Analysis]:
+    match session.roots.get(root):
+        Some(row):
+            row.analysis
+                .last_checked()
+                .map(pure func(sealed: SealedAnalysis) -> Analysis: sealed.analysis)
+        None:
+            None
+
+
+-- Answers the request that waited for a probe, from what the probe found,
+-- and changes nothing else: the probe's text is not the document's, so the
+-- root keeps its analysis, its staleness and its diagnostics.
+pure func probed(server: Server, asked: ProbeRequest, outcome: ProbeOutcome) -> Step:
+    Server.Init(lifecycle) = server
+
+    match lifecycle:
+        Serving(session):
+            answered: Json = match session.documents.get(asked.root):
+                Some(open):
+                    completion = asked.site.probed_completion(
+                        outcome,
+                        session.checked_analysis(asked.root)
+                    )
+
+                    open.text.completion_json(Some(completion), session)
+                None:
+                    Null
+
+            replying(lifecycle, [response(asked.id, answered)])
+        AwaitingInitialize(_) | ShutDown | Exited(_):
+            lifecycle.replying([])
 
 
 -- The answer to `query` about a text with no analysis: the lexer's tokens, no
@@ -895,7 +1001,6 @@ private pure func unanalysed_answer(
         TokensQuery: text.tokens_json({}, encoding)
         DefinitionQuery(_): Null
         ReferencesQuery(_): Array([])
-        CompletionQuery(_): completion_json([])
 
 
 -- The `semanticTokens/full` result for a document's text.
@@ -1131,13 +1236,7 @@ private pure func document_requested(
     params: Option[Json],
     query: Option[DocumentQuery]
 ) -> Step:
-    document: Option[DocumentUri] = params
-        .field("textDocument")
-        .text_field("uri")
-        .map(document_uri)
-        .get_or(None)
-
-    match (document, query):
+    match (params.requested_document(), query):
         (Some(LibraryFile(relative)), Some(asked)):
             match session.library_documents.get(relative):
                 Some(text):
@@ -1178,6 +1277,15 @@ private union DocumentUri:
     UserFile(Path)
     -- A `blorp-library:` URI's file path below the library root, as text.
     LibraryFile(String)
+
+
+-- The document a request's params name, if the server reads its URI's scheme.
+private pure func requested_document(params: Option[Json]) -> Option[DocumentUri]:
+    params
+        .field("textDocument")
+        .text_field("uri")
+        .map(document_uri)
+        .get_or(None)
 
 
 -- None for a URI of another scheme.

@@ -22,15 +22,17 @@ import:
         module_id,
         module_source
     ../../src/common/syntax/syntax: Diagnostic, Span, compiler_span, diagnostic, internal_error
+    ../../src/lsp/completion: probe_hole, probe_outcome
     ../../src/lsp/protocol: file_uri, library_uri
     ../../src/lsp/server:
         AnalysisOutcome(LoadFailed, CheckFailed, Analysed),
         AnalysisRequest,
         DocumentAnalysis,
-        Followup(Idle, Analyse, ReadSaved),
+        Followup(Idle, Analyse, ReadSaved, Probe),
         Server,
         Step,
         analysed,
+        probed,
         document_analysis,
         exit_status,
         receive,
@@ -73,7 +75,7 @@ private pure func received(server: Server, message: String) -> Step:
 
     match step.followup:
         ReadSaved(closed): step.server.reverted(closed, None)
-        Idle | Analyse(_): step
+        Idle | Analyse(_) | Probe(_): step
 
 
 -- The step a close of `uri` ends with once the transport hands back the
@@ -83,7 +85,7 @@ private pure func closing(server: Server, uri: String, saved: Option[String]) ->
 
     match step.followup:
         ReadSaved(closed): step.server.reverted(closed, saved)
-        Idle | Analyse(_): step
+        Idle | Analyse(_) | Probe(_): step
 
 
 -- Where a load would resolve a relative library root. The embedded root is
@@ -125,7 +127,7 @@ private pure func replies(step: Step) -> List[String]:
 private pure func asked_analysis(step: Step) -> Option[AnalysisRequest]:
     match step.followup:
         Analyse(asked): Some(asked)
-        Idle | ReadSaved(_): None
+        Idle | ReadSaved(_) | Probe(_): None
 
 
 -- The root a step asks the transport to analyse.
@@ -140,13 +142,16 @@ private pure func analysed_path(step: Step) -> Option[Path]:
 private pure func answers(step: Step, expected: List[String]) -> Bool:
     match step.followup:
         Idle: step.replies.map(render) == expected
-        Analyse(_) | ReadSaved(_): False
+        Analyse(_) | ReadSaved(_) | Probe(_): False
 
 
 private INITIALIZE: String = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"capabilities\":{\"general\":{\"positionEncodings\":[\"utf-16\",\"utf-8\"]}}}}"
 
 
 private INITIALIZE_UTF16: String = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"capabilities\":{}}}"
+
+
+private INITIALIZE_SNIPPETS: String = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"capabilities\":{\"general\":{\"positionEncodings\":[\"utf-8\"]},\"textDocument\":{\"completion\":{\"completionItem\":{\"snippetSupport\":true}}}}}}"
 
 
 private SHUTDOWN: String = "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"shutdown\"}"
@@ -628,7 +633,9 @@ private BROKEN_TEXT: String = "ONE: Int = 1.5"
 
 
 private func analysis_at(root: String, text: String) -> DocumentAnalysis:
-    document_analysis(load_program_with_sources(root, EmbeddedLibrary, [snapshot(root, text)]))
+    document_analysis(
+        load_program_with_sources(root, EmbeddedLibrary, [snapshot(root, text)], None)
+    )
 
 
 -- A real analysis, as `root`, of a program that checks.
@@ -1630,10 +1637,12 @@ private pure func navigated_text() -> String:
 -- as the transport does.
 private func navigated(text: String) -> DocumentAnalysis:
     document_analysis(
-        load_program_with_sources(ROOT, EmbeddedLibrary, [
-            snapshot(ROOT, text),
-            snapshot(HELPERS, HELPERS_TEXT)
-        ])
+        load_program_with_sources(
+            ROOT,
+            EmbeddedLibrary,
+            [snapshot(ROOT, text), snapshot(HELPERS, HELPERS_TEXT)],
+            None
+        )
     )
 
 
@@ -2522,10 +2531,12 @@ private HELPERS_EDITED_DECLARATION_TEXT: String = "pure func one() -> Int: -- no
 
 private func analysis_with_helpers(root_text: String, helpers_text: String) -> DocumentAnalysis:
     document_analysis(
-        load_program_with_sources(ROOT, EmbeddedLibrary, [
-            snapshot(ROOT, root_text),
-            snapshot(HELPERS, helpers_text)
-        ])
+        load_program_with_sources(
+            ROOT,
+            EmbeddedLibrary,
+            [snapshot(ROOT, root_text), snapshot(HELPERS, helpers_text)],
+            None
+        )
     )
 
 
@@ -2720,31 +2731,65 @@ private pure func completion_request(id: Int, uri: String, line: Int, character:
     "{\"jsonrpc\":\"2.0\",\"id\":${id},\"method\":\"textDocument/completion\",\"params\":{${position_params(uri, line, character)},\"context\":{\"triggerKind\":1}}}"
 
 
--- The reply to a completion request at `line` and `character` of the root.
-private pure func completion_at(server: Server, line: Int, character: Int) -> String:
+-- The step `step` ends with once the transport runs the completion probe it
+-- asks for, as `perform` does, reading HELPERS, which no test opens.
+private func after_probe(step: Step) -> Step:
+    match step.followup:
+        Probe(asked):
+            read = step.server
+                .snapshots()
+                .append(snapshot(HELPERS, HELPERS_TEXT))
+
+            loaded = asked.root
+                .to_string()
+                .load_program_with_sources(EmbeddedLibrary, read, Some(asked.site.probe_hole()))
+
+            step.server.probed(asked, loaded.probe_outcome())
+        _:
+            step
+
+
+-- The reply to a completion request at `line` and `character` of the root,
+-- after its probe when it needs one.
+private func completion_at(server: Server, line: Int, character: Int) -> String:
     server
-        .receive(json(completion_request(7, ROOT_URI, line, character))).replies
+        .receive(json(completion_request(7, ROOT_URI, line, character)))
+        .after_probe().replies
         .map(render)
         .join("")
 
 
 -- One item, as it is sent, replacing `start` to `end` of line 32.
 private pure func item(label: String, kind: Int, rank: Int, start: Int, end: Int) -> String:
-    "{\"label\":\"${label}\",\"kind\":${kind},\"sortText\":\"${rank}${label}\",\"textEdit\":{\"range\":{\"start\":{\"line\":32,\"character\":${start}},\"end\":{\"line\":32,\"character\":${end}}},\"newText\":\"${label}\"}}"
+    inserted(label, label, kind, rank, start, end)
+
+
+-- An item that inserts `text`, as a member call inserts its parentheses.
+private pure func inserted(
+    label: String,
+    text: String,
+    kind: Int,
+    rank: Int,
+    start: Int,
+    end: Int
+) -> String:
+    "{\"label\":\"${label}\",\"kind\":${kind},\"sortText\":\"${rank}${label}\",\"textEdit\":{\"range\":{\"start\":{\"line\":32,\"character\":${start}},\"end\":{\"line\":32,\"character\":${end}}},\"newText\":\"${text}\"}}"
 
 
 private EMPTY_LIST: String = "{\"jsonrpc\":\"2.0\",\"id\":7,\"result\":{\"isIncomplete\":false,\"items\":[]}}"
 
 
--- Every name the module can write, with its kind and rank, and the keywords,
--- each replacing the `pri` before the cursor.
-func test_a_name_site_sends_every_name_and_keyword_replacing_the_prefix() -> Bool:
+-- The locals first, then every name the module can write, with its kind and
+-- rank, and the keywords, each replacing the `pri` before the cursor.
+func test_a_name_site_sends_the_locals_every_name_and_keyword_replacing_the_prefix() -> Bool:
     loading(func(server: Server) -> Bool:
         sent = server
             .completing(typing("    pri"))
             .completion_at(32, 7)
 
         wanted = [
+            item("point", 6, 0, 4, 7),
+            item("total", 6, 0, 4, 7),
             item("print", 3, 3, 4, 7),
             item("area", 3, 1, 4, 7),
             item("main", 3, 1, 4, 7),
@@ -2819,17 +2864,83 @@ func test_a_union_dot_sends_its_variants() -> Bool:
     )
 
 
--- A built-in type, a record, a value and an unknown name qualify nothing until
--- 17b knows values.
+-- A value's dot sends its record's fields and the calls its type can take,
+-- each call inserted with its parentheses, and none where they are written.
+func test_a_value_dot_sends_its_fields_and_calls() -> Bool:
+    loading(func(server: Server) -> Bool:
+        sent = server
+            .completing(typing("    point."))
+            .completion_at(32, 10)
+
+        called = server
+            .completing(typing("    point.si()"))
+            .completion_at(32, 12)
+
+        and(
+            and(
+                sent.has_text(item("x", 5, 1, 10, 10)),
+                sent.has_text(inserted("size", "size()", 2, 1, 10, 10))
+            ),
+            and(not(sent.has_text("\"print\"")), called.has_text(item("size", 2, 1, 10, 12)))
+        )
+    )
+
+
+-- When the probe stops before its hole, a name gets the module's names
+-- without locals and a value's dot nothing.
+func test_a_probe_that_stops_falls_back() -> Bool:
+    loading(func(server: Server) -> Bool:
+        sent = server
+            .completing(typing("    missing + pri"))
+            .completion_at(32, 17)
+
+        and(
+            and(sent.has_text(item("print", 3, 3, 14, 17)), not(sent.has_text("\"total\""))),
+            (
+                server
+                    .completing(typing("    missing.x."))
+                    .completion_at(32, 14)
+                == EMPTY_LIST
+            )
+        )
+    )
+
+
+-- A probe is answered and changes nothing: no diagnostics are published, and
+-- the server it leaves keeps the root's analysis current, so a definition is
+-- answered at once.
+func test_a_probe_leaves_the_root_as_it_was() -> Bool:
+    loading(func(server: Server) -> Bool:
+        answered = server
+            .completing(typing("    point."))
+            .receive(json(completion_request(7, ROOT_URI, 32, 10)))
+            .after_probe()
+
+        and(
+            answered.replies.length() == 1,
+            answered.server
+                .receive(json(definition_request(8, ROOT_URI, 31, 19)))
+                .analysed_path()
+                .is_none()
+        )
+    )
+
+
+-- A client that reads snippets gets each call with the cursor between its
+-- parentheses.
+func test_a_call_is_a_snippet_for_a_client_that_reads_them() -> Bool:
+    loading(func(server: Server) -> Bool:
+        server
+            .completing_as(INITIALIZE_SNIPPETS, typing("    point."))
+            .completion_at(32, 10)
+            .has_text("\"newText\":\"size($0)\"},\"insertTextFormat\":2}")
+    )
+
+
+-- A built-in type, a record and an unknown name qualify nothing.
 func test_other_members_send_an_empty_list() -> Bool:
     loading(func(server: Server) -> Bool:
-        cases: List[(String, Int)] = [
-            ("    Int.", 8),
-            ("    Point.", 10),
-            ("    point.", 10),
-            ("    nowhere.", 12)
-        ]
-
+        cases: List[(String, Int)] = [("    Int.", 8), ("    Point.", 10), ("    nowhere.", 12)]
         var empty: Bool = True
 
         for case in cases:
@@ -2877,35 +2988,42 @@ func test_a_failing_root_completes_from_its_last_checked_analysis() -> Bool:
     )
 
 
-func test_a_root_that_never_checked_sends_an_empty_list() -> Bool:
+-- With no analysis that checked and a probe that stops, only the keywords.
+func test_a_root_that_never_checked_sends_only_the_keywords() -> Bool:
     loading(func(server: Server) -> Bool:
         broken = server
             .after([INITIALIZE, did_open(ROOT_URI, BROKEN_TEXT)]).server
             .analysed_root(analysis_of(BROKEN_TEXT)).server
 
-        broken.completion_at(0, 1) == EMPTY_LIST
+        sent = broken.completion_at(0, 1)
+        and(sent.has_text("\"label\":\"match\""), not(sent.has_text("\"ONE\"")))
     )
 
 
--- The edit stales the root, so the request waits for the analysis, which
--- answers it.
-func test_a_stale_root_is_analysed_before_it_completes() -> Bool:
+-- The edit stales the root, but a completion never analyses it: the probe
+-- and the root's last analysis that checked answer.
+func test_a_stale_root_completes_without_an_analysis() -> Bool:
     loading(func(server: Server) -> Bool:
         typed = typing("    pri")
 
-        waiting = server
+        step = server
             .navigating(navigated_text())
             .changed(did_change(ROOT_URI, typed.escaped()))
             .receive(json(completion_request(7, ROOT_URI, 32, 7)))
 
-        answered = waiting.server.analysed_as_asked(waiting, navigated(typed))
+        sent = step
+            .after_probe().replies
+            .map(render)
+            .join("")
 
         and(
-            and(waiting.replies.is_empty(), waiting.analysed_path() == path(ROOT)),
-            answered.replies
-                .map(render)
-                .join("")
-                .has_text(item("print", 3, 3, 4, 7))
+            and(
+                step.replies.is_empty(),
+                step
+                    .analysed_path()
+                    .is_none()
+            ),
+            and(sent.has_text(item("print", 3, 3, 4, 7)), sent.has_text(item("total", 6, 0, 4, 7)))
         )
     )
 
@@ -3271,8 +3389,8 @@ TESTS: TestSuite = {
             test_a_library_file_the_client_opens_gets_only_lexer_tokens
         ),
         (
-            "a name site sends every name and keyword replacing the prefix",
-            test_a_name_site_sends_every_name_and_keyword_replacing_the_prefix
+            "a name site sends the locals, every name and keyword replacing the prefix",
+            test_a_name_site_sends_the_locals_every_name_and_keyword_replacing_the_prefix
         ),
         (
             "the completion range counts in the agreed encoding",
@@ -3283,6 +3401,13 @@ TESTS: TestSuite = {
             test_an_alias_dot_sends_what_the_module_offers
         ),
         ("a union dot sends its variants", test_a_union_dot_sends_its_variants),
+        ("a value dot sends its fields and calls", test_a_value_dot_sends_its_fields_and_calls),
+        ("a probe that stops falls back", test_a_probe_that_stops_falls_back),
+        ("a probe leaves the root as it was", test_a_probe_leaves_the_root_as_it_was),
+        (
+            "a call is a snippet for a client that reads them",
+            test_a_call_is_a_snippet_for_a_client_that_reads_them
+        ),
         ("other members send an empty list", test_other_members_send_an_empty_list),
         (
             "a comment and a string send an empty list",
@@ -3293,12 +3418,12 @@ TESTS: TestSuite = {
             test_a_failing_root_completes_from_its_last_checked_analysis
         ),
         (
-            "a root that never checked sends an empty list",
-            test_a_root_that_never_checked_sends_an_empty_list
+            "a root that never checked sends only the keywords",
+            test_a_root_that_never_checked_sends_only_the_keywords
         ),
         (
-            "a stale root is analysed before it completes",
-            test_a_stale_root_is_analysed_before_it_completes
+            "a stale root completes without an analysis",
+            test_a_stale_root_completes_without_an_analysis
         ),
         (
             "a library file gets an empty list and a closed document null",

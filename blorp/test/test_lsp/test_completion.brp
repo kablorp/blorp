@@ -9,17 +9,23 @@ import:
     test: TestSuite
     ../../src/common/analysis/check/check: Analysis, analyze
     ../../src/common/analysis/load/load: LibrarySource(EmbeddedLibrary), load_program_with_sources
-    ../../src/common/syntax/lex: lex
+    ../../src/common/syntax/lex: lex, lex_with_completion_hole
     ../../src/common/syntax/names: program_names
     ../../src/common/syntax/source: SourceFile, module_source, root_module_id
-    ../../src/common/syntax/syntax: Span, TokenKind(KeywordToken)
+    ../../src/common/syntax/syntax: DiagnosticKind(CompilerFault), Span, TokenKind(KeywordToken)
     ../../src/lsp/completion:
+        CompletionPlan(Answered, Probing),
+        ProbedSite(ProbedName, ProbedMember),
         CompletionSite(NoCompletion, NameSite, MemberSite),
         Completion,
         Offered,
-        completion,
+        completion_plan,
         completion_site,
-        offered_json
+        offered_json,
+        ProbeOutcome(Faulted, Reached, Stopped),
+        probe_hole,
+        probe_outcome,
+        probed_completion
     ../support/text_search: find_text, replace_first
 
 
@@ -51,13 +57,13 @@ private pure func site_of(marked: String) -> String:
         NoCompletion:
             "none"
         NameSite(prefix):
-            "name:${text.spelled(prefix)}"
+            "name:${text.spelled(prefix.span)}"
         MemberSite(member):
             qualifier = match member.qualifier:
                 Some(written): text.spelled(written.span)
                 None: "-"
 
-            "member ${qualifier}:${text.spelled(member.prefix)}"
+            "member ${qualifier}:${text.spelled(member.prefix.span)}"
 
 
 private pure func site_is(marked: String, expected: String) -> Bool:
@@ -216,6 +222,172 @@ pure func test_a_chain_dot_at_a_line_start_is_a_member_and_one_ending_a_line_is_
     )
 
 
+-- What a probe of the site at the cursor mark replaces: the whole word at the
+-- cursor, and `called` when an argument list follows it.
+private pure func probed_word(marked: String) -> String:
+    (text, offset) = marked.without_cursor()
+
+    match text.completion_plan(offset, None):
+        Probing(site):
+            hole = site.probe_hole()
+
+            word = text.spelled({
+                source = module_source(root_module_id()),
+                start = hole.start,
+                end = hole.end
+            })
+
+            called: Bool = match site:
+                ProbedMember(member): member.called
+                ProbedName(_): False
+
+            if called:
+                "${word} called"
+            else:
+                word
+        Answered(_):
+            "answered"
+
+
+-- A probe's hole covers the word the cursor is in, ends or starts, so no rest
+-- of it is left to parse.
+-- Each kind of line and token, for the scan below.
+private SITE_SAMPLE: String =
+    raw
+        |---
+        |A doc block.
+        |---
+        |import:
+        |    list: join
+        |
+        |
+        |record Point {
+        |    x: Int
+        |}
+        |
+        |
+        |-- A comment.
+        |pure func area(p: Point, words: List[String]) -> Int:
+        |    total = p.x + 1 -- trailing
+        |    label = "a ${words.join(", ")} b"
+        |    block =
+        |        |line one
+        |        |line ${total}
+        |    if (total >= 2) and not(total == 3):
+        |        print(label)
+        |    sizes = words.map(
+        |        pure func(word: String) -> Int: word.length()
+        |    )
+        |    
+        |    match total:
+        |        0: 1
+        |        _: total.max(2)
+        |
+
+
+-- The lexer refuses a hole only as a fault in blorp, so the server, which
+-- probes only the sites it reads, must never send it one: at every offset of
+-- the sample, with and without its last line feed.
+func test_every_probed_site_is_a_hole_the_lexer_places() -> Bool:
+    unfinished = SITE_SAMPLE
+        .slice(0, SITE_SAMPLE.length() - 1)
+        .get_or("")
+
+    var placed: Bool = True
+
+    for text in [SITE_SAMPLE, unfinished]:
+        for offset in 0..(text.length() + 1):
+            match text.completion_plan(offset, None):
+                Answered(_):
+                    void
+                Probing(site):
+                    hole = site.probe_hole()
+
+                    match lex_with_completion_hole(
+                        module_source(root_module_id()),
+                        text,
+                        program_names().names,
+                        hole
+                    ):
+                        Ok(_):
+                            void
+                        Err(error):
+                            match error.kind:
+                                CompilerFault: placed = False
+                                _: void
+
+    placed
+
+
+-- What the probe of `text`, with an empty hole at `hole`, found.
+private func outcome_of(text: String, hole: Int) -> String:
+    loaded = load_program_with_sources(
+        ROOT,
+        EmbeddedLibrary,
+        [source(ROOT, text)],
+        Some({ start = hole, end = hole })
+    )
+
+    match loaded.probe_outcome():
+        Reached(_, _): "reached"
+        Stopped: "stopped"
+        Faulted(fault): fault.message
+
+
+-- A probe that reaches its hole has its facts, one that stops at the
+-- program's error has none, and a fault in blorp, such as a hole the lexer
+-- cannot place, is told apart so that the transport reports it.
+func test_a_probe_tells_a_stop_from_a_fault() -> Bool:
+    and(
+        and(
+            outcome_of("func main():\n    x = \"a\"\n    x.\n", 31) == "reached",
+            outcome_of("func main():\n    missing()\n    x.\n", 33) == "stopped"
+        ),
+        (
+            outcome_of("func main():\n    print(1)\n", 15)
+            == "internal compiler error: the completion hole is not where a token can start"
+        )
+    )
+
+
+pure func test_a_probe_covers_the_whole_word_at_the_cursor() -> Bool:
+    and(
+        and(
+            "x = name.le¦ngth()\n".probed_word() == "length called",
+            "x = name.¦length\n".probed_word() == "length"
+        ),
+        and(
+            "func f():\n    pr¦int(1)\n".probed_word() == "print",
+            "x = name.¦\n".probed_word() == ""
+        )
+    )
+
+
+-- What the plan at the cursor mark of `marked` is: `none` where nothing
+-- completes, `probe` where a probe answers, else `answered`.
+private pure func plan_is(marked: String, expected: String) -> Bool:
+    (text, offset) = marked.without_cursor()
+
+    found = match text.completion_plan(offset, None):
+        Answered(None): "none"
+        Answered(Some(_)): "answered"
+        Probing(_): "probe"
+
+    found == expected
+
+
+-- The lexer reads a line's indentation, a symbol and a pipe String whole, so
+-- it places no hole inside them, and nothing completes there.
+pure func test_nothing_completes_where_the_lexer_places_no_hole() -> Bool:
+    and(
+        and(
+            "func main():\n    x = 1\n  ¦  print(x)\n".plan_is("none"),
+            "func main():\n    ¦print(1)\n".plan_is("probe")
+        ),
+        and("x = a >¦= b\n".plan_is("none"), "x =\n    ¦|text\n".plan_is("none"))
+    )
+
+
 -- `..` and `...` are symbols of their own, not a dot.
 pure func test_a_range_is_not_a_member() -> Bool:
     and(
@@ -332,7 +504,7 @@ private pure func source(path: String, contents: String) -> SourceFile:
 private func analysed_root(root_text: String) -> Option[Analysis]:
     sources = [source(ROOT, root_text), source(HELPERS, HELPERS_TEXT)]
 
-    match load_program_with_sources(ROOT, EmbeddedLibrary, sources):
+    match load_program_with_sources(ROOT, EmbeddedLibrary, sources, None):
         Ok(loaded):
             match analyze(loaded.program):
                 Ok(analysis): Some(analysis)
@@ -350,7 +522,7 @@ private pure func shown(field: Option[Json]) -> String:
 
 -- An item as a client reads its JSON: its label, kind and sortText.
 private pure func fields(item: Offered) -> (String, String, String):
-    match item.offered_json(Null):
+    match item.offered_json(Null, False):
         Object(sent):
             (shown(sent.get("label")), shown(sent.get("kind")), shown(sent.get("sortText")))
         _:
@@ -363,14 +535,26 @@ private pure func row(item: Offered) -> String:
 
 
 -- The completion at the cursor mark of `marked`, the editor's text, from the
--- root's analysis of `root_text`. None where nothing completes.
+-- root's analysis of `root_text` and, where the site needs one, a probe of
+-- the editor's text. None where nothing completes.
 private func completed_in(marked: String, root_text: String) -> Option[Completion]:
-    match analysed_root(root_text):
-        Some(analysis):
-            (text, offset) = marked.without_cursor()
-            text.completion(offset, analysis)
-        None:
-            None
+    analysis = analysed_root(root_text)
+    (text, offset) = marked.without_cursor()
+
+    match text.completion_plan(offset, analysis):
+        Answered(offering):
+            offering
+        Probing(site):
+            sources = [source(ROOT, text), source(HELPERS, HELPERS_TEXT)]
+
+            loaded = load_program_with_sources(
+                ROOT,
+                EmbeddedLibrary,
+                sources,
+                Some(site.probe_hole())
+            )
+
+            Some(site.probed_completion(loaded.probe_outcome(), analysis))
 
 
 private func completed(marked: String) -> Option[Completion]:
@@ -401,10 +585,13 @@ private pure func labelled(rows: List[String], label: String) -> List[String]:
     rows.filter(pure func(shown_row: String) -> Bool: shown_row.starts_with("${label} "))
 
 
+-- The probe reaches its hole, so the names are those of the text as it is:
+-- `fresh`, which the last analysis did not have, among them.
 func test_a_name_site_lists_each_name_the_module_can_write_with_its_kind_and_rank() -> Bool:
-    rows = "func f() -> Int:\n    ¦\n".rows_at()
+    rows = (ROOT_TEXT.replace_first("    print(\"hi\")\n", "    ¦\n    print(\"hi\")\n") + "\n\npure func fresh() -> Int:\n    1\n").rows_at()
 
     expected = [
+        "fresh 3 1fresh",
         "area 3 1area",
         "hidden 3 1hidden",
         "main 3 1main",
@@ -553,6 +740,33 @@ func test_a_spelling_the_modules_own_variants_share_is_listed_once() -> Bool:
     rows.labelled("Init") == ["Init 20 1Init"]
 
 
+-- A probe that reaches its hole names what the text may name: its own
+-- private variant, and not another module's; a type and a constructor that
+-- share a spelling, each once.
+func test_a_probe_names_the_modules_own_private_variant_and_not_another_modules() -> Bool:
+    marked = ROOT_TEXT.replace_first("func main() -> Int:\n", "func main() -> Int:\n    ¦\n")
+    rows = marked.rows_at()
+
+    and(
+        and(
+            rows.labelled("Init") == ["Init 20 1Init"],
+            rows
+                .labelled("Checked")
+                .is_empty()
+        ),
+        rows
+            .labelled("Box")
+            .holds_exactly(["Box 13 1Box", "Box 20 1Box"])
+    )
+
+
+-- The module's own variants that share `Init` are listed once by a probe too.
+func test_a_probe_lists_a_spelling_the_modules_own_variants_share_once() -> Bool:
+    marked = SHARED_ROOT_TEXT.replace_first("func main() -> Int:\n", "func main() -> Int:\n    ¦\n")
+    rows = marked.rows_in(SHARED_ROOT_TEXT)
+    rows.labelled("Init") == ["Init 20 1Init"]
+
+
 func test_another_modules_private_variant_is_not_offered_after_its_union() -> Bool:
     "x = Email.¦\n".rows_at() == ["Unchecked 20 1Unchecked"]
 
@@ -564,35 +778,34 @@ func test_another_modules_private_variant_is_not_offered_after_its_alias() -> Bo
         .is_empty()
 
 
--- The qualifier is a type that is not a union, a function, a value the scope
--- does not hold, or nothing the namespace knows.
-func test_other_members_offer_nothing_until_values_are_known() -> Bool:
-    and(
-        and(
-            "x = Int.¦\n"
-                .rows_at()
-                .is_empty(),
-            "x = Point.¦\n"
-                .rows_at()
+-- The items after `qualifier.`, on a line in the middle of a body of ROOT_TEXT.
+private func rows_after(qualifier: String) -> List[String]:
+    (ROOT_TEXT + "\n\nfunc f() -> Int:\n    x = ${qualifier}.¦\n    0\n").rows_at()
+
+
+-- A type other than a union, a function and an unknown name have no members;
+-- a constant and a literal are values, with their type's.
+func test_other_members_offer_nothing_when_no_value_is_known() -> Bool:
+    var empty: Bool = True
+
+    for qualifier in ["Int", "Point", "print", "nothing"]:
+        if (
+            qualifier
+                .rows_after()
                 .is_empty()
-        ),
+                .not()
+        ):
+            empty = False
+
+    and(
+        empty,
         and(
-            and(
-                "x = print.¦\n"
-                    .rows_at()
-                    .is_empty(),
-                "x = LIMIT.¦\n"
-                    .rows_at()
-                    .is_empty()
-            ),
-            and(
-                "x = \"abc\".¦\n"
-                    .rows_at()
-                    .is_empty(),
-                "x = nothing.¦\n"
-                    .rows_at()
-                    .is_empty()
-            )
+            "LIMIT"
+                .rows_after()
+                .contains("max 2 1max"),
+            "\"abc\""
+                .rows_after()
+                .contains("length 2 1length")
         )
     )
 
@@ -679,7 +892,20 @@ TESTS: TestSuite = {
             "a chain dot at a line start is a member and one ending a line is not",
             test_a_chain_dot_at_a_line_start_is_a_member_and_one_ending_a_line_is_not
         ),
+        (
+            "nothing completes where the lexer places no hole",
+            test_nothing_completes_where_the_lexer_places_no_hole
+        ),
+        (
+            "every probed site is a hole the lexer places",
+            test_every_probed_site_is_a_hole_the_lexer_places
+        ),
         ("a range is not a member", test_a_range_is_not_a_member),
+        ("a probe tells a stop from a fault", test_a_probe_tells_a_stop_from_a_fault),
+        (
+            "a probe covers the whole word at the cursor",
+            test_a_probe_covers_the_whole_word_at_the_cursor
+        ),
         (
             "a name site lists each name the module can write with its kind and rank",
             test_a_name_site_lists_each_name_the_module_can_write_with_its_kind_and_rank
@@ -711,6 +937,14 @@ TESTS: TestSuite = {
             test_a_spelling_the_modules_own_variants_share_is_listed_once
         ),
         (
+            "a probe names the module's own private variant and not another module's",
+            test_a_probe_names_the_modules_own_private_variant_and_not_another_modules
+        ),
+        (
+            "a probe lists a spelling the module's own variants share once",
+            test_a_probe_lists_a_spelling_the_modules_own_variants_share_once
+        ),
+        (
             "another module's private variant is not offered after its union",
             test_another_modules_private_variant_is_not_offered_after_its_union
         ),
@@ -719,8 +953,8 @@ TESTS: TestSuite = {
             test_another_modules_private_variant_is_not_offered_after_its_alias
         ),
         (
-            "other members offer nothing until values are known",
-            test_other_members_offer_nothing_until_values_are_known
+            "other members offer nothing when no value is known",
+            test_other_members_offer_nothing_when_no_value_is_known
         ),
         ("nowhere to complete gives none", test_nowhere_to_complete_gives_none),
         (

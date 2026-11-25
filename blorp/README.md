@@ -1650,22 +1650,50 @@ references.
 character. The answer is one complete list that the editor filters as the word
 grows, and each item replaces the word before the cursor. It holds:
 
-- at a name, the names the open file's module can write (its declarations,
-  its imports and aliases, and the names the prelude supplies) and the
+- at a name, first the locals and parameters that the code at the cursor can
+  read, then the names the open file's module can write (its declarations,
+  its imports and aliases, and the names the prelude supplies), then the
   keywords;
+- after a value's `.`, its record's fields and the functions and trait
+  methods that a call on it can reach. A call is inserted with its
+  parentheses, with the cursor between them for an editor that reads
+  snippets, or as `name` alone when an argument list already follows the
+  word;
 - after `alias.`, the names that module offers, its types and traits among
   them;
 - after `Union.`, the variants the module may name: all of its own, and
   another module's public ones.
 
-While the program fails to load or check, these names come from its last
-analysis that checked, and a program that never checked offers nothing.
-Nothing is offered in a comment, a string, a number or an import block, after a
-word that declares a new name (`func`, `var`, `for`, `record`, `union`,
-`trait`, `type` or `as`), or past a place where the text stops
-lexing. Other places that declare a name, such as a parameter or a record's
-field, get the list anyway. A value's members and the locals at the cursor are
-not offered yet.
+A completion does not wait for the program to be analysed. The locals, a
+value's members and the module's names come from a probe: the open file's
+text, with the word at the cursor as a hole, checked as far as the cursor. The
+probe checks the function that holds the cursor first, and it stops at:
+
+- an unknown name or another error earlier in the same function;
+- a declaration error, or a module that does not load;
+- a cursor inside a constant's initializer;
+- a member of a callable parameter, such as `callback.`, or of a declared
+  function's name, such as `helper.`.
+
+Then a name offers the module's names from the program's last analysis that
+checked, even a stale one, and the keywords, and a value's `.` offers nothing.
+An alias's names and a union's variants always come from that analysis, so in
+a file that has never checked, `alias.` and `Union.` offer nothing. Inside
+a lambda, an enclosing function's `var` is not offered, since the lambda
+cannot read it. Inside a pure lambda or a concurrent task, an enclosing
+function's resource, or in a task a scoped callable, may be offered, with
+its members, although capturing it is an error that compiling reports. In a
+pure function or a pure lambda, no impure function or trait method is
+offered. A member is offered by the rule a call uses: a
+function whose receiver or bounds cannot fit the value is left out. A lambda
+in the value, such as `map`'s, is checked first, since it fixes the value's
+type, and a value whose type is still not known offers no call. Nothing is
+offered in a comment, a string, a number or an import block, in a line's
+indentation before its last space, inside an operator such as `>=`, at the `|`
+that starts a pipe String, after a word that declares a new name (`func`,
+`var`, `for`, `record`, `union`, `trait`, `type` or `as`), or past a place
+where the text stops lexing. Other places that declare a name, such as a
+parameter or a record's field, get the list anyway.
 
 The server colours a file through `textDocument/semanticTokens/full`, with
 only the protocol's standard token types and modifiers. Keywords, comments,

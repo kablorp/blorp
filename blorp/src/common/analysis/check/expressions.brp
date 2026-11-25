@@ -19,7 +19,7 @@ import:
         WrittenName,
         ParsedRecordField,
         ParsedDictEntry,
-        PostfixOperation(TupleIndex, ReceiverInvocation, FieldAccess),
+        PostfixOperation(TupleIndex, ReceiverInvocation, FieldAccess, CompletionMemberHole),
         ReceiverApplication,
         ComparisonOperator(
             EqualOperator,
@@ -59,7 +59,8 @@ import:
             NegationExpression,
             IfExpression,
             MatchExpression,
-            LambdaExpression
+            LambdaExpression,
+            CompletionNameHole
         ),
         Purity(Pure, Impure),
         TypeSyntax
@@ -91,6 +92,7 @@ import:
         WrittenName methods,
         Caller,
         ReceiverApplication methods
+    ./completion_facts: CompletionFacts(NameFacts, MemberFacts)
     ./constructors:
         ConstructionContext,
         SuspendedConstruction,
@@ -185,11 +187,13 @@ import:
         unsupported_form,
         method_error,
         checker_invariant,
+        completion_hole_reached,
         or_checker_invariant
     ./inference:
         SelectedReceiver,
         missing_method,
         receiver_can_fit,
+        receiver_members,
         PendingBase(
             PendingContext,
             PendingInterpolatedString,
@@ -361,7 +365,9 @@ import:
         ScopedValue(DataLocal, CallableLocal),
         LocalBinding,
         lookup_binding,
-        bind_local
+        bind_local,
+        readable_names,
+        readable_from
     ./signatures: AcceptedFunction
     ./traits: TraitAvailability
     ./well_formed: TraitAvailability methods
@@ -438,6 +444,7 @@ private union ResolvedPostfix:
     InvokeReceiver(ReceiverApplication, ResolvedReceiver)
     ReadIndex(ValueExpression, Span)
     ReadField(WrittenName)
+    ReachCompletionMember(Span)
 
 
 -- A called name: a call with the use of its name, a stored callable read with
@@ -511,7 +518,7 @@ private pure func postfix_hints(
             Some(PendingOverloadInvocation(_, _)):
                 -- A common concrete receiver hint would prove a declaration clash.
                 hint = None
-            Some(PendingField(_)) | Some(PendingTupleIndex(_, _)):
+            Some(PendingField(_)) | Some(PendingTupleIndex(_, _)) | Some(PendingCompletionMember(_)):
                 hint = None
             None:
                 failure = Some(checker_invariant(compiler_span(), InvalidInferenceWorklist))
@@ -525,6 +532,8 @@ private pure func postfix_hints(
 private union PendingPostfix:
     PendingTupleIndex(ValueExpression, Span)
     PendingField(WrittenName)
+    -- Checking stops here, with the receiver's members.
+    PendingCompletionMember(Span)
     PendingReceiverInvocation(ReceiverApplication, PendingCall)
     PendingOverloadInvocation(ReceiverApplication, List[ReceiverFunction])
 
@@ -552,6 +561,8 @@ private union ExpressionWork:
     ScheduleVariant(PendingVariantContract, List[ValueExpression], Span)
     ResolveLambdas(Int, Int)
     FinishLambda(LambdaFinish)
+    -- Reads the members at a completion hole once the lambdas have resolved.
+    ReadCompletionMembers(Span, InferenceUse, ResolutionContext)
     ContinuePostfix(
         List[PendingPostfix],
         List[Option[InferenceType]],
@@ -1228,6 +1239,16 @@ private pure func plan_dict_literal(
         Ok(PlannedCall(empty, [], ReturnPlacement(span, body.span), expectation, NoUses))
 
 
+-- Out of `plan_body_base`, where the same code costs a compile 0.04%.
+private pure func name_hole_reached(
+    scope: List[ScopedValue],
+    context: ResolutionContext,
+    hole: Span
+) -> CheckError:
+    locals = scope.readable_names(context.caller.body)
+    completion_hole_reached(hole, NameFacts({ locals = locals, namespace = context.namespace }))
+
+
 private pure func plan_body_base(
     scope: List[ScopedValue],
     body: ValueExpression,
@@ -1336,17 +1357,16 @@ private pure func plan_body_base(
                                 read
                             )
                         )
-                    else:
-                        if binding.binding_definition().mutable:
-                            Err(context.mutable_capture_error(name, binding))
-                        else:
-                            Ok(
-                                PlannedLeaf(
-                                    PendingCapture(binding.binding_site().binding, name.id),
-                                    binding.binding_definition().value_type,
-                                    read
-                                )
+                    else if binding.readable_from(context.caller.body):
+                        Ok(
+                            PlannedLeaf(
+                                PendingCapture(binding.binding_site().binding, name.id),
+                                binding.binding_definition().value_type,
+                                read
                             )
+                        )
+                    else:
+                        Err(context.mutable_capture_error(name, binding))
                 Some(CallableLocal(binding)):
                     local = binding.callable_local()
 
@@ -1421,6 +1441,8 @@ private pure func plan_body_base(
             Err(unsupported_form(body.base_span, MatchInExpression))
         LambdaExpression(_):
             Ok(PlannedCallable(body, expectation))
+        CompletionNameHole(hole):
+            Err(scope.name_hole_reached(context, hole))
 
         RecordExpression(_) | ListExpression(_) | TupleExpression(_) | VoidExpression | InterpolatedString(_) | StringExpression(_) | IntegerExpression(_) | FloatExpression(_):
             Err(checker_invariant(body.span, InvalidInferenceWorklist))
@@ -1618,6 +1640,10 @@ private pure func resolve_postfixes(
                 contracts = contracts.append(ReadIndex(index, span))
             FieldAccess(name):
                 contracts = contracts.append(ReadField(name))
+            -- What follows the hole is never checked.
+            CompletionMemberHole(hole):
+                contracts = contracts.append(ReachCompletionMember(hole))
+                break
             ReceiverInvocation(application):
                 match scope.lookup_binding(application.callee.id):
                     Some(CallableLocal(binding)):
@@ -2062,6 +2088,9 @@ private pure func elaborate_value(
     var operands: List[Option[PendingValue]] = []
     var operand_count = 0
     var result_incompatible: Bool = False
+    -- Whether a completion hole waits for the lambdas: then resolution that
+    -- stalls reports nothing, and the hole reads what is known.
+    var hole_waits: Bool = False
     var accepted: Option[CheckedExpr] = None
     var failure: Option[CheckError] = None
 
@@ -2203,6 +2232,10 @@ private pure func elaborate_value(
                                             )
                                         ReadField(name):
                                             postfixes = postfixes.append(PendingField(name))
+                                        ReachCompletionMember(hole):
+                                            postfixes = postfixes.append(
+                                                PendingCompletionMember(hole)
+                                            )
                                         InvokeReceiver(application, receiver):
                                             match receiver:
                                                 ReceiverCandidates(candidates):
@@ -3383,6 +3416,45 @@ private pure func elaborate_value(
                                                     )
 
                                                     operand_count = operand_count + 1
+                                        Some(PendingCompletionMember(hole)):
+                                            -- A lambda in the receiver, such as `map`'s, fixes its
+                                            -- type, so the lambdas resolve first. Inside a lambda
+                                            -- that is resolving, they cannot: it is one of them.
+                                            match site.body_context(hole):
+                                                Ok(context):
+                                                    receiver = current.pending_receiver_use()
+
+                                                    reading: ExpressionWork = ReadCompletionMembers(
+                                                        hole,
+                                                        receiver,
+                                                        context
+                                                    )
+
+                                                    work = work.push_at(work_count, Some(reading))
+                                                    work_count = work_count + 1
+
+                                                    -- Resolution reaches the hole again in a lambda that
+                                                    -- is resolving, or in a construction waiting for its
+                                                    -- type; the members are read at once then.
+                                                    if hole_waits.not():
+                                                        hole_waits = match context.caller.body:
+                                                            model.LambdaBody(_): False
+                                                            _: True
+
+                                                        if hole_waits:
+                                                            resolving: ExpressionWork = ResolveContexts(
+                                                                0,
+                                                                inference_revision
+                                                            )
+
+                                                            work = work.push_at(
+                                                                work_count,
+                                                                Some(resolving)
+                                                            )
+
+                                                            work_count = work_count + 1
+                                                Err(error):
+                                                    failure = Some(error)
                                         Some(PendingReceiverInvocation(application, call)):
                                             match current.unique_receiver_fit(
                                                 application,
@@ -3631,7 +3703,7 @@ private pure func elaborate_value(
 
                                             work = work.push_at(work_count, Some(next_resolution))
                                             work_count = work_count + 1
-                                        else:
+                                        else if hole_waits.not():
                                             for pending in context_work:
                                                 match pending:
                                                     AwaitingContext(construct, _, _, _, _):
@@ -3866,6 +3938,10 @@ private pure func elaborate_value(
                                 failure = Some(
                                     checker_invariant(body.span, InvalidInferenceWorklist)
                                 )
+                    ReadCompletionMembers(hole, receiver, context):
+                        failure = match context.receiver_members(receiver, slots, assumptions):
+                            Ok(members): Some(completion_hole_reached(hole, MemberFacts(members)))
+                            Err(error): Some(error)
                     FinishRoot:
                         operand_count = operand_count - 1
                         value_result = operands.expression_operand(operand_count, body.span)

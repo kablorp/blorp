@@ -14,15 +14,20 @@ import:
     ../namespace/namespace: OfferedValue(OfferedFunction), TypeHead(ListHead), offered_value
     ./callables:
         FunctionContract,
+        accept_method_call,
         accepted_function,
+        calls_impure_from_pure,
         listed_function,
+        method_id_contract,
         ResolutionContext,
         method_sites,
         receiver_head,
         Caller,
         TraitAvailability methods
+    ./completion_facts: ReceiverMembers
     ./errors:
         CheckError,
+        CheckErrorKind(InternalInvariant),
         GenericConflict,
         LiteralBinding,
         MethodError(NoApplicableMethod, MethodReceiverNeedsType),
@@ -44,7 +49,8 @@ import:
             InvalidInferenceWorklist,
             InvalidFunctionContract,
             MissingCallParameter,
-            MissingGenericParameter
+            MissingGenericParameter,
+            InvalidRecordDeclaration
         ),
         call_error,
         checker_invariant,
@@ -52,7 +58,7 @@ import:
     ./model:
         CheckedExpr,
         BindingId,
-        AggregateId,
+        AggregateId(RecordAggregate),
         CaptureId,
         ScopedBindingId,
         LambdaId,
@@ -61,6 +67,7 @@ import:
         FunctionSignature,
         TraitRequirement,
         ReceiverFunction,
+        ReceiverLookup(VisibleFunctions, VisibleMethod),
         CallIdentity(
             RuntimeTarget,
             MethodTarget,
@@ -2258,15 +2265,16 @@ private pure func with_flexible_parameters(
     flexible
 
 
--- Whether some solution of `slots`' unbound variables and of `declared`'s own
--- parameters makes `declared` equal to `actual`. The trial solution is discarded.
-private pure func admits(
+-- The solution of `slots`' unbound variables and of `declared`'s own
+-- parameters, numbered after them, that makes `declared` equal to `actual`, if
+-- one does: a trial that no caller keeps.
+private pure func admitting(
     declared: TypeRef,
     declared_parameters: List[TypeParameterId],
     actual: InferenceType,
     slots: List[InferenceSlot],
     span: Span
-) -> Result[Bool, CheckError]:
+) -> Result[Option[List[InferenceSlot]], CheckError]:
     equality: InferenceEquality = {
         expected = declared.inference_type(declared_parameters, slots.length()),
         actual = actual,
@@ -2275,9 +2283,20 @@ private pure func admits(
         parameter = None
     }
 
-    match equality.solve_overlap(slots.with_flexible_parameters(declared_parameters, span)):
-        Err(invariant): Err(invariant)
-        Ok(unified): Ok(unified.is_some())
+    equality.solve_overlap(slots.with_flexible_parameters(declared_parameters, span))
+
+
+-- Whether some solution of `slots`' unbound variables and of `declared`'s own
+-- parameters makes `declared` equal to `actual`.
+private pure func admits(
+    declared: TypeRef,
+    declared_parameters: List[TypeParameterId],
+    actual: InferenceType,
+    slots: List[InferenceSlot],
+    span: Span
+) -> Result[Bool, CheckError]:
+    unified ?= declared.admitting(declared_parameters, actual, slots, span)
+    Ok(unified.is_some())
 
 
 -- Both declarations' parameters are flexible in separate variable ranges.
@@ -2454,6 +2473,173 @@ private pure func choose_receiver(
                                     MethodReceiverNeedsType(callee.id, sites)
                                 )
                             )
+
+
+-- The trial solution under which `signature`'s receiver parameter admits a
+-- receiver of type `actual`, as far as it is known: the one `admits` discards
+-- when `choose_receiver` keeps a candidate.
+private pure func receiver_trial(
+    signature: FunctionSignature,
+    actual: InferenceUse,
+    slots: List[InferenceSlot]
+) -> Result[Option[List[InferenceSlot]], CheckError]:
+    match signature.parameters.get(0):
+        Some(receiver_parameter):
+            receiver_parameter.value_type.admitting(
+                signature.type_parameters,
+                actual.value_type,
+                slots,
+                actual.span
+            )
+        None:
+            Ok(None)
+
+
+-- Whether `signature`'s bounds can still hold under `trial`, in which its type
+-- parameters are the variables from `first`. A bound on an argument the trial
+-- solves is proved as a call proves it; one on an unsolved argument could
+-- still hold.
+private pure func bounds_can_hold(
+    signature: FunctionSignature,
+    trial: List[InferenceSlot],
+    first: Int,
+    traits: TraitAvailability,
+    assumptions: List[TraitRequirement],
+    span: Span
+) -> Result[Bool, CheckError]:
+    parameters = signature.type_parameters
+
+    variables = parameters.map(
+        pure func(parameter): ParameterType(parameter).inference_type(parameters, first)
+    )
+
+    arguments ?= variables.translated_list(
+        pure func(variable): variable.publish_inference_type(trial, DiagnosticInference, span)
+    )
+
+    solved ?= variables.translated_list(
+        pure func(variable): variable.inference_complete(trial, span)
+    )
+
+    known = signature.requirements.filter(
+        pure func(bound: TraitRequirement) -> Bool: solved
+            .get(bound.parameter.parameter_position())
+            .get_or(False)
+    )
+
+    traits
+        .prove_requirements({ signature | requirements = known }, arguments, assumptions, span)
+        .accepts()
+
+
+-- Whether a check accepted. A rejection is False; a fault in checking itself
+-- is no answer, so it passes through.
+private pure func accepts[T](checked: Result[T, CheckError]) -> Result[Bool, CheckError]:
+    match checked:
+        Ok(_):
+            Ok(True)
+        Err(error):
+            match error.kind:
+                InternalInvariant(_): Err(error)
+                _: Ok(False)
+
+
+-- What may follow the dot after a receiver of type `actual`, each by the rule
+-- checking accepts it with:
+-- - a record's fields;
+-- - each name of the receiver scope with a function that `choose_receiver`
+--   could choose for the receiver, without the name, and whose bounds can hold;
+-- - each visible trait method whose call `accept_method_call` accepts.
+-- A pure caller is offered no impure call, which `validate_purity` rejects.
+-- The receiver's lambdas are checked first, so its type is complete unless
+-- nothing fixes it yet; then whether a call is accepted depends on the part
+-- not known, and none is offered.
+pure func receiver_members(
+    context: ResolutionContext,
+    actual: InferenceUse,
+    slots: List[InferenceSlot],
+    assumptions: List[TraitRequirement]
+) -> Result[ReceiverMembers, CheckError]:
+    span = actual.span
+    complete ?= actual.value_type.inference_complete(slots, span)
+    receiver ?= actual.value_type.publish_inference_type(slots, DiagnosticInference, span)
+
+    fields ?= match receiver:
+        NominalType(RecordAggregate(id), _):
+            context.records
+                .get(id.record_number())
+                .or_checker_invariant(span, InvalidRecordDeclaration(id))
+                .map(
+                    pure func(declaration) -> List[NameId]: declaration.fields.map(
+                        pure func(field) -> NameId: field.name.id
+                    )
+                )
+        _:
+            Ok([])
+
+    var calls: List[NameId] = []
+    var failure: Option[CheckError] = None
+
+    call_candidates: List[(NameId, ReceiverLookup)] = if complete:
+        context.receiver_scope.names.entries()
+    else:
+        []
+
+    for (name, lookup) in call_candidates:
+        offered: Result[Bool, CheckError] = match lookup:
+            VisibleFunctions(candidates):
+                var fits: Result[Bool, CheckError] = Ok(False)
+
+                for candidate in candidates:
+                    fits = match accepted_function(span, candidate.id, context.signatures):
+                        Err(error):
+                            Err(error)
+                        Ok(accepted):
+                            match accepted.signature.receiver_trial(actual, slots):
+                                Ok(Some(trial)):
+                                    if context.caller.calls_impure_from_pure(accepted.signature):
+                                        Ok(False)
+                                    else:
+                                        accepted.signature.bounds_can_hold(
+                                            trial,
+                                            slots.length(),
+                                            context.traits,
+                                            assumptions,
+                                            span
+                                        )
+                                Ok(None):
+                                    Ok(False)
+                                Err(error):
+                                    Err(error)
+
+                    match fits:
+                        Ok(False): void
+                        _: break
+
+                fits
+            VisibleMethod(method):
+                match method_id_contract(span, method, context.traits.accepted_traits()):
+                    Ok(contract):
+                        if context.caller.calls_impure_from_pure(contract.signature):
+                            Ok(False)
+                        else:
+                            context.traits
+                                .accept_method_call(method, receiver, assumptions, span)
+                                .accepts()
+                    Err(error):
+                        Err(error)
+
+        match offered:
+            Ok(True): calls = calls.append(name)
+            Ok(False): void
+            Err(error): failure = Some(error)
+
+        if failure.is_some():
+            break
+
+    match failure:
+        Some(error): Err(error)
+        None: Ok({ fields = fields, calls = calls })
 
 
 -- The receiver function the receiver's type chose: its call contract, and the

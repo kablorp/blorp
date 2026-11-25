@@ -3,7 +3,8 @@
 **Status: plan, 2026-11-10; Keith settled its decisions and asked for a byte
 console on 2026-11-11. Landings 1–16 and 17a have landed. Landing 17,
 completion, was planned on 2026-11-23: 17a, names and qualifiers, is done,
-and Keith chose a completion hole for 17b, which a spike has tried.**
+and 17b, a value's members and the locals through a completion hole, has
+landed, within the ceilings Keith raised.**
 
 ## Problem
 
@@ -301,22 +302,25 @@ Landing **17a** completes names and qualifiers from facts the namespace
 already publishes. Landing **17b** completes a value's members and the
 locals at the cursor through a completion hole, which Keith chose on
 2026-11-23 because the cut does not check in most of the places a member is
-typed (17b below).
+typed (17b below). A probe in 17b replaces 17a's analysis of the root.
 
 #### The protocol
 
 - `initialize` announces `completionProvider: { triggerCharacters: ["."] }`
   without `resolveProvider`, since every item is complete when sent.
-- `textDocument/completion` becomes `CompletionQuery(Position)` of
-  `DocumentQuery`, answered like a definition: from the root's analysis,
-  analysed first when stale. While the root fails, its last analysis that
-  checked answers. `context.triggerKind` is not read, because the text says
-  whether a dot comes before the cursor.
+- `textDocument/completion` never analyses the root, from 17b on. The
+  editor's text gives the site. The locals, a value's members and the
+  module's names come from a probe of the text (17b below); an alias's names,
+  a union's variants and, after a probe that stops, the module's names come
+  from the root's latest analysis that checked, current or stale. In 17a, a `CompletionQuery(Position)` of `DocumentQuery`
+  analysed a stale root first, as a definition does. `context.triggerKind` is
+  not read, because the text says whether a dot comes before the cursor.
 - The answer is a `CompletionList` with `isIncomplete: false`. It holds every
   name the site allows, unfiltered, so the client filters as the word grows
-  and asks again only at a new word. A site with nothing to offer, a program
-  that never checked and a library document get an empty list. A document
-  that is not open gets `null`.
+  and asks again only at a new word. A site with nothing to offer and a
+  library document get an empty list. In a program that never checked, a
+  name offers only the probe's locals and the keywords. A document that is
+  not open gets `null`.
 - Each item has `label`, `kind`, `sortText`, and a `textEdit` that replaces
   the site's prefix with the label. The specification recommends `textEdit`
   over `insertText`, which a client may reinterpret. `sortText` is a rank,
@@ -333,10 +337,12 @@ typed (17b below).
   - Interface for a trait and Module for an alias;
   - Variable for a local or a parameter.
 - A member call (17b) inserts the call, since `x.f` without parentheses is a
-  field read. It inserts `length()`, or the snippet `get($0)` when the
-  function takes more than its receiver and the client sets
-  `completionItem.snippetSupport`. Every other name inserts the name alone,
-  since a function's name is also a value.
+  field read. For a client that sets `completionItem.snippetSupport`, it is
+  the snippet `length($0)`, with `insertTextFormat` 2, so the cursor lands
+  between the parentheses; otherwise `length()`. When an argument list
+  already follows the word, the call is inserted as the bare name. Every
+  other name inserts the name alone, since a function's name is also a
+  value.
 - `detail` is not sent. A type's text needs `render`'s private
   `type_spelling` (`check/render.brp:2210`), which hover needs too, so both
   come with hover.
@@ -437,8 +443,8 @@ variants are unique within their union, and `offer` never offers an alias.
 - **A member whose qualifier the root names as a union** (`named_type` gives
   `UnionHead`): its variants, read from the declaration inventory the
   analysis already shares, and ordered by label like every other item.
-- **Any other member** gets nothing until 17b: one with no qualifier, or a
-  qualifier that names a value, a function or another type.
+- **Any other member** gets nothing in 17a: one with no qualifier, or a
+  qualifier that names a value, a function or another type. 17b probes it.
 
 This distinction comes from name resolution, and it is exact: a qualifier
 that the root's scope holds as an alias or a type is never a local.
@@ -462,7 +468,9 @@ call.
 - filtering by the prefix in the server, since the client filters a
   complete list;
 - answering a stale root without analysing it, which would make 17a's
-  answers older than its definitions are.
+  answers older than its definitions are. 17b answers without analysing,
+  from a probe of the text as it is; only a probe that stops falls back to
+  the last analysis that checked, as 17a does for a root that fails.
 
 **Docs.**
 - `blorp/README.md`, "The language server", gains a paragraph after
@@ -976,195 +984,291 @@ pure func offered_json(item: Offered, range: Json) -> Json:
 
 #### 17b: a value's members and the locals at the cursor
 
-**What the cut meets.** Checking stops at its first error, so a probe
-answers only if its text checks. The cut puts the receiver where the
-member's value was, and most places constrain that value. Each row below is
-a small program with the cut already applied, compiled by an `-O2` build of
-main from 2026-11-22:
+**The design: a completion hole** (Keith, 2026-11-23, after a spike). The
+probe keeps the editor's text and names the whole word at the cursor as a
+hole. Lexing, parsing and checking each know the hole by a type of its own,
+and checking stops at it with what it knows there. This is not error
+recovery: no phase continues past an error, and only the server names a
+hole, which compilation never does. Lean 4 is the closest precedent: its
+elaborator records completion information at the cursor (a dot's receiver
+and the local context) for the server to read. GHC's typed holes report a
+hole's type and the bindings in scope.
 
-| Where the member is typed | After the cut | Result |
-| --- | --- | --- |
-| the last line of a Void function | `name` | checks |
-| a statement in the middle of a body | `name` | `expression statement must return Void` |
-| bound without annotation, unused so far | `n = items` | checks |
-| bound, then used | `n = items` then `n + 1` | `argument type does not match the parameter type` |
-| bound with an annotation | `n: Int = items` | `expression does not match the expected type` |
-| a typed function's result | `name` in `-> Int` | `expression does not match the expected type` |
-| an argument | `size(items)` | `argument type does not match the parameter type` |
-| an `if` condition | `if items:` | `condition must have the designated Bool type` |
-| a `match` scrutinee | `match items:` | `pattern does not match the value's type` |
-| a typed lambda's result | `x` in `-> Int` | `expression does not match the expected type` |
-| a `for` iterable | `for x in items:` | checks |
-| interpolated | `"${name}"`, `"${items}"` | checks for a `String`; for a `List[Int]`, `interpolation hole has type List[Int], which does not implement Stringable` |
+**Rejected: the cut.** Keith first chose a probe of the text with the
+unfinished member cut out (A above). Checking stops at its first error, and
+the cut leaves the receiver where the member's value was, a place that most
+code constrains. The cut checks in only four of the places in the table
+below: the last line of a Void function, a binding not yet used, a `for`
+iterable and an interpolated `String`. It fails on a new line in the middle
+of a body, which is where `name.` is typed most often. It would also have needed the
+root's receiver scope kept in `Analysis`, an extent for each binding, and a
+`line_map` insertion point for a line being written. A call that cannot
+resolve, such as `.zzz()`, was rejected too: it reads a fact out of a
+failure, and no lower_snake name is sure never to resolve.
 
-`_ = name` is not a statement either (`expected a return expression`). So
-the cut fails on a new line in the middle of a body, which is the most common
-place to type `name.`. It also fails in typed results, arguments, conditions
-and `match` scrutinees. This is why Keith chose option 2 on 2026-11-23,
-"starting with a spike".
+**Where each probe answers.** Each row is a small program with a member typed
+at one place. The cut's column compiles it with the cut applied, by an `-O2`
+build of main from 2026-11-22. The hole's column probes the same place, in
+the spike and in `test_completion_probe.brp`:
 
-The same programs with `.zzz()` in place of the cut show what a probe can
-rely on. The mid-body statement, the typed result, the condition, the
-scrutinee, the lambda's result and a chained call as an argument each fail
-first with `no method zzz for String is in scope` or `... for List[Int] ...`.
-The checker reaches a receiver's member before it compares the member's
-value with its place.
+| Where the member is typed | After the cut | The cut | The hole |
+| --- | --- | --- | --- |
+| the last line of a Void function | `name` | checks | `String`'s members |
+| a statement in the middle of a body | `name` | `expression statement must return Void` | `String`'s members |
+| bound without annotation, unused so far | `n = items` | checks | `List[Int]`'s members |
+| bound, then used | `n = items` then `n + 1` | `argument type does not match the parameter type` | `List[Int]`'s members |
+| bound with an annotation | `n: Int = items` | `expression does not match the expected type` | `List[Int]`'s members |
+| a typed function's result | `name` in `-> Int` | `expression does not match the expected type` | `String`'s members |
+| an argument | `size(items)` | `argument type does not match the parameter type` | `List[Int]`'s members |
+| an `if` condition | `if items:` | `condition must have the designated Bool type` | `List[Int]`'s members |
+| a `match` scrutinee | `match items:` | `pattern does not match the value's type` | `List[Int]`'s members |
+| a typed lambda's result | `x` in `-> Int` | `expression does not match the expected type` | `String`'s members |
+| a `for` iterable, with a line after the loop | `for x in items:` | checks | `List[Int]`'s members |
+| interpolated | `"${name}"`, `"${items}"` | checks for a `String`; for a `List[Int]`, `interpolation hole has type List[Int], which does not implement Stringable` | the value's members |
+| a list whose element type is unknown | `items = []` | stops at the binding | stops at the binding: `cannot infer the element type of an empty list literal` |
 
-**Option 1: the cut, as Keith chose it.** The probe text is the editor's
-text without the bytes from the dot's start to the prefix's end. The loader
-takes it as the root's snapshot, unchanged.
-- **The receiver** is the innermost `CheckedExpr` of the root whose span
-  ends at the cut. An enclosing expression that also ends there, such as
-  `total + name`, starts earlier. No expression ends there when the receiver
-  is a parenthesized group (`(a + b).`), since Check does not see groups.
-- **Its candidates** come from the root's receiver scope, which `Analysis`
-  would have to keep. Today the scopes end with body checking
-  (`check/model.brp:29`). A new
-  check query applies `admits` (`check/inference.brp:2221`) to a complete
-  type, which is the fitting rule `choose_receiver` (`:2360`) uses.
-- **Locals** need to know where each binding is visible, and nothing records
-  that today. There are two ways:
-  - check records an extent in each `BindingDefinition`
-    (`check/model.brp:958`). That is one fact at the phase that owns scope,
-    but every compile pays for it;
-  - the server walks `CheckedFunctionBody` and derives the scope rule again.
-    That is a second authority for matches, loops and captures, so it is
-    rejected.
-- **A line being written** is not in the root's last checked analysis, so
-  `line_map` would need an insertion point. The end of the previous
-  unchanged line can sit in a block the new line has left by its
-  indentation, so the query would need the cursor's indentation too.
+Two of the plan's programs were wrong before the spike. The `for` program
+ended its body with the loop, and a body cannot end with `for` (`expected a
+final expression after the bindings`), so it did not parse at all. The row
+now has a line after the loop. And `items = []`, meant to give a receiver
+whose type is only partly known, fails at the binding, before its member. Such
+a receiver comes from a call's result. When an untyped lambda in the call fixes
+the type, the probe checks that lambda first (below); when nothing fixes it
+yet, as for `nothing().` with `nothing[T]() -> List[T]`, it offers no call.
 
-It answers in 3 of the table's 12 rows, and in a fourth when the
-interpolated value is Stringable.
+**Lexing.** `lex_with_completion_hole` (`syntax/lex.brp:1933`) takes a
+`CompletionHole` (`syntax/syntax.brp:236`), a byte range, and returns the
+tokens with `LexedProgram.completion_hole`, the index of the one
+`TokenKind.CompletionHoleToken` that stands in place of the word. It checks
+the hole first: it is empty or a whole word, inside the text. A hole that no
+token can start at fails loudly as an internal error, since the server never
+sends one: it asks the lexer before it probes (below), and a test probes
+every offset of a sample to hold it to that.
+- The hole travels as a parameter, `Option[CompletionHole]`, to the six scans
+  that place it: `lex_text`, `next_code_line`, `line_code`, `pipe_tokens`,
+  `quoted_tokens` and `interpolation_tokens`. It is not a field of
+  `SourceText`. That record is passed by value to every byte test, and the
+  hole would have grown it from 16 to 40 bytes, which arm64 passes through
+  memory. Measured on its own, that cost +0.177% of fixed-input instructions
+  (Measurements).
+- The token loop scans to `stop`: the end of the source in compilation, or
+  the hole's start in a probe. The hole is placed once, outside the inner
+  loop, unless a token already holds that byte. `lex` passes `None`.
+- A blank line whose indentation ends at the hole is a code line, and so is a
+  last line, empty or of indentation, at the end of the source. A hole inside
+  a string's `${…}` is lexed there.
 
-**Option 2: a completion hole (recommended).** The probe keeps the editor's
-text and names the prefix's span as the hole.
-- **Lexing** turns the hole into one `HoleToken` in place of the prefix, so
-  no later phase reads a position.
-- **Parsing** accepts the hole where it requires a name today: as an
-  expression's base (`NameHole`) and as a member after a value
-  (`MemberHole`, at `consume_postfix`, `syntax/parse.brp:1865`).
-- **Checking** checks the body that holds the hole first. When it reaches
-  the hole it stops with what it knows there:
-  - the bindings a read at the hole would accept, which is its own `scope`
-    (`check/scope.brp:44`) without an enclosing body's mutable bindings
-    inside a lambda, since a read there rejects them;
-  - for a member hole: the receiver's type as far as it is known; the names
-    in the module's receiver scope that have a function whose receiver
-    parameter admits it, by `choose_receiver`'s rule without the name; the
-    trait methods the type implements; and a record's fields.
+**Parsing.** `ExpressionBase` gains `CompletionNameHole(Span)`, read by
+`consume_base`, and `PostfixOperation` gains `CompletionMemberHole(Span)`,
+read by `consume_postfix` (`syntax/parse.brp:1879`). When the word at the
+cursor is already called, as in `name.le|()`, the argument list after the
+hole is parsed and dropped (`past_hole_arguments`, `:1903`), because checking
+stops at the hole and never reads it.
 
-It should answer in every row of the table. The `.zzz()` programs show the
-checker reaching the member before the member's place in six of the rows,
-and the spike checks the others. `join` is offered on a `List[String]` and
-not on a `List[Int]`. The probe
-checks the signatures and only one body, and that body only up to the hole,
-so it may cost less than an analysis; a spike measures it. Locals come from
-the checker's own scope, so it needs no binding extents, no walk in the
-server and no `line_map` query.
+The program says which body holds the hole: one fact, in one place.
+- `holding_hole` (`:5111`) names the function whose tokens include the hole's.
+  That function can be a free function, an implementation's method or a
+  trait's default. Methods and defaults carry the name up through their own
+  result records, not on `ParserState`, which every parse step copies.
+- `ParsedModuleContents.completion_function: Option[WrittenName]` keeps it.
+- At sealing, assembly turns it into `ParsedContents.completion_body:
+  Option[FunctionId]` (`analysis/assemble.brp:777`). It finds the declaration
+  in the inventory by the written name's identity, its id and span. The
+  parser named a function it read, so a miss is a seal fault, not a probe
+  checked in declaration order.
+- Compilation has `None`. That field accounts for the +16 bytes of peak
+  heap.
 
-It fails only when checking stops before the hole: a load or declaration
-error, or an error earlier in the same body. Then a name site falls back to
-17a, and a member site offers nothing.
-
-It is not error recovery. No phase continues past an error, and the hole is
-a site the caller names, which compilation never does. Lean 4 is the
-closest precedent: its elaborator records completion information at the
-cursor (a dot's receiver and the local context) for the server to read.
-GHC's typed holes report a hole's type and the bindings in scope, and
-Merlin types its recovery holes at any type.
-
-It adds a mechanism to lex, parse and check, and to the loader's root
-snapshot, so `blorp/AGENTS.md` requires Keith's approval. One question
-remains open inside it: how checking stops at the hole. The cheapest way is
-one more `CheckError` case, `HoleReached(CompletionFacts)`. Only
-`analyze_completion` unwraps it, and `render` reports it as a checker
-invariant, since compilation never lexes a hole. The alternative threads a
-probe result through every checking function's return type.
-
-**Rejected: a member that cannot resolve.** Writing a call such as `.zzz()`
-in place of the prefix reaches `NoApplicableMethod`, whose
-`MissingMethod.receiver` (`check/errors.brp:119`) is the receiver's type, in
-each of the six places tested. But it reads a fact out of a failure, and it
-depends on that
-error being the first one checking reports. It also needs a name that no
-function can have. A member must be lower_snake (`syntax/parse.brp:1865`),
-so no spelling is guaranteed never to resolve.
-
-**What both options share.** A completion probe never disturbs the root. It
-is a fourth `Followup`, and the server answers its result without storing
-anything. The root keeps its analysis, its staleness and its published
-diagnostics, because the probe's text is not the document's. `Followup`
-(`lsp/server.brp:246`) gains:
+**Checking.**
+- `resolve_functions` (`check/bodies.brp:2298`) puts `completion_body`
+  first, so an error in another body cannot stop checking before the hole.
+- At a name hole, checking stops with
+  `CheckErrorKind.CompletionHoleReached(NameFacts(...))`. The facts are the
+  names a read there accepts, in scope order (`readable_names`,
+  `check/scope.brp`), and the probe's namespace. Inside a lambda the names
+  leave out an enclosing body's `var`s, which no read there may take.
+- At a member hole, checking resolves the receiver's use and pushes
+  `ReadCompletionMembers` beneath the expression's lambda resolution
+  (`ResolveContexts`, then `ResolveLambdas`), which runs as at the end of an
+  expression but reports nothing when it stalls. A lambda in the receiver,
+  such as `map`'s, fixes the receiver's type, so its body is checked first.
+  Inside a lambda that is itself resolving, the lambdas cannot resolve, since
+  it is one of them, and the members are read at once. Resolution can also
+  reach the hole a second time, when the hole sits in a record or variant
+  literal that waits for its type; only the first visit pushes the
+  resolution, and the second reads the members. Then checking stops
+  with `MemberFacts`, from `receiver_members` (`check/inference.brp:2504`).
+  What follows the hole is never checked.
+- `analyze_completion` (`check/check.brp:269`) unwraps the facts.
+- Two invariants cover the cases that cannot happen. `render` reports a
+  reached hole as `CompletionHoleRendered`, since compilation never lexes
+  one. A probe whose checking ends without reaching its hole is
+  `CompletionHoleUnreached`, since its body is checked.
 
 ```blorp
-    -- Analyse a completion probe of an open root, with every other open
-    -- document as it is, and hand the result to `probed`.
-    Probe(ProbeRequest)
-
-
--- A completion request that waits for its probe: the root, the request, and
--- what the probe analyses in place of the root's text (option 1: the cut
--- text; option 2: the text and its hole) with the prefix its items replace.
-record ProbeRequest {
-    root: Path,
-    id: RequestId,
-    probe: CompletionProbe
+-- What a name hole may name: the locals and parameters a read there accepts,
+-- in scope order, and the probe's namespace, whose module names are current
+-- where the root's last analysis may be stale.
+record NamesAtHole {
+    locals: List[NameId],
+    namespace: Namespace
 }
 
 
--- Answers `asked` from `result` and changes nothing else.
-pure func probed(server: Server, asked: ProbeRequest, result: ProbeResult) -> Step
-```
-
-`perform` (`lsp/lsp_command.brp:120`) gains its fourth arm. It is the only
-impure part of the probe:
-
-```blorp
-        Probe(request):
-            step.server
-                .probed(request, request.probe.probe_result(step.server.snapshots()))
-                .perform()
-```
-
-Under option 2, the syntax (`syntax/syntax.brp:214`, `:365`, `:415`) and
-check's boundary gain:
-
-```blorp
-union TokenKind:
-    ...
-    -- Where an editor asks what may be written. Only lexing that is given a
-    -- hole makes one, in place of the prefix; compilation never does.
-    HoleToken
-
-union ExpressionBase:
-    ...
-    NameHole(Span)
-
-union PostfixOperation:
-    ...
-    MemberHole(Span)
-```
-
-```blorp
--- What checking knew at the hole, with the scopes that spell it.
-record CompletionFacts {
-    visible: List[VisibleBinding],
-    member: Option[MemberFacts],
-    namespace: Namespace,
-    names: NameTable
+-- What may follow a receiver's dot: its record's fields, and the names of the
+-- functions and trait methods a call on it can reach.
+record ReceiverMembers {
+    fields: List[NameId],
+    calls: List[NameId]
 }
+
+
+union CompletionFacts:
+    -- A name hole. A lambda reads no enclosing body's `var`.
+    NameFacts(NamesAtHole)
+    -- A member hole after a value: what may follow its dot.
+    MemberFacts(ReceiverMembers)
 
 
 pure func analyze_completion(program: ParsedProgram) -> Result[CompletionFacts, CheckFailure]
 ```
 
-With option 2, a completion request on the root probes and never analyses
-the root. A name site takes its locals and module names from the probe,
-which removes 17a's analysis of a stale root at each new word. A member
-call's snippet needs `completionItem.snippetSupport`, which `initialize`
-reads into the session, as it reads `refreshSupport`.
+The ids are the probe's own and name nothing in any other analysis. The
+server spells them from the probe's name table.
+
+**What a member hole offers.** Each member is offered by the rule that
+checking uses to accept it. Offering a member that checking then rejects is a
+defect; leaving one out is the lesser error.
+- **Fields** are offered when the receiver's head is known to be a record.
+- **Functions:** each name in the module's receiver scope with a function
+  that `choose_receiver` could choose for the receiver, where `admits` holds
+  for its receiver parameter, without the name. So `join`, whose receiver is
+  a `List[String]`, is offered on a `List[String]` and not on a `List[Int]`.
+  The function's bounds must also be able to hold. `bounds_can_hold`
+  (`:2454`) runs `prove_requirements`, the checker's own rule, on each bound
+  whose type argument the trial solution (`receiver_trial`, `:2433`) solves.
+  A bound on a parameter the receiver does not decide, such as one a later
+  argument's lambda solves, could still hold. So `max[T: Orderable]` is
+  offered on an `Int` and not on a record that does not implement
+  `Orderable`.
+- **Trait methods:** those that `accept_method_call` accepts.
+- **Purity:** a pure caller, or a pure lambda, is offered no impure function
+  or trait method, by `calls_impure_from_pure`, the predicate
+  `validate_purity` rejects a call with.
+- **A receiver still unsolved** after its lambdas resolve is offered its
+  fields and no call: whether checking accepts a call there depends on the
+  part not known. `nothing().join(", ")` checks and `nothing().length()` does
+  not.
+- A rejection means "not offered", but a fault in checking itself, an
+  `InternalInvariant`, passes through and stops the probe.
+
+**The server.** A completion never analyses the root, not even a stale one.
+- `completion_requested` (`lsp/server.brp:894`) asks `completion_plan`
+  (`lsp/completion.brp:236`), which reads the site from the editor's text and
+  takes the root's latest analysis that checked, if there is one. The plan is
+  `Answered` when nothing completes, or when the analysis names the qualifier
+  as an alias or a type. It is `Probing(ProbedSite)` for a name and for any
+  other member.
+- Before it probes, `completion_plan` asks the lexer, through
+  `lex_with_completion_hole`, whether it can place the hole. The lexer reads
+  a line's indentation, a symbol such as `>=` and a pipe String whole, and
+  refuses a hole inside them, so nothing completes there. The lexer stays the
+  one judge of where a hole can start, at the cost of a second lex of the
+  root's text, rather than the site rules repeating its rules in bytes.
+- The probe's hole is the whole word at the cursor, from the prefix's start
+  to `Prefix.word_end`, so no rest of the word is left to parse. Each item
+  still replaces only the prefix before the cursor.
+- A probe is the fourth `Followup`. `perform` loads the root with the hole,
+  which is its only impure part, and `probe_outcome` checks it to the hole:
+  `Reached` with the facts and the probe's spellings, `Stopped` at the
+  program's own error, or `Faulted` at a fault in blorp, such as the lexer
+  refusing the hole or `CompletionHoleUnreached`. `perform` writes a fault
+  to standard error, as `serve` does, and `probed` answers either way and
+  stores nothing. The root keeps its analysis, its staleness and its
+  published diagnostics, because the probe's text is not the document's.
+
+```blorp
+    -- Load an open root with a completion probe's hole in its text, every open
+    -- document as it is, check it to the hole, and hand what it found to
+    -- `probed`.
+    Probe(ProbeRequest)
+
+
+-- A completion request that waits for a probe of its root: the root, the
+-- request and the site the probe answers.
+record ProbeRequest {
+    root: Path,
+    id: RequestId,
+    site: ProbedSite
+}
+```
+
+```blorp
+        Probe(request):
+            loaded = request.root
+                .to_string()
+                .load_program_with_sources(
+                    ANALYSED_LIBRARY,
+                    step.server.snapshots(),
+                    Some(request.site.probe_hole())
+                )
+            outcome = loaded.probe_outcome()
+            -- A fault in blorp is reported, as `serve` reports one; the editor
+            -- still gets the fallback.
+            match outcome:
+                Faulted(fault): print_error(error_message(fault.message, fault.help))
+                Reached(_, _) | Stopped: void
+            step.server
+                .probed(request, outcome)
+                .perform()
+```
+
+`load_program_with_sources` (`analysis/load/load.brp:887`) has one entry
+point, and a hole makes the load a probe, whose root text is lexed with it.
+
+**Items and ranks.**
+- **A name:** the probe's locals first, as Variables with rank 0. Then the
+  module's names, ranked 1 to 3 as in 17a: from the probe's own namespace,
+  which is current, or after a probe that stops, from the root's latest
+  analysis that checked. Then the keywords, with rank 4.
+- **A member:** the fields, as Fields, then the calls, as Methods, all with
+  rank 1. For a client that sets `completionItem.snippetSupport`, which
+  `initialize` reads into the session, a call inserts the snippet `name($0)`
+  with `insertTextFormat` 2, so the cursor lands between the parentheses;
+  otherwise it inserts `name()`. When an argument list already follows the
+  word (`MemberAt.called`), it inserts the bare name.
+
+**Fallbacks.** A probe that stops before its hole still gives an answer. A
+name site keeps the module's names and the keywords, and a member site
+offers nothing. A probe stops at:
+- a load or declaration error;
+- an error earlier in the same body, including one in a lambda of the
+  receiver, which is now checked first;
+- a hole in a constant's initializer, which is not a closed value;
+- a member of a callable parameter, which needs direct-call syntax, or of a
+  declared function's name, such as `helper.`.
+
+**Limit: captures.** Inside a pure closure or a concurrent task, completion
+may offer an enclosing body's resource local, or in a task a scoped
+callable, that the capture rules in resource scopes reject, and the members
+of such a local, as after `token.`. Compiling still reports the capture, for
+example "pure closures cannot capture the resource type Token". Keith decided
+on 2026-11-27 to drop the filter that left these out ("Drop it, record
+limit"); it is a later candidate below.
+
+**Limit: a revisited hole.** When resolution reaches a member hole a second
+time, inside a literal that waits for its type, the members are read at
+once. A receiver whose own lambdas have not resolved by then is still
+unsolved, so it offers its fields and no calls: after
+`points.append({ x = ["a"].map(pure func(s): s).` the list is empty. This
+leaves members out and never offers one that checking rejects.
+
+A root that has never checked offers the keywords, together with any locals
+the probe finds. Its qualifiers offer nothing: `alias.` and `Union.` answer
+from the last analysis that checked, as in 17a, which sent `[]` for a root
+that never checked. The probe's namespace could name an alias's entries, but
+a union's variants, filtered for privacy, come from checked declarations, so
+answering them from a probe would need a second path through that rule.
 
 ### Later
 
@@ -1175,6 +1279,9 @@ reads into the session, as it reads `refreshSupport`.
 - More facts as features need them: declaration extents, attached
   documentation, binding scopes, a reverse import graph, a position index.
 - One line-start table for `positions` and `common/cli/report.brp`.
+- Completion that offers no local a closure's capture rules reject, through
+  resource scopes' own rule. Review round 2 measured it at 89 compiler lines
+  (2026-11-26); Keith dropped it from 17b on 2026-11-27.
 
 ## Code
 
@@ -1467,18 +1574,23 @@ the other's `length` and `slice` uses.
 
 - **A client without LSP 3.18's `workspace/textDocumentContent`** gets no
   library locations. VS Code's client has it from 11.0.1.
-- **Completion after an edit analyses the root first in 17a**, as a
+- **Completion after an edit analysed the root first in 17a**, as a
   definition does. VS Code asks once at each new word, so typing in
-  `main.brp` costs about one analysis per word, about 340 ms at `-O2`.
-  Option 2 of 17b replaces that analysis with the probe.
+  `main.brp` cost about one analysis per word, about 340 ms at `-O2`. 17b
+  replaces that analysis with the probe, which checks the signatures and one
+  body up to the hole.
+
+**Open question.** `completion_plan` tells a hole the lexer refuses by the
+compiler-fault kind of the diagnostic `lex_with_completion_hole` returns;
+whether the lexer should report a refused hole as a typed result of its own
+is left open.
 
 ## Dependencies
 
 - Landing 11 follows 10, 13 follows 12, since only LSP4IJ opened a
   `blorp-library:` file then, and 14 follows 13.
-- 17b follows 17a. Option 2 adds a mechanism to lex, parse and check, which
-  Keith approved on 2026-11-23 with a spike first, which sets its line
-  ceiling.
+- 17b follows 17a. It adds a mechanism to lex, parse and check, which Keith
+  approved on 2026-11-23 with a spike first, which set its line ceiling.
 
 ## Release strategy
 
@@ -1513,8 +1625,8 @@ backs it out; for landing 7, re-pinning the previous seed does.
     2026-11-23).
 17. **Completion** (Keith, 2026-11-23), in two landings. 17a reads only
     facts the namespace already publishes and changes no checking. 17b adds a
-    probe analysis and the transport's fourth followup, and with option 2 a
-    mechanism in three phases. Each is useful and reviewable alone.
+    probe, the transport's fourth followup, and a completion hole in three
+    phases. Each is useful and reviewable alone.
     - **17a, names and qualifiers:** `completionProvider`, the root's names
       and keywords, `alias.` and `Union.`. It also fixes the VS Code README's
       stale limit on built-in types, which landing 16 removed.
@@ -1547,7 +1659,7 @@ lines counted apart. Compile cost must also fit the e2e instruction ceilings'
 | 16 built-in type definitions, fixed input | ≤ +0.3% | ≤ +0.3% | not set | not set |
 | 16 follow-up, notes reuse `referent_declaration`, fixed input | ≤ +0.1%, C identical | ≤ +0.1% | not set | ≤ −90 net |
 | 17a names and qualifiers, fixed input | ≤ +0.1%, C identical | no increase | no increase | ≤ +590 net, from a 512-line sketch |
-| 17b members and locals, fixed input | set with the option; option 2 ≤ +0.1%, C identical | option 2 no increase | option 2 no increase | from a spike |
+| 17b members and locals, fixed input | ≤ +0.1%, C identical | no increase | ≤ +16 bytes | compiler ≤ +706 and server ≤ +400 net, of which 611 and 335 non-blank (history below) |
 
 **17a's line ceiling** comes from its sketch, written out in full with
 comments, blank lines and imports. `completion.brp` was run through
@@ -1574,9 +1686,71 @@ The ceiling, ≤ +590 net, leaves about 15% for what a sketch misses.
 Exceeding it stops the landing for a growth audit, and the coordinator then
 decides whether to cut, accept or rescope the landing.
 
-**Option 2's sketch** for 17b is about +300 in the compiler (lexing 25,
-parsing 40, syntax 15, the loader 25, assembly 15, checking 150, `render` 10,
-`check.brp` 20) and about +250 in the server, before a spike.
+**17b's ceilings** have a history:
+- **The sketch** put the hole at about +300 in the compiler (lexing 25,
+  parsing 40, syntax 15, the loader 25, assembly 15, checking 150, `render`
+  10, `check.brp` 20) and about +250 in the server.
+- **The spike** (`a86ad4f83`) measured +452 in the compiler.
+- **Keith's approval,** on 2026-11-23, was +730 net in all, the compiler at
+  most +480 and the server at most +250. It also held fixed-input
+  instructions to +0.1% with the C identical, and allowed no increase in
+  allocations or peak heap.
+- **The landing** came to +606 in the compiler and +320 in the server. That
+  stopped it for a growth audit, kept in the 17b worktree at
+  `blorp/build/spike/17b-growth-audit.md`. The audit found two estimates
+  wrong: the bound check on offered functions is 49 lines, not 15, and the
+  hole's owner on the program is 59, not 0 (the spike had a flag on each
+  function). Its cuts, none losing a behaviour or a test, brought the
+  landing to +591 and +283.
+- **Keith raised the ceilings** the same day: the compiler at most +600, the
+  server at most +290, and peak heap at most +16 bytes, which the one
+  `completion_body` field accounts for. The instruction, C and allocation
+  ceilings stayed.
+- **The code review** then found members offered that checking rejects
+  (impure calls in a pure body, and calls an unsolved receiver's lambda
+  rules out), sites the lexer cannot place a hole at, faults that fell back
+  silently, and two changes from this plan left unrecorded (the module's names
+  from a stale analysis, and no snippets). Fixing them brought the landing to
+  +643 in the compiler and +373 in the server, over the raised ceilings by 43
+  and 83 lines (Measurements).
+- **Keith raised the ceilings again** on 2026-11-24, for that overrun: the
+  compiler at most +650 and the server at most +380. The instruction, C,
+  allocation and peak heap ceilings stayed.
+- **On the new main** (`9823919fa`), whose formatter sets multi-line body
+  items apart with a blank line, the same code counts +696 and +397 against
+  its base. The rule adds 53 and 24 of those lines, all blank; without them it
+  is the +643 and +373 the ceilings were raised for.
+- **A routine correction** by the coordinator, under Keith's standing
+  delegation (2026-11-26), moved the ceilings from compiler +650 and server
+  +380 to compiler +700 and server +400, for formatting only: the blank-line
+  rule adds those 53 and 24 lines, and the non-blank lines stay at 603 and
+  335. Any non-blank growth past 603 and 335 still needs a reason.
+- **On `4fb81b64f`**, where 17b landed as one commit, it counts +699 and +397:
+  94 and 62 blank, 605 and 335 not. The compiler's 2 non-blank lines over 603
+  come from main, not from 17b's behaviour. Main shortened the mutable-capture
+  error that 17b's capture rule replaces, so the replacement saves 5 fewer
+  lines. Migrating `from_opaque CheckFailure` to a `CheckFailure.Init` binding
+  adds 1. The lexer's error texts as constants and main's `AggregateId` import
+  take 4 back.
+- **Review round 2** found a probe that loops at a member hole in a literal
+  waiting for its type, and locals offered that a capture rule later
+  rejects. Their fixes add 93 compiler lines, 81 of them non-blank, which
+  takes the compiler to +792 against `04a7ceff7`, 92 over +700; the server is
+  unchanged at +397. The loop's fix is 4 lines. The capture rule is the rest:
+  the rule shared with resource scopes and its probe form, 41 lines in
+  `resource_types.brp`; resource scopes using it, 8; the filter in
+  `readable_names`, 19; and the name hole's helper, 21. The overrun is not a
+  routine correction and went to Keith.
+- **Keith decided** on 2026-11-27: "Drop it, record limit". The 89-line
+  capture filter is gone, its over-offer is a recorded limit, and the loop's
+  fix stays. 17b counts +706 in the compiler and +397 in the server against
+  `04a7ceff7`, of which 611 and 335 are not blank (Measurements). The name
+  hole's code sits in a 4-line helper outside `plan_body_base`: inline, the
+  same code costs the fixed input +0.090% instead of +0.053%.
+- **The coordinator**, under Keith's standing delegation (2026-11-27), moved
+  the compiler's ceiling from +700 to +706, a routine correction for the 6
+  lines over it: the name hole's helper, which keeps 0.036% off the fixed
+  input, and the loop's guard with its comment.
 
 **Latency.** Per request after one change, on this host: ≤ 1.0 s for
 `blorp/src/main.brp`, and ≤ 50 ms for a one-module program. Landing 1
@@ -2661,6 +2835,264 @@ reported, not held.
   cases) and a hole's `}` closing its string (the hole case). Logs:
   `blorp/build/mutation-*.log`.
 
+**Landing 17b, a value's members and the locals** (`fe369d93d` against
+`f9423ade5`). Apple M4, macOS 26.7.1, Apple clang 21.0.0, on a machine other
+sessions share. The paths below are in the 17b worktree.
+
+`blorp/scripts/self-compile-cost f9423ade5 fe369d93d --output
+blorp/build/attr/cost-final`, `-O2`, 11 rounds. Ceilings: fixed-input
+instructions ≤ +0.1% with the C identical, no increase in allocations, peak
+heap ≤ +16 bytes, production lines ≤ +600 in the compiler and ≤ +290 in the
+server. The log is `blorp/build/attr/cost-final.log`, and the raw samples are
+in `blorp/build/attr/cost-final/`.
+
+| Measure | Base | Candidate | Change |
+| --- | ---: | ---: | ---: |
+| Fixed input, allocations | 13,029,666 | 13,029,666 | unchanged |
+| Fixed input, instructions (median) | 13,214,350,509 | 13,224,177,171 | +0.0744% |
+| Fixed input, peak heap (requested bytes) | 184,750,855 | 184,750,871 | +16 bytes |
+| Own source, allocations | 13,029,666 | 13,169,634 | +1.074% |
+| Own source, instructions (median) | 13,215,695,887 | 13,365,589,351 | +1.134% |
+| Own source, peak heap (requested bytes) | 184,750,854 | 186,030,930 | +0.693% |
+| Lines: compiler, server and tests | | | +591, +283 and +899 net |
+
+The fixed-input C is identical (`47693459b6901d27`). The own-source row grows
+with the new lines and is reported, not held. Another session's
+`self-compile-cost` ran while this one measured. Retired instructions are
+counted per process, and the result agrees with an earlier 11-round run at
+`a2fc961d0`, +0.0555% (`blorp/build/spike/17b-self-compile-cost-3.log`).
+
+- **Where the instructions went.** At `980e9b584` the fixed-input row was
+  +0.134% (3 rounds), over its ceiling. Each compiler was linked
+  `-O0 -DBLORP_MEMORY_DIAGNOSTICS=1 -fprofile-instr-generate` and run on the
+  fixed input. Its call counts (`xcrun llvm-profdata show --all-functions
+  --counts`, named through each definition's `/* module.function */`
+  comment) put the cost in the lexer's token loop, which paid for the hole on
+  every step:
+  - **The loop's `continue`.** Placing the hole inside the scan loop gave it a
+    second back edge. The ownership pass then carried the token list and the
+    cursor's `Result` across it with a dup and a drop on every iteration:
+    550,683 more of each list dup, drop and drop-at, and about 600,000 more
+    of each union dup and drop, among 3,518,451 more calls (+0.21%).
+  - **`SourceText` grew from 16 to 40 bytes,** holding the hole. Every byte
+    test takes it by value, and arm64 passes a composite over 16 bytes
+    through memory. The -O0 counts do not show that, but -O2 does: putting
+    the hole back into `SourceText` alone (`4359a3006` against `3c665094d`)
+    costs +0.177% of fixed-input instructions over 11 rounds
+    (`blorp/build/attr/cost-a-vs-b.log`).
+
+  The fix threads the hole to the six scans that place it and places it
+  outside the inner loop. At `f73efbb06` the candidate makes 129,940 more
+  calls than the base (+0.008%), with no change in token-list dups. The full
+  tables, before and after, are in `blorp/build/spike/17b-growth-audit.md`.
+- **Lines.** Compiler: `lex.brp` +136, `parse.brp` +101, `inference.brp`
+  +159, `expressions.brp` +33, `scope.brp` +24, `completion_facts.brp` +23,
+  `load.brp` +23, `assemble.brp` +22, `syntax.brp` +20, `check.brp` +19,
+  `errors.brp` +13, `flat.brp` +7, `bodies.brp` +5, `render.brp` +4,
+  `layout.brp` +2. Server: `completion.brp` +184, `server.brp` +86,
+  `lsp_command.brp` +13, `tokens.brp` 0. Tests: `test_completion_probe.brp`
+  468, `test_completion_hole.brp` 113, `test_server.brp` +104,
+  `test_source_snapshots.brp` +75 (the loader's one entry point),
+  `test_completion.brp` +56, `cli.brp` +51, and 32 in the driver's list
+  and other suites' hole arms and loader calls.
+- **Latency** at `-O2` (`blorp/build/o2/blorp`, linked
+  `make -C blorp link-compiler TEST_COMPILER_FLAGS=-O2
+  BLORP_COMPILER=blorp/build/o2/blorp` from `fe369d93d`'s `blorp.c`). Each
+  whole `blorp lsp` session opens the root, inserts a line and asks for
+  completion at its end, and the same session without the completion is
+  timed alongside. The figure is the difference of the medians over 11
+  alternating rounds (`ROUNDS=11 bash blorp/build/spike/latency17b/run.sh`;
+  `session.py` writes the sessions; log `run-final-2.log`, samples
+  `samples-final-2.txt`; for `parse.brp`, 7 rounds, `samples-parse.txt`).
+  The load average was 3.2 to 3.8:
+
+  | Program and site | Completion | Items | Ceiling |
+  | --- | ---: | ---: | --- |
+  | `blorp/src/main.brp`, after `args.` in `main` | 192.6 ms | 33 | 1.0 s |
+  | one module, after `name.` on a new line of `main` | 2.2 ms | 16 | 50 ms |
+  | `blorp/src/common/syntax/parse.brp`, after `state.` in `consume_postfix` | 31.2 ms | 216 | 50 ms |
+  | the same, on a blank line there | 36.9 ms | 792 | 50 ms |
+
+  At `980e9b584`, under a lighter load, the `main.brp` and one-module
+  sessions gave 131.5 ms and 2.6 ms. The session without the completion took 402 ms then and 558 ms now,
+  so the completion's share of the session, about a third, is about the
+  same.
+- **Tests.** Mutations, one at a time at `980e9b584`, each failing only its
+  own tests: checking the bodies in declaration order, dropping the bound
+  check, the rule for unsolved parts, the lambda's `var` rule, the whole-word
+  hole, the `called` insert, or the locals (`blorp/build/spike/17b-mutations.log`).
+  Both VS Code checks fail against 17a's server and pass against 17b's.
+
+**After the code review** (`61da5b3f2` against `f9423ade5`). The fixes are
+listed in 17b's ceilings history. Same host and method:
+`blorp/scripts/self-compile-cost f9423ade5 61da5b3f2 --output
+blorp/build/attr/cost-r2`, `-O2`, 11 rounds, with nothing else measuring; log
+`blorp/build/attr/cost-r2.log`.
+
+| Measure | Base | Candidate | Change |
+| --- | ---: | ---: | ---: |
+| Fixed input, allocations | 13,029,666 | 13,029,666 | unchanged |
+| Fixed input, instructions (median) | 13,207,899,436 | 13,215,331,317 | +0.0563% |
+| Fixed input, peak heap (requested bytes) | 184,750,852 | 184,750,868 | +16 bytes |
+| Own source, allocations | 13,029,666 | 13,191,180 | +1.240% |
+| Own source, instructions (median) | 13,207,645,988 | 13,391,798,312 | +1.394% |
+| Own source, peak heap (requested bytes) | 184,750,851 | 186,236,239 | +0.804% |
+| Lines: compiler, server and tests | | | +643, +373 and +1,111 net |
+
+The fixed-input C is identical (`47693459b6901d27`).
+
+- **What the fixes' lines pay for**, against `fe369d93d`, about:
+  - compiler +52: the receiver's lambdas resolved before its members are
+    read, +17 (+22 in `expressions.brp`, less the unsolved-part rule it
+    replaced in `inference.brp`); purity, +10; invariants passed through,
+    +9; the probe's namespace in the name facts, +11; the seal fault, +2;
+    the formatter's comments and the hole check, +3;
+  - server +90: the lexer asked before a probe, +13; probe outcomes and the
+    transport's fault report, +31; the probe's module names, +11; snippets,
+    +27; imports, +8.
+- **Latency** at `-O2`, the same sessions, 11 rounds (7 for `parse.brp`),
+  load average 3.6 to 3.8 (`blorp/build/spike/latency17b/run-r2.log`,
+  `samples-r2.txt`, `samples-parse-r2.txt`). The second lex of the root, to
+  ask the lexer about the hole, is in these figures:
+
+  | Program and site | Completion | Items | Ceiling |
+  | --- | ---: | ---: | --- |
+  | `blorp/src/main.brp`, after `args.` in `main` | 128.9 ms | 33 | 1.0 s |
+  | one module, after `name.` on a new line of `main` | 2.2 ms | 16 | 50 ms |
+  | `blorp/src/common/syntax/parse.brp`, after `state.` | 23.7 ms | 216 | 50 ms |
+  | the same, on a blank line there | 24.3 ms | 792 | 50 ms |
+
+- **Mutations**, one at a time, each failing only its own tests
+  (`blorp/build/spike/17b-r2-mutations.log`): no purity check for functions,
+  or for trait methods; members read before the lambdas resolve; calls
+  offered on an unsolved receiver; a probe without asking the lexer; no hole
+  on an empty last line; a fault read as a stop; the module's names from the
+  last analysis after a reached probe; no snippets. The log's three `site-`
+  rows are from byte rules the lexer's own check replaced.
+- **Gates:** `make -C blorp test` passes, 257 suites
+  (`blorp/build/attr/r2-make-test-final.log`), and `npm test` 13 of 13
+  (`blorp/build/attr/npm-test-r2.log`).
+
+**On the new main** (`506d299a1` against `4fb81b64f`, which deleted opaque
+types for private variants and added `concurrent:` blocks). Same host and
+method: `blorp/scripts/self-compile-cost 4fb81b64f 506d299a1 --output
+blorp/build/attr/cost-land3`, `-O2`, 11 rounds, with no other cost run
+(`pgrep -fl self-compile-cost` empty); log `blorp/build/attr/cost-land3.log`.
+
+| Measure | Base | Candidate | Change |
+| --- | ---: | ---: | ---: |
+| Fixed input, allocations | 13,515,368 | 13,515,368 | unchanged |
+| Fixed input, instructions (median) | 13,755,136,490 | 13,759,655,699 | +0.0329% |
+| Fixed input, peak heap (requested bytes) | 192,370,196 | 192,370,212 | +16 bytes |
+| Own source, allocations | 13,515,368 | 13,676,955 | +1.196% |
+| Own source, instructions (median) | 13,747,239,986 | 13,929,311,752 | +1.324% |
+| Own source, peak heap (requested bytes) | 192,370,195 | 193,865,867 | +0.778% |
+| Lines: compiler, server and tests | | | +699, +397 and +1,203 net |
+
+The fixed-input C is identical (`8be9533cd7fca8fd`). Of the lines, 94 and 62
+are blank and 605 and 335 are not (17b's ceilings history explains the 2).
+
+- **Latency** at `-O2`, the sessions regenerated from this tree with
+  `session.py`, 11 rounds, under a load average of 5 to 6 from other
+  sessions' test runs (`blorp/build/spike/latency17b/run-land3.log`,
+  `samples-land3.txt`, `samples-parse-land3b.txt`):
+
+  | Program and site | Completion | Items | Ceiling |
+  | --- | ---: | ---: | --- |
+  | `blorp/src/main.brp`, after `args.` in `main` | 194.5 ms | 33 | 1.0 s |
+  | one module, after `name.` on a new line of `main` | 3.3 ms | 16 | 50 ms |
+  | `blorp/src/common/syntax/parse.brp`, after `state.` | 38.7 ms | 225 | 50 ms |
+  | the same, on a blank line there | 38.3 ms | 805 | 50 ms |
+
+  The sessions without a completion took 575 ms and 174 ms, against 422 ms
+  and 115 ms at `61da5b3f2` under a load average of 3.7, so the completion's
+  share of each session is unchanged: about a third for `main.brp` and a fifth
+  for `parse.brp`.
+- **Gates:** `make -C blorp test` passes, 268 component programs
+  (`blorp/build/attr/land3-make-test.log`), and `npm test` 13 of 13
+  (`blorp/build/attr/npm-test-land3.log`). The landing also passes the hole
+  argument at three loader calls main added in `test_concurrent_blocks.brp`,
+  `test_concurrency_module.brp` and `native_call_inputs.brp`.
+
+**After review round 2** (`HEAD` of `land/lsp-completion-17b` against
+`04a7ceff7`). **How lines are counted:** totals are `git diff --numstat
+04a7ceff7 HEAD -- blorp/src`, added less removed, with `blorp/src/lsp/` as the
+server and the rest as the compiler. Non-blank lines are
+`git diff -U0 04a7ceff7 HEAD -- PATHS | grep -E '^[+-]' | grep -vE
+'^(\+\+\+|---) (a/|b/|/dev/null)' | grep -vE '^[+-][[:space:]]*$'`, added
+less removed, with PATHS `blorp/src ':!blorp/src/lsp'` for the compiler and
+`blorp/src/lsp` for the server. `git diff --numstat --ignore-blank-lines`
+counts the same totals, since a hunk that mixes blank and other lines keeps
+its blank ones. A pattern that drops every diff line starting `--` or `++`,
+not only the file headers, also drops removed comments written at the
+margin, which is how 607 and 347 were counted for `4612eddf7`; by this
+method that commit counts 605 and 335.
+
+| Lines | Compiler | Server | Tests |
+| --- | ---: | ---: | ---: |
+| Total | +792 | +397 | +1,337 |
+| Not blank | +686 | +335 | |
+
+`blorp/scripts/self-compile-cost 04a7ceff7 c9c1b66fb --output
+blorp/build/attr/cost-final-r3`, 11 rounds, with no other cost run; log
+`blorp/build/attr/cost-final-r3.log`:
+
+| Measure | Base | Candidate | Change |
+| --- | ---: | ---: | ---: |
+| Fixed input, allocations | 13,515,820 | 13,515,820 | unchanged |
+| Fixed input, instructions (median) | 13,748,049,584 | 13,755,485,756 | +0.0541% |
+| Fixed input, peak heap (requested bytes) | 191,002,556 | 191,002,572 | +16 bytes |
+| Own source, instructions (median) | 13,752,582,479 | 13,938,827,773 | +1.354% |
+
+The fixed-input C is identical (`e901b6ac94121f6a`).
+
+- **A first draft cost +0.157%**, with neither fix's code running in a
+  compile: a compile reaches no hole. The cost was code shape. Moving the name
+  hole's closure out of `plan_body_base` into its own function took 0.11% back
+  (`cost-exp-helper.log`). Writing the loop's guard as a check around the old
+  push, rather than a new binding, took 0.06% more (`cost-exp-wrap.log`).
+  Restoring `admit_closure`'s old match made it 0.14% worse
+  (`cost-exp-closure.log`), so this draft kept the shared capture rule,
+  which Keith's decision below then removed.
+- **Gates:** `make -C blorp test` passes, 268 component programs
+  (`blorp/build/attr/r3-make-test-c9c.log`), and `npm test` 13 of 13
+  (`blorp/build/attr/npm-test-r3b.log`).
+- **Mutations:** reverting the loop's guard fails only the 20-second e2e
+  session, by its timeout (`blorp/build/spike/17b-hang-mutation-2.log`).
+  Dropping the capture filter fails the three capture tests; the task rule
+  in `admits_capture` fails the two task tests and resource scopes' own task
+  rejections; the pure rule fails the pure-closure test; and counting no
+  callable as scoped fails the scoped-callable test
+  (`blorp/build/spike/17b-r3-mutations.log`).
+
+**After Keith's decision** (`c93f70407` against `04a7ceff7`, 2026-11-27): the
+capture filter dropped and recorded as a limit, the loop's fix kept. Lines by
+the method above:
+
+| Lines | Compiler | Server | Tests |
+| --- | ---: | ---: | ---: |
+| Total | +706 | +397 | +1,280 |
+| Not blank | +611 | +335 | |
+
+`resource_scopes.brp` and `resource_types.brp` have no diff against main.
+`blorp/scripts/self-compile-cost 04a7ceff7 c93f70407 --output
+blorp/build/attr/cost-r4-final`, 11 rounds, with no other cost run; log
+`blorp/build/attr/cost-r4-final.log`:
+
+| Measure | Base | Candidate | Change |
+| --- | ---: | ---: | ---: |
+| Fixed input, allocations | 13,515,820 | 13,515,820 | unchanged |
+| Fixed input, instructions (median) | 13,750,906,814 | 13,757,166,163 | +0.0455% |
+| Fixed input, peak heap (requested bytes) | 191,002,556 | 191,002,572 | +16 bytes |
+| Own source, instructions (median) | 13,739,108,514 | 13,918,824,747 | +1.308% |
+
+The fixed-input C is identical (`e901b6ac94121f6a`). The name hole's helper
+keeps that figure: the same code inline in `plan_body_base` measured
++0.0899%, and the helper +0.0534% (`cost-r4-inline.log`,
+`cost-r4-helper.log`). `make -C blorp test` passes, 268 component programs
+(`blorp/build/attr/r4-make-test.log`), and `npm test` 13 of 13
+(`blorp/build/attr/npm-test-r4.log`).
+
 ## Testing
 
 Each landing starts with a failing test.
@@ -2686,7 +3118,7 @@ Each landing starts with a failing test.
 | 16 | `test/test_lsp/`: definition on `Int` is its library location, references list its declaration only on request, and without the capability definition is `null`. `test_name_uses`: `Int`, `Float`, `List`, `String` and `Void` each resolve to their own declaration. |
 | 16 follow-up | No oracle changes. A surface e2e case pins the note for an imported trait method, beside the `Box` one for a union. |
 | 17a | `test/test_lsp/test_completion.brp`, a new suite, which must be added to the `private COMPONENT_SOURCES` list in `blorp/test/driver/driver.brp` (a full run fails on a suite it does not list; the Makefile's `TARGET_COMPONENT_SOURCES` only picks suites to run). Each site: a blank line; a partial name; a cursor inside a name; a comment; inside a quoted string and at its closing quote; after a hole's `}` in a string; a hole in a string; a number; an import block's row, and the first line after the block; `func `, `var ` and `for `; a text that stops lexing before and after the cursor; `"abc".`; `alias.`; `Union.Va`; an indented chain's `.ma`; a dot that ends the line above; `0..`. `test_server.brp`, from real analyses: the exact `initialize` reply. A name site lists a declared function, a private one, an imported one, `print`, a constant, a record, a union and its variant, a trait and the keywords, each with its kind and rank. Each item that is a keyword lexes as one, and `detach` and `builtin` are not offered. An alias is listed once, as a Module. `union Box: Box(Int)` lists `Box` twice, as an Enum and as an EnumMember. The `textEdit` range is correct in UTF-8, and in UTF-16 after an `é`. `alias.` lists the module's public names, its types among them, but not its private names or its imports; `Option.` lists `None` and `Some`; `Int.` and a value's dot list nothing. A failing root answers from its last checked analysis; a root that never checked and a library document get `[]`; a stale root is analysed first. Mutations: drop the dot test; keep an alias's Types copy; offer an alias target's imports; end the range at the token's end; treat a hole's `}` as closing its string. Each fails only its own tests. `editor/vscode`: completion on a blank line of a body lists `helper`, `print` and `match`, and after `Option.` it lists `None` and `Some`. |
-| 17b | Each row of the cut table lists the receiver's members. `join` is offered on a `List[String]` and not on a `List[Int]`. A record's fields come as fields and its functions as calls, with the snippet only for a client that sets `snippetSupport`. A trait method the receiver implements is offered. Locals: a parameter; an earlier local but not a later one; a match capture only inside its arm; a `for` item only inside its loop; inside a lambda, its parameters and the enclosing immutable bindings but not mutable ones. A probe leaves the root's analysis, staleness and diagnostics as they were. When a probe fails before the hole, a name site falls back and a member site offers nothing. An e2e session in `cli.brp` carries a probe through the transport. `editor/vscode`: `name.` typed on a new line in the middle of a body lists `length`. |
+| 17b | `test_common/test_syntax/test_lex/test_completion_hole.brp`: the hole after a dot, empty at a line's end and between brackets, on a blank line at its indentation, on a last line without a line feed, on an empty last line, inside an interpolation and over a whole word; a hole in a comment, inside a word, over other bytes or ending before its start is rejected; lexing without a hole makes none. `test_common/test_analysis/test_check/test_completion_probe.brp`, a new suite listed in `driver.brp`: every row of the table above answers, the `for` row with a line after the loop, and an empty list stops at its binding; `join` on a `List[String]` and not on a `List[Int]`; a record's fields; a bounded function only where its bound holds; a lambda in the receiver is checked before its members are read, so an identity `map` of a `List[Int]` offers no `join`; a receiver still unsolved offers no call; a pure body, and a pure lambda, is offered no impure function or trait method; a literal whose annotation fixes its type offers its field value's members; a type parameter offers its bounds' methods; a word already called is the hole. Locals: parameters and earlier locals only, also on a blank line; a match capture only inside its arm; a `for` item only inside its loop; inside a lambda, its parameters and the enclosing immutable bindings. The body with the hole, a method or a default among them, is checked before an earlier broken body; an error before the hole and a constant stop the probe; rendering a reached hole is a compiler fault. `test_lsp/test_completion.brp`: the probe covers the whole word at the cursor; a type, a function and an unknown name offer nothing after their dot, inside a body, and a constant and a literal their type's members; nothing completes inside an indentation, inside a symbol or at a pipe String's `|`, where the lexer places no hole; at every offset of a sample, with and without its last line feed, the lexer places the hole of each probed site; a probe tells a reached hole, a stop and a fault apart; a name site's module names come from the probe, with a function the last analysis did not have; through a probe, a module's own private variant is named and another module's is not, a type and a constructor sharing a spelling are each listed once, and so is a spelling two of the module's own variants share. `test_server.brp`: a name site sends the locals, then every name and keyword, replacing the prefix; a value's dot sends its fields and calls; a probe that stops falls back; the server a probe leaves keeps the root's analysis current; a call is a snippet for a client that reads them; a root that never checked sends only the keywords; a stale root completes without an analysis. An e2e session in `cli.brp` carries a probe through the transport and publishes nothing, and another, held to 20 s, answers a member hole inside a record and a variant literal that wait for their type. Mutations: check the bodies in declaration order; drop the bound check, the lambda's `var` rule, the whole word, the `called` insert or the locals; and, after review, drop the purity check for functions or trait methods, the lambdas resolved first, the no-call rule for an unsolved receiver, the lexer's say before a probe, the empty last line, the fault, the probe's module names or the snippets. Each fails only its own tests. `editor/vscode`: Ctrl+Space on a blank line of a body lists a parameter and an earlier local before the module's functions, and `name.` typed on a new line in the middle of a pure body lists `length` as the snippet `length($0)`, and no `print` call. |
 
 **Commands:** those in `blorp/AGENTS.md`, `scripts/blorp-fixpoint --prove`
 for compiler landings, and `make -C blorp test-e2e INSTRUCTION_CHECK=on`
@@ -2731,12 +3163,15 @@ when compile cost changes.
   the fixed-input C identical, and completion latency is within its
   ceilings. In VS Code, Ctrl+Space on a blank line of a body lists the
   file's functions, `print` and `match`, and `Option.` lists its variants.
-- [ ] **17b.** In VS Code, typing `name.` lists the receiver's members in
-  each of these places: a new line in the middle of a body, a typed
-  function's result, an argument, an `if` condition and a `match`
-  scrutinee. `join` is offered on a `List[String]` and not on a
-  `List[Int]`. Ctrl+Space lists the parameters and the locals declared above
-  the cursor. 17b's tests pass, and its row's ceilings are met.
+- [ ] **17b.** `test_completion_probe.brp` shows a receiver's members in each
+  of these places: a new line in the middle of a body, a typed function's
+  result, an argument, an `if` condition and a `match` scrutinee; and `join`
+  offered on a `List[String]` and not on a `List[Int]`. In VS Code
+  (`cd editor/vscode && npm test`), typing `name.` on a new line in the
+  middle of a body lists `length`, and Ctrl+Space on a blank line lists a
+  parameter and an earlier local before the module's functions. 17b's tests
+  pass, each listed mutation fails only its own tests, and its row's ceilings
+  are met.
 - [ ] **Every landing** meets its ceilings, passes `make -C blorp test`, and
   is reviewed and test-run.
 

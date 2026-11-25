@@ -49,7 +49,8 @@ import:
             NegationExpression,
             LambdaExpression,
             IfExpression,
-            MatchExpression
+            MatchExpression,
+            CompletionNameHole
         ),
         ComparisonOperator(
             EqualOperator,
@@ -164,7 +165,7 @@ import:
         UnionKind(OrdinaryUnion, FixedUnion, ResourceUnion),
         ParsedVariant,
         effective_visibility,
-        PostfixOperation(ReceiverInvocation, FieldAccess, TupleIndex),
+        PostfixOperation(ReceiverInvocation, FieldAccess, TupleIndex, CompletionMemberHole),
         Purity(Pure, Impure),
         Spacing(Adjacent, Spaced),
         Span,
@@ -216,7 +217,8 @@ import:
             InterpolationOpen,
             InterpolationClose,
             StringEnd,
-            CharLiteral
+            CharLiteral,
+            CompletionHoleToken
         ),
         NameForm(CapitalizedCamel, LowerSnake, Malformed, SingleCapitalWord, UpperSnake),
         StringForm(QuotedStringForm, PipeStringForm),
@@ -324,6 +326,9 @@ record ParsedModuleContents {
     records: List[ParsedRecord],
     constants: List[ParsedConstant],
     concurrent_blocks: Bool,
+    -- The function whose body holds the completion hole: only a probe's root
+    -- has one, and checking reaches it first.
+    completion_function: Option[WrittenName],
     end: Span
 }
 
@@ -1834,6 +1839,16 @@ private pure func consume_base(start: ParserState, token: Token) -> Result[Parse
             )
         IdentifierToken(_, _):
             start.consume_name_or_call()
+        CompletionHoleToken:
+            after
+                .past_hole_arguments()
+                .map(
+                    pure func(next: ParserState) -> ParsedBase: {
+                        base = CompletionNameHole(token.span),
+                        span = token.span,
+                        next = next
+                    }
+                )
         KeywordToken(WhileKeyword):
             Err(statement_as_value(start, "`while` is a statement and has no value"))
         KeywordToken(ForKeyword):
@@ -1864,6 +1879,40 @@ private record ParsedPostfix {
 
 -- `state` follows the dot.
 private pure func consume_postfix(state: ParserState) -> Result[ParsedPostfix, Diagnostic]:
+    match state.current_token():
+        Some(token):
+            match token.kind:
+                CompletionHoleToken:
+                    state
+                        .shifted(1)
+                        .past_hole_arguments()
+                        .map(
+                            pure func(next: ParserState) -> ParsedPostfix: {
+                                operation = CompletionMemberHole(token.span),
+                                end = token.span.end,
+                                next = next
+                            }
+                        )
+                _:
+                    state.consume_member()
+        None:
+            state.consume_member()
+
+
+-- After a completion hole: past the arguments when the hole's word was already
+-- called, as in `name.le()`. They are parsed and dropped: checking stops at
+-- the hole, before it would read them.
+private pure func past_hole_arguments(state: ParserState) -> Result[ParserState, Diagnostic]:
+    if state.at_left_paren():
+        state
+            .consume_call_arguments()
+            .map(pure func(call): call.next)
+    else:
+        Ok(state)
+
+
+-- A field read or a receiver call after the dot at `state`.
+private pure func consume_member(state: ParserState) -> Result[ParsedPostfix, Diagnostic]:
     name ?= state.consume_used_name("expected a field or function name after '.'")
 
     _: Void ?= if DeclaredField.accepts(name.form):
@@ -2388,6 +2437,9 @@ private pure func first_postfix_spelling(
                 .map(pure func(name): ".${name}")
         [TupleIndex(_, _), ..._]:
             Some("[...]")
+        -- A probe's `-2.`, whose member is not yet written.
+        [CompletionMemberHole(_), ..._]:
+            Some(".")
         []:
             None
 
@@ -4360,7 +4412,7 @@ private pure func value_line_form(value: ParsedValue) -> Result[LineForm, Diagno
     for application in value.body.applications:
         match application:
             TupleIndex(_, _): indexed = True
-            ReceiverInvocation(_) | FieldAccess(_): void
+            ReceiverInvocation(_) | FieldAccess(_) | CompletionMemberHole(_): void
 
     if indexed.and(value.next.at_assignment()):
         Err(
@@ -5418,6 +5470,23 @@ private record FunctionResult {
 }
 
 
+-- `name`, the name of the function the parse from `state` to `end` read, when
+-- its body holds the completion hole's token.
+private pure func holding_hole(
+    state: ParserState,
+    end: ParserState,
+    name: WrittenName
+) -> Option[WrittenName]:
+    match state.input.completion_hole:
+        Some(index):
+            if (state.position <= index).and(index < end.position):
+                Some(name)
+            else:
+                None
+        None:
+            None
+
+
 private pure func consume_function(
     start: ParserState,
     declaration_start: Span,
@@ -5448,6 +5517,8 @@ private pure func consume_function(
 
 private record ParsedTraitMethods {
     methods: List[ParsedTraitMethod],
+    -- The default whose body holds the completion hole, if one does.
+    hole_owner: Option[WrittenName],
     next: ParserState
 }
 
@@ -5516,19 +5587,27 @@ private pure func consume_trait_methods(
     state: ParserState,
     module: ModuleId,
     visibility: Visibility,
-    methods: List[ParsedTraitMethod]
+    methods: List[ParsedTraitMethod],
+    hole_owner: Option[WrittenName]
 ) -> Result[ParsedTraitMethods, Diagnostic]:
     method ?= state.consume_trait_method(module, visibility)
     gathered = methods.append(method.method)
 
+    owner = match (hole_owner, method.method):
+        (None, DefaultTraitMethod(function, _)):
+            state.holding_hole(method.next, function.function_name)
+        _:
+            hole_owner
+
     if method.next.at_dedent():
-        Ok({ methods = gathered, next = method.next.shifted(1) })
+        Ok({ methods = gathered, hole_owner = owner, next = method.next.shifted(1) })
     else:
-        method.next.consume_trait_methods(module, visibility, gathered)
+        method.next.consume_trait_methods(module, visibility, gathered, owner)
 
 
 private record TraitResult {
     declaration: ParsedTrait,
+    hole_owner: Option[WrittenName],
     next: ParserState
 }
 
@@ -5551,14 +5630,14 @@ private pure func consume_trait_block(
         "declare at least one pure method signature"
     )
 
-    opened.consume_trait_methods(module, visibility, [])
+    opened.consume_trait_methods(module, visibility, [], None)
 
 
 -- A bundle ends its line, or the file. An indented block below it means the
 -- second colon is missing, reported where it belongs.
 private pure func consume_bundle_end(state: ParserState) -> Result[ParsedTraitMethods, Diagnostic]:
     if state.at_end():
-        Ok({ methods = [], next = state })
+        Ok({ methods = [], hole_owner = None, next = state })
     else if (
         state
             .at_newline()
@@ -5580,7 +5659,7 @@ private pure func consume_bundle_end(state: ParserState) -> Result[ParsedTraitMe
             "expected ':' or a newline after the supertraits",
             "add ':' before indented methods, or end the line for a trait without methods"
         ):
-            Ok(next): Ok({ methods = [], next = next })
+            Ok(next): Ok({ methods = [], hole_owner = None, next = next })
             Err(error): Err(error)
 
 
@@ -5643,12 +5722,15 @@ private pure func consume_trait(
             methods = methods.methods,
             span = { start.parser_span() | end = name.next.parser_span().end }
         },
+        hole_owner = methods.hole_owner,
         next = methods.next
     })
 
 
 private record ImplementationMethods {
     methods: List[ParsedFunction],
+    -- The method whose body holds the completion hole, if one does.
+    hole_owner: Option[WrittenName],
     next: ParserState
 }
 
@@ -5657,22 +5739,28 @@ private pure func consume_implementation_methods(
     state: ParserState,
     module: ModuleId,
     visibility: Visibility,
-    methods: List[ParsedFunction]
+    methods: List[ParsedFunction],
+    hole_owner: Option[WrittenName]
 ) -> Result[ImplementationMethods, Diagnostic]:
     -- A free function can start at `private`, so the caller names the start; a
     -- method starts at its own first token.
     method ?= state.consume_function(state.parser_span(), module, visibility)
     gathered = methods.append(method.function)
 
+    owner = match hole_owner:
+        Some(_): hole_owner
+        None: state.holding_hole(method.next, method.function.function_name)
+
     if method.next.at_dedent():
-        Ok({ methods = gathered, next = method.next.shifted(1) })
+        Ok({ methods = gathered, hole_owner = owner, next = method.next.shifted(1) })
     else:
-        method.next.consume_implementation_methods(module, visibility, gathered)
+        method.next.consume_implementation_methods(module, visibility, gathered, owner)
 
 
 private record ImplementationResult {
     header: ParsedImplementationHeader,
     methods: List[ParsedFunction],
+    hole_owner: Option[WrittenName],
     next: ParserState
 }
 
@@ -5724,7 +5812,7 @@ private pure func consume_authored_implementation(
         "define at least one method after ':', or omit ':' to use only trait defaults"
     )
 
-    opened.consume_implementation_methods(module, visibility, [])
+    opened.consume_implementation_methods(module, visibility, [], None)
 
 
 private pure func consume_implementation_body(
@@ -5735,13 +5823,13 @@ private pure func consume_implementation_body(
     if state.at_colon():
         state.consume_authored_implementation(module, visibility)
     else if state.at_end():
-        Ok({ methods = [], next = state })
+        Ok({ methods = [], hole_owner = None, next = state })
     else:
         match state.consume_line_end(
             "expected ':' or a newline after the implementation receiver",
             "add ':' before authored methods, or end the line to use only trait defaults"
         ):
-            Ok(next): Ok({ methods = [], next = next })
+            Ok(next): Ok({ methods = [], hole_owner = None, next = next })
             Err(error): Err(error)
 
 
@@ -5792,6 +5880,7 @@ private pure func consume_implementation(
             span = { start.parser_span() | end = header_end }
         },
         methods = methods.methods,
+        hole_owner = methods.hole_owner,
         next = methods.next
     })
 
@@ -6984,8 +7073,9 @@ private pure func consume_import_block(start: ParserState) -> Result[ImportBlock
 private union Declaration:
     ImportBlock(List[ParsedImport])
     BuiltinTypeDeclaration(ParsedBuiltinTypeDeclaration)
-    FunctionDeclaration(ParsedFunctionGroup)
-    TraitDeclaration(ParsedTrait)
+    -- Each with the name of its function whose body holds the completion hole.
+    FunctionDeclaration(ParsedFunctionGroup, Option[WrittenName])
+    TraitDeclaration(ParsedTrait, Option[WrittenName])
     UnionDeclaration(ParsedUnion)
     RecordDeclaration(ParsedRecord)
     ConstantDeclaration(ParsedConstant)
@@ -7130,7 +7220,10 @@ private pure func consume_visible_declaration(
     if state.at_keyword(TraitKeyword):
         match state.consume_trait(declaration_start, module, visibility):
             Ok(parsed):
-                Ok({ declaration = TraitDeclaration(parsed.declaration), next = parsed.next })
+                Ok({
+                    declaration = TraitDeclaration(parsed.declaration, parsed.hole_owner),
+                    next = parsed.next
+                })
             Err(error):
                 Err(error)
     else if state.at_keyword(ImplementsKeyword):
@@ -7138,7 +7231,8 @@ private pure func consume_visible_declaration(
             Ok(parsed):
                 Ok({
                     declaration = FunctionDeclaration(
-                        ImplementationGroup(parsed.header, parsed.methods)
+                        ImplementationGroup(parsed.header, parsed.methods),
+                        parsed.hole_owner
                     ),
                     next = parsed.next
                 })
@@ -7229,7 +7323,10 @@ private pure func consume_remaining_declaration(
         match state.consume_function(declaration_start, module, visibility):
             Ok(parsed):
                 Ok({
-                    declaration = FunctionDeclaration(FreeFunction(parsed.function)),
+                    declaration = FunctionDeclaration(
+                        FreeFunction(parsed.function),
+                        state.holding_hole(parsed.next, parsed.function.function_name)
+                    ),
                     next = parsed.next
                 })
             Err(error):
@@ -7254,6 +7351,7 @@ pure func parse_module(input: LexedProgram, module: ModuleId) -> Result[ParsedMo
     var unions: List[ParsedUnion] = []
     var records: List[ParsedRecord] = []
     var constants: List[ParsedConstant] = []
+    var completion_function: Option[WrittenName] = None
     -- Whether a declaration other than an import block has been read.
     var declared: Bool = False
 
@@ -7282,11 +7380,19 @@ pure func parse_module(input: LexedProgram, module: ModuleId) -> Result[ParsedMo
                             BuiltinTypeDeclaration(declaration):
                                 builtin_types = builtin_types.append(declaration)
                                 declared = True
-                            FunctionDeclaration(function):
+                            FunctionDeclaration(function, owner):
                                 functions = functions.append(function)
+
+                                if owner.is_some():
+                                    completion_function = owner
+
                                 declared = True
-                            TraitDeclaration(declaration):
+                            TraitDeclaration(declaration, owner):
                                 traits = traits.append(declaration)
+
+                                if owner.is_some():
+                                    completion_function = owner
+
                                 declared = True
                             UnionDeclaration(declaration):
                                 unions = unions.append(declaration)
@@ -7319,6 +7425,7 @@ pure func parse_module(input: LexedProgram, module: ModuleId) -> Result[ParsedMo
             records = records,
             constants = constants,
             concurrent_blocks = finished.concurrent_blocks,
+            completion_function = completion_function,
             end = input.end
         })
     )
