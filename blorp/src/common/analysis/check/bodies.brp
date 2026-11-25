@@ -34,6 +34,7 @@ import:
         PatternHead(BareHead, QualifiedHead),
         ParsedStatement(
             TupleBinding,
+            VariantBinding,
             BindingStatement,
             PropagatingBinding,
             ExpressionStatement,
@@ -45,14 +46,22 @@ import:
         Span,
         ValueExpression,
         WrittenName,
-        TypeSyntax
+        TypeSyntax,
+        ParsedVariantBinding
     ../assemble: ParsedModuleRow
-    ../ids: FunctionId, OpaqueRow, TraitId, TraitMethodId, VariantId
+    ../ids:
+        DeclarationInventory,
+        FunctionId,
+        TraitId,
+        TraitMethodId,
+        UnionId,
+        VariantId,
+        inventory_opaques
     ../namespace/builtins: DesignatedResult, DesignatedBoolean, DesignatedOption, RuntimeOperation
     ../namespace/namespace: Namespace
     ./callables: ResolutionContext
-    ./constructors: VariantContract, ConstructionContext
-    ./declarations: CheckedDeclarations, ResolvedType(ResolvedTypeTerm)
+    ./constructors: VariantContract, ConstructionContext, construction_context, destructured_variant
+    ./declarations: CheckedDeclarations, ResolvedType(ResolvedTypeTerm), occurrence_fields
     ./errors:
         CheckError,
         RecursionError(
@@ -108,6 +117,17 @@ import:
         checker_invariant,
         match_error,
         statement_error,
+        ConstructorError(DestructuringRejected),
+        DestructuringProblem(
+            SeveralVariants,
+            PayloadCountMismatch,
+            ValueOfOtherType,
+            NotStoredAsPayload
+        ),
+        constructor_error,
+        ResourceError(MatchedResource),
+        resource_error,
+        Option methods,
         UnsupportedForm(CharPattern, IfValue),
         unsupported_form
     ./expressions: CheckedValueResult, ResolvedBody, check_value, synthesize_value
@@ -159,7 +179,8 @@ import:
             MakeCallable,
             ReadBinding,
             ConstructVariant,
-            ReadTupleElement
+            ReadTupleElement,
+            ReadPayload
         ),
         CheckedCallOperand(ValueOperand, CallableOperand),
         CheckedFunction,
@@ -188,13 +209,16 @@ import:
         FunctionSignature,
         TypeUse,
         UnionOccurrence,
+        UnionStorage(StoredAsPayload, StoredByValue, StoredOnHeap),
+        union_occurrence,
         callable_parameter,
         binding_id,
         implementation_rows
-    ./name_uses: NameUse, Referent(BindingReferent), name_use
+    ./name_uses: NameUse, Referent(BindingReferent), name_use, with_uses
     ./patterns as patterns: ParsedPattern methods, TypeRef methods
     ./recursion: BodyCalls, automatic_origin, check_execution
     ./resource_scopes: ResourceDefault, admit_resource_body, resource_defaults
+    ./resource_types: TypeRef methods, declares_resources
     ./scope:
         ScopedValue(DataLocal, CallableLocal),
         LocalBinding,
@@ -255,13 +279,19 @@ private pure func start_match(
         resolve_lambda_block
     )
 
-    _: Void ?= match scrutinee.value.value_type.supports_root():
-        True:
-            Ok(void)
-        False:
-            Err(match_error(body.scrutinee.span, InvalidMatchScrutinee(scrutinee.value.value_type)))
+    scrutinee_type = scrutinee.value.value_type
 
-    subject ?= scrutinee.value.value_type.prepare_subject(context, body.scrutinee.span)
+    _: Void ?= match scrutinee_type.supports_root():
+        True: Ok(void)
+        False: Err(match_error(body.scrutinee.span, InvalidMatchScrutinee(scrutinee_type)))
+
+    held ?= scrutinee_type.as_resource(context.body_types.inventory, body.scrutinee.span)
+
+    _: Void ?= match held:
+        Some(matched): Err(resource_error(body.scrutinee.span, MatchedResource(matched)))
+        None: Ok(void)
+
+    subject ?= scrutinee_type.prepare_subject(context, body.scrutinee.span)
 
     Ok({
         lambdas = scrutinee.lambdas,
@@ -915,6 +945,8 @@ private pure func resolve_statement(
     match statement:
         TupleBinding(binders, initializer, span):
             binders.resolve_tuple_binding(initializer, span, block, context)
+        VariantBinding(binding):
+            binding.resolve_variant_binding(block, context)
         BindingStatement(binding):
             binding.resolve_assignment(block, context)
         PropagatingBinding(propagation):
@@ -1389,40 +1421,15 @@ private pure func bind_tuple_elements(
                             checker_invariant(name.span, UnsupportedPatternReachedResolution)
                         )
                     Some(value_type):
-                        id = binding_id(resolved.bindings.length())
-
-                        definition: BindingDefinition = {
-                            origin = BodyLocal,
-                            mutable = False,
-                            named = True,
+                        projection: CheckedExpr = {
+                            form = ReadTupleElement(subject, position),
                             value_type = value_type,
                             span = name.span
                         }
 
-                        match resolved.scope.bind_local(
-                            context.namespace,
-                            context.module,
-                            context.caller.body,
-                            name,
-                            id,
-                            definition
-                        ):
-                            Err(error):
-                                failure = Some(error)
-                            Ok(binding):
-                                projection: CheckedExpr = {
-                                    form = ReadTupleElement(subject, position),
-                                    value_type = value_type,
-                                    span = name.span
-                                }
-
-                                resolved = { resolved |
-                                    bindings = resolved.bindings.append(definition),
-                                    scope = [binding].concat(resolved.scope),
-                                    statements = resolved.statements.append(
-                                        InitializeBinding(id, projection)
-                                    )
-                                }
+                        match resolved.bind_projection(name, projection, context):
+                            Err(error): failure = Some(error)
+                            Ok(bound): resolved = bound
 
         if failure.is_some():
             break
@@ -1472,6 +1479,120 @@ private pure func resolve_tuple_binding(
         },
         context
     )
+
+
+-- A destructured name: a new immutable binding initialized with `projection`.
+private pure func bind_projection(
+    block: ResolvedStatements,
+    name: WrittenName,
+    projection: CheckedExpr,
+    context: ResolutionContext
+) -> Result[ResolvedStatements, CheckError]:
+    id = binding_id(block.bindings.length())
+
+    definition: BindingDefinition = {
+        origin = BodyLocal,
+        mutable = False,
+        named = True,
+        value_type = projection.value_type,
+        span = name.span
+    }
+
+    binding ?= block.scope.bind_local(
+        context.namespace,
+        context.module,
+        context.caller.body,
+        name,
+        id,
+        definition
+    )
+
+    Ok(
+        { block |
+            bindings = block.bindings.append(definition),
+            scope = [binding].concat(block.scope),
+            statements = block.statements.append(InitializeBinding(id, projection))
+        }
+    )
+
+
+-- `Union.Variant(binders) = value` reads a union with one variant (rule 7).
+-- Its variant resolves as a construction's does, so the access and ambiguity
+-- rules apply unchanged. Until landing 7 only a union stored as its payload is
+-- destructured: its one binder reads that payload, and nothing binds the union
+-- itself, so a resource union's handle is read without an alias.
+private pure func resolve_variant_binding(
+    written: ParsedVariantBinding,
+    block: ResolvedStatements,
+    context: ResolutionContext
+) -> Result[ResolvedStatements, CheckError]:
+    head ?= context
+        .construction_context()
+        .destructured_variant(written.variant)
+
+    variant = head[0]
+    owner = variant.variant_owner()
+
+    rejected = pure func(span: Span, problem: DestructuringProblem) -> CheckError: constructor_error(
+        span,
+        DestructuringRejected(variant, problem)
+    )
+
+    declaration ?= context.unions
+        .get(owner.union_number())
+        .or_checker_invariant(written.span, InvalidCheckedUnion(owner))
+
+    fields: List[TypeUse] ?= match declaration.variants:
+        [only]: Ok(only.fields)
+        _: Err(rejected(written.span, SeveralVariants(declaration.variants.length())))
+
+    -- Before the arity: a union not stored as its payload is reported alone.
+    _: Void ?= match declaration.storage:
+        StoredAsPayload: Ok(void)
+        StoredByValue | StoredOnHeap: Err(rejected(written.span, NotStoredAsPayload))
+
+    _: Void ?= if fields.length() == written.binders.length():
+        Ok(void)
+    else:
+        Err(rejected(written.span, PayloadCountMismatch(fields.length(), written.binders.length())))
+
+    resolved ?= block.resolve_value(written.initializer, UntypedValue, context)
+    value_type = resolved.value.value_type
+
+    occurrence: UnionOccurrence ?= match value_type.union_occurrence():
+        Some(found):
+            if found.owner == owner:
+                Ok(found)
+            else:
+                Err(rejected(written.initializer.span, ValueOfOtherType(value_type)))
+        None:
+            Err(rejected(written.initializer.span, ValueOfOtherType(value_type)))
+
+    payloads ?= fields.occurrence_fields(occurrence)
+
+    -- The arity check and StoredAsPayload leave exactly one payload and binder.
+    read: CheckedExpr ?= match payloads:
+        [payload]:
+            Ok({
+                form = ReadPayload(variant, resolved.value, 0),
+                value_type = payload.value_type,
+                span = written.span
+            })
+        _:
+            Err(checker_invariant(written.span, InvalidCheckedUnion(owner)))
+
+    next: ResolvedStatements = { block |
+        lambdas = resolved.lambdas,
+        bindings = resolved.bindings,
+        reassigned = resolved.reassigned,
+        uses = block.uses
+            .concat(resolved.uses)
+            .with_uses(head[1])
+    }
+
+    match written.binders:
+        [NamedBinder(name)]: next.bind_projection(name, read, context)
+        _: Ok({ next | statements = next.statements.append(DiscardExpression(read)) })
 
 
 private pure func bind_for_binder(
@@ -2413,7 +2534,7 @@ pure func resolve_functions(
     modules: List[ParsedModuleRow],
     whole_library: Bool,
     declarations: CheckedDeclarations,
-    opaque_declarations: List[OpaqueRow],
+    inventory: DeclarationInventory,
     namespace: Namespace,
     receivers: List[AdmittedReceiverScope],
     constants: List[CheckedConstant],
@@ -2423,13 +2544,14 @@ pure func resolve_functions(
     option: DesignatedOption[VariantId],
     synthesized_entry: Option[FunctionId]
 ) -> Result[CheckedBodies, CheckError]:
-    has_resources = opaque_declarations.any(pure func(row): row.declaration.resource_type)
+    opaque_declarations = inventory.inventory_opaques()
+    has_resources = declares_resources(inventory)
 
     inherited: List[ResourceDefault] ?= if has_resources:
         traits
             .accepted_traits().implementations
             .implementation_rows()
-            .resource_defaults(opaque_declarations)
+            .resource_defaults(inventory)
     else:
         Ok([])
 
@@ -2558,7 +2680,7 @@ pure func resolve_functions(
                                         id,
                                         signature,
                                         functions,
-                                        opaque_declarations,
+                                        inventory,
                                         inherited
                                     )
                                 else:

@@ -583,6 +583,14 @@ are not forms. Write `read.Empty` for a variant through a module alias. A
 pattern's union must be the matched value's: matching a `Shape` with
 `Other.Empty` reports that `Other.Empty` is a variant of `Other`.
 
+A union with one variant is read by destructuring, as a tuple is:
+`Meters.Init(length) = distance`, or `Init(length) = distance` where the bare
+name is unambiguous, binds one new name or `_` for each payload, and always
+matches. A union with several variants is read with `match` instead:
+destructuring one reports that it could fail to match. For now only a union
+stored as its one payload, described below, can be destructured; read any
+other union with `match`.
+
 Variant names share one namespace with the module's functions and constants.
 In one union each variant name is unique, and none is spelled like its union:
 `union Box: Box(Int)` is rejected, because `Box` should always mean the type.
@@ -597,8 +605,14 @@ unique and cannot replace a base type.
 
 `union Result[T, E]:` declares type parameters, and an application such as
 `Result[Box[Int], Int]` supplies all of them in order. A union of bare
-variants compiles to a C enum. Any other union is a tagged C struct stored
-inline that owns only its active variant's payload.
+variants compiles to a C enum. A union with one variant and one payload is
+stored as that payload, with no tag and no wrapper, as an opaque type is:
+`union Meters: Init(Int)` is an `int64_t` in C. That holds when the payload
+never reaches the union again by any path, through type arguments (phantom
+ones included), records, opaque types, Lists and callables. The test is
+conservative: a rose tree, `union Tree: Node(List[Tree])`, could be stored as
+its List but stays a tagged union. Any other union is a tagged C struct
+stored inline that owns only its active variant's payload.
 
 A union may contain itself: directly, as in `Succ(Nat)`, `Node(Tree, Int,
 Tree)` or a generic `Link(T, Chain[T])`; through other unions, as `Even` and
@@ -626,14 +640,15 @@ union UserId:
 private pure func user_id(value: Int) -> UserId:
     Init(value)
 pure func number(id: UserId) -> Int:
-    match id:
-        Init(value): value
+    Init(value) = id
+    value
 func main() -> Int:
     number(user_id(7))
 ```
 
-This exits 7. A variant marked `private` is built and matched only in the
-module that declares it. `Init` is the convention for a type's one private
+This exits 7. A variant marked `private` is built, matched and destructured
+only in the module that declares it. `UserId` has one variant and one
+payload, so it is stored as its `Int`. `Init` is the convention for a type's one private
 variant; the language does not require the name. A private variant's payload
 may mention private types, since no other module sees it. In a `private
 union` every variant is private already, so a variant there takes no mark:
@@ -676,6 +691,24 @@ type. Its module alone may wrap and project values, using the same conversions.
 Resources may be whole impure function or callable parameters and arguments;
 they cannot be local aliases, results, constants, aggregate children, opaque
 representations or explicit or inferred generic arguments.
+
+A `resource union` is a resource too, and follows the same rules:
+
+```blorp
+resource union Reader:
+    private Init(Int)
+
+func read_chunk(reader: Reader, limit: Int) -> Int:
+    Reader.Init(handle) = reader
+    handle + limit
+```
+
+It has exactly one variant, private by its mark or, in a `private resource
+union`, through its union, with exactly one payload, and no type parameters;
+any other shape is one error. Only its module builds or reads one, by
+destructuring: nothing matches a resource ("a resource cannot be matched"),
+and a resource has no `==`. Its one payload is the handle, so it is stored as
+that payload.
 
 ```blorp
 resource type Reader = Int

@@ -1,4 +1,5 @@
 import:
+    bool: and, or
     int: INT_MIN, INT_MAX
     string: from_codepoint
     ../utils/results: translated_list
@@ -148,11 +149,14 @@ import:
         SystemOperation,
         SYSTEM_OPERATIONS,
         ParsedPropagation,
+        ParsedVariantBinding,
+        DestructuredVariant(BareVariant, UnionVariant),
         ParsedWhile,
         ParsedFor,
         ParsedStatement(
             BindingStatement,
             TupleBinding,
+            VariantBinding,
             PropagatingBinding,
             ExpressionStatement,
             WhileLoop,
@@ -161,7 +165,9 @@ import:
             Continue
         ),
         ParsedUnion,
+        UnionKind(OrdinaryUnion, FixedUnion, ResourceUnion),
         ParsedVariant,
+        effective_visibility,
         PostfixOperation(ReceiverInvocation, FieldAccess, TupleIndex),
         Purity(Pure, Impure),
         Spacing(Adjacent, Spaced),
@@ -421,7 +427,11 @@ private pure func misplaced_annotation(state: ParserState) -> Diagnostic:
 
 -- The symbol at the parser position, or None for any other token or the end.
 private pure func current_symbol(state: ParserState) -> Option[Symbol]:
-    match state.current_token():
+    state.symbol_at(state.position)
+
+
+private pure func symbol_at(state: ParserState, position: Int) -> Option[Symbol]:
+    match state.input.tokens.get(position):
         Some(token):
             match token.kind:
                 SymbolToken(symbol): Some(symbol)
@@ -432,7 +442,11 @@ private pure func current_symbol(state: ParserState) -> Option[Symbol]:
 
 -- Reserved words have their own identity; punctuation never enters this query.
 private pure func current_keyword(state: ParserState) -> Option[Keyword]:
-    match state.current_token():
+    state.keyword_at(state.position)
+
+
+private pure func keyword_at(state: ParserState, position: Int) -> Option[Keyword]:
+    match state.input.tokens.get(position):
         Some(token):
             match token.kind:
                 KeywordToken(keyword): Some(keyword)
@@ -2873,10 +2887,10 @@ private FLAT_TUPLE_MESSAGE: String = "tuple destructuring requires flat names or
 private FLAT_TUPLE_HELP: String = "bind a nested tuple to a name, then destructure it separately"
 
 
-private TUPLE_BINDER_ANNOTATION_MESSAGE: String = "tuple destructuring names cannot have type annotations"
+private BINDER_ANNOTATION_MESSAGE: String = "destructuring names cannot have type annotations"
 
 
-private TUPLE_BINDER_ANNOTATION_HELP: String = "annotate the tuple value before destructuring it"
+private BINDER_ANNOTATION_HELP: String = "annotate the value before destructuring it"
 
 
 -- Preserve a bare binder at its syntactic boundary. A leading parenthesized
@@ -2926,7 +2940,7 @@ private pure func consume_enclosed_member(
             .or(state.at_wildcard())
             .and(after.at_colon())
     ):
-        Err(expected_syntax(after, TUPLE_BINDER_ANNOTATION_MESSAGE, TUPLE_BINDER_ANNOTATION_HELP))
+        Err(expected_syntax(after, BINDER_ANNOTATION_MESSAGE, BINDER_ANNOTATION_HELP))
     else if bare:
         state.consume_bare_member()
     else:
@@ -4167,31 +4181,29 @@ private pure func tuple_declaration_binders(
                 )
             )
         TupleContents(members):
-            var binders: List[ParsedBinder] = []
-            var failure: Option[Diagnostic] = None
+            members.translated_list(
+                pure func(member: EnclosedMember) -> Result[ParsedBinder, Diagnostic]:
+                    member.member_binder(enclosed.next, FLAT_TUPLE_MESSAGE, FLAT_TUPLE_HELP)
+            )
 
-            for member in members:
-                match member:
-                    BareMember(name, form):
-                        match enclosed.next.input.names.check_declared_name(
-                            DeclaredLocal,
-                            name,
-                            form
-                        ):
-                            Ok(_):
-                                binders = binders.append(NamedBinder(name))
-                            Err(error):
-                                failure = Some(error)
-                                break
-                    BareDiscard(span):
-                        binders = binders.append(DiscardBinder(span))
-                    ValueMember(value):
-                        failure = Some(diagnostic(value.span, FLAT_TUPLE_MESSAGE, FLAT_TUPLE_HELP))
-                        break
 
-            match failure:
-                Some(error): Err(error)
-                None: Ok(binders)
+-- A destructuring member's binder: the name it declares, or `_`. Any other
+-- value is reported at its whole extent with `message` and `help`.
+private pure func member_binder(
+    member: EnclosedMember,
+    state: ParserState,
+    message: String,
+    help: String
+) -> Result[ParsedBinder, Diagnostic]:
+    match member:
+        BareMember(name, form):
+            state.input.names
+                .check_declared_name(DeclaredLocal, name, form)
+                .map(pure func(_): NamedBinder(name))
+        BareDiscard(span):
+            Ok(DiscardBinder(span))
+        ValueMember(value):
+            Err(diagnostic(value.span, message, help))
 
 
 private pure func consume_tuple_binding(enclosed: ParsedEnclosed) -> Result[LineForm, Diagnostic]:
@@ -4205,6 +4217,118 @@ private pure func consume_tuple_binding(enclosed: ParsedEnclosed) -> Result[Line
 
     initializer ?= equals.consume_initializer(Assign, BINDING_LINE_MESSAGE, BINDING_LINE_HELP)
     Ok(StatementForm(TupleBinding(binders, initializer.body, enclosed.span), initializer.next))
+
+
+private VARIANT_BINDER_MESSAGE: String = "destructuring binds a name or '_' for each payload"
+
+
+private VARIANT_BINDER_HELP: String = "bind the payload to a name, then compare or use that name"
+
+
+private pure func at_variant_name(state: ParserState, position: Int) -> Bool:
+    match state.input.tokens.get(position):
+        Some(token):
+            match token.kind:
+                IdentifierToken(_, form): DeclaredVariant.accepts(form)
+                _: False
+        None:
+            False
+
+
+-- Whether the line is `Name(...) =` or `Union.Name(...) =`: a variant, then a
+-- '(' whose matching ')' is followed by '=' or '?='. Like a line that starts
+-- with '(', it commits at that ')'. Every line that starts with a value
+-- reaches this test: one that starts with no variant reads one token, and the
+-- rest are read by position, since a shifted ParserState is a new record.
+private pure func at_variant_binding(state: ParserState) -> Bool:
+    var position = state.position + 1
+    var depth: Int = 0
+    var closed: Bool = False
+
+    if state.at_variant_name(state.position):
+        if and(state.symbol_at(position) == Some(Dot), state.at_variant_name(position + 1)):
+            position = position + 2
+
+        if state.symbol_at(position) == Some(LeftParen):
+            while and(closed.not(), position < state.input.tokens.length()):
+                match state.symbol_at(position):
+                    Some(LeftParen):
+                        depth = depth + 1
+                    Some(RightParen):
+                        depth = depth - 1
+                        closed = depth == 0
+                    _:
+                        void
+
+                position = position + 1
+
+    if closed:
+        match state.symbol_at(position):
+            Some(Equals) | Some(QuestionEquals): True
+            _: False
+    else:
+        False
+
+
+private pure func consume_payload_binder(
+    _: Int,
+    state: ParserState
+) -> Result[ParsedItem[ParsedBinder], Diagnostic]:
+    member ?= state.consume_enclosed_member()
+    binder ?= member.item.member_binder(state, VARIANT_BINDER_MESSAGE, VARIANT_BINDER_HELP)
+    Ok({ item = binder, next = member.next })
+
+
+-- `Name(binders) = value` or `Union.Name(binders) = value`, which
+-- `at_variant_binding` found. Its binders are read as a tuple's are.
+private pure func consume_variant_binding(state: ParserState) -> Result[LineForm, Diagnostic]:
+    head ?= state.consume_used_name("expected a variant name")
+
+    written: ParsedItem[DestructuredVariant] = match head.variant_after():
+        Some(variant):
+            {
+                item = UnionVariant({ union_name = head.name, variant = variant.name }),
+                next = variant.next
+            }
+        None:
+            { item = BareVariant(head.name), next = head.next }
+
+    listed ?= written.next
+        .shifted(1)
+        .with_enclosure(Bracketed)
+        .consume_parenthesized_items([], consume_payload_binder)
+
+    closed ?= listed.next.expect(
+        listed.next.at_right_paren(),
+        "expected ')' after the destructured names",
+        VARIANT_BINDER_HELP
+    )
+
+    span = { head.name.span | end = listed.next.parser_span().end }
+
+    _: Void ?= if listed.items.is_empty():
+        Err(diagnostic(span, VARIANT_BINDER_MESSAGE, "name the payload, or write _ to discard it"))
+    else:
+        Ok(void)
+
+    after = closed.with_enclosure(state.enclosure)
+
+    equals ?= after.expect(
+        after.at_equals(),
+        "destructuring requires '='",
+        "propagate into a name first, then destructure the result"
+    )
+
+    initializer ?= equals.consume_initializer(Assign, BINDING_LINE_MESSAGE, BINDING_LINE_HELP)
+
+    binding: ParsedVariantBinding = {
+        variant = written.item,
+        binders = listed.items,
+        initializer = initializer.body,
+        span = span
+    }
+
+    Ok(StatementForm(VariantBinding(binding), initializer.next))
 
 
 -- A line beginning with '(' shares the ordinary expression parser's rest
@@ -4325,6 +4449,8 @@ private pure func consume_line_form(state: ParserState) -> Result[LineForm, Diag
         state.consume_binding()
     else if state.at_left_paren():
         state.consume_parenthesized_line()
+    else if state.at_variant_binding():
+        state.consume_variant_binding()
     else if state.at_keyword(WhileKeyword):
         state.consume_while()
     else if state.at_for():
@@ -4451,8 +4577,8 @@ private pure func consume_tuple_binder(
                     Err(
                         expected_syntax(
                             binder.next,
-                            TUPLE_BINDER_ANNOTATION_MESSAGE,
-                            TUPLE_BINDER_ANNOTATION_HELP
+                            BINDER_ANNOTATION_MESSAGE,
+                            BINDER_ANNOTATION_HELP
                         )
                     )
                 else if count == TUPLE_MAXIMUM_ELEMENTS:
@@ -4525,6 +4651,7 @@ private pure func statement_end(statement: ParsedStatement) -> Int:
     match statement:
         BindingStatement(binding): binding.initializer.span.end
         TupleBinding(_, initializer, _): initializer.span.end
+        VariantBinding(binding): binding.initializer.span.end
         PropagatingBinding(propagation): propagation.value.span.end
         ExpressionStatement(value): value.span.end
         WhileLoop(loop): loop.span.end
@@ -5814,20 +5941,44 @@ private pure func reject_fixed_type_parameters(
         Ok(void)
 
 
--- `start` is at the `union` keyword.
+-- The kind of union a declaration header starts: `union`, `fixed union` or
+-- `resource union`. `fixed union` promises inline storage with no counted
+-- child: the parser rejects its type parameters, and checking rejects managed
+-- payloads and recursion.
+private pure func union_header(state: ParserState) -> Option[UnionKind]:
+    -- Read by position: every declaration reaches this test, and a shifted
+    -- ParserState is a new record.
+    qualified = state.keyword_at(state.position + 1) == Some(UnionKeyword)
+
+    if state.at_keyword(UnionKeyword):
+        Some(OrdinaryUnion)
+    else if and(state.at_word(state.recognized_words().fixed_word), qualified):
+        Some(FixedUnion)
+    else if and(state.at_keyword(ResourceKeyword), qualified):
+        Some(ResourceUnion)
+    else:
+        None
+
+
+-- `start` is at a union header of this kind.
 private pure func consume_union(
     start: ParserState,
     declaration_start: Span,
     module: ModuleId,
     visibility: Visibility,
-    fixed: Bool
+    kind: UnionKind
 ) -> Result[UnionResult, Diagnostic]:
+    header_words = match kind:
+        OrdinaryUnion: 1
+        FixedUnion | ResourceUnion: 2
+
     name ?= start
-        .shifted(1)
+        .shifted(header_words)
         .consume_declared_name(DeclaredType, "expected a union type name")
 
     type_parameters ?= name.next.consume_type_parameters()
-    _: Void ?= name.next.reject_fixed_type_parameters(type_parameters, fixed, "union")
+
+    _: Void ?= name.next.reject_fixed_type_parameters(type_parameters, kind == FixedUnion, "union")
 
     colon ?= type_parameters.next.expect(
         type_parameters.next.at_colon(),
@@ -5849,18 +6000,52 @@ private pure func consume_union(
 
     variants ?= opened.consume_variants(name.name, visibility, [])
 
-    Ok({
-        declaration = {
-            start = declaration_start,
-            module = module,
-            visibility = visibility,
-            type_name = name.name,
-            type_parameters = type_parameters.parameters,
-            variants = variants.variants,
-            fixed = fixed
-        },
-        next = variants.next
-    })
+    declaration: ParsedUnion = {
+        start = declaration_start,
+        module = module,
+        visibility = visibility,
+        type_name = name.name,
+        type_parameters = type_parameters.parameters,
+        variants = variants.variants,
+        kind = kind
+    }
+
+    _: Void ?= declaration.check_resource_shape(start.input.names)
+    Ok({ declaration = declaration, next = variants.next })
+
+
+-- A resource union has no type parameters and exactly one variant, private
+-- by its mark or through its union, with exactly one payload (decision 1).
+-- Breaking any of these is one error, at the union's name.
+private pure func check_resource_shape(
+    declaration: ParsedUnion,
+    names: NameTable
+) -> Result[Void, Diagnostic]:
+    shaped = match declaration.variants:
+        [variant]:
+            and(
+                variant.fields.length() == 1,
+                variant.effective_visibility(declaration.visibility) != Public
+            )
+        _:
+            False
+
+    if or(declaration.kind != ResourceUnion, and(shaped, declaration.type_parameters.is_empty())):
+        Ok(void)
+    else:
+        name = names.spelling_of(declaration.type_name.id)
+
+        help = match declaration.visibility:
+            Private(_): "declare private resource union ${name}: Init(Int)"
+            Public: "declare resource union ${name}: private Init(Int)"
+
+        Err(
+            diagnostic(
+                declaration.type_name.span,
+                "a resource union has no type parameters and exactly one private variant with one payload",
+                help
+            )
+        )
 
 
 private record ParsedLiteralFields {
@@ -6831,8 +7016,14 @@ private pure func consume_opaque(
     else:
         "opaque"
 
+    -- `resource union` was read before this; another word gets both forms.
+    expected = if resource_type:
+        "expected 'type' or 'union' after 'resource'"
+    else:
+        "expected 'type' after 'opaque'"
+
     help = if resource_type:
-        "write resource type Name = Underlying"
+        "write resource type Name = Underlying or resource union Name: private Init(Underlying)"
     else:
         OPAQUE_DECLARATION_HELP
 
@@ -6841,7 +7032,7 @@ private pure func consume_opaque(
     type_word: ParserState ?= if after_opaque.at_type_keyword():
         Ok(after_opaque.shifted(1))
     else:
-        Err(expected_syntax(after_opaque, "expected 'type' after '${kind}'", help))
+        Err(expected_syntax(after_opaque, expected, help))
 
     name_message = if resource_type:
         "expected a resource type name"
@@ -7011,16 +7202,6 @@ private pure func consume_visible_declaration(
                 Err(error)
     else if (
         state
-            .at_keyword(OpaqueKeyword)
-            .or(state.at_keyword(ResourceKeyword))
-    ):
-        match state.consume_opaque(declaration_start, module, visibility):
-            Ok(parsed):
-                Ok({ declaration = OpaqueDeclaration(parsed.declaration), next = parsed.next })
-            Err(error):
-                Err(error)
-    else if (
-        state
             .at_identifier()
             .and(
                 state
@@ -7033,31 +7214,38 @@ private pure func consume_visible_declaration(
                 Ok({ declaration = ConstantDeclaration(parsed.declaration), next = parsed.next })
             Err(error):
                 Err(error)
-    else if state.at_keyword(UnionKeyword):
-        match state.consume_union(declaration_start, module, visibility, False):
-            Ok(parsed):
-                Ok({ declaration = UnionDeclaration(parsed.declaration), next = parsed.next })
-            Err(error):
-                Err(error)
-    -- `fixed union` promises inline storage with no counted child. The parser
-    -- rejects its type parameters; checking rejects managed payloads and
-    -- recursion.
-    else if (
+    else:
+        -- A union header is read once; `fixed union` and `resource union` win
+        -- over the `fixed` error and the opaque and resource types below it.
+        match state.union_header():
+            Some(kind):
+                match state.consume_union(declaration_start, module, visibility, kind):
+                    Ok(parsed):
+                        Ok({
+                            declaration = UnionDeclaration(parsed.declaration),
+                            next = parsed.next
+                        })
+                    Err(error):
+                        Err(error)
+            None:
+                state.consume_remaining_declaration(declaration_start, module, visibility)
+
+
+-- An opaque or resource type, the `fixed` error, or else a function.
+private pure func consume_remaining_declaration(
+    state: ParserState,
+    declaration_start: Span,
+    module: ModuleId,
+    visibility: Visibility
+) -> Result[DeclarationResult, Diagnostic]:
+    if (
         state
-            .at_word(state.recognized_words().fixed_word)
-            .and(
-                state
-                    .shifted(1)
-                    .at_keyword(UnionKeyword)
-            )
+            .at_keyword(OpaqueKeyword)
+            .or(state.at_keyword(ResourceKeyword))
     ):
-        match (
-            state
-                .shifted(1)
-                .consume_union(declaration_start, module, visibility, True)
-        ):
+        match state.consume_opaque(declaration_start, module, visibility):
             Ok(parsed):
-                Ok({ declaration = UnionDeclaration(parsed.declaration), next = parsed.next })
+                Ok({ declaration = OpaqueDeclaration(parsed.declaration), next = parsed.next })
             Err(error):
                 Err(error)
     else if state.at_word(state.recognized_words().fixed_word):

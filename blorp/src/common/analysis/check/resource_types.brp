@@ -1,58 +1,82 @@
 ---
-Synchronous loans use the parsed opaque declaration as their resource authority.
-These checks publish no runtime or downstream lifetime representation.
+Synchronous loans use the parsed declarations as their resource authority: a
+`resource union`, and until landing 6 removes it, a `resource type`. These
+checks publish no runtime or downstream lifetime representation.
 ---
 import:
     ../../syntax/syntax: Span, Purity(Pure)
-    ../ids: OpaqueId, OpaqueRow, opaque_number
+    ../ids: DeclarationInventory, inventory_opaques, opaque_number
     ./errors as errors: CheckError, ResourceUse, checker_invariant, resource_error
-    ./model as model: TypeRef, type_children
+    ./model as model: NominalId, TypeRef, type_children
 
 
--- `id` when it declares a resource type. The inventory issued every OpaqueId,
--- so a miss is a checker defect: it stops the check instead of reading as
--- "not a resource", which would turn the loan rules off.
+-- `id` when it declares a resource; the one place that decides it. The
+-- inventory issued every id, so a miss is a checker defect: it stops the check
+-- instead of reading as "not a resource", which would turn the loan rules off.
 pure func declared_resource(
-    id: OpaqueId,
-    opaques: List[OpaqueRow],
+    id: NominalId,
+    inventory: DeclarationInventory,
     span: Span
-) -> Result[Option[OpaqueId], CheckError]:
-    match opaques.get(id.opaque_number()):
-        Some(row):
-            if row.declaration.resource_type:
-                Ok(Some(id))
-            else:
-                Ok(None)
-        None:
-            Err(checker_invariant(span, errors.InvalidOpaqueDeclaration(id)))
+) -> Result[Option[NominalId], CheckError]:
+    -- Every type a resource walk visits reaches this, so each arm answers
+    -- directly rather than through a Result[Bool] it unwraps again.
+    match id:
+        model.OpaqueNominal(declared_opaque):
+            match inventory_opaques(inventory).get(declared_opaque.opaque_number()):
+                Some(row): id.resource_when(row.declaration.resource_type)
+                None: Err(checker_invariant(span, errors.InvalidOpaqueDeclaration(declared_opaque)))
+        model.AggregateNominal(model.UnionAggregate(owner)):
+            match inventory.is_resource_union(owner):
+                Some(declared): id.resource_when(declared)
+                None: Err(checker_invariant(span, errors.InvalidCheckedUnion(owner)))
+        model.AggregateNominal(model.RecordAggregate(_)):
+            Ok(None)
+
+
+private pure func resource_when(
+    id: NominalId,
+    declared: Bool
+) -> Result[Option[NominalId], CheckError]:
+    if declared:
+        Ok(Some(id))
+    else:
+        Ok(None)
+
+
+-- Whether the program declares any resource: some union in the derived
+-- index, or some resource type. Without one, no loan can originate.
+pure func declares_resources(inventory: DeclarationInventory) -> Bool:
+    inventory
+        .declares_resource_unions()
+        .or(inventory_opaques(inventory).any(pure func(row): row.declaration.resource_type))
 
 
 -- The resource the whole type is, if it is one.
 pure func as_resource(
     value_type: TypeRef,
-    opaques: List[OpaqueRow],
+    inventory: DeclarationInventory,
     span: Span
-) -> Result[Option[OpaqueId], CheckError]:
+) -> Result[Option[NominalId], CheckError]:
     match value_type:
-        model.NominalType(model.OpaqueNominal(id), _):
-            id.declared_resource(opaques, span)
-        model.NominalType(model.AggregateNominal(_), _) | model.ListType(_) | model.TupleType(_) | model.CallableType(_, _, _) | model.VoidType | model.IntegerType(_) | model.FloatType | model.StringType | model.ParameterType(_):
+        model.NominalType(id, _):
+            id.declared_resource(inventory, span)
+        model.ListType(_) | model.TupleType(_) | model.CallableType(_, _, _) | model.VoidType | model.IntegerType(_) | model.FloatType | model.StringType | model.ParameterType(_):
             Ok(None)
 
 
 -- The first resource the type mentions, the type itself first.
 pure func mentioned_resource(
     value_type: TypeRef,
-    opaques: List[OpaqueRow],
+    inventory: DeclarationInventory,
     span: Span
-) -> Result[Option[OpaqueId], CheckError]:
-    found = value_type.as_resource(opaques, span)
+) -> Result[Option[NominalId], CheckError]:
+    found = value_type.as_resource(inventory, span)
 
     match found:
         Ok(None):
             value_type
                 .type_children()
-                .first_mentioned(opaques, span)
+                .first_mentioned(inventory, span)
         Ok(Some(_)) | Err(_):
             found
 
@@ -60,14 +84,14 @@ pure func mentioned_resource(
 -- The first resource any of the types mentions.
 pure func first_mentioned(
     types: List[TypeRef],
-    opaques: List[OpaqueRow],
+    inventory: DeclarationInventory,
     span: Span
-) -> Result[Option[OpaqueId], CheckError]:
-    var found: Result[Option[OpaqueId], CheckError] = Ok(None)
+) -> Result[Option[NominalId], CheckError]:
+    var found: Result[Option[NominalId], CheckError] = Ok(None)
 
     for value_type in types:
         match found:
-            Ok(None): found = value_type.mentioned_resource(opaques, span)
+            Ok(None): found = value_type.mentioned_resource(inventory, span)
             Ok(Some(_)) | Err(_): break
 
     found
@@ -75,7 +99,7 @@ pure func first_mentioned(
 
 -- Rejects the resource the search found, if any, as a `use` it cannot have.
 pure func refuse(
-    found: Result[Option[OpaqueId], CheckError],
+    found: Result[Option[NominalId], CheckError],
     span: Span,
     use: ResourceUse
 ) -> Result[Void, CheckError]:
@@ -89,22 +113,22 @@ pure func refuse(
 -- Rejects the type as a `use` it cannot have when it is a resource.
 pure func refuse_resource(
     value_type: TypeRef,
-    opaques: List[OpaqueRow],
+    inventory: DeclarationInventory,
     span: Span,
     use: ResourceUse
 ) -> Result[Void, CheckError]:
     value_type
-        .as_resource(opaques, span)
+        .as_resource(inventory, span)
         .refuse(span, use)
 
 
 pure func resource_free(
     value_type: TypeRef,
-    opaques: List[OpaqueRow],
+    inventory: DeclarationInventory,
     span: Span
 ) -> Result[Void, CheckError]:
     value_type
-        .mentioned_resource(opaques, span)
+        .mentioned_resource(inventory, span)
         .refuse(span, errors.ResourceStorage)
 
 
@@ -112,7 +136,7 @@ pure func resource_free(
 -- and generic applications cannot contain even a resource-taking callable.
 pure func admit_resource_type(
     value_type: TypeRef,
-    opaques: List[OpaqueRow],
+    inventory: DeclarationInventory,
     span: Span
 ) -> Result[Void, CheckError]:
     match value_type:
@@ -122,28 +146,28 @@ pure func admit_resource_type(
             for parameter in parameters:
                 if (purity == Pure).and(admitted.is_ok()):
                     admitted = parameter.refuse_resource(
-                        opaques,
+                        inventory,
                         span,
                         errors.ResourcePureParameter
                     )
 
                 if admitted.is_ok():
-                    admitted = parameter.admit_resource_type(opaques, span)
+                    admitted = parameter.admit_resource_type(inventory, span)
 
             if admitted.is_ok():
-                admitted = result.refuse_resource(opaques, span, errors.ResourceResult)
+                admitted = result.refuse_resource(inventory, span, errors.ResourceResult)
 
             if admitted.is_ok():
-                admitted = result.admit_resource_type(opaques, span)
+                admitted = result.admit_resource_type(inventory, span)
 
             admitted
         model.ListType(_) | model.NominalType(_, _):
             value_type
                 .type_children()
-                .first_mentioned(opaques, span)
+                .first_mentioned(inventory, span)
                 .refuse(span, errors.ResourceTypeArgument)
         model.TupleType(_):
-            value_type.resource_free(opaques, span)
+            value_type.resource_free(inventory, span)
         model.VoidType | model.IntegerType(_) | model.FloatType | model.StringType | model.ParameterType(_):
             Ok(void)
 
@@ -152,12 +176,12 @@ pure func admit_resource_type(
 -- `whole` is what a resource may not be in this place, if anything.
 pure func admit_as_written(
     value_type: TypeRef,
-    opaques: List[OpaqueRow],
+    inventory: DeclarationInventory,
     span: Span,
     whole: Option[ResourceUse]
 ) -> Result[Void, CheckError]:
     _: Void ?= match whole:
-        Some(use): value_type.refuse_resource(opaques, span, use)
+        Some(use): value_type.refuse_resource(inventory, span, use)
         None: Ok(void)
 
-    value_type.admit_resource_type(opaques, span)
+    value_type.admit_resource_type(inventory, span)

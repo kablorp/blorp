@@ -13,6 +13,7 @@ import:
         Span,
         compiler_span,
         TypeSyntax(TupleTypeSyntax, AtomicType, AppliedType, QualifiedType, CallableTypeSyntax),
+        UnionKind(FixedUnion),
         WrittenName,
         Visibility(Private, Public)
     ../../utils/results: first_error, translated_list
@@ -26,7 +27,10 @@ import:
         DeclarationInventory,
         RecordId,
         OpaqueId,
-        UnionId
+        UnionId,
+        inventory_records,
+        inventory_unions,
+        inventory_opaques
     ../namespace/builtins: integer_fixed_storage
     ../namespace/namespace:
         AliasedModule,
@@ -82,6 +86,7 @@ import:
         CheckedUnion,
         CheckedVariant,
         LocatedTrait,
+        UnionStorage(StoredAsPayload, StoredByValue, StoredOnHeap),
         TraitRequirement,
         TypeParameterId,
         TypeParameterOwner(
@@ -140,12 +145,10 @@ record SelfBinding {
 
 
 -- The type names visible where a type is written: the module's namespace, the
--- declared unions and the enclosing declaration's own type parameters.
+-- declarations' row tables and the enclosing declaration's own type parameters.
 record TypeScope {
     self_binding: Option[SelfBinding],
-    records: List[RecordRow],
-    unions: List[UnionRow],
-    opaques: List[OpaqueRow],
+    inventory: DeclarationInventory,
     namespace: Namespace,
     module: ModuleId,
     access: TypeAccess,
@@ -315,15 +318,15 @@ private pure func nominal_arity(
 ) -> Result[Int, CheckError]:
     match owner:
         AggregateNominal(RecordAggregate(id)):
-            match scope.records.get(id.record_number()):
+            match inventory_records(scope.inventory).get(id.record_number()):
                 Some(row): Ok(row.declaration.type_parameters.length())
                 None: Err(checker_invariant(span, InvalidRecordDeclaration(id)))
         AggregateNominal(UnionAggregate(id)):
-            match scope.unions.get(id.union_number()):
+            match inventory_unions(scope.inventory).get(id.union_number()):
                 Some(row): Ok(row.type_parameters.length())
                 None: Err(checker_invariant(span, InvalidUnionDeclaration(id)))
         OpaqueNominal(id):
-            match scope.opaques.get(id.opaque_number()):
+            match inventory_opaques(scope.inventory).get(id.opaque_number()):
                 Some(row): Ok(row.declaration.type_parameters.length())
                 None: Err(checker_invariant(span, InvalidOpaqueDeclaration(id)))
 
@@ -612,7 +615,7 @@ pure func resolve_type(
 
     _: Void ?= resolved
         .resolved_value_type()
-        .admit_resource_type(scope.opaques, written.type_span())
+        .admit_resource_type(scope.inventory, written.type_span())
 
     Ok(resolved)
 
@@ -778,9 +781,7 @@ private pure func declare_types(
 
             scope: TypeScope = {
                 self_binding = None,
-                records = parsed.declarations.inventory_records(),
-                unions = parsed.declarations.inventory_unions(),
-                opaques = parsed.declarations.inventory_opaques(),
+                inventory = parsed.declarations,
                 namespace = namespace,
                 module = declaration.declared_module(),
                 access = access,
@@ -809,7 +810,7 @@ private pure func plain_annotation(
 
     _: Void ?= resolved
         .resolved_value_type()
-        .resource_free(scope.opaques, written.type_span())
+        .resource_free(scope.inventory, written.type_span())
 
     Ok(resolved)
 
@@ -871,7 +872,7 @@ private pure func resolved_union(
                 type_parameters = scope.declared_parameters(),
                 requirements = bounds.bounds.parameter_requirements(owner),
                 variants = variants,
-                fixed = row.fixed
+                fixed = row.kind == FixedUnion
             }
 
             Ok({
@@ -1675,10 +1676,10 @@ private pure func validate_finite_declarations(
 
     unions ?= declarations.unions.translated_list(
         pure func(declaration: ResolvedUnion) -> Result[CheckedUnion, CheckError]:
-            UnionAggregate(declaration.id)
-                .contains_itself(cells, declarations)
+            declaration
+                .union_storage(cells, declarations)
                 .map(
-                    pure func(found) -> CheckedUnion: {
+                    pure func(storage) -> CheckedUnion: {
                         id = declaration.id,
                         module = declaration.module,
                         name = declaration.name,
@@ -1686,7 +1687,7 @@ private pure func validate_finite_declarations(
                         requirements = declaration.requirements,
                         variants = declaration.variants,
                         fixed = declaration.fixed,
-                        contains_itself = found
+                        storage = storage
                     }
                 )
     )
@@ -1694,39 +1695,41 @@ private pure func validate_finite_declarations(
     Ok({ unions = unions, records = records, opaques = declarations.opaques })
 
 
--- Fixed-target reachability is fresh for every opaque. Mark a type only when
--- expanding it: all its children are then pending, so an aggregate revisit
--- needs no second expansion. Check target reentry before that shortcut. Every
--- opaque is walked as a target, so an opaque on any cycle is found by its own walk.
-private pure func validate_opaque_representation(
-    root: CheckedOpaque,
+-- Where the walk from `start` meets `root` again by any path: type
+-- arguments, phantom ones included, then each declaration's written body,
+-- through records, unions, opaque types, Lists and callables. Reachability is
+-- fresh for every root. Mark a type only when expanding it: all its children
+-- are then pending, so an aggregate revisit needs no second expansion. Check
+-- reentry before that shortcut. An opaque type that meets itself is rejected,
+-- and a union whose one payload never meets it is stored as that payload.
+private pure func first_reentry(
+    start: TypeUse,
+    root: NominalId,
     declarations: ResolvedDeclarations
-) -> Result[Void, CheckError]:
-    var pending = [root.underlying_type]
+) -> Result[Option[Span], CheckError]:
+    var pending = [start]
     var depth = 1
     var visited: List[TypeRef] = []
+    var found: Option[Span] = None
     var failure: Option[CheckError] = None
 
-    while (depth > 0).and(failure.is_none()):
+    while (
+        (depth > 0)
+            .and(found.is_none())
+            .and(failure.is_none())
+    ):
         depth = depth - 1
 
         match pending.get(depth):
             None:
-                failure = Some(
-                    checker_invariant(root.underlying_type.span, InvalidDeclarationVisit)
-                )
+                failure = Some(checker_invariant(start.span, InvalidDeclarationVisit))
             Some(annotation):
                 reentry = match annotation.value_type:
-                    NominalType(OpaqueNominal(id), _): id == root.id
+                    NominalType(owner, _): owner == root
                     _: False
 
                 if reentry:
-                    failure = Some(
-                        type_declaration_error(
-                            annotation.span,
-                            RecursiveOpaqueRepresentation(root.id)
-                        )
-                    )
+                    found = Some(annotation.span)
                 else:
                     var seen: Bool = False
 
@@ -1775,16 +1778,63 @@ private pure func validate_opaque_representation(
 
     match failure:
         Some(error): Err(error)
-        None: Ok(void)
+        None: Ok(found)
 
 
+-- Every opaque type is walked as a root, so one on any cycle is found by its own walk.
 private pure func validate_opaque_representations(
     declarations: ResolvedDeclarations
 ) -> Result[Void, CheckError]:
     declarations.opaques.first_error(
         pure func(declaration: CheckedOpaque) -> Result[Void, CheckError]:
-            declaration.validate_opaque_representation(declarations)
+            match declaration.underlying_type.first_reentry(
+                OpaqueNominal(declaration.id),
+                declarations
+            ):
+                Ok(Some(span)):
+                    Err(type_declaration_error(span, RecursiveOpaqueRepresentation(declaration.id)))
+                Ok(None):
+                    Ok(void)
+                Err(error):
+                    Err(error)
     )
+
+
+-- A union with one variant and one payload that never reaches the union again
+-- is stored as that payload (rule 8). The walk follows every path, so it can
+-- decline a union that would be safe to erase, but never erases one that is
+-- not. Any other union is stored as `contains_itself` classifies it.
+private pure func union_storage(
+    declaration: ResolvedUnion,
+    cells: RecordEdges,
+    declarations: ResolvedDeclarations
+) -> Result[UnionStorage, CheckError]:
+    erased: Bool ?= match declaration.variants:
+        [variant]:
+            match variant.fields:
+                [payload]:
+                    payload
+                        .first_reentry(
+                            AggregateNominal(UnionAggregate(declaration.id)),
+                            declarations
+                        )
+                        .map(pure func(reentry): reentry.is_none())
+                _:
+                    Ok(False)
+        _:
+            Ok(False)
+
+    if erased:
+        Ok(StoredAsPayload)
+    else:
+        UnionAggregate(declaration.id)
+            .contains_itself(cells, declarations)
+            .map(pure func(found) -> UnionStorage:
+                if found:
+                    StoredOnHeap
+                else:
+                    StoredByValue
+            )
 
 
 -- Arguments, including phantom ones, precede the declaration's written body.

@@ -1,0 +1,214 @@
+---
+How Check stores each union (rule 8). A union with one variant and one
+payload is stored as that payload when the payload never reaches the union
+again by any path: type arguments, phantom ones included, records, Lists,
+callables and opaque types. The walk is conservative: it declines a union
+that would be safe to erase, such as a rose tree, but never erases one that
+is not. Any other union is on the heap when it contains itself, and is a
+tagged value otherwise.
+---
+import:
+    test: TestSuite
+    ../../../../src/common/analysis/check/check: check, checked_functions
+    ../../../../src/common/analysis/check/model:
+        UnionStorage(StoredAsPayload, StoredByValue, StoredOnHeap)
+    ../../../../src/common/syntax/source: module_source, root_module_id
+    ../../../support/module_input: parse_modules
+
+
+private ENTRY: String =
+    |func main() -> Int:
+    |    0
+    |
+
+
+-- How each union the program declares is stored, in declaration order, when
+-- the program is accepted; the foundation's unions are left out.
+private pure func stored(declarations: String) -> Option[List[UnionStorage]]:
+    match parse_modules([{ source = declarations + ENTRY, targets = [] }]):
+        Err(_):
+            None
+        Ok(parsed):
+            match check(parsed):
+                Err(_):
+                    None
+                Ok(accepted):
+                    var storages: List[UnionStorage] = []
+
+                    for declaration in checked_functions(accepted).unions:
+                        if declaration.name.span.source == module_source(root_module_id()):
+                            storages = storages.append(declaration.storage)
+
+                    Some(storages)
+
+
+pure func test_a_plain_payload_is_stored_as_itself() -> Bool:
+    program: String =
+        |union Meters:
+        |    Init(Int)
+        |
+
+    stored(program) == Some([StoredAsPayload])
+
+
+pure func test_a_generic_payload_is_stored_as_itself() -> Bool:
+    program: String =
+        |union Id[T]:
+        |    private Init(Int)
+        |union Wrapper[T]:
+        |    Init(T)
+        |
+
+    stored(program) == Some([StoredAsPayload, StoredAsPayload])
+
+
+-- An erased union holding another is still erased: Outer is Inner is Int.
+pure func test_a_payload_of_another_erased_union_is_stored_as_itself() -> Bool:
+    program: String =
+        |union Inner:
+        |    Init(Int)
+        |union Outer:
+        |    Init(Inner)
+        |
+
+    stored(program) == Some([StoredAsPayload, StoredAsPayload])
+
+
+pure func test_a_union_that_contains_itself_is_on_the_heap() -> Bool:
+    program: String =
+        |union Chain:
+        |    Again(Option[Chain])
+        |
+
+    stored(program) == Some([StoredOnHeap])
+
+
+-- A List is a pointer, so the tree does not contain itself, but its payload
+-- reaches it, so it is not erased.
+pure func test_a_rose_tree_is_a_tagged_value() -> Bool:
+    program: String =
+        |union Tree:
+        |    Node(List[Tree])
+        |
+
+    stored(program) == Some([StoredByValue])
+
+
+-- `Tag[Node]` stores an Int, but its phantom argument names Node.
+pure func test_a_phantom_argument_cycle_is_a_tagged_value() -> Bool:
+    program: String =
+        |union Tag[T]:
+        |    Init(Int)
+        |union Node:
+        |    Init(Tag[Node])
+        |
+
+    stored(program) == Some([StoredAsPayload, StoredByValue])
+
+
+pure func test_a_cycle_through_a_callable_is_a_tagged_value() -> Bool:
+    program: String =
+        |union Step:
+        |    Then((Int) -> Step)
+        |
+
+    stored(program) == Some([StoredByValue])
+
+
+-- The record reaches the union only through a List, so neither contains
+-- itself, and the walk follows the record to that List.
+pure func test_a_cycle_through_a_record_is_a_tagged_value() -> Bool:
+    program: String =
+        |record Holder {
+        |    held: List[Held],
+        |}
+        |union Held:
+        |    Init(Holder)
+        |
+
+    stored(program) == Some([StoredByValue])
+
+
+-- The opaque type stores its argument by value, which is the union.
+pure func test_a_cycle_through_an_opaque_type_is_on_the_heap() -> Bool:
+    program: String =
+        |opaque type Box[V] = V
+        |union Hidden:
+        |    Init(Box[Hidden])
+        |
+
+    stored(program) == Some([StoredOnHeap])
+
+
+pure func test_a_union_with_two_variants_is_a_tagged_value() -> Bool:
+    program: String =
+        |union Pick:
+        |    Left(Int)
+        |    Right(Int)
+        |
+
+    stored(program) == Some([StoredByValue])
+
+
+pure func test_a_union_with_two_payloads_is_a_tagged_value() -> Bool:
+    program: String =
+        |union Pair:
+        |    Init(Int, Int)
+        |
+
+    stored(program) == Some([StoredByValue])
+
+
+pure func test_a_variant_without_a_payload_is_a_tagged_value() -> Bool:
+    program: String =
+        |union Unit:
+        |    Only
+        |
+
+    stored(program) == Some([StoredByValue])
+
+
+TESTS: TestSuite = {
+    description = "How Check stores each union",
+    tests = [
+        ("a plain payload is stored as itself", test_a_plain_payload_is_stored_as_itself),
+        ("a generic payload is stored as itself", test_a_generic_payload_is_stored_as_itself),
+        (
+            "a payload of another erased union is stored as itself",
+            test_a_payload_of_another_erased_union_is_stored_as_itself
+        ),
+        (
+            "a union that contains itself is on the heap",
+            test_a_union_that_contains_itself_is_on_the_heap
+        ),
+        ("a rose tree is a tagged value", test_a_rose_tree_is_a_tagged_value),
+        (
+            "a phantom argument cycle is a tagged value",
+            test_a_phantom_argument_cycle_is_a_tagged_value
+        ),
+        (
+            "a cycle through a callable is a tagged value",
+            test_a_cycle_through_a_callable_is_a_tagged_value
+        ),
+        (
+            "a cycle through a record is a tagged value",
+            test_a_cycle_through_a_record_is_a_tagged_value
+        ),
+        (
+            "a cycle through an opaque type is on the heap",
+            test_a_cycle_through_an_opaque_type_is_on_the_heap
+        ),
+        (
+            "a union with two variants is a tagged value",
+            test_a_union_with_two_variants_is_a_tagged_value
+        ),
+        (
+            "a union with two payloads is a tagged value",
+            test_a_union_with_two_payloads_is_a_tagged_value
+        ),
+        (
+            "a variant without a payload is a tagged value",
+            test_a_variant_without_a_payload_is_a_tagged_value
+        )
+    ]
+}

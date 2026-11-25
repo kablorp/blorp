@@ -1,0 +1,156 @@
+---
+Specialization erases a union Check stored as its payload (rule 8) at the type
+level, as it erases an opaque type: the union's arguments close, then its
+payload's type expands under the declaration's own parameters, and no union
+layout is made. Function instances keep the union's semantic arguments.
+---
+import:
+    bool: and
+    test: TestSuite
+    ../../../../src/common/analysis/check/check: check
+    ../../../../src/common/codegen/specialize/specialize as specialized
+    ../../../../src/common/syntax/source: label_text
+    ../../../../src/common/syntax/syntax: IntegerFormat(Int64Format)
+    ../../../support/module_input: parse_modules
+
+
+private pure func specialize_source(source: String) -> Option[specialized.SpecializedContents]:
+    match parse_modules([{ source = source, targets = [] }]):
+        Err(_):
+            None
+        Ok(parsed):
+            match check(parsed):
+                Err(_):
+                    None
+                Ok(accepted):
+                    match specialized.specialize(accepted):
+                        Err(_): None
+                        Ok(program): Some(specialized.specialized_contents(program))
+
+
+private pure func takes_and_returns_int(function: specialized.ConcreteFunction) -> Bool:
+    match (function.signature.parameters, function.signature.return_type):
+        ([specialized.IntegerType(Int64Format)], specialized.IntegerType(Int64Format)): True
+        _: False
+
+
+-- `meters` takes and returns an Int, and no layout has one variant of one Int.
+pure func test_an_erased_union_is_its_payload() -> Bool:
+    source: String =
+        |union Meters:
+        |    Init(Int)
+        |pure func meters(value: Int) -> Meters:
+        |    Init(value)
+        |func main() -> Int:
+        |    match meters(3):
+        |        Init(value): value
+        |
+
+    match specialize_source(source):
+        None:
+            False
+        Some(contents):
+            tagged = contents.unions.any(
+                pure func(layout): (
+                    specialized.union_variants(layout)
+                    == [[specialized.IntegerType(Int64Format)]]
+                )
+            )
+
+            and(contents.functions.any(takes_and_returns_int), tagged.not())
+
+
+-- `Id[User]` and `Id[Order]` are two instances of `echo`, both over an Int.
+pure func test_phantom_arguments_split_instances_of_one_payload() -> Bool:
+    source: String =
+        |record User { name: String }
+        |record Order { total: Int }
+        |union Id[T]:
+        |    private Init(Int)
+        |pure func user_id(number: Int) -> Id[User]:
+        |    Init(number)
+        |pure func order_id(number: Int) -> Id[Order]:
+        |    Init(number)
+        |pure func echo[X](value: X) -> X:
+        |    value
+        |func main() -> Int:
+        |    user = echo(user_id(3))
+        |    match echo(order_id(4)):
+        |        Init(number): number
+        |
+
+    match specialize_source(source):
+        None:
+            False
+        Some(contents):
+            echoes = contents.functions.filter(
+                pure func(function): label_text(function.label) == "module_0.echo"
+            )
+
+            and(echoes.length() == 2, echoes.all(takes_and_returns_int))
+
+
+-- The element type of a one-field `Rows` layout: its List's element.
+private pure func rows_element(
+    records: List[specialized.ConcreteRecord],
+    value: specialized.TypeRef
+) -> Option[specialized.TypeRef]:
+    match value:
+        specialized.RecordType(id):
+            match records.get(specialized.record_number(id)):
+                Some(layout):
+                    match specialized.record_fields(layout):
+                        [specialized.ListType(element)]: Some(element)
+                        _: None
+                None:
+                    None
+        _:
+            None
+
+
+-- `Box[Box[Int]]` is `Rows[Rows[Int]]`: the outer argument closes before the
+-- payload's type expands.
+pure func test_nested_arguments_close_before_the_payload_expands() -> Bool:
+    source: String =
+        |record Rows[V] { values: List[V] }
+        |union Box[V]:
+        |    Init(Rows[V])
+        |pure func wrap[V](value: V) -> Box[V]:
+        |    Init({ values = [value] })
+        |pure func twice(value: Int) -> Box[Box[Int]]:
+        |    wrap(wrap(value))
+        |func main() -> Int:
+        |    nested = twice(7)
+        |    0
+        |
+
+    match specialize_source(source):
+        None:
+            False
+        Some(contents):
+            contents.functions.any(pure func(function):
+                match rows_element(contents.records, function.signature.return_type):
+                    Some(inner):
+                        (
+                            rows_element(contents.records, inner)
+                            == Some(specialized.IntegerType(Int64Format))
+                        )
+                    None:
+                        False
+            )
+
+
+TESTS: TestSuite = {
+    description = "Erased union specialization",
+    tests = [
+        ("an erased union is its payload", test_an_erased_union_is_its_payload),
+        (
+            "phantom arguments split function instances of one payload",
+            test_phantom_arguments_split_instances_of_one_payload
+        ),
+        (
+            "nested arguments close before the payload expands",
+            test_nested_arguments_close_before_the_payload_expands
+        )
+    ]
+}

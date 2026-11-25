@@ -93,7 +93,6 @@ import:
         ImplRow,
         FunctionRole(ImplementationBody, FreeFunctionBody, TraitDefaultBody),
         OpaqueId,
-        OpaqueRow,
         TraitId,
         TraitMethodId,
         VariantId,
@@ -339,9 +338,7 @@ private pure func accept_functions(
 
         scope: TypeScope = {
             self_binding = None,
-            records = parsed.declarations.inventory_records(),
-            unions = parsed.declarations.inventory_unions(),
-            opaques = parsed.declarations.inventory_opaques(),
+            inventory = parsed.declarations,
             namespace = namespace,
             module = function.module,
             access = type_access(function.visibility, function.function_name.id),
@@ -411,7 +408,7 @@ private pure func resolve_signature(
         _:
             Ok(void)
 
-    _: Void ?= return_type.refuse_resource(scope.opaques, return_span, errors.ResourceResult)
+    _: Void ?= return_type.refuse_resource(scope.inventory, return_span, errors.ResourceResult)
 
     formal_parameters ?= scope.annotated_types(
         function.parameters.map(pure func(parameter) -> TypeSyntax: parameter.type_name),
@@ -438,7 +435,7 @@ private pure func resolve_signature(
         if admitted.is_ok():
             admitted = match formal_parameters.types.get(position):
                 Some(formal):
-                    formal.admit_parameter_loan(parameter, function.purity, scope.opaques)
+                    formal.admit_parameter_loan(parameter, function.purity, scope.inventory)
                 None:
                     Err(
                         checker_invariant(
@@ -479,10 +476,10 @@ private pure func admit_parameter_loan(
     resolved: TypeUse,
     parameter: ParsedParameter,
     purity: Purity,
-    opaques: List[OpaqueRow]
+    inventory: DeclarationInventory
 ) -> Result[Void, CheckError]:
     _: Void ?= if purity == Pure:
-        resolved.value_type.refuse_resource(opaques, resolved.span, errors.ResourcePureParameter)
+        resolved.value_type.refuse_resource(inventory, resolved.span, errors.ResourcePureParameter)
     else:
         Ok(void)
 
@@ -779,9 +776,13 @@ private pure func implementation_header(
     head = receiver.head
     receiver_span = row.header.receiver.receiver_head_span()
 
-    lent_receiver: Option[OpaqueId] ?= match head:
-        OpaqueHead(id): id.declared_resource(scope.opaques, receiver_span)
-        PrimitiveHead(_) | ListHead | UnionHead(_) | RecordHead(_): Ok(None)
+    lent_receiver: Option[NominalId] ?= match head:
+        OpaqueHead(id):
+            OpaqueNominal(id).declared_resource(scope.inventory, receiver_span)
+        UnionHead(id):
+            AggregateNominal(UnionAggregate(id)).declared_resource(scope.inventory, receiver_span)
+        PrimitiveHead(_) | ListHead | RecordHead(_):
+            Ok(None)
 
     implemented ?= scope.namespace
         .implementation_trait(row.header.module, row.id)
@@ -789,7 +790,7 @@ private pure func implementation_header(
 
     -- Before any signature or body that takes the resource as Self.
     _: Void ?= match lent_receiver:
-        Some(lent): traits.admit_lent_methods(lent, implemented, scope.opaques, receiver_span)
+        Some(lent): traits.admit_lent_methods(lent, implemented, scope.inventory, receiver_span)
         None: Ok(void)
 
     arity ?= scope.receiver_arity(head, receiver_span)
@@ -823,9 +824,9 @@ private pure func implementation_header(
 -- other parameter or result may hold it.
 private pure func admit_lent_methods(
     traits: List[AcceptedTrait],
-    resource_type: OpaqueId,
+    resource_type: NominalId,
     implemented: TraitId,
-    opaques: List[OpaqueRow],
+    inventory: DeclarationInventory,
     receiver: Span
 ) -> Result[Void, CheckError]:
     var admitted: Result[Void, CheckError] = Ok(void)
@@ -838,12 +839,12 @@ private pure func admit_lent_methods(
         ):
             lent: Substitution = {
                 owner = TraitDeclaration(candidate.id),
-                values = [NominalType(OpaqueNominal(resource_type), [])]
+                values = [NominalType(resource_type, [])]
             }
 
             for method in candidate.methods:
                 if admitted.is_ok():
-                    admitted = match method.signature.admit_lent_signature(lent, opaques):
+                    admitted = match method.signature.admit_lent_signature(lent, inventory):
                         Ok(_):
                             Ok(void)
                         Err(error):
@@ -855,7 +856,7 @@ private pure func admit_lent_methods(
 private pure func admit_lent_signature(
     signature: FunctionSignature,
     lent: Substitution,
-    opaques: List[OpaqueRow]
+    inventory: DeclarationInventory
 ) -> Result[Void, CheckError]:
     whole: Option[errors.ResourceUse] = match signature.purity:
         Pure: Some(errors.ResourcePureParameter)
@@ -865,10 +866,14 @@ private pure func admit_lent_signature(
 
     for parameter in signature.parameters:
         if admitted.is_ok():
-            admitted = parameter.admit_lent_use(lent, opaques, whole)
+            admitted = parameter.admit_lent_use(lent, inventory, whole)
 
     if admitted.is_ok():
-        admitted = signature.return_type.admit_lent_use(lent, opaques, Some(errors.ResourceResult))
+        admitted = signature.return_type.admit_lent_use(
+            lent,
+            inventory,
+            Some(errors.ResourceResult)
+        )
 
     admitted
 
@@ -876,18 +881,18 @@ private pure func admit_lent_signature(
 private pure func admit_lent_use(
     written: TypeUse,
     lent: Substitution,
-    opaques: List[OpaqueRow],
+    inventory: DeclarationInventory,
     whole: Option[errors.ResourceUse]
 ) -> Result[Void, CheckError]:
     value_type ?= written.value_type.substitute_type(lent, written.span)
-    value_type.admit_as_written(opaques, written.span, whole)
+    value_type.admit_as_written(inventory, written.span, whole)
 
 
 -- A resource misuse becomes `ResourceContract` at the receiver. Requirement
 -- acceptance refused every other resource a signature could hold.
 private pure func as_contract(
     error: CheckError,
-    resource_type: OpaqueId,
+    resource_type: NominalId,
     implemented: TraitId,
     method: TraitMethodId,
     receiver: Span
@@ -921,9 +926,7 @@ private pure func implementation_headers(
 
     for row in parsed.declarations.inventory_implementations():
         scope: TypeScope = {
-            records = parsed.declarations.inventory_records(),
-            unions = parsed.declarations.inventory_unions(),
-            opaques = parsed.declarations.inventory_opaques(),
+            inventory = parsed.declarations,
             namespace = namespace,
             module = row.header.module,
             access = PrivateTypeUse,

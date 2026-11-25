@@ -138,7 +138,7 @@ import:
         direct_supertraits,
         entails
     ./name_uses: NameUse, Referent(TraitReferent), trait_uses
-    ./resource_types: TypeRef methods
+    ./resource_types: TypeRef methods, declared_resource
     ./signatures: AcceptedFunction
 
 
@@ -196,7 +196,7 @@ private pure func requirement(
 
                 -- D35: only a pure method keeps resources out of its parameters.
                 admitted = if header.purity == Pure:
-                    value_type.refuse_resource(scope.opaques, span, errors.ResourcePureParameter)
+                    value_type.refuse_resource(scope.inventory, span, errors.ResourcePureParameter)
                 else:
                     Ok(void)
 
@@ -236,7 +236,8 @@ private pure func requirement(
         Some(written): written.type_span()
         None: header.function_name.span
 
-    _: Void ?= result.refuse_resource(scope.opaques, result_span, errors.ResourceResult)
+    _: Void ?= result.refuse_resource(scope.inventory, result_span, errors.ResourceResult)
+
     unique ?= row.id.unique_requirement_parameters(header)
 
     default_body: Option[FunctionId] = match row.declaration:
@@ -267,9 +268,7 @@ private pure func accept_trait(
     self = type_parameter_id(TraitDeclaration(row.id), 0)
 
     scope: TypeScope = {
-        records = parsed.declarations.inventory_records(),
-        unions = parsed.declarations.inventory_unions(),
-        opaques = parsed.declarations.inventory_opaques(),
+        inventory = parsed.declarations,
         namespace = namespace,
         module = row.module,
         access = type_access(row.visibility, row.type_name.id),
@@ -983,7 +982,8 @@ private pure func declared_function(
 
 -- The prelude selects Dict through its ordinary binding, and a literal calls
 -- the functions Dict's own module declares, so no name in the literal's
--- scope can stand in. A prelude without an opaque Dict offers no literals.
+-- scope can stand in. A prelude whose Dict is neither a union nor an opaque
+-- type offers no literals.
 private pure func dict_literal_functions(
     parsed: ParsedContents,
     namespace: Namespace
@@ -1000,6 +1000,11 @@ private pure func dict_literal_functions(
                 .inventory_opaques()
                 .get(id.opaque_number())
                 .map(pure func(row): row.declaration.module)
+        Some(UnionHead(id)):
+            parsed.declarations
+                .inventory_unions()
+                .get(id.union_number())
+                .map(pure func(row): row.module)
         _:
             None
 
@@ -1809,21 +1814,32 @@ private pure func complete_equality_availability(
                 )
             )
 
-    for union_row in unions:
-        if (
-            traits
-                .family_for(canonical, UnionHead(union_row.id))
-                .is_none()
-        ):
-            possible = possible.append(
-                equality_candidate(
-                    AggregateEquality(UnionAggregate(union_row.id)),
-                    union_row.requirements
-                )
-            )
-
-    -- A resource type is never copied, so its handle has no value equality.
+    -- A resource is never copied, so its handle has no value equality.
     var derivation_fault: Option[CheckError] = None
+
+    for union_row in unions:
+        lent = AggregateNominal(UnionAggregate(union_row.id)).declared_resource(
+            parsed.declarations,
+            compiler_span()
+        )
+
+        match lent:
+            Ok(None):
+                if (
+                    traits
+                        .family_for(canonical, UnionHead(union_row.id))
+                        .is_none()
+                ):
+                    possible = possible.append(
+                        equality_candidate(
+                            AggregateEquality(UnionAggregate(union_row.id)),
+                            union_row.requirements
+                        )
+                    )
+            Ok(Some(_)):
+                void
+            Err(error):
+                derivation_fault = Some(error)
 
     for opaque_row in declarations.opaques:
         written = parsed.declarations

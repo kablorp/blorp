@@ -1,8 +1,8 @@
 # Private variants plan
 
-**Status: in progress, 2026-11-23.** Keith approved the design and asked for
-this plan, then started it with landing 0. Landings 0 and 1 have landed;
-landing 2 is next. Landing 0 belongs to [`EQUALITY_PLAN.md`](EQUALITY_PLAN.md),
+**Status: in progress, 2026-11-24.** Keith approved the design and asked for
+this plan, then started it with landing 0. Landings 0, 1 and 2 have landed;
+landing 3, the seed rotation, is next. Landing 0 belongs to [`EQUALITY_PLAN.md`](EQUALITY_PLAN.md),
 which records its results.
 
 **The direction.** Keith chose it in discussion:
@@ -69,9 +69,10 @@ pure func number(id: UserId) -> Int:
    matched and destructured only in its declaring module. The union keeps one
    copy of the declaring module, on `CheckedUnion`, and each variant carries
    only its privacy. A variant is private when it is marked, or when its
-   union is private. That effective privacy has one producer, `VariantRow`,
-   which namespace, check, the resource shape rule, the hidden head and the
-   visible-variants query all read. `ParsedVariant` keeps only the written
+   union is private. That effective privacy has one producer,
+   `effective_visibility`, which `VariantRow` stores and the parser's
+   resource shape rule calls; namespace, check, the hidden head and the
+   visible-variants query read `VariantRow`. `ParsedVariant` keeps only the written
    mark, for the formatter and rule 4.
 2. **Bare names when unambiguous.** Every variant, public or private, enters
    its module's scope under its bare name, and the module's own variants may
@@ -118,7 +119,7 @@ pure func number(id: UserId) -> Int:
 
 The parser owns the parts of these rules that are local to one declaration:
 reading `private`, the duplicate check within one union, the redundant mark
-(rule 4) and the same-name ban (rule 6). It has every fact, and principle 7
+(rule 4), the same-name ban (rule 6) and a resource union's shape (rule 9). It has every fact, and principle 7
 puts a rejection at the earliest phase that can detect it. Access outside the
 module (rules 1 and 3) belongs to namespace and check.
 
@@ -218,10 +219,12 @@ function exists, the help is the generic form.
   - **It is conservative.** It can decline to erase a union that would be
     safe to erase, but it never erases one that is not. The README says so.
 - **Equality.** It is the derived union equality: a union is `Equatable` when
-  its payloads are, and no type loses equality. For a single-variant union,
-  the derived body is built from two `ReadPayload`s with no selection. That
-  avoids binding a match arm's inputs to the scrutinee itself, a shape no
-  current program produces. Opaque types' separate representation equality
+  its payloads are, and no type loses equality. A single-variant union keeps
+  today's template, which already drops the tag test. Under erasure its arm
+  binds the payload to the scrutinee itself, a shape no program produced
+  before; landing 2's spike showed lower, own and verify accept it, clean
+  under sanitizers and the strict leak check. A managed payload is retained
+  and released once per side per comparison. Opaque types' separate representation equality
   (`RepresentationBody`) goes. A type that relied on it gets an
   `equality for X` C function where the C used to call the payload's equality
   directly.
@@ -260,8 +263,8 @@ Each fact has one enforcement site, and every other phase reads it.
 | No message another module sees names a private variant the user did not write | One query of the union's variants visible from a module, which the four error paths and the exhaustiveness witness ask |
 | In one union, variant names are unique and differ from the union's, and a private union's variants carry no `private` | The parser, for one declaration |
 | Outside its module, only `_` covers a union's private variants | The pattern domain's hidden head |
-| A union is stored one way | `UnionStorage`, classified once in check; specialize, lower, own and emit read it |
-| A resource union has one private variant with one payload, and is never matched | Check: the union declaration for its shape, `match` for the rejection |
+| A union is stored one way | `UnionStorage`, classified once in check; specialize publishes each union's erasure from it once, at sealing, so lower, own, verify and emit never see an erased union |
+| A resource union has one private variant with one payload, and is never matched | The parser, for its shape, which one declaration decides; check, at `match`, for the rejection |
 | A destructuring always matches | Check, which rejects a union with several variants; from landing 7, verify also proves it |
 
 ### Not in this change
@@ -380,7 +383,7 @@ Deleting it also removes:
 | 1, 4, 6. Declaration-local rules | The parser checks the duplicate within one union, the redundant mark and the same-name ban | 35 |
 | 3. Outside rejection and exhaustiveness | The access check in `resolve_union_variant`, which covers values and patterns; alias and import rejection; the paths that must not name a private variant (`unknown_value_error`, `UnimportedConstructorPattern` and its help, the `UnionHasNoVariant` help, and the exhaustiveness witness); a hidden head in the pattern domain that only `_` covers | 130 |
 | 5. Payload privacy | Private access for a private variant's payload in `resolved_union` | 6 |
-| 7. Destructuring, erased unions | `DestructuringBinding` syntax. Variant binders allow one to N names, unlike the tuple path's two to four, and the parser commits to destructuring once it sees `) =`, as the tuple path does. `ReadPayload`, which generalizes `ProjectOpaque`; the arity and type errors | 140 |
+| 7. Destructuring, erased unions | `VariantBinding` syntax. Variant binders allow one to N names, unlike the tuple path's two to four, and the parser commits to destructuring once it sees `) =`, as the tuple path does. `ReadPayload`, which generalizes `ProjectOpaque`; the arity and type errors | 140 |
 | 7. Destructuring, other single-variant unions | own models a standalone payload read as it models a record-field read: an `OwnedArgument` parent, `Projection`, `borrowed_extents`. verify gets a path that proves the single variant. specialize and lower get a variant field read | 110 |
 | 8. Payload layout | The `UnionStorage` classification and any-path walk; specialize's erasure arms, mostly moved from the opaque arms; derived equality from `ReadPayload`s | 195 |
 | 9. Resource unions | `UnionKind = OrdinaryUnion \| FixedUnion \| ResourceUnion` replaces `fixed: Bool`; the shape rules and the match rejection; the resource authority re-keyed from opaque rows to unions, through `NominalId` during the transition | 60 |
@@ -538,6 +541,22 @@ delete. The seed rotates once.
    - **Dict.** The dict literal lookup accepts a union-headed `Dict`, the only
      foundation type found by its head (`traits.brp`'s
      `dict_literal_functions` matches only an opaque head today).
+   - **Results.** It landed on 2026-11-24 with +747 production lines and
+     +1,872 test lines against `9823919fa`.
+     - **Cost.** Fixed-input instructions rose +0.178% by callgrind (Linux
+       arm64, deterministic) and +0.18% by `self-compile-cost --rounds 9`.
+       Allocations fell 0.021%, peak heap rose 0.001%, and the C was
+       identical. The cost is spread: specialize's erasure, where
+       `concrete_types` is no longer inlined (+5.4M), the resource walk's
+       lookup of each union and record type (+4.1M), parser inlining (+2.0M),
+       the destructuring lookahead (+1.7M), opaque types through the shared
+       erasure functions (+1.6M), and the narrowed type translation (+4.1M,
+       a list drop the base also pays).
+     - **The spike.** Lower, own and verify accept a match arm bound to the
+       scrutinee itself, so derived equality keeps its singleton template.
+     - **Review and probes.** The review found no blockers, and its fixes are
+       in. 75 probes found no miscompiles or leaks. The one verifier failure
+       they found predates this plan and has its own session.
 
    No union in `src` or the library has one variant with one payload, so the
    fixed-input C stays byte-identical through landings 1 and 2.
@@ -616,7 +635,7 @@ Upper bounds, measured with `blorp/scripts/self-compile-cost PARENT CANDIDATE
 | --- | --- | --- | --- | --- | --- |
 | 0 | `EQUALITY_PLAN.md`, landing 3 | | | | |
 | 1 | +0.1% | +0.05% | +0.1% | +655 | +1,310 |
-| 2 | +0.15% | +0.1% | +0.1% | +480 | +450 |
+| 2 | +0.18% | +0.1% | +0.1% | +750 | +1,900 |
 | 3 | reported | reported | reported | 0 | 0 |
 | 4 | +0.1% | +0.01% | +0.1% | +320 | +230 |
 | 5 | +0.05% | +0.0% | +0.05% | −380 | 0 |
@@ -624,11 +643,13 @@ Upper bounds, measured with `blorp/scripts/self-compile-cost PARENT CANDIDATE
 | 7 | +0.1% | +0.05% | +0.1% | +140 | +320 |
 | 8 | +0.05% | +0.0% | +0.05% | −20 | 0 |
 
-**The stack.** Landings 1 to 7 together come to 0 production lines or fewer:
-the plan must not grow the compiler. After landing 1's +651 the estimate is
-about +46, give or take 150: landings 2, 4 and 7 add about +790, and
-landings 5 and 6 remove about −1,395 if landing 6 reaches its −915. The
-deletions decide it, and the deferred review fixes below count against it.
+**The stack.** Landings 1 to 7 no longer promise to shrink the compiler or
+to leave it the same size: Keith dropped the promise of 0 or fewer on
+2026-11-24, when he accepted landing 2 at about +680. After landing 2 the
+estimate is about +400: landing 1's +651, landing 2's +747, landings 4 and 7
+at +395 by their estimates, and landings 5 and 6 removing about −1,395 if
+landing 6 reaches its −915. Additions have run 1.5 to 2.6 times their
+estimates, and the deferred fixes below count against it.
 The estimates predate main's body spacing rule, which lengthens the code
 landings 5 and 6 delete as well as the code the others add, so landing 5
 re-surveys them before it starts.
@@ -675,9 +696,46 @@ messages to about 240 (estimate 130). The later corrections:
   ceiling from +1,250 to +1,310, a routine correction for integrating with
   a concurrent landing.
 
-**Deferred review fixes.** These refine landing 1's helps, which match the
-plan's table as they stand. They are one follow-up with its own ceiling of
-+110, counted against the stack:
+**Landing 2, before implementation.** On 2026-11-24 the coordinator raised
+landing 2's test ceiling from +450 to +900, a routine correction from
+landing 1's measurement: its tests came to 2.4 times their estimate, with one
+test per diagnostics row and per behaviour, aligned multiline programs, and
+the body spacing rule. The production ceiling stays at +480, which stops the
+landing for a growth audit. The coordinator also moved the resource shape
+rule from check to the parser, which has every fact it needs, as rules 4 and
+6 are there.
+
+**Landing 2, after its growth audit.** Rules 7 and 8 came to +550 production
+lines, after cuts of about 45 and a cost fix of 21, so destructuring ran
+about +365 against its estimate of 140. With rule 9 and the `Dict` head, about
++113, the landing projects about +660. On 2026-11-24 Keith accepted about
++680, and dropped the stack's promise (above). The later corrections:
+- **+690 and +700,** routine: the first for an index of erased unions, which
+  removed a cost regression, and the second for the review fixes as
+  estimated.
+- **Keith accepted about +735** when the review fixes came to +58, not about
+  13. The coordinator then set +740 for the reviewer's short
+  `declares_resources` and +750 for the two cost simplifications below, both
+  routine.
+- **The test ceiling** went from +900 to +1,900 (measured +1,872), a routine
+  correction for necessary test growth: four new suites of 869 lines, the
+  rule 9 and `Dict` tests, and the fixture review.
+- **The instruction ceiling** went from +0.15% to +0.18%.
+  - Callgrind showed the regression was real, at +0.175%, and that about 80%
+    of it was already in rules 7 and 8, whose macOS reading had been noise.
+  - Keith chose to apply two simplifications first and correct only by what
+    remained. Specialize now publishes each union's erasure once (−2.4M), and
+    `declared_resource` is one direct match (−1.3M). Together they brought
+    it to +0.144%.
+  - Narrowing the type translation's parameters back to `opaques`
+    (CODE_STYLE rule 1) then cost +4.1M, through a list drop the base pays
+    too. The coordinator kept it, because the root `AGENTS.md` does not bend
+    a design to a cost the compiler imposes. The remaining +0.18% is the
+    correction.
+
+**Deferred review fixes.** These refine landing 1's and landing 2's helps,
+which match the plan's table as they stand, and add one missing form. They
+are one follow-up with its own ceiling of +140, counted against the stack:
 
 - **A private variant in an outside pattern** (`Email.Checked(_)`) gets
   "cover it with _, which matches the variants private to ./email" instead
@@ -688,6 +746,12 @@ plan's table as they stand. They are one follow-up with its own ceiling of
 - **A private spelling several unions share** (`mail.Init`) gets the generic
   "use the functions ./email exports" instead of naming the first union.
   About +25.
+- **A private variant destructured from another module** gets the build
+  help, where it should say to read the value through the functions the
+  module exports. About +10, beside the pattern help above.
+- **Destructuring through an import alias** (`ids.Len(v) = m`) has no
+  accepted form, and gets the generic value-line error. Construction and
+  patterns accept `alias.Variant`, so destructuring should too. About +20.
 
 A fourth, dropped: the namespace would carry whether a variant is private by
 its mark or through its union, so render need not read `UnionRow.visibility`.
@@ -721,9 +785,37 @@ of their measured cost plus 15%:
 
 - **Landing 1:** a module of 64 unions with private variants, matched from
   another module, for the access check and the hidden head.
-- **Landing 2:** a chain of 200 single-variant unions, each over the next,
-  for the storage walk. Doubling the chain must no more than double its
-  allocations.
+- **Landing 2:** 200 independent erased unions, for the storage walk and the
+  erasure index. Doubling them must no more than double their allocations.
+
+  The plan first asked for a chain of 200 unions, each over the next. Erasure
+  makes a chain's compile allocations superlinear in its depth: 1.03M at 200
+  and 3.53M at 400, against 305k at 200 before erasure. Specialize expands the
+  chain again each time one of its types is made concrete. Opaque types already
+  behave this way, at 2.8 times for double the depth, and real types nest two
+  or three deep, so the self-compile is flat. On 2026-11-24 Keith accepted
+  parity with opaque types for now. Memoized erasure is a follow-up, best after
+  landing 6, where it can replace the `opaques` threading
+  ([Simplifications](#simplifications-this-enables), item 3): the sealed
+  tables publish each erased key's concrete type, and storage is classified
+  by cycles in the declaration graph. It is about +60 to +90 lines.
+
+**Cost follow-ups from landing 2.** Its callgrind attribution named these.
+Each needs its own measurement:
+- **Cache translated types** per type and substitution in specialize, with
+  memoized erasure.
+- **Memoize the resource walk** per type in check, or have the declarations
+  publish which types are resources.
+- **Emit compiled functions as `static`,** so the C compiler can inline small
+  accessors such as `union_number`, `List.get` and the `from_opaque`
+  readers. This is compiler-wide.
+- **Inline the fast path of list drops,** which the narrowed type translation
+  pays on every call.
+- **Add a callgrind mode to `self-compile-cost`.** On macOS, nine rounds
+  spread by 14M to 30M per side and cannot resolve a 0.1% change. Callgrind
+  in the Linux Docker image is deterministic, at about 6 minutes per side.
+- **Repair `blorp/scripts/attribution/run`.** Its markers stage patches an
+  anchor in `emit.brp` that no longer exists.
 
 ## Review, probes and gates
 
@@ -759,12 +851,13 @@ The gates follow `blorp/AGENTS.md` ("Which gates a change runs"):
     ambiguity, and `UserId.Init` resolves;
   - the fixed-input C is byte-identical;
   - the ceilings hold, and the gates pass.
-- [ ] **Landing 2:**
+- [x] **Landing 2:**
   - a `resource union` fixture reads its handle by destructuring;
   - a union-headed `Dict` literal compiles;
   - each of the 52 layout fixtures has a second variant, or is labelled an
     erasure test;
   - the rows for rules 7 to 9 are tested as in landing 1;
+  - the stress fixture's allocations grow no worse than linearly;
   - the fixed-input C is byte-identical;
   - the ceilings hold, and the gates pass.
 - [ ] **Landing 3:**

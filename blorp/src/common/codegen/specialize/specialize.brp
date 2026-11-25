@@ -966,23 +966,18 @@ private pure func concrete_type(
     records: SealedRecords
 ) -> Result[TypeRef, Diagnostic]:
     match value_type:
-        -- The arguments close in the enclosing substitution; the underlying type
-        -- then expands in the opaque declaration's own.
         model.NominalType(model.OpaqueNominal(id), arguments):
             match opaques.get(id.opaque_number()):
                 Some(declaration):
-                    match arguments.semantic_arguments(substitution, span):
-                        Err(error):
-                            Err(error)
-                        Ok(closed):
-                            concrete_type(
-                                opaques,
-                                declaration.underlying_type.value_type,
-                                { owner = model.OpaqueDeclaration(id), values = closed },
-                                unions,
-                                span,
-                                records
-                            )
+                    opaques.concrete_erased_type(
+                        model.OpaqueDeclaration(id),
+                        declaration.underlying_type.value_type,
+                        arguments,
+                        substitution,
+                        unions,
+                        span,
+                        records
+                    )
                 None:
                     Err(internal_error(span, "unknown opaque declaration"))
         model.CallableType(_, parameters, result):
@@ -1011,18 +1006,116 @@ private pure func concrete_type(
             match concrete_record(opaques, id, arguments, substitution, unions, span, records):
                 Ok(owner): Ok(RecordType(owner))
                 Err(error): Err(error)
+        -- Erasure is decided before any argument is made concrete: an erased
+        -- union's arguments close into its payload's type, and making them
+        -- concrete first as well would repeat that work at every nested level.
         model.NominalType(model.AggregateNominal(model.UnionAggregate(id)), arguments):
-            match concrete_types(opaques, arguments, substitution, unions, span, records):
-                Ok(concrete_arguments):
-                    match unions.ids.get({ declaration = id, arguments = concrete_arguments }):
-                        Some(union_id): Ok(UnionType(union_id))
-                        None: Err(internal_error(span, "unprepared union instance"))
-                Err(error):
-                    Err(error)
+            match unions.erasure(id):
+                Some(Some(erased)):
+                    concrete_erased_type(
+                        opaques,
+                        erased.owner,
+                        erased.body,
+                        arguments,
+                        substitution,
+                        unions,
+                        span,
+                        records
+                    )
+                Some(None):
+                    match concrete_types(opaques, arguments, substitution, unions, span, records):
+                        Ok(concrete_arguments):
+                            match unions.ids.get({
+                                declaration = id,
+                                arguments = concrete_arguments
+                            }):
+                                Some(union_id): Ok(UnionType(union_id))
+                                None: Err(internal_error(span, "unprepared union instance"))
+                        Err(error):
+                            Err(error)
+                None:
+                    Err(internal_error(span, "unknown union declaration"))
         model.ParameterType(id):
             match semantic_type(model.ParameterType(id), substitution, span):
                 Err(error): Err(error)
                 Ok(value): concrete_type(opaques, value, substitution, unions, span, records)
+
+
+-- A nominal type that specialization erases at the type level, so that lower,
+-- own, verify and emit never see it: the type written in its declaration, an
+-- opaque type's underlying type or the one payload of a union Check stored as
+-- its payload (rule 8), under the declaration's type parameters.
+private record ErasedDeclaration {
+    owner: model.TypeParameterOwner,
+    parameters: List[TypeParameterId],
+    body: model.TypeRef
+}
+
+
+-- Union `id`'s erasure while instances expand, before sealing publishes it.
+private pure func erased_union(
+    checked: model.CheckedFunctions,
+    id: UnionId,
+    span: Span
+) -> Result[Option[ErasedDeclaration], Diagnostic]:
+    declaration ?= checked.unions
+        .get(id.union_number())
+        .or_internal_error(span, "unknown union declaration")
+
+    declaration.union_erasure(span)
+
+
+private ERASED_UNION_SHAPE: String = "an erased union has one variant with one payload"
+
+
+-- What `declaration` is erased to when Check stored it as its one payload, or None.
+private pure func union_erasure(
+    declaration: model.CheckedUnion,
+    span: Span
+) -> Result[Option[ErasedDeclaration], Diagnostic]:
+    match declaration.storage:
+        model.StoredAsPayload:
+            match declaration.variants:
+                [only]:
+                    match only.fields:
+                        [payload]:
+                            Ok(
+                                Some({
+                                    owner = model.UnionDeclaration(declaration.id),
+                                    parameters = declaration.type_parameters,
+                                    body = payload.value_type
+                                })
+                            )
+                        _:
+                            Err(internal_error(span, ERASED_UNION_SHAPE))
+                _:
+                    Err(internal_error(span, ERASED_UNION_SHAPE))
+        model.StoredByValue | model.StoredOnHeap:
+            Ok(None)
+
+
+-- Union `id`'s published erasure; the outer None only for an id no declaration issued.
+private pure func erasure(unions: SealedUnions, id: UnionId) -> Option[Option[ErasedDeclaration]]:
+    unions.erasures.get(id.union_number())
+
+
+-- An erased declaration's body at `arguments`, which close in the enclosing
+-- substitution before the body expands in the declaration's own. The parts
+-- are passed apart: a record holding them would be allocated for every
+-- opaque type the translation meets.
+private pure func concrete_erased_type(
+    opaques: List[model.CheckedOpaque],
+    owner: model.TypeParameterOwner,
+    body: model.TypeRef,
+    arguments: List[model.TypeRef],
+    substitution: declarations.Substitution,
+    unions: SealedUnions,
+    span: Span,
+    records: SealedRecords
+) -> Result[TypeRef, Diagnostic]:
+    closed ?= arguments.semantic_arguments(substitution, span)
+
+    concrete_type(opaques, body, { owner = owner, values = closed }, unions, span, records)
 
 
 private pure func concrete_tuple_type(
@@ -1344,7 +1437,12 @@ private record PreparedInstances {
 -- instance number without copying.
 private record SealedUnions {
     ids: Dict[UnionKey, UnionInstanceId],
-    layouts: List[ConcreteUnion]
+    layouts: List[ConcreteUnion],
+    -- Each union declaration's erasure, by number: what it is erased to when
+    -- Check stored it as its payload, or None. Derived from
+    -- CheckedUnion.storage once, at sealing, so translation reads it without
+    -- a call or a copied declaration.
+    erasures: List[Option[ErasedDeclaration]]
 }
 
 
@@ -1992,7 +2090,40 @@ private pure func ensure_union(
                         in_progress = marked
                     })
                 None:
-                    key.prepare_union(checked, unions, span, records, in_progress)
+                    match checked.erased_union(key.declaration, span):
+                        Ok(Some(erased)):
+                            prepare_erased_type(
+                                erased.owner,
+                                erased.parameters,
+                                erased.body,
+                                key.arguments,
+                                checked,
+                                unions,
+                                span,
+                                records,
+                                in_progress
+                            )
+                        Ok(None):
+                            key.prepare_union(checked, unions, span, records, in_progress)
+                        Err(error):
+                            Err(error)
+
+
+-- An erased declaration's body, prepared under its parameters bound to the
+-- arguments; no layout is made for the erased type itself.
+private pure func prepare_erased_type(
+    owner: model.TypeParameterOwner,
+    parameters: List[TypeParameterId],
+    body: model.TypeRef,
+    arguments: List[PartialType],
+    checked: model.CheckedFunctions,
+    unions: IndexedList[UnionSlot],
+    span: Span,
+    records: IndexedList[RecordSlot],
+    in_progress: List[InProgressLayout]
+) -> Result[PreparedType, Diagnostic]:
+    inner ?= parameters.parameter_substitution(arguments, owner, span)
+    body.prepare_type(inner, checked, unions, span, records, in_progress)
 
 
 private pure func prepare_union(
@@ -2065,13 +2196,17 @@ private pure func prepare_union(
 
     -- An instance of a declaration that contains itself, as Check classified
     -- it, is boxed whatever else it stores; the box owns every payload.
-    -- Otherwise an owning child makes it owning.
-    representation: UnionRepresentation = if declaration.contains_itself:
-        BoxedRecursive
-    else if owning:
-        InlineOwningPayload
-    else:
-        InlineUnmanaged
+    -- Otherwise an owning child makes it owning. An erased union has no layout.
+    representation: UnionRepresentation ?= match declaration.storage:
+        model.StoredOnHeap:
+            Ok(BoxedRecursive)
+        model.StoredByValue:
+            if owning:
+                Ok(InlineOwningPayload)
+            else:
+                Ok(InlineUnmanaged)
+        model.StoredAsPayload:
+            Err(internal_error(span, "an erased union reached its layout"))
 
     -- Checking accepts a fixed union only when every payload is unmanaged and
     -- none contains the union, so its instances are always InlineUnmanaged.
@@ -2688,14 +2823,11 @@ private pure func prepare_opaque(
         in_progress
     )
 
-    inner ?= declaration.type_parameters.parameter_substitution(
-        prepared.arguments,
+    prepare_erased_type(
         model.OpaqueDeclaration(declaration.id),
-        span
-    )
-
-    declaration.underlying_type.value_type.prepare_type(
-        inner,
+        declaration.type_parameters,
+        declaration.underlying_type.value_type,
+        prepared.arguments,
         checked,
         prepared.unions,
         span,
@@ -2742,7 +2874,10 @@ private pure func prepare_tuple_type(
 -- an equal key, so two equal keys would mean resolution made distinct keys equal.
 -- The Dict would then be shorter than `layouts` and every later id would shift,
 -- so sealing fails instead.
-private pure func seal_unions(slots: IndexedList[UnionSlot]) -> Result[SealedUnions, Diagnostic]:
+private pure func seal_unions(
+    slots: IndexedList[UnionSlot],
+    checked_unions: List[model.CheckedUnion]
+) -> Result[SealedUnions, Diagnostic]:
     var ids: Dict[UnionKey, UnionInstanceId] = dict_ops.dict(slots.entries.length())
     var layouts: List[ConcreteUnion] = []
     var failure: Option[Diagnostic] = None
@@ -2766,9 +2901,14 @@ private pure func seal_unions(slots: IndexedList[UnionSlot]) -> Result[SealedUni
 
                 break
 
+    erasures ?= checked_unions.translated_list(
+        pure func(declaration: model.CheckedUnion) -> Result[Option[ErasedDeclaration], Diagnostic]:
+            declaration.union_erasure(compiler_span())
+    )
+
     match failure:
         Some(error): Err(error)
-        None: Ok({ ids = ids, layouts = layouts })
+        None: Ok({ ids = ids, layouts = layouts, erasures = erasures })
 
 
 -- A capture environment that no instance turns into a runtime closure is only
@@ -2974,9 +3114,7 @@ private pure func append_node_types(
         model.ConstructRecord(_, fields):
             for field in fields:
                 types = types.append_value_types(field.value)
-        model.ConstructOpaque(_, child):
-            types = types.append_value_types(child)
-        model.ProjectOpaque(_, child):
+        model.ConstructOpaque(_, child) | model.ProjectOpaque(_, child) | model.ReadPayload(_, child, _):
             types = types.append_value_types(child)
         model.ConstructTuple(elements):
             for element in elements:
@@ -4875,14 +5013,22 @@ private pure func translate_expr(
             match context.translated_type(value.value_type, value.span):
                 Err(error): Err(error)
                 Ok(value_type): translate_callable_value(context, choice, value_type, value.span)
-        model.ConstructOpaque(_, child):
+        -- A value of an erased type is the value it wraps.
+        model.ConstructOpaque(_, child) | model.ProjectOpaque(_, child):
             match translate_expr(context, child):
                 Ok(translated): Ok({ translated | span = value.span })
                 Err(error): Err(error)
-        model.ProjectOpaque(_, child):
-            match translate_expr(context, child):
-                Ok(translated): Ok({ translated | span = value.span })
-                Err(error): Err(error)
+        -- Until landing 7, check reads a payload only from a union stored as it.
+        model.ReadPayload(variant, child, _):
+            match context.unions.erasure(variant.variant_owner()):
+                Some(Some(_)):
+                    match translate_expr(context, child):
+                        Ok(translated): Ok({ translated | span = value.span })
+                        Err(error): Err(error)
+                Some(None):
+                    Err(internal_error(value.span, "a payload read from a tagged union"))
+                None:
+                    Err(internal_error(value.span, "unknown union declaration"))
         model.ReadTupleElement(receiver, ordinal):
             translate_tuple_element(context, value, receiver, ordinal)
         model.ReadRecordField(receiver, field):
@@ -4985,27 +5131,39 @@ private pure func translate_expr(
                 Err(error):
                     Err(error)
         model.ConstructVariant(id, children):
-            match context.translated_type(value.value_type, value.span):
-                Ok(value_type):
-                    match value_type.concrete_union_owner(value.span):
-                        Ok(owner):
-                            match id.translate_variant(owner, context.unions, value.span):
-                                Ok(variant):
-                                    match translate_exprs(context, children):
-                                        Ok(values):
-                                            Ok({
-                                                form = ConstructVariant(variant, values),
-                                                value_type = value_type,
-                                                span = value.span
-                                            })
+            match context.unions.erasure(id.variant_owner()):
+                Some(Some(_)):
+                    match children:
+                        [child]:
+                            match translate_expr(context, child):
+                                Ok(translated): Ok({ translated | span = value.span })
+                                Err(error): Err(error)
+                        _:
+                            Err(internal_error(value.span, "an erased union has one payload"))
+                None:
+                    Err(internal_error(value.span, "unknown union declaration"))
+                Some(None):
+                    match context.translated_type(value.value_type, value.span):
+                        Ok(value_type):
+                            match value_type.concrete_union_owner(value.span):
+                                Ok(owner):
+                                    match id.translate_variant(owner, context.unions, value.span):
+                                        Ok(variant):
+                                            match translate_exprs(context, children):
+                                                Ok(values):
+                                                    Ok({
+                                                        form = ConstructVariant(variant, values),
+                                                        value_type = value_type,
+                                                        span = value.span
+                                                    })
+                                                Err(error):
+                                                    Err(error)
                                         Err(error):
                                             Err(error)
                                 Err(error):
                                     Err(error)
                         Err(error):
                             Err(error)
-                Err(error):
-                    Err(error)
         model.ConstructTuple(elements):
             translate_tuple(context, value, elements)
         model.ConstructRecord(declaration, fields):
@@ -5501,23 +5659,32 @@ private pure func translate_place(
                 Err(error):
                     Err(error)
                 Ok(concrete_parent):
-                    match concrete_parent.value_type.translate_place_variant(
-                        id,
-                        context.unions,
-                        span
-                    ):
-                        Err(error):
-                            Err(error)
-                        Ok(variant):
-                            Ok(
-                                UnionField(
-                                    concrete_parent,
-                                    into_opaque VariantFieldInstanceId({
-                                        variant = variant,
-                                        position = ordinal
-                                    })
-                                )
-                            )
+                    match context.unions.erasure(id.variant_owner()):
+                        -- An erased union's payload is the union's own place. No
+                        -- variant test reaches one: its pattern domain has one head,
+                        -- and a test would fail in `translate_variant`.
+                        Some(Some(_)):
+                            Ok(concrete_parent.route)
+                        None:
+                            Err(internal_error(span, "unknown union declaration"))
+                        Some(None):
+                            match concrete_parent.value_type.translate_place_variant(
+                                id,
+                                context.unions,
+                                span
+                            ):
+                                Err(error):
+                                    Err(error)
+                                Ok(variant):
+                                    Ok(
+                                        UnionField(
+                                            concrete_parent,
+                                            into_opaque VariantFieldInstanceId({
+                                                variant = variant,
+                                                position = ordinal
+                                            })
+                                        )
+                                    )
 
     translated ?= route
     Ok({ value_type = value_type, route = translated })
@@ -6210,7 +6377,7 @@ pure func specialize(program: CheckedProgram) -> Result[SpecializedProgram, Diag
     }
 
     expanded ?= checked.expand_instances(initial)
-    sealed_unions ?= expanded.unions.seal_unions()
+    sealed_unions ?= expanded.unions.seal_unions(checked.unions)
     sealed_records ?= expanded.records.seal_records(expanded.converted_environments)
 
     prepared: SealedInstances = {

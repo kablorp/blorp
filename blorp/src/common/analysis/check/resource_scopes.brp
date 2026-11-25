@@ -8,7 +8,7 @@ resource.
 import:
     list: repeat
     ../../syntax/syntax: Span, Purity(Pure, Impure)
-    ../ids: FunctionId, OpaqueId, OpaqueRow, TraitMethodId, function_number
+    ../ids: DeclarationInventory, FunctionId, TraitMethodId, function_number
     ../namespace/namespace: TypeHead(PrimitiveHead, ListHead, UnionHead, RecordHead, OpaqueHead)
     ./declarations: Substitution, TypeRef methods
     ./errors as errors: CheckError, ResourceUse, resource_error, scoped_error, Option methods
@@ -29,7 +29,7 @@ import:
 
 
 private record Admission {
-    opaques: List[OpaqueRow],
+    inventory: DeclarationInventory,
     functions: List[AcceptedFunction],
     lambdas: List[model.LambdaRow],
     -- Set while an inherited default is walked again: its Self, as the resource.
@@ -48,7 +48,7 @@ private record Facts {
 -- `TraitDefault` member: the method, the body it names, and the
 -- implementation that reports a misuse.
 record ResourceDefault {
-    resource_type: OpaqueId,
+    resource_type: model.NominalId,
     method: TraitMethodId,
     default_body: FunctionId,
     implementation: Span
@@ -59,16 +59,22 @@ record ResourceDefault {
 -- resource inherits.
 pure func resource_defaults(
     implementations: List[AcceptedImplementation],
-    opaques: List[OpaqueRow]
+    inventory: DeclarationInventory
 ) -> Result[List[ResourceDefault], CheckError]:
     var rows: List[ResourceDefault] = []
     var failure: Option[CheckError] = None
 
     for implementation in implementations:
-        lent: Result[Option[OpaqueId], CheckError] = match implementation.receiver_head:
-            model.NamedHead(OpaqueHead(id)): id.declared_resource(opaques, implementation.span)
-            model.NamedHead(PrimitiveHead(_) | ListHead | UnionHead(_) | RecordHead(_)): Ok(None)
-            model.TupleHead(_): Ok(None)
+        lent: Result[Option[model.NominalId], CheckError] = match implementation.receiver_head:
+            model.NamedHead(OpaqueHead(id)):
+                model.OpaqueNominal(id).declared_resource(inventory, implementation.span)
+            model.NamedHead(UnionHead(id)):
+                union_type = model.AggregateNominal(model.UnionAggregate(id))
+                union_type.declared_resource(inventory, implementation.span)
+            model.NamedHead(PrimitiveHead(_) | ListHead | RecordHead(_)):
+                Ok(None)
+            model.TupleHead(_):
+                Ok(None)
 
         match lent:
             Ok(Some(resource_type)):
@@ -105,10 +111,10 @@ pure func admit_resource_body(
     id: FunctionId,
     signature: FunctionSignature,
     functions: List[AcceptedFunction],
-    opaques: List[OpaqueRow],
+    inventory: DeclarationInventory,
     inherited: List[ResourceDefault]
 ) -> Result[Void, CheckError]:
-    var admitted = body.admit_body_loans(signature, functions, opaques, None)
+    var admitted = body.admit_body_loans(signature, functions, inventory, None)
 
     for row in inherited:
         if (
@@ -118,10 +124,10 @@ pure func admit_resource_body(
         ):
             lent: Substitution = {
                 owner = model.FunctionDeclaration(id),
-                values = [model.NominalType(model.OpaqueNominal(row.resource_type), [])]
+                values = [model.NominalType(row.resource_type, [])]
             }
 
-            admitted = match body.admit_body_loans(signature, functions, opaques, Some(lent)):
+            admitted = match body.admit_body_loans(signature, functions, inventory, Some(lent)):
                 Ok(_): Ok(void)
                 Err(error): Err(error.as_lent_default(row))
 
@@ -149,11 +155,11 @@ private pure func admit_body_loans(
     body: ResolvedBody,
     signature: FunctionSignature,
     functions: List[AcceptedFunction],
-    opaques: List[OpaqueRow],
+    inventory: DeclarationInventory,
     lent_self: Option[Substitution]
 ) -> Result[Void, CheckError]:
     admission: Admission = {
-        opaques = opaques,
+        inventory = inventory,
         functions = functions,
         lambdas = body.lambdas,
         lent_self = lent_self
@@ -214,7 +220,7 @@ private pure func admit_written(
     whole: Option[ResourceUse]
 ) -> Result[Void, CheckError]:
     seen ?= admission.viewed(value_type, span)
-    seen.admit_as_written(admission.opaques, span, whole)
+    seen.admit_as_written(admission.inventory, span, whole)
 
 
 -- A scoped parameter's binding starts scoped; every other binding starts unscoped.
@@ -324,7 +330,8 @@ private pure func admit_binding(
         .or_checker_invariant(value.span, errors.InvalidInferenceWorklist)
 
     stored ?= admission.viewed(value.value_type, value.span)
-    _: Void ?= stored.refuse_resource(admission.opaques, value.span, errors.ResourceStorage)
+
+    _: Void ?= stored.refuse_resource(admission.inventory, value.span, errors.ResourceStorage)
 
     if scoped_callable.and(definition.mutable):
         Err(scoped_error(value.span, errors.ScopedStorage))
@@ -388,7 +395,7 @@ private pure func admit_return(
     else if scoped_callable:
         Err(scoped_error(value.span, errors.ScopedResult))
     else:
-        returned.refuse_resource(admission.opaques, value.span, errors.ResourceResult)
+        returned.refuse_resource(admission.inventory, value.span, errors.ResourceResult)
 
 
 -- Check rejects matching a callable or an opaque value, and admission
@@ -401,7 +408,7 @@ private pure func admit_match_root(
 ) -> Result[Void, CheckError]:
     scoped_callable ?= admission.admit_expression(scrutinee, facts)
     matched ?= admission.viewed(scrutinee.value_type, scrutinee.span)
-    held ?= matched.mentioned_resource(admission.opaques, scrutinee.span)
+    held ?= matched.mentioned_resource(admission.inventory, scrutinee.span)
 
     if scoped_callable.or(held.is_some()):
         Err(errors.checker_invariant(scrutinee.span, errors.LoanInMatchRoot))
@@ -453,7 +460,8 @@ private pure func admit_stored(
 ) -> Result[Void, CheckError]:
     scoped_callable ?= admission.admit_expression(value, facts)
     stored ?= admission.viewed(value.value_type, value.span)
-    _: Void ?= stored.refuse_resource(admission.opaques, value.span, errors.ResourceStorage)
+
+    _: Void ?= stored.refuse_resource(admission.inventory, value.span, errors.ResourceStorage)
 
     if scoped_callable:
         Err(scoped_error(value.span, errors.ScopedStorage))
@@ -476,7 +484,7 @@ private pure func admit_type_arguments(
                 .viewed(argument, span)
                 .and_then(
                     pure func(seen): seen
-                        .mentioned_resource(admission.opaques, span)
+                        .mentioned_resource(admission.inventory, span)
                         .refuse(span, errors.ResourceInferredType(seen))
                 )
 
@@ -491,7 +499,7 @@ private pure func admit_receiver(
     span: Span
 ) -> Result[Void, CheckError]:
     seen ?= admission.viewed(receiver, span)
-    whole ?= seen.as_resource(admission.opaques, span)
+    whole ?= seen.as_resource(admission.inventory, span)
 
     match whole:
         Some(_): Ok(void)
@@ -530,7 +538,7 @@ private pure func admit_closure(
 ) -> Result[Bool, CheckError]:
     var captures: List[Bool] = []
     var scoped_capture: Bool = False
-    var captured_resource: Option[OpaqueId] = None
+    var captured_resource: Option[model.NominalId] = None
     var failure: Option[CheckError] = None
 
     for value in environment:
@@ -541,7 +549,7 @@ private pure func admit_closure(
             Ok(captured):
                 whole = admission
                     .viewed(value.value_type, value.span)
-                    .and_then(pure func(seen): seen.as_resource(admission.opaques, value.span))
+                    .and_then(pure func(seen): seen.as_resource(admission.inventory, value.span))
 
                 match whole:
                     Err(error):
@@ -585,7 +593,9 @@ private pure func admit_lambda(
 ) -> Result[Void, CheckError]:
     result = lambda.return_type
     returned ?= admission.viewed(result.value_type, result.span)
-    _: Void ?= returned.refuse_resource(admission.opaques, result.span, errors.ResourceResult)
+
+    _: Void ?= returned.refuse_resource(admission.inventory, result.span, errors.ResourceResult)
+
     _: Void ?= admission.admit_lent_types(lambda.bindings, lambda.purity, result)
 
     facts: Facts = {
@@ -694,7 +704,7 @@ private pure func admit_expression(
             )
         model.ConstructOpaque(_, child):
             admission.admit_construction(value, [child], facts)
-        model.ProjectOpaque(_, child) | model.ReadRecordField(child, _) | model.ReadTupleElement(child, _):
+        model.ProjectOpaque(_, child) | model.ReadPayload(_, child, _) | model.ReadRecordField(child, _) | model.ReadTupleElement(child, _):
             admission
                 .admit_expression(child, facts)
                 .map(pure func(_): False)
@@ -715,7 +725,7 @@ private pure func admit_construction(
 
     _: Void ?= constructed
         .type_children()
-        .first_mentioned(admission.opaques, value.span)
+        .first_mentioned(admission.inventory, value.span)
         .refuse(value.span, errors.ResourceInferredType(constructed))
 
     _: Void ?= admission.admit_storage(children, facts)

@@ -23,13 +23,16 @@ done.
   - **Status:** planned on 2026-11-23. Opaque types become unions with private
     variants (`union UserId: private Init(Int)`) in nine landings: enable
     private variants, rotate the seed, migrate every opaque use, then delete
-    the opaque machinery, with no net growth in production lines.
+    the opaque machinery. Keith dropped the promise of no net growth on
+    2026-11-24; the estimate after landing 2 is about +400 lines.
   - **Landed:** landing 0, `EQUALITY_PLAN.md`'s landing 3: the 29
     hand-written identity equalities are gone, −149 lines (2026-11-23).
     Landing 1, private variants and bare names when unambiguous, +651 lines
-    (2026-11-24).
-  - **Next:** landing 2, destructuring, layout and resource unions. Three
-    deferred help refinements from landing 1's review wait as a follow-up.
+    (2026-11-24). Landing 2, destructuring, unions stored as their payload,
+    and resource unions, +747 lines (2026-11-24).
+  - **Next:** landing 3, the seed rotation. Waiting as follow-ups: the
+    deferred help and alias-destructuring fixes, memoized erasure, and the
+    cost follow-ups the plan lists.
 - **UInt8 and Bytes:** [`UINT8_BYTES_PLAN.md`](UINT8_BYTES_PLAN.md).
   - **Status:** U1 to U9 and B1 to B3 are decided. L0, the
     `IntegerType(Int64Format)` refactor, and L1, the compiler's `UInt8` with
