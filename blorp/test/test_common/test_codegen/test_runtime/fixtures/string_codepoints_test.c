@@ -6,7 +6,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* The exact fragments string_runtime() and STRING_SLICE_RUNTIME supply, after
+/* The exact fragments STRING_RUNTIME and STRING_SLICE_RUNTIME supply, after
  * MEMORY_RUNTIME, built with memory diagnostics so every release recounts. */
 #include "string_codepoints_runtime.c"
 

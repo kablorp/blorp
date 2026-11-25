@@ -402,7 +402,7 @@ grows capacity without touching either count.
   `from_bytes` counts its copy, not the one pass "Code" suggests. Fusing the
   two would change every native for a saving the measurement cannot see.
 - **Where the functions live.** `codepoint_length` and `codepoint_at` are in
-  `string_runtime()`, beside `byte_at`; both slices share
+  `STRING_RUNTIME`, beside `byte_at`; both slices share
   `STRING_SLICE_RUNTIME`.
 - **S9 runs only under `BLORP_LEAK_CHECK=strict`**, because the full recount
   cost 5.14% of a -O2 diagnostics self-compile, above its 3% ceiling. Every
@@ -641,7 +641,7 @@ The change moved these ceilings:
        directory.
      - The new C functions have no Blorp caller until L3, so a runtime suite
        tests them directly in C. It follows `test/test_common/test_codegen/test_runtime/string_literal_suite.brp`,
-       which writes `string_runtime()` beside a C fixture and compiles them
+       which writes `STRING_RUNTIME` beside a C fixture and compiles them
        together.
    - **Compile ceilings.** The e2e records' `{ allocations, instructions }`
      are compile ceilings for the seed-built test compiler, so L1 does not
