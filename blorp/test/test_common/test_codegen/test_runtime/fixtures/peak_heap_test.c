@@ -1,4 +1,5 @@
 #include <assert.h>
+#include <pthread.h>
 
 #include "memory_runtime.c"
 
@@ -28,12 +29,37 @@ static void peak_by_resize(void) {
     blorp_memory_release(large);
 }
 
+/* Peak 800: each thread holds 100 bytes until all eight do, then releases them
+ * and allocates and releases 100 bytes at a time, racing the others for the
+ * lock, so no more than eight blocks are ever live. */
+enum { THREADS = 8, THREAD_ALLOCATIONS = 2000 };
+static atomic_int holding;
+
+static void *allocate_and_release(void *unused) {
+    (void)unused;
+    void *held = blorp_memory_allocate(SMALL_BYTES);
+    atomic_fetch_add(&holding, 1);
+    while (atomic_load(&holding) < THREADS) {}
+    blorp_memory_release(held);
+    for (int index = 0; index < THREAD_ALLOCATIONS; index++) blorp_memory_release(blorp_memory_allocate(SMALL_BYTES));
+    return NULL;
+}
+
+static void peak_by_threads(void) {
+    pthread_t threads[THREADS];
+    for (int thread = 0; thread < THREADS; thread++)
+        if (pthread_create(&threads[thread], NULL, allocate_and_release, NULL) != 0) abort();
+    for (int thread = 0; thread < THREADS; thread++)
+        if (pthread_join(threads[thread], NULL) != 0) abort();
+}
+
 int main(int argc, char **argv) {
     blorp_memory_start();
     assert(argc == 2);
     const char *mode = argv[1];
     if (strcmp(mode, "allocation") == 0) peak_by_allocation();
     else if (strcmp(mode, "resize") == 0) peak_by_resize();
+    else if (strcmp(mode, "threads") == 0) peak_by_threads();
     /* "idle" allocates nothing. */
     else if (strcmp(mode, "idle") != 0) return 2;
     return blorp_memory_finish(0);

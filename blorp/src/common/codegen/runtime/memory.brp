@@ -15,6 +15,7 @@ MEMORY_RUNTIME: String =
         |#error BLORP_MEMORY_DIAGNOSTICS must be 0 or 1
         |#endif
         |#if BLORP_MEMORY_DIAGNOSTICS
+        |#include <pthread.h>
         |enum {BLORP_STRICT_LEAK_EXIT_STATUS=99};
         |union blorp_memory_header {max_align_t alignment;size_t requested;};
         |struct blorp_memory_counts {size_t allocations,releases,live,bytes;};
@@ -22,7 +23,8 @@ MEMORY_RUNTIME: String =
         |/* The most requested bytes live at once, without the header or the allocator's rounding, which vary by platform. Guarded by the lock.
         |   Not a fifth counts field: -O0 builds would then copy the counts through memcpy on every allocation and release. */
         |static size_t blorp_memory_peak_bytes;
-        |static atomic_flag blorp_memory_lock=ATOMIC_FLAG_INIT;
+        |/* A mutex, not a spin lock: threads that allocate at once wait in the kernel instead of spinning on one cache line. */
+        |static pthread_mutex_t blorp_memory_lock=PTHREAD_MUTEX_INITIALIZER;
         |static int blorp_memory_strict;
         |static void blorp_memory_fail(const char *message){fputs(message,stderr);abort();}
         |static size_t blorp_memory_add(size_t left,size_t right){
@@ -33,10 +35,8 @@ MEMORY_RUNTIME: String =
         |if(right>left)blorp_memory_fail("error: target memory accounting underflow\n");
         |return left-right;
         |}
-        |static void blorp_memory_enter(void){
-        |while(atomic_flag_test_and_set_explicit(&blorp_memory_lock,memory_order_acquire)){}
-        |}
-        |static void blorp_memory_leave(void){atomic_flag_clear_explicit(&blorp_memory_lock,memory_order_release);}
+        |static void blorp_memory_enter(void){if(pthread_mutex_lock(&blorp_memory_lock)!=0)blorp_memory_fail("error: target memory lock failed\n");}
+        |static void blorp_memory_leave(void){if(pthread_mutex_unlock(&blorp_memory_lock)!=0)blorp_memory_fail("error: target memory unlock failed\n");}
         |#if defined(__APPLE__)&&defined(__has_include)
         |#if __has_include(<execinfo.h>)&&__has_include(<mach-o/dyld.h>)
         |#include <execinfo.h>
