@@ -34,11 +34,20 @@ static int counting_close(int descriptor) {
     return close(descriptor);
 }
 
+/* Runs after an interrupted call of the production open, before its retry. Only
+ * the interrupted-open case sets it. */
+static void (*after_interrupted_open)(void) = NULL;
+
 /* The read fragment never creates a file, so open takes no mode here. */
 static int counting_open(const char *path, int flags, ...) {
     assert((flags & O_CREAT) == 0);
     const int descriptor = open(path, flags);
-    if (descriptor < 0 && errno == EINTR) interrupted_opens++;
+    if (descriptor < 0 && errno == EINTR) {
+        interrupted_opens++;
+        if (after_interrupted_open != NULL) after_interrupted_open();
+        /* The production retry reads errno. */
+        errno = EINTR;
+    }
     return descriptor;
 }
 
@@ -328,23 +337,33 @@ static int case_entry_kinds(const char *directory) {
     return 0;
 }
 
-/* The interval timer's handler lets a child writer go on: one byte per tick.
- * Installed without SA_RESTART, so a blocked call returns EINTR. */
+/* An interval timer's ticks interrupt the reader's blocked calls. Its handler is
+ * installed without SA_RESTART, so a blocked call returns EINTR. A child writer
+ * waits for one byte on the go pipe before each step. */
 static int go_pipe[2];
 static volatile sig_atomic_t ticks = 0;
 enum { TICK_MICROSECONDS = 20000 };
 
-static void on_tick(int signal_number) {
-    (void)signal_number;
-    const int saved = errno;
+static void let_writer_go(void) {
     const char go = 1;
-    ticks++;
     const ssize_t written = write(go_pipe[1], &go, 1);
     (void)written;
+}
+
+static void count_tick(int signal_number) {
+    (void)signal_number;
+    ticks++;
+}
+
+static void count_tick_and_let_writer_go(int signal_number) {
+    (void)signal_number;
+    const int saved = errno;
+    ticks++;
+    let_writer_go();
     errno = saved;
 }
 
-static void start_ticks(void) {
+static void start_ticks(void (*on_tick)(int)) {
     struct sigaction action;
     memset(&action, 0, sizeof action);
     action.sa_handler = on_tick;
@@ -392,9 +411,26 @@ static const char *make_fifo(const char *directory, const char *name) {
     return path;
 }
 
-/* open blocks until a writer exists. The writer waits for the first tick, so
- * the reader's open returns EINTR at least once, which the counting open sees,
- * and must be retried, not failed. */
+/* No tick may come once the writer may open. On macOS, a signal that reaches
+ * the blocked reader around the writer's open, before the reader runs again,
+ * fails the reader's open with EINTR although the writer's open has succeeded.
+ * The writer then writes to a FIFO with no reader and exits, and the retried
+ * open waits for a writer that never comes. Ignoring SIGALRM before stopping
+ * the timer also discards a tick already pending. */
+static void release_writer_after_interrupt(void) {
+    struct sigaction ignore;
+    memset(&ignore, 0, sizeof ignore);
+    ignore.sa_handler = SIG_IGN;
+    sigemptyset(&ignore.sa_mask);
+    assert(sigaction(SIGALRM, &ignore, NULL) == 0);
+    stop_ticks();
+    let_writer_go();
+}
+
+/* open blocks until a writer exists. Ticks come until one interrupts the
+ * reader's open, which the counting open sees and which must be retried, not
+ * failed. Only then does the writer open, so the retried open is the one that
+ * returns. */
 static int case_interrupted_open(const char *directory) {
     const char *fifo = make_fifo(directory, "interrupted_open.fifo");
     assert(pipe(go_pipe) == 0);
@@ -408,10 +444,10 @@ static int case_interrupted_open(const char *directory) {
         (void)close(writer);
         _exit(0);
     }
-    start_ticks();
+    after_interrupted_open = release_writer_after_interrupt;
+    start_ticks(count_tick);
     const int before = close_calls;
     expect_text(read_path(fifo), "after the tick", 14);
-    stop_ticks();
     assert(ticks >= 1);
     assert(interrupted_opens >= 1);
     assert(close_calls == before + 1);
@@ -421,17 +457,22 @@ static int case_interrupted_open(const char *directory) {
 
 /* A FIFO has no size, and a writer appends one chunk per tick while the reader
  * is blocked. Each tick interrupts the read, which is retried, until the writer
- * closes. The writer's open is the readiness handshake: the reader's open
- * returns only once the writer exists, and each chunk waits for a tick. */
+ * closes. The writer opens before any tick and before the reader, while a
+ * reader that never blocks holds the FIFO open until the read ends. So the
+ * reader's open finds the writer and never sleeps, and even an interrupted open
+ * could not leave the writer without a reader, as an interrupted open can on
+ * macOS (see release_writer_after_interrupt). */
 static int case_appending_writer(const char *directory) {
     enum { CHUNKS = 10, CHUNK_SIZE = 20000 };
     const char *fifo = make_fifo(directory, "appending_writer.fifo");
     assert(pipe(go_pipe) == 0);
+    const int holder = open(fifo, O_RDONLY | O_NONBLOCK);
+    assert(holder >= 0);
+    const int writer = open(fifo, O_WRONLY);
+    assert(writer >= 0);
     const pid_t child = fork();
     assert(child >= 0);
     if (child == 0) {
-        const int writer = open(fifo, O_WRONLY);
-        if (writer < 0) _exit(1);
         for (int chunk = 0; chunk < CHUNKS; chunk++) {
             wait_for_go();
             char bytes[CHUNK_SIZE];
@@ -441,10 +482,13 @@ static int case_appending_writer(const char *directory) {
         (void)close(writer);
         _exit(0);
     }
-    start_ticks();
+    /* The reader sees end of file once the child's writer, the last, closes. */
+    assert(close(writer) == 0);
+    start_ticks(count_tick_and_let_writer_go);
     const int before = close_calls;
     struct outcome outcome = read_path(fifo);
     stop_ticks();
+    assert(close(holder) == 0);
     assert(ticks >= CHUNKS);
     assert(outcome.succeeded == BLORP_FS_SUCCEEDED);
     assert(outcome.text->length == (int64_t)CHUNKS * CHUNK_SIZE);

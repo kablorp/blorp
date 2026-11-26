@@ -1640,3 +1640,52 @@ too close to that limit.
   no failure, maximum 3.63 s. With a 2 s limit, one full local e2e run had
   only two cases over it: this one and "a million-deep left spine of a record
   tree is released", which takes 0.5 to 0.8 s unloaded.
+
+## FIFO open probe hang on macOS CI, 2026-11-26
+
+The runtime probe "an interrupted open of a FIFO is retried after it returned
+EINTR" (`interrupted_open` in `fixtures/fs_test.c`) timed out after 30,000 ms,
+with nothing on stderr, on the macOS ARM64 job of main's run 45764151953
+(attempt 1, `dee4a2445`), and passed on the re-run. The runtime's open retry
+was right. The probe could deadlock itself.
+
+- **What macOS does.** A FIFO reader's blocking open, reached by a signal
+  around the writer's open and before the reader runs again, fails with EINTR
+  although the writer's open has succeeded. The writer is left holding a FIFO
+  that nobody reads. A standalone probe, whose reader opens once with no retry
+  while a child opens the writer and signals the reader, saw this on an idle
+  Mac in 2 of 300 trials with the signal sent just after the writer's open and
+  in 6 of 300 with it sent just before. Linux's FIFO open succeeds once its
+  partner has arrived, whatever signal is pending.
+- **How the probe hung.** Ticks came every 20 ms for the whole read, and the
+  child opened the writer after the first one. When a later tick reached the
+  reader during the writer's open, the child wrote into the orphaned FIFO and
+  exited. The production retry then waited for a writer that would never come,
+  and each tick only restarted the wait. With the probe at nice 15 under 30 busy
+  loops on 10 cores, 22 of 900 runs hung: each stack ended in the production
+  `open`, under `blorp_fs_read_path`, after 0.06 s of CPU in 10 s, and no child
+  was left. Unloaded, or under 25 busy loops at the same priority, 500 of 500
+  runs passed, which is why the hang shows only on a loaded CI runner.
+- **The appending-writer probe** had the same exposure, since a tick could
+  interrupt its reader's open while its writer's open completed. With that
+  writer's open delayed by about one tick, under the same load, 3 of 800 runs
+  failed. In each, the reader's open had been interrupted, the writer had been
+  killed by SIGPIPE, and the read ended after 0 or 8,192 of 200,000 bytes.
+- **Change.** In `interrupted_open`, the writer opens only after the reader's
+  open has returned EINTR. On that EINTR the counting open runs a hook before
+  the production retry. The hook ignores SIGALRM, which also discards a pending
+  tick, stops the timer and lets the writer go, so no signal can reach the
+  retried open. In `appending_writer`, the parent opens a reader that never
+  blocks, then the writer, before it forks and starts the ticks. The reader's
+  open then finds a writer and never sleeps, and that reader keeps the writer
+  from being orphaned until the read ends. Both cases still prove what they
+  did. With the read fragment's open retry removed, `interrupted_open` fails
+  its `expect_text` assertion at once (exit 134), where it used to time out.
+  With its read retry removed, `appending_writer` fails `ticks >= CHUNKS` at
+  once (exit 134).
+- **Evidence.** After the change, under the same nice-15 load with 30 busy
+  loops, both cases passed every run: `interrupted_open` 900 of 900 (at most
+  0.53 s), and 400 of 400 more with its writer's open delayed by about one
+  tick, and `appending_writer` 800 of 800 (at most 1.11 s). Unloaded, both
+  passed 300 of 300. In the Linux CI images (GCC on x86-64, Clang on ARM64),
+  both passed 50 of 50.
