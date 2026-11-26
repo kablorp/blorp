@@ -3,7 +3,9 @@
 **Status: done, 2026-11-25.** Keith approved the design and asked for this
 plan, then started it with landing 0. Landings 0 to 8 have landed, and opaque
 types are gone. The deferred help fixes and destructuring through an alias
-followed on 2026-11-26. Memoized erasure and the cost follow-ups wait. Landing 0
+followed on 2026-11-26. Memoized erasure and the cost follow-ups wait.
+[`UNION_DESTRUCTURING_REMOVAL_PLAN.md`](UNION_DESTRUCTURING_REMOVAL_PLAN.md)
+proposes removing rule 7's destructuring in favour of `match`. Landing 0
 belongs to [`EQUALITY_PLAN.md`](EQUALITY_PLAN.md), which records its results.
 
 **The direction.** Keith chose it in discussion:
