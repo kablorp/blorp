@@ -1492,6 +1492,116 @@ Four-thread cells give the time against the mutex's in the same run.
 The raw samples and scripts are in `build/landing1b/`, ignored, in the
 landing's worktree.
 
+### Landing 2 results
+
+Landing 2 is the front end of `concurrent:` blocks for pure tasks. The native
+`join` moved to landing 2a, after a first stop: lines were over the ceiling,
+and direct-call trampolines need own and verify changes.
+
+**What it does:**
+- **Syntax.** `concurrent:` is a contextual word, recognized only before
+  `:` and a line end. Each line of the block is a task, and a task rejects
+  `?=`, `break` and `continue` that would leave it. The formatter and the
+  grammar follow; the language server needs no change.
+- **Load.** `concurrency.brp` has its own module role by path. The loader
+  queues it once its queue drains and some loaded module used a block, so a
+  program without one loads exactly what it did.
+- **Check.**
+  - Each task's whole statement is checked once, as any statement is, as the
+    body of a pure `() -> T` lambda whose row check builds directly. The
+    lambda returns what the statement bound: nothing, its one binding, or a
+    tuple of several, which costs one allocation when its elements are managed.
+  - Two or more tasks become the right-leaning chain of the module's `join`,
+    and one task a call of its `run`, which runs it in place: a checked form
+    cannot call a lambda value directly without a closure. After the block
+    each name a task bound is bound once more, as the task bound it.
+  - A nested block binds what its own tasks bind, so its names follow the
+    outer block too; Keith decided on 2026-10-02 that nested blocks are not
+    errors.
+  - `join` and `run` are validated where they are designated. Landing 2a can
+    move `join`'s check into its `runtime_contract`, which checks the same
+    shape.
+  - Every rule of the brief's table is worded for the task, as are an
+    expression task's value (the existing rule that an expression statement
+    is Void) and an assignment of any outer binding, var or immutable, which
+    has one message.
+  - The resource pass is the one authority for a task's resource and
+    scoped-callable captures. It reads the lambda's origin and rejects the
+    first such capture at its first use, by the name it was used by: a
+    capture records that name with its span. A lent Self in an inherited
+    default names the type instead, as that rejection's rewording needs.
+  - A task's bindings are the head of its statement's scope. A rest that is
+    not the block's scope, or a callable among them, is a checker invariant.
+  - `concurrent: x = 1` on one line reports "unknown type"; no carrier
+    brings the `concurrent` word to that rejection, so it has no hint.
+- **`join` and `run` are written in Blorp,** so a block's tasks run one after
+  the other. Specialization calls each task's lambda directly, with no
+  closure.
+
+**Ceilings, corrected by the coordinator on 2026-11-25:**
+
+| Ceiling | Old | New |
+| --- | ---: | ---: |
+| Production lines | +1,000 | +1,060, then +1,080 |
+| Test lines | +900 | +1,200, then +1,400 |
+
+The growth audit found that check needs about twice the brief's estimate of
+250–400 lines for its rules, not bloat; the native moved out, and the
+audit's cuts apply. The second test correction, from +1,200 to +1,400, is
+for necessary coverage of the rules and cases review asked for. The second
+production correction, from +1,060 to +1,080, pays for the last review's
+fixes: each rejected capture named at its use, and the task's scope checked
+as an invariant.
+
+**Lines,** from `bd6922f69`: production +1,076 net, 16 over the +1,060
+ceiling, and tests +1,382 net, within +1,400. The tests add the review's
+cases, a shared marked-rejection helper and a language-server definition
+test.
+- **A first fix round** reached +1,193 production: its fixes added more than
+  the audit's cuts removed.
+- **A simplification round** checked each task's whole statement and
+  rebound its names once, in place of applying its pattern a second time
+  after the block. It also moved the capture rules to the resource pass,
+  and dropped the one-line hint and the nested-block rejection.
+- **A review round**, after the rebase onto `bd6922f69` (+1,045), named each
+  capture rejection at its use and made the task's scope an invariant, at
+  about +55. Folding the one-task result into the join operand's shape took
+  back about 24, which left it 16 over; the coordinator corrected the
+  ceiling.
+
+**Cost,** `self-compile-cost bd6922f69 070073d22 --rounds 3`, on arm64
+macOS 26.7.1 with Apple clang 21.0.0, `-O0`. The fixed-input C is identical
+(`82852fffae471842`).
+
+| Measure | Base | Candidate | Change |
+| --- | ---: | ---: | ---: |
+| Fixed input, allocations | 13,161,848 | 13,161,868 | +0.0002% |
+| Fixed input, peak heap | 187,091,716 | 187,091,975 | +0.0001% |
+| Fixed input, instructions | 13,369,098,024 | 13,373,402,448 | +0.032% |
+| Own source, allocations | 13,161,848 | 13,313,945 | +1.16% |
+| Own source, peak heap | 187,091,715 | 190,306,457 | +1.72% |
+| Own source, instructions | 13,348,111,648 | 13,509,311,358 | +1.21% |
+
+The fixed-input instruction samples overlap: the base's three span
+13,365–13,390 M and the candidate's 13,362–13,378 M. The previous row,
+against `eb2edd2cc`, was +0.0082%.
+
+Three earlier versions missed the cost ceilings, and each fix is its own
+commit:
+- **+0.35% allocations.** Every line asked whether it started a block, and
+  the eager `and()` built two shifted parser states each time.
+- **+0.17% peak heap.** A second Span in the block's node grew every
+  statement by 16 bytes, since a statement List holds its elements inline.
+- **+0.02% allocations, +0.11% instructions.** Routing every declaration
+  through the task binder built an extra record and a tuple per binding.
+
+Against a compiler built from `bd6922f69`, every existing fixture under
+`test/test_compile/fixtures` compiles to the same C, or the same diagnostic:
+761 files, 627 of them programs. Only the landing's six block fixtures
+differ. The compiler's own source at `bd6922f69` compiles to the same C
+(`82852fffae471842`). The raw samples are in `build/landing2/`, ignored, in
+the landing's worktree.
+
 ### Spike K: the concurrency kernel
 
 **The question.** Can the Blorp kernel, with pure transitions through
@@ -1569,22 +1679,27 @@ compiled code.
      otherwise contend.
    - **Done** with no emit change, together with a test-and-test-and-set
      diagnostics lock: see "Landing 1b results".
-2. **`concurrent:` for pure tasks,** end to end, with no seed rotation (see
-   "What the compiler needs"):
+2. **`concurrent:` for pure tasks, the front end,** with no seed rotation
+   (see "What the compiler needs"):
    - `concurrent:` syntax and its checks, accepting only pure tasks for now.
      Until landing 4, an impure task is rejected with `concurrent tasks must
      be pure until the concurrency runtime lands`;
    - the designated `concurrency` module, loaded when a module uses the
-     block, and the only module that may declare `concurrency.*` labels;
-   - a private `join` native, with callable parameters and per-instance
-     trampolines;
+     block;
+   - its private `join` and `run`, written in Blorp, so a block's tasks run
+     one after the other;
    - the README section, grammar and fixtures.
 
-   `join` runs its two tasks one after the other here, so the compiler work
-   and the pool are reviewed apart.
+   **Landing 2a: the native `join`.** `join` becomes a native with callable
+   parameters and per-instance trampolines that call each task's lambda
+   directly. Own gives the task instances a native calls the borrowed ABI,
+   as it does for instances taken as callables, and verify checks each
+   task's callee against its slot. Only the concurrency module may declare
+   `concurrency.*` labels. It is built on landing 2b's pool, so no serial C
+   body lands.
 
-   **Landing 2b: the pool.** A work-stealing pool replaces the serial
-   `join`, with thread counts, stack sizes and guards. It is runtime C only.
+   **Landing 2b: the pool.** A work-stealing pool runs `join`'s tasks at
+   once, with thread counts, stack sizes and guards. It is runtime C only.
 3. **`parallel_map`:** native, specialized per callback, and splitting
    adaptively on the pool.
 
