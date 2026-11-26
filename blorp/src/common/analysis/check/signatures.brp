@@ -82,7 +82,8 @@ import:
             StringAppendIntBuiltin,
             StringPrintBuiltin,
             StringPrintErrorBuiltin,
-            StringToBytesBuiltin
+            StringToBytesBuiltin,
+            ConcurrencyJoinBuiltin
         )
     ../assemble: ParsedContents
     ../ids:
@@ -105,9 +106,10 @@ import:
             ElementRuntimeType,
             ListRuntimeType,
             StringListRuntimeType,
-            UInt8ListRuntimeType
+            UInt8ListRuntimeType,
+            TaskRuntimeType
         ),
-        RuntimeResult(ValueResult, OptionalResult, ResultResult, BooleanResult),
+        RuntimeResult(ValueResult, OptionalResult, ResultResult, BooleanResult, PairResult),
         ParsedRuntimeOperation methods
     ../namespace/namespace:
         Namespace,
@@ -147,7 +149,8 @@ import:
             IndependentImplementationParameters
         ),
         signature_error,
-        BuiltinError(BuiltinContractMismatch, BuiltinTailAnnotation, BuiltinLibraryOnly),
+        BuiltinError(BuiltinContractMismatch, BuiltinTailAnnotation, BuiltinRestricted),
+        RestrictedBuiltin(FilesystemHandle, ConcurrencyNative),
         builtin_error
     ./model:
         AcceptedTrait,
@@ -164,6 +167,7 @@ import:
             IntegerType,
             ListType,
             StringType,
+            TupleType,
             VoidType,
             NominalType
         ),
@@ -517,6 +521,7 @@ private pure func runtime_type_ref(value_type: builtins.RuntimeType[TypeRef]) ->
         ListRuntimeType(element): ListType(element)
         StringListRuntimeType: ListType(StringType)
         UInt8ListRuntimeType: ListType(IntegerType(UInt8Format))
+        TaskRuntimeType(result): CallableType(Pure, [], result)
 
 
 -- A List operation's real E is the element of the header's first parameter.
@@ -639,6 +644,19 @@ private pure func accepted_operation(
             Ok(builtins.StringPrintError)
         StringToBytesBuiltin:
             Ok(builtins.StringToBytes)
+        -- join[A, B] with no bounds: the block's calls pass a type argument per
+        -- task, left then right, and require nothing of them.
+        ConcurrencyJoinBuiltin:
+            match (site.signature.type_parameters, site.signature.requirements):
+                ([left, right], []):
+                    Ok(
+                        builtins.ConcurrencyJoin({
+                            left = ParameterType(left),
+                            right = ParameterType(right)
+                        })
+                    )
+                _:
+                    Err(builtin_error(site.span, BuiltinContractMismatch(parsed)))
 
 
 -- What validating one builtin body needs: its declaration and signature, and
@@ -669,6 +687,8 @@ private pure func runtime_result_type(result: RuntimeResult[VariantId, TypeRef])
             ])
         BooleanResult(boolean):
             NominalType(AggregateNominal(UnionAggregate(boolean.true_variant.variant_owner())), [])
+        PairResult(left, right):
+            TupleType([left, right])
 
 
 pure func validate_builtin_body(
@@ -684,7 +704,7 @@ pure func validate_builtin_body(
     signature = site.signature
 
     generic_header: Bool = match parsed:
-        ListRepeatBuiltin | ListLengthBuiltin | ListGetBuiltin | ListAppendBuiltin | ListSetBuiltin | ListConcatBuiltin:
+        ListRepeatBuiltin | ListLengthBuiltin | ListGetBuiltin | ListAppendBuiltin | ListSetBuiltin | ListConcatBuiltin | ConcurrencyJoinBuiltin:
             True
         _:
             signature.type_parameters.is_empty()
@@ -1056,6 +1076,21 @@ private pure func resolve_default_function(
     })
 
 
+-- The restriction on who may declare `operation`, if only some modules may.
+private pure func restricted_builtin(
+    operation: ParsedRuntimeOperation
+) -> Option[RestrictedBuiltin]:
+    match operation:
+        SystemBuiltin(FsOpenRead) | SystemBuiltin(FsNextLines) | SystemBuiltin(FsClose) | SystemBuiltin(FsReadChunk):
+            Some(FilesystemHandle)
+        SystemBuiltin(FsWriterBegin) | SystemBuiltin(FsWriterWriteAll) | SystemBuiltin(FsWriterFinish) | SystemBuiltin(FsWriterDiscard):
+            Some(FilesystemHandle)
+        ConcurrencyJoinBuiltin:
+            Some(ConcurrencyNative)
+        _:
+            None
+
+
 private pure func resolve_function(
     row: FunctionRow,
     parsed: ParsedContents,
@@ -1067,22 +1102,24 @@ private pure func resolve_function(
 ) -> Result[AcceptedSignature, CheckError]:
     label ?= row.function_label(parsed)
 
-    -- The loader's module role is the sole authority for raw native handles.
+    -- The loader's module role is the sole authority for restricted natives.
     -- Validate before dispatch so implementation and trait-default bodies have
     -- the same admission rule as free functions; no permission survives Check.
     _: Void ?= match row.declaration.body:
-        ParsedBuiltinBody(SystemBuiltin(operation), span):
-            match operation:
-                FsOpenRead | FsNextLines | FsClose | FsReadChunk | FsWriterBegin | FsWriterWriteAll | FsWriterFinish | FsWriterDiscard:
+        ParsedBuiltinBody(operation, span):
+            match operation.restricted_builtin():
+                None:
+                    Ok(void)
+                Some(restriction):
                     match parsed.modules.get(row.declaration.module.module_number()):
                         Some(module):
-                            match module.role:
-                                LibraryModule | ConcurrencyModule: Ok(void)
-                                _: Err(builtin_error(span, BuiltinLibraryOnly))
+                            match (restriction, module.role):
+                                (FilesystemHandle, LibraryModule) | (FilesystemHandle, ConcurrencyModule) | (ConcurrencyNative, ConcurrencyModule):
+                                    Ok(void)
+                                _:
+                                    Err(builtin_error(span, BuiltinRestricted(restriction)))
                         None:
                             Err(checker_invariant(span, InvalidResolvedFunction(row.id)))
-                _:
-                    Ok(void)
         _:
             Ok(void)
 

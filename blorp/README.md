@@ -959,8 +959,8 @@ func main() -> Int:
     0
 ```
 
-This prints `14 52`. Each line of a `concurrent:` block is a task. For now
-the tasks run one after another; a later landing runs them at once. A task is
+This prints `14 52`. Each line of a `concurrent:` block is a task, and the
+tasks may run at once on a pool of threads. A task is
 a binding (`name = value`, `name: T = value`, `var name = value`, a tuple or a
 variant destructuring), an expression, a loop or another block, which binds
 what its own tasks bind. The block has no value, so a last line that is an
@@ -996,7 +996,19 @@ task:
 A loop inside a task keeps its own `break` and `continue`. Check turns a block
 into calls of the library's private `join`, or `run` for one task, in
 `concurrency.brp`, which the compiler loads only for a program that uses a
-block.
+block. `join` is the native `concurrency.join`, which only that module may
+declare ("concurrency.join is private to the concurrency library").
+
+The pool starts at a program's first block of two or more tasks, and
+`BLORP_THREADS` sets how many threads it runs, the calling thread included:
+one per online processor when it is unset or empty, none beside the caller
+for `1`, and at most 64. Any other value stops the program before it runs any
+of its code, with `error: BLORP_THREADS must be a positive integer or unset`
+and status 1. A pool thread's stack is the main thread's size, so pure
+recursion that fits on the main thread fits in a task. A program's output and
+allocation counts are the same at every thread count: a task borrows what it
+captures from the code around the block, which holds it until every task has
+finished, so a task that updates a captured value always copies it.
 
 ### Generics and declaration bounds
 
@@ -1872,9 +1884,10 @@ The peak heap is the most bytes the program had requested and not yet
 released at any one time, counted at each allocation and resize. It leaves out
 the runtime's header and the allocator's rounding, which differ between
 platforms and C libraries, so it depends only on what the program allocates
-and repeats exactly from run to run. Plans set peak heap ceilings on it, not
-on the process's peak memory footprint, which varies by a few percent between
-runs.
+and repeats exactly from run to run for a program that runs no tasks at
+once; tasks on the pool allocate in an order that varies. Plans set peak heap
+ceilings on it, not on the process's peak memory footprint, which varies by a
+few percent between runs.
 
 ### Allocation sites
 

@@ -6,7 +6,7 @@ import:
     ../../analysis/namespace/builtins as builtins:
         integer_fits,
         RuntimeOperation,
-        RuntimeResult(ValueResult, OptionalResult, ResultResult, BooleanResult)
+        RuntimeResult(ValueResult, OptionalResult, ResultResult, BooleanResult, PairResult)
     ../../syntax/syntax:
         IntegerFormat(Int64Format, UInt8Format),
         Diagnostic,
@@ -67,7 +67,8 @@ import:
         ReturnTransfer(UnmanagedReturn, OwnedReturn),
         StoredPayload(UnmanagedPayload, OwnedPayload)
     ../specialize/specialize:
-        CallTarget(UserFunction, RuntimeFunction),
+        CallTarget(UserFunction, RuntimeFunction, JoinTasks),
+        TaskJoin,
         ConcretePatternPlace,
         ConcretePatternRoute(MatchRoot, UnionField, RecordField, ListElement),
         ConcreteRecord(InlineFields, ValueFields, CountedFields),
@@ -463,8 +464,10 @@ private pure func verify_borrow(
 
 
 -- The signature a call's target declares, after its types are shown to exist.
+-- A join's result is `value_type`, once it is shown to hold its tasks' results.
 private pure func call_signature(
     target: CallTarget,
+    value_type: TypeRef,
     span: Span,
     functions: List[OwnedFunction],
     unions: List[ConcreteUnion],
@@ -473,6 +476,8 @@ private pure func call_signature(
     match target:
         RuntimeFunction(operation):
             operation.verify_runtime_signature(span, unions, records)
+        JoinTasks(tasks):
+            tasks.join_signature(value_type, span, functions, records)
         UserFunction(id):
             match functions.get(id.function_number()):
                 Some(function):
@@ -484,13 +489,59 @@ private pure func call_signature(
                     Err(verification_error(span, "unknown called function"))
 
 
+-- A task's slot in a join: its trampoline lends it the job's environment, if
+-- it takes one, so it is pinned borrowed as an instance taken as a callable is.
+private pure func task_slot(
+    task: FunctionInstanceId,
+    functions: List[OwnedFunction],
+    span: Span
+) -> Result[OwnedFunction, Diagnostic]:
+    function ?= task.pinned_callable(functions, span)
+
+    if function.parameters.length() > 1:
+        Err(verification_error(span, "a joined task takes no argument but its environment"))
+    else:
+        Ok(function)
+
+
+-- The arguments are the tasks' environments, left first; the result is the
+-- pair of their results.
+private pure func join_signature(
+    tasks: TaskJoin,
+    value_type: TypeRef,
+    span: Span,
+    functions: List[OwnedFunction],
+    records: List[ConcreteRecord]
+) -> Result[FunctionSignature, Diagnostic]:
+    left ?= tasks.left.task_slot(functions, span)
+    right ?= tasks.right.task_slot(functions, span)
+
+    pair: Option[ConcreteRecord] = match value_type:
+        RecordType(id): records.get(id.record_number())
+        _: None
+
+    holds = match pair:
+        Some(layout): layout.record_fields() == [left.return_type, right.return_type]
+        None: False
+
+    if holds:
+        Ok({
+            parameters = left.parameters
+                .concat(right.parameters)
+                .map(parameter_type),
+            return_type = value_type
+        })
+    else:
+        Err(verification_error(span, "a join's result does not hold its tasks' results"))
+
+
 private pure func verify_runtime_signature(
     operation: RuntimeOperation[VariantInstanceId, TypeRef],
     span: Span,
     unions: List[ConcreteUnion],
     records: List[ConcreteRecord]
 ) -> Result[FunctionSignature, Diagnostic]:
-    contract = operation.runtime_signature()
+    contract ?= operation.runtime_signature(span)
 
     _ ?= contract.parameters.first_error(pure func(parameter: TypeRef) -> Result[Void, Diagnostic]:
         parameter.verify_type_membership(unions, records, span)
@@ -526,6 +577,9 @@ private pure func verify_runtime_signature(
                 span,
                 "runtime Bool constructors do not cover one result union"
             )
+        -- runtime_signature already refused the one operation with one.
+        PairResult(_, _):
+            Err(verification_error(span, "a join reached the runtime operations"))
 
     valid ?= validation
     result ?= contract.return_type.verify_type_membership(unions, records, span)
@@ -649,6 +703,9 @@ private pure func transferred_borrows(
                         Ok(arguments)
                 _:
                     Ok(arguments)
+        -- A join lends each environment to its task.
+        JoinTasks(_):
+            Ok(arguments)
         UserFunction(id):
             match functions.get(id.function_number()):
                 None:
@@ -1508,7 +1565,13 @@ private pure func operation_value(
                                         )
                                     )
         CallDefinition(target, arguments):
-            match target.call_signature(definition.span, functions, unions, records):
+            match target.call_signature(
+                definition.value_type,
+                definition.span,
+                functions,
+                unions,
+                records
+            ):
                 Ok(contract):
                     match target.transferred_borrows(arguments, functions, definition.span):
                         Err(error):

@@ -61,16 +61,18 @@ import:
             FloatMultiply,
             FloatDivide,
             FloatRemainder,
-            FloatToString
+            FloatToString,
+            ConcurrencyJoin
         ),
         RuntimeType(
             PrimitiveRuntimeType,
             ElementRuntimeType,
             ListRuntimeType,
             StringListRuntimeType,
-            UInt8ListRuntimeType
+            UInt8ListRuntimeType,
+            TaskRuntimeType
         ),
-        RuntimeResult(ValueResult, OptionalResult, ResultResult, BooleanResult)
+        RuntimeResult(ValueResult, OptionalResult, ResultResult, BooleanResult, PairResult)
     ../../syntax/source: FunctionLabel
     ../../syntax/syntax:
         IntegerFormat(Int64Format, UInt8Format),
@@ -253,9 +255,20 @@ record FunctionSignature {
 }
 
 
+-- A join of two tasks, each its lambda's instance, which the native's
+-- trampolines call directly with the environment borrowed. The call's
+-- arguments are the environment of each task whose instance takes one, left
+-- first; its value is the pair of the tasks' results.
+record TaskJoin {
+    left: FunctionInstanceId,
+    right: FunctionInstanceId
+}
+
+
 union CallTarget:
     UserFunction(FunctionInstanceId)
     RuntimeFunction(RuntimeOperation[VariantInstanceId, TypeRef])
+    JoinTasks(TaskJoin)
 
 
 record ConcreteCall {
@@ -280,25 +293,30 @@ pure func runtime_type_ref(value_type: builtins.RuntimeType[TypeRef]) -> TypeRef
         ListRuntimeType(element): ListType(element)
         StringListRuntimeType: ListType(StringType)
         UInt8ListRuntimeType: ListType(IntegerType(UInt8Format))
+        TaskRuntimeType(result): CallableType([], result)
 
 
+-- A pair result has no concrete type here: specialization turns the one
+-- operation with one, join, into a JoinTasks call.
 pure func runtime_signature(
-    operation: RuntimeOperation[VariantInstanceId, TypeRef]
-) -> FunctionSignature:
+    operation: RuntimeOperation[VariantInstanceId, TypeRef],
+    span: Span
+) -> Result[FunctionSignature, Diagnostic]:
     contract = operation.runtime_contract()
 
-    result = match contract.return_type:
-        ValueResult(value_type): value_type.runtime_type_ref()
-        OptionalResult(_, option): UnionType(option.some.variant_owner())
-        ResultResult(_, _, constructors): UnionType(constructors.ok.variant_owner())
-        BooleanResult(boolean): UnionType(boolean.true_variant.variant_owner())
+    result: TypeRef ?= match contract.return_type:
+        ValueResult(value_type): Ok(value_type.runtime_type_ref())
+        OptionalResult(_, option): Ok(UnionType(option.some.variant_owner()))
+        ResultResult(_, _, constructors): Ok(UnionType(constructors.ok.variant_owner()))
+        BooleanResult(boolean): Ok(UnionType(boolean.true_variant.variant_owner()))
+        PairResult(_, _): Err(internal_error(span, "a join reached the runtime operations"))
 
-    {
+    Ok({
         parameters = contract.parameters.map(
             pure func(parameter: builtins.RuntimeType[TypeRef]) -> TypeRef: parameter.runtime_type_ref()
         ),
         return_type = result
-    }
+    })
 
 
 record ConcreteRecordField {
@@ -3927,6 +3945,17 @@ private pure func prepare_call(
                         prepared,
                         call.span
                     )
+        model.RuntimeFunction(builtins.ConcurrencyJoin(_)):
+            var tasks: Result[PreparedInstances, Diagnostic] = Ok(prepared)
+
+            for operand in call.operands:
+                match operand:
+                    model.ValueOperand(_):
+                        void
+                    model.CallableOperand(_, choice, span):
+                        tasks = tasks.prepare_task(choice, request, checked, span)
+
+            tasks
         model.RuntimeFunction(_):
             Ok(prepared)
         model.ValueCall(_):
@@ -3952,6 +3981,32 @@ private pure func prepare_call(
                 has_type_parameters,
                 checked
             )
+
+
+-- `outcome` with the instance of the native task `choice` requested: a
+-- native's task is a callable parameter its declaration forwards, only join
+-- has any, and the instance is the static callable the key chose for it.
+private pure func prepare_task(
+    outcome: Result[PreparedInstances, Diagnostic],
+    choice: model.CallableChoice,
+    request: FunctionRequest,
+    checked: model.CheckedFunctions,
+    span: Span
+) -> Result[PreparedInstances, Diagnostic]:
+    prepared ?= outcome
+
+    parameter: model.CallableParameterId ?= match choice:
+        model.ForwardedCallable(forwarded): Ok(forwarded)
+        _: Err(internal_error(span, "a native's task is not its declaration's parameter"))
+
+    mode ?= request.key.callables.callable_mode(parameter, span)
+
+    task: KnownCallable ?= match mode:
+        StaticCallable(known): Ok(known)
+        RuntimeCallable(_): Err(internal_error(span, "a native's task is a runtime callable"))
+
+    key ?= task.body.runtime_key(task.arguments, checked, span)
+    prepared.request_instance(key, request.source, span)
 
 
 -- A static callable operand's instance request, made concrete at `span`.
@@ -4491,6 +4546,8 @@ private pure func translate_call(
                     context.keys
                         .runtime_instance(selected.body, selected.arguments, call.span)
                         .map(pure func(id): UserFunction(id))
+        model.RuntimeFunction(builtins.ConcurrencyJoin(_)):
+            context.joined_tasks(call)
         model.RuntimeFunction(operation):
             concrete_result: Result[RuntimeOperation[VariantInstanceId, TypeRef], Diagnostic] = match operation:
                 IntegerAdd(format):
@@ -4668,6 +4725,8 @@ private pure func translate_call(
                     match boolean.translate_boolean(result_type, context.unions, call.span):
                         Ok(translated): Ok(builtins.StringEquals(translated))
                         Err(error): Err(error)
+                ConcurrencyJoin(_):
+                    Err(internal_error(call.span, "a join's call names its task instances"))
 
             match concrete_result:
                 Ok(concrete): Ok(RuntimeFunction(concrete))
@@ -4788,6 +4847,34 @@ private pure func translate_call(
 
     target ?= target_result
     Ok({ target = target, span = call.span })
+
+
+-- A join call names the instances of its two tasks, as a call of a static
+-- callable parameter names its one.
+private pure func joined_tasks(
+    context: TranslationContext,
+    call: model.CheckedCall
+) -> Result[CallTarget, Diagnostic]:
+    tasks ?= call.operands.translated_list(
+        pure func(operand: model.CheckedCallOperand) -> Result[FunctionInstanceId, Diagnostic]:
+            match operand:
+                model.CallableOperand(_, model.ForwardedCallable(parameter), span):
+                    match context.callables.translated_callable(parameter, span):
+                        Ok(ErasedCallableBinding(known, _)) | Ok(CapturedCallableBinding(known, _, _)):
+                            context.keys.runtime_instance(known.body, known.arguments, span)
+                        Ok(_):
+                            Err(internal_error(span, "a native's task is a runtime callable"))
+                        Err(error):
+                            Err(error)
+                model.CallableOperand(_, _, span):
+                    Err(internal_error(span, "a native's task is not its declaration's parameter"))
+                model.ValueOperand(value):
+                    Err(internal_error(value.span, "a join takes only tasks"))
+    )
+
+    match tasks:
+        [left, right]: Ok(JoinTasks({ left = left, right = right }))
+        _: Err(internal_error(call.span, "a join takes two tasks"))
 
 
 private pure func concrete_union_owner(

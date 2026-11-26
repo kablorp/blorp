@@ -51,7 +51,8 @@ import:
             FloatMultiply,
             FloatDivide,
             FloatRemainder,
-            FloatToString
+            FloatToString,
+            ConcurrencyJoin
         ),
         SystemPayload(IntPayload, StringPayload, StringListPayload, UInt8ListPayload, VoidPayload),
         system_signature
@@ -101,6 +102,7 @@ import:
         StoredPayload(UnmanagedPayload, OwnedPayload),
         parameter_type
     ../runtime/float: FLOAT_PARSE_RUNTIME, FLOAT_RUNTIME, FLOAT_STRING_RUNTIME
+    ../runtime/join: JOIN_RUNTIME
     ../runtime/list:
         ListElementKey,
         ListUpdate(AppendUpdate, SetUpdate, ConcatUpdate, SuffixUpdate),
@@ -140,7 +142,9 @@ import:
         system_runtime,
         system_symbol
     ../specialize/specialize as specialized:
-        CallTarget(UserFunction, RuntimeFunction),
+        CallTarget(UserFunction, RuntimeFunction, JoinTasks),
+        FunctionInstanceId,
+        TaskJoin,
         ConcreteRecord(InlineFields, ValueFields, CountedFields),
         ConcretePatternPlace,
         ConcreteUnion(PlainCases, OwningCases, BoxedCases),
@@ -179,7 +183,8 @@ import:
             StatementOnlyValue,
             InvalidOperationShape,
             MissingAggregateLayout,
-            MissingInPlaceHelper
+            MissingInPlaceHelper,
+            MissingJoinedTask
         ),
         render
     ./float_literal: c_float_literal
@@ -242,6 +247,8 @@ private pure func append_owner_name(output: String, id: OwnerId) -> String:
 -- constructor publication, not the ordinary expression-callable symbol path.
 private pure func c_callable(target: CallTarget) -> Option[String]:
     match target:
+        JoinTasks(_):
+            None
         UserFunction(id):
             Some(
                 id
@@ -326,7 +333,7 @@ private pure func c_callable(target: CallTarget) -> Option[String]:
                 ListConcat(element):
                     Some(ConcatUpdate.list_update_name(element.list_element_key()))
                 -- append_operation writes a conversion as a C cast.
-                StringEquals(_) | IntegerEquals(_, _) | IntegerLessThan(_, _) | IntegerConvert(_, _) | FloatEquals(_) | FloatLessThan(_) | BytesToText(_) | StringByteSlice(_) | StringCodepointAt(_) | SystemCall(_, _):
+                StringEquals(_) | IntegerEquals(_, _) | IntegerLessThan(_, _) | IntegerConvert(_, _) | FloatEquals(_) | FloatLessThan(_) | BytesToText(_) | StringByteSlice(_) | StringCodepointAt(_) | SystemCall(_, _) | ConcurrencyJoin(_):
                     None
 
 
@@ -479,15 +486,19 @@ private pure func append_record_type_name(output: String, id: RecordInstanceId) 
 
 
 private pure func append_field_name(output: String, id: FieldInstanceId) -> String:
+    output.append_field_position_name(id.field_owner(), id.field_number())
+
+
+private pure func append_field_position_name(
+    output: String,
+    owner: RecordInstanceId,
+    position: Int
+) -> String:
     output
         .concat("blorp_rf_")
-        .append_int(
-            id
-                .field_owner()
-                .record_number()
-        )
+        .append_int(owner.record_number())
         .concat("_")
-        .append_int(id.field_number())
+        .append_int(position)
 
 
 private pure func append_record(
@@ -1764,6 +1775,189 @@ private pure func append_list_get(
     prefix.append_optional_value(id, option, "${scratch}_some", scratch, unions, span)
 
 
+-- A join's job, named by its two tasks' instances: its slots follow from
+-- their signatures alone, so one pair of tasks has one job.
+private pure func append_job_name(output: String, tasks: TaskJoin) -> String:
+    output
+        .concat("blorp_job_")
+        .append_int(tasks.left.function_number())
+        .concat("_")
+        .append_int(tasks.right.function_number())
+
+
+-- The trampoline blorp_join runs for the task at `position`, 0 for the left
+-- and 1 for the right, as in the pair: it calls the task's instance
+-- directly, lending it the job's environment slot `environment` when the task
+-- takes one, and stores the result unless it is Void.
+private pure func append_trampoline(
+    output: String,
+    job: String,
+    position: Int,
+    task: FunctionInstanceId,
+    function: OwnedFunction,
+    environment: Int
+) -> String:
+    takes_environment = function.parameters
+        .is_empty()
+        .not()
+
+    argument = if takes_environment:
+        "slots->environment_${environment}"
+    else:
+        ""
+
+    call = "${task.function_number().c_name()}(${argument})"
+    stores_result = function.return_type != VoidType
+
+    body = if stores_result:
+        "slots->result_${position}=${call};"
+    else:
+        "(void)${call};"
+
+    slots = if stores_result.or(takes_environment):
+        "struct ${job} *const slots=job;"
+    else:
+        "(void)job;"
+
+    "${output}static void ${job}_${position}(void *job){${slots}${body}}"
+
+
+-- A task's result slot in its job, which a Void result does not have.
+private pure func result_slot(
+    function: OwnedFunction,
+    position: Int,
+    unions: List[ConcreteUnion]
+) -> Result[List[String], Diagnostic]:
+    match function.return_type:
+        VoidType:
+            Ok([])
+        _:
+            ""
+                .append_type_name(function.return_type, unions, compiler_span())
+                .map(pure func(typed) -> List[String]: ["${typed} result_${position};"])
+
+
+-- The job a join's call fills and the trampolines blorp_join runs on it. It
+-- holds each environment the tasks take, numbered in the call's argument
+-- order, then each task's result but Void, since C has no Void member.
+private pure func append_job(
+    output: String,
+    tasks: TaskJoin,
+    functions: List[OwnedFunction],
+    unions: List[ConcreteUnion]
+) -> Result[String, Diagnostic]:
+    left ?= functions
+        .get(tasks.left.function_number())
+        .to_result(render(compiler_span(), MissingJoinedTask(tasks.left.function_number())))
+
+    right ?= functions
+        .get(tasks.right.function_number())
+        .to_result(render(compiler_span(), MissingJoinedTask(tasks.right.function_number())))
+
+    job = "".append_job_name(tasks)
+
+    environments ?= left.parameters
+        .concat(right.parameters)
+        .translated_list(pure func(parameter: own.OwnedParameter) -> Result[String, Diagnostic]:
+            "".append_type_name(parameter.parameter_type(), unions, compiler_span())
+        )
+
+    left_result ?= left.result_slot(0, unions)
+    right_result ?= right.result_slot(1, unions)
+    var members: List[String] = []
+
+    for typed in environments:
+        members = members.append("${typed} environment_${members.length()};")
+
+    members = members
+        .concat(left_result)
+        .concat(right_result)
+
+    slots = if members.is_empty():
+        "uint8_t unit;"
+    else:
+        members.join("")
+
+    Ok(
+        "${output}struct ${job}{${slots}};"
+            .append_trampoline(job, 0, tasks.left, left, 0)
+            .append_trampoline(job, 1, tasks.right, right, left.parameters.length())
+    )
+
+
+-- A join's call: the job holds the environments it lends, blorp_join runs
+-- both trampolines, and the pair takes the results they stored, moved, as
+-- ConstructRecordDefinition builds a record.
+private pure func append_task_join(
+    output: String,
+    id: ValueId,
+    value_type: TypeRef,
+    tasks: TaskJoin,
+    arguments: List[OwnedArgument],
+    unions: List[ConcreteUnion],
+    records: List[ConcreteRecord],
+    span: Span
+) -> Result[String, Diagnostic]:
+    owner: RecordInstanceId ?= match value_type:
+        RecordType(pair): Ok(pair)
+        _: Err(render(span, InvalidOperationShape(id)))
+
+    layout ?= records
+        .get(owner.record_number())
+        .to_result(render(span, MissingRecordLayout(owner)))
+
+    job = "".append_job_name(tasks)
+    scratch = "blorp_runtime_".append_int(id.value_number())
+    var lent: List[String] = []
+
+    for argument in arguments:
+        lent = lent.append(
+            ".environment_${lent.length()}=".append_local_name(argument.argument_value())
+        )
+
+    var stored: List[String] = []
+    var position = 0
+
+    for field in layout.record_fields():
+        if field != VoidType:
+            stored = stored.append(
+                "."
+                    .append_field_position_name(owner, position)
+                    .concat("=${scratch}.result_${position}")
+            )
+
+        position = position + 1
+
+    filled = if lent.is_empty():
+        "0"
+    else:
+        lent.join(",")
+
+    values = if stored.is_empty():
+        "0"
+    else:
+        stored.join(",")
+
+    pair = "(struct blorp_r_${owner.record_number()}){${values}}"
+
+    made = match layout:
+        CountedFields(_): "blorp_record_make_${owner.record_number()}(${pair})"
+        InlineFields(_) | ValueFields(_): "(${pair})"
+
+    declared ?= output
+        .concat("struct ${job} ${scratch}={${filled}};")
+        .concat("blorp_join(${job}_0,${job}_1,&${scratch});")
+        .append_local_declaration(value_type, InitializedLocal, unions, span)
+
+    Ok(
+        declared
+            .append_local_name(id)
+            .concat("=${made};(void)")
+            .append_local_name(id)
+            .concat(";")
+    )
+
+
 private pure func append_value(
     output: String,
     id: ValueId,
@@ -1776,6 +1970,8 @@ private pure func append_value(
     match operation:
         CallDefinition(target, arguments):
             match target:
+                JoinTasks(tasks):
+                    output.append_task_join(id, value_type, tasks, arguments, unions, records, span)
                 RuntimeFunction(StringParseInt(option)):
                     output.append_unary_option(
                         id,
@@ -3364,7 +3560,8 @@ private fixed record RuntimeRequirements {
     string_to_bytes: Bool,
     bytes_to_text: Bool,
     float_formatting: Bool,
-    float_parsing: Bool
+    float_parsing: Bool,
+    thread_pool: Bool
 }
 
 
@@ -3385,7 +3582,10 @@ private pure func runtime_requirements(inventory: ProgramInventory) -> RuntimeRe
         string_to_bytes = False,
         bytes_to_text = False,
         float_formatting = False,
-        float_parsing = False
+        float_parsing = False,
+        thread_pool = inventory.task_joins
+            .is_empty()
+            .not()
     }
 
     for value_type in inventory.types:
@@ -3428,7 +3628,8 @@ private pure func runtime_requirements(inventory: ProgramInventory) -> RuntimeRe
                 void
             IntegerToString(_) | IntegerEquals(_, _) | IntegerLessThan(_, _) | IntegerConvert(_, _) | FloatAdd | FloatSubtract | FloatMultiply | FloatDivide | FloatRemainder | StringLength | StringByteLength | StringCodepointLength | StringByteAtUInt8(_) | StringCodepointAt(_) | StringFromCodepoint(_):
                 void
-            FloatCopySign | FloatEquals(_) | FloatLessThan(_):
+            -- Specialization turns join into a JoinTasks call: see task_joins.
+            FloatCopySign | FloatEquals(_) | FloatLessThan(_) | ConcurrencyJoin(_):
                 void
             -- Shared system helpers name String storage even when the selected
             -- operation has only Int or byte-list parameters and results.
@@ -3611,7 +3812,9 @@ private record ProgramInventory {
     callable_types: List[TypeRef],
     runtime_calls: List[RuntimeOperation[VariantInstanceId, TypeRef]],
     list_updates: List[ListUpdateHelper],
-    callable_entries: List[OwnedDefinition]
+    callable_entries: List[OwnedDefinition],
+    -- Each pair of tasks a join runs, once, with one job and two trampolines.
+    task_joins: List[TaskJoin]
 }
 
 
@@ -3620,6 +3823,7 @@ private pure func program_inventory(program: OwnershipProgram) -> ProgramInvento
     var runtime_calls: List[RuntimeOperation[VariantInstanceId, TypeRef]] = []
     var list_updates: List[ListUpdateHelper] = []
     var callable_entries: List[OwnedDefinition] = []
+    var task_joins: List[TaskJoin] = []
 
     for layout in program.records:
         for field in layout.record_fields():
@@ -3680,7 +3884,14 @@ private pure func program_inventory(program: OwnershipProgram) -> ProgramInvento
                                         match runtime.call_list_update():
                                             Some(helper): list_updates = list_updates.append(helper)
                                             None: void
-                                    _:
+                                    JoinTasks(tasks):
+                                        if (
+                                            task_joins
+                                                .contains(tasks)
+                                                .not()
+                                        ):
+                                            task_joins = task_joins.append(tasks)
+                                    UserFunction(_):
                                         void
                             ListSuffixDefinition(_, _):
                                 match definition.value_type:
@@ -3717,7 +3928,8 @@ private pure func program_inventory(program: OwnershipProgram) -> ProgramInvento
         callable_types = callables,
         runtime_calls = runtime_calls,
         list_updates = list_updates,
-        callable_entries = callable_entries
+        callable_entries = callable_entries,
+        task_joins = task_joins
     }
 
 
@@ -4234,9 +4446,14 @@ pure func emit(program: VerifiedProgram) -> Result[String, Diagnostic]:
             )
         )
 
-    -- Every system operation's fragment needs POSIX.1-2008, with the XSI and
-    -- Darwin extensions, requested before any header.
-    var fragments: List[String] = if system.is_empty():
+    -- Every system operation's fragment, and the thread pool, needs
+    -- POSIX.1-2008, with the XSI and Darwin extensions, requested before any
+    -- header.
+    var fragments: List[String] = if (
+        system
+            .is_empty()
+            .and(requirements.thread_pool.not())
+    ):
         [MEMORY_RUNTIME, prelude]
     else:
         [PROCESS_POSIX_PRELUDE, MEMORY_RUNTIME, prelude]
@@ -4259,6 +4476,9 @@ pure func emit(program: VerifiedProgram) -> Result[String, Diagnostic]:
 
     if needs_allocation_headers:
         fragments = fragments.append("#include <stdlib.h>\n#include <stdatomic.h>\n")
+
+    if requirements.thread_pool:
+        fragments = fragments.append(JOIN_RUNTIME)
 
     if requirements.float_types:
         fragments = fragments.append(FLOAT_RUNTIME)
@@ -4335,6 +4555,14 @@ pure func emit(program: VerifiedProgram) -> Result[String, Diagnostic]:
             .is_some()
             .not()
     ):
+        for tasks in inventory.task_joins:
+            match "".append_job(tasks, checked.functions, checked.unions):
+                Ok(job):
+                    fragments = fragments.append(job)
+                Err(error):
+                    failure = Some(error)
+                    break
+
         for entry in inventory.callable_entries:
             match entry.append_callable_entry(checked):
                 Ok(adapter):
@@ -4383,11 +4611,19 @@ pure func emit(program: VerifiedProgram) -> Result[String, Diagnostic]:
                 .function_number()
                 .c_name()
 
+            -- A program that runs tasks rejects a bad BLORP_THREADS before any
+            -- of its own code runs, as the memory start does BLORP_LEAK_CHECK;
+            -- the pool's threads still start at the first join.
+            start = if requirements.thread_pool:
+                "blorp_memory_start();(void)blorp_join_requested_threads();"
+            else:
+                "blorp_memory_start();"
+
             wrapper = match checked.entrypoint:
                 NoArguments(_, IntegerExitStatus):
-                    "${output}int main(void){blorp_memory_start();return blorp_program_finish((int)${name}());}\n"
+                    "${output}int main(void){${start}return blorp_program_finish((int)${name}());}\n"
                 NoArguments(_, SuccessfulExit):
-                    "${output}int main(void){blorp_memory_start();(void)${name}();return blorp_program_finish(0);}\n"
+                    "${output}int main(void){${start}(void)${name}();return blorp_program_finish(0);}\n"
                 WithArguments(_, result):
                     suffix = StringType
                         .list_element_key()
@@ -4395,7 +4631,7 @@ pure func emit(program: VerifiedProgram) -> Result[String, Diagnostic]:
 
                     prefix = output
                         .concat(
-                            "int main(int argc,char **argv){blorp_memory_start();struct blorp_l_${suffix} *const blorp_arguments=blorp_list_from_argv(argc,argv);"
+                            "int main(int argc,char **argv){${start}struct blorp_l_${suffix} *const blorp_arguments=blorp_list_from_argv(argc,argv);"
                         )
                         .concat(
                             "if(blorp_arguments==NULL){fputs(\"error: command-line argument is not valid UTF-8\\nhelp: pass UTF-8 encoded arguments\\n\",stderr);return blorp_program_finish(1);}"
