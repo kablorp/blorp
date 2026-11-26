@@ -511,17 +511,16 @@ case. Building, updating or returning such a record allocates nothing, and a
 copy acquires its one counted value. Any other record, and every record that
 contains itself (below), is a reference-counted heap object. Tuples follow
 the same rule. `fixed record` promises that a record holds only plain data and
-is checked: every field is `Int`, `Float`, a `fixed record`, a `fixed union` or
-an opaque type over one of these, and a fixed type takes no type parameters
-and never contains itself. Such a record is a struct by the same rule. An
-ordinary record is not accepted as a fixed field even when it happens to hold
-only plain data, so that editing it cannot break the promise.
+is checked: every field is `Int`, `Float`, a `fixed record` or a `fixed union`,
+and a fixed type takes no type parameters and never contains itself. Such a
+record is a struct by the same rule. An ordinary record is not accepted as a
+fixed field even when it happens to hold only plain data, so that editing it
+cannot break the promise.
 
 A record may contain itself: through a union, as
 `record Node { value: Int, next: Option[Node] }` does through `Option[Node]`,
-or through another record, a tuple or an opaque type. Such a record is a
-reference-counted heap object. A List element and a function are references,
-so `record Branch { value: Int, children: List[Branch] }` does not contain
+or through another record or a tuple. Such a record is a reference-counted
+heap object. A List element and a function are references, so `record Branch { value: Int, children: List[Branch] }` does not contain
 itself, and with one counted value, its List, it is a struct. Values never
 form cycles, so reference counting frees them. Releasing a value of any depth
 uses bounded C stack: up to 128 nested releases run directly, and deeper ones
@@ -606,19 +605,18 @@ unique and cannot replace a base type.
 `union Result[T, E]:` declares type parameters, and an application such as
 `Result[Box[Int], Int]` supplies all of them in order. A union of bare
 variants compiles to a C enum. A union with one variant and one payload is
-stored as that payload, with no tag and no wrapper, as an opaque type is:
-`union Meters: Init(Int)` is an `int64_t` in C. That holds when the payload
-never reaches the union again by any path, through type arguments (phantom
-ones included), records, opaque types, Lists and callables. The test is
-conservative: a rose tree, `union Tree: Node(List[Tree])`, could be stored as
+stored as that payload, with no tag and no wrapper: `union Meters: Init(Int)`
+is an `int64_t` in C. That holds when the payload never reaches the union
+again by any path, through type arguments (phantom ones included), records,
+Lists and callables. The test is conservative: a rose tree, `union Tree: Node(List[Tree])`, could be stored as
 its List but stays a tagged union. Any other union is a tagged C struct
 stored inline that owns only its active variant's payload.
 
 A union may contain itself: directly, as in `Succ(Nat)`, `Node(Tree, Int,
 Tree)` or a generic `Link(T, Chain[T])`; through other unions, as `Even` and
 `Odd` do through `EvenNext(Odd)` and `OddNext(Even)`, or `Node` does through
-`Next(Option[Node])`; or through a tuple, an opaque type or a record that does
-not contain itself, as `Tree` does through `Node(Box[Tree])` with
+`Next(Option[Node])`; or through a tuple or a record that does not contain
+itself, as `Tree` does through `Node(Box[Tree])` with
 `record Box[T] { value: T }`. A union that contains itself is stored on the
 heap: each value is one reference-counted node, and the union is passed as a
 pointer to it. Every other union is stored inline, so `Option[Node]` above is
@@ -665,34 +663,18 @@ cannot name a private variant to build it, match it or import it. Their
 example](test/test_compile/fixtures/variants/signup.brp); without one it is
 not exhaustive, and the diagnostic names no private variant.
 
-### Opaque and private types
+Opaque types (`opaque type`, `into_opaque` and `from_opaque`) are gone: a
+union with a private variant hides a representation instead, and `resource
+type` became `resource union`.
 
-```blorp
-opaque type UserId = Int
-pure func user_id(value: Int) -> UserId:
-    into_opaque UserId(value)
-pure func number(id: UserId) -> Int:
-    from_opaque UserId(id)
-func main() -> Int:
-    number(user_id(7))
-```
+### Resources and private declarations
 
-An opaque type is distinct from its underlying type during checking and has
-its layout at run time, with no wrapper. Only its declaring module may use
-`into_opaque` and `from_opaque`; other modules use the functions it exports,
-as in the [two-file example](test/test_compile/fixtures/opaque/int/main.brp). Opaque
-types may have type parameters, including phantom ones the underlying type
-does not mention (`id: Id[User] = into_opaque Id(7)`). Conversions take no
-written type arguments. An opaque type inherits no fields or methods, and one
-whose representation reaches itself is rejected.
+A `resource` is a value that is lent, never copied. Resources may be whole
+impure function or callable parameters and arguments; they cannot be local
+aliases, results, constants, aggregate children or explicit or inferred
+generic arguments.
 
-A `resource type` is a nongeneric opaque type with a resource-free underlying
-type. Its module alone may wrap and project values, using the same conversions.
-Resources may be whole impure function or callable parameters and arguments;
-they cannot be local aliases, results, constants, aggregate children, opaque
-representations or explicit or inferred generic arguments.
-
-A `resource union` is a resource too, and follows the same rules:
+A `resource union` declares one:
 
 ```blorp
 resource union Reader:
@@ -711,7 +693,8 @@ and a resource has no `==`. Its one payload is the handle, so it is stored as
 that payload.
 
 ```blorp
-resource type Reader = Int
+resource union Reader:
+    private Init(Int)
 
 func consume(reader: Reader) -> Void:
     void
@@ -738,7 +721,7 @@ owner must lend a valid value and close it correctly.
 The promise is on the declared parameter, not the general callable type.
 Saving `invoke` as an ordinary function value loses that promise, so an indirect
 call cannot pass a scoped closure. Trait requirements cannot declare scoped
-parameters. `private resource type` keeps the declaration inside its module.
+parameters.
 
 `private` before a declaration keeps it inside its module: it cannot be
 imported or reached through an alias. A public function, field or payload
@@ -960,15 +943,15 @@ arguments, then from a known expected result, and every parameter must be
 determined ("cannot infer the type parameter from the argument"). Each set of
 type arguments compiles to its own C function. A generic recursion that would
 need unboundedly many instances, by nesting a parameter inside a type
-application on each call, is rejected. The same holds for each record, union
-and opaque type, which compiles to one layout per set of type arguments: it
-may refer to itself, directly or through other types, with its parameters
-unchanged, permuted or replaced by concrete types, as in `Link(T, Chain[T])`,
-but `Nest(Nested[List[T]])` reports "recursive type grows its type arguments
+application on each call, is rejected. The same holds for each record and union,
+which compiles to one layout per set of type arguments: it may refer to
+itself, directly or through other types, with its parameters unchanged,
+permuted or replaced by concrete types, as in `Link(T, Chain[T])`, but
+`Nest(Nested[List[T]])` reports "recursive type grows its type arguments
 without bound".
 
 `[T: Orderable + Hashable]` bounds a parameter with traits joined by `+`. A
-record, union or opaque type may bound its parameters too, and the bound is
+record or union may bound its parameters too, and the bound is
 part of the type: every use of the type meets it under the bounds in scope.
 Nothing is implied, so each signature restates it:
 
@@ -1094,21 +1077,19 @@ type, so `[] == []` needs a typed binding.
 
 #### Automatic equality
 
-A record, union, opaque type or tuple supports `==` when every field, payload,
-representation or element does, with no declaration. A record or union with a
-tuple member qualifies the same way. Fields compare in declaration order and stop at the first
+A record, union or tuple supports `==` when every field, payload or element
+does, with no declaration. A record or union with a tuple member qualifies the
+same way. Fields compare in declaration order and stop at the first
 difference; union tags must agree before payloads compare. A written
 `Equatable` implementation replaces the automatic one for that type. A generic
 type's condition comes from its actual fields, so a phantom parameter needs no
 bound. An unused type with a field that is not Equatable is legal; using `==`
 on it is rejected at that field. Callables get no automatic equality.
 
-An opaque type's automatic `==` compares representations, under the type's
-declared bounds, so `Box[Plain]` is Equatable when `List[Plain]` is. A type
-whose distinct representations mean the same value (an unsorted List standing
-for a set, an unnormalized spelling) must write its own `Equatable`
-implementation, which replaces the automatic one. A resource type is never
-copied and gets none.
+A type whose distinct representations mean the same value (an unsorted List
+standing for a set, an unnormalized spelling) must write its own `Equatable`
+implementation, which replaces the automatic one. A resource is never copied
+and gets none.
 
 `Hashable: Equatable` requires `hash(value: Self) -> Int`, and equal values must
 hash equally, so implementing it needs an `Equatable` implementation, written or
@@ -1556,7 +1537,7 @@ While the program fails to load or check, these names come from its last
 analysis that checked, and a program that never checked offers nothing.
 Nothing is offered in a comment, a string, a number or an import block, after a
 word that declares a new name (`func`, `var`, `for`, `record`, `union`,
-`trait`, `type`, `opaque` or `as`), or past a place where the text stops
+`trait`, `type` or `as`), or past a place where the text stops
 lexing. Other places that declare a name, such as a parameter or a record's
 field, get the list anyway. A value's members and the locals at the cursor are
 not offered yet.
@@ -1673,7 +1654,7 @@ the output may already be new.
    node with its span; direct and UFCS calls stay distinct. It recognises
    contextual words such as `fixed` by the ids the name seed gives them.
    [`assemble.brp`](src/common/analysis/assemble.brp) seals the modules and name table
-   into an opaque `ParsedProgram`, issues declaration ids once (functions,
+   into a sealed `ParsedProgram`, issues declaration ids once (functions,
    records, unions and owner-qualified variants) and fixes the module
    dependency order, rejecting import cycles.
 3. **Load** ([`load`](src/common/analysis/load/load.brp)) reads the root, `_base.brp`, the

@@ -21,7 +21,6 @@ import:
     ../assemble: ParsedContents
     ../ids:
         DeclarationInventory,
-        OpaqueRow,
         RecordRow,
         UnionRow,
         FunctionId,
@@ -34,15 +33,14 @@ import:
         ImplRow,
         TraitId,
         RecordId,
-        UnionId,
-        OpaqueId
+        UnionId
     ../namespace/builtins: DesignatedBoolean
     ../namespace/namespace:
         Namespace,
         FunctionSource(DeclaredHere),
         NamedValue(NamedFunction),
         TraitReference,
-        TypeHead(PrimitiveHead, ListHead, RecordHead, UnionHead, OpaqueHead)
+        TypeHead(PrimitiveHead, ListHead, RecordHead, UnionHead)
     ./declarations:
         CheckedDeclarations,
         ResolvedType(ResolvedTypeTerm),
@@ -93,13 +91,12 @@ import:
         trait_error
     ./model:
         AggregateId(RecordAggregate, UnionAggregate),
-        NominalId(AggregateNominal, OpaqueNominal),
-        EqualityMember(EqualityField, EqualityPayload, EqualityRepresentation),
-        EqualityOwner(AggregateEquality, OpaqueEquality),
+        NominalId(AggregateNominal),
+        EqualityMember(EqualityField, EqualityPayload),
+        EqualityOwner(AggregateEquality),
         ImplementationHead(NamedHead, TupleHead),
         equality_head,
         equality_parameter_owner,
-        CheckedOpaque,
         CheckedRecord,
         CheckedUnion,
         AcceptedTraits,
@@ -118,13 +115,7 @@ import:
         AcceptedTraitMethod,
         AcceptedImplementation,
         ImplementedMethod,
-        ImplementedBody(
-            AuthoredMethod,
-            TraitDefault,
-            StructuralEquality,
-            RepresentationBody,
-            TupleEquality
-        ),
+        ImplementedBody(AuthoredMethod, TraitDefault, StructuralEquality, TupleEquality),
         TypeParameterId,
         LocatedTrait,
         TraitRequirement,
@@ -657,11 +648,6 @@ private pure func receiver_module(receiver: TypeHead, parsed: ParsedContents) ->
                 .inventory_unions()
                 .get(id.union_number())
                 .map(pure func(owner): owner.module)
-        OpaqueHead(id):
-            parsed.declarations
-                .inventory_opaques()
-                .get(id.opaque_number())
-                .map(pure func(owner): owner.declaration.module)
 
 
 private pure func accept_implementation(
@@ -982,8 +968,7 @@ private pure func declared_function(
 
 -- The prelude selects Dict through its ordinary binding, and a literal calls
 -- the functions Dict's own module declares, so no name in the literal's
--- scope can stand in. A prelude whose Dict is neither a union nor an opaque
--- type offers no literals.
+-- scope can stand in. A prelude whose Dict is not a union offers no literals.
 private pure func dict_literal_functions(
     parsed: ParsedContents,
     namespace: Namespace
@@ -995,11 +980,6 @@ private pure func dict_literal_functions(
             .named_type(parsed.foundation.prelude, words.dict_word)
             .map(pure func(named): named.head)
     ):
-        Some(OpaqueHead(id)):
-            parsed.declarations
-                .inventory_opaques()
-                .get(id.opaque_number())
-                .map(pure func(row): row.declaration.module)
         Some(UnionHead(id)):
             parsed.declarations
                 .inventory_unions()
@@ -1402,9 +1382,8 @@ private record EqualityUnavailable {
 
 
 -- `declarations` carries the written bounds that every application of a
--- record, union or opaque type proves. It is borrowed, not copied, and lives
--- here because proving those bounds is trait proof: body freezing, which
--- proves an `into_opaque` value's bounds, receives only this availability.
+-- record or union proves. It is borrowed, not copied, and lives
+-- here because proving those bounds is trait proof.
 private record AvailabilityContents {
     accepted: AcceptedTraits,
     unavailable: List[EqualityUnavailable],
@@ -1437,10 +1416,6 @@ pure func declared_requirements(
         AggregateNominal(UnionAggregate(id)):
             declarations.unions
                 .get(id.union_number())
-                .map(pure func(row): row.requirements)
-        OpaqueNominal(id):
-            declarations.opaques
-                .get(id.opaque_number())
                 .map(pure func(row): row.requirements)
 
 
@@ -1678,7 +1653,6 @@ private pure func summarize_members(
     candidate: EqualityCandidate,
     records: List[CheckedRecord],
     unions: List[CheckedUnion],
-    opaques: List[CheckedOpaque],
     possible: List[EqualityCandidate]
 ) -> Result[EqualitySummary, CheckError]:
     -- Atom order is first-established and never oscillates through recursive
@@ -1745,22 +1719,6 @@ private pure func summarize_members(
                                 .or(invalid.is_some())
                         ):
                             break
-                None:
-                    invalid = Some(checker_invariant(compiler_span(), InvalidFunctionContract))
-        OpaqueEquality(opaque_id):
-            match opaques.get(opaque_id.opaque_number()):
-                Some(row):
-                    match traits.summarize_goal(
-                        required,
-                        row.underlying_type.value_type,
-                        possible,
-                        candidate.owner,
-                        EqualityRepresentation(opaque_id),
-                        summary,
-                        row.underlying_type.span
-                    ):
-                        Ok(updated): summary = updated
-                        Err(error): invalid = Some(error)
                 None:
                     invalid = Some(checker_invariant(compiler_span(), InvalidFunctionContract))
 
@@ -1846,27 +1804,6 @@ private pure func complete_equality_availability(
             Err(error):
                 derivation_fault = Some(error)
 
-    for opaque_row in declarations.opaques:
-        written = parsed.declarations
-            .inventory_opaques()
-            .get(opaque_row.id.opaque_number())
-
-        derives = match written:
-            Some(row):
-                row.declaration.resource_type.not()
-            None:
-                derivation_fault = Some(checker_invariant(compiler_span(), InvalidFunctionContract))
-                False
-
-        if derives.and(
-            traits
-                .family_for(canonical, OpaqueHead(opaque_row.id))
-                .is_none()
-        ):
-            possible = possible.append(
-                equality_candidate(OpaqueEquality(opaque_row.id), opaque_row.requirements)
-            )
-
     _: Void ?= match derivation_fault:
         Some(error): Err(error)
         None: Ok(void)
@@ -1880,14 +1817,7 @@ private pure func complete_equality_availability(
         var retained: List[EqualityCandidate] = []
 
         for candidate in possible:
-            match traits.summarize_members(
-                canonical,
-                candidate,
-                records,
-                unions,
-                declarations.opaques,
-                possible
-            ):
+            match traits.summarize_members(canonical, candidate, records, unions, possible):
                 Ok(summary):
                     match summary.failure:
                         Some(failure):
@@ -1934,16 +1864,6 @@ private pure func complete_equality_availability(
                     boolean,
                     canonical
                 )
-            OpaqueEquality(opaque_id):
-                parsed.declarations
-                    .inventory_opaques()
-                    .representation_implementation(
-                        opaque_id,
-                        candidate.requirements,
-                        declarations.opaques,
-                        contract,
-                        canonical
-                    )
 
         match built:
             Ok(implementation):
@@ -2103,46 +2023,6 @@ private pure func inferred_bounds(
         parameter_bounds = parameter_bounds.append(bounds)
 
     parameter_bounds
-
-
--- An opaque type with no written implementation implements the trait by its
--- representation. Erasure makes the two one function, so no body is generated:
--- the row names the representation, and `method_body` selects its member.
-private pure func representation_implementation(
-    written: List[OpaqueRow],
-    id: OpaqueId,
-    requirements: List[TraitRequirement],
-    opaques: List[CheckedOpaque],
-    contract: AcceptedTrait,
-    canonical: TraitId
-) -> Result[AcceptedImplementation, CheckError]:
-    row ?= written
-        .get(id.opaque_number())
-        .or_checker_invariant(compiler_span(), InvalidFunctionContract)
-
-    span = row.declaration.type_name.span
-
-    declared ?= opaques
-        .get(id.opaque_number())
-        .or_checker_invariant(span, InvalidFunctionContract)
-
-    var methods: List[ImplementedMethod] = []
-
-    for method in contract.methods:
-        body: ImplementedBody = match method.default_body:
-            Some(function): TraitDefault(function)
-            None: RepresentationBody(id, declared.underlying_type.value_type)
-
-        methods = methods.append({ method = method.id, body = body })
-
-    Ok({
-        trait_id = canonical,
-        receiver_head = NamedHead(OpaqueHead(id)),
-        parameter_bounds = inferred_bounds(declared.type_parameters, requirements),
-        methods = methods,
-        method_provider = None,
-        span = span
-    })
 
 
 private pure func aggregate_name(

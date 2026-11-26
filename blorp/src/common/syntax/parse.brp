@@ -38,8 +38,6 @@ import:
             QualifiedApplication,
             VariantName,
             VariantApplication,
-            OpaqueWrap,
-            OpaqueUnwrap,
             ListExpression,
             TupleExpression,
             RangeExpression,
@@ -101,11 +99,8 @@ import:
             ImplementsKeyword,
             BuiltinKeyword,
             AsKeyword,
-            OpaqueKeyword,
             ResourceKeyword,
-            ScopedKeyword,
-            IntoOpaqueKeyword,
-            FromOpaqueKeyword
+            ScopedKeyword
         ),
         LexedProgram,
         ParsedBinding,
@@ -123,7 +118,6 @@ import:
         ParsedReceiverHead(ReceiverName, QualifiedReceiverName),
         ParsedFunctionGroup(FreeFunction, ImplementationGroup),
         ParsedMatchArm,
-        ParsedOpaque,
         ParsedField,
         ParsedParameter,
         ParsedPattern(
@@ -317,7 +311,6 @@ record ParsedModuleContents {
     traits: List[ParsedTrait],
     unions: List[ParsedUnion],
     records: List[ParsedRecord],
-    opaques: List[ParsedOpaque],
     constants: List[ParsedConstant],
     end: Span
 }
@@ -1824,10 +1817,6 @@ private pure func consume_base(start: ParserState, token: Token) -> Result[Parse
             )
         IdentifierToken(_, _):
             start.consume_name_or_call()
-        KeywordToken(IntoOpaqueKeyword):
-            start.consume_opaque_conversion(Wrapping)
-        KeywordToken(FromOpaqueKeyword):
-            start.consume_opaque_conversion(Unwrapping)
         KeywordToken(WhileKeyword):
             Err(statement_as_value(start, "`while` is a statement and has no value"))
         KeywordToken(ForKeyword):
@@ -1847,60 +1836,6 @@ private pure func consume_base(start: ParserState, token: Token) -> Result[Parse
             )
         _:
             Err(expected_syntax(start, "expected a return expression", EXPRESSION_HELP))
-
-
-private OPAQUE_CONVERSION_HELP: String = "write into_opaque Name(value) or from_opaque Name(value) with one value"
-
-
--- The two conversion keywords: into_opaque wraps, from_opaque unwraps.
-private fixed union OpaqueDirection:
-    Wrapping
-    Unwrapping
-
-
--- `state` is at the conversion keyword: `into_opaque Name(value)`.
-private pure func consume_opaque_conversion(
-    state: ParserState,
-    direction: OpaqueDirection
-) -> Result[ParsedBase, Diagnostic]:
-    keyword = state.parser_span()
-
-    name ?= state
-        .shifted(1)
-        .consume_used_name("expected an opaque type name")
-
-    -- Blorp has no explicit type arguments: the operand and the expected type supply them.
-    _: Void ?= if name.next.at_left_bracket():
-        Err(
-            expected_syntax(
-                name.next,
-                "opaque conversions take no type arguments",
-                "write into_opaque Name(value) or from_opaque Name(value); the value and the expected type supply the arguments"
-            )
-        )
-    else:
-        Ok(void)
-
-    opened ?= name.next.expect(
-        name.next.at_left_paren(),
-        "expected '(' after the opaque type name",
-        OPAQUE_CONVERSION_HELP
-    )
-
-    value ?= opened.consume_value()
-    closing = value.next.parser_span()
-
-    closed ?= value.next.expect(
-        value.next.at_right_paren(),
-        "expected ')' after the converted value",
-        OPAQUE_CONVERSION_HELP
-    )
-
-    base: ExpressionBase = match direction:
-        Wrapping: OpaqueWrap(name.name, value.body)
-        Unwrapping: OpaqueUnwrap(name.name, value.body)
-
-    Ok({ base = base, span = { keyword | end = closing.end }, next = closed })
 
 
 private record ParsedPostfix {
@@ -6948,7 +6883,6 @@ private union Declaration:
     TraitDeclaration(ParsedTrait)
     UnionDeclaration(ParsedUnion)
     RecordDeclaration(ParsedRecord)
-    OpaqueDeclaration(ParsedOpaque)
     ConstantDeclaration(ParsedConstant)
 
 
@@ -6998,78 +6932,6 @@ private pure func consume_constant(
         },
         next = value.next
     })
-
-
-private record ParsedOpaqueResult {
-    declaration: ParsedOpaque,
-    next: ParserState
-}
-
-
--- Opaque and resource declarations share nominal identity and conversions.
-private pure func consume_opaque(
-    start: ParserState,
-    declaration_start: Span,
-    module: ModuleId,
-    visibility: Visibility
-) -> Result[ParsedOpaqueResult, Diagnostic]:
-    resource_type = start.at_keyword(ResourceKeyword)
-
-    kind = if resource_type:
-        "resource"
-    else:
-        "opaque"
-
-    -- `resource union` was read before this; another word gets both forms.
-    expected = if resource_type:
-        "expected 'type' or 'union' after 'resource'"
-    else:
-        "expected 'type' after 'opaque'"
-
-    help = if resource_type:
-        "write resource type Name = Underlying or resource union Name: private Init(Underlying)"
-    else:
-        OPAQUE_DECLARATION_HELP
-
-    after_opaque = start.shifted(1)
-
-    type_word: ParserState ?= if after_opaque.at_type_keyword():
-        Ok(after_opaque.shifted(1))
-    else:
-        Err(expected_syntax(after_opaque, expected, help))
-
-    name_message = if resource_type:
-        "expected a resource type name"
-    else:
-        "expected an opaque type name"
-
-    name ?= type_word.consume_declared_name(DeclaredType, name_message)
-    type_parameters ?= name.next.consume_type_parameters()
-
-    equals ?= type_parameters.next.expect(
-        type_parameters.next.at_equals(),
-        "expected '=' after the ${kind} type name",
-        help
-    )
-
-    underlying ?= equals.consume_type("expected the underlying type after '='")
-    next ?= underlying.next.end_value_line()
-
-    Ok({
-        declaration = {
-            start = declaration_start,
-            module = module,
-            visibility = visibility,
-            type_name = name.name,
-            type_parameters = type_parameters.parameters,
-            underlying = underlying.written,
-            resource_type = resource_type
-        },
-        next = next
-    })
-
-
-private OPAQUE_DECLARATION_HELP: String = "write opaque type Name = Underlying, or opaque type Name[T] = Underlying"
 
 
 private record DeclarationResult {
@@ -7220,7 +7082,7 @@ private pure func consume_visible_declaration(
                 Err(error)
     else:
         -- A union header is read once; `fixed union` and `resource union` win
-        -- over the `fixed` error and the opaque and resource types below it.
+        -- over the `fixed` and `resource` errors below it.
         match state.union_header():
             Some(kind):
                 match state.consume_union(declaration_start, module, visibility, kind):
@@ -7235,23 +7097,21 @@ private pure func consume_visible_declaration(
                 state.consume_remaining_declaration(declaration_start, module, visibility)
 
 
--- An opaque or resource type, the `fixed` error, or else a function.
+-- The `resource` and `fixed` errors, or else a function.
 private pure func consume_remaining_declaration(
     state: ParserState,
     declaration_start: Span,
     module: ModuleId,
     visibility: Visibility
 ) -> Result[DeclarationResult, Diagnostic]:
-    if (
-        state
-            .at_keyword(OpaqueKeyword)
-            .or(state.at_keyword(ResourceKeyword))
-    ):
-        match state.consume_opaque(declaration_start, module, visibility):
-            Ok(parsed):
-                Ok({ declaration = OpaqueDeclaration(parsed.declaration), next = parsed.next })
-            Err(error):
-                Err(error)
+    if state.at_keyword(ResourceKeyword):
+        Err(
+            expected_syntax(
+                state.shifted(1),
+                "expected 'union' after 'resource'",
+                "write resource union Name: private Init(Underlying)"
+            )
+        )
     else if state.at_word(state.recognized_words().fixed_word):
         Err(
             expected_syntax(
@@ -7288,7 +7148,6 @@ pure func parse_module(input: LexedProgram, module: ModuleId) -> Result[ParsedMo
     var traits: List[ParsedTrait] = []
     var unions: List[ParsedUnion] = []
     var records: List[ParsedRecord] = []
-    var opaques: List[ParsedOpaque] = []
     var constants: List[ParsedConstant] = []
     -- Whether a declaration other than an import block has been read.
     var declared: Bool = False
@@ -7329,9 +7188,6 @@ pure func parse_module(input: LexedProgram, module: ModuleId) -> Result[ParsedMo
                             RecordDeclaration(declaration):
                                 records = records.append(declaration)
                                 declared = True
-                            OpaqueDeclaration(declaration):
-                                opaques = opaques.append(declaration)
-                                declared = True
                             ConstantDeclaration(declaration):
                                 constants = constants.append(declaration)
                                 declared = True
@@ -7355,7 +7211,6 @@ pure func parse_module(input: LexedProgram, module: ModuleId) -> Result[ParsedMo
             traits = traits,
             unions = unions,
             records = records,
-            opaques = opaques,
             constants = constants,
             end = input.end
         })

@@ -46,10 +46,13 @@ done.
     and resource unions, +747 lines (2026-11-24). Landing 3, the rotation
     to `blorp-seed-aad181bcdc73`, so `src` and the library may use the new
     forms (2026-11-25). Landing 4, every opaque type in `src` and the
-    library migrated, +191 lines (2026-11-25).
-  - **Next:** landing 5, deleting the conversions. Waiting as follow-ups: the
-    deferred help and alias-destructuring fixes, memoized erasure, and the
-    cost follow-ups the plan lists.
+    library migrated, +191 lines (2026-11-25). Landings 5 and 6 together:
+    the opaque machinery is deleted, −1,439 lines (2026-11-25). The plan
+    stands at +150 production lines.
+  - **Next:** landing 7, destructuring unions that are not stored as their
+    payload, then the optional landing 8, collapsing `NominalId`. Waiting as
+    follow-ups: the deferred help and alias-destructuring fixes, memoized
+    erasure, and the cost follow-ups the plan lists.
 - **UInt8 and Bytes:** [`UINT8_BYTES_PLAN.md`](UINT8_BYTES_PLAN.md).
   - **Status:** U1 to U9 and B1 to B3 are decided. L0, the
     `IntegerType(Int64Format)` refactor, and L1, the compiler's `UInt8` with

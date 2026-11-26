@@ -1,8 +1,9 @@
 # Private variants plan
 
 **Status: in progress, 2026-11-25.** Keith approved the design and asked for
-this plan, then started it with landing 0. Landings 0 to 4 have landed;
-landing 5, deleting the conversions, is next. Landing 0 belongs to [`EQUALITY_PLAN.md`](EQUALITY_PLAN.md),
+this plan, then started it with landing 0. Landings 0 to 6 have landed, and
+opaque types are gone. Landing 7, destructuring the other single-variant
+unions, and the optional landing 8 remain. Landing 0 belongs to [`EQUALITY_PLAN.md`](EQUALITY_PLAN.md),
 which records its results.
 
 **The direction.** Keith chose it in discussion:
@@ -629,6 +630,36 @@ delete. The seed rotates once.
    The resource authority narrows from `NominalId` to unions. `resource type`
    goes with the production, so `resource union` must already be in use
    everywhere.
+
+   **Landings 5 and 6 land together.** On 2026-11-25 the coordinator combined
+   them, as two commits on one branch, conversions first. Once the
+   conversions go, an opaque type can be declared but never built or read.
+   Keeping that state for a landing of its own would cost a full gate,
+   review and CI round for no benefit, and Keith had asked for the work to
+   move faster. Their ceilings add: production −1,020 or fewer, tests 0 or
+   fewer.
+   - **Results.** They landed together on 2026-11-25 with −1,439 production
+     lines (−546 for the conversions, −893 for the declarations) and −2,361
+     test lines. The estimate was −1,395. The review found that the
+     deletion had taken some runtime coverage with it, so its round restored
+     it (+363 test lines) on unions:
+     - recursion through an erased generic union, including the million-deep
+       chain release;
+     - generic erased unions at two instantiations and through a generic
+       callback;
+     - the owner-only rejections for a resource union.
+     - **Cost.** The fixed-input C was identical. Instructions fell 0.37%,
+       allocations 0.07%, and peak heap was unchanged.
+     - **Resources.** The resource authority answers only for unions.
+       `resource` stays a keyword, so `resource type X = Int` is rejected
+       with "expected 'union' after 'resource'".
+     - **Ordinary names.** `opaque`, `into_opaque` and `from_opaque` are
+       ordinary names, with a test.
+     - **Tests.** The tests of the deleted machinery went. The loan rules,
+       recursion, erasure and equality tests were ported to `resource union`
+       and private-variant unions.
+     - **For landing 8.** `NominalId` and `EqualityOwner` are left with one
+       case each.
 7. **Landing 7: destructuring of the other single-variant unions** (decision 2). This
    covers multi-payload unions, and single-payload unions that cannot be
    erased. own models a standalone payload read the way it models a
@@ -684,10 +715,10 @@ Upper bounds, measured with `blorp/scripts/self-compile-cost PARENT CANDIDATE
 
 **The stack.** Landings 1 to 7 no longer promise to shrink the compiler or
 to leave it the same size: Keith dropped the promise of 0 or fewer on
-2026-11-24, when he accepted landing 2 at about +680. After landing 4 the
-estimate is about +300: landing 1's +651, landing 2's +747, landing 4's
-+191, landing 7 at +110 by its estimate, and landings 5 and 6 removing about
-−1,395 if landing 6 reaches its −915. Additions have run 1.5 to 2.6 times their
+2026-11-24, when he accepted landing 2 at about +680. After landing 6 the
+plan stands at +150 production lines: landing 1's +651, landing 2's +747,
+landing 4's +191, and landings 5 and 6's −1,439. Landing 7 adds about +110 by
+its estimate. Additions have run 1.5 to 2.6 times their
 estimates, and the deferred fixes below count against it.
 The estimates predate main's body spacing rule, which lengthens the code
 landings 5 and 6 delete as well as the code the others add, so landing 5
@@ -912,11 +943,13 @@ The gates follow `blorp/AGENTS.md` ("Which gates a change runs"):
   - the own-source C differs only in the equality functions each commit
     lists, under a diff that ignores `blorp_f_N`;
   - the ceilings hold, and the gates pass.
-- [ ] **Landing 5:**
+- [x] **Landing 5:**
   - `grep -rn -E 'into_opaque|from_opaque|OpaqueWrap|OpaqueUnwrap|ConstructOpaque|ProjectOpaque'
-    blorp/src blorp/test` finds nothing;
+    blorp/src blorp/test` finds nothing, apart from the test in
+    `test_lex/test_keywords.brp` that spells the three words to prove they
+    are ordinary names;
   - the ceilings hold, and the gates pass.
-- [ ] **Landing 6:**
+- [x] **Landing 6:**
   - `grep -rn -i opaque blorp/src blorp/standard_library blorp/grammar.ebnf`
     finds nothing;
   - the README keeps one line saying that opaque types are gone;

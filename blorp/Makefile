@@ -113,7 +113,6 @@ test:
 FORMAT_ROOTS := blorp/scripts blorp/src blorp/standard_library blorp/test
 FORMAT_EXCLUDED := \
 	blorp/test/test_format/fixtures \
-	blorp/test/test_compile/fixtures/opaque/generic/explicit_arguments.brp \
 	blorp/test/test_compile/fixtures/unsupported/propagation_if.brp \
 	blorp/test/test_compile/fixtures/unsupported/propagation_match.brp \
 	blorp/test/test_compile/fixtures/variants/alias_union_variant.brp \

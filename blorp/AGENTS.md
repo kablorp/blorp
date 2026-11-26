@@ -34,7 +34,7 @@ These govern design and review. A change that breaks one is incomplete.
    types. Transient facts may be discarded after validation. A change to a
    fact's representation names its producer, owner, lifetime and consumers.
 2. **Keep the model small, and do not encode the same fact twice.**
-   Use a variant or opaque identity when cases carry different data or when
+   Use a variant or an identity type when cases carry different data or when
    two fields could otherwise disagree. Two empty tags used only as a
    switch are usually a `Bool` whose field name is the concept. Prefer
    construction-time checks over parallel lists and optional fields with
@@ -63,7 +63,7 @@ These govern design and review. A change that breaks one is incomplete.
    rebuilding what a phase already published. Build locally, freeze once and
    borrow downstream. Add a table or cache only for a measured repeated
    query, with its complete key, lifetime and cost measured against the
-   simpler alternative. An opaque wrapper or record can still allocate;
+   simpler alternative. A wrapper union or record can still allocate;
    check generated C before spreading a carrier. Never special-case code
    to move a counter, and never distort a sound model to avoid an
    unmeasured host-compiler cost.

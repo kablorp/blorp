@@ -17,14 +17,14 @@ import:
         Visibility(Public, Private),
         WrittenName
     ../../utils/stack: push_at
-    ../ids: TraitId, TraitMethodId, ConstantId, FunctionId, OpaqueId, RecordId, UnionId, VariantId
+    ../ids: TraitId, TraitMethodId, ConstantId, FunctionId, RecordId, UnionId, VariantId
     ../namespace/builtins:
         integer_primitive,
         PrimitiveType(BuiltinInt, BuiltinUInt8, BuiltinFloat, BuiltinString, BuiltinVoid),
         RuntimeOperation,
         DesignatedBoolean,
         DesignatedOption
-    ../namespace/namespace: TypeHead(ListHead, PrimitiveHead, RecordHead, UnionHead, OpaqueHead)
+    ../namespace/namespace: TypeHead(ListHead, PrimitiveHead, RecordHead, UnionHead)
 
 
 -- Check admission owns these complete per-module lookups until body checking
@@ -73,8 +73,8 @@ record CheckedRecord {
     requirements: List[TraitRequirement],
     fields: List[CheckedField],
     -- Whether the declaration's fields, followed at its own type parameters
-    -- through the records, unions, tuples and opaque types they store by
-    -- value, reach it again. Every instance of such a record is a counted
+    -- through the records, unions and tuples they store by value, reach it
+    -- again. Every instance of such a record is a counted
     -- cell; any other record is stored by value when that is cheaper.
     contains_itself: Bool
 }
@@ -85,7 +85,6 @@ fixed union TypeParameterOwner:
     FunctionDeclaration(FunctionId)
     UnionDeclaration(UnionId)
     RecordDeclaration(RecordId)
-    OpaqueDeclaration(OpaqueId)
     -- The elements of every tuple of this arity: one structural template.
     TupleDeclaration(Int)
 
@@ -108,7 +107,7 @@ union TypeRef:
     StringType
     ListType(TypeRef)
     TupleType(List[TypeRef])
-    -- A record, union or opaque type applied to its type arguments, which
+    -- A record or union applied to its type arguments, which
     -- match the declaration's arity; a nongeneric declaration has none.
     NominalType(NominalId, List[TypeRef])
     ParameterType(TypeParameterId)
@@ -234,7 +233,7 @@ record CheckedUnion {
 -- specialization reads. StoredAsPayload: one variant with one payload that
 -- never reaches the union again by any path, so the union is that payload with
 -- no tag (rule 8). StoredOnHeap: the payloads, followed at the union's own type
--- parameters through the unions, tuples, opaque types and records that do not
+-- parameters through the unions, tuples and records that do not
 -- contain themselves they store by value, reach it again, so every instance
 -- is a counted heap node. StoredByValue: any other union, a tagged value.
 fixed union UnionStorage:
@@ -260,15 +259,6 @@ pure func visible_variants(declaration: CheckedUnion, module: ModuleId) -> List[
         declaration.variants.filter(pure func(variant): variant.visibility == Public)
     else:
         declaration.variants
-
-
-record CheckedOpaque {
-    id: OpaqueId,
-    type_parameters: List[TypeParameterId],
-    -- The written bounds on the type parameters; every application proves them.
-    requirements: List[TraitRequirement],
-    underlying_type: TypeUse
-}
 
 
 record TypeUse {
@@ -379,9 +369,6 @@ union ImplementedBody:
     AuthoredMethod(FunctionId)
     TraitDefault(FunctionId)
     StructuralEquality(AggregateId, CheckedEqualityBody)
-    -- An opaque type's derived member is its representation's, written over the
-    -- opaque declaration's own parameters; erasure makes them one function.
-    RepresentationBody(OpaqueId, TypeRef)
     -- Every tuple of an arity compares its elements in order.
     TupleEquality(Int, TupleEqualityRecipe)
 
@@ -389,26 +376,22 @@ union ImplementedBody:
 fixed union EqualityMember:
     EqualityField(FieldId)
     EqualityPayload(VariantId, Int)
-    EqualityRepresentation(OpaqueId)
 
 
 -- The declaration whose equality is derived from its parts: an aggregate's
--- fields or payloads, or an opaque type's representation.
+-- fields or payloads.
 fixed union EqualityOwner:
     AggregateEquality(AggregateId)
-    OpaqueEquality(OpaqueId)
 
 
 pure func equality_head(owner: EqualityOwner) -> TypeHead:
     match owner:
         AggregateEquality(aggregate): aggregate.aggregate_head()
-        OpaqueEquality(id): OpaqueHead(id)
 
 
 pure func equality_parameter_owner(owner: EqualityOwner) -> TypeParameterOwner:
     match owner:
         AggregateEquality(aggregate): aggregate.aggregate_owner()
-        OpaqueEquality(id): OpaqueDeclaration(id)
 
 
 -- A record or union declaration: the head of a nominal type, and the owner of
@@ -418,12 +401,10 @@ fixed union AggregateId:
     UnionAggregate(UnionId)
 
 
--- The declaration a nominal type names. Only an aggregate has fields or
--- variants; an opaque type is distinct during checking and erased in
--- specialization.
+-- The declaration a nominal type names: an aggregate, which has fields or
+-- variants.
 fixed union NominalId:
     AggregateNominal(AggregateId)
-    OpaqueNominal(OpaqueId)
 
 
 -- One ordinary template, owned by its canonical equals member.
@@ -778,60 +759,36 @@ pure func method_body(
     call: AcceptedMethodCall
 ) -> Option[SelectedMethodBody]:
     var found: Option[SelectedMethodBody] = None
-    var receiver = call.method_receiver()
+    receiver = call.method_receiver()
     method = call.method_identity()
-    -- A derived opaque member continues at its representation, so this loops
-    -- rather than recurses: a recursive method_body is never inlined into its
-    -- many hot callers. Declarations are finite, so the chain ends.
-    var resolving: Bool = True
+    family = traits.family_for_receiver(method.trait_method_owner(), receiver)
 
-    while resolving:
-        resolving = False
-        family = traits.family_for_receiver(method.trait_method_owner(), receiver)
+    match family:
+        None:
+            void
+        Some(implementation):
+            for member in implementation.methods:
+                if member.method == method:
+                    match member.body:
+                        AuthoredMethod(function):
+                            found = Some({
+                                body = DeclaredBody(function),
+                                arguments = receiver.receiver_arguments()
+                            })
+                        TraitDefault(function):
+                            found = Some({ body = DeclaredBody(function), arguments = [receiver] })
+                        StructuralEquality(aggregate, _):
+                            found = Some({
+                                body = DerivedEqualityBody(aggregate),
+                                arguments = receiver.receiver_arguments()
+                            })
+                        TupleEquality(arity, _):
+                            found = Some({
+                                body = DerivedTupleEquality(arity),
+                                arguments = receiver.receiver_arguments()
+                            })
 
-        match family:
-            None:
-                void
-            Some(implementation):
-                for member in implementation.methods:
-                    if member.method == method:
-                        match member.body:
-                            AuthoredMethod(function):
-                                found = Some({
-                                    body = DeclaredBody(function),
-                                    arguments = receiver.receiver_arguments()
-                                })
-                            TraitDefault(function):
-                                found = Some({
-                                    body = DeclaredBody(function),
-                                    arguments = [receiver]
-                                })
-                            StructuralEquality(aggregate, _):
-                                found = Some({
-                                    body = DerivedEqualityBody(aggregate),
-                                    arguments = receiver.receiver_arguments()
-                                })
-                            TupleEquality(arity, _):
-                                found = Some({
-                                    body = DerivedTupleEquality(arity),
-                                    arguments = receiver.receiver_arguments()
-                                })
-                            RepresentationBody(opaque_id, representation):
-                                match representation.substitute_parameters(
-                                    OpaqueDeclaration(opaque_id),
-                                    receiver.receiver_arguments()
-                                ):
-                                    Ok(actual):
-                                        receiver = actual
-                                        resolving = True
-                                    -- Every use supplies the opaque type's own arguments, so
-                                    -- a missing one cannot happen; the None left in `found`
-                                    -- would reach specialize's "accepted method has no
-                                    -- implementation body" fault.
-                                    Err(_):
-                                        void
-
-                        break
+                    break
 
     found
 
@@ -1072,10 +1029,8 @@ union CheckedForm:
     ConstructRecord(RecordId, List[CheckedRecordField])
     ConstructList(List[CheckedExpr])
     ConstructTuple(List[CheckedExpr])
-    ConstructOpaque(OpaqueId, CheckedExpr)
-    ProjectOpaque(OpaqueId, CheckedExpr)
     -- The payload at this position of a union with one variant, read by a
-    -- destructuring (rule 7). It generalizes ProjectOpaque, which landing 5 removes.
+    -- destructuring (rule 7).
     ReadPayload(VariantId, CheckedExpr, Int)
     -- A value match, including an ordinary function's tail expression.
     Match(CheckedJoin)
@@ -1313,7 +1268,6 @@ record CheckedFunctions {
     traits: AcceptedTraits,
     records: List[CheckedRecord],
     unions: List[CheckedUnion],
-    opaques: List[CheckedOpaque],
     functions: List[CheckedFunction],
     lambdas: List[CheckedLambda],
     entrypoint: Entrypoint[FunctionId]
@@ -1340,7 +1294,6 @@ pure func type_head(value_type: TypeRef) -> Option[TypeHead]:
         StringType: Some(PrimitiveHead(BuiltinString))
         ListType(_): Some(ListHead)
         NominalType(AggregateNominal(aggregate), _): Some(aggregate.aggregate_head())
-        NominalType(OpaqueNominal(id), _): Some(OpaqueHead(id))
         ParameterType(_) | CallableType(_, _, _) | TupleType(_): None
 
 
@@ -1349,8 +1302,6 @@ pure func receiver_type(head: TypeHead, arguments: List[TypeRef]) -> Option[Type
     match head:
         PrimitiveHead(primitive):
             Some(primitive.primitive_ref())
-        OpaqueHead(owner):
-            Some(NominalType(OpaqueNominal(owner), arguments))
         RecordHead(owner):
             Some(NominalType(AggregateNominal(RecordAggregate(owner)), arguments))
         UnionHead(owner):
@@ -1402,10 +1353,6 @@ private pure func choice_expressions(choice: CallableChoice) -> List[CheckedExpr
 -- are children; each is a variable read, so visiting them finds no call.
 pure func child_expressions(form: CheckedForm) -> List[CheckedExpr]:
     match form:
-        ConstructOpaque(_, child):
-            [child]
-        ProjectOpaque(_, child):
-            [child]
         ReadPayload(_, child, _):
             [child]
         ReadTupleElement(child, _):

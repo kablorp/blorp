@@ -12,7 +12,7 @@ import:
         FieldId,
         LambdaId,
         TypeParameterId
-    ../../analysis/ids as declared: FunctionId, OpaqueId, RecordId, UnionId, VariantId
+    ../../analysis/ids as declared: FunctionId, RecordId, UnionId, VariantId
     ../../analysis/namespace/builtins as builtins:
         DesignatedBoolean,
         DesignatedOption,
@@ -920,7 +920,6 @@ private pure func translate_field(
 
 -- The prepared instance of a record declaration at these checked type arguments.
 private pure func concrete_record(
-    opaques: List[model.CheckedOpaque],
     declaration: RecordId,
     arguments: List[model.TypeRef],
     substitution: declarations.Substitution,
@@ -928,7 +927,7 @@ private pure func concrete_record(
     span: Span,
     records: SealedRecords
 ) -> Result[RecordInstanceId, Diagnostic]:
-    concrete ?= concrete_types(opaques, arguments, substitution, unions, span, records)
+    concrete ?= concrete_types(arguments, substitution, unions, span, records)
     key: RecordKey = { origin = DeclaredRecord(declaration), arguments = concrete }
 
     records.ids
@@ -939,7 +938,6 @@ private pure func concrete_record(
 -- A record construction's instance: the declaration its form names, at the type
 -- arguments of its checked type, which checking derived from that declaration.
 private pure func record_instance(
-    opaques: List[model.CheckedOpaque],
     declaration: RecordId,
     value: model.CheckedExpr,
     substitution: declarations.Substitution,
@@ -948,21 +946,12 @@ private pure func record_instance(
 ) -> Result[RecordInstanceId, Diagnostic]:
     match value.value_type:
         model.NominalType(model.AggregateNominal(model.RecordAggregate(_)), arguments):
-            concrete_record(
-                opaques,
-                declaration,
-                arguments,
-                substitution,
-                unions,
-                value.span,
-                records
-            )
+            concrete_record(declaration, arguments, substitution, unions, value.span, records)
         _:
             Err(internal_error(value.span, "record construction has a non-record type"))
 
 
 private pure func concrete_types(
-    opaques: List[model.CheckedOpaque],
     arguments: List[model.TypeRef],
     substitution: declarations.Substitution,
     unions: SealedUnions,
@@ -970,12 +959,11 @@ private pure func concrete_types(
     records: SealedRecords
 ) -> Result[List[TypeRef], Diagnostic]:
     arguments.translated_list(pure func(argument: model.TypeRef) -> Result[TypeRef, Diagnostic]:
-        concrete_type(opaques, argument, substitution, unions, span, records)
+        concrete_type(argument, substitution, unions, span, records)
     )
 
 
 private pure func concrete_type(
-    opaques: List[model.CheckedOpaque],
     value_type: model.TypeRef,
     substitution: declarations.Substitution,
     unions: SealedUnions,
@@ -983,26 +971,12 @@ private pure func concrete_type(
     records: SealedRecords
 ) -> Result[TypeRef, Diagnostic]:
     match value_type:
-        model.NominalType(model.OpaqueNominal(id), arguments):
-            match opaques.get(id.opaque_number()):
-                Some(declaration):
-                    opaques.concrete_erased_type(
-                        model.OpaqueDeclaration(id),
-                        declaration.underlying_type.value_type,
-                        arguments,
-                        substitution,
-                        unions,
-                        span,
-                        records
-                    )
-                None:
-                    Err(internal_error(span, "unknown opaque declaration"))
         model.CallableType(_, parameters, result):
-            match concrete_types(opaques, parameters, substitution, unions, span, records):
+            match concrete_types(parameters, substitution, unions, span, records):
                 Err(error):
                     Err(error)
                 Ok(inputs):
-                    match concrete_type(opaques, result, substitution, unions, span, records):
+                    match concrete_type(result, substitution, unions, span, records):
                         Err(error): Err(error)
                         Ok(output): Ok(CallableType(inputs, output))
         model.VoidType:
@@ -1014,13 +988,13 @@ private pure func concrete_type(
         model.StringType:
             Ok(StringType)
         model.TupleType(elements):
-            concrete_tuple_type(opaques, elements, substitution, unions, span, records)
+            concrete_tuple_type(elements, substitution, unions, span, records)
         model.ListType(element):
-            match concrete_type(opaques, element, substitution, unions, span, records):
+            match concrete_type(element, substitution, unions, span, records):
                 Ok(concrete): Ok(ListType(concrete))
                 Err(error): Err(error)
         model.NominalType(model.AggregateNominal(model.RecordAggregate(id)), arguments):
-            match concrete_record(opaques, id, arguments, substitution, unions, span, records):
+            match concrete_record(id, arguments, substitution, unions, span, records):
                 Ok(owner): Ok(RecordType(owner))
                 Err(error): Err(error)
         -- Erasure is decided before any argument is made concrete: an erased
@@ -1030,7 +1004,6 @@ private pure func concrete_type(
             match unions.erasure(id):
                 Some(Some(erased)):
                     concrete_erased_type(
-                        opaques,
                         erased.owner,
                         erased.body,
                         arguments,
@@ -1040,7 +1013,7 @@ private pure func concrete_type(
                         records
                     )
                 Some(None):
-                    match concrete_types(opaques, arguments, substitution, unions, span, records):
+                    match concrete_types(arguments, substitution, unions, span, records):
                         Ok(concrete_arguments):
                             match unions.ids.get({
                                 declaration = id,
@@ -1055,13 +1028,12 @@ private pure func concrete_type(
         model.ParameterType(id):
             match semantic_type(model.ParameterType(id), substitution, span):
                 Err(error): Err(error)
-                Ok(value): concrete_type(opaques, value, substitution, unions, span, records)
+                Ok(value): concrete_type(value, substitution, unions, span, records)
 
 
 -- A nominal type that specialization erases at the type level, so that lower,
--- own, verify and emit never see it: the type written in its declaration, an
--- opaque type's underlying type or the one payload of a union Check stored as
--- its payload (rule 8), under the declaration's type parameters.
+-- own, verify and emit never see it: the one payload of a union Check stored
+-- as its payload (rule 8), under the declaration's type parameters.
 private record ErasedDeclaration {
     owner: model.TypeParameterOwner,
     parameters: List[TypeParameterId],
@@ -1119,9 +1091,8 @@ private pure func erasure(unions: SealedUnions, id: UnionId) -> Option[Option[Er
 -- An erased declaration's body at `arguments`, which close in the enclosing
 -- substitution before the body expands in the declaration's own. The parts
 -- are passed apart: a record holding them would be allocated for every
--- opaque type the translation meets.
+-- erased union the translation meets.
 private pure func concrete_erased_type(
-    opaques: List[model.CheckedOpaque],
     owner: model.TypeParameterOwner,
     body: model.TypeRef,
     arguments: List[model.TypeRef],
@@ -1132,18 +1103,17 @@ private pure func concrete_erased_type(
 ) -> Result[TypeRef, Diagnostic]:
     closed ?= arguments.semantic_arguments(substitution, span)
 
-    concrete_type(opaques, body, { owner = owner, values = closed }, unions, span, records)
+    concrete_type(body, { owner = owner, values = closed }, unions, span, records)
 
 
 private pure func concrete_tuple_type(
-    opaques: List[model.CheckedOpaque],
     elements: List[model.TypeRef],
     substitution: declarations.Substitution,
     unions: SealedUnions,
     span: Span,
     records: SealedRecords
 ) -> Result[TypeRef, Diagnostic]:
-    arguments ?= concrete_types(opaques, elements, substitution, unions, span, records)
+    arguments ?= concrete_types(elements, substitution, unions, span, records)
     key: RecordKey = { origin = StructuralTuple, arguments = arguments }
 
     owner ?= records.ids
@@ -1298,7 +1268,7 @@ private pure func parameter_substitution[T](
 
 
 -- Keys retain ground semantic arguments. Layout projection cannot replace this
--- authority: same-storage opaque types may select different ordinary bodies.
+-- authority: same-storage types may select different ordinary bodies.
 private pure func function_substitution(
     function: SelectedBody,
     arguments: List[model.TypeRef],
@@ -2847,20 +2817,6 @@ private pure func prepare_type(
     in_progress: List[InProgressLayout]
 ) -> Result[PreparedType, Diagnostic]:
     match value:
-        model.NominalType(model.OpaqueNominal(id), arguments):
-            match checked.opaques.get(id.opaque_number()):
-                Some(declaration):
-                    declaration.prepare_opaque(
-                        arguments,
-                        substitution,
-                        checked,
-                        unions,
-                        span,
-                        records,
-                        in_progress
-                    )
-                None:
-                    Err(internal_error(span, "unknown opaque declaration"))
         model.CallableType(_, parameters, result):
             match parameters.prepare_arguments(
                 substitution,
@@ -2985,40 +2941,6 @@ private pure func prepare_type(
                     )
                 Err(error):
                     Err(error)
-
-
--- As for a record: prepare the arguments, then the underlying type under the
--- declaration's parameters bound to them.
-private pure func prepare_opaque(
-    declaration: model.CheckedOpaque,
-    arguments: List[model.TypeRef],
-    substitution: List[TypeSubstitution[PartialType]],
-    checked: model.CheckedFunctions,
-    unions: IndexedList[UnionSlot],
-    span: Span,
-    records: IndexedList[RecordSlot],
-    in_progress: List[InProgressLayout]
-) -> Result[PreparedType, Diagnostic]:
-    prepared ?= arguments.prepare_arguments(
-        substitution,
-        checked,
-        unions,
-        span,
-        records,
-        in_progress
-    )
-
-    prepare_erased_type(
-        model.OpaqueDeclaration(declaration.id),
-        declaration.type_parameters,
-        declaration.underlying_type.value_type,
-        prepared.arguments,
-        checked,
-        prepared.unions,
-        span,
-        prepared.records,
-        prepared.in_progress
-    )
 
 
 private pure func prepare_tuple_type(
@@ -3299,7 +3221,7 @@ private pure func append_node_types(
         model.ConstructRecord(_, fields):
             for field in fields:
                 types = types.append_value_types(field.value)
-        model.ConstructOpaque(_, child) | model.ProjectOpaque(_, child) | model.ReadPayload(_, child, _):
+        model.ReadPayload(_, child, _):
             types = types.append_value_types(child)
         model.ConstructTuple(elements):
             for element in elements:
@@ -3688,7 +3610,7 @@ private pure func prepare_callable_storage(
 
 
 -- Check has proved the obligation. Ground semantic Self before selecting the
--- ordinary body request; opaque receiver identity never comes from its layout.
+-- ordinary body request; a receiver's identity never comes from its layout.
 private pure func selected_method_body(
     method: AcceptedMethodCall,
     substitution: declarations.Substitution,
@@ -4407,7 +4329,6 @@ private record TranslationBindings {
 -- What every step of one function's translation reads. Built once per
 -- function instance; nothing below `translate_function` changes it.
 private record TranslationContext {
-    opaques: List[model.CheckedOpaque],
     substitution: declarations.Substitution,
     callables: TranslationBindings,
     keys: IndexedList[FunctionRequest],
@@ -4422,14 +4343,7 @@ private pure func translated_type(
     value_type: model.TypeRef,
     span: Span
 ) -> Result[TypeRef, Diagnostic]:
-    concrete_type(
-        context.opaques,
-        value_type,
-        context.substitution,
-        context.unions,
-        span,
-        context.records
-    )
+    concrete_type(value_type, context.substitution, context.unions, span, context.records)
 
 
 -- The concrete types of `arguments` under the function's substitution.
@@ -4438,14 +4352,7 @@ private pure func translated_types(
     arguments: List[model.TypeRef],
     span: Span
 ) -> Result[List[TypeRef], Diagnostic]:
-    concrete_types(
-        context.opaques,
-        arguments,
-        context.substitution,
-        context.unions,
-        span,
-        context.records
-    )
+    concrete_types(arguments, context.substitution, context.unions, span, context.records)
 
 
 private pure func translated_binding(
@@ -4531,7 +4438,6 @@ private pure func lambda_storage(
     id: LambdaId,
     capture_count: Int,
     arguments: List[model.TypeRef],
-    opaques: List[model.CheckedOpaque],
     substitution: declarations.Substitution,
     unions: SealedUnions,
     records: SealedRecords,
@@ -4540,7 +4446,7 @@ private pure func lambda_storage(
     if capture_count == 0:
         Ok(ErasedCallable)
     else:
-        match concrete_types(opaques, arguments, substitution, unions, span, records):
+        match concrete_types(arguments, substitution, unions, span, records):
             Err(error):
                 Err(error)
             Ok(physical):
@@ -4820,7 +4726,6 @@ private pure func translate_call(
                                             .lambda_storage(
                                                 captures.length(),
                                                 root_arguments,
-                                                context.opaques,
                                                 context.substitution,
                                                 context.unions,
                                                 context.records,
@@ -5194,11 +5099,6 @@ private pure func translate_expr(
             match context.translated_type(value.value_type, value.span):
                 Err(error): Err(error)
                 Ok(value_type): translate_callable_value(context, choice, value_type, value.span)
-        -- A value of an erased type is the value it wraps.
-        model.ConstructOpaque(_, child) | model.ProjectOpaque(_, child):
-            match translate_expr(context, child):
-                Ok(translated): Ok({ translated | span = value.span })
-                Err(error): Err(error)
         -- Until landing 7, check reads a payload only from a union stored as it.
         model.ReadPayload(variant, child, _):
             match context.unions.erasure(variant.variant_owner()):
@@ -5252,7 +5152,6 @@ private pure func translate_expr(
                 None: translate_invocation(context, value, call, None)
         model.UpdateRecord(declaration, update):
             match record_instance(
-                context.opaques,
                 declaration,
                 value,
                 context.substitution,
@@ -5349,7 +5248,6 @@ private pure func translate_expr(
             translate_tuple(context, value, elements)
         model.ConstructRecord(declaration, fields):
             match record_instance(
-                context.opaques,
                 declaration,
                 value,
                 context.substitution,
@@ -5562,7 +5460,6 @@ private pure func translate_capture_environment(
     match id.lambda_storage(
         captures.length(),
         context.substitution.values,
-        context.opaques,
         context.substitution,
         context.unions,
         context.records,
@@ -6282,7 +6179,6 @@ private record TranslatedParameters {
 
 
 private pure func translate_parameters(
-    opaques: List[model.CheckedOpaque],
     function: SelectedBody,
     key: InstanceKey,
     substitution: declarations.Substitution,
@@ -6304,7 +6200,6 @@ private pure func translate_parameters(
             match id.lambda_storage(
                 function.captures.length(),
                 key.arguments,
-                opaques,
                 substitution,
                 unions,
                 records,
@@ -6338,7 +6233,6 @@ private pure func translate_parameters(
                         failure = Some(error)
                     Ok(StaticCallable(known)):
                         match concrete_type(
-                            opaques,
                             written.value_type,
                             substitution,
                             unions,
@@ -6367,7 +6261,6 @@ private pure func translate_parameters(
                                         parameters = parameters.append(RecordType(owner))
                     Ok(RuntimeCallable(_)):
                         match concrete_type(
-                            opaques,
                             written.value_type,
                             substitution,
                             unions,
@@ -6390,7 +6283,6 @@ private pure func translate_parameters(
                                 parameters = parameters.append(value_type)
             _:
                 match concrete_type(
-                    opaques,
                     written.value_type,
                     substitution,
                     unions,
@@ -6469,7 +6361,6 @@ private pure func translate_match(
 
 
 private pure func translate_function(
-    opaques: List[model.CheckedOpaque],
     function: SelectedBody,
     key: InstanceKey,
     keys: IndexedList[FunctionRequest],
@@ -6480,12 +6371,11 @@ private pure func translate_function(
     span = function.return_type.span
     substitution ?= function.function_substitution(key.arguments, span)
 
-    runtime ?= translate_parameters(opaques, function, key, substitution, unions, records, traits)
+    runtime ?= translate_parameters(function, key, substitution, unions, records, traits)
     parameters = runtime.parameters
     bindings = runtime.bindings
 
     context: TranslationContext = {
-        opaques = opaques,
         substitution = substitution,
         callables = runtime.translation,
         keys = keys,
@@ -6568,7 +6458,6 @@ pure func specialize(program: CheckedProgram) -> Result[SpecializedProgram, Diag
                     Err(error)
                 Ok(function):
                     translate_function(
-                        checked.opaques,
                         function,
                         request.key,
                         prepared.functions,

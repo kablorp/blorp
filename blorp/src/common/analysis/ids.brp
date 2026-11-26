@@ -8,7 +8,6 @@ import:
         FunctionHeader,
         ParsedImplementationHeader,
         ParsedFunctionGroup(FreeFunction, ImplementationGroup),
-        ParsedOpaque,
         ParsedRecord,
         ParsedTypeParameter,
         ParsedUnion,
@@ -32,10 +31,6 @@ fixed union UnionId:
 
 
 fixed union RecordId:
-    private Init(Int)
-
-
-fixed union OpaqueId:
     private Init(Int)
 
 
@@ -103,10 +98,6 @@ private pure func record_id(position: Int) -> RecordId:
     RecordId.Init(position)
 
 
-private pure func opaque_id(position: Int) -> OpaqueId:
-    OpaqueId.Init(position)
-
-
 private pure func constant_id(position: Int) -> ConstantId:
     ConstantId.Init(position)
 
@@ -127,11 +118,6 @@ pure func union_number(id: UnionId) -> Int:
 
 pure func record_number(id: RecordId) -> Int:
     RecordId.Init(number) = id
-    number
-
-
-pure func opaque_number(id: OpaqueId) -> Int:
-    OpaqueId.Init(number) = id
     number
 
 
@@ -203,12 +189,6 @@ record RecordRow {
 }
 
 
-record OpaqueRow {
-    id: OpaqueId,
-    declaration: ParsedOpaque
-}
-
-
 record ConstantRow {
     id: ConstantId,
     declaration: ParsedConstant
@@ -246,7 +226,6 @@ private record DeclarationRows {
     -- Whether each union, by number, is a `resource union`: derived from its
     -- row's kind once, here, so that a resource check copies no row.
     resource_unions: List[Bool],
-    opaques: List[OpaqueRow],
     constants: List[ConstantRow]
 }
 
@@ -283,7 +262,6 @@ pure func issue_inventory(
     functions: List[ParsedFunctionGroup],
     records: List[ParsedRecord],
     unions: List[ParsedUnion],
-    opaques: List[ParsedOpaque],
     constants: List[ParsedConstant],
     traits: List[ParsedTrait]
 ) -> DeclarationInventory:
@@ -292,7 +270,6 @@ pure func issue_inventory(
     var impl_rows: List[ImplRow] = []
     var record_rows: List[RecordRow] = []
     var union_rows: List[UnionRow] = []
-    var opaque_rows: List[OpaqueRow] = []
     var constant_rows: List[ConstantRow] = []
     -- Both syntax lists follow module inventory order. Merge their cursors so a
     -- module's authored groups precede its defaults, including modules that have
@@ -445,12 +422,6 @@ pure func issue_inventory(
             kind = declaration.kind
         })
 
-    for declaration in opaques:
-        opaque_rows = opaque_rows.append({
-            id = opaque_id(opaque_rows.length()),
-            declaration = declaration
-        })
-
     for declaration in constants:
         constant_rows = constant_rows.append({
             id = constant_id(constant_rows.length()),
@@ -464,7 +435,6 @@ pure func issue_inventory(
         records = record_rows,
         unions = union_rows,
         resource_unions = union_rows.map(pure func(row): row.kind == ResourceUnion),
-        opaques = opaque_rows,
         constants = constant_rows
     })
 
@@ -507,11 +477,6 @@ pure func inventory_unions(inventory: DeclarationInventory) -> List[UnionRow]:
     contents.unions
 
 
-pure func inventory_opaques(inventory: DeclarationInventory) -> List[OpaqueRow]:
-    DeclarationInventory.Init(contents) = inventory
-    contents.opaques
-
-
 pure func inventory_constants(inventory: DeclarationInventory) -> List[ConstantRow]:
     DeclarationInventory.Init(contents) = inventory
     contents.constants
@@ -520,7 +485,6 @@ pure func inventory_constants(inventory: DeclarationInventory) -> List[ConstantR
 union NominalRow:
     UnionDeclarationRow(UnionRow)
     RecordDeclarationRow(RecordRow)
-    OpaqueDeclarationRow(OpaqueRow)
 
 
 private pure func declaration_precedes(
@@ -535,83 +499,31 @@ private pure func declaration_precedes(
         first_module.module_number() < second_module.module_number()
 
 
--- Source-order projection without a second declaration-order table. The three
--- counters are traversal positions, never identities. Read at most three rows.
+-- Source-order projection without a second declaration-order table. The two
+-- counters are traversal positions, never identities. Read at most two rows.
 pure func next_nominal(
     inventory: DeclarationInventory,
     records_seen: Int,
-    unions_seen: Int,
-    opaques_seen: Int
+    unions_seen: Int
 ) -> Option[NominalRow]:
     DeclarationInventory.Init(rows) = inventory
 
     match rows.records.get(records_seen):
         None:
             match rows.unions.get(unions_seen):
-                None:
-                    match rows.opaques.get(opaques_seen):
-                        None: None
-                        Some(row): Some(OpaqueDeclarationRow(row))
-                Some(union_row):
-                    match rows.opaques.get(opaques_seen):
-                        None:
-                            Some(UnionDeclarationRow(union_row))
-                        Some(opaque_row):
-                            if declaration_precedes(
-                                union_row.module,
-                                union_row.type_name.span.start,
-                                opaque_row.declaration.module,
-                                opaque_row.declaration.type_name.span.start
-                            ):
-                                Some(UnionDeclarationRow(union_row))
-                            else:
-                                Some(OpaqueDeclarationRow(opaque_row))
+                None: None
+                Some(union_row): Some(UnionDeclarationRow(union_row))
         Some(record_row):
             match rows.unions.get(unions_seen):
                 None:
-                    match rows.opaques.get(opaques_seen):
-                        None:
-                            Some(RecordDeclarationRow(record_row))
-                        Some(opaque_row):
-                            if declaration_precedes(
-                                record_row.declaration.module,
-                                record_row.declaration.type_name.span.start,
-                                opaque_row.declaration.module,
-                                opaque_row.declaration.type_name.span.start
-                            ):
-                                Some(RecordDeclarationRow(record_row))
-                            else:
-                                Some(OpaqueDeclarationRow(opaque_row))
+                    Some(RecordDeclarationRow(record_row))
                 Some(union_row):
-                    record_first = declaration_precedes(
+                    if declaration_precedes(
                         record_row.declaration.module,
                         record_row.declaration.type_name.span.start,
                         union_row.module,
                         union_row.type_name.span.start
-                    )
-
-                    match rows.opaques.get(opaques_seen):
-                        None:
-                            if record_first:
-                                Some(RecordDeclarationRow(record_row))
-                            else:
-                                Some(UnionDeclarationRow(union_row))
-                        Some(opaque_row):
-                            if record_first.and(
-                                declaration_precedes(
-                                    record_row.declaration.module,
-                                    record_row.declaration.type_name.span.start,
-                                    opaque_row.declaration.module,
-                                    opaque_row.declaration.type_name.span.start
-                                )
-                            ):
-                                Some(RecordDeclarationRow(record_row))
-                            else if declaration_precedes(
-                                union_row.module,
-                                union_row.type_name.span.start,
-                                opaque_row.declaration.module,
-                                opaque_row.declaration.type_name.span.start
-                            ):
-                                Some(UnionDeclarationRow(union_row))
-                            else:
-                                Some(OpaqueDeclarationRow(opaque_row))
+                    ):
+                        Some(RecordDeclarationRow(record_row))
+                    else:
+                        Some(UnionDeclarationRow(union_row))
