@@ -3,7 +3,9 @@ Checks function bodies: parameter scope, ordered statements, match arms
 and patterns, and the canonical Void tail.
 ---
 import:
+    bool: and, not
     list: repeat
+    ../../syntax/names: NameId
     ../../syntax/source: ModuleId, ModuleKind(UserModule)
     ../../syntax/syntax:
         IntegerFormat(Int64Format),
@@ -17,6 +19,7 @@ import:
         ParsedIf,
         ParsedWhile,
         ParsedFor,
+        ParsedConcurrentBlock,
         ParsedBinder(NamedBinder, DiscardBinder),
         ElseBranch(ElseIf, ElseBlock),
         ParsedMatch,
@@ -32,6 +35,7 @@ import:
             PatternChar
         ),
         PatternHead(BareHead, QualifiedHead),
+        statement_end,
         ParsedStatement(
             TupleBinding,
             VariantBinding,
@@ -41,13 +45,15 @@ import:
             WhileLoop,
             ForLoop,
             Break,
-            Continue
+            Continue,
+            ConcurrentBlock
         ),
         Span,
         ValueExpression,
         WrittenName,
         TypeSyntax,
-        ParsedVariantBinding
+        ParsedVariantBinding,
+        Purity(Pure)
     ../assemble: ParsedModuleRow
     ../ids: DeclarationInventory, FunctionId, TraitId, TraitMethodId, UnionId, VariantId
     ../namespace/builtins: DesignatedResult, DesignatedBoolean, DesignatedOption, RuntimeOperation
@@ -57,13 +63,18 @@ import:
     ./declarations: CheckedDeclarations, ResolvedType(ResolvedTypeTerm), occurrence_fields
     ./errors:
         CheckError,
+        CheckErrorKind(CallRejection, ValueRejection),
+        CallError(UnknownFunction),
+        ConcurrencyError(TaskRejection, UnboundTaskValue, ConcurrentBlockRequiresLibrary),
+        TaskRule(TaskSiblingBinding, TaskAssignment),
+        concurrency_error,
         RecursionError(
             CallableTailRecursionUnsupported,
             GenericTailRecursionUnsupported,
             PropagationTailRecursionUnsupported
         ),
         recursion_error,
-        ValueError(ExpressionTypeMismatch, MissingIfElse, IfBranchWithoutValue),
+        ValueError(ExpressionTypeMismatch, MissingIfElse, IfBranchWithoutValue, UnknownValue),
         value_error,
         CheckerInvariant(
             InvalidReceiverScope,
@@ -123,7 +134,13 @@ import:
         Option methods,
         UnsupportedForm(CharPattern, IfValue),
         unsupported_form
-    ./expressions: CheckedValueResult, ResolvedBody, check_value, synthesize_value
+    ./expressions:
+        CheckedValueResult,
+        ResolvedBody,
+        capture_operands,
+        check_value,
+        lambda_captures,
+        synthesize_value
     ./model:
         BodyOwner(DeclaredBody, LambdaBody, DerivedEqualityBody, DerivedTupleEquality),
         AcceptedMethodCall,
@@ -146,7 +163,13 @@ import:
         expression_callable_creations,
         AdmittedReceiverScope,
         CheckedLambda,
+        LambdaOrigin(BlockTask, BlockRest),
+        ScopedBindingId,
+        ConcurrentFunctions,
+        LambdaId,
         LambdaRow(CollectingLambda, CheckedLambdaRow),
+        lambda_id,
+        lambda_number,
         CheckedConstant,
         BindingDefinition,
         BindingId,
@@ -167,7 +190,8 @@ import:
             ReadBinding,
             ConstructVariant,
             ReadTupleElement,
-            ReadPayload
+            ReadPayload,
+            ConstructTuple
         ),
         CheckedCallOperand(ValueOperand, CallableOperand),
         CheckedFunction,
@@ -392,6 +416,10 @@ private union ValueExpectation:
     AbsentElseBranch(Span)
     -- An arm of a statement match, or of a match nested as one's value.
     StatementArm
+    -- A concurrent task that is an expression: Void as a statement is, and so
+    -- are its `if` branches and `match` arms, where a value would be the
+    -- task's, which the block, having no value, cannot keep.
+    TaskStatementValue
     -- A Void function's tail. The match there is Void; its arms keep their
     -- values' own types only until normalize_void_body discards them, after
     -- tail-recursion analysis has seen them at the tail. Like any tail arm,
@@ -525,6 +553,13 @@ private pure func resolve_value(
                                 context,
                                 block.lambdas
                             )
+                        TaskStatementValue:
+                            block.scope.statement_value(
+                                written,
+                                ConcurrentTaskValue,
+                                context,
+                                block.lambdas
+                            )
 
                     match value_result:
                         Ok(value):
@@ -546,6 +581,7 @@ private fixed union VoidPosition:
     ExpressionStatementValue
     StatementMatchArmValue
     IfThenWithoutElse(Span)
+    ConcurrentTaskValue
 
 
 private pure func statement_value(
@@ -567,6 +603,8 @@ private pure func statement_value(
                 statement_error(written.span, NonVoidMatchArm(value.value.value_type))
             IfThenWithoutElse(origin):
                 value_error(origin, MissingIfElse)
+            ConcurrentTaskValue:
+                concurrency_error(written.span, UnboundTaskValue)
 
         Err(rejection)
 
@@ -584,8 +622,10 @@ private pure func resolve_join(
     -- A statement match's arms, and those of matches nested as their values,
     -- are statement arms.
     arm_expectation: ValueExpectation = match expectation:
-        StatementValue | StatementArm | AbsentElseBranch(_): StatementArm
-        UntypedValue | ConditionValue(_) | CheckedAgainst(_, _) | VoidTail: expectation
+        StatementValue | StatementArm | AbsentElseBranch(_):
+            StatementArm
+        UntypedValue | ConditionValue(_) | CheckedAgainst(_, _) | VoidTail | TaskStatementValue:
+            expectation
 
     resolved ?= body.arms.resolve_join_arms(
         started.match_context,
@@ -609,11 +649,15 @@ private pure func resolve_join(
     )
 
     decided: Result[TypeRef, CheckError] = match resolved.expectation:
-        ConditionValue(expected): Ok(expected)
-        CheckedAgainst(expected, _): Ok(expected)
-        StatementValue | StatementArm | AbsentElseBranch(_) | VoidTail: Ok(VoidType)
+        ConditionValue(expected):
+            Ok(expected)
+        CheckedAgainst(expected, _):
+            Ok(expected)
+        StatementValue | StatementArm | AbsentElseBranch(_) | VoidTail | TaskStatementValue:
+            Ok(VoidType)
         -- Only a match without arms leaves its type undecided.
-        UntypedValue: Err(checker_invariant(body.keyword_span, JoinWithoutArms))
+        UntypedValue:
+            Err(checker_invariant(body.keyword_span, JoinWithoutArms))
 
     value_type ?= decided
 
@@ -665,7 +709,7 @@ private pure func resolve_join_arms(
                         None:
                             match progress.expectation:
                                 -- An arm of a statement match may end with a statement.
-                                StatementValue | StatementArm | AbsentElseBranch(_):
+                                StatementValue | StatementArm | AbsentElseBranch(_) | TaskStatementValue:
                                     Ok({
                                         value = {
                                             form = LiteralVoid,
@@ -685,7 +729,7 @@ private pure func resolve_join_arms(
                             expectation: ValueExpectation = match progress.expectation:
                                 UntypedValue:
                                     CheckedAgainst(value.value.value_type, FirstArmValue)
-                                ConditionValue(_) | CheckedAgainst(_, _) | StatementValue | StatementArm | AbsentElseBranch(_) | VoidTail:
+                                ConditionValue(_) | CheckedAgainst(_, _) | StatementValue | StatementArm | AbsentElseBranch(_) | VoidTail | TaskStatementValue:
                                     progress.expectation
 
                             written.resolve_join_arms(
@@ -946,6 +990,8 @@ private pure func resolve_statement(
             resolve_loop_control(BreakSourceLoop(span), span, block, context)
         Continue(span):
             resolve_loop_control(ContinueSourceLoop(span), span, block, context)
+        ConcurrentBlock(written):
+            written.resolve_concurrent_block(block, context)
         ExpressionStatement(expression):
             match block.resolve_value(expression, StatementValue, context):
                 Ok(resolved):
@@ -1020,7 +1066,7 @@ private pure func resolve_if_branch(
                     prefix.resolve_value(body, expectation, context)
                 None:
                     match expectation:
-                        AbsentElseBranch(_):
+                        AbsentElseBranch(_) | TaskStatementValue:
                             Ok({
                                 value = {
                                     form = LiteralVoid,
@@ -1101,10 +1147,14 @@ private pure func resolve_if(
                             })
 
     value_type = match expectation:
-        UntypedValue: selected.value.value_type
-        CheckedAgainst(expected, _): expected
-        ConditionValue(expected): expected
-        StatementValue | StatementArm | AbsentElseBranch(_) | VoidTail: VoidType
+        UntypedValue:
+            selected.value.value_type
+        CheckedAgainst(expected, _):
+            expected
+        ConditionValue(expected):
+            expected
+        StatementValue | StatementArm | AbsentElseBranch(_) | VoidTail | TaskStatementValue:
+            VoidType
 
     -- With no else, branches were checked without the receiving expectation.
     -- Validate its canonical Void result before publishing any join facts.
@@ -1660,6 +1710,552 @@ private pure func resolve_for(
     )
 
 
+-- An assignment of a binding from a body that does not own it: a lambda's
+-- capture, or a task's, which names the binding, var or immutable.
+private pure func captured_assignment_error(
+    context: ResolutionContext,
+    name: WrittenName,
+    binding: LocalBinding
+) -> CheckError:
+    if context.caller.concurrent_task:
+        concurrency_error(name.span, TaskRejection(TaskAssignment, name.id))
+    else:
+        statement_error(name.span, CapturedAssignment(binding.binding_site().binding))
+
+
+private pure func binder_names(binders: List[ParsedBinder]) -> List[NameId]:
+    var names: List[NameId] = []
+
+    for binder in binders:
+        match binder:
+            NamedBinder(name): names = names.append(name.id)
+            DiscardBinder(_): void
+
+    names
+
+
+-- The names tasks bind, which no other task of their block may use. A nested
+-- block's are its own tasks'.
+private pure func task_names(tasks: List[ParsedStatement]) -> List[NameId]:
+    var names: List[NameId] = []
+
+    for task in tasks:
+        bound: List[NameId] = match task:
+            BindingStatement(binding): [binding.name.id]
+            TupleBinding(binders, _, _): binders.binder_names()
+            VariantBinding(binding): binding.binders.binder_names()
+            ConcurrentBlock(block): block.tasks.task_names()
+            _: []
+
+        names = names.concat(bound)
+
+    names
+
+
+-- A name unknown in a task that another task of the block binds is that
+-- task's binding, which tasks running at once cannot share.
+private pure func as_sibling_error(
+    error: CheckError,
+    task: ParsedStatement,
+    siblings: List[NameId]
+) -> CheckError:
+    match error.kind:
+        ValueRejection(UnknownValue(name)) | CallRejection(UnknownFunction(name)):
+            own = [task].task_names()
+
+            if and(siblings.contains(name), not(own.contains(name))):
+                concurrency_error(error.span, TaskRejection(TaskSiblingBinding, name))
+            else:
+                error
+        _:
+            error
+
+
+-- A checked lambda of a block: what it returns, the values its environment
+-- captures in the body that creates it, and the rows and uses after it.
+private record TaskLambda {
+    id: LambdaId,
+    result: TypeRef,
+    environment: List[CheckedExpr],
+    lambdas: List[LambdaRow],
+    uses: List[NameUse],
+    span: Span
+}
+
+
+-- The row of a pure `() -> T` lambda `id` whose statements are `prefix`'s and
+-- which returns `value`, and the values that create it in `parent`.
+private pure func finished_lambda(
+    id: LambdaId,
+    parent: BodyOwner,
+    prefix: ResolvedStatements,
+    value: CheckedExpr,
+    origin: LambdaOrigin,
+    span: Span,
+    context: ResolutionContext
+) -> Result[TaskLambda, CheckError]:
+    result = value.value_type
+    captures ?= prefix.lambdas.lambda_captures(id, span)
+
+    resolved: ResolvedBody = {
+        bindings = prefix.bindings,
+        statements = prefix.statements,
+        body = CheckedValueBody(ReturnExpression(value)),
+        lambdas = prefix.lambdas,
+        uses = prefix.uses
+    }
+
+    body = if result == VoidType:
+        resolved.normalize_void_body()
+    else:
+        resolved
+
+    row: CheckedLambda = {
+        purity = Pure,
+        origin = origin,
+        root = context.root_function,
+        parameters = [],
+        return_type = { value_type = result, span = span },
+        bindings = body.bindings,
+        captures = captures,
+        statements = body.statements,
+        body = body.body
+    }
+
+    rows = body.lambdas.set(id.lambda_number(), CheckedLambdaRow(row))
+    environment ?= capture_operands(id, parent, rows, span)
+
+    Ok({
+        id = id,
+        result = result,
+        environment = environment,
+        lambdas = rows,
+        uses = body.uses,
+        span = span
+    })
+
+
+-- What every task of one block is checked with: the block's word, whose
+-- source its tasks share, and its end, which a rest's lambda spans to; the
+-- functions it calls; the scope before it; and the names its tasks bind.
+private record TaskSite {
+    keyword: Span,
+    end: Int,
+    functions: ConcurrentFunctions,
+    scope: List[ScopedValue],
+    siblings: List[NameId],
+    context: ResolutionContext
+}
+
+
+-- A lambda created in `parent` and the empty body it starts with, which sees
+-- the block's scope: every read of a binding there is a capture, so the
+-- closure rules hold in it.
+private pure func lambda_start(
+    lambdas: List[LambdaRow],
+    parent: BodyOwner,
+    site: TaskSite
+) -> ResolvedStatements:
+    {
+        lambdas = lambdas.append(CollectingLambda({ parent = parent, captures = [] })),
+        bindings = [],
+        scope = site.scope,
+        statements = [],
+        reassigned = [],
+        uses = []
+    }
+
+
+-- A task's statement, checked as any statement is, except that a value an
+-- expression task leaves is the task's, which the block cannot keep.
+private pure func task_statement(
+    task: ParsedStatement,
+    start: ResolvedStatements,
+    task_context: ResolutionContext
+) -> Result[ResolvedStatements, CheckError]:
+    match task:
+        ExpressionStatement(written):
+            start
+                .resolve_value(written, TaskStatementValue, task_context)
+                .map(
+                    pure func(resolved) -> ResolvedStatements: { start |
+                        lambdas = resolved.lambdas,
+                        bindings = resolved.bindings,
+                        statements = [DiscardExpression(resolved.value)],
+                        reassigned = resolved.reassigned,
+                        uses = resolved.uses
+                    }
+                )
+        _:
+            task.resolve_statement(start, task_context)
+
+
+private pure func scoped_identity(value: ScopedValue) -> ScopedBindingId:
+    match value:
+        DataLocal(local):
+            local.binding_site().binding
+        CallableLocal(callable):
+            callable
+                .callable_local()
+                .binding_site().binding
+
+
+-- The bindings a statement made, in order: it adds them at the head of its
+-- block's scope and keeps the rest, `before`. Only a parameter binds a
+-- callable, so each is data.
+private pure func made_bindings(
+    after: List[ScopedValue],
+    before: List[ScopedValue],
+    span: Span
+) -> Result[List[LocalBinding], CheckError]:
+    added = after.length() - before.length()
+    var made: List[LocalBinding] = []
+
+    var valid: Bool = (
+        after
+            .drop(added)
+            .map(scoped_identity)
+        == before.map(scoped_identity)
+    )
+
+    for value in after.take(added):
+        match value:
+            DataLocal(local): made = [local].concat(made)
+            CallableLocal(_): valid = False
+
+    if valid:
+        Ok(made)
+    else:
+        Err(checker_invariant(span, InvalidInferenceWorklist))
+
+
+-- What a task's lambda returns: nothing for a task that binds no name, its
+-- one binding's value, or a tuple of its bindings' values.
+private pure func task_value(made: List[LocalBinding], span: Span) -> CheckedExpr:
+    reads = made.map(
+        pure func(local) -> CheckedExpr: {
+            form = ReadBinding(local.local_binding_id()),
+            value_type = local.binding_definition().value_type,
+            span = span
+        }
+    )
+
+    match reads:
+        []:
+            { form = LiteralVoid, value_type = VoidType, span = span }
+        [only]:
+            only
+        _:
+            types = reads.map(pure func(read) -> TypeRef: read.value_type)
+            { form = ConstructTuple(reads), value_type = TupleType(types), span = span }
+
+
+-- A task's whole statement as the body of an unscoped pure `() -> T` lambda
+-- created in `parent`.
+private pure func task_lambda(
+    task: ParsedStatement,
+    parent: BodyOwner,
+    lambdas: List[LambdaRow],
+    site: TaskSite
+) -> Result[JoinOperand, CheckError]:
+    id = lambda_id(lambdas.length())
+    span = { site.keyword | start = task.statement_start(), end = task.statement_end() }
+
+    task_context = { site.context |
+        caller = { body = LambdaBody(id), purity = Pure, concurrent_task = True },
+        in_source_loop = False
+    }
+
+    resolved ?= task
+        .task_statement(lambdas.lambda_start(parent, site), task_context)
+        .map_err(pure func(error) -> CheckError: error.as_sibling_error(task, site.siblings))
+
+    made ?= resolved.scope.made_bindings(site.scope, span)
+
+    lambda ?= finished_lambda(
+        id,
+        parent,
+        resolved,
+        made.task_value(span),
+        BlockTask,
+        span,
+        site.context
+    )
+
+    result: TaskResult = { made = made, result = lambda.result, holds = lambda.result }
+    Ok({ lambda = lambda, results = [result] })
+
+
+-- A call of `function`, a block's `run` or `join`, with one task lambda per
+-- callable parameter, each created where the call is.
+private pure func task_call(
+    function: FunctionId,
+    lambdas: List[TaskLambda],
+    value_type: TypeRef,
+    span: Span
+) -> CheckedExpr:
+    var operands: List[CheckedCallOperand] = []
+    var types: List[TypeRef] = []
+
+    for lambda in lambdas:
+        parameter = callable_parameter(function, types.length())
+        choice: CallableChoice = LambdaCallable(lambda.id, lambda.environment)
+        operands = operands.append(CallableOperand(parameter, choice, lambda.span))
+        types = types.append(lambda.result)
+
+    target: CallTarget = UserFunction(function, types)
+
+    {
+        form = InvokeFunction({ target = target, operands = operands, span = span }),
+        value_type = value_type,
+        span = span
+    }
+
+
+-- What a task's bindings take after the block: its lambda's result, read
+-- from `holds`, the type of the pair that holds it and every later result.
+private record TaskResult {
+    made: List[LocalBinding],
+    result: TypeRef,
+    holds: TypeRef
+}
+
+
+-- The calls of a block's tasks, made in the body that holds the block, and
+-- what each task binds, in the block's order.
+private record TaskChain {
+    call: CheckedExpr,
+    results: List[TaskResult],
+    lambdas: List[LambdaRow],
+    uses: List[NameUse]
+}
+
+
+-- One task has nothing to run beside it, so the library's `run` calls it in
+-- place.
+private pure func run_task(
+    task: ParsedStatement,
+    parent: BodyOwner,
+    lambdas: List[LambdaRow],
+    site: TaskSite
+) -> Result[TaskChain, CheckError]:
+    checked ?= task.task_lambda(parent, lambdas, site)
+    lambda = checked.lambda
+
+    Ok({
+        call = task_call(site.functions.run, [lambda], lambda.result, site.keyword),
+        results = checked.results,
+        lambdas = lambda.lambdas,
+        uses = lambda.uses
+    })
+
+
+-- What `join` or `run` calls: a task's lambda, or a rest's, and what the
+-- tasks it runs bind, which the block binds again after it.
+private record JoinOperand {
+    lambda: TaskLambda,
+    results: List[TaskResult]
+}
+
+
+-- The tasks from `first` on as the right-leaning chain
+-- `join(t1, () -> join(t2, ... join(tn-1, tn)))` called in `parent`. With
+-- work stealing a chain still runs every task at once, since each stolen rest
+-- pushes its own rest, and a block has a handful of tasks.
+private pure func task_chain(
+    first: ParsedStatement,
+    second: ParsedStatement,
+    more: List[ParsedStatement],
+    parent: BodyOwner,
+    lambdas: List[LambdaRow],
+    site: TaskSite
+) -> Result[TaskChain, CheckError]:
+    left ?= first.task_lambda(parent, lambdas, site)
+
+    side: Result[JoinOperand, CheckError] = match more:
+        []: second.task_lambda(parent, left.lambda.lambdas, site)
+        [third, ...rest]: second.rest_lambda(third, rest, parent, left.lambda.lambdas, site)
+
+    right ?= side
+    pair: TypeRef = TupleType([left.lambda.result, right.lambda.result])
+    held = left.results.map(pure func(result) -> TaskResult: { result | holds = pair })
+
+    Ok({
+        call = task_call(site.functions.join, [left.lambda, right.lambda], pair, site.keyword),
+        results = held.concat(right.results),
+        lambdas = right.lambda.lambdas,
+        uses = left.lambda.uses.concat(right.lambda.uses)
+    })
+
+
+-- The tasks from `first` on, run by a lambda of their own whose body is the
+-- next join.
+private pure func rest_lambda(
+    first: ParsedStatement,
+    second: ParsedStatement,
+    more: List[ParsedStatement],
+    parent: BodyOwner,
+    lambdas: List[LambdaRow],
+    site: TaskSite
+) -> Result[JoinOperand, CheckError]:
+    id = lambda_id(lambdas.length())
+    span = { site.keyword | start = first.statement_start(), end = site.end }
+    start = lambdas.lambda_start(parent, site)
+    inner ?= first.task_chain(second, more, LambdaBody(id), start.lambdas, site)
+    prefix = { start | lambdas = inner.lambdas, uses = inner.uses }
+    lambda ?= finished_lambda(id, parent, prefix, inner.call, BlockRest, span, site.context)
+    Ok({ lambda = lambda, results = inner.results })
+
+
+-- A binding a task made joins the enclosing scope after the block, bound once
+-- more as the task bound it: its type, mutability and literal note.
+private pure func rebind(
+    block: ResolvedStatements,
+    made: LocalBinding,
+    value: CheckedExpr,
+    context: ResolutionContext
+) -> Result[ResolvedStatements, CheckError]:
+    site = made.binding_site()
+    definition = made.binding_definition()
+    id = binding_id(block.bindings.length())
+
+    bound ?= block.scope.bind_local(
+        context.namespace,
+        context.module,
+        context.caller.body,
+        { id = site.name, span = site.span },
+        id,
+        definition
+    )
+
+    noted = match made.literal_binding():
+        Some(literal): bound.with_literal(literal.literal)
+        None: bound
+
+    Ok(
+        { block |
+            bindings = block.bindings.append(definition),
+            scope = [noted].concat(block.scope),
+            statements = block.statements.append(InitializeBinding(id, value))
+        }
+    )
+
+
+-- A task's bindings take `value`, its lambda's result: itself for one, an
+-- element of the tuple for each of several.
+private pure func rebind_task(
+    block: ResolvedStatements,
+    task: TaskResult,
+    value: CheckedExpr,
+    context: ResolutionContext
+) -> Result[ResolvedStatements, CheckError]:
+    match task.made:
+        [only]:
+            block.rebind(only, value, context)
+        _:
+            var bound: Result[ResolvedStatements, CheckError] = Ok(block)
+            var position = 0
+
+            for made in task.made:
+                element: CheckedExpr = { value |
+                    form = ReadTupleElement(value, position),
+                    value_type = made.binding_definition().value_type
+                }
+
+                bound = bound.and_then(pure func(current) -> Result[ResolvedStatements, CheckError]:
+                    current.rebind(made, element, context)
+                )
+
+                position = position + 1
+
+            bound
+
+
+-- The tasks' results, from `pairs`, the chain's nested pairs
+-- `(r1, (r2, ... (rn-1, rn)))`: each takes a first element, and the last task
+-- the innermost pair's second.
+private pure func rebind_results(
+    block: ResolvedStatements,
+    results: List[TaskResult],
+    pairs: CheckedExpr,
+    context: ResolutionContext
+) -> Result[ResolvedStatements, CheckError]:
+    match results:
+        [first, second, ...rest]:
+            element: CheckedExpr = { pairs |
+                form = ReadTupleElement(pairs, 0),
+                value_type = first.result
+            }
+
+            others: CheckedExpr = { pairs |
+                form = ReadTupleElement(pairs, 1),
+                value_type = second.holds
+            }
+
+            block
+                .rebind_task(first, element, context)
+                .and_then(pure func(bound) -> Result[ResolvedStatements, CheckError]:
+                    bound.rebind_results([second].concat(rest), others, context)
+                )
+        [only]:
+            block.rebind_task(only, pairs, context)
+        []:
+            Ok(block)
+
+
+-- A `concurrent:` block. Each task's statement is checked as the body of an
+-- unscoped pure `() -> T` lambda, and the tasks become calls of the
+-- concurrency module's `join`, or of its `run` for one task, as a Dict literal
+-- becomes calls, so later phases see only calls and lambdas. An unnamed
+-- binding holds the results until each name a task bound is bound again.
+private pure func resolve_concurrent_block(
+    written: ParsedConcurrentBlock,
+    block: ResolvedStatements,
+    context: ResolutionContext
+) -> Result[ResolvedStatements, CheckError]:
+    functions ?= context.traits
+        .accepted_traits().canonical.concurrent_functions
+        .to_result(concurrency_error(written.keyword, ConcurrentBlockRequiresLibrary))
+
+    site: TaskSite = {
+        keyword = written.keyword,
+        end = ConcurrentBlock(written).statement_end(),
+        functions = functions,
+        scope = block.scope,
+        siblings = written.tasks.task_names(),
+        context = context
+    }
+
+    parent = context.caller.body
+
+    chained: Result[TaskChain, CheckError] = match written.tasks:
+        [only]: only.run_task(parent, block.lambdas, site)
+        [first, second, ...more]: first.task_chain(second, more, parent, block.lambdas, site)
+        -- The parser admits no block without a task.
+        []: Err(checker_invariant(written.keyword, InvalidInferenceWorklist))
+
+    chain ?= chained
+    id = binding_id(block.bindings.length())
+    results = chain.call.value_type
+
+    definition: BindingDefinition = {
+        origin = BodyLocal,
+        mutable = False,
+        named = False,
+        value_type = results,
+        span = written.keyword
+    }
+
+    pairs: CheckedExpr = { form = ReadBinding(id), value_type = results, span = written.keyword }
+
+    { block |
+        lambdas = chain.lambdas,
+        bindings = block.bindings.append(definition),
+        statements = block.statements.append(InitializeBinding(id, chain.call)),
+        uses = block.uses.concat(chain.uses)
+    }.rebind_results(chain.results, pairs, context)
+
+
 -- Resolve a declaration's annotation before its initializer. Propagation stays
 -- at this function's top level, as required by the compiler's source subset.
 private pure func resolve_initializer(
@@ -1714,12 +2310,7 @@ private pure func resolve_assignment(
                                 )
                     Some(DataLocal(binding)):
                         if binding.binding_site().binding.owner != context.caller.body:
-                            Err(
-                                statement_error(
-                                    written.name.span,
-                                    CapturedAssignment(binding.binding_site().binding)
-                                )
-                            )
+                            Err(context.captured_assignment_error(written.name, binding))
                         else:
                             if binding.binding_definition().mutable:
                                 Ok(Some(binding))
@@ -2632,7 +3223,8 @@ pure func resolve_functions(
                             traits = traits,
                             caller = {
                                 body = DeclaredBody(id),
-                                purity = accepted.signature.purity
+                                purity = accepted.signature.purity,
+                                concurrent_task = False
                             },
                             root_function = id,
                             module = accepted.body_types.module,

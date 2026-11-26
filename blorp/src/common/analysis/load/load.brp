@@ -14,6 +14,7 @@ import:
         ParsedModule,
         ParsedImport,
         ImportOrigin(RelativeImport, LibraryImport),
+        module_uses_concurrent_blocks,
         parse_module
     ../../syntax/source:
         ModuleId,
@@ -22,7 +23,8 @@ import:
             LibraryModule,
             FoundationTypesModule,
             FoundationPreludeModule,
-            FoundationMethodsModule
+            FoundationMethodsModule,
+            ConcurrencyModule
         ),
         ModuleSource,
         SourceFile,
@@ -58,6 +60,8 @@ private FOUNDATION_PRELUDE_PATH: String = "prelude.brp"
 private FOUNDATION_METHODS_PATH: String = "_methods.brp"
 
 private LIBRARY_TEST_PATH: String = "test.brp"
+
+private LIBRARY_CONCURRENCY_PATH: String = "concurrency.brp"
 
 private LIBRARY_ROOT_NAME: String = "the library root"
 
@@ -135,7 +139,8 @@ private record LibraryContents {
     types_path: Path,
     prelude_path: Path,
     methods_path: Path,
-    test_path: Path
+    test_path: Path,
+    concurrency_path: Path
 }
 
 
@@ -173,6 +178,7 @@ private pure func root_contents(root: Path) -> Result[LibraryContents, PathError
     prelude_file ?= FOUNDATION_PRELUDE_PATH.to_path()
     methods_file ?= FOUNDATION_METHODS_PATH.to_path()
     test_file ?= LIBRARY_TEST_PATH.to_path()
+    concurrency_file ?= LIBRARY_CONCURRENCY_PATH.to_path()
     root_text = root.to_string()
 
     prefix = if root_text == ROOT_DIRECTORY:
@@ -186,7 +192,8 @@ private pure func root_contents(root: Path) -> Result[LibraryContents, PathError
         types_path = path_ops.join(root, types_file),
         prelude_path = path_ops.join(root, prelude_file),
         methods_path = path_ops.join(root, methods_file),
-        test_path = path_ops.join(root, test_file)
+        test_path = path_ops.join(root, test_file),
+        concurrency_path = path_ops.join(root, concurrency_file)
     })
 
 
@@ -233,6 +240,8 @@ pure func module_role(layout: LibraryLayout, path: Path) -> ModuleKind:
         FoundationPreludeModule
     else if path == contents.methods_path:
         FoundationMethodsModule
+    else if path == contents.concurrency_path:
+        ConcurrencyModule
     else if (
         path
             .to_string()
@@ -456,7 +465,7 @@ private pure func module_store(
             match role:
                 UserModule:
                     Ok(DiskFile)
-                FoundationTypesModule | FoundationPreludeModule | FoundationMethodsModule | LibraryModule:
+                FoundationTypesModule | FoundationPreludeModule | FoundationMethodsModule | LibraryModule | ConcurrencyModule:
                     match layout.library_relative_path(path):
                         Some(inside):
                             Ok(EmbeddedFile(inside.to_string()))
@@ -487,7 +496,7 @@ private pure func unreadable(reason: String, site: Option[Span], role: ModuleKin
             help = match role:
                 UserModule:
                     "check the path and provide a readable .brp file"
-                FoundationTypesModule | FoundationPreludeModule | FoundationMethodsModule | LibraryModule:
+                FoundationTypesModule | FoundationPreludeModule | FoundationMethodsModule | LibraryModule | ConcurrencyModule:
                     "check that --library-root names a directory that holds the standard library"
 
             path_error(compiler_span(), message, help)
@@ -535,13 +544,16 @@ private func read_module(
 
 -- Everything loading threads through the queue. Each queued file yields exactly
 -- one row, so the row count is the next file's queue position.
+-- `concurrent_blocks` says whether a module loaded so far holds a
+-- `concurrent:` block, which needs the concurrency module.
 private record LoadState {
     layout: LibraryLayout,
     overrides: SourceOverrides,
     root_path: String,
     requests: List[RequestedModule],
     assembly: ParsedAssembly,
-    modules: List[ModuleSource]
+    modules: List[ModuleSource],
+    concurrent_blocks: Bool
 }
 
 
@@ -583,13 +595,13 @@ private pure func import_diagnostic(
                     "remove this import; library modules receive its methods automatically"
                 )
             )
-        FoundationTypesModule | LibraryModule:
+        FoundationTypesModule | LibraryModule | ConcurrencyModule:
             None
         UserModule:
             match importer:
                 UserModule:
                     None
-                FoundationTypesModule | FoundationPreludeModule | FoundationMethodsModule | LibraryModule:
+                FoundationTypesModule | FoundationPreludeModule | FoundationMethodsModule | LibraryModule | ConcurrencyModule:
                     Some(
                         diagnostic(
                             span,
@@ -679,7 +691,13 @@ private func link_module(
         current.path.to_string()
     )
 
-    Ok({ state | requests = resolved.requests, assembly = assembly })
+    Ok(
+        { state |
+            requests = resolved.requests,
+            assembly = assembly,
+            concurrent_blocks = state.concurrent_blocks.or(parsed.module_uses_concurrent_blocks())
+        }
+    )
 
 
 -- Readable bytes stay in the failure's sources even when parsing fails, so the
@@ -715,11 +733,43 @@ private func load_module(
 private func load_queue(state: LoadState) -> Result[LoadState, LoadFailure]:
     match state.requests.get(state.modules.length()):
         None:
-            Ok(state)
+            match state.concurrency_request():
+                Ok(Some(request)):
+                    { state | requests = state.requests.append(request) }.load_queue()
+                Ok(None):
+                    Ok(state)
+                Err(error):
+                    Err(error)
         Some(current):
             match state.load_module(current):
                 Ok(next): next.load_queue()
                 Err(error): Err(error)
+
+
+-- Once the queue drains, a program whose modules hold a `concurrent:` block
+-- queues the exact configured-library path of the concurrency module, unless
+-- an import queued it already. Queuing it last means no other source ID moves,
+-- and a program with no block loads what it would without the module.
+private pure func concurrency_request(
+    state: LoadState
+) -> Result[Option[RequestedModule], LoadFailure]:
+    if state.concurrent_blocks:
+        path = layout_contents(state.layout).concurrency_path
+
+        match (state.requests.known_module(path), module_id(state.requests.length())):
+            (Some(_), _):
+                Ok(None)
+            (None, Some(id)):
+                Ok(Some(designated(id, path, ConcurrencyModule)))
+            (None, None):
+                Err(
+                    failure(
+                        state.modules,
+                        internal_error(compiler_span(), "module inventory is too large")
+                    )
+                )
+    else:
+        Ok(None)
 
 
 private union LoadMode:
@@ -1005,7 +1055,7 @@ private func load_input(
                     )
                 )
             )
-        LibraryModule | UserModule:
+        LibraryModule | ConcurrencyModule | UserModule:
             Ok(void)
 
     designated_inputs = [
@@ -1037,7 +1087,8 @@ private func load_input(
         root_path = root_path,
         requests = designated_inputs.concat(later),
         assembly = begin_program(),
-        modules = []
+        modules = [],
+        concurrent_blocks = False
     })
 
     loaded: LoadState ?= match mode:

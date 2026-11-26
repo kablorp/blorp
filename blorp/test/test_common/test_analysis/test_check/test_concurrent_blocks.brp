@@ -1,0 +1,499 @@
+---
+A `concurrent:` block checks each task as the body of a pure lambda and
+binds each task's result after the block, in the enclosing scope. Every rule
+a task breaks is worded for the task, never the lambda. Programs load the
+library on disk, as `make test` does; each rejection marks the span of its one
+diagnostic with `[[` and `]]`.
+---
+import:
+    test: TestSuite
+    ../../../../src/common/analysis/check/check: check
+    ../../../../src/common/analysis/check/render: render_failure
+    ../../../../src/common/analysis/load/load:
+        LibrarySource(LibraryDirectory),
+        SourceLoadFailure(LoadingFailed),
+        load_program_with_sources
+    ../../../../src/common/syntax/source: SourceFile
+    ../../../../src/common/syntax/syntax: Diagnostics, compiler_span, diagnostic
+    ../../../support/marked_rejection: rejects_marked
+
+
+private ROOT: String = "build/concurrent-blocks/root.brp"
+private LIBRARY: String = "blorp/standard_library"
+private CONCURRENCY: String = "blorp/standard_library/concurrency.brp"
+
+
+-- Loading and checking `source`, with `library` standing in for files of the
+-- library on disk.
+private func diagnose(source: String, library: List[SourceFile]) -> Result[Void, Diagnostics]:
+    sources: List[SourceFile] = [{ path = ROOT, contents = source }].concat(library)
+
+    match load_program_with_sources(ROOT, LibraryDirectory(LIBRARY), sources):
+        Err(LoadingFailed(failure)):
+            Err({ first = failure.diagnostic, remaining = [] })
+        Err(_):
+            Err({
+                first = diagnostic(
+                    compiler_span(),
+                    "the test's sources did not load",
+                    "list each once"
+                ),
+                remaining = []
+            })
+        Ok(loaded):
+            check(loaded.program)
+                .map(pure func(_) -> Void: void)
+                .map_err(render_failure)
+
+
+private func accepts(source: String) -> Bool:
+    diagnose(source, []).is_ok()
+
+
+private func rejects_with(
+    marked: String,
+    library: List[SourceFile],
+    message: String,
+    help: String
+) -> Bool:
+    rejects_marked(
+        marked,
+        message,
+        help,
+        func(source: String) -> Result[Void, Diagnostics]: diagnose(source, library)
+    )
+
+
+private func rejects(marked: String, message: String, help: String) -> Bool:
+    rejects_with(marked, [], message, help)
+
+
+private UNUSED_VALUE: String = "this concurrent task's value is unused"
+
+
+private UNUSED_VALUE_HELP: String = "bind it with name = expression; a concurrent block has no value"
+
+
+private LIBRARY_MESSAGE: String = "concurrent blocks require the library's join and run"
+
+
+private LIBRARY_HELP: String = "use a library root whose concurrency.brp declares join and run as the standard library does"
+
+
+func test_bindings_join_the_scope_after_the_block() -> Bool:
+    source: String =
+        |pure func summary(values: List[Int]) -> Int:
+        |    concurrent:
+        |        first: Int = values.length()
+        |        var second = values.length() + 1
+        |        (low, high) = (1, 2)
+        |    second = second + low
+        |    first + second + high
+        |
+        |func main() -> Int:
+        |    [1, 2].summary()
+        |
+
+    accepts(source)
+
+
+func test_a_block_in_a_pure_function_is_accepted() -> Bool:
+    source: String =
+        |pure func both(values: List[Int]) -> Int:
+        |    concurrent:
+        |        a = values.length()
+        |        b = values.length()
+        |    a + b
+        |
+        |func main() -> Int:
+        |    [1].both()
+        |
+
+    accepts(source)
+
+
+-- One task runs in place, and its pattern binds as any task's does.
+func test_one_task_runs_in_place() -> Bool:
+    source: String =
+        |func main() -> Int:
+        |    concurrent:
+        |        (low, high) = (3, 4)
+        |    low + high
+        |
+
+    accepts(source)
+
+
+func test_an_impure_call_in_a_task_is_rejected() -> Bool:
+    marked: String =
+        |func fetch() -> Int:
+        |    1
+        |
+        |func main() -> Int:
+        |    concurrent:
+        |        a = 1
+        |        b = [[fetch]]()
+        |    a + b
+        |
+
+    rejects(
+        marked,
+        "`fetch` is impure, and concurrent tasks must be pure until the concurrency runtime lands",
+        "call it before or after the concurrent block"
+    )
+
+
+-- A task that names another task's binding hears why, not "unknown value".
+func test_another_tasks_binding_is_rejected() -> Bool:
+    marked: String =
+        |func main() -> Int:
+        |    concurrent:
+        |        orders = 3
+        |        total = [[orders]] + 1
+        |    total
+        |
+
+    rejects(
+        marked,
+        "orders is bound by this concurrent block, so the other tasks cannot use it",
+        "if a line needs orders, put it after the block"
+    )
+
+
+-- A task's own binding is not yet bound inside it, as in any binding.
+func test_a_tasks_own_binding_is_unknown_inside_it() -> Bool:
+    marked: String =
+        |func main() -> Int:
+        |    concurrent:
+        |        count = [[count]] + 1
+        |        other = 1
+        |    count + other
+        |
+
+    rejects(
+        marked,
+        "unknown value",
+        "use this function's parameter name, a declared variant, or a call"
+    )
+
+
+func test_a_resource_in_a_task_is_rejected() -> Bool:
+    marked: String =
+        |resource union Writer:
+        |    private Init(Int)
+        |
+        |func report(writer: Writer) -> Int:
+        |    concurrent:
+        |        a = 1
+        |        b = [ [[writer]] ].length()
+        |    a + b
+        |
+        |func main() -> Int:
+        |    0
+        |
+
+    rejects(
+        marked,
+        "writer is a resource, so a concurrent task cannot use it",
+        "use the resource before or after the block"
+    )
+
+
+func test_assigning_an_outer_var_is_rejected() -> Bool:
+    marked: String =
+        |func main() -> Int:
+        |    var total = 0
+        |
+        |    concurrent:
+        |        [[total]] = 5
+        |        other = 1
+        |    total + other
+        |
+
+    rejects(
+        marked,
+        "a concurrent task cannot assign total",
+        "bind the result to a new name in the task, and use that name after the block"
+    )
+
+
+-- Inside a task's own loop, assigning an outer var is the same rule.
+func test_assigning_an_outer_var_from_a_loop_is_rejected() -> Bool:
+    marked: String =
+        |func main() -> Int:
+        |    var total = 0
+        |
+        |    concurrent:
+        |        for value in [1, 2]:
+        |            [[total]] = value
+        |        other = 1
+        |    total + other
+        |
+
+    rejects(
+        marked,
+        "a concurrent task cannot assign total",
+        "bind the result to a new name in the task, and use that name after the block"
+    )
+
+
+func test_reading_an_outer_var_is_rejected() -> Bool:
+    marked: String =
+        |func main() -> Int:
+        |    var total = 0
+        |
+        |    concurrent:
+        |        doubled = [[total]] * 2
+        |        other = 1
+        |    doubled + other
+        |
+
+    rejects(
+        marked,
+        "a concurrent task cannot read var total",
+        "copy total to an immutable binding before the block"
+    )
+
+
+func test_a_scoped_callable_in_a_task_is_rejected() -> Bool:
+    marked: String =
+        |pure func keep(callback: (Int) -> Void) -> Int:
+        |    0
+        |
+        |func each(on_line: scoped (Int) -> Void) -> Int:
+        |    concurrent:
+        |        a = 1
+        |        b = keep([[on_line]])
+        |    a + b
+        |
+        |func main() -> Int:
+        |    0
+        |
+
+    rejects(
+        marked,
+        "on_line is scoped, so a concurrent task cannot use it",
+        "call it before or after the block"
+    )
+
+
+-- The block has no value, so a task that is an expression keeps none, nor
+-- does an `if` or `match` branch of one.
+func test_a_task_with_an_unused_value_is_rejected() -> Bool:
+    marked: String =
+        |pure func ready(values: List[Int]) -> Bool:
+        |    True
+        |
+        |func main() -> Int:
+        |    concurrent:
+        |        a = 1
+        |        [[[1].ready()]]
+        |    a
+        |
+
+    rejects(marked, UNUSED_VALUE, UNUSED_VALUE_HELP)
+
+
+func test_an_if_task_with_an_unused_value_is_rejected() -> Bool:
+    marked: String =
+        |func main() -> Int:
+        |    flag = 1 > 0
+        |
+        |    concurrent:
+        |        a = 1
+        |        if flag:
+        |            [[2]]
+        |        else:
+        |            3
+        |    a
+        |
+
+    rejects(marked, UNUSED_VALUE, UNUSED_VALUE_HELP)
+
+
+func test_a_match_task_with_an_unused_value_is_rejected() -> Bool:
+    marked: String =
+        |func main() -> Int:
+        |    flag = 1 > 0
+        |
+        |    concurrent:
+        |        a = 1
+        |        match flag:
+        |            True: [[2]]
+        |            False: 3
+        |    a
+        |
+
+    rejects(marked, UNUSED_VALUE, UNUSED_VALUE_HELP)
+
+
+-- Statement branches of an `if` or `match` task keep no value, so they stand.
+func test_statement_branches_of_a_task_are_accepted() -> Bool:
+    source: String =
+        |pure func noop() -> Void:
+        |    void
+        |
+        |func main() -> Int:
+        |    flag = 1 > 0
+        |
+        |    concurrent:
+        |        a = 1
+        |        if flag:
+        |            noop()
+        |        else:
+        |            b = 2
+        |        match flag:
+        |            True: noop()
+        |            False: c = 3
+        |    a
+        |
+
+    accepts(source)
+
+
+-- A block written as a task binds what its tasks bind, so its names, like
+-- every other task's, join the scope after the outer block.
+func test_a_nested_blocks_bindings_follow_the_outer_block() -> Bool:
+    source: String =
+        |func main() -> Int:
+        |    concurrent:
+        |        a = 1
+        |        concurrent:
+        |            b = 2
+        |            c = 3
+        |    a + b + c
+        |
+
+    accepts(source)
+
+
+-- Any binding outside a task is the block's to assign, not the task's.
+func test_assigning_an_outer_binding_is_rejected() -> Bool:
+    marked: String =
+        |func main() -> Int:
+        |    total = 0
+        |
+        |    concurrent:
+        |        [[total]] = 5
+        |        other = 1
+        |    total + other
+        |
+
+    rejects(
+        marked,
+        "a concurrent task cannot assign total",
+        "bind the result to a new name in the task, and use that name after the block"
+    )
+
+
+-- A default walked with its Self read as a resource names the task too.
+func test_an_inherited_default_names_the_task() -> Bool:
+    marked: String =
+        |resource union Writer:
+        |    private Init(Int)
+        |
+        |pure func keep[T](value: T) -> Int:
+        |    0
+        |
+        |trait Describe:
+        |    func describe(self: Self) -> Int:
+        |        concurrent:
+        |            a = keep(self)
+        |            b = 2
+        |        a + b
+        |
+        |[[implements Describe for Writer]]
+        |
+        |func main() -> Int:
+        |    0
+        |
+
+    rejects(
+        marked,
+        "the resource type Writer cannot use Describe's default describe",
+        "write describe in this implementation without a concurrent task that uses the Writer, or do not implement Describe for Writer"
+    )
+
+
+-- A library root whose concurrency module lacks `join` or `run`, or declares
+-- one of another shape, cannot run a block.
+func test_a_block_needs_the_librarys_join_and_run() -> Bool:
+    marked: String =
+        |func main() -> Int:
+        |    [[concurrent]]:
+        |        a = 1
+        |        b = 2
+        |    a + b
+        |
+
+    run = "private pure func run[A](task: pure () -> A) -> A:\n    task()\n"
+
+    libraries = [
+        "pure func other[T](value: T) -> T:\n    value\n",
+        (
+            "private pure func join[A, B](left: pure () -> B, right: pure () -> A) -> (B, A):\n    (left(), right())\n"
+            + run
+        ),
+        (
+            "private pure func join[A](left: pure () -> A, right: pure () -> A) -> (A, A):\n    (left(), right())\n"
+            + run
+        )
+    ]
+
+    var rejected: Bool = True
+
+    for contents in libraries:
+        rejected = rejected.and(
+            rejects_with(
+                marked,
+                [{ path = CONCURRENCY, contents = contents }],
+                LIBRARY_MESSAGE,
+                LIBRARY_HELP
+            )
+        )
+
+    rejected
+
+
+TESTS: TestSuite = {
+    description = "Concurrent block checks",
+    tests = [
+        ("bindings join the scope after the block", test_bindings_join_the_scope_after_the_block),
+        ("a block in a pure function is accepted", test_a_block_in_a_pure_function_is_accepted),
+        ("one task runs in place", test_one_task_runs_in_place),
+        ("an impure call in a task is rejected", test_an_impure_call_in_a_task_is_rejected),
+        ("another task's binding is rejected", test_another_tasks_binding_is_rejected),
+        (
+            "a task's own binding is unknown inside it",
+            test_a_tasks_own_binding_is_unknown_inside_it
+        ),
+        ("a resource in a task is rejected", test_a_resource_in_a_task_is_rejected),
+        ("assigning an outer var is rejected", test_assigning_an_outer_var_is_rejected),
+        (
+            "assigning an outer var from a loop is rejected",
+            test_assigning_an_outer_var_from_a_loop_is_rejected
+        ),
+        ("reading an outer var is rejected", test_reading_an_outer_var_is_rejected),
+        ("a scoped callable in a task is rejected", test_a_scoped_callable_in_a_task_is_rejected),
+        ("a task with an unused value is rejected", test_a_task_with_an_unused_value_is_rejected),
+        (
+            "an if task with an unused value is rejected",
+            test_an_if_task_with_an_unused_value_is_rejected
+        ),
+        (
+            "a match task with an unused value is rejected",
+            test_a_match_task_with_an_unused_value_is_rejected
+        ),
+        (
+            "statement branches of a task are accepted",
+            test_statement_branches_of_a_task_are_accepted
+        ),
+        (
+            "a nested block's bindings follow the outer block",
+            test_a_nested_blocks_bindings_follow_the_outer_block
+        ),
+        ("assigning an outer binding is rejected", test_assigning_an_outer_binding_is_rejected),
+        ("an inherited default names the task", test_an_inherited_default_names_the_task),
+        ("a block needs the library's join and run", test_a_block_needs_the_librarys_join_and_run)
+    ]
+}

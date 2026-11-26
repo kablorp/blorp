@@ -1,0 +1,350 @@
+---
+`concurrent:` heads a block only before `:` and a line end, so a binding
+named `concurrent` stays a binding. Every line of the block is a task, a last
+value line included, and a task's body rejects `?=`, `break` and `continue`
+wherever they would leave it. Each rejection marks the span of its one
+diagnostic with `[[` and `]]`.
+---
+import:
+    test: TestSuite
+    ../../../../src/common/syntax/names: NameTable, NameId, name_spelling
+    ../../../../src/common/syntax/parse:
+        module_contents,
+        module_names,
+        module_uses_concurrent_blocks
+    ../../../../src/common/syntax/syntax:
+        ParsedConcurrentBlock,
+        ParsedFunction,
+        statement_end,
+        ParsedFunctionGroup(FreeFunction),
+        ParsedStatement(
+            BindingStatement,
+            ConcurrentBlock,
+            ExpressionStatement,
+            ForLoop,
+            PropagatingBinding,
+            TupleBinding,
+            WhileLoop
+        ),
+        Span
+    ./parse_rejection: parse_rejects, parsed
+
+
+private pure func spelled(names: NameTable, id: NameId) -> String:
+    name_spelling(names, id).get_or("?")
+
+
+private pure func covered(source: String, span: Span) -> String:
+    source
+        .slice(span.start, span.end)
+        .get_or("")
+
+
+-- A task's kind, and the name it binds when it is a binding.
+private pure func task_kind(task: ParsedStatement, names: NameTable) -> String:
+    match task:
+        BindingStatement(binding): "binding ${names.spelled(binding.name.id)}"
+        TupleBinding(_, _, _): "tuple binding"
+        PropagatingBinding(_): "propagation"
+        ExpressionStatement(_): "expression"
+        WhileLoop(_): "while"
+        ForLoop(_): "for"
+        _: "other"
+
+
+-- The first function's statements, or none when the source does not parse.
+private pure func first_function(source: String) -> Option[ParsedFunction]:
+    match parsed(source):
+        Err(_):
+            None
+        Ok(module):
+            match module_contents(module).functions:
+                [FreeFunction(function), ..._]: Some(function)
+                _: None
+
+
+-- Each concurrent block among the first function's statements, written back as
+-- its keyword, its body's source and its tasks' kinds.
+private pure func blocks(source: String) -> List[String]:
+    match parsed(source):
+        Err(_):
+            []
+        Ok(module):
+            names = module_names(module)
+
+            match first_function(source):
+                None:
+                    []
+                Some(function):
+                    var found: List[String] = []
+
+                    for statement in function.statements:
+                        match statement:
+                            ConcurrentBlock(block):
+                                found = found.append(block.written_back(names, source))
+                            _:
+                                void
+
+                    found
+
+
+private pure func written_back(
+    block: ParsedConcurrentBlock,
+    names: NameTable,
+    source: String
+) -> String:
+    kinds = block.tasks.map(pure func(task: ParsedStatement) -> String: task.task_kind(names))
+
+    start = match block.tasks:
+        [BindingStatement(binding), ..._]: binding.name.span.start
+        [TupleBinding(_, _, span), ..._]: span.start
+        [WhileLoop(loop), ..._]: loop.span.start
+        _: block.keyword.start
+
+    body: Span = { block.keyword | start = start, end = ConcurrentBlock(block).statement_end() }
+    "${source.covered(block.keyword)} | ${source.covered(body)} | ${kinds.join(", ")}"
+
+
+private QUESTION_EQUALS_MESSAGE: String = "`?=` cannot leave a concurrent task"
+
+private QUESTION_EQUALS_HELP: String = "match the result inside the task, or use ?= after the block"
+
+
+private LOOP_CONTROL_HELP: String = "put the whole loop inside the task, or the loop control outside the block"
+
+
+pure func test_each_line_of_the_block_is_a_task() -> Bool:
+    source: String =
+        |pure func summary(values: List[Int]) -> Int:
+        |    concurrent:
+        |        sum: Int = values.total()
+        |        var squared = values.squares()
+        |    sum + squared
+        |
+
+    (
+        blocks(source)
+        == [
+            "concurrent | sum: Int = values.total()\n        var squared = values.squares() | binding sum, binding squared"
+        ]
+    )
+
+
+-- The block has no value, so its last line is a task even when it is a value.
+pure func test_a_last_value_line_is_an_expression_task() -> Bool:
+    source: String =
+        |pure func work(values: List[Int]) -> Int:
+        |    concurrent:
+        |        (low, high) = values.bounds()
+        |        values.check()
+        |    low
+        |
+
+    (
+        blocks(source)
+        == [
+            "concurrent | (low, high) = values.bounds()\n        values.check() | tuple binding, expression"
+        ]
+    )
+
+
+pure func test_loops_are_tasks() -> Bool:
+    source: String =
+        |pure func work(values: List[Int]) -> Int:
+        |    concurrent:
+        |        while False:
+        |            break
+        |        for value in values:
+        |            continue
+        |    0
+        |
+
+    (
+        blocks(source)
+        == [
+            "concurrent | while False:\n            break\n        for value in values:\n            continue | while, for"
+        ]
+    )
+
+
+pure func test_a_binding_named_concurrent_stays_a_binding() -> Bool:
+    source: String =
+        |pure func work() -> Int:
+        |    concurrent: Int = 5
+        |    concurrent = 6
+        |    concurrent
+        |
+
+    match (parsed(source), first_function(source)):
+        (Ok(module), Some(function)):
+            names = module_names(module)
+
+            (
+                function.statements.map(pure func(statement: ParsedStatement) -> String:
+                    statement.task_kind(names)
+                )
+                == ["binding concurrent", "binding concurrent"]
+            )
+        _:
+            False
+
+
+pure func test_the_module_records_whether_it_holds_a_block() -> Bool:
+    with_block: String =
+        |pure func work() -> Int:
+        |    if True:
+        |        concurrent:
+        |            a = 1
+        |    0
+        |
+
+    without_block: String =
+        |pure func work() -> Int:
+        |    concurrent = 1
+        |    concurrent
+        |
+
+    match (parsed(with_block), parsed(without_block)):
+        (Ok(holding), Ok(lacking)):
+            [module_uses_concurrent_blocks(holding), module_uses_concurrent_blocks(lacking).not()].all(
+                pure func(held: Bool) -> Bool: held
+            )
+        _:
+            False
+
+
+pure func test_an_empty_block_is_rejected() -> Bool:
+    marked: String =
+        |pure func work() -> Int:
+        |    [[concurrent]]:
+        |    0
+        |
+
+    parse_rejects(
+        marked,
+        "a concurrent block needs at least one task",
+        "indent each task on its own line under `concurrent:`"
+    )
+
+
+pure func test_question_equals_cannot_leave_a_task() -> Bool:
+    marked: String =
+        |func work() -> Result[Int, String]:
+        |    concurrent:
+        |        value [[?=]] parse("1")
+        |    Ok(value)
+        |
+
+    parse_rejects(marked, QUESTION_EQUALS_MESSAGE, QUESTION_EQUALS_HELP)
+
+
+pure func test_question_equals_cannot_leave_a_task_from_a_nested_block() -> Bool:
+    marked: String =
+        |func work() -> Result[Int, String]:
+        |    concurrent:
+        |        value = if True:
+        |            _ [[?=]] parse("1")
+        |            1
+        |        else:
+        |            2
+        |    Ok(value)
+        |
+
+    parse_rejects(marked, QUESTION_EQUALS_MESSAGE, QUESTION_EQUALS_HELP)
+
+
+-- A block inside a loop body admits no loop control in its tasks: `break`
+-- would leave the task, not only the block.
+pure func test_break_cannot_leave_a_task_inside_a_loop() -> Bool:
+    marked: String =
+        |pure func work() -> Int:
+        |    while True:
+        |        concurrent:
+        |            [[break]]
+        |    0
+        |
+
+    parse_rejects(marked, "`break` cannot leave a concurrent task", LOOP_CONTROL_HELP)
+
+
+pure func test_continue_cannot_leave_a_task_from_a_nested_block() -> Bool:
+    marked: String =
+        |pure func work(values: List[Int]) -> Int:
+        |    for value in values:
+        |        concurrent:
+        |            if value == 0:
+        |                [[continue]]
+        |    0
+        |
+
+    parse_rejects(marked, "`continue` cannot leave a concurrent task", LOOP_CONTROL_HELP)
+
+
+-- A loop inside a task is the task's own, so its loop control stays inside.
+pure func test_a_loop_inside_a_task_keeps_its_loop_control() -> Bool:
+    source: String =
+        |pure func work() -> Int:
+        |    concurrent:
+        |        counted = if True:
+        |            var seen = 0
+        |
+        |            while seen < 3:
+        |                seen = seen + 1
+        |
+        |                if seen == 2:
+        |                    break
+        |
+        |            seen
+        |        else:
+        |            0
+        |    counted
+        |
+
+    blocks(source).length() == 1
+
+
+-- The task context ends with the block, so the code after it may propagate.
+pure func test_question_equals_is_allowed_after_the_block() -> Bool:
+    source: String =
+        |func work() -> Result[Int, String]:
+        |    concurrent:
+        |        a = 1
+        |    value ?= parse("1")
+        |    Ok(value)
+        |
+
+    blocks(source).length() == 1
+
+
+TESTS: TestSuite = {
+    description = "Concurrent block syntax",
+    tests = [
+        ("each line of the block is a task", test_each_line_of_the_block_is_a_task),
+        ("a last value line is an expression task", test_a_last_value_line_is_an_expression_task),
+        ("loops are tasks", test_loops_are_tasks),
+        (
+            "a binding named concurrent stays a binding",
+            test_a_binding_named_concurrent_stays_a_binding
+        ),
+        (
+            "the module records whether it holds a block",
+            test_the_module_records_whether_it_holds_a_block
+        ),
+        ("an empty block is rejected", test_an_empty_block_is_rejected),
+        ("?= cannot leave a task", test_question_equals_cannot_leave_a_task),
+        (
+            "?= cannot leave a task from a nested block",
+            test_question_equals_cannot_leave_a_task_from_a_nested_block
+        ),
+        ("break cannot leave a task inside a loop", test_break_cannot_leave_a_task_inside_a_loop),
+        (
+            "continue cannot leave a task from a nested block",
+            test_continue_cannot_leave_a_task_from_a_nested_block
+        ),
+        (
+            "a loop inside a task keeps its loop control",
+            test_a_loop_inside_a_task_keeps_its_loop_control
+        ),
+        ("?= is allowed after the block", test_question_equals_is_allowed_after_the_block)
+    ]
+}

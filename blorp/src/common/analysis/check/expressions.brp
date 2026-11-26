@@ -149,6 +149,9 @@ import:
         ImpureCallee(CalledFunction, CalledMethod),
         ConstantError(ConstantCalled, NonClosedInitializer),
         constant_error,
+        ConcurrencyError(TaskRejection),
+        TaskRule(TaskVarRead),
+        concurrency_error,
         ConstructorError(ConstructorNeedsExpectedType),
         RecordError(RecordNeedsExpectedType, FieldRequiresRecord),
         ValueError(
@@ -679,32 +682,33 @@ private pure func capture_position(
 private pure func register_capture(
     lambdas: List[LambdaRow],
     owner: LambdaId,
-    binding: ScopedBindingId,
-    value_type: TypeUse
+    capture: CheckedCapture
 ) -> Result[CaptureRegistration, CheckError]:
+    span = capture.value_type.span
+
     row ?= lambdas
         .get(owner.lambda_number())
-        .or_checker_invariant(value_type.span, InvalidInferenceWorklist)
+        .or_checker_invariant(span, InvalidInferenceWorklist)
 
     match row:
         CheckedLambdaRow(_):
-            Err(checker_invariant(value_type.span, InvalidInferenceWorklist))
+            Err(checker_invariant(span, InvalidInferenceWorklist))
         CollectingLambda(pending):
-            match pending.captures.capture_position(binding):
+            match pending.captures.capture_position(capture.binding):
                 Some(position):
                     Ok({ id = capture_id(owner, position), lambdas = lambdas })
                 None:
                     ancestors: Result[List[LambdaRow], CheckError] = if (
                         pending.parent
-                        == binding.owner
+                        == capture.binding.owner
                     ):
                         Ok(lambdas)
                     else:
                         match pending.parent:
                             DeclaredBody(_) | model.DerivedEqualityBody(_) | model.DerivedTupleEquality(_):
-                                Err(checker_invariant(value_type.span, InvalidInferenceWorklist))
+                                Err(checker_invariant(span, InvalidInferenceWorklist))
                             model.LambdaBody(parent):
-                                match lambdas.register_capture(parent, binding, value_type):
+                                match lambdas.register_capture(parent, capture):
                                     Ok(registered): Ok(registered.lambdas)
                                     Err(error): Err(error)
 
@@ -717,18 +721,13 @@ private pure func register_capture(
                                 lambdas = rows.set(
                                     owner.lambda_number(),
                                     CollectingLambda(
-                                        { pending |
-                                            captures = pending.captures.append({
-                                                binding = binding,
-                                                value_type = value_type
-                                            })
-                                        }
+                                        { pending | captures = pending.captures.append(capture) }
                                     )
                                 )
                             })
 
 
-private pure func lambda_captures(
+pure func lambda_captures(
     lambdas: List[LambdaRow],
     owner: LambdaId,
     span: Span
@@ -745,7 +744,7 @@ private pure func lambda_captures(
 -- Creation occurs in the restored parent body. These operands read the
 -- parent's own bindings or its already established captures, never a foreign
 -- body's dense local ordinal.
-private pure func capture_operands(
+pure func capture_operands(
     id: LambdaId,
     parent_body: BodyOwner,
     lambdas: List[LambdaRow],
@@ -1097,6 +1096,18 @@ private pure func plan_closed_qualified(
             )
 
 
+-- A read of an outer `var`, which a closure cannot capture; a task names it.
+private pure func mutable_capture_error(
+    context: ResolutionContext,
+    name: WrittenName,
+    binding: LocalBinding
+) -> CheckError:
+    if context.caller.concurrent_task:
+        concurrency_error(name.span, TaskRejection(TaskVarRead, name.id))
+    else:
+        value_error(name.span, MutableCapture(binding.binding_site().binding))
+
+
 -- An operator needs the prelude-selected trait of its family.
 private pure func selected_contract[Contract](
     contract: Option[Contract],
@@ -1314,16 +1325,11 @@ private pure func plan_body_base(
                         )
                     else:
                         if binding.binding_definition().mutable:
-                            Err(
-                                value_error(
-                                    name.span,
-                                    MutableCapture(binding.binding_site().binding)
-                                )
-                            )
+                            Err(context.mutable_capture_error(name, binding))
                         else:
                             Ok(
                                 PlannedLeaf(
-                                    PendingCapture(binding.binding_site().binding),
+                                    PendingCapture(binding.binding_site().binding, name.id),
                                     binding.binding_definition().value_type,
                                     read
                                 )
@@ -1337,7 +1343,7 @@ private pure func plan_body_base(
                     ):
                         AcceptedBinding(local.local_binding_id(), None)
                     else:
-                        PendingCapture(local.binding_site().binding)
+                        PendingCapture(local.binding_site().binding, name.id)
 
                     Ok(
                         PlannedLeaf(
@@ -2289,7 +2295,7 @@ private pure func elaborate_value(
                                                 uses = uses.with_uses(leaf_uses)
 
                                                 accepted_base: Result[PendingBase, CheckError] = match base:
-                                                    PendingCapture(binding):
+                                                    PendingCapture(binding, captured):
                                                         match site.body_context(written.span):
                                                             Err(error):
                                                                 Err(error)
@@ -2305,10 +2311,13 @@ private pure func elaborate_value(
                                                                     model.LambdaBody(owner):
                                                                         match lambdas.register_capture(
                                                                             owner,
-                                                                            binding,
                                                                             {
-                                                                                value_type = value_type,
-                                                                                span = written.base_span
+                                                                                binding = binding,
+                                                                                name = captured,
+                                                                                value_type = {
+                                                                                    value_type = value_type,
+                                                                                    span = written.base_span
+                                                                                }
                                                                             }
                                                                         ):
                                                                             Err(error):
@@ -3108,7 +3117,7 @@ private pure func elaborate_value(
                                         Ok(PendingDeclared(id))
                                     ParameterTarget(id):
                                         Ok(PendingParameter(id))
-                                    ValueTarget(binding):
+                                    ValueTarget(binding, called):
                                         value_type: TypeRef = CallableType(
                                             contract.signature.purity,
                                             contract.signature.parameters.map(
@@ -3135,9 +3144,13 @@ private pure func elaborate_value(
                                                         )
                                                     )
                                                 model.LambdaBody(owner):
-                                                    match lambdas.register_capture(owner, binding, {
-                                                        value_type = value_type,
-                                                        span = contract.span
+                                                    match lambdas.register_capture(owner, {
+                                                        binding = binding,
+                                                        name = called,
+                                                        value_type = {
+                                                            value_type = value_type,
+                                                            span = contract.span
+                                                        }
                                                     }):
                                                         Err(error):
                                                             Err(error)
@@ -3668,7 +3681,8 @@ private pure func elaborate_value(
                                                                         body = model.LambdaBody(
                                                                             admission.id
                                                                         ),
-                                                                        purity = admission.written.purity
+                                                                        purity = admission.written.purity,
+                                                                        concurrent_task = False
                                                                     },
                                                                     in_source_loop = False
                                                                 }
@@ -4567,7 +4581,7 @@ private pure func freeze_pending_form(
             Ok(ReadBinding(id))
         AcceptedCapture(id):
             Ok(ReadCapture(id))
-        PendingCapture(_):
+        PendingCapture(_, _):
             Err(checker_invariant(value.span, InvalidInferenceWorklist))
         PendingConstructRecord(owner, fields):
             match fields.freeze_record_fields(slots, captures, constructions, assumptions, traits):
@@ -4842,7 +4856,7 @@ private pure func data_callable_application(
                 Ok(void)
             else:
                 if definition.mutable:
-                    Err(value_error(name.span, MutableCapture(binding.binding_site().binding)))
+                    Err(context.mutable_capture_error(name, binding))
                 else:
                     Ok(void)
 
@@ -4866,7 +4880,7 @@ private pure func data_callable_application(
                     match context.caller.value_callable_contract(
                         name,
                         arguments,
-                        ValueTarget(binding.binding_site().binding),
+                        ValueTarget(binding.binding_site().binding, name.id),
                         contract
                     ):
                         Ok(accepted):
@@ -5635,6 +5649,7 @@ private pure func checked_lambda(
 
     Ok({
         purity = admission.written.purity,
+        origin = model.WrittenLambda,
         root = admission.context.root_function,
         parameters = parameters,
         return_type = { value_type = result, span = admission.written.span },

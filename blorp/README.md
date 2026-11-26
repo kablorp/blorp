@@ -190,7 +190,8 @@ list admits a trailing comma.
 Identifiers are ASCII letters, digits and `_`, not starting with a digit.
 [`grammar.ebnf`](grammar.ebnf) lists the reserved words; declaring one reports
 "`match` is a reserved keyword and cannot be used as a name". `fixed`,
-`methods`, `tail_recursive`, `and`, `or` and `not` are ordinary names.
+`methods`, `tail_recursive`, `concurrent`, `and`, `or` and `not` are ordinary
+names; `concurrent` heads a block only before `:` and a line end.
 
 ### Naming
 
@@ -921,6 +922,82 @@ parameter or a function name may not: `formal.use(17)`, `value.formal()` and
 function named as a value is instantiated at each use; one without enough type
 evidence is rejected rather than becoming a runtime generic.
 
+### Concurrent blocks
+
+```blorp
+import:
+    io/console/output: print
+
+
+pure func total(values: List[Int]) -> Int:
+    var sum = 0
+
+    for value in values:
+        sum = sum + value
+
+    sum
+
+
+pure func squares(values: List[Int]) -> Int:
+    var sum = 0
+
+    for value in values:
+        sum = sum + value * value
+
+    sum
+
+
+pure func summary(values: List[Int]) -> String:
+    concurrent:
+        sum: Int = values.total()
+        squared: Int = values.squares()
+    "${sum} ${squared}"
+
+
+func main() -> Int:
+    print([3, 1, 4, 1, 5].summary())
+    0
+```
+
+This prints `14 52`. Each line of a `concurrent:` block is a task. For now
+the tasks run one after another; a later landing runs them at once. A task is
+a binding (`name = value`, `name: T = value`, `var name = value`, a tuple or a
+variant destructuring), an expression, a loop or another block, which binds
+what its own tasks bind. The block has no value, so a last line that is an
+expression is a task too, and its value must be Void ("this concurrent task's
+value is unused").
+
+`concurrent` heads a block only alone on its line: `concurrent = 5` is a
+binding, and `concurrent: x = 1` is read as a binding of `concurrent` with the
+type `x`, which reports "unknown type".
+
+The block waits for all its tasks. Their bindings join the enclosing scope
+after the block, unlike an `if` block's, so the code after it reads each
+result. A task cannot see another task's binding, since the two may run at
+once: "orders is bound by this concurrent block, so the other tasks cannot use
+it". A block of one task runs it in place.
+
+Every task must be pure for now, so a block of impure work is rejected until
+the concurrency runtime lands, and a block may stand in a pure function. Each
+task is checked as a pure function's body, and its rules are worded for the
+task:
+
+| A task may not | Rejection |
+| --- | --- |
+| call an impure function | `` `fetch` is impure, and concurrent tasks must be pure until the concurrency runtime lands `` |
+| use another task's binding | `orders is bound by this concurrent block, so the other tasks cannot use it` |
+| use a resource | `writer is a resource, so a concurrent task cannot use it` |
+| assign an outer binding | `a concurrent task cannot assign total` |
+| read an outer `var` | `a concurrent task cannot read var total` |
+| use a scoped callable | `on_line is scoped, so a concurrent task cannot use it` |
+| leave with `?=` | `` `?=` cannot leave a concurrent task `` |
+| leave with `break` or `continue` | `` `break` cannot leave a concurrent task `` |
+
+A loop inside a task keeps its own `break` and `continue`. Check turns a block
+into calls of the library's private `join`, or `run` for one task, in
+`concurrency.brp`, which the compiler loads only for a program that uses a
+block.
+
 ### Generics and declaration bounds
 
 ```blorp
@@ -1555,8 +1632,9 @@ builds in `defaultLibrary`, and a `---` block `documentation`. A string with
 values in it is coloured in pieces around each `${…}`, and a token that spans
 lines is sent once per line. A file whose program never checked gets only the lexer's tokens, and a file
 that does not lex gets those before its first error. The names in an import path (its `..` and `/` are
-operators), a module alias where it is declared, the words `fixed` and
-`methods`, and a trait requirement's parameters are not coloured.
+operators), a module alias where it is declared, the words `fixed`,
+`methods` and `concurrent`, and a trait requirement's parameters are not
+coloured.
 
 While a file's program fails to load or check, the server keeps answering from
 the last analysis of that program that checked, so editing a file does not

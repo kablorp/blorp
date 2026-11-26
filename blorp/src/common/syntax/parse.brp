@@ -147,6 +147,8 @@ import:
         DestructuredVariant(BareVariant, UnionVariant),
         ParsedWhile,
         ParsedFor,
+        ParsedConcurrentBlock,
+        statement_end,
         ParsedStatement(
             BindingStatement,
             TupleBinding,
@@ -156,7 +158,8 @@ import:
             WhileLoop,
             ForLoop,
             Break,
-            Continue
+            Continue,
+            ConcurrentBlock
         ),
         ParsedUnion,
         UnionKind(OrdinaryUnion, FixedUnion, ResourceUnion),
@@ -234,13 +237,16 @@ import:
 -- A function's own statements admit `?=`; every `if` or `match` block
 -- rejects it. Loop bodies admit loop controls; value blocks inside loops
 -- admit none. Lambdas reject `?=` and need their own loop for loop control.
--- Each block restores its caller's context when it ends.
+-- A concurrent task, and every block inside it but a loop's, admits neither,
+-- since both would leave the task. Each block restores its caller's context
+-- when it ends.
 private fixed union StatementContext:
     FunctionBody
     FunctionBlock
     InsideLambda
     LoopBody
     ValueInLoop
+    ConcurrentTask
 
 
 -- Whether the parser stands inside an open bracket, where a block's last
@@ -250,12 +256,16 @@ private fixed union Enclosure:
     Bracketed
 
 
+-- `concurrent_blocks` says whether the module read so far holds a
+-- `concurrent:` block, which the loader answers by loading the concurrency
+-- library.
 private record ParserState {
     input: LexedProgram,
     position: Int,
     aliases: List[NameId],
     context: StatementContext,
-    enclosure: Enclosure
+    enclosure: Enclosure,
+    concurrent_blocks: Bool
 }
 
 
@@ -301,6 +311,8 @@ record ParsedImport {
 
 
 -- `base_names` is the table lexing extended; `names` adds the module's spellings.
+-- `concurrent_blocks` says whether any function of the module holds a
+-- `concurrent:` block.
 record ParsedModuleContents {
     base_names: NameTable,
     names: NameTable,
@@ -312,6 +324,7 @@ record ParsedModuleContents {
     unions: List[ParsedUnion],
     records: List[ParsedRecord],
     constants: List[ParsedConstant],
+    concurrent_blocks: Bool,
     end: Span
 }
 
@@ -334,6 +347,11 @@ pure func module_names(parsed: ParsedModule) -> NameTable:
 pure func module_imports(parsed: ParsedModule) -> List[ParsedImport]:
     ParsedModule.Init(contents) = parsed
     contents.imports
+
+
+pure func module_uses_concurrent_blocks(parsed: ParsedModule) -> Bool:
+    ParsedModule.Init(contents) = parsed
+    contents.concurrent_blocks
 
 
 private IMPORT_IN_BODY_MESSAGE: String = "imports belong at module scope"
@@ -2464,7 +2482,7 @@ private pure func consume_operand(start: ParserState) -> Result[ParsedValue, Dia
 private pure func as_function_block(state: ParserState) -> ParserState:
     match state.context:
         FunctionBody: state.with_context(FunctionBlock)
-        FunctionBlock | InsideLambda | LoopBody | ValueInLoop: state
+        FunctionBlock | InsideLambda | LoopBody | ValueInLoop | ConcurrentTask: state
 
 
 -- An `if` or `match` operand is a value wherever its line stands: in a
@@ -2472,7 +2490,7 @@ private pure func as_function_block(state: ParserState) -> ParserState:
 private pure func as_value_position(state: ParserState) -> ParserState:
     match state.context:
         LoopBody: state.with_context(ValueInLoop)
-        FunctionBody | FunctionBlock | InsideLambda | ValueInLoop: state
+        FunctionBody | FunctionBlock | InsideLambda | ValueInLoop | ConcurrentTask: state
 
 
 -- The operand's caller's context returns once its value is read.
@@ -4070,6 +4088,14 @@ private pure func consume_binding(state: ParserState) -> Result[LineForm, Diagno
                         "bind it before the loop, or use `match` inside the loop"
                     )
                 )
+            ConcurrentTask:
+                Err(
+                    expected_syntax(
+                        annotation.next,
+                        "`?=` cannot leave a concurrent task",
+                        "match the result inside the task, or use ?= after the block"
+                    )
+                )
     else:
         match target.binder:
             DiscardBinder(_):
@@ -4384,6 +4410,8 @@ private pure func consume_line_form(state: ParserState) -> Result[LineForm, Diag
             )
     ):
         Err(expected_syntax(state, "expected a return expression", EXPRESSION_HELP))
+    else if state.at_concurrent_block():
+        state.consume_concurrent_block()
     else if state.at_binding():
         state.consume_binding()
     else if state.at_left_paren():
@@ -4409,6 +4437,53 @@ private pure func consume_line_form(state: ParserState) -> Result[LineForm, Diag
                 match value_result:
                     Ok(value): value.value_line_form()
                     Err(error): Err(error)
+
+
+-- `concurrent` heads a block only before `:` and a line end, so
+-- `concurrent: Int = 5` and `concurrent = 5` stay bindings. Every line asks,
+-- so only a line that starts with the word looks further.
+private pure func at_concurrent_block(state: ParserState) -> Bool:
+    if state.at_word(state.recognized_words().concurrent_word):
+        and(at_colon(shifted(state, 1)), at_newline(shifted(state, 2)))
+    else:
+        False
+
+
+-- `state` is at `concurrent`, which `:` and a line end follow. Each line of
+-- the indented block is a task, read in the task context; the context ends
+-- with the block.
+private pure func consume_concurrent_block(state: ParserState) -> Result[LineForm, Diagnostic]:
+    keyword = state.parser_span()
+    opened = state.shifted(3)
+
+    _: Void ?= if opened.at_indent():
+        Ok(void)
+    else:
+        Err(
+            diagnostic(
+                keyword,
+                "a concurrent block needs at least one task",
+                "indent each task on its own line under `concurrent:`"
+            )
+        )
+
+    body ?= opened
+        .shifted(1)
+        .with_context(ConcurrentTask)
+        .consume_block()
+
+    tasks = match body.block.value:
+        Some(value): body.block.statements.append(ExpressionStatement(value))
+        None: body.block.statements
+
+    block: ParsedConcurrentBlock = { keyword = keyword, tasks = tasks }
+
+    Ok(
+        StatementForm(
+            ConcurrentBlock(block),
+            { body.next | context = state.context, concurrent_blocks = True }
+        )
+    )
 
 
 -- `state` is at `while`: the condition, then a body read as a loop body.
@@ -4564,6 +4639,14 @@ private pure func consume_loop_control(
                     "write the `if` or `match` as a statement on its own line, or move `${word}` out of it"
                 )
             )
+        ConcurrentTask:
+            Err(
+                expected_syntax(
+                    state,
+                    "`${word}` cannot leave a concurrent task",
+                    "put the whole loop inside the task, or the loop control outside the block"
+                )
+            )
 
     next ?= state
         .shifted(1)
@@ -4583,20 +4666,6 @@ private record BlockResult {
     block: ParsedBlock,
     next: ParserState
 }
-
-
--- Where a statement's syntax ends.
-private pure func statement_end(statement: ParsedStatement) -> Int:
-    match statement:
-        BindingStatement(binding): binding.initializer.span.end
-        TupleBinding(_, initializer, _): initializer.span.end
-        VariantBinding(binding): binding.initializer.span.end
-        PropagatingBinding(propagation): propagation.value.span.end
-        ExpressionStatement(value): value.span.end
-        WhileLoop(loop): loop.span.end
-        ForLoop(loop): loop.span.end
-        Break(span): span.end
-        Continue(span): span.end
 
 
 -- The lines of an indented block, after its Indent, in one loop: statement
@@ -7158,7 +7227,8 @@ pure func parse_module(input: LexedProgram, module: ModuleId) -> Result[ParsedMo
         position = 0,
         aliases = [],
         context = FunctionBody,
-        enclosure = Unbracketed
+        enclosure = Unbracketed,
+        concurrent_blocks = False
     })
 
     while True:
@@ -7212,6 +7282,7 @@ pure func parse_module(input: LexedProgram, module: ModuleId) -> Result[ParsedMo
             unions = unions,
             records = records,
             constants = constants,
+            concurrent_blocks = finished.concurrent_blocks,
             end = input.end
         })
     )

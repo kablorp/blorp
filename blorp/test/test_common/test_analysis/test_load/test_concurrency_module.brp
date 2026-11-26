@@ -1,0 +1,151 @@
+---
+The loader reads the library's concurrency module only for a program that
+uses a `concurrent:` block, after every other module, so a program with no
+block loads exactly the modules it would without it. An import of the module
+gives it the same role as the implicit load.
+---
+import:
+    test: TestSuite
+    ../../../../src/common/analysis/load/load:
+        LibrarySource(EmbeddedLibrary, LibraryDirectory),
+        SourceLoadFailure(LoadingFailed),
+        load_program_with_sources
+    ../../../../src/common/syntax/source: ModuleKind(ConcurrencyModule), ModuleSource, SourceFile
+    ../../../support/loader_rows: absolute
+
+
+private ROOT: String = "build/concurrency-module/root.brp"
+private HELPER: String = "build/concurrency-module/helper.brp"
+private EMBEDDED_CONCURRENCY: String = "<standard library>/concurrency.brp"
+
+
+private LIBRARY_WITHOUT_CONCURRENCY: String = "blorp/test/test_common/test_analysis/test_load/library_inputs/library"
+
+
+private WITHOUT_BLOCK: String =
+    |func main() -> Int:
+    |    concurrent = 1
+    |    concurrent
+    |
+
+
+private WITH_BLOCK: String =
+    |func main() -> Int:
+    |    concurrent:
+    |        a = 1
+    |    a
+    |
+
+
+private IMPORTING_HELPER: String =
+    |import:
+    |    ./helper: value
+    |
+    |func main() -> Int:
+    |    value()
+    |
+
+
+private HELPER_WITH_BLOCK: String =
+    |pure func value() -> Int:
+    |    concurrent:
+    |        a = 1
+    |    a
+    |
+
+
+private IMPORTING_CONCURRENCY: String =
+    |import:
+    |    concurrency as tasks
+    |
+    |func main() -> Int:
+    |    concurrent:
+    |        a = 1
+    |    a
+    |
+
+
+private func loaded_rows(root: String, helper: Option[String]) -> List[ModuleSource]:
+    sources: List[SourceFile] = match helper:
+        Some(contents): [{ path = ROOT, contents = root }, { path = HELPER, contents = contents }]
+        None: [{ path = ROOT, contents = root }]
+
+    match load_program_with_sources(ROOT, EmbeddedLibrary, sources):
+        Ok(loaded): loaded.sources.modules
+        Err(_): []
+
+
+private pure func concurrency_rows(rows: List[ModuleSource]) -> List[ModuleSource]:
+    rows.filter(pure func(row: ModuleSource) -> Bool: row.path == EMBEDDED_CONCURRENCY)
+
+
+func test_a_program_without_a_block_loads_no_concurrency_module() -> Bool:
+    rows = loaded_rows(WITHOUT_BLOCK, None)
+
+    [
+        rows
+            .is_empty()
+            .not(),
+        rows
+            .concurrency_rows()
+            .is_empty(),
+        rows.all(pure func(row: ModuleSource) -> Bool: row.role != ConcurrencyModule)
+    ].all(pure func(held: Bool) -> Bool: held)
+
+
+func test_a_block_loads_the_concurrency_module_last() -> Bool:
+    match loaded_rows(WITH_BLOCK, None).last():
+        Some(row): (row.path == EMBEDDED_CONCURRENCY).and(row.role == ConcurrencyModule)
+        None: False
+
+
+func test_a_block_in_an_imported_module_loads_it() -> Bool:
+    match loaded_rows(IMPORTING_HELPER, Some(HELPER_WITH_BLOCK)).last():
+        Some(row): (row.path == EMBEDDED_CONCURRENCY).and(row.role == ConcurrencyModule)
+        None: False
+
+
+-- Both routes give the module one role, and the import's row is the only one.
+func test_an_import_gives_the_module_the_same_role_once() -> Bool:
+    match loaded_rows(IMPORTING_CONCURRENCY, None).concurrency_rows():
+        [only]: only.role == ConcurrencyModule
+        _: False
+
+
+func test_a_library_without_the_module_is_reported() -> Bool:
+    sources: List[SourceFile] = [{ path = ROOT, contents = WITH_BLOCK }]
+
+    match load_program_with_sources(ROOT, LibraryDirectory(LIBRARY_WITHOUT_CONCURRENCY), sources):
+        Err(LoadingFailed(failure)):
+            missing = absolute("${LIBRARY_WITHOUT_CONCURRENCY}/concurrency.brp")
+
+            [
+                failure.diagnostic.message == "could not read module ${missing}: no such file",
+                (
+                    failure.diagnostic.help
+                    == "check that --library-root names a directory that holds the standard library"
+                )
+            ].all(pure func(held: Bool) -> Bool: held)
+        _:
+            False
+
+
+TESTS: TestSuite = {
+    description = "Loading the concurrency module",
+    tests = [
+        (
+            "a program without a block loads no concurrency module",
+            test_a_program_without_a_block_loads_no_concurrency_module
+        ),
+        (
+            "a block loads the concurrency module last",
+            test_a_block_loads_the_concurrency_module_last
+        ),
+        ("a block in an imported module loads it", test_a_block_in_an_imported_module_loads_it),
+        (
+            "an import gives the module the same role once",
+            test_an_import_gives_the_module_the_same_role_once
+        ),
+        ("a library without the module is reported", test_a_library_without_the_module_is_reported)
+    ]
+}

@@ -4,14 +4,18 @@ any body can use them. Inventory owns member identities; this phase publishes
 the resolved requirement-to-body mapping consumed by checking and specialization.
 ---
 import:
+    bool: and
     list: repeat
     ../../syntax/names: NameTable, NameId
-    ../../syntax/source: ModuleId, equality_label, ModuleKind(LibraryModule)
+    ../../syntax/source: ModuleId, equality_label, ModuleKind(LibraryModule, ConcurrencyModule)
     ../../syntax/syntax:
         FunctionHeader,
         ParsedBinder(NamedBinder, DiscardBinder),
         WrittenName,
-        TypeSyntax(CallableTypeSyntax),
+        TypeSyntax(AtomicType, CallableTypeSyntax, TupleTypeSyntax),
+        ParsedFunction,
+        ParsedParameter,
+        ParsedTypeParameter,
         Purity(Pure),
         Visibility(Public, Private),
         Span,
@@ -103,6 +107,7 @@ import:
         AcceptedTraitContracts,
         CanonicalContracts,
         DictLiteralFunctions,
+        ConcurrentFunctions,
         ImplementationTable,
         implementation_table,
         CanonicalEquality,
@@ -689,7 +694,7 @@ private pure func accept_implementation(
                 match parsed.modules.get(written.module.module_number()):
                     Some(module):
                         match module.role:
-                            LibraryModule: True
+                            LibraryModule | ConcurrencyModule: True
                             _: False
                     None:
                         False
@@ -701,7 +706,7 @@ private pure func accept_implementation(
     library = match parsed.modules.get(row.header.module.module_number()):
         Some(module):
             match module.role:
-                LibraryModule:
+                LibraryModule | ConcurrencyModule:
                     foundation_receiver.and(
                         (written.module == parsed.foundation.types).or(canonical_library)
                     )
@@ -1003,6 +1008,82 @@ private pure func dict_literal_functions(
                     None
 
 
+-- Whether `written` names the type parameter. As for the designated unions,
+-- a name equal to a type parameter's is that parameter: declaration checking
+-- rejects a type parameter named like any visible type.
+private pure func names_parameter(written: TypeSyntax, parameter: ParsedTypeParameter) -> Bool:
+    match written:
+        AtomicType(name): name.id == parameter.name.id
+        _: False
+
+
+-- An unscoped `pure () -> T` parameter for the unbounded type parameter T.
+private pure func takes_task(written: ParsedParameter, parameter: ParsedTypeParameter) -> Bool:
+    match (written.scoped_qualifier, written.type_name, parameter.bounds):
+        (None, CallableTypeSyntax(Pure, [], result, _), []): result.names_parameter(parameter)
+        _: False
+
+
+-- `join[A, B](pure () -> A, pure () -> B) -> (A, B)`, the shape a block's
+-- chain of calls relies on.
+private pure func join_shaped(function: ParsedFunction) -> Bool:
+    match (function.type_parameters, function.parameters, function.return_type):
+        ([a, b], [left, right], Some(TupleTypeSyntax([first, second], _))):
+            and(
+                and(left.takes_task(a), right.takes_task(b)),
+                and(first.names_parameter(a), second.names_parameter(b))
+            )
+        _:
+            False
+
+
+-- `run[A](pure () -> A) -> A`.
+private pure func run_shaped(function: ParsedFunction) -> Bool:
+    match (function.type_parameters, function.parameters, function.return_type):
+        ([a], [task], Some(result)): and(task.takes_task(a), result.names_parameter(a))
+        _: False
+
+
+-- A block calls the `join` and `run` the concurrency module declares, which
+-- no name in the block's scope can stand in for, of the shapes its calls rely
+-- on. A program without a block has no such module, and so neither.
+private pure func concurrent_functions(
+    parsed: ParsedContents,
+    namespace: Namespace
+) -> Option[ConcurrentFunctions]:
+    words = parsed.names.foundation_words()
+    rows = parsed.declarations.inventory_functions()
+    var found: Option[ConcurrentFunctions] = None
+
+    for row in parsed.modules:
+        if row.role == ConcurrencyModule:
+            shaped = pure func(
+                word: NameId,
+                shape: pure (ParsedFunction) -> Bool
+            ) -> Option[FunctionId]:
+                match parsed.declared_function(namespace, row.module, word):
+                    Some(id):
+                        match rows.get(id.function_number()):
+                            Some(declared):
+                                if shape(declared.declaration):
+                                    Some(id)
+                                else:
+                                    None
+                            None:
+                                None
+                    None:
+                        None
+
+            found = match (
+                shaped(words.join_word, join_shaped),
+                shaped(words.run_word, run_shaped)
+            ):
+                (Some(join), Some(run)): Some({ join = join, run = run })
+                _: None
+
+    found
+
+
 private pure func designates(designated: Option[TraitId], row: TraitRow) -> Bool:
     match designated:
         Some(owner): owner == row.id
@@ -1072,7 +1153,8 @@ pure func accept_trait_contracts(
         remainder = None,
         negation = None,
         stringable = None,
-        dict_literal = parsed.dict_literal_functions(namespace)
+        dict_literal = parsed.dict_literal_functions(namespace),
+        concurrent_functions = parsed.concurrent_functions(namespace)
     }
 
     var declarations: List[AcceptedTrait] = []

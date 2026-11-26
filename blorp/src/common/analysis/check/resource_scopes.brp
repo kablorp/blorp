@@ -536,7 +536,8 @@ private pure func admit_closure(
 ) -> Result[Bool, CheckError]:
     var captures: List[Bool] = []
     var scoped_capture: Bool = False
-    var captured_resource: Option[model.NominalId] = None
+    -- The first resource captured, and its position among the captures.
+    var captured_resource: Option[(model.NominalId, Int)] = None
     var failure: Option[CheckError] = None
 
     for value in environment:
@@ -554,11 +555,14 @@ private pure func admit_closure(
                         failure = Some(error)
                         break
                     Ok(held):
+                        match (captured_resource, held):
+                            (None, Some(nominal)):
+                                captured_resource = Some((nominal, captures.length()))
+                            _:
+                                void
+
                         captures = captures.append(captured)
                         scoped_capture = scoped_capture.or(captured)
-
-                        if captured_resource.is_none():
-                            captured_resource = held
 
     _: Void ?= match failure:
         Some(error): Err(error)
@@ -574,14 +578,41 @@ private pure func admit_closure(
         model.CollectingLambda(_):
             Err(errors.checker_invariant(span, errors.InvalidInferenceWorklist))
 
-    _: Void ?= match (lambda.purity, captured_resource):
-        (Pure, Some(captured)):
+    -- A task may run at once with its block's code, so it captures neither a
+    -- resource nor a scoped callable, each rejected at its first use. A default
+    -- walked again with Self read as a resource names the type instead, and a
+    -- rest of a block's tasks only forwards what its tasks' walks reject.
+    _: Void ?= match (lambda.origin, lambda.purity, captured_resource, admission.lent_self):
+        (model.BlockTask, _, Some((captured, _)), Some(_)):
+            Err(resource_error(span, errors.MisusedResource(captured, errors.ResourceTaskCapture)))
+        (model.BlockTask, _, Some((_, position)), None):
+            lambda.captures.refuse_capture(Some(position), errors.TaskResource, span)
+        (model.BlockTask, _, None, _):
+            lambda.captures.refuse_capture(captures.index_of(True), errors.TaskScopedCallable, span)
+        (model.WrittenLambda, Pure, Some((captured, _)), _):
             Err(resource_error(span, errors.MisusedResource(captured, errors.ResourcePureCapture)))
-        (Impure, _) | (Pure, None):
+        (model.WrittenLambda, _, _, _) | (model.BlockRest, _, _, _):
             Ok(void)
 
     _: Void ?= admission.admit_lambda(lambda, captures)
     Ok(scoped_capture.or(captured_resource.is_some()))
+
+
+-- The capture at `position`, if any, rejected under `rule` at its first use.
+private pure func refuse_capture(
+    captures: List[model.CheckedCapture],
+    position: Option[Int],
+    rule: errors.TaskRule,
+    span: Span
+) -> Result[Void, CheckError]:
+    match position.map(pure func(index) -> Option[model.CheckedCapture]: captures.get(index)):
+        Some(Some(capture)):
+            first_use = capture.value_type.span
+            Err(errors.concurrency_error(first_use, errors.TaskRejection(rule, capture.name)))
+        Some(None):
+            Err(errors.checker_invariant(span, errors.InvalidInferenceWorklist))
+        None:
+            Ok(void)
 
 
 private pure func admit_lambda(
