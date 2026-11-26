@@ -3,7 +3,7 @@
 **Status: in progress, 2026-11-25.** Keith approved the design and asked for
 this plan, then started it with landing 0. Landings 0 to 6 have landed, and
 opaque types are gone. Landing 7, destructuring the other single-variant
-unions, and the optional landing 8 remain. Landing 0 belongs to [`EQUALITY_PLAN.md`](EQUALITY_PLAN.md),
+unions, has landed too; only the optional landing 8 remains. Landing 0 belongs to [`EQUALITY_PLAN.md`](EQUALITY_PLAN.md),
 which records its results.
 
 **The direction.** Keith chose it in discussion:
@@ -266,7 +266,7 @@ Each fact has one enforcement site, and every other phase reads it.
 | Outside its module, only `_` covers a union's private variants | The pattern domain's hidden head |
 | A union is stored one way | `UnionStorage`, classified once in check; specialize publishes each union's erasure from it once, at sealing, so lower, own, verify and emit never see an erased union |
 | A resource union has one private variant with one payload, and is never matched | The parser, for its shape, which one declaration decides; check, at `match`, for the rejection |
-| A destructuring always matches | Check, which rejects a union with several variants; from landing 7, verify also proves it |
+| A destructuring always matches | Check, which rejects a union with several variants; a single-variant union is destructured by a single-arm `match` per binder |
 
 ### Not in this change
 
@@ -662,10 +662,26 @@ delete. The seed rotates once.
        case each.
 7. **Landing 7: destructuring of the other single-variant unions** (decision 2). This
    covers multi-payload unions, and single-payload unions that cannot be
-   erased. own models a standalone payload read the way it models a
-   record-field read, verify proves the single variant, and both get phase
-   tests. Nothing before needs it, so it can land any time after landing 2.
-   It waits until the migration is done, to keep the critical path short.
+   erased. The coordinator chose a smaller design than own modelling a
+   standalone payload read: check binds the value once to an unnamed
+   binding, as a tuple binding does, and projects each named binder's payload
+   with a single-arm `match` on it, built as derived equality's singleton
+   selection is. A one-variant match compiles with no tag test, and its arm
+   inputs are ordinary borrowed union places, so specialize, lower, own,
+   verify and emit change nothing. The cost of a managed payload is one
+   retained copy, as reading it with `match` costs. A union stored as its
+   payload keeps `ReadPayload`. Own and verify modelling of a standalone read
+   was rejected: it needs a new read form in four phases, and no measured
+   workload needs the retain it would save.
+   - **Results.** It landed on 2026-11-25 with +122 production lines, all
+     in check, and +101 test lines.
+     - **Lines.** The synthesized `match` literal accounts for most of the
+       production lines, laid out one field per line.
+     - **Cost.** The fixed-input C was identical, and instructions read
+       −0.04%.
+     - **Behaviour.** A two-payload union, a rose tree, and managed payloads
+       read from a parameter, a temporary, a loop and a closure all run
+       clean under the strict leak check.
 8. **Landing 8, optional: the `NominalId` collapse,** as a mechanical rename.
 
 No second rotation is needed. The seed still accepts opaque types, and after
@@ -845,8 +861,9 @@ The estimates behind the line ceilings:
   115 lines more than their sum, so landing 6 may reach about −915. Each
   ceiling asks for 80% of its estimate. No source uses opaque types after
   landing 4, so their fixed-input C is identical.
-- **Landing 7:** +110. Tests, about +250: the own and verify phase tests for a
-  standalone payload read.
+- **Landing 7:** +110 by the plan's own-and-verify design; the single-arm
+  `match` design (check only) replaced it, with a ceiling of +140 production
+  and +320 test lines. Tests: check tests and e2e programs.
 - **Landing 8:** −30.
 
 **Stress fixtures.** Allocation counts are deterministic, so they catch a
@@ -957,8 +974,11 @@ The gates follow `blorp/AGENTS.md` ("Which gates a change runs"):
 - [ ] **Landing 7:**
   - a union with two payloads, and a single-payload union that cannot be
     erased, destructure;
-  - the own and verify phase tests cover the standalone payload read;
-  - the probes run clean under sanitizers and the strict leak check;
+  - the e2e programs run clean under the strict leak check: `Pair` over `Int`
+    and `String`, a union of two managed payloads destructured from a
+    parameter, a temporary, a loop over a reassigned `var` and a closure, and
+    a rose tree;
+  - the fixed-input C and the own-source C are identical;
   - the ceilings hold, and the gates pass.
 - [ ] **Landing 8:**
   - `NominalId` is gone;
