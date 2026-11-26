@@ -18,8 +18,14 @@ done.
   - **Landed:**
     - landing 1 (2026-11-24): literals are published once under a lock;
     - landing 1b (2026-11-25): a normal build never writes a literal's
-      count, and the diagnostics allocator has a test-and-test-and-set lock.
-  - **Next:** landing 2, the pool and `join`.
+      count, and the diagnostics allocator has a test-and-test-and-set lock;
+    - landing 2 (2026-11-25): `concurrent:` blocks of pure tasks, checked
+      and rewritten into calls of the concurrency module's `join` and `run`;
+    - landing 2a, with landing 2b's work-stealing pool: `join` is a native
+      whose trampolines call each task directly, so a block's tasks run at
+      once (3.2× on 4 threads for four CPU-bound tasks).
+  - **Next:** landing 3, `parallel_map`, native and splitting adaptively on
+    the pool.
   - **Overlap:** `CTFE_PLAN.md`'s L1 replaces landing 1's lazy literal site
     with static literals. Keep the threaded literal test when it does.
 - **Compile-time evaluation:** [`CTFE_PLAN.md`](CTFE_PLAN.md).

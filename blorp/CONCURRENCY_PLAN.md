@@ -177,9 +177,13 @@ Its jobs live on the joining thread's stack and its result is allocated once,
 so how it splits never shows in any count.
 
 **Allocation counts.** In Spike P, counts were identical at 1 and 4 threads
-and from run to run. They stay so when no two tasks update one shared
-captured value. Copy-on-write makes one copy or two depending on timing, so
-the strict e2e fixtures avoid that case.
+and from run to run, and they stay so for every program. A task borrows its
+environment from the joining code, which holds it until the join returns, so
+a task never finds a captured value unique: a task that updates one always
+copies it, whatever the timing. The landing-2a review found the same counts
+and peak heap in 30 runs of each of 1 and 4 threads with two tasks growing
+one captured List. Peak heap can still differ, since it depends on the order
+in which tasks allocate.
 
 ### The concurrency MVP
 
@@ -1296,7 +1300,7 @@ Allocations were identical in every variant, at 13,189,121.
 | Literal sites | `emit.brp:356` | fixed: an atomic pointer, published under the lock |
 | The literal registry | `string.brp:247` | fixed: pushed under the literal lock, and read at exit after every task |
 | Literal counts | `string.brp` | fixed in landing 1b: a normal build never writes them |
-| Memory counts, peak heap, the allocation-site table | `memory.brp:22, 25, 64, 65` | fixed: under the diagnostics lock, a mutex in landing 1 and test-and-test-and-set from landing 1b. Peak heap becomes order-dependent under threads, and its README note is deferred to landing 3 |
+| Memory counts, peak heap, the allocation-site table | `memory.brp:22, 25, 64, 65` | fixed: under the diagnostics lock, a mutex in landing 1 and test-and-test-and-set from landing 1b. Peak heap becomes order-dependent under threads, and its README note landed with landing 2a |
 | `blorp_memory_strict`, the image base | `memory.brp:28, 66` | safe: written once at start |
 | Allocation-sites output | `memory.brp:63, 140` | safe: written at start and finish. Landing 2 must stop pool workers allocating before the program finishes |
 | The release state | `memory.brp:266` | safe: `_Thread_local` |
@@ -1601,6 +1605,175 @@ Against a compiler built from `bd6922f69`, every existing fixture under
 differ. The compiler's own source at `bd6922f69` compiles to the same C
 (`82852fffae471842`). The raw samples are in `build/landing2/`, ignored, in
 the landing's worktree.
+
+### Landing 2a results
+
+Landing 2a makes `join` the native `concurrency.join`, on landing 2b's
+pool, so a block's tasks run at once. `run` stays Blorp.
+
+**What it does:**
+- **Check.** `concurrency.join` is a builtin label, which only the
+  `ConcurrencyModule` role may declare ("concurrency.join is private to the
+  concurrency library", help "run tasks with a concurrent: block"). The
+  library-only rule for raw file handles became one table of restricted
+  builtins. Its runtime contract, from the operation's `TaskTypes`, is
+  `join[A, B]` with no bounds, two `pure () -> A` and `pure () -> B`
+  parameters and an `(A, B)` result, through a new `TaskRuntimeType`
+  parameter form and a `PairResult` result form.
+  `join_shaped` is gone: the designation asks only that `join`'s body is the
+  native, and the contract gives its shape. A builtin body now forwards its
+  callable parameters to the native.
+- **Specialize.** A new call target, `JoinTasks(TaskJoin)`, names the two
+  task instances, as a call of a static callable parameter names its one.
+  The call's arguments are the environments of the tasks that take one, left
+  first. The instances are requested as the Blorp `join` requested them, so
+  no instance numbering changes. `ConcurrencyJoin` never leaves
+  specialization: its arms after it fail loudly, and `runtime_signature`
+  became fallible for the pair result, which only join has.
+- **Own.** A join's task instances join the instances taken as callables,
+  which are pinned to the borrowed ABI (Lean's borrowed parameters, as own
+  already did for callables). Pinning reaches only those instances, since
+  each task lambda is created once, for its block's join.
+- **Verify.** Each task goes through `pinned_callable`, the check that
+  instances taken as callables already use, takes at most its environment,
+  and the call's value must be a record whose fields are the two tasks'
+  results.
+- **Emit.** One job per pair of tasks, named by their instances, holds the
+  environments, numbered in argument order, and the non-Void results,
+  numbered by the task's position in the pair. Two static trampolines call
+  the task functions directly (Rayon's `join`, with the job on the joining
+  thread's stack). The call fills the job, calls
+  `blorp_join` and builds the pair from the result slots, moved, as
+  `ConstructRecordDefinition` builds a record. `JOIN_RUNTIME` and the POSIX
+  prelude are included only for a program with a join, whose `main` also
+  calls the pool's `blorp_join_requested_threads` before any user code, so
+  `BLORP_THREADS=x` stops it with status 1 before it prints.
+
+The summary fixture's join instance:
+
+```c
+struct blorp_job_3_4{blorp_r_1 environment_0;blorp_r_2 environment_1;int64_t result_0;int64_t result_1;};
+static void blorp_job_3_4_0(void *job){struct blorp_job_3_4 *const slots=job;slots->result_0=blorp_f_3(slots->environment_0);}
+static void blorp_job_3_4_1(void *job){struct blorp_job_3_4 *const slots=job;slots->result_1=blorp_f_4(slots->environment_1);}
+/* concurrency.join */ blorp_r_0 blorp_f_5(blorp_r_1 blorp_p_0,blorp_r_2 blorp_p_1){...
+  struct blorp_job_3_4 blorp_runtime_2={.environment_0=blorp_vl_0,.environment_1=blorp_vl_1};
+  blorp_join(blorp_job_3_4_0,blorp_job_3_4_1,&blorp_runtime_2);
+  const blorp_r_0 blorp_vl_2=((struct blorp_r_0){.blorp_rf_0_0=blorp_runtime_2.result_0,.blorp_rf_0_1=blorp_runtime_2.result_1});...}
+```
+
+**Tests:**
+- **E2e.** A Fibonacci fixture runs `fibonacci(24)` through 75,024 joins.
+  Every block fixture runs with the driver's `BLORP_THREADS`, which
+  `make test` leaves unset: one thread per processor.
+- **Thread counts by hand.** The harness cannot set an environment variable
+  per run. All seven fixtures, built as the harness builds them, give the
+  same stdout and strict counts with `BLORP_THREADS` unset, 1 and 4 (4, 10,
+  8, 10, 1, 1 and 6 allocations). `BLORP_THREADS=x` and `0` stop a program that prints
+  first with status 1, the message and empty stdout; empty and `2` run it.
+  The smallest harness change: an `environment` field on `NativeRun`, merged
+  over `without_diagnostics` in `launch`, which six construction sites fill.
+- **The consuming fixture** is landing 2's `shared_capture`, whose
+  `values.append(7)` task took its environment owned and dropped it before
+  this landing. A `void_tasks` fixture covers tasks that return Void: a job
+  slot and a pair member are left out, and a job of two capture-free loops
+  has no slot.
+- **Check.** The label restriction, with exact text and span; a native join
+  of another shape, rejected by its contract; a Blorp `join` is no longer
+  the library's join.
+- **Verify and own.** A unit suite checks that each task borrows its
+  environment when own's test labelling owns every other parameter. It
+  rejects, at the call, a join whose tasks are the wrong way round ("a
+  join's result does not hold its tasks' results"), one that names an
+  instance owning a parameter ("pinned instance has an owned parameter") and
+  one that names a two-parameter instance ("a joined task takes no argument
+  but its environment"). Without the pin, or without verify's pin check, a
+  case fails.
+- **ThreadSanitizer** found nothing in the six fixtures at 4 threads, three
+  runs each of the normal build and one of the diagnostics build for the
+  three that allocate.
+- **The tests bite.** Without the pin, verify rejects `shared_capture`
+  ("pinned instance has an owned parameter"); with verify's check removed as
+  well, ASan reports a heap-use-after-free in `blorp_list_dup`. With the
+  trampolines' result slots swapped, `summary` prints `52 14`, and the three
+  fixtures whose results differ in type fail to compile.
+
+**Timing,** four CPU-bound pure tasks (`spin` with 200,000,000 rounds each),
+`-O2`, no diagnostics, on an Apple M4 (4 performance and 6 efficiency
+cores), macOS 26.7.1, Apple clang 21.0.0. Seven interleaved runs each, and
+each sample includes two Python start-ups, which lowers the ratio. Other
+sessions loaded the machine: the load average was 3.1 to 3.4 for the final
+commit's run, and 2.1 for an earlier one whose C differed only in names.
+
+| `BLORP_THREADS` | Final median | Final range | Earlier median |
+| --- | ---: | ---: | ---: |
+| 1 | 2.908 s | 2.864–3.197 s | 2.284 s |
+| 4 | 0.907 s | 0.832–0.935 s | 0.685 s |
+| Speed-up | 3.21× | | 3.34× |
+
+**Cost,** `self-compile-cost ee5755113 cbd54cb73 --rounds 3`, on the same
+machine, `-O0`. The fixed-input C is identical (`8f14763f5c063f7e`).
+
+| Measure | Base | Candidate | Change |
+| --- | ---: | ---: | ---: |
+| Fixed input, allocations | 13,313,945 | 13,313,948 | +0.0000% |
+| Fixed input, peak heap | 190,306,052 | 190,306,117 | +0.0000% |
+| Fixed input, instructions | 13,525,901,556 | 13,525,533,087 | −0.0027% |
+| Own source, allocations | 13,313,945 | 13,409,383 | +0.72% |
+| Own source, instructions | 13,511,214,535 | 13,618,026,409 | +0.79% |
+
+The fixed-input instruction samples overlap: 13,524.7–13,533.9 M for the
+base and 13,519.1–13,534.7 M for the candidate.
+
+An earlier version missed the ceilings, at +0.34% allocations and +0.22%
+instructions. `ConcurrencyJoin(Element, Element)` was the first operation
+whose copy acquires two counts, so a `CallTarget` could cost two and every
+`ConcreteCall` became a heap record, made once per call in specialization and
+again in emission. The two types now share one `TaskTypes` record, and a
+copy acquires one count again. A second fix kept the task-instance request
+to joins, where it had built a Result for every runtime call.
+
+Every fixture under `test/test_compile/fixtures` but the seven block
+fixtures compiles to the same C, or the same diagnostic, as a compiler built
+from `ee5755113`: 761 of 768 files. The compiler's own source at
+`ee5755113` compiles to the same C (`8f14763f5c063f7e`). Raw samples are in
+`build/landing2a/` of the landing's worktree.
+
+**Lines** for the native, from `ee5755113` and without the pool's 347
+production and 587 test lines: production +476 net (554 added, 78 removed),
+within +500. Tests are +437 net, over the +300 estimate: they stood at +244
+before the soundness review, whose requested cases added 193, the verify and
+own cases and the Void fixture. Of the rest, three codegen tests read the
+now fallible `runtime_signature`, and five pin the label help, which gains
+`concurrency.join`. The coordinator corrected the test ceiling from +300 to
++440 on 2026-11-25, for the verify and own cases and the fixture that
+review asked for; the shared test support has no source-to-lowered-program
+helper to reuse.
+
+**Follow-ups,** not in this landing:
+- **A checked call target for join.** Check could give `join` a call target
+  of its own, so that `ConcurrencyJoin` and `PairResult` cannot exist after
+  specialization. That would remove the five arms that refuse them and make
+  `runtime_signature` total again.
+- **A per-run environment in the e2e harness,** `NativeRun.environment`, so
+  the start-time check and the runs at 1 and 4 threads become automated
+  tests. Landing 3 will want it.
+
+**The pool (landing 2b),** cherry-picked unchanged:
+- **Test-line ceiling corrections:** +400, then +490, +520 and +590.
+- **Leapfrogging.** A thread waiting for a stolen half takes tasks only from
+  that half's thief (Wagner and Calder), so the stack never exceeds the
+  serial run's. Against helping with any task, a C benchmark of four
+  workloads (Fibonacci with and without a cutoff, uneven leaves and uneven
+  halves) at 1, 2, 4 and 8 threads gave medians within 5% in its second run.
+  The first run's gaps of 10 to 20% at one thread, where both take the same
+  path, were noise.
+- **Two review blockers, fixed.** Helping with any task could overflow a
+  stack the serial run fits, which leapfrogging fixed. A waiter paused before
+  its leapfrog steal could win an unrelated task its thief pushed after
+  finishing the awaited one; the steal now checks `done` before the CAS.
+- **Fork, for landing 4.** Idle workers take the pool mutex at any time, to
+  sleep and to be woken, so a forked child that runs Blorp code needs a
+  `pthread_atfork` reset of it.
 
 ### Spike K: the concurrency kernel
 
