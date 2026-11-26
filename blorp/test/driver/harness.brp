@@ -188,20 +188,31 @@ private func link_fixture(
     expect(linked.stderr, "", "C compiler stderr")
 
 
+-- What a strict run's leak check writes as the program's last act.
+union StrictReport:
+    -- Every one of this many allocations was released.
+    BalancedAllocations(Int)
+    -- Nothing: the runtime stopped the program before any of its code ran,
+    -- as it does for a bad BLORP_THREADS.
+    StoppedBeforeStart
+
+
 -- One native invocation. A run that shares its fixture with others has a
 -- `label` naming it in error text; `directory` is where the program starts
 -- (None keeps the runner's own), and `descriptor_limit` the most files it may
--- hold open (None keeps the runner's own). `stderr` is everything the program
--- itself writes to stderr, byte for byte.
+-- hold open (None keeps the runner's own). `environment` is set over the
+-- run's isolated environment: Some sets a variable and None removes it.
+-- `stderr` is everything the program itself writes to stderr, byte for byte.
 record NativeRun {
     label: Option[String],
     arguments: List[String],
     directory: Option[String],
     descriptor_limit: Option[Int],
+    environment: Dict[String, Option[String]],
     status: Int,
     stdout: String,
     stderr: String,
-    allocations: Int
+    report: StrictReport
 }
 
 
@@ -210,8 +221,13 @@ record NativeRun {
 private LIMIT_DESCRIPTORS: String = "ulimit -n \"$1\" && shift && exec \"$@\""
 
 
--- One run of `binary`, isolated; a strict run changes its environment.
-private pure func launch(binary: String, run: NativeRun) -> Result[Command, String]:
+-- One run of `binary`, isolated in `isolation`, with the run's own
+-- environment set over it.
+private pure func launch(
+    binary: String,
+    run: NativeRun,
+    isolation: Dict[String, Option[String]]
+) -> Result[Command, String]:
     started ?= match run.descriptor_limit:
         None:
             isolated(binary, run.arguments, NATIVE_TIMEOUT_MS)
@@ -226,7 +242,12 @@ private pure func launch(binary: String, run: NativeRun) -> Result[Command, Stri
         None: Ok(None)
         Some(text): path_of(text).map(pure func(place: Path) -> Option[Path]: Some(place))
 
-    Ok({ started | directory = directory })
+    var environment = isolation
+
+    for (name, value) in run.environment.entries():
+        environment = environment.set(name, value)
+
+    Ok({ started | directory = directory, environment = environment })
 
 
 private pure func label_suffix(run: NativeRun) -> String:
@@ -236,41 +257,40 @@ private pure func label_suffix(run: NativeRun) -> String:
 
 
 private func run_normal(prefix: String, run: NativeRun) -> Result[Void, String]:
-    launched ?= launch(prefix + ".normal", run)
+    launched ?= launch(prefix + ".normal", run, without_diagnostics())
     ran ?= run_expecting(prefix + label_suffix(run) + ".normal.run", launched, run.status)
     _ ?= expect(ran.stdout, run.stdout, "native stdout" + label_suffix(run))
     expect(ran.stderr, run.stderr, "native stderr" + label_suffix(run))
 
 
 private func run_strict(prefix: String, run: NativeRun) -> Result[Void, String]:
-    launched ?= launch(strict_native_binary(prefix), run)
-
-    ran ?= run_expecting(
-        prefix + label_suffix(run) + ".strict.run",
-        { launched | environment = strict_leak_check() },
-        run.status
-    )
-
+    launched ?= launch(strict_native_binary(prefix), run, strict_leak_check())
+    ran ?= run_expecting(prefix + label_suffix(run) + ".strict.run", launched, run.status)
     _ ?= expect(ran.stdout, run.stdout, "strict native stdout" + label_suffix(run))
 
-    -- The runtime writes its report as the program's last act, after everything
-    -- the program wrote to the same stream. Its peak heap line, last, varies
-    -- with the fixture; the peak heap runtime suite checks its value.
-    report = (
-        ("blorp: leak check: " + run.allocations.to_string() + " allocs, ")
-        + run.allocations.to_string()
-        + " releases, 0 leaked, 0 bytes\n"
-    )
+    match run.report:
+        StoppedBeforeStart:
+            expect(ran.stderr, run.stderr, "strict native stderr" + label_suffix(run))
+        BalancedAllocations(allocations):
+            -- The runtime writes its report as the program's last act, after
+            -- everything the program wrote to the same stream. Its peak heap
+            -- line, last, varies with the fixture; the peak heap runtime suite
+            -- checks its value.
+            report = (
+                ("blorp: leak check: " + allocations.to_string() + " allocs, ")
+                + allocations.to_string()
+                + " releases, 0 leaked, 0 bytes\n"
+            )
 
-    before_peak: String ?= without_peak_heap(ran.stderr).map_err(
-        pure func(error: String): "strict native stderr" + label_suffix(run) + ": " + error
-    )
-
-    expect(
-        before_peak,
-        run.stderr + report,
-        "strict native stderr and accounting" + label_suffix(run)
-    )
+            match without_peak_heap(ran.stderr):
+                Err(error):
+                    Err("strict native stderr" + label_suffix(run) + ": " + error)
+                Ok(before_peak):
+                    expect(
+                        before_peak,
+                        run.stderr + report,
+                        "strict native stderr and accounting" + label_suffix(run)
+                    )
 
 
 private func run_fixture(prefix: String, run: NativeRun) -> Result[Void, String]:
@@ -413,10 +433,11 @@ pure func once_given(
             arguments = arguments,
             directory = None,
             descriptor_limit = None,
+            environment = {},
             status = status,
             stdout = stdout,
             stderr = "",
-            allocations = allocations
+            report = BalancedAllocations(allocations)
         }
     ]
 
@@ -437,10 +458,11 @@ pure func with_arguments(
         arguments = arguments,
         directory = None,
         descriptor_limit = None,
+        environment = {},
         status = status,
         stdout = stdout,
         stderr = "",
-        allocations = allocations
+        report = BalancedAllocations(allocations)
     }
 
 
@@ -517,10 +539,11 @@ pure func writes_errors(
             arguments = [],
             directory = None,
             descriptor_limit = None,
+            environment = {},
             status = status,
             stdout = "",
             stderr = stderr,
-            allocations = allocations
+            report = BalancedAllocations(allocations)
         }
     ])
 
