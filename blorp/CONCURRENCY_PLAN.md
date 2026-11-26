@@ -1105,11 +1105,12 @@ builtin label at parse time, but it reads only the library modules that
   is one, and the compiler's own source uses no concurrency
   (`blorp/AGENTS.md`). Landings 2, 3, 5 and 6 add their syntax, natives,
   library code and fixtures together.
-- **A rotation before a module `src` imports uses a new label.** Moving
-  natives onto helper threads changes `io/files` and `io/console`, which
-  `src` imports, so landing 4's new labels reach the seed before those
-  modules use them. That landing also measures the self-compile cost, since
-  the compiler's own C changes.
+- **A rotation before a module `src` imports uses a new label.** Running
+  natives on helper threads does not need one. Emit calls each system
+  operation's C directly, so the move is runtime C behind unchanged labels
+  and contracts, in `io/files` and `io/console` alike. Landing 4 therefore
+  rotates nothing. It still measures the self-compile cost, since the
+  compiler's own C changes.
 
 The first draft of this plan put a rotation after every compiler landing, as
 the UInt8 and LSP plans had. Those needed one because `src` used their new
@@ -2619,19 +2620,58 @@ compiled code.
 
 **Concurrency, after Spike K:**
 
-4. **Kernel support:**
-   - `Guarded`, `take` and `put`;
-   - the switch, stacks and park;
-   - the blocking pool with cancel descriptors;
-   - the fork lock, the counted signal swap and the line lock;
-   - the kernel-owned stdin;
-   - poll-based console and non-regular-file reads;
-   - `first:` syntax, and impure tasks in `concurrent:`;
-   - Spike K's design changes 3, 4, 6 and 9, under "Spike K results".
+4. **Kernel support.** The coordinator split it on 2026-11-26 into seven
+   slices, after a survey of the code. Each is tested on its own, most as
+   direct-C suites, as landing 2b's pool was.
+   - **4a. Natives safe on several threads:**
+     - the fork lock;
+     - the counted SIGINT and SIGQUIT swap, including `capture`'s child
+       and `exit_interrupted`;
+     - whole lines from `print` and `print_error`;
+     - feature macros before the first include (Spike K's change 9);
+     - an audit of the globals that impure natives touch.
+   - **4b. The fiber primitives:**
+     - kernel locks that spin, then block (change 4);
+     - the switch for arm64 and x86-64, with CET and BTI;
+     - fiber stacks with a lazy commit, a guard and a cache;
+     - the ASan and TSan switch hooks.
+   - **4c. Parking and the blocking pool:**
+     - park and unpark with permits;
+     - the wait word and its claim, with one waker per wait (change 3's C
+       half);
+     - the carrier's idle wait;
+     - the blocking pool. It grows on demand, never queues an unbounded
+       native, and caps the bounded ones;
+     - withdrawing a job (change 6);
+     - one cancel pipe per helper, which bounds descriptors.
+   - **4d. The console:** the kernel-owned stdin with its line lock;
+     poll-based console reads that can be cancelled; and a job for each
+     blocking native.
+   - **4e. Non-regular-file reads.** `open` on a FIFO blocks before `fstat`
+     can run, so this slice starts with a design for telling which reads
+     are unbounded.
+   - **4f. The kernel module and its cell:**
+     - a `KernelModule` role, designated by its path,
+       `concurrency/kernel.brp`, which only the concurrency module may
+       import;
+     - the `Guarded[T]` type, and its constructor, `kernel.guard`.
+   - **4g. `kernel.take`, `kernel.put` and `update`.**
+     - `put` receives its value through a new rule that names the operand a
+       runtime operation owns. In-place reuse moves only operand 0, so it
+       cannot express this.
 
-   Then a seed rotation.
+   **No seed rotation.** Every native keeps its label and contract, so the
+   modules that `src` imports do not change.
+
+   **Moved to landing 5:** `first:` and impure tasks in `concurrent:`.
+   `first:` is typed `First[A]`, and an impure task runs as a fiber, so
+   neither can work before landing 5.
 5. **The MVP:**
+   - `first:` syntax, and impure tasks in `concurrent:`, moved from landing
+     4;
    - fibers, block scopes and the cancellation tree;
+   - `run` reaping through `blorp_process_reap`'s reservation, so a
+     canceller can kill its child (it reaps with a plain `waitpid` today);
    - `First`, `sleep`, `timeout` and `cancelled`;
    - `Duration`, `concurrent_map` and `simulate`;
    - cancellable `capture`, `output` and `run`, and `Command.timeout_ms`
