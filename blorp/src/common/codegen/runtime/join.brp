@@ -1,0 +1,348 @@
+-- The runtime behind the native `join`: a work-stealing pool of threads that
+-- runs the two halves of a join at once. It follows Spike P's pool
+-- (CONCURRENCY_PLAN.md, "Spike P results") and Rayon's join: one Chase-Lev
+-- deque per thread (Le, Pop, Cohen, Zappa Nardelli, PPoPP 2013, the C11
+-- version), jobs on the joining thread's stack, and a thread that waits for a
+-- stolen half runs other work meanwhile. The pool starts on the first join, and
+-- allocates nothing through the Blorp allocator, so allocation counts, the
+-- leak report and the peak heap do not change.
+JOIN_RUNTIME: String =
+    raw
+        |
+        |#include <errno.h>
+        |#include <pthread.h>
+        |#include <stdatomic.h>
+        |#include <stdint.h>
+        |#include <stdio.h>
+        |#include <stdlib.h>
+        |#include <string.h>
+        |#include <sys/resource.h>
+        |#include <unistd.h>
+        |/* The most threads the pool runs, the caller included. A machine with more cores uses this many; far above any
+        |   machine Spike P measured, which scaled to 7.5 on 8 threads. */
+        |enum {BLORP_JOIN_MAX_THREADS=64};
+        |/* Pending right halves one thread can offer; a power of two so an index masks. A deeper nest runs its right halves
+        |   inline. Spike P used 4096, far deeper than its nested maps (a depth of about 25). A test may override it. */
+        |#ifndef BLORP_JOIN_DEQUE_CAPACITY
+        |#define BLORP_JOIN_DEQUE_CAPACITY 4096
+        |#endif
+        |_Static_assert(BLORP_JOIN_DEQUE_CAPACITY>0&&(BLORP_JOIN_DEQUE_CAPACITY&(BLORP_JOIN_DEQUE_CAPACITY-1))==0,"the deque capacity must be a power of two");
+        |/* A test may define this to pause a waiting thread between reading its thief and stealing from it, where the thief can
+        |   meanwhile finish the awaited task. It is empty otherwise. */
+        |#ifndef BLORP_JOIN_BEFORE_LEAPFROG_STEAL
+        |#define BLORP_JOIN_BEFORE_LEAPFROG_STEAL() ((void)0)
+        |#endif
+        |/* Failed steal rounds before a thread sleeps. Spike P's value: sleeping and waking costs microseconds, so a thread
+        |   that expects work soon spins first. */
+        |enum {BLORP_JOIN_SPIN_ROUNDS=64};
+        |/* Keeps each deque's indices on their own cache lines: Apple M-series lines are 128 bytes, x86-64 lines 64, so 128
+        |   covers both. */
+        |enum {BLORP_JOIN_CACHE_LINE_BYTES=128};
+        |/* A pool thread's stack when RLIMIT_STACK is unlimited or unreadable: the 8 MiB Linux and macOS give the main thread. */
+        |#define BLORP_JOIN_STACK_CAP_BYTES ((size_t)8<<20)
+        |/* Guard below each pool thread's stack, so running out of stack faults instead of writing into other memory
+        |   (CONCURRENCY_PLAN.md, "Stack overflow"). It catches a frame up to this size; a larger frame can step over it,
+        |   which -fstack-clash-protection, left to the build, would stop. A multiple of every supported page size, 4 KiB
+        |   and Apple's 16 KiB. */
+        |#define BLORP_JOIN_GUARD_BYTES ((size_t)64<<10)
+        |/* The right half of a join, offered to the other threads. It lives on the joining thread's stack. */
+        |enum {BLORP_JOIN_NO_THIEF=-1};
+        |struct blorp_join_task {
+        |    void (*right)(void *job);
+        |    void *job;
+        |    atomic_int done;
+        |    atomic_int thief; /* the thread that stole it, set before it runs; BLORP_JOIN_NO_THIEF until then */
+        |};
+        |struct blorp_join_deque {
+        |    _Alignas(BLORP_JOIN_CACHE_LINE_BYTES) _Atomic int64_t top;
+        |    _Alignas(BLORP_JOIN_CACHE_LINE_BYTES) _Atomic int64_t bottom;
+        |    _Alignas(BLORP_JOIN_CACHE_LINE_BYTES) struct blorp_join_task *_Atomic slots[BLORP_JOIN_DEQUE_CAPACITY];
+        |};
+        |static struct blorp_join_deque *blorp_join_deques;
+        |/* Written once by blorp_join_start, before any pool thread exists; read-only afterwards. */
+        |static int blorp_join_threads=1;
+        |static pthread_once_t blorp_join_once=PTHREAD_ONCE_INIT;
+        |/* The calling thread's deque. Every thread that is not a pool thread reads 0, so only one such thread, the main
+        |   thread, may join; landing 4's other callers will need a membership flag here. */
+        |static _Thread_local int blorp_join_self;
+        |/* xorshift64 state. A pool thread seeds it from its index, a multiple of the 64-bit golden-ratio constant, which is odd
+        |   and so never zero; thread 0 starts with the constant itself. */
+        |#define BLORP_JOIN_SEED 0x9E3779B97F4A7C15u
+        |static _Thread_local uint64_t blorp_join_random=BLORP_JOIN_SEED;
+        |static atomic_int blorp_join_sleepers;
+        |static atomic_uint blorp_join_epoch;
+        |static pthread_mutex_t blorp_join_mutex=PTHREAD_MUTEX_INITIALIZER;
+        |static pthread_cond_t blorp_join_cond=PTHREAD_COND_INITIALIZER;
+        |static void blorp_join_fail(const char *step,int code){
+        |fprintf(stderr,"error: cannot start the thread pool: %s failed: %s\n",step,strerror(code));
+        |abort();
+        |}
+        |static void blorp_join_pause(void){
+        |#if defined(__aarch64__)
+        |__asm__ __volatile__("yield");
+        |#elif defined(__x86_64__)||defined(__i386__)
+        |__asm__ __volatile__("pause");
+        |#endif
+        |}
+        |/* ---- the deque ---- */
+        |/* Owner only. Returns 0 when the deque is full. */
+        |static int blorp_join_push(struct blorp_join_deque *deque,struct blorp_join_task *task){
+        |const int64_t bottom=atomic_load_explicit(&deque->bottom,memory_order_relaxed);
+        |const int64_t top=atomic_load_explicit(&deque->top,memory_order_acquire);
+        |if(bottom-top>=BLORP_JOIN_DEQUE_CAPACITY)return 0;
+        |atomic_store_explicit(&deque->slots[bottom&(BLORP_JOIN_DEQUE_CAPACITY-1)],task,memory_order_relaxed);
+        |/* A release store, not the paper's release fence and relaxed store: the same ordering, and one ThreadSanitizer sees. */
+        |atomic_store_explicit(&deque->bottom,bottom+1,memory_order_release);
+        |return 1;
+        |}
+        |/* Owner only: the newest task, or NULL when the deque is empty or a thief took the last one. */
+        |static struct blorp_join_task *blorp_join_take(struct blorp_join_deque *deque){
+        |const int64_t bottom=atomic_load_explicit(&deque->bottom,memory_order_relaxed)-1;
+        |atomic_store_explicit(&deque->bottom,bottom,memory_order_relaxed);
+        |/* Pairs with the fence in blorp_join_steal: the owner's lowered bottom and a thief's read of it cannot both miss
+        |   the other, so at most one of them takes the last task. */
+        |atomic_thread_fence(memory_order_seq_cst);
+        |int64_t top=atomic_load_explicit(&deque->top,memory_order_relaxed);
+        |struct blorp_join_task *task=NULL;
+        |if(top<=bottom){
+        |task=atomic_load_explicit(&deque->slots[bottom&(BLORP_JOIN_DEQUE_CAPACITY-1)],memory_order_relaxed);
+        |if(top==bottom){
+        |/* The last task: the owner and a thief race for it, and the compare-and-swap on top picks the winner. */
+        |if(!atomic_compare_exchange_strong_explicit(&deque->top,&top,top+1,memory_order_seq_cst,memory_order_relaxed))task=NULL;
+        |atomic_store_explicit(&deque->bottom,bottom+1,memory_order_relaxed);
+        |}
+        |}else{
+        |atomic_store_explicit(&deque->bottom,bottom+1,memory_order_relaxed);
+        |}
+        |return task;
+        |}
+        |/* Any thread: the oldest task, or NULL when the deque is empty or another thread won it. A leapfrogging thread passes the
+        |   task it awaits, and takes nothing once that is done. Its deque's owner may have finished `awaited`, gone idle and
+        |   pushed an unrelated task since the caller last looked, and winning that task would break the stack bound. The
+        |   `done` load below is after the acquire load of `bottom` and before the compare-and-swap. A task pushed after
+        |   `awaited` finished follows the owner's release store of `done`, and a steal that sees that task acquired its push
+        |   through `bottom`, so it sees `done` set and gives up. A task it wins with `done` clear was pushed while the owner
+        |   ran `awaited`, so it is a descendant. A stale `top` cannot win: it only grows, so the compare-and-swap fails. */
+        |static struct blorp_join_task *blorp_join_steal(struct blorp_join_deque *deque,const struct blorp_join_task *awaited){
+        |int64_t top=atomic_load_explicit(&deque->top,memory_order_acquire);
+        |atomic_thread_fence(memory_order_seq_cst);
+        |const int64_t bottom=atomic_load_explicit(&deque->bottom,memory_order_acquire);
+        |if(top>=bottom)return NULL;
+        |if(awaited!=NULL&&atomic_load_explicit(&awaited->done,memory_order_acquire))return NULL;
+        |struct blorp_join_task *task=atomic_load_explicit(&deque->slots[top&(BLORP_JOIN_DEQUE_CAPACITY-1)],memory_order_relaxed);
+        |if(!atomic_compare_exchange_strong_explicit(&deque->top,&top,top+1,memory_order_seq_cst,memory_order_relaxed))return NULL;
+        |/* Recorded before the task runs, and while its owner cannot return: the owner waits for `done`. A joiner reads it to
+        |   know whose deque holds the task's descendants. */
+        |atomic_store_explicit(&task->thief,blorp_join_self,memory_order_release);
+        |return task;
+        |}
+        |static int blorp_join_has_tasks(const struct blorp_join_deque *deque){
+        |const int64_t top=atomic_load_explicit(&deque->top,memory_order_relaxed);
+        |const int64_t bottom=atomic_load_explicit(&deque->bottom,memory_order_relaxed);
+        |return top<bottom;
+        |}
+        |static int blorp_join_has_work(void){
+        |for(int index=0;index<blorp_join_threads;index++)if(blorp_join_has_tasks(&blorp_join_deques[index]))return 1;
+        |return 0;
+        |}
+        |/* Whether a thread waiting for `awaited` has a task to take: see blorp_join_wait. */
+        |static int blorp_join_has_leapfrog_work(const struct blorp_join_task *awaited){
+        |const int thief=atomic_load_explicit(&awaited->thief,memory_order_acquire);
+        |return thief!=BLORP_JOIN_NO_THIEF&&blorp_join_has_tasks(&blorp_join_deques[thief]);
+        |}
+        |/* One round: try every other thread once, from a random start. */
+        |static struct blorp_join_task *blorp_join_steal_any(void){
+        |blorp_join_random^=blorp_join_random<<13;
+        |blorp_join_random^=blorp_join_random>>7;
+        |blorp_join_random^=blorp_join_random<<17;
+        |const int start=(int)(blorp_join_random%(uint64_t)blorp_join_threads);
+        |for(int offset=0;offset<blorp_join_threads;offset++){
+        |const int victim=(start+offset)%blorp_join_threads;
+        |if(victim==blorp_join_self)continue;
+        |struct blorp_join_task *task=blorp_join_steal(&blorp_join_deques[victim],NULL);
+        |if(task!=NULL)return task;
+        |}
+        |return NULL;
+        |}
+        |/* ---- sleeping ---- */
+        |/* Called after a push or a completion. Two fence pairs prevent a lost wake-up. A sleeper raises `sleepers`, fences,
+        |   then looks for work; a notifier publishes its work, fences, then reads `sleepers`. With both fences seq_cst, one of
+        |   them sees the other: the sleeper finds the work and does not sleep, or the notifier sees the sleeper and wakes it.
+        |   The epoch, bumped under the mutex, closes the gap between the sleeper's look and its wait. */
+        |static void blorp_join_notify(void){
+        |atomic_thread_fence(memory_order_seq_cst);
+        |if(atomic_load_explicit(&blorp_join_sleepers,memory_order_relaxed)==0)return;
+        |pthread_mutex_lock(&blorp_join_mutex);
+        |atomic_fetch_add_explicit(&blorp_join_epoch,1,memory_order_relaxed);
+        |pthread_cond_broadcast(&blorp_join_cond);
+        |pthread_mutex_unlock(&blorp_join_mutex);
+        |}
+        |/* Sleeps until a push or a completion, or until `awaited` (when not NULL) is done. A thread waiting for `awaited` looks
+        |   only for work it may take. The mutex is held only here, never while
+        |   running a task, and pthread_cond_wait releases it while asleep. */
+        |static void blorp_join_sleep(struct blorp_join_task *awaited){
+        |const unsigned epoch=atomic_load_explicit(&blorp_join_epoch,memory_order_relaxed);
+        |atomic_fetch_add_explicit(&blorp_join_sleepers,1,memory_order_relaxed);
+        |atomic_thread_fence(memory_order_seq_cst);
+        |if(awaited==NULL?blorp_join_has_work():(atomic_load_explicit(&awaited->done,memory_order_acquire)||blorp_join_has_leapfrog_work(awaited))){
+        |atomic_fetch_sub_explicit(&blorp_join_sleepers,1,memory_order_relaxed);
+        |return;
+        |}
+        |pthread_mutex_lock(&blorp_join_mutex);
+        |while(atomic_load_explicit(&blorp_join_epoch,memory_order_relaxed)==epoch&&
+        |!(awaited!=NULL&&atomic_load_explicit(&awaited->done,memory_order_acquire)))
+        |pthread_cond_wait(&blorp_join_cond,&blorp_join_mutex);
+        |pthread_mutex_unlock(&blorp_join_mutex);
+        |atomic_fetch_sub_explicit(&blorp_join_sleepers,1,memory_order_relaxed);
+        |}
+        |/* Runs a task another thread offered. Nothing may touch `task` after `done` is set: its owner may return and reuse
+        |   the stack at once. */
+        |static void blorp_join_execute(struct blorp_join_task *task){
+        |void (*const right)(void *job)=task->right;
+        |void *const job=task->job;
+        |atomic_int *const done=&task->done;
+        |right(job);
+        |atomic_store_explicit(done,1,memory_order_release);
+        |blorp_join_notify();
+        |}
+        |/* Spins, then sleeps, when a thread found nothing to run. */
+        |static void blorp_join_idle(int *idle_rounds,struct blorp_join_task *awaited){
+        |if(++*idle_rounds<BLORP_JOIN_SPIN_ROUNDS){
+        |blorp_join_pause();
+        |}else{
+        |blorp_join_sleep(awaited);
+        |*idle_rounds=0;
+        |}
+        |}
+        |/* A pool thread's whole life: it has no join in progress, so its stack is empty and it may take any task. */
+        |static void *blorp_join_worker(void *index){
+        |blorp_join_self=(int)(intptr_t)index;
+        |blorp_join_random=BLORP_JOIN_SEED*((uint64_t)blorp_join_self+1);
+        |int idle_rounds=0;
+        |for(;;){
+        |struct blorp_join_task *task=blorp_join_steal_any();
+        |if(task!=NULL){
+        |blorp_join_execute(task);
+        |idle_rounds=0;
+        |}else{
+        |blorp_join_idle(&idle_rounds,NULL);
+        |}
+        |}
+        |return NULL;
+        |}
+        |/* Waits for `awaited`, a task of this thread's that a thief took, and runs the thief's tasks meanwhile (leapfrogging,
+        |   Wagner and Calder, PLDI 1993). Running any task would put an unrelated one on top of this thread's waiting frames, and
+        |   a stack the serial run never needs could overflow: a program must give what its serial run gives. So a waiting thread
+        |   takes tasks only from the thief of `awaited`. They are its descendants, because:
+        |   - a thread steals only with an empty deque: a pool thread has no join in progress, and a thread waiting for a stolen
+        |     task has an empty deque, since thieves take the oldest task first, so every older task was taken before `awaited`;
+        |   - so everything the thief pushes while it runs `awaited` is below `awaited`.
+        |   The stack is then within the serial run's along every path, plus a few runtime frames (finish, wait, execute) per
+        |   level: the waiting frames, then a descendant of `awaited`, which the serial run would have run in this very place. The thief never waits for this thread, so the wait ends. */
+        |static void blorp_join_wait(struct blorp_join_task *awaited){
+        |int idle_rounds=0;
+        |while(!atomic_load_explicit(&awaited->done,memory_order_acquire)){
+        |const int thief=atomic_load_explicit(&awaited->thief,memory_order_acquire);
+        |struct blorp_join_task *task=NULL;
+        |if(thief!=BLORP_JOIN_NO_THIEF){
+        |BLORP_JOIN_BEFORE_LEAPFROG_STEAL();
+        |task=blorp_join_steal(&blorp_join_deques[thief],awaited);
+        |}
+        |if(task!=NULL){
+        |blorp_join_execute(task);
+        |idle_rounds=0;
+        |}else{
+        |blorp_join_idle(&idle_rounds,awaited);
+        |}
+        |}
+        |}
+        |/* ---- start ---- */
+        |/* BLORP_THREADS, or one thread per online processor; unset and empty both mean the default, as BLORP_LEAK_CHECK treats
+        |   them. A value above the maximum is clamped, since the thread count never changes a program's output. */
+        |static int blorp_join_requested_threads(void){
+        |const char *text=getenv("BLORP_THREADS");
+        |long long requested;
+        |if(text==NULL||text[0]=='\0'){
+        |const long online=sysconf(_SC_NPROCESSORS_ONLN);
+        |requested=online<1?1:online;
+        |}else{
+        |char *end=NULL;
+        |requested=strtoll(text,&end,10);
+        |/* strtoll also accepts a sign and leading blanks; only digits are a thread count. */
+        |if(text[0]<'0'||text[0]>'9'||*end!='\0'||requested<=0){
+        |fputs("error: BLORP_THREADS must be a positive integer or unset\n",stderr);exit(1);
+        |}
+        |}
+        |return requested>BLORP_JOIN_MAX_THREADS?BLORP_JOIN_MAX_THREADS:(int)requested;
+        |}
+        |/* The main thread's stack size, so deep pure recursion does not overflow on a pool thread where it would not on the
+        |   main one: macOS gives secondary threads 512 KiB by default. A whole number of pages, as macOS requires. */
+        |static size_t blorp_join_stack_bytes(void){
+        |struct rlimit limit;
+        |size_t bytes=BLORP_JOIN_STACK_CAP_BYTES;
+        |if(getrlimit(RLIMIT_STACK,&limit)==0&&limit.rlim_cur!=RLIM_INFINITY&&limit.rlim_cur<=SIZE_MAX)bytes=(size_t)limit.rlim_cur;
+        |const long page=sysconf(_SC_PAGESIZE);
+        |return page>0?bytes-bytes%(size_t)page:bytes;
+        |}
+        |static void blorp_join_start(void){
+        |blorp_join_threads=blorp_join_requested_threads();
+        |if(blorp_join_threads==1)return;
+        |const size_t bytes=sizeof *blorp_join_deques*(size_t)blorp_join_threads;
+        |blorp_join_deques=aligned_alloc(BLORP_JOIN_CACHE_LINE_BYTES,bytes);
+        |if(blorp_join_deques==NULL)blorp_join_fail("aligned_alloc",ENOMEM);
+        |memset(blorp_join_deques,0,bytes);
+        |pthread_attr_t attributes;
+        |int code=pthread_attr_init(&attributes);
+        |if(code!=0)blorp_join_fail("pthread_attr_init",code);
+        |code=pthread_attr_setstacksize(&attributes,blorp_join_stack_bytes());
+        |if(code!=0)blorp_join_fail("pthread_attr_setstacksize",code);
+        |code=pthread_attr_setguardsize(&attributes,BLORP_JOIN_GUARD_BYTES);
+        |if(code!=0)blorp_join_fail("pthread_attr_setguardsize",code);
+        |/* Detached: the pool lives until the process ends, and exit does not wait for it. */
+        |code=pthread_attr_setdetachstate(&attributes,PTHREAD_CREATE_DETACHED);
+        |if(code!=0)blorp_join_fail("pthread_attr_setdetachstate",code);
+        |for(int index=1;index<blorp_join_threads;index++){
+        |pthread_t thread;
+        |code=pthread_create(&thread,&attributes,blorp_join_worker,(void *)(intptr_t)index);
+        |if(code!=0)blorp_join_fail("pthread_create",code);
+        |}
+        |pthread_attr_destroy(&attributes);
+        |}
+        |/* ---- join ---- */
+        |/* Waits for the offered right half: takes it back and runs it here when no thread stole it, and otherwise waits for
+        |   the thief, helping it. */
+        |static void blorp_join_finish(struct blorp_join_task *task){
+        |struct blorp_join_deque *const own=&blorp_join_deques[blorp_join_self];
+        |/* Nothing but joins push, and each join is finished before its caller continues, so the newest task in the
+        |   deque is this one, or a thief has it, and then every older task was taken first and the deque is empty.
+        |   Leapfrogging runs the thief's tasks, whose own joins finish before they return, so this still holds. Anything
+        |   else is a defect in the pool. */
+        |struct blorp_join_task *newest=blorp_join_take(own);
+        |if(newest==task){
+        |task->right(task->job);
+        |return;
+        |}
+        |if(newest!=NULL){
+        |fputs("error: thread pool invariant broken: a join found another task in its deque\n",stderr);
+        |abort();
+        |}
+        |blorp_join_wait(task);
+        |}
+        |void blorp_join(void (*left)(void *job),void (*right)(void *job),void *job){
+        |pthread_once(&blorp_join_once,blorp_join_start);
+        |struct blorp_join_task task;
+        |task.right=right;
+        |task.job=job;
+        |atomic_init(&task.done,0);
+        |atomic_init(&task.thief,BLORP_JOIN_NO_THIEF);
+        |/* With one thread, or a full deque, both halves run here, left first. */
+        |if(blorp_join_threads==1||!blorp_join_push(&blorp_join_deques[blorp_join_self],&task)){
+        |left(job);
+        |right(job);
+        |return;
+        |}
+        |blorp_join_notify();
+        |left(job);
+        |blorp_join_finish(&task);
+        |}
+        |

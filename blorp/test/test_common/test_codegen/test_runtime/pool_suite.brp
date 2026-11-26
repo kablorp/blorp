@@ -1,0 +1,315 @@
+import:
+    io/process: CaptureError, Exit(Exited, Signaled), capture
+    test: TestSuite
+    ../../../../src/common/codegen/runtime/join: JOIN_RUNTIME
+    ../../../../src/common/codegen/runtime/memory: MEMORY_RUNTIME
+    ../../../driver/file_access: write_file
+    ../../../driver/harness: ending, isolated, run_expecting
+    ../../../driver/reports: without_peak_heap
+
+
+private COMPILE_TIMEOUT_MS: Int = 600000
+private CHILD_TIMEOUT_MS: Int = 60000
+-- The pool sizes of the cases: serial, a pair, a typical machine and more
+-- threads than most test machines have cores.
+private THREAD_COUNTS: List[Int] = [1, 2, 4, 8]
+-- The leapfrog gap case needs exactly three: with more, an idle thread takes the
+-- unrelated task before the paused waiter does, and the case no longer tests it.
+private GAP_THREADS: List[Int] = [3]
+-- A probe is built with or without memory diagnostics, which count every
+-- allocation, and with the pool's default deque capacity or a small one that the
+-- overflow case, which nests far deeper, fills.
+private DIAGNOSTIC: List[String] = ["-DBLORP_MEMORY_DIAGNOSTICS=1"]
+private NORMAL: List[String] = ["-DBLORP_MEMORY_DIAGNOSTICS=0"]
+
+
+private DIAGNOSTIC_SMALL: List[String] = [
+    "-DBLORP_MEMORY_DIAGNOSTICS=1",
+    "-DBLORP_JOIN_DEQUE_CAPACITY=8"
+]
+
+
+private NORMAL_SMALL: List[String] = [
+    "-DBLORP_MEMORY_DIAGNOSTICS=0",
+    "-DBLORP_JOIN_DEQUE_CAPACITY=8"
+]
+
+
+-- SIGABRT, which a failed thread start ends the program with, as an allocation
+-- failure does.
+private ABORT_SIGNAL: Int = 6
+private BAD_THREADS_MESSAGE: String = "error: BLORP_THREADS must be a positive integer or unset\n"
+
+
+-- The wrapper in the fixture fails creation with EAGAIN.
+private START_FAILURE_MESSAGE: String = "error: cannot start the thread pool: pthread_create failed: Resource temporarily unavailable\n"
+
+
+-- The pool allocates nothing through the Blorp allocator, so a strict run that
+-- joins and exits reports no allocation at all.
+private IDLE_EXIT_REPORT: String = "blorp: leak check: 0 allocs, 0 releases, 0 leaked, 0 bytes\n"
+
+
+-- The executables of the pool probe: with memory diagnostics, which count every
+-- allocation, and without, and each with the pool's default deque capacity or a
+-- small one that the overflow case fills.
+private record Probes {
+    diagnostic: String,
+    normal: String,
+    diagnostic_small: String,
+    normal_small: String
+}
+
+
+-- Builds the probe `name` from the runtime files in `directory`, with `defines`.
+private func build_probe(
+    c_compiler: String,
+    directory: String,
+    name: String,
+    defines: List[String]
+) -> Result[String, String]:
+    executable = directory + "/" + name
+
+    command ?= isolated(
+        c_compiler,
+        [
+            "-std=c11",
+            "-O0",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            "-pedantic",
+            "-pthread",
+            "-fsanitize=address,undefined",
+            "-fno-sanitize-recover=all"
+        ]
+            .concat(defines)
+            .concat([
+                "-I",
+                directory,
+                "blorp/test/test_common/test_codegen/test_runtime/fixtures/pool_test.c",
+                "-o",
+                executable
+            ]),
+        COMPILE_TIMEOUT_MS
+    )
+
+    built ?= run_expecting("pool native build", command, 0)
+
+    if built.stderr == "":
+        Ok(executable)
+    else:
+        Err("pool native build: " + built.stderr)
+
+
+private func ready(c_compiler: String, directory: String) -> Result[Probes, String]:
+    _ ?= write_file(directory + "/memory_runtime.c", MEMORY_RUNTIME)
+    _ ?= write_file(directory + "/join_runtime.c", JOIN_RUNTIME)
+    diagnostic ?= build_probe(c_compiler, directory, "probe", DIAGNOSTIC)
+    normal ?= build_probe(c_compiler, directory, "probe_normal", NORMAL)
+    diagnostic_small ?= build_probe(c_compiler, directory, "probe_small", DIAGNOSTIC_SMALL)
+    normal_small ?= build_probe(c_compiler, directory, "probe_normal_small", NORMAL_SMALL)
+
+    Ok({
+        diagnostic = diagnostic,
+        normal = normal,
+        diagnostic_small = diagnostic_small,
+        normal_small = normal_small
+    })
+
+
+-- A run of the probe with BLORP_THREADS = `threads` (unset when None), which
+-- must end as `exit`, print nothing to stdout and print `stderr`, less a strict
+-- run's peak heap line, to stderr. `strict` turns the strict leak check on.
+private func run_matches(
+    executable: String,
+    mode: String,
+    threads: Option[String],
+    strict: Bool,
+    exit: Exit,
+    stderr: String
+) -> Result[Void, String]:
+    leak_check: Option[String] = if strict:
+        Some("strict")
+    else:
+        None
+
+    run ?= isolated(executable, [mode], CHILD_TIMEOUT_MS)
+
+    environment = run.environment
+        .set("BLORP_THREADS", threads)
+        .set("BLORP_LEAK_CHECK", leak_check)
+        .set("BLORP_ALLOCATION_SITES", None)
+
+    label = "${mode} with BLORP_THREADS=${threads.get_or("unset")}"
+    invocation = { run | environment = environment }
+
+    captured ?= capture(invocation).map_err(
+        pure func(error: CaptureError) -> String: "${label}: ${error}"
+    )
+
+    before_peak ?= if strict:
+        without_peak_heap(captured.stderr).map_err(
+            pure func(error: String) -> String: label + ": " + error
+        )
+    else:
+        Ok(captured.stderr)
+
+    if (
+        (captured.exit == exit)
+            .and(captured.stdout == "")
+            .and(before_peak == stderr)
+    ):
+        Ok(void)
+    else:
+        Err(
+            "${label}: expected ${exit.ending(None)}, stderr [${stderr}] and no stdout; got ${captured.exit.ending(invocation.timeout_ms)}, [${before_peak}] and [${captured.stdout}]"
+        )
+
+
+private func report(checked: Result[Void, String]) -> Bool:
+    match checked:
+        Ok(_):
+            True
+        Err(error):
+            print_error(error)
+            False
+
+
+-- `mode` succeeds with `stderr` at each of `counts`.
+private func at_counts(
+    executable: String,
+    mode: String,
+    counts: List[Int],
+    strict: Bool,
+    stderr: String
+) -> Bool:
+    var checked: Result[Void, String] = Ok(void)
+
+    for count in counts:
+        if checked.is_ok():
+            checked = run_matches(executable, mode, Some("${count}"), strict, Exited(0), stderr)
+
+    report(checked)
+
+
+private func succeeds(executable: String, mode: String) -> Bool:
+    at_counts(executable, mode, THREAD_COUNTS, False, "")
+
+
+-- A thread that cannot be created stops the program, with the cause.
+private func stops_when_thread_creation_fails(executable: String) -> Bool:
+    report(
+        run_matches(
+            executable,
+            "creation_fails",
+            Some("4"),
+            False,
+            Signaled(ABORT_SIGNAL),
+            START_FAILURE_MESSAGE
+        )
+    )
+
+
+-- BLORP_THREADS = `value` is rejected with the message, or, when `value` is
+-- empty, taken as unset, as an empty BLORP_LEAK_CHECK is.
+private func rejects_threads(executable: String, value: String) -> Bool:
+    if value == "":
+        report(run_matches(executable, "start", Some(value), False, Exited(0), ""))
+    else:
+        report(run_matches(executable, "start", Some(value), False, Exited(1), BAD_THREADS_MESSAGE))
+
+
+func suite(c_compiler: String, directory: String) -> TestSuite:
+    match ready(c_compiler, directory):
+        Err(error):
+            print_error(error)
+
+            { description = "Thread pool setup", tests = [("native probes build", func(): False)] }
+        Ok(probes):
+            {
+                description = "Work-stealing pool behind join",
+                tests = [
+                    (
+                        "nested joins, diagnostics",
+                        func(): succeeds(probes.diagnostic, "nested_joins")
+                    ),
+                    ("nested joins, normal", func(): succeeds(probes.normal, "nested_joins")),
+                    (
+                        "uneven halves, diagnostics",
+                        func(): succeeds(probes.diagnostic, "uneven_halves")
+                    ),
+                    ("uneven halves, normal", func(): succeeds(probes.normal, "uneven_halves")),
+                    (
+                        "deep recursion, diagnostics",
+                        func(): succeeds(probes.diagnostic, "deep_recursion")
+                    ),
+                    ("deep recursion, normal", func(): succeeds(probes.normal, "deep_recursion")),
+                    (
+                        "helping stays within the serial stack, diagnostics",
+                        func(): succeeds(probes.diagnostic, "helping_stack")
+                    ),
+                    (
+                        "helping stays within the serial stack, normal",
+                        func(): succeeds(probes.normal, "helping_stack")
+                    ),
+                    (
+                        "a waiter whose thief finished takes nothing, diagnostics",
+                        func(): at_counts(
+                            probes.diagnostic,
+                            "leapfrog_gap",
+                            GAP_THREADS,
+                            False,
+                            ""
+                        )
+                    ),
+                    (
+                        "a waiter whose thief finished takes nothing, normal",
+                        func(): at_counts(probes.normal, "leapfrog_gap", GAP_THREADS, False, "")
+                    ),
+                    (
+                        "last task taken back or stolen, diagnostics",
+                        func(): succeeds(probes.diagnostic, "take_back_race")
+                    ),
+                    (
+                        "last task taken back or stolen, normal",
+                        func(): succeeds(probes.normal, "take_back_race")
+                    ),
+                    (
+                        "n threads start n - 1, diagnostics",
+                        func(): succeeds(probes.diagnostic, "thread_count")
+                    ),
+                    (
+                        "n threads start n - 1, normal",
+                        func(): succeeds(probes.normal, "thread_count")
+                    ),
+                    (
+                        "full deque, diagnostics",
+                        func(): succeeds(probes.diagnostic_small, "deque_overflow")
+                    ),
+                    ("full deque, normal", func(): succeeds(probes.normal_small, "deque_overflow")),
+                    ("BLORP_THREADS=0 stops", func(): rejects_threads(probes.normal, "0")),
+                    ("BLORP_THREADS=-3 stops", func(): rejects_threads(probes.normal, "-3")),
+                    ("BLORP_THREADS=+4 stops", func(): rejects_threads(probes.normal, "+4")),
+                    ("BLORP_THREADS=' 4' stops", func(): rejects_threads(probes.normal, " 4")),
+                    ("BLORP_THREADS=x stops", func(): rejects_threads(probes.normal, "x")),
+                    (
+                        "an empty BLORP_THREADS means unset",
+                        func(): rejects_threads(probes.normal, "")
+                    ),
+                    (
+                        "a thread that cannot be created stops the program",
+                        func(): stops_when_thread_creation_fails(probes.normal)
+                    ),
+                    (
+                        "exit while idle leaves a clean strict report",
+                        func(): at_counts(
+                            probes.diagnostic,
+                            "exit_while_idle",
+                            THREAD_COUNTS,
+                            True,
+                            IDLE_EXIT_REPORT
+                        )
+                    )
+                ]
+            }
