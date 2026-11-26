@@ -81,12 +81,13 @@ done.
     the cost follow-ups the plan lists.
 - **Union destructuring removal:**
   [`UNION_DESTRUCTURING_REMOVAL_PLAN.md`](UNION_DESTRUCTURING_REMOVAL_PLAN.md).
-  - **Status:** proposed on 2026-11-26. Keith chose `match` as the one way to
+  - **Status:** approved on 2026-11-26. Keith chose `match` as the one way to
     read a union. The plan has five landings: a resource union matched in its
     module, lower flattening a selection with no test, a rotation, the
     migration of 204 sites, then deleting destructuring. The net is about −75
     to −135 lines.
-  - **Next:** Keith's three decisions in the plan, then landing 1.
+  - **Next:** landing 1, a resource union matched in its module. Keith
+    accepted the plan's three decisions on 2026-11-26.
 - **UInt8 and Bytes:** [`UINT8_BYTES_PLAN.md`](UINT8_BYTES_PLAN.md).
   - **Status:** U1 to U9 and B1 to B3 are decided. L0, the
     `IntegerType(Int64Format)` refactor, and L1, the compiler's `UInt8` with

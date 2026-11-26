@@ -1,7 +1,8 @@
 # Union destructuring removal plan
 
-**Status: proposed, 2026-11-26.** Keith asked for this plan on 2026-11-26.
-Each landing waits for his word.
+**Status: approved, 2026-11-26.** Keith asked for this plan on 2026-11-26 and
+accepted its three decisions the same day ("Accept all three"). Each landing
+waits for his word.
 
 **The direction.** On 2026-11-26 Keith compared an accessor written both
 ways, after the help fixes landed:
@@ -383,7 +384,9 @@ would be Keith's decision, not a routine correction.
 - The `declares no public Point` wording, which `PRIVATE_VARIANTS_PLAN.md`
   records.
 
-## Decisions for Keith
+## Decisions
+
+Keith accepted all three on 2026-11-26.
 
 1. **The binding form for the 47 sites that keep going**
    (`contents = match self: Dict.Init(contents): contents`), rather than
@@ -391,5 +394,5 @@ would be Keith's decision, not a routine correction.
 2. **A parser rejection with a migration help,** rather than leaving the line
    to today's generic "expected a newline after the return expression".
 3. **Landing 2's flattening, and a rotation, before the migration,** so that
-   the migration costs nothing. The alternative is to take about +0.66%
+   the migration costs nothing. The alternative was to take about +0.66%
    instructions on the self-compile and flatten later.
