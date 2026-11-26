@@ -1,10 +1,10 @@
 # Private variants plan
 
-**Status: in progress, 2026-11-25.** Keith approved the design and asked for
-this plan, then started it with landing 0. Landings 0 to 6 have landed, and
-opaque types are gone. Landing 7, destructuring the other single-variant
-unions, has landed too; only the optional landing 8 remains. Landing 0 belongs to [`EQUALITY_PLAN.md`](EQUALITY_PLAN.md),
-which records its results.
+**Status: done, 2026-11-25.** Keith approved the design and asked for this
+plan, then started it with landing 0. Landings 0 to 8 have landed, and opaque
+types are gone. The deferred help fixes and destructuring through an alias
+followed on 2026-11-26. Memoized erasure and the cost follow-ups wait. Landing 0
+belongs to [`EQUALITY_PLAN.md`](EQUALITY_PLAN.md), which records its results.
 
 **The direction.** Keith chose it in discussion:
 
@@ -848,6 +848,29 @@ are one follow-up with its own ceiling of +140, counted against the stack:
 - **Destructuring through an import alias** (`ids.Len(v) = m`) has no
   accepted form, and gets the generic value-line error. Construction and
   patterns accept `alias.Variant`, so destructuring should too. About +20.
+
+**Result (2026-11-26).** The follow-up adds `VariantUse` (`Built`,
+`Matched`, `Destructured`) to `ForeignPrivateVariant` and a
+`QualifiedVariantNotOffered` error for the alias spelling in patterns and
+destructurings, so `QualifiedNotOffered` keeps no field that means nothing
+for a function. `Unoffered` gains `SeveralPrivateVariants`, returned only
+when two or more of a spelling's variants are declared private and none is
+public, and `ParsedVariantBinding.variant` is a `PatternHead`, which deletes
+`DestructuredVariant` and accepts `alias.Variant(x) = value`. Production +171
+lines; tests +284. `self-compile-cost`: fixed-input C identical, allocations
+and peak heap identical, fixed-input instructions +0.0508%.
+
+- **Ceiling corrections, routine (coordinator).** The production ceiling went
+  from +140 to +160 before implementation, for the alias spellings of the
+  pattern and destructuring helps (`mail.Checked(_)`,
+  `email.Checked(text) = ...`), which the estimate left out and without which
+  the two spellings would disagree. It went from +160 to +175 for the
+  review's fixes (+12): `SeveralPrivateVariants` limited to declared-private
+  entries, so imported and implicit ones keep their reasons, a doc line and a
+  rename. The test ceiling was +300.
+- **Left for later.** `module ./m declares no public Point`, for a public
+  type written as `m.Point(...)`, is wrong in both the call and the
+  destructuring forms: it should say that `Point` is not a constructor.
 
 A fourth, dropped: the namespace would carry whether a variant is private by
 its mark or through its union, so render need not read `UnionRow.visibility`.

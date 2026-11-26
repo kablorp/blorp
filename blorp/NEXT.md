@@ -73,9 +73,11 @@ done.
     destructuring single-variant unions not stored as their payload, +122
     lines (2026-11-25). Landing 8, the `NominalId` and `EqualityOwner`
     collapse into `AggregateId`, −87 lines (2026-11-25). The plan stands at
-    +185 production lines and is done.
-  - **Next:** nothing in the plan. Waiting as follow-ups: the deferred help and alias-destructuring fixes, memoized
-    erasure, and the cost follow-ups the plan lists.
+    +185 production lines and is done. The deferred help fixes and
+    destructuring through an import alias (`ids.Len(v) = m`) followed, +171
+    lines (2026-11-26).
+  - **Next:** nothing in the plan. Waiting as follow-ups: memoized erasure and
+    the cost follow-ups the plan lists.
 - **UInt8 and Bytes:** [`UINT8_BYTES_PLAN.md`](UINT8_BYTES_PLAN.md).
   - **Status:** U1 to U9 and B1 to B3 are decided. L0, the
     `IntegerType(Int64Format)` refactor, and L1, the compiler's `UInt8` with

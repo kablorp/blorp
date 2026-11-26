@@ -144,7 +144,6 @@ import:
         SYSTEM_OPERATIONS,
         ParsedPropagation,
         ParsedVariantBinding,
-        DestructuredVariant(BareVariant, UnionVariant),
         ParsedWhile,
         ParsedFor,
         ParsedConcurrentBlock,
@@ -4200,32 +4199,47 @@ private pure func at_variant_name(state: ParserState, position: Int) -> Bool:
             False
 
 
--- Whether the line is `Name(...) =` or `Union.Name(...) =`: a variant, then a
--- '(' whose matching ')' is followed by '=' or '?='. Like a line that starts
--- with '(', it commits at that ')'. Every line that starts with a value
--- reaches this test: one that starts with no variant reads one token, and the
--- rest are read by position, since a shifted ParserState is a new record.
+-- Whether the token at `position` is a module alias the import block declared.
+private pure func at_module_alias(state: ParserState, position: Int) -> Bool:
+    match state.input.tokens.get(position):
+        Some(token):
+            match token.kind:
+                IdentifierToken(id, _): state.is_module_alias(id)
+                _: False
+        None:
+            False
+
+
+-- Whether the line is `Name(...) =`, `Union.Name(...) =` or
+-- `alias.Name(...) =`: a variant, then a '(' whose matching ')' is followed by
+-- '=' or '?='. Like a line that starts with '(', it commits at that ')'. Every
+-- line that starts with a value reaches this test: one that starts with no
+-- head reads one token, and the rest are read by position, since a shifted
+-- ParserState is a new record. A lower-case first name heads only when it is
+-- a declared alias, as for a qualified value, so `list.append(x)` stays a call.
 private pure func at_variant_binding(state: ParserState) -> Bool:
     var position = state.position + 1
     var depth: Int = 0
     var closed: Bool = False
+    var headed: Bool = state.at_variant_name(state.position)
 
-    if state.at_variant_name(state.position):
-        if and(state.symbol_at(position) == Some(Dot), state.at_variant_name(position + 1)):
+    if and(state.symbol_at(position) == Some(Dot), state.at_variant_name(position + 1)):
+        if headed.or(state.at_module_alias(state.position)):
+            headed = True
             position = position + 2
 
-        if state.symbol_at(position) == Some(LeftParen):
-            while and(closed.not(), position < state.input.tokens.length()):
-                match state.symbol_at(position):
-                    Some(LeftParen):
-                        depth = depth + 1
-                    Some(RightParen):
-                        depth = depth - 1
-                        closed = depth == 0
-                    _:
-                        void
+    if and(headed, state.symbol_at(position) == Some(LeftParen)):
+        while and(closed.not(), position < state.input.tokens.length()):
+            match state.symbol_at(position):
+                Some(LeftParen):
+                    depth = depth + 1
+                Some(RightParen):
+                    depth = depth - 1
+                    closed = depth == 0
+                _:
+                    void
 
-                position = position + 1
+            position = position + 1
 
     if closed:
         match state.symbol_at(position):
@@ -4244,19 +4258,41 @@ private pure func consume_payload_binder(
     Ok({ item = binder, next = member.next })
 
 
--- `Name(binders) = value` or `Union.Name(binders) = value`, which
--- `at_variant_binding` found. Its binders are read as a tuple's are.
+-- The head `at_variant_binding` found, after its first name.
+private pure func consume_variant_head(
+    head: ParsedName
+) -> Result[ParsedItem[PatternHead], Diagnostic]:
+    match head.variant_after():
+        Some(variant):
+            Ok({
+                item = UnionVariantHead({ union_name = head.name, variant = variant.name }),
+                next = variant.next
+            })
+        None:
+            if head.next.at_dot():
+                match (
+                    head.next
+                        .shifted(1)
+                        .consume_used_name("expected a variant name after the module alias and '.'")
+                ):
+                    Ok(member):
+                        Ok({
+                            item = QualifiedHead({ module = head.name, name = member.name }),
+                            next = member.next
+                        })
+                    Err(error):
+                        Err(error)
+            else:
+                Ok({ item = BareHead(head.name), next = head.next })
+
+
+-- `Name(binders) = value`, `Union.Name(binders) = value` or
+-- `alias.Name(binders) = value`, which `at_variant_binding` found. Its binders
+-- are read as a tuple's are.
 private pure func consume_variant_binding(state: ParserState) -> Result[LineForm, Diagnostic]:
     head ?= state.consume_used_name("expected a variant name")
 
-    written: ParsedItem[DestructuredVariant] = match head.variant_after():
-        Some(variant):
-            {
-                item = UnionVariant({ union_name = head.name, variant = variant.name }),
-                next = variant.next
-            }
-        None:
-            { item = BareVariant(head.name), next = head.next }
+    written ?= head.consume_variant_head()
 
     listed ?= written.next
         .shifted(1)

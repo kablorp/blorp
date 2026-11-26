@@ -14,7 +14,7 @@ import:
         ParsedDictEntry,
         ParsedQualified,
         ParsedUnionVariant,
-        DestructuredVariant(BareVariant, UnionVariant)
+        PatternHead(BareHead, QualifiedHead, UnionVariantHead)
     ../../utils/results: first_error, translated_list
     ../ids: RecordId, UnionId, VariantId
     ../namespace/namespace:
@@ -22,6 +22,7 @@ import:
         Namespace,
         NamedValue(NamedConstant, NamedConstructor, NamedVariants),
         OfferedValue(OfferedConstructor),
+        Unoffered(UnknownName),
         TypeHead(ListHead, PrimitiveHead, RecordHead, UnionHead)
     ./callables: FunctionContract, ResolutionContext
     ./declarations:
@@ -42,7 +43,8 @@ import:
             TraitQualifier,
             TypeParameterQualifier
         ),
-        QualifiedError(QualifiedNotOffered),
+        QualifiedError(QualifiedVariantNotOffered),
+        VariantUse(Built, Matched, Destructured),
         match_error,
         qualified_error,
         ConstructorError(
@@ -118,7 +120,7 @@ import:
         visible_variants
     ./name_uses:
         NameUse,
-        Referent(VariantReferent),
+        Referent(ModuleReferent, VariantReferent),
         WrittenUses(OneUse, QualifiedUses),
         name_use,
         union_use
@@ -247,6 +249,25 @@ pure func find_variant(
                 Err(error): Err(error)
 
 
+-- `alias.Variant` names no variant the module offers, for the reason given.
+private pure func variant_not_offered(
+    qualified: ParsedQualified,
+    aliased: AliasedModule,
+    reason: Unoffered,
+    use: VariantUse
+) -> CheckError:
+    qualified_error(
+        qualified.name.span,
+        QualifiedVariantNotOffered(
+            qualified.module.id,
+            qualified.name.id,
+            aliased.path,
+            reason,
+            use
+        )
+    )
+
+
 -- Qualification selects an exported declaration, then the same membership
 -- authority as a bare head checks it against the scrutinee's union.
 pure func find_qualified_variant(
@@ -261,17 +282,7 @@ pure func find_qualified_variant(
         Ok(_):
             Ok(None)
         Err(reason):
-            Err(
-                qualified_error(
-                    qualified.name.span,
-                    QualifiedNotOffered(
-                        qualified.module.id,
-                        qualified.name.id,
-                        aliased.path,
-                        reason
-                    )
-                )
-            )
+            Err(qualified.variant_not_offered(aliased, reason, Matched))
 
     match declared:
         None:
@@ -357,7 +368,8 @@ pure func unknown_value_error(context: ConstructionContext, name: WrittenName) -
 private pure func variant_of_union(
     context: ConstructionContext,
     owner: UnionId,
-    written: ParsedUnionVariant
+    written: ParsedUnionVariant,
+    use: VariantUse
 ) -> Result[VariantId, CheckError]:
     declaration ?= context.unions
         .get(owner.union_number())
@@ -371,7 +383,8 @@ private pure func variant_of_union(
         None:
             match declaration.variants.variant_named(written.variant.id):
                 Some(hidden):
-                    Err(constructor_error(written.variant.span, ForeignPrivateVariant(hidden.id)))
+                    refused: ConstructorError = ForeignPrivateVariant(hidden.id, use)
+                    Err(constructor_error(written.variant.span, refused))
                 None:
                     Err(
                         constructor_error(
@@ -388,10 +401,11 @@ private pure func variant_of_union(
 -- `X.Y` names variant `Y` of the union type `X` visible in this module.
 pure func resolve_union_variant(
     context: ConstructionContext,
-    written: ParsedUnionVariant
+    written: ParsedUnionVariant,
+    use: VariantUse
 ) -> Result[VariantId, CheckError]:
     match context.union_named(written.union_name.id):
-        Ok(owner): context.variant_of_union(owner, written)
+        Ok(owner): context.variant_of_union(owner, written, use)
         Err(problem): Err(constructor_error(written.union_name.span, problem))
 
 
@@ -400,26 +414,66 @@ pure func resolve_union_variant(
 -- apply unchanged.
 pure func destructured_variant(
     context: ConstructionContext,
-    written: DestructuredVariant
+    written: PatternHead
 ) -> Result[(VariantId, WrittenUses), CheckError]:
-    variant: VariantId ?= match written:
-        UnionVariant(qualified):
-            context.resolve_union_variant(qualified)
-        BareVariant(name):
-            match context.namespace.named_value(context.module, name.id):
-                Some(NamedConstructor(found)): Ok(found)
-                Some(NamedVariants(first, rest)): Err(ambiguous_variant(name.span, first, rest))
-                _: Err(context.unknown_value_error(name))
+    match written:
+        UnionVariantHead(qualified): context.union_destructured_variant(qualified)
+        BareHead(name): context.bare_destructured_variant(name)
+        QualifiedHead(qualified): context.aliased_destructured_variant(qualified)
 
-    used: Referent = VariantReferent(variant)
 
-    uses: WrittenUses = match written:
-        UnionVariant(qualified):
-            QualifiedUses(qualified.union_name.union_use(variant), qualified.variant.name_use(used))
-        BareVariant(name):
-            OneUse(name.name_use(used))
+private pure func union_destructured_variant(
+    context: ConstructionContext,
+    qualified: ParsedUnionVariant
+) -> Result[(VariantId, WrittenUses), CheckError]:
+    variant ?= context.resolve_union_variant(qualified, Destructured)
 
-    Ok((variant, uses))
+    Ok(
+        (
+            variant,
+            QualifiedUses(
+                qualified.union_name.union_use(variant),
+                qualified.variant.name_use(VariantReferent(variant))
+            )
+        )
+    )
+
+
+private pure func bare_destructured_variant(
+    context: ConstructionContext,
+    name: WrittenName
+) -> Result[(VariantId, WrittenUses), CheckError]:
+    variant: VariantId ?= match context.namespace.named_value(context.module, name.id):
+        Some(NamedConstructor(found)): Ok(found)
+        Some(NamedVariants(first, rest)): Err(ambiguous_variant(name.span, first, rest))
+        _: Err(context.unknown_value_error(name))
+
+    Ok((variant, OneUse(name.name_use(VariantReferent(variant)))))
+
+
+-- `alias.Variant(binders) = value`: the alias selects the module's offered
+-- variant, as it does in a pattern.
+private pure func aliased_destructured_variant(
+    context: ConstructionContext,
+    qualified: ParsedQualified
+) -> Result[(VariantId, WrittenUses), CheckError]:
+    aliased ?= context.namespace.aliased_module(context.module, qualified.module)
+
+    -- A variant spelling is offered as a constructor or not at all.
+    variant: VariantId ?= match context.namespace.offered_value(aliased.target, qualified.name.id):
+        Ok(OfferedConstructor(found)): Ok(found)
+        Ok(_): Err(qualified.variant_not_offered(aliased, UnknownName, Destructured))
+        Err(reason): Err(qualified.variant_not_offered(aliased, reason, Destructured))
+
+    Ok(
+        (
+            variant,
+            QualifiedUses(
+                qualified.module.name_use(ModuleReferent(aliased.target)),
+                qualified.name.name_use(VariantReferent(variant))
+            )
+        )
+    )
 
 
 -- `Union.Variant` in a value: the same planning as `alias.Variant`, with the
@@ -432,7 +486,7 @@ pure func plan_union_variant(
     context: ConstructionContext,
     slots: List[InferenceSlot]
 ) -> Result[PlannedBase, CheckError]:
-    variant ?= context.resolve_union_variant(written)
+    variant ?= context.resolve_union_variant(written, Built)
 
     variant
         .variant_owner()
@@ -455,7 +509,7 @@ pure func find_union_variant(
     written: ParsedUnionVariant,
     span: Span
 ) -> Result[Option[VariantContract], CheckError]:
-    variant ?= context.resolve_union_variant(written)
+    variant ?= context.resolve_union_variant(written, Matched)
 
     _: Void ?= if variant.variant_owner() == occurrence.owner:
         Ok(void)

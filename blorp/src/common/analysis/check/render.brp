@@ -79,6 +79,7 @@ import:
             PrivateName,
             PrivateVariant,
             SeveralVariants,
+            SeveralPrivateVariants,
             ImportedThere,
             ProvidedThere
         )
@@ -482,43 +483,61 @@ private pure func render_qualified_error(
                         "write ${spelling}.name to use a declaration of that module"
                     )
         errors.QualifiedNotOffered(aliased, name, path, reason):
-            match aliased.parsed_spelling(context.parsed.names, span):
-                Err(error):
-                    error
-                Ok(alias_spelling):
-                    match name.parsed_spelling(context.parsed.names, span):
+            render_not_offered(span, aliased, name, path, reason, errors.Built, context)
+        errors.QualifiedVariantNotOffered(aliased, name, path, reason, use):
+            render_not_offered(span, aliased, name, path, reason, use, context)
+
+
+-- A qualified name its module does not offer. `use` decides the help for a
+-- private variant; a value is always built.
+private pure func render_not_offered(
+    span: Span,
+    aliased: NameId,
+    name: NameId,
+    path: ModulePath,
+    reason: Unoffered,
+    use: errors.VariantUse,
+    context: RenderContext
+) -> Diagnostic:
+    match (
+        aliased.parsed_spelling(context.parsed.names, span),
+        name.parsed_spelling(context.parsed.names, span),
+        path.module_path_spelling(context, span)
+    ):
+        (Err(error), _, _) | (_, Err(error), _) | (_, _, Err(error)):
+            error
+        (Ok(alias_spelling), Ok(selected_spelling), Ok(module)):
+            match reason.shown_reason(context):
+                PrivateName:
+                    rendered(
+                        span,
+                        "${selected_spelling} is private to ${module}",
+                        "remove private or qualify a public declaration"
+                    )
+                PrivateVariant(variant):
+                    match variant.private_variant_help(use, module, context, span):
                         Err(error):
                             error
-                        Ok(selected_spelling):
-                            match path.module_path_spelling(context, span):
-                                Err(error):
-                                    error
-                                Ok(module):
-                                    match reason.shown_reason(context):
-                                        PrivateName:
-                                            rendered(
-                                                span,
-                                                "${selected_spelling} is private to ${module}",
-                                                "remove private or qualify a public declaration"
-                                            )
-                                        PrivateVariant(variant):
-                                            match variant.build_help(module, context, span):
-                                                Err(error):
-                                                    error
-                                                Ok(help):
-                                                    rendered(
-                                                        span,
-                                                        "${alias_spelling}.${selected_spelling} is private to module ${module}",
-                                                        help
-                                                    )
-                                        SeveralVariants(first, rest):
-                                            shared_name(span, first, rest, module, context, False)
-                                        UnknownName | ImportedThere(_) | ProvidedThere(_):
-                                            rendered(
-                                                span,
-                                                "module ${module} declares no public ${selected_spelling}",
-                                                "${alias_spelling} names module ${module}; qualify a public function, constructor or type it declares; imports are not reexported"
-                                            )
+                        Ok(help):
+                            rendered(
+                                span,
+                                "${alias_spelling}.${selected_spelling} is private to module ${module}",
+                                help
+                            )
+                SeveralPrivateVariants:
+                    rendered(
+                        span,
+                        "${alias_spelling}.${selected_spelling} is private to module ${module}",
+                        use.private_variant_use_help(module)
+                    )
+                SeveralVariants(first, rest):
+                    shared_name(span, first, rest, module, context, False)
+                UnknownName | ImportedThere(_) | ProvidedThere(_):
+                    rendered(
+                        span,
+                        "module ${module} declares no public ${selected_spelling}",
+                        "${alias_spelling} names module ${module}; qualify a public function, constructor or type it declares; imports are not reexported"
+                    )
 
 
 -- Every namespace problem: a conflict in one table, a selection by its reason.
@@ -730,6 +749,12 @@ private pure func render_selection(
                                     )
                         NotOffered(SeveralVariants(first, rest)):
                             shared_name(span, first, rest, module, context, True)
+                        NotOffered(SeveralPrivateVariants):
+                            rendered(
+                                span,
+                                "${name} is private to module ${module}",
+                                "use the functions ${module} exports"
+                            )
                         NotOffered(ImportedThere(entity)):
                             message = "${name} is imported by ${module}, not declared there"
 
@@ -897,6 +922,32 @@ private pure func build_help(
             Ok(generic)
 
 
+-- What to write instead of a private variant `id`, by how it was used.
+private pure func private_variant_help(
+    id: VariantId,
+    use: errors.VariantUse,
+    module: String,
+    context: RenderContext,
+    span: Span
+) -> Result[String, Diagnostic]:
+    declared ?= id
+        .variant_owner()
+        .union_spelling(context, span)
+
+    match use:
+        errors.Built: id.build_help(module, context, span)
+        errors.Matched: Ok(use.private_variant_use_help(module))
+        errors.Destructured: Ok("read the ${declared.name} through the functions ${module} exports")
+
+
+-- What to write when no one union names the fix: a `match` covers private
+-- variants with `_`; anything else goes through the module's functions.
+private pure func private_variant_use_help(use: errors.VariantUse, module: String) -> String:
+    match use:
+        errors.Matched: "cover it with _, which matches the variants private to ${module}"
+        errors.Built | errors.Destructured: "use the functions ${module} exports"
+
+
 -- The module that declares `owner`, as the diagnostic's own module writes its
 -- path, like the qualified-name diagnostics; the stem when it writes none.
 private pure func union_module(
@@ -948,7 +999,11 @@ private pure func shared_name(
             help = if selected:
                 "select it with its union, as in ${variant.owner.name}(${variant.name})"
             else:
-                "select the union, and write ${variant.owner.name}.${variant.name}"
+                written = [variant]
+                    .concat(others)
+                    .map(pure func(candidate): "${candidate.owner.name}.${candidate.name}")
+
+                "select its union from ${module}, and write it through one of them: ${written.comma_separated()}"
 
             rendered(
                 span,
@@ -1615,7 +1670,7 @@ private pure func render_constructor_error(
                                 "its variants are ${variants.map(pure func(variant): variant.name).comma_separated()}"
 
                             rendered(span, "${declared.name} has no variant ${spelled}", help)
-        errors.ForeignPrivateVariant(id):
+        errors.ForeignPrivateVariant(id, use):
             match (
                 id.variant_spelling(context, span),
                 id
@@ -1623,7 +1678,7 @@ private pure func render_constructor_error(
                     .union_module(context, span)
             ):
                 (Ok(variant), Ok(module)):
-                    match id.build_help(module, context, span):
+                    match id.private_variant_help(use, module, context, span):
                         Ok(help):
                             rendered(
                                 span,

@@ -584,12 +584,12 @@ pattern's union must be the matched value's: matching a `Shape` with
 `Other.Empty` reports that `Other.Empty` is a variant of `Other`.
 
 A union with one variant is read by destructuring, as a tuple is:
-`Meters.Init(length) = distance`, or `Init(length) = distance` where the bare
-name is unambiguous, binds one new name or `_` for each payload, and always
-matches. A union with several variants is read with `match` instead:
-destructuring one reports that it could fail to match. For now only a union
-stored as its one payload, described below, can be destructured; read any
-other union with `match`.
+`Meters.Init(length) = distance`, `units.Init(length) = distance` through a
+module alias, or `Init(length) = distance` where the bare name is unambiguous,
+binds one new name or `_` for each payload, and always matches. A union with
+several variants is read with `match` instead: destructuring one reports that
+it could fail to match. Another module cannot destructure a private variant;
+the error says to read the union through the functions its module exports.
 
 Variant names share one namespace with the module's functions and constants.
 In one union each variant name is unique, and none is spelled like its union:
