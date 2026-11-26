@@ -15,6 +15,14 @@ done.
     - Keith made 19 decisions.
     - Spike P's verdict was continue: 0.99 of linear on 4 threads for
       CPU-bound work, and about 0.7 for allocation-heavy work.
+    - Spike K (2026-11-26) says continue, with the kernel's transitions in
+      Blorp:
+      - every race case held, on 1 to 4 carriers;
+      - a switching round trip is 2.3 to 2.8× C;
+      - a buffered one is 8.9 to 10.4× C. Its estimate once the removable
+        work is gone is 3.1 to 3.6×, leaving general code generation;
+      - each channel message allocates twice, until a uniquely owned record
+        is updated in place.
   - **Landed:**
     - landing 1 (2026-11-24): literals are published once under a lock;
     - landing 1b (2026-11-25): a normal build never writes a literal's
@@ -27,9 +35,13 @@ done.
     - landing 3: `parallel_map`, a native specialized per callback that
       splits its List adaptively on the pool (3.48× on 4 threads for
       CPU-bound elements, and one allocation for the result).
-  - **Next:** Spike K, the concurrency kernel, then landing 4, its runtime
-    support. Landing 5 changes `parallel_map`'s impure-callback help to
-    "use concurrent_map for impure work".
+  - **Next:** landing 4, the kernel's runtime support, with Spike K's design
+    changes.
+    - Before landing 6's channels: in-place reuse of a uniquely owned
+      record, a compiler change of its own, and a decision on the buffered
+      round trip's remaining gap.
+    - Landing 5 changes `parallel_map`'s impure-callback help to "use
+      concurrent_map for impure work".
   - **Overlap:** `CTFE_PLAN.md`'s L1 replaces landing 1's lazy literal site
     with static literals. Keep the threaded literal test when it does.
 - **Compile-time evaluation:** [`CTFE_PLAN.md`](CTFE_PLAN.md).

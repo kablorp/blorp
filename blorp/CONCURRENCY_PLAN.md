@@ -2027,6 +2027,538 @@ queues. The 3× threshold then measures code generation alone.
 
 **Budget:** about four working days.
 
+### Spike K results
+
+It ran on 2026-11-26 on the Apple Silicon machine of Spike P: 10 cores, 4 of
+them performance cores, 32 GiB, macOS 26.7.1 and Apple clang 21. Linux runs
+used the cached test images: arm64 Ubuntu 24.04 in Docker's linuxkit 7.0.14
+VM, with clang 18 and glibc 2.39, and amd64 under Rosetta for the x86-64
+switch.
+- **Where things are.** The spike's sources are on the unlanded branch
+  `spike/concurrency-kernel`, under `spike/kernel/`. Raw samples, logs and
+  builds are in the main checkout's ignored `build/concurrency/spike-k/`.
+- **Load.** Other sessions kept the Mac at a load average of 2 to 4 during
+  timing.
+- **Review.** A review on Opus checked these results, and its probes are in
+  `review/`.
+
+**What was built.**
+- **The kernel, in Blorp:** 904 lines of logic in `kernel.brp`.
+  - `Ring[T]` over a List, and `Waiter`.
+  - `ChannelState`, and the pure transitions `offer`, `accept`,
+    `next_sender`, `attempt`, `registered`, `without_fiber` and
+    `closed_state`.
+  - `send`, `receive` with an optional deadline, `close`, and two-branch
+    choice, which locks its channels in id order.
+  - Per-carrier run queues, the scheduler loop, and join scopes.
+  - The cases and `main` are another 1,037 lines; the 51 native stubs are
+    248.
+- **The patch.** `patch.py` finds each stub by its marker
+  `/* kernel.NAME */` and reads its types from the emitted signature.
+  - **It checks the ABI:** own must have given every owning stub its
+    parameter owned, and `Scope` must be a struct passed by value with an
+    empty dup helper.
+  - **It replaces the bodies,** and includes the runtime after the
+    prototypes.
+  - **Anything else fails loudly.**
+- **The C runtime,** `spike_kernel.h`:
+  - the switch, for arm64 (Mach-O and ELF) and x86-64;
+  - stacks of 256 KiB, lazily committed above a 64 KiB `PROT_NONE` guard,
+    and cached for reuse;
+  - the ASan and TSan fiber annotations on every switch;
+  - park and wake with permits, on one atomic word per fiber;
+  - a wait word per fiber, the generation shifted left 2 bits with the
+    phase below, and its compare-and-swap claim;
+  - one to four carriers with an eventcount idle wait;
+  - a timer thread, two helper threads for blocking natives, and a
+    watchdog;
+  - the cell tables.
+- **The C baseline,** `baseline.c`, 449 lines: the same algorithm on the
+  same runtime, with the same locks, rings, claims and permits. The review
+  confirmed it is the same algorithm.
+
+**Ownership across the seam.**
+- **No mismatch remains,** so the C needs no retain:
+  - `take_*` returns its state owned;
+  - own made each `put_*` and `new_*_cell` own its counted parameter, and
+    `patch.py` checks that it did, failing closed;
+  - `Scope` crosses by value and holds nothing counted, which `patch.py`
+    asserts;
+  - `Task` crosses as its C enum.
+- **The placeholder decides the ABI.** A placeholder that reaches an
+  in-place operand, `state.buffer.push(cell)`, is owned. The first one
+  tried stored the state in a List literal, and own inferred it borrowed:
+  the caller dropped the state after the call, and the C would have had to
+  retain it. That is 2 count operations per `put`.
+- **Landing 4 still needs `put` to own its operand by name,** by
+  generalizing `reuses_first_operand`. A placeholder is not a contract.
+
+**`update` stays Blorp, and is a direct call.** `update_queue` calls its step,
+`next_ready`, as `blorp_f_41`, and the program has no closure.
+- **Channel operations cannot use `update` as written.** A waiter's claim is
+  a C compare-and-swap, so impure. It must run between pure steps while
+  the cell is held: claim, or drop the waiter and try the next.
+- **So `send`, `receive` and choice** take the state, loop over a pure step
+  and a claim, and then put it back.
+
+**Round trips, Blorp against C.**
+- **How it was measured.** `-O2` without diagnostics, with the kernel's
+  default spinning lock in both programs. Each figure is the median of 7
+  interleaved runs at 2N, in nanoseconds per unit; the steady-state figures,
+  (median(2N) − median(N)) / N, agree within 5%.
+- **The runs.** macOS is the final run, at a load of about 3.7; its
+  "Earlier" column is the first run, at 2 to 3. Linux ran once, at a load
+  of 1 to 2.
+- **N was** 200,000 round trips, 2,000,000 messages, or 200,000 tasks.
+- **Cycles and instructions** come from macOS's `/usr/bin/time -l`, per
+  unit, on one carrier. The Linux image has no counters, so Linux has none.
+
+| Unit | Carriers | macOS C | macOS Blorp | Ratio | Earlier | Cycles, C : Blorp | Linux C | Linux Blorp | Ratio |
+| --- | ---: | ---: | ---: | ---: | ---: | --- | ---: | ---: | ---: |
+| Ping-pong round trip | 1 | 109 | 306 | 2.80 | 2.42 | 419 : 1,095 (2.6×) | 114 | 264 | 2.32 |
+| Ping-pong round trip | 4 | 472 | 1,110 | 2.35 | 2.19 | | 478 | 1,269 | 2.66 |
+| Half-full: a send and a receive | 1 | 6.8 | 70.6 | 10.4 | 10.5 | 25 : 252 (10.1×) | 6.3 | 56.0 | 8.9 |
+| Pipeline message | 1 | 10.0 | 74.0 | 7.4 | 7.0 | 39 : 266 (6.8×) | 10.1 | 81.3 | 8.1 |
+| Pipeline message | 4 | 20.4 | 107.5 | 5.3 | 1.24 | | 22.8 | 81.2 | 3.6 |
+| Task, batches of 1 | 1 | 138 | 182 | 1.32 | 1.31 | 518 : 668 (1.3×) | 153 | 208 | 1.36 |
+| Task, batches of 1 | 4 | 135 | 182 | 1.35 | 1.33 | | 150 | 209 | 1.39 |
+| Task, batches of 64 | 1 | 77 | 96 | 1.24 | 1.24 | 278 : 347 (1.25×) | 86 | 109 | 1.27 |
+| Task, batches of 64 | 4 | 706 | 895 | 1.27 | 1.53 | | 304 | 322 | 1.06 |
+
+- **The half-full case is one fiber,** so its 4-carrier figures equal its
+  1-carrier ones and are left out.
+- **Instructions per unit,** on one carrier on macOS, C against Blorp:
+  - ping-pong, 822 against 3,860;
+  - half-full, 181 against 1,613;
+  - pipeline, 189 against 1,645;
+  - task, 1,672 against 2,233.
+- **The ping-pong spread.** Paired by round, the final 1-carrier ping-pong
+  ratios ran 2.37 to 3.05, with three of the seven runs at 2.95 or above.
+- **The pipeline spread.** The 4-carrier pipeline settles into a different
+  regime from run to run: C ran 78 to 90 ns in the first run and 20 to 22
+  ns in the final one, so its ratio is not stable.
+
+So, against the rule's "a round trip within about 3×":
+- **The switching round trip passes.** Ping-pong is 2.3 to 2.8× in time, and
+  2.6× in cycles.
+- **The buffered round trip fails.** The half-full channel is the brief's
+  other case-1 round trip. It is 8.9 to 10.4× as measured, and an estimated
+  3.1 to 3.6× once the attributed removable work is gone.
+- **The pipeline fails as well:** 3.6 to 8.1×.
+- **Tasks are within 1.4×.**
+
+**Allocations and counts per message.** These are steady-state figures,
+(count at 2N − count at N) / N, from a diagnostics build with
+`BLORP_LEAK_CHECK=strict` clean at both sizes. The C baseline makes neither.
+
+| Unit | Allocations | Count operations | Attributed to |
+| --- | ---: | ---: | --- |
+| Ping-pong round trip, 1 carrier | 4 | 64 | `blorp_record_make_11`, in `offer` and `accept` |
+| Ping-pong round trip, 4 carriers | 4 | 72 | the same, plus run-queue pops by carriers that woke without work |
+| Buffered send and receive | 2 | 28 | the same |
+| Pipeline message, 1 carrier | 2.03 | 28.4 | the same; a few parks add run-queue traffic |
+| Task, batches of 1 | 1 | 16 | the runtime's fiber record, which C allocates too; counts on the run-queue Ring |
+| Task, batches of 64 | 1 | 8.1 | the same |
+
+- **`BLORP_ALLOCATION_SITES`,** rerun on the final binaries at 20,000 rounds
+  (emitted C `ac3dfba49a43fdee`), puts every per-message allocation in
+  `blorp_record_make_11`. That is the heap `ChannelState`, rebuilt by every
+  `{ state | ... }`.
+- **The rebuild, in the emitted C,** is three field dups, the old record's
+  drop, and a fresh `blorp_record_make_11`; `with_buffered` is the smallest
+  example.
+- **No other source.** There is no closure, no boxed step, no tuple and no
+  List copy: each ring's List is updated in place, and `pop` dups its List
+  rather than copying it.
+
+**Where the time goes,** on the buffered path, one carrier, macOS.
+- **The removable work, alone.** `removable.c` performs exactly what the
+  counts attribute to one send and receive: two rebuilds and 28 count
+  operations. It retires about 1,030 instructions in 180 to 200 cycles,
+  45 to 47 ns.
+- **Unit costs.** A free and then a malloc of the record retires 496
+  instructions in 67 cycles, using the review's `unit.c`. A dependent dup
+  and drop pair is 6 instructions in 14 cycles.
+
+  | | macOS | Linux |
+  | --- | ---: | ---: |
+  | A free then a malloc of the record | 17 to 21 ns | 5.2 ns |
+  | A dup and drop pair | 3.5 ns | 3.5 ns |
+  | An uncontended lock and unlock | 0.9 ns | 0.9 ns |
+
+- **The allocator's share,** by instructions and cycles: two pairs are 992
+  of Blorp's 1,613 instructions (61%) and about 134 of its 252 cycles
+  (53%).
+  - **`sample` shows more:** 79% of the carrier's samples, of which 748 of
+    1,556 are in `mach_absolute_time`, under `_xzm_free`. That is likely
+    skid, so the cycle figure stands.
+  - **What the samples do show:** macOS 26's free reads the clock and
+    zeroes the block.
+- **What remains:** 581 instructions, against C's 181. At the measured IPC
+  of 6.4 to 7.2 that is 81 to 91 cycles, against C's 25.
+- **The ratio once the removable work is gone,** by estimate:
+
+  | Path | System | Measured | Estimated without it | How |
+  | --- | --- | ---: | ---: | --- |
+  | Buffered | macOS | 10.1× in cycles | 3.1 to 3.6× | the 581 remaining instructions at IPC 6.4 to 7.2; 2.6 to 3.8× across both programs' run spread |
+  | Buffered | Linux | 8.9× in time | not verifiable | no counters in the image; subtracting `removable.c`'s 29 ns gives about 4.3×, unchecked |
+  | Ping-pong | macOS | 2.6× in cycles | 1.2 to 1.7× | the remaining ~1,800 of 3,860 instructions at its IPC of 3.5, or the isolated cycles subtracted |
+  | Ping-pong | Linux | 2.3× in time | not verifiable | |
+
+- **What the estimate assumes removed.** Both remedies below:
+  - **reuse alone** removes the 2 allocations and about 14 of the 28 count
+    operations (the rebuild's field dups and release);
+  - **the other 14** need dup and drop elision: moving out of the dying
+    `(state, step)` tuple, and a borrowed `pop`.
+- **What remains is general code generation, not structural.** Structs over
+  16 bytes, such as `Ring` and the step tuples, are passed and returned
+  through memory; Option and tuple values are shuffled; every List access
+  is bounds-checked.
+- **A measured ratio** would need a rewrite of emitted helpers, such as a
+  free list behind `blorp_record_make_11` or plain counts. This spike's
+  approval does not cover that.
+
+**Contention amplifies a long critical section.**
+- **The transition runs under the cell's lock,** so the record rebuild's
+  malloc and free do too.
+- **With pthread mutexes,** cross-carrier ping-pong spent its time in
+  `__psynch_mutexwait`. The retained samples show medians of 73,537
+  involuntary context switches at 200,000 round trips and 93,178 at
+  400,000, against 50 and 87 for C. macOS mutexes block in the kernel at
+  the first contention. With the spinning lock, Blorp's are 247 and 343.
+- **The spike's default lock** spins 64 times, then calls `sched_yield`,
+  and never sleeps. No kernel lock is held across a park, so spinning
+  cannot deadlock. But a lock that never sleeps wastes a core when
+  carriers outnumber cores, and that oversubscription was not tested. Go's
+  runtime locks spin, yield, and then sleep on a futex.
+
+The same final macOS run with pthread mutexes in both programs, medians in
+nanoseconds:
+
+| Unit | Carriers | C, mutex | Blorp, mutex | Ratio | Blorp, spinning lock |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Ping-pong round trip | 1 | 152 | 339 | 2.23 | 306 |
+| Ping-pong round trip | 4 | 552 | 1,789 | 3.24 | 1,110 |
+| Half-full: a send and a receive | 1 | 12.2 | 76.7 | 6.3 | 70.6 |
+| Pipeline message | 4 | 104 | 220 | 2.12 | 107.5 |
+
+The spinning lock takes 38% off Blorp's cross-carrier round trip and 15% off
+C's: the longer Blorp section collides more often.
+
+**Scheduling across carriers costs both programs alike.** These are costs of
+the shared runtime, not of Blorp:
+- **Cross-carrier ping-pong** is about 4× the 1-carrier figure in both: 109
+  to 472 ns in C, and 306 to 1,110 in Blorp.
+- **Tasks in batches of 64 on 4 carriers** cost 706 ns a task in C, against
+  77 on 1 carrier; on Linux, 304 against 86.
+- **Each cross-carrier wake** goes through the eventcount, and often a
+  sleeping carrier's condition variable.
+
+The old compiler's 3× was task and scheduling cost. Here the gap between
+Blorp and C is absent: 1.06 to 1.53× for tasks. The scheduling cost itself
+is not.
+
+**Race cases.** Each runs 100,000 rounds, in three macOS builds (`-O2`, ASan
+and UBSan with the strict leak check, and diagnostics with counts and the
+strict leak check) and three Linux ones (`-O2`, ASan, and TSan with
+`halt_on_error=1`).
+
+| Build | Runs | Failures |
+| --- | ---: | ---: |
+| macOS: each of three builds, on the revised binaries | 22 | 0 |
+| arm64 Linux: each of three builds, on the revised binaries | 22 | 0 |
+| amd64 Linux under Rosetta, `-O2` and ASan, 20,000 rounds | 14 | 0 |
+
+- **What the 22 runs are:**
+  - choice, self-choice, helper-wake, cancel and timer, on 1 and 4
+    carriers;
+  - then ping-pong, pipeline, choice and helper-wake on 2, 3 and 4
+    carriers, for case 8.
+- **So there are duplicates.** Choice and helper-wake on 4 carriers run
+  twice.
+- **Ping-pong and the pipeline use carriers 0 and 1 at every count,** so
+  their 3- and 4-carrier runs add only idle carriers.
+
+**Which runs race.**
+- **On one carrier,** choice, self-choice and cancel run every fiber on one
+  thread in turn.
+  - **Cancel is deterministic** there: 25,000 received and 75,000
+    cancelled in every build.
+  - **Choice passes without the claim's CAS.**
+  - **Helper-wake and the timer do race:** the helper and timer threads run
+    beside the carrier.
+- **Self-choice never contends the CAS.** Each selection's two waiters are on
+  one channel, so its claimers serialize under that channel's lock.
+- **The jitters,** in relax instructions:
+  - helper-wake: up to 96 on carrier 0, and up to 144 on carrier 3;
+  - the canceller: up to 192;
+  - cancel's racing sender: up to 160;
+  - the timer case's sender: up to 25,600.
+- **Deadlines** are 2 to 5 µs.
+
+The invariants each case asserts in the program:
+- **Choice:** two rendezvous channels.
+  - **Senders:** a plain sender on each channel, and two selecting senders
+    over both.
+  - **Receivers:** two selecting receivers over both, and a plain receiver
+    on each.
+  - **After the run:** after 400,000 distinct values, the count, sum and sum
+    of squares received equal those sent, and every selection completes
+    branch 0 or 1.
+  - **Before closing:** close drains every ring, so the waiter check runs
+    first. No sender waiter may be left, and no channel may hold more than
+    its 3 receivers' waiters. With the leave skipped, that check fails:
+    26,003 receiver waiters on one carrier, and 67 on four.
+- **Self-choice:** two pairs, each selecting a send and a receive on one
+  channel. Sends equal receives, 200,000 pairs; no fiber received its own
+  value; and no waiter is left once every fiber has finished.
+- **Helper wake:** a helper thread unparks the fiber while it parks. All
+  100,000 wakes arrive, with the watchdog armed.
+- **Cancel:** a target parked on a receive is cancelled, and every other
+  round a sender races the cancel.
+  - Either the target got the value and the channel is empty, or it was
+    cancelled and any raced value is still buffered.
+  - No cancelled waiter is left, and a probe send after the scope is
+    retired meets none.
+- **Timer:** a receive with a deadline races a send. Exactly one of a value
+  and a timeout happens, and a timed-out value is still in the channel.
+
+**Where each cancel and timeout met its fiber.** These are path counters, at
+100,000 rounds. A cancel or timeout can find its fiber:
+- **parked:** the carrier has published PARKED;
+- **mid-park:** the fiber has decided to park, but its carrier has not yet
+  published PARKED;
+- **arming:** it has armed its wait and not yet parked;
+- **at arm:** the wait's own check after arming sees the cancel;
+- **at top:** `receive`'s `cancelled()` sees it before arming.
+
+Misses are cancels that found no armed wait, and timers whose claim lost to
+a handoff.
+
+| Run | Outcome | Parked | Mid-park | Arming | At arm | At top | Missed |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| macOS `-O2`, 1 carrier | 75,000 cancelled | 75,000 | 0 | 0 | 0 | 0 | 25,000 |
+| macOS `-O2`, 4 carriers | 97,399 cancelled | 49,454 | 630 | 341 | 46,537 | 437 | 49,575 |
+| Linux `-O2`, 4 carriers | 99,658 cancelled | 14,741 | 5,473 | 4,367 | 74,309 | 768 | 75,419 |
+| Linux TSan, 1 carrier | 75,000 cancelled | 75,000 | 0 | 0 | 0 | 0 | 25,000 |
+| Linux TSan, 4 carriers | 80,975 cancelled | 49,000 | 431 | 920 | 10,886 | 19,738 | 49,649 |
+| macOS `-O2`, 1 carrier | 50,522 timed out | 50,522 | 0 | 0 | | | 7,651 |
+| macOS `-O2`, 4 carriers | 49,187 timed out | 49,183 | 3 | 1 | | | 7,672 |
+| Linux `-O2`, 4 carriers | 33,737 timed out | 33,732 | 2 | 3 | | | 9,265 |
+| Linux TSan, 1 carrier | 26,094 timed out | 26,071 | 13 | 10 | | | 31,811 |
+| Linux TSan, 4 carriers | 11,154 timed out | 11,148 | 3 | 3 | | | 8,098 |
+
+Each row's classes sum to its cancels or timeouts. A cancel's misses equal
+its at-arm and at-top hits plus the rounds whose target received the value.
+
+- **The cancel windows are exercised only on 4 carriers.** On one carrier,
+  every cancel met a parked fiber.
+- **The timer rarely meets a window,** a few dozen times in 100,000: it is
+  armed after the wait registers, and its deadline is at least 2 µs.
+  Under TSan it does so even on one carrier, since the timer thread races
+  the carrier.
+
+**The bites.** Each change was made in its own build, and each run checks
+the invariant.
+
+| Change | Case | Result |
+| --- | --- | --- |
+| No permit: a wake before its park is dropped | 4, on 1 and 4 carriers | the watchdog's "no switch for 3000 ms with N fibers live", exit 3 |
+| No claim CAS, no widening | 3, on 4 carriers | 213 and 335 waits claimed twice in two runs; 400,065 and 400,169 values received for 400,000 sent |
+| No claim CAS, no widening | 5, cancel, on 4 carriers | 312 and 156 double claims; "cancelled, and the racing value was lost" |
+| No claim CAS, no widening | 5, timer, on 4 carriers | 386 and 403 double claims; "timed out, and the value was lost" |
+| No claim CAS, no widening | 5, timer, on 1 carrier | 123 double claims, since the timer thread races the carrier |
+| No claim CAS, no widening, under TSan, 20,000 rounds | 3, cancel and timer, on 4 carriers | data races in all three: in `spike_claim`'s outcome write, and in choice and cancel also in the delivery; 114, 25 and 23 double claims |
+| A cancelled waiter does not leave its queue | 5, under ASan | `heap-use-after-free` in `spike_claim`: the probe send claims a waiter whose fiber record the scope's retire freed |
+| A selection does not leave its other queue | 3, on 1 and 4 carriers | the pre-close check fails, as above |
+
+**Widening the claim's window.** It is `SPIKE_CLAIM_WINDOW`, relax
+instructions between the test and the store, 0 by default. Set to 64, it
+raised cancel's double claims to 1,841 and 1,549. Choice, at 270 and 256,
+and the timer, at 424 and 456, barely changed. The first report's 93 double
+claims in choice came from that widened build.
+
+**Where the CAS is needed.**
+- **Between claimers under different locks:** in a selection over two
+  channels, and between a channel, the timer and a canceller. The bites
+  above show all three.
+- **Not within one channel,** where that channel's lock serializes every
+  claim: without it, choice and cancel still passed on one carrier, and so
+  did self-choice on four.
+
+**Not shown: the rule that a waiter never owns its fiber.**
+- **The cycle cannot form here.** Ring entries hold Ints, not references,
+  and channels are Ints too. So the plan's cycle, from the channel through
+  its waiter and fiber and the fiber's stack back to the channel, cannot
+  form in the spike.
+- **What the bite build did instead.** The `SPIKE_WAITER_OWNS_FIBER` build
+  simulates the waiter's reference with a count on the fiber record, taken
+  when the wait arms and dropped by `end_wait`.
+  - **With the leave,** the strict leak check is clean in the cancel and
+    timer cases. That shows balanced bookkeeping, not the rule.
+  - **Without the leave,** 78,995 records leaked and the run exited 99. But
+    the leak comes from `SPIKE_SKIP_LEAVE` also skipping `end_wait`'s
+    simulated release, not from a queue holding a reference.
+- **So the rule is untested.**
+
+**Fiber limits** (case 6).
+
+| | macOS, arm64 (16 KiB pages) | Linux, arm64 (4 KiB pages) |
+| --- | --- | --- |
+| Mappings per live fiber | 2.0: the stack and its guard | 2.0 |
+| Resident per parked fiber | 16.6 KB: one page and its record | 4.3 KB |
+| 10,000 parked fibers | 169 MB resident; parked in 27 ms | 47 MB; 26 ms |
+| 100,000 parked fibers | 1.67 GB resident; parked in 0.30 s | 433 MB; 0.26 s |
+| Where it stops | not on mappings: the probe was granted 4,000,000 guarded reservations, 1.2 TiB; memory stops it near 2 million parked fibers in 32 GiB | at half of `vm.max_map_count`: 131,055 live fibers at this VM's 262,144, where mprotect fails with ENOMEM; about 32,750 at the default 65,530 |
+
+- **A page guard splits a mapping,** so two mappings per fiber is the floor
+  with guard pages. 100,000 fibers on a default Linux needs
+  `vm.max_map_count` raised, or another guard scheme.
+- **The default's stop is derived, not observed.** `vm.max_map_count` is
+  global to the shared Docker VM, so it was not lowered.
+- **No fiber hit its guard.** Stack overflow was not tested.
+
+**Natives, tasks and the stack.**
+- **A native's round trip through the blocking pool,** case 7, is about 2.0
+  µs on 1 and 4 carriers. A helper's wake in case 4 is 2.1 µs. Both are the
+  helper's condition-variable wake; a direct call costs about 1 ns.
+- **Per task,** case 2:
+  - **allocations:** one, the runtime's fiber record, which C allocates too;
+  - **counts:** 16 in batches of 1, and 8.1 in batches of 64;
+  - **stacks:** reused from the cache.
+- **What the real design adds:** a task's closure environment, one more
+  allocation for a capturing lambda, unless the runtime stores it in the
+  fiber record.
+- **A deep drop on a fiber,** a chain of a million nodes, used 8.4 to 9.0
+  KB of stack on arm64 and 4.2 KB on x86-64. Blorp's bounded release is
+  128 levels, then a loop.
+
+**Parking: a design difference from the plan.**
+- **The plan's protocol** releases the kernel lock only after the switch
+  has saved the fiber, as Go's `gopark` does.
+- **The spike did not build it.** It puts the cell back before parking:
+  `send` puts at `kernel.brp:324` and parks at `336`, and `receive_until`
+  puts at `410` and parks at `420`. It then relies on the permit and on
+  publishing PARKED on the carrier's stack after the switch
+  (`spike_kernel.h`, `spike_switch_to`, lines 540 to 556). A waker queues
+  the fiber only once it sees PARKED.
+- **Pinning matters here.** Fibers stay on the carrier that started them,
+  so no other carrier can resume a half-saved fiber.
+- **So the difference is untested until fibers migrate.** The path counters
+  show the window is reached: 630 cancels met a fiber mid-park.
+
+**Design changes, for the landings that own them.** The plan's design
+sections were not edited.
+1. **Landing 5: a scope's child count goes down on the carrier.** It must
+   happen after the fiber's last switch and after its record is filed, as
+   Go's `goexit` runs on g0. The strict leak check found the first version
+   leaking one 136-byte fiber record in a 4-carrier ping-pong run: the
+   child lowered the count on its own stack, and the parent retired the
+   scope before the record was filed.
+2. **Landing 5: the scope owns its children's records until it is
+   retired.** A canceller in the scope then never touches a freed record.
+   The cancellation tree must give that guarantee, since a cancelled fiber
+   cannot wait for a handshake.
+3. **Landings 4 and 5: exactly one party wakes a wait, its claim's
+   winner.** So no permit is ever stale. When the fiber was not parked, the
+   permit exchange is the waker's last touch of it. When it was parked,
+   `enqueue` also reads `fiber_carrier`, and the fiber stays parked until
+   it is queued. The kernel asserts the rule: "a fiber woke before its wait
+   was claimed".
+4. **Landing 4: kernel locks spin, then block.** They spin briefly, then
+   sleep, as Go's do, rather than spin forever or use macOS pthread mutexes.
+5. **Landing 5: a cancel must not claim a join's wait.** Rule 4 has a
+   cancelled block still wait for its tasks.
+6. **Landings 4 and 5: helper jobs are retired as timers are.** A waiter
+   that ends without its native's result removes its job, under the job
+   queue's lock, before moving on.
+7. **Landing 6: channel operations loop a pure step and a claim under the
+   held cell,** rather than one `update`.
+8. **Landing 6: channels wait for in-place reuse of a uniquely owned
+   record.** Landing 5, the MVP, has no channels.
+9. **Landing 4: the emitted file sets feature macros before its first
+   include.** glibc declares `clock_gettime` and `nanosleep` under
+   `-std=c11` only with `_POSIX_C_SOURCE`, and the runtime arrives mid-file;
+   the spike passes it on the command line.
+
+**Thread-locals.**
+- **Fibers stay on the carrier that started them,** and `spike_switch_to`
+  asserts it.
+- **A fiber touches these thread-locals:**
+  - `spike_self`, the carrier;
+  - Blorp's `blorp_release_state`;
+  - libc's, such as `errno` and the allocator's per-thread state; macOS
+    reaches them through `_tlv_get_addr`, which the profile shows.
+- **Migration would need more than accessors.** Under ASan, the code after
+  a fiber switches back records the carrier's stack in the carrier pointer
+  it read before the switch. M:N, landing 7, needs that re-read, beside the
+  plan's `noinline` accessors.
+
+**Latent use-after-frees no case exercises.** Both are risks for landings 4
+and 5.
+- **A cancelled join.** `spike_cancel` claims any armed wait, a join's
+  included. `join_scope` then retires the scope while its children still
+  run, against rule 4. Their records are later filed under a retired, and
+  perhaps reused, scope.
+- **A cancelled native.** Its helper job stays queued after the waiter
+  returns. The job's later `spike_claim` touches a record that the scope's
+  retire may have freed.
+
+**The decision, as the rule gives it.**
+- **Every race case kept its invariant,** in normal, ASan and TSan builds on
+  1 to 4 carriers. The section above says which runs race, and each bite
+  failed as expected; the waiter-ownership rule is untested.
+- **Each message allocates twice in the steady state,** from one cause. Own
+  does not yet update a uniquely owned heap record in place, so every
+  `{ state | ... }` of `ChannelState` allocates. The cause is removable.
+- **The switching round trip is within 3×:** 2.3 to 2.8× in time, and 2.6×
+  in cycles.
+- **The buffered round trip is not.**
+  - **As measured:** 8.9 to 10.4×, and 10.1× in cycles.
+  - **After the attributed removable work,** by estimate: 3.1 to 3.6× on
+    macOS. Linux cannot be checked without counters.
+  - **What remains** is general code generation.
+- **No structural cost was found.**
+  - **Locks:** an operation takes exactly the locks the C baseline takes,
+    one channel cell plus the woken fiber's run queue.
+  - **Choice:** a selection takes two channel cells, as Go's does.
+- **So the rule says continue,** with the transitions in Blorp. The seam
+  still lets a hot transition move to C one for one, if the buffered gap
+  stays after the compiler work. Whether that residual is acceptable is
+  Keith's judgement.
+
+**Costs to remove,** each removable by the compiler:
+- **The record rebuild per transition:**
+  - two allocations per buffered send and receive;
+  - 61% of its instructions and about half its cycles on macOS.
+
+  In-place reuse of a uniquely owned record removes it, as Lean 4 and Koka
+  reuse a constructor cell. It also removes about 14 of the 28 count
+  operations.
+- **The other count traffic:** moving fields out of the dying
+  `(state, step)` tuple, and a borrowed `pop`.
+- **The longer critical section.** Reuse shortens it; until then, the
+  spinning lock contains it.
+- **General code generation:** about 580 instructions against C's 181. Structs
+  over 16 bytes go through memory, and Options and tuples are shuffled.
+
+**Not covered:**
+- a quiet machine, and Linux cycle counts;
+- native x86-64 hardware, and CET and BTI;
+- a measured, not estimated, ratio with the removable costs gone;
+- channel messages other than Int, and generic channel states;
+- the rule that a waiter never owns its fiber;
+- a fiber's stack guard being hit;
+- a timer as a branch of a selection, and choice over more than two
+  branches;
+- cancelled joins and cancelled natives, the latent use-after-frees above;
+- oversubscription: more carriers than cores, where a lock that never
+  sleeps wastes cores;
+- the cancellation tree, `simulate` and deadlock detection;
+- a timer queue in Blorp, untested by the brief's choice, which put the
+  timer in C;
+- the plan's lock-after-switch parking, and fiber migration.
+
 ## Landings
 
 Each is a vertical slice that can be tested on its own. Every one runs
@@ -2094,7 +2626,8 @@ compiled code.
    - the fork lock, the counted signal swap and the line lock;
    - the kernel-owned stdin;
    - poll-based console and non-regular-file reads;
-   - `first:` syntax, and impure tasks in `concurrent:`.
+   - `first:` syntax, and impure tasks in `concurrent:`;
+   - Spike K's design changes 3, 4, 6 and 9, under "Spike K results".
 
    Then a seed rotation.
 5. **The MVP:**
@@ -2105,14 +2638,20 @@ compiled code.
      deleted;
    - `parallel_map`'s impure-callback help, "use a for loop for impure work"
      since landing 3, becomes "use concurrent_map for impure work"
-     (`PARALLEL_CALLBACK_HELP` in `check/render.brp`).
+     (`PARALLEL_CALLBACK_HELP` in `check/render.brp`);
+   - Spike K's design changes 1, 2, 3, 5 and 6, so a cancel never claims a
+     join's wait.
 
    The first user is the e2e test driver, which runs its cases as processes
    with timeouts: exactly the MVP's shape, outside compiler source.
 6. **Channels:**
    - `Channel[T]` and the `Message` bound;
    - `concurrent for`, and `for item in channel:`;
-   - channel branches in `first:`.
+   - channel branches in `first:`;
+   - Spike K's design changes 7 and 8.
+
+   It waits for in-place reuse of a uniquely owned record, a compiler change
+   of its own. Without it, Spike K's channel messages allocated twice each.
 
 **Only for a named workload that needs them:**
 
@@ -2203,8 +2742,10 @@ Keith settled these on 2026-11-24:
 **Approvals Keith gives later:**
 - **Spike P's build** patches emitted C on a branch that never lands
   (`blorp/AGENTS.md`). This is needed first.
-- **A TSan run** would be a new harness mode. Spike K needs it for the race
-  cases, on its own branch.
+- **A TSan run** would be a new harness mode. Spike K ran TSan by hand
+  instead, so it added none.
+- **Spike K's build** replaced its stubs' emitted bodies with C, on a branch
+  that never lands. Keith approved it on 2026-11-26.
 - **Deleting `Command.timeout_ms`** is a breaking change, in landing 5.
 
 ## What we take from other languages
