@@ -683,6 +683,16 @@ delete. The seed rotates once.
        read from a parameter, a temporary, a loop and a closure all run
        clean under the strict leak check.
 8. **Landing 8, optional: the `NominalId` collapse,** as a mechanical rename.
+   - **Landed (2026-11-25, `1ec450376`).** `NominalId` and `EqualityOwner` are
+     deleted and `AggregateId` is used directly. One-arm matches on either
+     became the direct use of the payload. `equality_head` and
+     `equality_parameter_owner` were `aggregate_head` and `aggregate_owner`
+     under another name, so they went too. The stale "and underlying type" in
+     `well_formed.brp` is dropped.
+   - **Measured.** Production −87 lines (ceiling −20, estimate −30); tests
+     +2 −2. Fixed-input C identical (`6c85ff3e04a4086f`). Fixed-input
+     instructions −0.06%, allocations and peak heap +0.0000%; own-source
+     instructions −0.07%, allocations −0.06%, peak heap −0.03%.
 
 No second rotation is needed. The seed still accepts opaque types, and after
 landing 4 no source uses them.
@@ -980,7 +990,7 @@ The gates follow `blorp/AGENTS.md` ("Which gates a change runs"):
     a rose tree;
   - the fixed-input C and the own-source C are identical;
   - the ceilings hold, and the gates pass.
-- [ ] **Landing 8:**
+- [x] **Landing 8:**
   - `NominalId` is gone;
   - the fixed-input C is byte-identical.
 

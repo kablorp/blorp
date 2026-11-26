@@ -55,9 +55,10 @@ done.
     library migrated, +191 lines (2026-11-25). Landings 5 and 6 together:
     the opaque machinery is deleted, −1,439 lines (2026-11-25). Landing 7,
     destructuring single-variant unions not stored as their payload, +122
-    lines (2026-11-25). The plan stands at +272 production lines.
-  - **Next:** the optional landing 8, collapsing `NominalId`. Waiting as
-    follow-ups: the deferred help and alias-destructuring fixes, memoized
+    lines (2026-11-25). Landing 8, the `NominalId` and `EqualityOwner`
+    collapse into `AggregateId`, −87 lines (2026-11-25). The plan stands at
+    +185 production lines and is done.
+  - **Next:** nothing in the plan. Waiting as follow-ups: the deferred help and alias-destructuring fixes, memoized
     erasure, and the cost follow-ups the plan lists.
 - **UInt8 and Bytes:** [`UINT8_BYTES_PLAN.md`](UINT8_BYTES_PLAN.md).
   - **Status:** U1 to U9 and B1 to B3 are decided. L0, the

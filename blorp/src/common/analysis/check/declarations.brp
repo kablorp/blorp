@@ -102,7 +102,6 @@ import:
             StringType
         ),
         AggregateId(RecordAggregate, UnionAggregate),
-        NominalId(AggregateNominal),
         TypeUse,
         UnionOccurrence,
         aggregate_owner,
@@ -306,15 +305,15 @@ pure func parameter_requirements(
 -- The number of type parameters a record or union declares.
 private pure func nominal_arity(
     scope: TypeScope,
-    owner: NominalId,
+    owner: AggregateId,
     span: Span
 ) -> Result[Int, CheckError]:
     match owner:
-        AggregateNominal(RecordAggregate(id)):
+        RecordAggregate(id):
             match inventory_records(scope.inventory).get(id.record_number()):
                 Some(row): Ok(row.declaration.type_parameters.length())
                 None: Err(checker_invariant(span, InvalidRecordDeclaration(id)))
-        AggregateNominal(UnionAggregate(id)):
+        UnionAggregate(id):
             match inventory_unions(scope.inventory).get(id.union_number()):
                 Some(row): Ok(row.type_parameters.length())
                 None: Err(checker_invariant(span, InvalidUnionDeclaration(id)))
@@ -323,7 +322,7 @@ private pure func nominal_arity(
 -- A nominal head written alone, which its declaration must not need arguments for.
 private pure func unapplied_nominal(
     scope: TypeScope,
-    owner: NominalId,
+    owner: AggregateId,
     span: Span
 ) -> Result[TypeRef, CheckError]:
     arity ?= scope.nominal_arity(owner, span)
@@ -337,7 +336,7 @@ private pure func unapplied_nominal(
 -- A nominal head with written arguments, which must match its arity.
 private pure func resolve_nominal(
     scope: TypeScope,
-    owner: NominalId,
+    owner: AggregateId,
     arguments: List[TypeSyntax],
     span: Span,
     uses: List[NameUse]
@@ -387,8 +386,8 @@ private pure func resolve_atomic_head(
     match head:
         PrimitiveHead(primitive): Ok(primitive.primitive_ref())
         ListHead: Err(type_term_error(name.span, ListTypeArgumentCount))
-        RecordHead(id): scope.unapplied_nominal(AggregateNominal(RecordAggregate(id)), name.span)
-        UnionHead(id): scope.unapplied_nominal(AggregateNominal(UnionAggregate(id)), name.span)
+        RecordHead(id): scope.unapplied_nominal(RecordAggregate(id), name.span)
+        UnionHead(id): scope.unapplied_nominal(UnionAggregate(id), name.span)
 
 
 -- One unqualified lookup validates access before publishing the head.
@@ -485,9 +484,9 @@ private pure func resolve_applied_head(
                 _:
                     Err(type_term_error(span, ListTypeArgumentCount))
         RecordHead(owner):
-            scope.resolve_nominal(AggregateNominal(RecordAggregate(owner)), arguments, span, uses)
+            scope.resolve_nominal(RecordAggregate(owner), arguments, span, uses)
         UnionHead(owner):
-            scope.resolve_nominal(AggregateNominal(UnionAggregate(owner)), arguments, span, uses)
+            scope.resolve_nominal(UnionAggregate(owner), arguments, span, uses)
         PrimitiveHead(_):
             Err(type_term_error(name.span, NonApplicableType(name.id)))
 
@@ -530,8 +529,8 @@ pure func resolve_receiver_head(
 pure func receiver_arity(scope: TypeScope, head: TypeHead, span: Span) -> Result[Int, CheckError]:
     match head:
         ListHead: Ok(1)
-        RecordHead(owner): scope.nominal_arity(AggregateNominal(RecordAggregate(owner)), span)
-        UnionHead(owner): scope.nominal_arity(AggregateNominal(UnionAggregate(owner)), span)
+        RecordHead(owner): scope.nominal_arity(RecordAggregate(owner), span)
+        UnionHead(owner): scope.nominal_arity(UnionAggregate(owner), span)
         PrimitiveHead(_): Ok(0)
 
 
@@ -1129,8 +1128,7 @@ private pure func written_flows(
 
     match written.value_type:
         NominalType(nominal, arguments):
-            owner: TypeParameterOwner = match nominal:
-                AggregateNominal(aggregate): aggregate.aggregate_owner()
+            owner: TypeParameterOwner = nominal.aggregate_owner()
 
             var position = 0
 
@@ -1235,12 +1233,12 @@ private pure func fixed_storage(
             Ok(format.integer_fixed_storage())
         FloatType:
             Ok(True)
-        NominalType(AggregateNominal(UnionAggregate(id)), _):
+        NominalType(UnionAggregate(id), _):
             declarations.unions
                 .get(id.union_number())
                 .map(pure func(declaration: ResolvedUnion) -> Bool: declaration.fixed)
                 .or_checker_invariant(span, InvalidUnionDeclaration(id))
-        NominalType(AggregateNominal(RecordAggregate(id)), _):
+        NominalType(RecordAggregate(id), _):
             declarations.records
                 .get(id.record_number())
                 .map(pure func(declaration: ResolvedRecord) -> Bool: declaration.fixed)
@@ -1326,7 +1324,7 @@ private pure func walk_fixed_type(
     for field in fields:
         if failure.is_none():
             match field.value_type:
-                NominalType(AggregateNominal(target), _):
+                NominalType(target, _):
                     if path.contains_aggregate(target):
                         failure = Some(
                             type_declaration_error(
@@ -1428,7 +1426,7 @@ private pure func met(
     match field.value_type:
         TupleType(elements):
             Ok(MetElements(elements.map(pure func(element): { field | value_type = element })))
-        NominalType(AggregateNominal(aggregate), arguments):
+        NominalType(aggregate, arguments):
             if aggregate == root:
                 Ok(MetRoot)
             else:
@@ -1586,7 +1584,7 @@ private pure func validate_finite_declarations(
 -- stored as that payload.
 private pure func first_reentry(
     start: TypeUse,
-    root: NominalId,
+    root: AggregateId,
     declarations: ResolvedDeclarations
 ) -> Result[Option[Span], CheckError]:
     var pending = [start]
@@ -1677,10 +1675,7 @@ private pure func union_storage(
             match variant.fields:
                 [payload]:
                     payload
-                        .first_reentry(
-                            AggregateNominal(UnionAggregate(declaration.id)),
-                            declarations
-                        )
+                        .first_reentry(UnionAggregate(declaration.id), declarations)
                         .map(pure func(reentry): reentry.is_none())
                 _:
                     Ok(False)
@@ -1704,13 +1699,12 @@ private pure func union_storage(
 -- The body is not substituted: its parameters are leaves, so the walk meets
 -- only written types and is finite however a cycle would grow its arguments.
 private pure func representation_children(
-    owner: NominalId,
+    owner: AggregateId,
     arguments: List[TypeRef],
     span: Span,
     declarations: ResolvedDeclarations
 ) -> Result[List[TypeUse], CheckError]:
-    body: List[TypeUse] ?= match owner:
-        AggregateNominal(aggregate): aggregate.root_fields(declarations)
+    body: List[TypeUse] ?= owner.root_fields(declarations)
 
     Ok(
         arguments

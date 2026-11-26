@@ -97,12 +97,8 @@ import:
         trait_error
     ./model:
         AggregateId(RecordAggregate, UnionAggregate),
-        NominalId(AggregateNominal),
         EqualityMember(EqualityField, EqualityPayload),
-        EqualityOwner(AggregateEquality),
         ImplementationHead(NamedHead, TupleHead),
-        equality_head,
-        equality_parameter_owner,
         CheckedRecord,
         CheckedUnion,
         AcceptedTraits,
@@ -409,10 +405,7 @@ private pure func binary_predicate(
 ) -> MemberShape:
     {
         parameters = [self, self],
-        result = NominalType(
-            AggregateNominal(UnionAggregate(boolean.true_variant.variant_owner())),
-            []
-        )
+        result = NominalType(UnionAggregate(boolean.true_variant.variant_owner()), [])
     }
 
 
@@ -1453,7 +1446,7 @@ pure func prove_requirements(
 -- Negative causes are checker-local. Successful publication keeps only the
 -- same accepted view; no partially supported body or proof cache escapes.
 private record EqualityUnavailable {
-    owner: EqualityOwner,
+    owner: AggregateId,
     member: EqualityMember,
     required_trait: TraitId,
     receiver: TypeRef
@@ -1482,17 +1475,17 @@ pure func accepted_traits(availability: TraitAvailability) -> AcceptedTraits:
 -- The written bounds of the declaration a nominal type names.
 pure func declared_requirements(
     availability: TraitAvailability,
-    owner: NominalId
+    owner: AggregateId
 ) -> Option[List[TraitRequirement]]:
     TraitAvailability.Init(contents) = availability
     declarations = contents.declarations
 
     match owner:
-        AggregateNominal(RecordAggregate(id)):
+        RecordAggregate(id):
             declarations.records
                 .get(id.record_number())
                 .map(pure func(row): row.requirements)
-        AggregateNominal(UnionAggregate(id)):
+        UnionAggregate(id):
             declarations.unions
                 .get(id.union_number())
                 .map(pure func(row): row.requirements)
@@ -1506,7 +1499,7 @@ pure func unavailable_equality_member(
     TraitAvailability.Init(contents) = availability
 
     contents.unavailable
-        .find(pure func(failure): failure.owner.equality_head() == head)
+        .find(pure func(failure): failure.owner.aggregate_head() == head)
         .map(pure func(failure): failure.member)
 
 
@@ -1514,7 +1507,7 @@ pure func unavailable_equality_member(
 -- read the preceding round's summary, substituting real ordered arguments;
 -- they never recursively reopen another declaration's fields.
 private record EqualityCandidate {
-    owner: EqualityOwner,
+    owner: AggregateId,
     -- The owner's head, taken once at construction: `summarize_family` scans every
     -- candidate for each goal, so the scan must not recompute it.
     head: TypeHead,
@@ -1533,14 +1526,14 @@ private pure func summarize_goal(
     required: TraitId,
     receiver: TypeRef,
     possible: List[EqualityCandidate],
-    owner: EqualityOwner,
+    owner: AggregateId,
     member: EqualityMember,
     summary: EqualitySummary,
     span: Span
 ) -> Result[EqualitySummary, CheckError]:
     match receiver:
         ParameterType(parameter):
-            if parameter.parameter_owner() == owner.equality_parameter_owner():
+            if parameter.parameter_owner() == owner.aggregate_owner():
                 var requirements = summary.requirements
                 var known: Bool = False
                 var position = 0
@@ -1579,7 +1572,7 @@ private pure func summarize_family(
     required: TraitId,
     receiver: TypeRef,
     possible: List[EqualityCandidate],
-    owner: EqualityOwner,
+    owner: AggregateId,
     member: EqualityMember,
     summary: EqualitySummary,
     span: Span
@@ -1682,7 +1675,7 @@ private pure func summarize_family(
                             }
                         Some(candidate):
                             substitution: Substitution = {
-                                owner = candidate.owner.equality_parameter_owner(),
+                                owner = candidate.owner.aggregate_owner(),
                                 values = arguments
                             }
 
@@ -1720,10 +1713,10 @@ private pure func summarize_family(
 
 
 private pure func equality_candidate(
-    owner: EqualityOwner,
+    owner: AggregateId,
     requirements: List[TraitRequirement]
 ) -> EqualityCandidate:
-    { owner = owner, head = owner.equality_head(), requirements = requirements }
+    { owner = owner, head = owner.aggregate_head(), requirements = requirements }
 
 
 private pure func summarize_members(
@@ -1740,7 +1733,7 @@ private pure func summarize_members(
     var invalid: Option[CheckError] = None
 
     match candidate.owner:
-        AggregateEquality(RecordAggregate(record_row)):
+        RecordAggregate(record_row):
             match records.get(record_row.record_number()):
                 Some(row):
                     for field in row.fields:
@@ -1764,7 +1757,7 @@ private pure func summarize_members(
                             break
                 None:
                     invalid = Some(checker_invariant(compiler_span(), InvalidFunctionContract))
-        AggregateEquality(UnionAggregate(union_row)):
+        UnionAggregate(union_row):
             match unions.get(union_row.union_number()):
                 Some(row):
                     for variant in row.variants:
@@ -1850,20 +1843,14 @@ private pure func complete_equality_availability(
                 .is_none()
         ):
             possible = possible.append(
-                equality_candidate(
-                    AggregateEquality(RecordAggregate(record_row.id)),
-                    record_row.requirements
-                )
+                equality_candidate(RecordAggregate(record_row.id), record_row.requirements)
             )
 
     -- A resource is never copied, so its handle has no value equality.
     var derivation_fault: Option[CheckError] = None
 
     for union_row in unions:
-        lent = AggregateNominal(UnionAggregate(union_row.id)).declared_resource(
-            parsed.declarations,
-            compiler_span()
-        )
+        lent = UnionAggregate(union_row.id).declared_resource(parsed.declarations, compiler_span())
 
         match lent:
             Ok(None):
@@ -1873,10 +1860,7 @@ private pure func complete_equality_availability(
                         .is_none()
                 ):
                     possible = possible.append(
-                        equality_candidate(
-                            AggregateEquality(UnionAggregate(union_row.id)),
-                            union_row.requirements
-                        )
+                        equality_candidate(UnionAggregate(union_row.id), union_row.requirements)
                     )
             Ok(Some(_)):
                 void
@@ -1929,20 +1913,18 @@ private pure func complete_equality_availability(
     var error: Option[CheckError] = None
 
     for candidate in possible:
-        built = match candidate.owner:
-            AggregateEquality(aggregate):
-                supported_implementation(
-                    parsed.names,
-                    written_records,
-                    written_unions,
-                    aggregate,
-                    candidate.requirements,
-                    records,
-                    unions,
-                    contract,
-                    boolean,
-                    canonical
-                )
+        built = supported_implementation(
+            parsed.names,
+            written_records,
+            written_unions,
+            candidate.owner,
+            candidate.requirements,
+            records,
+            unions,
+            contract,
+            boolean,
+            canonical
+        )
 
         match built:
             Ok(implementation):
@@ -2150,9 +2132,9 @@ pure func equality_error(
             Some(head):
                 if current_trait == required:
                     for failure in contents.unavailable:
-                        if failure.owner.equality_head() == head:
+                        if failure.owner.aggregate_head() == head:
                             substitution: Substitution = {
-                                owner = failure.owner.equality_parameter_owner(),
+                                owner = failure.owner.aggregate_owner(),
                                 values = current.receiver_arguments()
                             }
 

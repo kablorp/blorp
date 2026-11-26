@@ -268,7 +268,7 @@ Paths below are relative to `blorp/src/`.
 | `common/analysis/check/errors.brp` | `AbsentSupertrait`, `ArithmeticTrait`, `CanonicalFamily`, `CheckerInvariant`, `ComparisonTrait`, `ConstantError`, `ListElementReference`, `QualifierKind`, `RecursionError`, `TypeTermError`, `UnsupportedForm` |
 | `common/analysis/check/inference.brp` | `InferencePublication`, `InferenceReadiness`, `InferenceRelation`, `SlotOrigin` |
 | `common/analysis/check/instantiation_paths.brp` | `PathOperation` |
-| `common/analysis/check/model.brp` | `BindingOrigin`, `EqualityMember`, `ListLengthTest`, `NominalId` |
+| `common/analysis/check/model.brp` | `BindingOrigin`, `EqualityMember`, `ListLengthTest` |
 | `common/analysis/check/patterns.brp` | `PatternPosition` |
 | `common/analysis/check/recursion.brp` | `ConstructorOperation`, `ConstructorSlot` |
 | `common/analysis/ids.brp` | `FunctionRole` |
