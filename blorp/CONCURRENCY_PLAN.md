@@ -747,7 +747,7 @@ see it, with an exact message, help and span:
 | A task may not assign an outer `var` | `a concurrent task cannot assign var total` / `bind the task's result, and assign it after the block` |
 | A `concurrent:` block in a pure function has only pure tasks | `fetch(url) is impure, so this concurrent block cannot be in a pure function` / `remove pure from the function, or keep only pure tasks in the block` |
 | `first:`, `concurrent for`, channels, time and `cancelled` are impure | `first is impure, so a pure function cannot use it` / `remove pure from the function` |
-| `parallel_map`'s function is pure | `parallel_map needs a pure function: read_text is impure` / `use concurrent_map for impure work` |
+| `parallel_map`'s function is pure | `parallel_map needs a pure function: read_text is impure` / `use concurrent_map for impure work` (until landing 5, `use a for loop for impure work`) |
 | A `first:` branch may not be pure | `solve(puzzle) is pure, so first: cannot stop it` / `run pure work before or after the race, as its own concurrent: task` |
 | The work branches of `first:` have one type | `the branches of first: have different types: this one is Int, the first is Result[Page, String]` / `give every branch one type, for example by wrapping each in a variant of one union, as Event does` |
 | `timeout(...)` is a clause of `first:`, used once | `timeout(...) is the deadline of a first: block, so it cannot be used here` / `timeout takes no value; write it once, directly inside first:, where it ends the block with Timeout` |
@@ -1775,6 +1775,215 @@ helper to reuse.
   sleep and to be woken, so a forked child that runs Blorp code needs a
   `pthread_atfork` reset of it.
 
+### Landing 3 results
+
+Landing 3 adds `parallel_map`, the native `concurrency.parallel_map`, on
+landing 2b's pool, which is unchanged.
+
+**What it does:**
+- **Check.** `concurrency.brp` declares the public `parallel_map[A, B]`, whose
+  body is the native. Its contract is pure, with a `List[A]` and a
+  `pure (A) -> B` parameter and a `List[B]` result. Join's task form
+  generalized into `PureCallableRuntimeType`, a record of parameter and
+  result types, so a copy still acquires one count. The label joins 2a's
+  restricted builtins ("concurrency.parallel_map is private to the
+  concurrency library", help "import parallel_map from concurrency"). An
+  impure named function or method given to the map is rejected with
+  "parallel_map needs a pure function: read_text is impure", help "use a for
+  loop for impure work". Check knows the map by its body: the call's
+  contract, made where the callee's accepted function is in hand, says
+  whether the pool runs its callbacks (`pooled_callbacks`), and each
+  callable argument reads that from the pending call.
+- **Specialize.** A new call target, `MapElements(MapCallback)`, names a
+  static callback's instance (`DirectCallback`) or, for a stored closure,
+  the map's element and result types (`ClosureCallback`). The map's callback
+  is requested as a call of a callable parameter is, so a stored closure
+  needs no instance; join's tasks keep the rule that a task is static. The
+  call's arguments are the List, then the instance's environment or the
+  closure, as the callable parameter's binding gives them.
+- **Own.** A direct callback joins the instances taken as callables, pinned
+  to the borrowed ABI. A closure's instance is pinned where the closure is
+  made.
+- **Verify.** A direct callback goes through `pinned_callable` and takes an
+  element and at most its environment; the call's parameters are the List
+  of its element and its environment, and its result the List of its
+  result. A closure callback's call takes the List and `(A) -> B`.
+- **Emit.** One job per callback: `blorp_map_7` for the instance `blorp_f_7`,
+  `blorp_map_p1_s_r_i_e` for a closure of `(String) -> Int`. Each has a
+  struct, a piece that calls the callback for each index of its range, and a
+  run function the call calls. It returns the empty root for an empty input,
+  and otherwise allocates the result once, runs `blorp_join_range` and then
+  sets the length. `JOIN_RANGE_RUNTIME`, after `JOIN_RUNTIME`, splits as
+  Rayon's `LengthSplitter` does on `blorp_join`; a right half knows it was
+  stolen when the thread running it is not the one that split it, so the
+  pool needed no change. The start-time `BLORP_THREADS` check is emitted for
+  a program that uses the pool through either native.
+- **The stack.** Each split nests `blorp_join_range_run`, `blorp_join` and
+  `blorp_join_finish`, for about log2(count) levels per map. The serial
+  `map` has none of these frames, so `blorp_join_wait`'s bound, the serial
+  run's stack plus a few frames per join, does not count them.
+
+The job and call for the problem's program, `square` over five Ints:
+
+```c
+struct blorp_map_1{const struct blorp_l_0_i* values;struct blorp_l_0_i* result;};
+static void blorp_map_1_piece(void *job,int64_t low,int64_t high){struct blorp_map_1 *const slots=job;
+  for(int64_t index=low;index<high;index++)slots->result->values[index]=blorp_f_1(slots->values->values[index]);}
+static struct blorp_l_0_i* blorp_map_1_run(const struct blorp_l_0_i* values){const int64_t count=values->length;
+  if(count==0)return (struct blorp_l_0_i*)blorp_list_empty_acquire(&blorp_list_empty_0_i);
+  ...allocate result with count slots...
+  struct blorp_map_1 job={.values=values,.result=result};
+  blorp_join_range(blorp_map_1_piece,&job,count);result->length=count;return result;}
+/* concurrency.parallel_map */ struct blorp_l_0_i* blorp_f_2(struct blorp_l_0_i* blorp_p_0){...
+  struct blorp_l_0_i* const blorp_vl_1=blorp_map_1_run(blorp_vl_0);...}
+```
+
+**Tests:**
+- **The harness.** A `NativeRun` has an `environment`, set over the run's
+  isolated one, and a `StrictReport`: balanced allocations, or nothing for
+  a program the runtime stops before it starts. The strict build prints no
+  leak report for `BLORP_THREADS=x`, which exits in the runtime, so the
+  brief's field alone could not express that run. Every block and map
+  fixture runs at `BLORP_THREADS` unset, 1 and 4 with exact stdout and
+  counts, and `BLORP_THREADS=x` stops a block program and a map program with
+  status 1, the message and empty stdout.
+- **E2e,** eight map fixtures: a named callback over Ints, which also
+  matches `map` and maps to `List[Void]`; a lambda capturing a List, over
+  Strings; a closure from a record field; a nested map over
+  `List[List[Int]]`; an empty input, with no allocation in the whole
+  program; a callback that appends to its row, balanced and clean under
+  ASan; a map in a block's task, from a module that imports `concurrency`;
+  and 10,000 elements, by their sum and six positions. At 4 threads that
+  map ran as 103 pieces on four threads; at 1 thread as one.
+- **`List[Void]`:** `map` takes a Void callback, so the map does too. A
+  `List[Void]` holds a byte per element and a Void function returns that
+  byte, so the job needs no case of its own.
+- **Check:** the impure function and the impure method, with exact text and
+  span, and the label in a user module.
+- **Verify:** a callback with the wrong result ("call result type does not
+  match its contract"), one that owns a parameter ("pinned instance has an
+  owned parameter"), one with a second parameter, read as an environment the
+  call does not lend ("call is missing its argument"), one with three ("a
+  mapped callback takes an element and at most its environment"), and a
+  stored closure of `(String) -> Int` named as a map of Ints ("call argument
+  type does not match its contract"). The join and map suites share
+  `test_verify/native_call_inputs.brp`.
+- **ThreadSanitizer** found nothing in the eight fixtures at 4 threads:
+  three runs each of the normal build and one of the diagnostics build.
+- **The tests bite:**
+  - without own's pin, the consuming fixture fails in verify ("pinned
+    instance has an owned parameter") and the borrow case fails; with
+    verify's check also removed, ASan reports a heap-use-after-free in
+    `blorp_list_dup_0_i`;
+  - results written at `length-1-index` fail six of the seven non-empty
+    fixtures; the map in a task sums its results, so order cannot show;
+  - a piece that counts `length++`, as a List literal does, gives 6 to 20
+    ThreadSanitizer races per run on the 10,000-element fixture and wrong
+    output;
+  - check's pooled rule and the label restriction, each removed, fail their
+    cases.
+- **A bite experiment that found no race.** The brief expected
+  ThreadSanitizer to report one when a changed run function set the length
+  before `blorp_join_range`. It reported none in three runs, and the output
+  was right: no piece reads or writes the length, and nothing reads the
+  result before the join returns. The shipped code sets the length after the
+  join, so it counts only written slots, as emit's comment says.
+
+**Timing,** Spike P's workloads with `map` replaced, `-O2`, no
+diagnostics, on an Apple M4 (4 performance and 6 efficiency cores), macOS
+26.7.1, Apple clang 21.0.0. Seven interleaved runs after one warm-up, each
+wall time a `perf_counter` around the child (`/usr/bin/time` reports 10 ms
+steps), so it includes process start and the setup loops. Load average 1.4
+to 1.8.
+
+| Workload | `map` | 1 thread | 4 threads | Speed-up | 1 thread against `map` |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| CPU-bound (w1) | 0.4819 s | 0.4815 s | 0.1382 s | 3.48× | −0.1% |
+| Tiny elements (w5) | 0.1400 s | 0.0587 s | 0.0585 s | 1.00× | −58% |
+| Nested (w6) | 0.1875 s | 0.1870 s | 0.0558 s | 3.35× | −0.2% |
+
+Every configuration printed the same output as `map`. Instructions at 4
+threads were within 0.1% of 1 thread for w1 and w6, and 7.5% above it for
+w5, whose fifty small maps wake idle workers each time. Tiny elements gain
+nothing whole-program: the map is a small part of w5 beside its setup and
+fifty serial checksums, which Spike P's region timing left out.
+
+**Cost,** `self-compile-cost dee4a2445 7eccd55b3 --rounds 9`, on the same
+machine, `-O2`. The fixed-input C is identical (`47286d12d57dc754`):
+
+| Measure | Base | Candidate | Change |
+| --- | ---: | ---: | ---: |
+| Fixed input, allocations | 13,409,321 | 13,409,322 | +0.0000% |
+| Fixed input, peak heap | 191,321,020 | 191,321,085 | +0.0000% |
+| Fixed input, instructions | 13,619,944,970 | 13,626,422,401 | +0.0476% |
+| Own source, allocations | 13,409,321 | 13,482,218 | +0.5436% |
+| Own source, instructions | 13,620,158,752 | 13,701,111,131 | +0.5944% |
+
+The fixed-input samples are 13,614.2–13,624.6 M for the base and
+13,619.6–13,632.0 M for the candidate.
+
+- **Two costs were found on the way.** The first candidate cost +0.175%:
+  check fetched the call's signature list for every argument of every call.
+  The call's contract now carries `pooled_callbacks`, decided where the
+  callee's accepted function is already in hand. That left about +0.13%,
+  which was emit's.
+- **A compiler cost to remove later: Lists carried through a `match`.**
+  `program_inventory`'s loop over every block operation carries each `var`
+  List it builds through its `match`, and acquires and releases each once
+  per operation: 152,749 dups and drops each on the fixed input, about 0.1%
+  of instructions per List. A sixth List, `map_jobs`, cost that; call-count
+  builds of the script's two `compiler.c` found it
+  (`landing3-evidence/cost-investigation/`). Joins and maps now share one
+  `pool_jobs` List, so the walk carries five again.
+
+**Identity.** Every fixture under `test/test_compile/fixtures` but the
+eight map fixtures compiles to the same C, or the same diagnostic, as a
+compiler built from `dee4a2445` with that revision's library: 771 of 780.
+The ninth, `missing_library_import`, differs only in the library path its
+diagnostic names, since the base ran against an extracted copy. The seven
+block fixtures are among the 771.
+
+**Lines,** from `dee4a2445`, over both ceilings, which stopped the landing
+for a growth audit:
+- **production** +533 net (619 added, 86 removed), against +450;
+- **tests** +725 net, against +550: step 0 +85 and the native +640.
+
+**Ceilings, corrected by the coordinator on 2026-11-26:**
+
+| Ceiling | Old | New |
+| --- | ---: | ---: |
+| Production lines | +450 | +540 |
+| Test lines | +550 | +730 |
+
+The brief's figures were estimates from uncompiled sketches. The audit below
+found no bloat: the growth is the emitted job, written out (about 125); the
+plan's own impure-callback message, which names the map (+89); and the
+range splitter's C (+73). The tests grew by the verify cases for both
+callback kinds, among them the closure rejection that review asked for, and
+by eight fixtures, each run at three thread counts.
+
+| Area | Production | What it holds |
+| --- | ---: | --- |
+| Emit | +180 | the job, piece and run function (about 125), the inventory, requirements and names |
+| Check, the impure-callback message | +89 | the rendering (+37), `pooled_callbacks` on the contract and pending call (+22), through the worklist (+18), the decision (+9) and the error (+3) |
+| The range splitter | +73 | `JOIN_RANGE_RUNTIME`, C |
+| Specialize | +64 | `MapCallback`, its request and translation, and the shared callable-parameter request |
+| Check, the native | +63 | the label, operation, contract, generalized callable form and restriction |
+| Verify | +47 | the map's signature for both callbacks |
+| Own and the library | +17 | the pin, and `parallel_map` |
+
+| Area | Tests |
+| --- | ---: |
+| Step 0: the harness and the block runs | +85 |
+| The eight fixtures | +181 |
+| Their e2e cases | +96 |
+| The verify suite and its shared helper, less what join's suite lost | +287 |
+| The check cases | +76 |
+
+The estimate did not foresee the emitted job's size once formatted, nor that
+naming the map in the impure message means carrying a callable's use through
+check's worklist.
+
 ### Spike K: the concurrency kernel
 
 **The question.** Can the Blorp kernel, with pure transitions through
@@ -1874,7 +2083,7 @@ compiled code.
    **Landing 2b: the pool.** A work-stealing pool runs `join`'s tasks at
    once, with thread counts, stack sizes and guards. It is runtime C only.
 3. **`parallel_map`:** native, specialized per callback, and splitting
-   adaptively on the pool.
+   adaptively on the pool. Done: see "Landing 3 results".
 
 **Concurrency, after Spike K:**
 
@@ -1893,7 +2102,10 @@ compiled code.
    - `First`, `sleep`, `timeout` and `cancelled`;
    - `Duration`, `concurrent_map` and `simulate`;
    - cancellable `capture`, `output` and `run`, and `Command.timeout_ms`
-     deleted.
+     deleted;
+   - `parallel_map`'s impure-callback help, "use a for loop for impure work"
+     since landing 3, becomes "use concurrent_map for impure work"
+     (`PARALLEL_CALLBACK_HELP` in `check/render.brp`).
 
    The first user is the e2e test driver, which runs its cases as processes
    with timeouts: exactly the MVP's shape, outside compiler source.

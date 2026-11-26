@@ -23,9 +23,13 @@ done.
       and rewritten into calls of the concurrency module's `join` and `run`;
     - landing 2a, with landing 2b's work-stealing pool: `join` is a native
       whose trampolines call each task directly, so a block's tasks run at
-      once (3.2× on 4 threads for four CPU-bound tasks).
-  - **Next:** landing 3, `parallel_map`, native and splitting adaptively on
-    the pool.
+      once (3.2× on 4 threads for four CPU-bound tasks);
+    - landing 3: `parallel_map`, a native specialized per callback that
+      splits its List adaptively on the pool (3.48× on 4 threads for
+      CPU-bound elements, and one allocation for the result).
+  - **Next:** Spike K, the concurrency kernel, then landing 4, its runtime
+    support. Landing 5 changes `parallel_map`'s impure-callback help to
+    "use concurrent_map for impure work".
   - **Overlap:** `CTFE_PLAN.md`'s L1 replaces landing 1's lazy literal site
     with static literals. Keep the threaded literal test when it does.
 - **Compile-time evaluation:** [`CTFE_PLAN.md`](CTFE_PLAN.md).
