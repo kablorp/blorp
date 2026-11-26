@@ -995,20 +995,56 @@ task:
 
 A loop inside a task keeps its own `break` and `continue`. Check turns a block
 into calls of the library's private `join`, or `run` for one task, in
-`concurrency.brp`, which the compiler loads only for a program that uses a
-block. `join` is the native `concurrency.join`, which only that module may
-declare ("concurrency.join is private to the concurrency library").
+`concurrency.brp`, which the compiler loads for a program that uses a block
+or imports the module. `join` is the native `concurrency.join`, which only
+that module may declare ("concurrency.join is private to the concurrency
+library").
 
-The pool starts at a program's first block of two or more tasks, and
-`BLORP_THREADS` sets how many threads it runs, the calling thread included:
-one per online processor when it is unset or empty, none beside the caller
-for `1`, and at most 64. Any other value stops the program before it runs any
-of its code, with `error: BLORP_THREADS must be a positive integer or unset`
-and status 1. A pool thread's stack is the main thread's size, so pure
-recursion that fits on the main thread fits in a task. A program's output and
-allocation counts are the same at every thread count: a task borrows what it
-captures from the code around the block, which holds it until every task has
-finished, so a task that updates a captured value always copies it.
+`parallel_map`, imported from `concurrency`, applies a pure function to each
+element of a List, possibly at once on the same pool, and returns the results
+in the order of the input:
+
+```blorp
+import:
+    concurrency: parallel_map
+    io/console/output: print
+
+
+pure func square(value: Int) -> Int:
+    value * value
+
+
+func main() -> Int:
+    squares = [3, 1, 4, 1, 5].parallel_map(square)
+    print("${squares.length()}")
+    0
+```
+
+This prints `5`. The callback may be anything `map` takes: a named function,
+a method, a lambda or a stored closure. The pool runs it, so it must be pure
+whatever calls the map: `paths.parallel_map(read_text)` is rejected with
+"parallel_map needs a pure function: read_text is impure" and the help "use a
+for loop for impure work". The map splits its List into pieces as threads
+fall idle, down to one element, so a nested `parallel_map`, or one in a
+block's task, spreads over the pool too; with one thread the List is one
+piece. It allocates its result once, sized to the input, and nothing for an
+empty input, so its allocation counts are the same at every thread count.
+Only the concurrency module may declare the native `concurrency.parallel_map`
+("concurrency.parallel_map is private to the concurrency library").
+
+The pool starts at a program's first block of two or more tasks, or its first
+non-empty parallel map, and `BLORP_THREADS` sets how many threads it runs, the
+calling thread included: one per online processor when it is unset or empty,
+none beside the caller for `1`, and at most 64. Any other value stops the
+program before it runs any of its code, with
+`error: BLORP_THREADS must be a positive integer or unset` and status 1. A
+pool thread's stack is the main thread's size, so pure recursion that fits on
+the main thread fits in a task. A parallel map also nests three runtime frames
+per halving of its List, about log2 of its length deep, which `map` does not.
+A program's output and allocation counts are the same at every thread count: a
+task borrows what it captures from the code around the block, which holds it
+until every task has finished, so a task that updates a captured value always
+copies it.
 
 ### Generics and declaration bounds
 

@@ -67,7 +67,8 @@ import:
         ReturnTransfer(UnmanagedReturn, OwnedReturn),
         StoredPayload(UnmanagedPayload, OwnedPayload)
     ../specialize/specialize:
-        CallTarget(UserFunction, RuntimeFunction, JoinTasks),
+        CallTarget(UserFunction, RuntimeFunction, JoinTasks, MapElements),
+        MapCallback(DirectCallback, ClosureCallback),
         TaskJoin,
         ConcretePatternPlace,
         ConcretePatternRoute(MatchRoot, UnionField, RecordField, ListElement),
@@ -478,6 +479,8 @@ private pure func call_signature(
             operation.verify_runtime_signature(span, unions, records)
         JoinTasks(tasks):
             tasks.join_signature(value_type, span, functions, records)
+        MapElements(callback):
+            callback.map_signature(span, functions)
         UserFunction(id):
             match functions.get(id.function_number()):
                 Some(function):
@@ -533,6 +536,49 @@ private pure func join_signature(
         })
     else:
         Err(verification_error(span, "a join's result does not hold its tasks' results"))
+
+
+-- A parallel map's arguments are its List, then what its pieces lend the
+-- callback: a direct callback's environment, if it takes one, or the closure.
+-- Its value is the List of the callback's results.
+private pure func map_signature(
+    callback: MapCallback,
+    span: Span,
+    functions: List[OwnedFunction]
+) -> Result[FunctionSignature, Diagnostic]:
+    match callback:
+        DirectCallback(id):
+            id.direct_callback_signature(span, functions)
+        ClosureCallback(types):
+            Ok({
+                parameters = [ListType(types.element), CallableType([types.element], types.result)],
+                return_type = ListType(types.result)
+            })
+
+
+-- A direct callback's pieces lend it the environment, if it takes one, and an
+-- element, so it is pinned borrowed as an instance taken as a callable is.
+private pure func direct_callback_signature(
+    callback: FunctionInstanceId,
+    span: Span,
+    functions: List[OwnedFunction]
+) -> Result[FunctionSignature, Diagnostic]:
+    function ?= callback.pinned_callable(functions, span)
+
+    parameters: List[TypeRef] ?= match function.parameters.map(parameter_type):
+        [element]:
+            Ok([ListType(element)])
+        [environment, element]:
+            Ok([ListType(element), environment])
+        _:
+            Err(
+                verification_error(
+                    span,
+                    "a mapped callback takes an element and at most its environment"
+                )
+            )
+
+    Ok({ parameters = parameters, return_type = ListType(function.return_type) })
 
 
 private pure func verify_runtime_signature(
@@ -703,8 +749,9 @@ private pure func transferred_borrows(
                         Ok(arguments)
                 _:
                     Ok(arguments)
-        -- A join lends each environment to its task.
-        JoinTasks(_):
+        -- A join lends each environment to its task, and a parallel map its
+        -- List and its callback's environment or closure to its pieces.
+        JoinTasks(_) | MapElements(_):
             Ok(arguments)
         UserFunction(id):
             match functions.get(id.function_number()):

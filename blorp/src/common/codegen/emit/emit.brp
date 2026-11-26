@@ -52,7 +52,8 @@ import:
             FloatDivide,
             FloatRemainder,
             FloatToString,
-            ConcurrencyJoin
+            ConcurrencyJoin,
+            ConcurrencyParallelMap
         ),
         SystemPayload(IntPayload, StringPayload, StringListPayload, UInt8ListPayload, VoidPayload),
         system_signature
@@ -102,7 +103,7 @@ import:
         StoredPayload(UnmanagedPayload, OwnedPayload),
         parameter_type
     ../runtime/float: FLOAT_PARSE_RUNTIME, FLOAT_RUNTIME, FLOAT_STRING_RUNTIME
-    ../runtime/join: JOIN_RUNTIME
+    ../runtime/join: JOIN_RANGE_RUNTIME, JOIN_RUNTIME
     ../runtime/list:
         ListElementKey,
         ListUpdate(AppendUpdate, SetUpdate, ConcatUpdate, SuffixUpdate),
@@ -113,6 +114,7 @@ import:
         callable_suffix,
         consuming_helper_name,
         list_element_key,
+        list_empty_root,
         list_release_name,
         list_root_allocation,
         list_slot_store,
@@ -142,8 +144,9 @@ import:
         system_runtime,
         system_symbol
     ../specialize/specialize as specialized:
-        CallTarget(UserFunction, RuntimeFunction, JoinTasks),
+        CallTarget(UserFunction, RuntimeFunction, JoinTasks, MapElements),
         FunctionInstanceId,
+        MapCallback(DirectCallback, ClosureCallback),
         TaskJoin,
         ConcreteRecord(InlineFields, ValueFields, CountedFields),
         ConcretePatternPlace,
@@ -184,7 +187,8 @@ import:
             InvalidOperationShape,
             MissingAggregateLayout,
             MissingInPlaceHelper,
-            MissingJoinedTask
+            MissingJoinedTask,
+            InvalidMapCallback
         ),
         render
     ./float_literal: c_float_literal
@@ -249,6 +253,12 @@ private pure func c_callable(target: CallTarget) -> Option[String]:
     match target:
         JoinTasks(_):
             None
+        MapElements(callback):
+            Some(
+                ""
+                    .append_map_job_name(callback)
+                    .concat("_run")
+            )
         UserFunction(id):
             Some(
                 id
@@ -333,7 +343,7 @@ private pure func c_callable(target: CallTarget) -> Option[String]:
                 ListConcat(element):
                     Some(ConcatUpdate.list_update_name(element.list_element_key()))
                 -- append_operation writes a conversion as a C cast.
-                StringEquals(_) | IntegerEquals(_, _) | IntegerLessThan(_, _) | IntegerConvert(_, _) | FloatEquals(_) | FloatLessThan(_) | BytesToText(_) | StringByteSlice(_) | StringCodepointAt(_) | SystemCall(_, _) | ConcurrencyJoin(_):
+                StringEquals(_) | IntegerEquals(_, _) | IntegerLessThan(_, _) | IntegerConvert(_, _) | FloatEquals(_) | FloatLessThan(_) | BytesToText(_) | StringByteSlice(_) | StringCodepointAt(_) | SystemCall(_, _) | ConcurrencyJoin(_) | ConcurrencyParallelMap(_):
                     None
 
 
@@ -1958,6 +1968,141 @@ private pure func append_task_join(
     )
 
 
+-- A parallel map's job and its functions: `blorp_map_7` for a direct call of
+-- the instance blorp_f_7, and `blorp_map_p1_s_r_i_e` for a closure of
+-- `(String) -> Int`, by its callable type's suffix. The two never meet, since
+-- an instance number starts with a digit and a callable suffix with `p`.
+private pure func append_map_job_name(output: String, callback: MapCallback) -> String:
+    match callback:
+        DirectCallback(id):
+            output
+                .concat("blorp_map_")
+                .append_int(id.function_number())
+        ClosureCallback(types):
+            output
+                .concat("blorp_map_")
+                .append_callable_suffix([types.element], types.result)
+
+
+-- A parallel map's job: the job's struct, its piece and its run function,
+-- which the map's call calls. A direct callback's job lends it the
+-- environment, if its instance takes one, and a closure's job holds the
+-- closure, which the piece invokes as InvokeCallable does.
+private pure func append_map_job(
+    output: String,
+    callback: MapCallback,
+    functions: List[OwnedFunction],
+    unions: List[ConcreteUnion]
+) -> Result[String, Diagnostic]:
+    job = "".append_map_job_name(callback)
+    element = "slots->values->values[index]"
+
+    match callback:
+        ClosureCallback(types):
+            output.append_map_functions(
+                job,
+                types.element,
+                types.result,
+                Some(("closure", CallableType([types.element], types.result))),
+                "slots->closure.ops->invoke(slots->closure.environment,${element})",
+                unions
+            )
+        DirectCallback(id):
+            callee = id
+                .function_number()
+                .c_name()
+
+            invalid = render(compiler_span(), InvalidMapCallback(id.function_number()))
+
+            match functions.get(id.function_number()):
+                None:
+                    Err(invalid)
+                Some(function):
+                    match function.parameters.map(parameter_type):
+                        [taken]:
+                            output.append_map_functions(
+                                job,
+                                taken,
+                                function.return_type,
+                                None,
+                                "${callee}(${element})",
+                                unions
+                            )
+                        [environment, taken]:
+                            output.append_map_functions(
+                                job,
+                                taken,
+                                function.return_type,
+                                Some(("environment", environment)),
+                                "${callee}(slots->environment,${element})",
+                                unions
+                            )
+                        _:
+                            Err(invalid)
+
+
+-- A job of `call`, the callback's call on the element at `index`, mapping
+-- `element`s to `result`s, with the value the callback borrows besides each
+-- element, if any, as its slot's name and type. The run function returns the
+-- layout's empty root for an empty input, with no allocation, as `map` does,
+-- and otherwise allocates the result once, with a slot per element, and runs
+-- the pieces on the pool. A piece writes only the slots of its range, never
+-- the length, so no two threads write one location. blorp_join_range returns
+-- once every piece has, and each join's `done` is released after its half's
+-- last write and acquired before the join returns, so every slot is visible
+-- here before the length, written once, counts it and the result is returned.
+private pure func append_map_functions(
+    output: String,
+    job: String,
+    element: TypeRef,
+    result: TypeRef,
+    borrowed: Option[(String, TypeRef)],
+    call: String,
+    unions: List[ConcreteUnion]
+) -> Result[String, Diagnostic]:
+    values ?= "const ".append_type_name(ListType(element), unions, compiler_span())
+    results ?= "".append_type_name(ListType(result), unions, compiler_span())
+
+    lent: Option[(String, String)] ?= match borrowed:
+        None:
+            Ok(None)
+        Some((name, value_type)):
+            ""
+                .append_type_name(value_type, unions, compiler_span())
+                .map(pure func(typed) -> Option[(String, String)]: Some(("${typed} ${name}", name)))
+
+    (member, parameter, initializer) = match lent:
+        None: ("", "", "")
+        Some((declared, name)): ("${declared};", ",${declared}", ",.${name}=${name}")
+
+    empty = result
+        .list_element_key()
+        .list_empty_root()
+
+    allocation = results.list_root_allocation("result", "count")
+
+    Ok(
+        "${output}struct ${job}{${values} values;${results} result;${member}};"
+            .concat(
+                "static void ${job}_piece(void *job,int64_t low,int64_t high){struct ${job} *const slots=job;"
+            )
+            .concat(
+                "for(int64_t index=low;index<high;index++)slots->result->values[index]=${call};}"
+            )
+            .concat(
+                "static ${results} ${job}_run(${values} values${parameter}){const int64_t count=values->length;"
+            )
+            .concat("if(count==0)return ${empty};")
+            .concat(
+                "if((uintmax_t)count>(SIZE_MAX-sizeof *((${results})0))/sizeof ((${results})0)->values[0])abort();"
+            )
+            .concat("${allocation}struct ${job} job={.values=values,.result=result${initializer}};")
+            .concat(
+                "blorp_join_range(${job}_piece,&job,count);result->length=count;return result;}"
+            )
+    )
+
+
 private pure func append_value(
     output: String,
     id: ValueId,
@@ -3561,7 +3706,8 @@ private fixed record RuntimeRequirements {
     bytes_to_text: Bool,
     float_formatting: Bool,
     float_parsing: Bool,
-    thread_pool: Bool
+    thread_pool: Bool,
+    range_splitter: Bool
 }
 
 
@@ -3583,9 +3729,14 @@ private pure func runtime_requirements(inventory: ProgramInventory) -> RuntimeRe
         bytes_to_text = False,
         float_formatting = False,
         float_parsing = False,
-        thread_pool = inventory.task_joins
+        thread_pool = inventory.pool_jobs
             .is_empty()
-            .not()
+            .not(),
+        range_splitter = inventory.pool_jobs.any(pure func(job: PoolJob) -> Bool:
+            match job:
+                MapJob(_): True
+                JoinJob(_): False
+        )
     }
 
     for value_type in inventory.types:
@@ -3628,8 +3779,9 @@ private pure func runtime_requirements(inventory: ProgramInventory) -> RuntimeRe
                 void
             IntegerToString(_) | IntegerEquals(_, _) | IntegerLessThan(_, _) | IntegerConvert(_, _) | FloatAdd | FloatSubtract | FloatMultiply | FloatDivide | FloatRemainder | StringLength | StringByteLength | StringCodepointLength | StringByteAtUInt8(_) | StringCodepointAt(_) | StringFromCodepoint(_):
                 void
-            -- Specialization turns join into a JoinTasks call: see task_joins.
-            FloatCopySign | FloatEquals(_) | FloatLessThan(_) | ConcurrencyJoin(_):
+            -- Specialization turns join into a JoinTasks call, and a parallel
+            -- map into a MapElements one: see pool_jobs.
+            FloatCopySign | FloatEquals(_) | FloatLessThan(_) | ConcurrencyJoin(_) | ConcurrencyParallelMap(_):
                 void
             -- Shared system helpers name String storage even when the selected
             -- operation has only Int or byte-list parameters and results.
@@ -3813,9 +3965,17 @@ private record ProgramInventory {
     runtime_calls: List[RuntimeOperation[VariantInstanceId, TypeRef]],
     list_updates: List[ListUpdateHelper],
     callable_entries: List[OwnedDefinition],
-    -- Each pair of tasks a join runs, once, with one job and two trampolines.
-    task_joins: List[TaskJoin]
+    -- Each job the pool runs, once, in the walk's order: one list, since the
+    -- walk's loop dups and drops every list it carries once per operation.
+    pool_jobs: List[PoolJob]
 }
+
+
+-- A job the thread pool runs: a join's tasks, with two trampolines, or a
+-- parallel map's callback, with a piece and a run function.
+private union PoolJob:
+    JoinJob(TaskJoin)
+    MapJob(MapCallback)
 
 
 private pure func program_inventory(program: OwnershipProgram) -> ProgramInventory:
@@ -3823,7 +3983,7 @@ private pure func program_inventory(program: OwnershipProgram) -> ProgramInvento
     var runtime_calls: List[RuntimeOperation[VariantInstanceId, TypeRef]] = []
     var list_updates: List[ListUpdateHelper] = []
     var callable_entries: List[OwnedDefinition] = []
-    var task_joins: List[TaskJoin] = []
+    var pool_jobs: List[PoolJob] = []
 
     for layout in program.records:
         for field in layout.record_fields():
@@ -3886,11 +4046,18 @@ private pure func program_inventory(program: OwnershipProgram) -> ProgramInvento
                                             None: void
                                     JoinTasks(tasks):
                                         if (
-                                            task_joins
-                                                .contains(tasks)
+                                            pool_jobs
+                                                .contains(JoinJob(tasks))
                                                 .not()
                                         ):
-                                            task_joins = task_joins.append(tasks)
+                                            pool_jobs = pool_jobs.append(JoinJob(tasks))
+                                    MapElements(callback):
+                                        if (
+                                            pool_jobs
+                                                .contains(MapJob(callback))
+                                                .not()
+                                        ):
+                                            pool_jobs = pool_jobs.append(MapJob(callback))
                                     UserFunction(_):
                                         void
                             ListSuffixDefinition(_, _):
@@ -3929,7 +4096,7 @@ private pure func program_inventory(program: OwnershipProgram) -> ProgramInvento
         runtime_calls = runtime_calls,
         list_updates = list_updates,
         callable_entries = callable_entries,
-        task_joins = task_joins
+        pool_jobs = pool_jobs
     }
 
 
@@ -4480,6 +4647,9 @@ pure func emit(program: VerifiedProgram) -> Result[String, Diagnostic]:
     if requirements.thread_pool:
         fragments = fragments.append(JOIN_RUNTIME)
 
+    if requirements.range_splitter:
+        fragments = fragments.append(JOIN_RANGE_RUNTIME)
+
     if requirements.float_types:
         fragments = fragments.append(FLOAT_RUNTIME)
 
@@ -4555,10 +4725,14 @@ pure func emit(program: VerifiedProgram) -> Result[String, Diagnostic]:
             .is_some()
             .not()
     ):
-        for tasks in inventory.task_joins:
-            match "".append_job(tasks, checked.functions, checked.unions):
-                Ok(job):
-                    fragments = fragments.append(job)
+        for job in inventory.pool_jobs:
+            emitted = match job:
+                JoinJob(tasks): "".append_job(tasks, checked.functions, checked.unions)
+                MapJob(callback): "".append_map_job(callback, checked.functions, checked.unions)
+
+            match emitted:
+                Ok(code):
+                    fragments = fragments.append(code)
                 Err(error):
                     failure = Some(error)
                     break
@@ -4611,9 +4785,10 @@ pure func emit(program: VerifiedProgram) -> Result[String, Diagnostic]:
                 .function_number()
                 .c_name()
 
-            -- A program that runs tasks rejects a bad BLORP_THREADS before any
-            -- of its own code runs, as the memory start does BLORP_LEAK_CHECK;
-            -- the pool's threads still start at the first join.
+            -- A program that uses the pool, through a join or a parallel map,
+            -- rejects a bad BLORP_THREADS before any of its own code runs, as
+            -- the memory start does BLORP_LEAK_CHECK; the pool's threads still
+            -- start at the first join or map.
             start = if requirements.thread_pool:
                 "blorp_memory_start();(void)blorp_join_requested_threads();"
             else:

@@ -83,7 +83,8 @@ import:
             StringPrintBuiltin,
             StringPrintErrorBuiltin,
             StringToBytesBuiltin,
-            ConcurrencyJoinBuiltin
+            ConcurrencyJoinBuiltin,
+            ConcurrencyParallelMapBuiltin
         )
     ../assemble: ParsedContents
     ../ids:
@@ -107,7 +108,7 @@ import:
             ListRuntimeType,
             StringListRuntimeType,
             UInt8ListRuntimeType,
-            TaskRuntimeType
+            PureCallableRuntimeType
         ),
         RuntimeResult(ValueResult, OptionalResult, ResultResult, BooleanResult, PairResult),
         ParsedRuntimeOperation methods
@@ -150,7 +151,7 @@ import:
         ),
         signature_error,
         BuiltinError(BuiltinContractMismatch, BuiltinTailAnnotation, BuiltinRestricted),
-        RestrictedBuiltin(FilesystemHandle, ConcurrencyNative),
+        RestrictedBuiltin(FilesystemHandle, JoinNative, ParallelMapNative),
         builtin_error
     ./model:
         AcceptedTrait,
@@ -201,6 +202,15 @@ record AcceptedFunction {
     body_types: TypeScope,
     body: AcceptedBody
 }
+
+
+-- Whether the thread pool runs the function's callbacks, as a parallel map's.
+-- Check knows the map by its body, the native only the concurrency library
+-- may declare, and never by its name.
+pure func pools_callbacks(accepted: AcceptedFunction) -> Bool:
+    match accepted.body:
+        BuiltinBody(builtins.ConcurrencyParallelMap(_), _): True
+        _: False
 
 
 private pure func function_label(
@@ -520,7 +530,7 @@ private pure func runtime_type_ref(value_type: builtins.RuntimeType[TypeRef]) ->
         ListRuntimeType(element): ListType(element)
         StringListRuntimeType: ListType(StringType)
         UInt8ListRuntimeType: ListType(IntegerType(UInt8Format))
-        TaskRuntimeType(result): CallableType(Pure, [], result)
+        PureCallableRuntimeType(callable): CallableType(Pure, callable.parameters, callable.result)
 
 
 -- A List operation's real E is the element of the header's first parameter.
@@ -656,6 +666,18 @@ private pure func accepted_operation(
                     )
                 _:
                     Err(builtin_error(site.span, BuiltinContractMismatch(parsed)))
+        -- parallel_map[A, B] with no bounds, its element type then its result.
+        ConcurrencyParallelMapBuiltin:
+            match (site.signature.type_parameters, site.signature.requirements):
+                ([element, result], []):
+                    Ok(
+                        builtins.ConcurrencyParallelMap({
+                            element = ParameterType(element),
+                            result = ParameterType(result)
+                        })
+                    )
+                _:
+                    Err(builtin_error(site.span, BuiltinContractMismatch(parsed)))
 
 
 -- What validating one builtin body needs: its declaration and signature, and
@@ -701,7 +723,7 @@ pure func validate_builtin_body(
     signature = site.signature
 
     generic_header: Bool = match parsed:
-        ListRepeatBuiltin | ListLengthBuiltin | ListGetBuiltin | ListAppendBuiltin | ListSetBuiltin | ListConcatBuiltin | ConcurrencyJoinBuiltin:
+        ListRepeatBuiltin | ListLengthBuiltin | ListGetBuiltin | ListAppendBuiltin | ListSetBuiltin | ListConcatBuiltin | ConcurrencyJoinBuiltin | ConcurrencyParallelMapBuiltin:
             True
         _:
             signature.type_parameters.is_empty()
@@ -1081,7 +1103,9 @@ private pure func restricted_builtin(
         SystemBuiltin(FsWriterBegin) | SystemBuiltin(FsWriterWriteAll) | SystemBuiltin(FsWriterFinish) | SystemBuiltin(FsWriterDiscard):
             Some(FilesystemHandle)
         ConcurrencyJoinBuiltin:
-            Some(ConcurrencyNative)
+            Some(JoinNative)
+        ConcurrencyParallelMapBuiltin:
+            Some(ParallelMapNative)
         _:
             None
 
@@ -1109,7 +1133,7 @@ private pure func resolve_function(
                     match parsed.modules.get(row.declaration.module.module_number()):
                         Some(module):
                             match (restriction, module.role):
-                                (FilesystemHandle, LibraryModule) | (FilesystemHandle, ConcurrencyModule) | (ConcurrencyNative, ConcurrencyModule):
+                                (FilesystemHandle, LibraryModule) | (FilesystemHandle, ConcurrencyModule) | (JoinNative, ConcurrencyModule) | (ParallelMapNative, ConcurrencyModule):
                                     Ok(void)
                                 _:
                                     Err(builtin_error(span, BuiltinRestricted(restriction)))

@@ -62,15 +62,17 @@ import:
             FloatDivide,
             FloatRemainder,
             FloatToString,
-            ConcurrencyJoin
+            ConcurrencyJoin,
+            ConcurrencyParallelMap
         ),
+        MapTypes,
         RuntimeType(
             PrimitiveRuntimeType,
             ElementRuntimeType,
             ListRuntimeType,
             StringListRuntimeType,
             UInt8ListRuntimeType,
-            TaskRuntimeType
+            PureCallableRuntimeType
         ),
         RuntimeResult(ValueResult, OptionalResult, ResultResult, BooleanResult, PairResult)
     ../../syntax/source: FunctionLabel
@@ -265,10 +267,22 @@ record TaskJoin {
 }
 
 
+-- A parallel map's callback: its own instance, called directly with its
+-- environment borrowed, or a stored closure the call lends, called through
+-- its operations, with the map's element and result types, which a direct
+-- callback's instance gives. The call's arguments are the List, then the
+-- instance's environment, if it takes one, or the closure; its value is the
+-- List of the callback's results.
+union MapCallback:
+    DirectCallback(FunctionInstanceId)
+    ClosureCallback(MapTypes[TypeRef])
+
+
 union CallTarget:
     UserFunction(FunctionInstanceId)
     RuntimeFunction(RuntimeOperation[VariantInstanceId, TypeRef])
     JoinTasks(TaskJoin)
+    MapElements(MapCallback)
 
 
 record ConcreteCall {
@@ -293,7 +307,7 @@ pure func runtime_type_ref(value_type: builtins.RuntimeType[TypeRef]) -> TypeRef
         ListRuntimeType(element): ListType(element)
         StringListRuntimeType: ListType(StringType)
         UInt8ListRuntimeType: ListType(IntegerType(UInt8Format))
-        TaskRuntimeType(result): CallableType([], result)
+        PureCallableRuntimeType(callable): CallableType(callable.parameters, callable.result)
 
 
 -- A pair result has no concrete type here: specialization turns the one
@@ -3952,20 +3966,20 @@ private pure func prepare_call(
                         tasks = tasks.prepare_task(choice, request, checked, span)
 
             tasks
+        -- Unlike a join's task, a parallel map's callback may be a stored
+        -- closure: the map calls it as a body calls a callable parameter.
+        model.RuntimeFunction(builtins.ConcurrencyParallelMap(_)):
+            match call.operands:
+                [model.ValueOperand(_), model.CallableOperand(_, model.ForwardedCallable(parameter), span)]:
+                    prepared.prepare_parameter_call(parameter, request, checked, span)
+                _:
+                    Err(internal_error(call.span, "a parallel map takes a List and its callback"))
         model.RuntimeFunction(_):
             Ok(prepared)
         model.ValueCall(_):
             Ok(prepared)
         model.CallableParameter(parameter):
-            match request.key.callables.callable_mode(parameter, call.span):
-                Err(error):
-                    Err(error)
-                Ok(RuntimeCallable(_)):
-                    Ok(prepared)
-                Ok(StaticCallable(choice)):
-                    match choice.body.runtime_key(choice.arguments, checked, call.span):
-                        Ok(key): prepared.request_instance(key, request.source, call.span)
-                        Err(error): Err(error)
+            prepared.prepare_parameter_call(parameter, request, checked, call.span)
         model.UserFunction(declaration, arguments):
             prepared.prepare_user_call(
                 declaration,
@@ -3979,9 +3993,30 @@ private pure func prepare_call(
             )
 
 
--- `outcome` with the instance of the native task `choice` requested: a
--- native's task is a callable parameter its declaration forwards, only join
--- has any, and the instance is the static callable the key chose for it.
+-- `prepared` with the instance a call of the callable `parameter` names
+-- requested: the static callable the key chose for it. A stored closure's
+-- instance was requested where the closure was made.
+private pure func prepare_parameter_call(
+    prepared: PreparedInstances,
+    parameter: model.CallableParameterId,
+    request: FunctionRequest,
+    checked: model.CheckedFunctions,
+    span: Span
+) -> Result[PreparedInstances, Diagnostic]:
+    match request.key.callables.callable_mode(parameter, span):
+        Err(error):
+            Err(error)
+        Ok(RuntimeCallable(_)):
+            Ok(prepared)
+        Ok(StaticCallable(choice)):
+            match choice.body.runtime_key(choice.arguments, checked, span):
+                Ok(key): prepared.request_instance(key, request.source, span)
+                Err(error): Err(error)
+
+
+-- `outcome` with the instance of the join task `choice` requested: a task is
+-- a callable parameter the join's declaration forwards, and always a lambda,
+-- so the key chose a static callable for it.
 private pure func prepare_task(
     outcome: Result[PreparedInstances, Diagnostic],
     choice: model.CallableChoice,
@@ -4544,6 +4579,8 @@ private pure func translate_call(
                         .map(pure func(id): UserFunction(id))
         model.RuntimeFunction(builtins.ConcurrencyJoin(_)):
             context.joined_tasks(call)
+        model.RuntimeFunction(builtins.ConcurrencyParallelMap(types)):
+            context.mapped_callback(call, types)
         model.RuntimeFunction(operation):
             concrete_result: Result[RuntimeOperation[VariantInstanceId, TypeRef], Diagnostic] = match operation:
                 IntegerAdd(format):
@@ -4721,8 +4758,8 @@ private pure func translate_call(
                     match boolean.translate_boolean(result_type, context.unions, call.span):
                         Ok(translated): Ok(builtins.StringEquals(translated))
                         Err(error): Err(error)
-                ConcurrencyJoin(_):
-                    Err(internal_error(call.span, "a join's call names its task instances"))
+                ConcurrencyJoin(_) | ConcurrencyParallelMap(_):
+                    Err(internal_error(call.span, "a native's call names its callables"))
 
             match concrete_result:
                 Ok(concrete): Ok(RuntimeFunction(concrete))
@@ -4871,6 +4908,33 @@ private pure func joined_tasks(
     match tasks:
         [left, right]: Ok(JoinTasks({ left = left, right = right }))
         _: Err(internal_error(call.span, "a join takes two tasks"))
+
+
+-- A parallel map's call names its callback as a call of its callable
+-- parameter does: the instance of a static one, or a stored closure.
+private pure func mapped_callback(
+    context: TranslationContext,
+    call: model.CheckedCall,
+    types: MapTypes[model.TypeRef]
+) -> Result[CallTarget, Diagnostic]:
+    element ?= context.translated_type(types.element, call.span)
+    result ?= context.translated_type(types.result, call.span)
+
+    match call.operands:
+        [model.ValueOperand(_), model.CallableOperand(_, model.ForwardedCallable(parameter), span)]:
+            match context.callables.translated_callable(parameter, span):
+                Ok(ErasedCallableBinding(known, _)) | Ok(CapturedCallableBinding(known, _, _)):
+                    context.keys
+                        .runtime_instance(known.body, known.arguments, span)
+                        .map(pure func(id): MapElements(DirectCallback(id)))
+                Ok(RuntimeCallableBinding(_, _, _)):
+                    Ok(MapElements(ClosureCallback({ element = element, result = result })))
+                Ok(RuntimeValueBinding(_, _)):
+                    Err(internal_error(span, "ordinary binding used as a callable formal"))
+                Err(error):
+                    Err(error)
+        _:
+            Err(internal_error(call.span, "a parallel map takes a List and its callback"))
 
 
 private pure func concrete_union_owner(

@@ -154,6 +154,13 @@ These ordinary source helpers are loops. `map` and `filter` append to a local
 accumulator that each append consumes, so they visit every element once, grow
 the result in place and use constant C stack.
 
+`concurrency.brp` declares `parallel_map(values: List[A], transform: pure (A)
+-> B) -> List[B]`, the native `concurrency.parallel_map`. It applies
+`transform` to each element, possibly at once on the thread pool, and returns
+the results in the order of `values`, allocating the result once, sized to
+the input. The module's private `join` and `run` are what check rewrites a
+`concurrent:` block into.
+
 List literals are supported. `set_index(values, index, value)` returns
 `Option[List[T]]`: `Some(updated)` for a valid index, or `None` for a negative
 or out-of-bounds index. `set(values, index, value)` returns `List[T]`:

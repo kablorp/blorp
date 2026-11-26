@@ -346,3 +346,76 @@ JOIN_RUNTIME: String =
         |blorp_join_finish(&task);
         |}
         |
+
+
+-- The range splitter behind a native parallel map, included after
+-- JOIN_RUNTIME for a program with one. It splits a map's range as Rayon's
+-- LengthSplitter does (CONCURRENCY_PLAN.md, "Spike P results"), on
+-- blorp_join: a range starts with one split per thread and halves that budget
+-- at each split, and a half another thread stole resets it to the thread
+-- count, so idle threads cause more splitting and busy ones none. It splits
+-- down to pieces of one element, since no fixed piece size fits every
+-- workload: Spike P's nested map needed pieces of one element, and its
+-- cheapest elements about 256. Both halves of a split live on the splitting
+-- thread's stack, so splitting allocates nothing.
+JOIN_RANGE_RUNTIME: String =
+    raw
+        |
+        |/* A piece of a map: runs its callback over [low, high), writing only those result slots. */
+        |typedef void (*blorp_join_piece)(void *job,int64_t low,int64_t high);
+        |/* `owner` is the thread that split this range off, which a right half reads to know it was stolen. */
+        |struct blorp_join_range {
+        |    blorp_join_piece piece;
+        |    void *job;
+        |    int64_t low;
+        |    int64_t high;
+        |    int splits;
+        |    int owner;
+        |};
+        |struct blorp_join_halves {
+        |    struct blorp_join_range left;
+        |    struct blorp_join_range right;
+        |};
+        |static void blorp_join_range_run(struct blorp_join_range range,int stolen);
+        |static void blorp_join_range_left(void *job){
+        |struct blorp_join_halves *const halves=job;
+        |blorp_join_range_run(halves->left,0);
+        |}
+        |/* The right half was stolen when another thread runs it: its owner took it back, or ran it inline, otherwise. */
+        |static void blorp_join_range_right(void *job){
+        |struct blorp_join_halves *const halves=job;
+        |blorp_join_range_run(halves->right,halves->right.owner!=blorp_join_self);
+        |}
+        |/* Each split nests this frame, blorp_join's and blorp_join_finish's, for about log2(count) levels per map: frames
+        |   the serial map does not have, which blorp_join_wait's stack bound does not count. */
+        |static void blorp_join_range_run(struct blorp_join_range range,int stolen){
+        |int split=range.high-range.low>=2;
+        |if(split&&stolen){
+        |range.splits=range.splits/2>blorp_join_threads?range.splits/2:blorp_join_threads;
+        |}else if(split&&range.splits>0){
+        |range.splits/=2;
+        |}else{
+        |split=0;
+        |}
+        |if(!split){
+        |range.piece(range.job,range.low,range.high);
+        |return;
+        |}
+        |struct blorp_join_halves halves={range,range};
+        |halves.left.high=range.low+(range.high-range.low)/2;
+        |halves.right.low=halves.left.high;
+        |halves.right.owner=blorp_join_self;
+        |blorp_join(blorp_join_range_left,blorp_join_range_right,&halves);
+        |}
+        |/* Runs `piece` over pieces that cover [0, count), possibly at once, and returns when all have finished. With one
+        |   thread the whole range is one piece. */
+        |void blorp_join_range(blorp_join_piece piece,void *job,int64_t count){
+        |pthread_once(&blorp_join_once,blorp_join_start);
+        |if(blorp_join_threads==1){
+        |piece(job,0,count);
+        |return;
+        |}
+        |const struct blorp_join_range range={piece,job,0,count,blorp_join_threads,blorp_join_self};
+        |blorp_join_range_run(range,0);
+        |}
+        |

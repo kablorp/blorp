@@ -294,6 +294,28 @@ private pure func method_label(
     Ok("${spelling.trait_name}.${spelling.method_name}")
 
 
+-- How a diagnostic names an impure callee: a function by its declared name,
+-- a trait method as `Logger.log`.
+private pure func callee_label(
+    callee: errors.ImpureCallee,
+    context: RenderContext,
+    span: Span
+) -> Result[String, Diagnostic]:
+    match callee:
+        errors.CalledFunction(id):
+            match (
+                context.parsed.declarations
+                    .inventory_functions()
+                    .get(id.function_number())
+            ):
+                Some(row):
+                    row.declaration.function_name.id.parsed_spelling(context.parsed.names, span)
+                None:
+                    Err(render_fault(span, errors.InvalidResolvedFunction(id)))
+        errors.CalledMethod(method):
+            method.method_label(context, span)
+
+
 pure func render_check_error(program: ParsedProgram, error: errors.CheckError) -> Diagnostic:
     render_context_error({ parsed = program.parsed_contents(), functions = [] }, error)
 
@@ -1122,11 +1144,17 @@ private pure func render_builtin_error(span: Span, rejection: errors.BuiltinErro
                 "raw filesystem builtin is restricted to library modules",
                 "use the io/files library operations instead of declaring this builtin"
             )
-        errors.BuiltinRestricted(errors.ConcurrencyNative):
+        errors.BuiltinRestricted(errors.JoinNative):
             rendered(
                 span,
                 "concurrency.join is private to the concurrency library",
                 "run tasks with a concurrent: block"
+            )
+        errors.BuiltinRestricted(errors.ParallelMapNative):
+            rendered(
+                span,
+                "concurrency.parallel_map is private to the concurrency library",
+                "import parallel_map from concurrency"
             )
         errors.BuiltinTailAnnotation:
             rendered(
@@ -1207,6 +1235,11 @@ private pure func missing_implementation(
 
 -- A constant, a return or a field also holds a pure callable type.
 private PURE_CALLABLE_HELP: String = "pass a pure function, or make the expected callable type impure"
+
+
+-- A parallel map's callback runs on the thread pool. Landing 5 of
+-- CONCURRENCY_PLAN.md changes this to "use concurrent_map for impure work".
+private PARALLEL_CALLBACK_HELP: String = "use a for loop for impure work"
 
 
 -- A member is pure because its trait's method is, which only that trait's author can change.
@@ -1291,6 +1324,16 @@ private pure func render_call_error(
                         span,
                         "a pure callable type requires a pure method, and ${label} is impure",
                         PURE_CALLABLE_HELP
+                    )
+                Err(fault):
+                    fault
+        errors.ImpureParallelCallback(callee):
+            match callee.callee_label(context, span):
+                Ok(label):
+                    rendered(
+                        span,
+                        "parallel_map needs a pure function: ${label} is impure",
+                        PARALLEL_CALLBACK_HELP
                     )
                 Err(fault):
                     fault

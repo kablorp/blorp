@@ -1,0 +1,281 @@
+---
+A parallel map's pieces call its direct callback's instance with an element
+of the List, lending it both, and store each result in the map's List, so own
+pins the callback to the borrowed ABI and verification checks it against the
+call. A map that names the wrong instance is rejected at the call. The program
+loads the library on disk, as `make test` does, for its import.
+---
+import:
+    test: TestSuite
+    ../../../../src/common/codegen/own/own as own
+    ../../../../src/common/codegen/specialize/specialize as specialized
+    ../../../../src/common/codegen/verify/verify: verify
+    ../../../../src/common/syntax/syntax: Span
+    ./native_call_inputs: borrows, called_instance, owned_program
+
+
+private ROOT: String = "build/parallel-maps/root.brp"
+
+
+-- `size` is the map's callback. It takes a String, so labels that own every
+-- unpinned parameter would own its element. The other calls give the
+-- instances a rejected map names instead: `described` returns a String, `+`
+-- takes two Ints and `clamped` three.
+private SOURCE: String =
+    |import:
+    |    concurrency: parallel_map
+    |
+    |pure func size(word: String) -> Int:
+    |    word.length()
+    |
+    |pure func described(word: String) -> String:
+    |    word.length().to_string()
+    |
+    |pure func clamped(value: Int, low: Int, high: Int) -> Int:
+    |    if value < low:
+    |        low
+    |    else if value > high:
+    |        high
+    |    else:
+    |        value
+    |
+    |func main() -> Int:
+    |    sizes = ["a", "bb"].parallel_map(size)
+    |    sizes.length() + described("x").length() + clamped(5, 0, 3)
+    |
+
+
+-- The map's callback is a stored closure of `(String) -> Int`.
+private CLOSURE_SOURCE: String =
+    |import:
+    |    concurrency: parallel_map
+    |
+    |record Holder {
+    |    score: pure (String) -> Int
+    |}
+    |
+    |pure func size(word: String) -> Int:
+    |    word.length()
+    |
+    |func main() -> Int:
+    |    holder: Holder = { score = size }
+    |    ["a", "bb"].parallel_map(holder.score).length()
+    |
+
+
+-- The program's one parallel map, by its callback, and the span of its call.
+private record FoundMap {
+    callback: specialized.MapCallback,
+    span: Span
+}
+
+
+private pure func found_map(program: own.OwnershipProgram) -> Option[FoundMap]:
+    var found: Option[FoundMap] = None
+
+    for function in program.functions:
+        for operation in function.operations:
+            match operation:
+                own.DefineValue(definition):
+                    match definition.operation:
+                        own.CallDefinition(specialized.MapElements(callback), _):
+                            found = Some({ callback = callback, span = definition.span })
+                        _:
+                            void
+                _:
+                    void
+
+    found
+
+
+-- The program with its one parallel map calling `callback` instead.
+private pure func remapped(
+    program: own.OwnershipProgram,
+    callback: specialized.MapCallback
+) -> own.OwnershipProgram:
+    var functions: List[own.OwnedFunction] = []
+
+    for function in program.functions:
+        var operations: List[own.OwnershipOperation] = []
+
+        for operation in function.operations:
+            next: own.OwnershipOperation = match operation:
+                own.DefineValue(definition):
+                    match definition.operation:
+                        own.CallDefinition(specialized.MapElements(_), arguments):
+                            own.DefineValue(
+                                { definition |
+                                    operation = own.CallDefinition(
+                                        specialized.MapElements(callback),
+                                        arguments
+                                    )
+                                }
+                            )
+                        _:
+                            operation
+                _:
+                    operation
+
+            operations = operations.append(next)
+
+        functions = functions.append({ function | operations = operations })
+
+    { program | functions = functions }
+
+
+-- Whether verifying `program` with its map calling the instance that
+-- `matches` fails at the map's call with `message`.
+private pure func rejected(
+    program: own.OwnershipProgram,
+    matches: pure (own.OwnedFunction) -> Bool,
+    message: String
+) -> Bool:
+    match (program.found_map(), program.called_instance(matches)):
+        (Some(map), Some(callback)):
+            match verify(program.remapped(specialized.DirectCallback(callback))):
+                Ok(_):
+                    False
+                Err(error):
+                    (error.message == "ownership verification failed: " + message).and(
+                        error.span == map.span
+                    )
+        _:
+            False
+
+
+private pure func takes(count: Int) -> pure (own.OwnedFunction) -> Bool:
+    pure func(function: own.OwnedFunction) -> Bool: function.parameters.length() == count
+
+
+func test_a_map_naming_its_callback_verifies() -> Bool:
+    match owned_program(ROOT, SOURCE, own.InferredLabels):
+        None: False
+        Some(program): verify(program).is_ok()
+
+
+-- Labels that own every other parameter still lend the callback its element.
+func test_the_callback_borrows_its_element_when_every_other_parameter_owns() -> Bool:
+    match owned_program(ROOT, SOURCE, own.AllOwnedExceptPinned):
+        None:
+            False
+        Some(program):
+            match program.found_map():
+                None:
+                    False
+                Some(map):
+                    match map.callback:
+                        specialized.DirectCallback(id):
+                            match program.functions.get(specialized.function_number(id)):
+                                Some(callback):
+                                    (callback.parameters.length() == 1)
+                                        .and(borrows(callback))
+                                        .and(verify(program).is_ok())
+                                None:
+                                    False
+                        specialized.ClosureCallback(_):
+                            False
+
+
+-- `described` takes the List's String elements but returns a String.
+func test_a_callback_with_the_wrong_result_is_rejected() -> Bool:
+    match owned_program(ROOT, SOURCE, own.InferredLabels):
+        None:
+            False
+        Some(program):
+            program.rejected(
+                pure func(callee) -> Bool: (callee.parameters.map(own.parameter_type) == [
+                    specialized.StringType
+                ]).and(callee.return_type == specialized.StringType),
+                "call result type does not match its contract"
+            )
+
+
+-- Every unpinned parameter owns, so `described`'s String parameter does.
+func test_a_callback_that_owns_a_parameter_is_rejected() -> Bool:
+    match owned_program(ROOT, SOURCE, own.AllOwnedExceptPinned):
+        None:
+            False
+        Some(program):
+            program.rejected(
+                pure func(callee) -> Bool: borrows(callee).not(),
+                "pinned instance has an owned parameter"
+            )
+
+
+-- `+`'s instance takes two Ints, so its first reads as an environment the
+-- call does not lend.
+func test_a_callback_with_a_second_parameter_is_rejected() -> Bool:
+    match owned_program(ROOT, SOURCE, own.InferredLabels):
+        None: False
+        Some(program): program.rejected(takes(2), "call is missing its argument")
+
+
+func test_a_callback_with_three_parameters_is_rejected() -> Bool:
+    match owned_program(ROOT, SOURCE, own.InferredLabels):
+        None:
+            False
+        Some(program):
+            program.rejected(
+                takes(3),
+                "a mapped callback takes an element and at most its environment"
+            )
+
+
+-- The closure takes Strings, so a map that names Ints as its elements does not
+-- match it.
+func test_a_closure_of_another_element_type_is_rejected() -> Bool:
+    match owned_program(ROOT, CLOSURE_SOURCE, own.InferredLabels):
+        None:
+            False
+        Some(program):
+            match program.found_map():
+                None:
+                    False
+                Some(map):
+                    match map.callback:
+                        specialized.DirectCallback(_):
+                            False
+                        specialized.ClosureCallback(types):
+                            mismatched = specialized.ClosureCallback(
+                                { types | element = types.result }
+                            )
+
+                            match (verify(program), verify(program.remapped(mismatched))):
+                                (Ok(_), Err(error)):
+                                    (error.message == "ownership verification failed: call argument type does not match its contract").and(
+                                        error.span == map.span
+                                    )
+                                _:
+                                    False
+
+
+TESTS: TestSuite = {
+    description = "Verified parallel maps",
+    tests = [
+        ("a map naming its callback verifies", test_a_map_naming_its_callback_verifies),
+        (
+            "the callback borrows its element when every other parameter owns",
+            test_the_callback_borrows_its_element_when_every_other_parameter_owns
+        ),
+        (
+            "a callback with the wrong result is rejected",
+            test_a_callback_with_the_wrong_result_is_rejected
+        ),
+        (
+            "a callback that owns a parameter is rejected",
+            test_a_callback_that_owns_a_parameter_is_rejected
+        ),
+        (
+            "a callback with a second parameter is rejected",
+            test_a_callback_with_a_second_parameter_is_rejected
+        ),
+        (
+            "a callback with three parameters is rejected",
+            test_a_callback_with_three_parameters_is_rejected
+        ),
+        (
+            "a closure of another element type is rejected",
+            test_a_closure_of_another_element_type_is_rejected
+        )
+    ]
+}

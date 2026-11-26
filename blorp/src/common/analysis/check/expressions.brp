@@ -142,6 +142,7 @@ import:
             LambdaResultNeedsType,
             CallableReceiverSyntax,
             ImpureCallback,
+            ImpureParallelCallback,
             CallableValueRequired,
             UnknownFunction,
             UncallableBinding
@@ -543,7 +544,9 @@ private fixed record OperandRange {
 
 private union ExpressionWork:
     EnterExpression(ValueExpression, Option[InferenceType])
-    EnterCallable(ValueExpression, Option[InferenceType])
+    -- A callable argument, and whether the thread pool runs it, as a parallel
+    -- map's callback.
+    EnterCallable(ValueExpression, Option[InferenceType], Bool)
     ResolveContexts(Int, Int)
     FinishContext(Int, List[ScopedValue], ExpressionSite, Int)
     ScheduleVariant(PendingVariantContract, List[ValueExpression], Span)
@@ -845,10 +848,20 @@ private pure func record_operands(
         None: Ok(fields)
 
 
+-- An impure callee given as a callback, which the thread pool runs when it is
+-- `pooled`, as a parallel map's.
+private pure func impure_callback(callee: ImpureCallee, pooled: Bool) -> CallError:
+    if pooled:
+        ImpureParallelCallback(callee)
+    else:
+        ImpureCallback(callee)
+
+
 -- Context can weaken outer purity; parameter/result equality stays exact.
 private pure func callable_permission(
     value: PendingValue,
     expected: Option[InferenceType],
+    pooled: Bool,
     slots: List[InferenceSlot]
 ) -> Result[PendingValue, CheckError]:
     match expected:
@@ -869,7 +882,7 @@ private pure func callable_permission(
                                         Err(
                                             call_error(
                                                 value.span,
-                                                ImpureCallback(CalledFunction(id))
+                                                CalledFunction(id).impure_callback(pooled)
                                             )
                                         )
                                 PendingMethodCallable(method, signature, _):
@@ -879,7 +892,7 @@ private pure func callable_permission(
                                         Err(
                                             call_error(
                                                 value.span,
-                                                ImpureCallback(CalledMethod(method))
+                                                CalledMethod(method).impure_callback(pooled)
                                             )
                                         )
                                 _:
@@ -941,7 +954,7 @@ private pure func argument_work(
         .or_checker_invariant(call.span, MissingCallParameter(argument_position))
 
     match written.value_type:
-        CallableType(_, _, _): Ok(EnterCallable(argument, hint))
+        CallableType(_, _, _): Ok(EnterCallable(argument, hint, call.pooled_callbacks))
         _: Ok(EnterExpression(argument, hint))
 
 
@@ -2060,7 +2073,7 @@ private pure func elaborate_value(
         match next:
             Some(Some(action)):
                 match action:
-                    EnterCallable(written, hint):
+                    EnterCallable(written, hint, pooled):
                         match written.base:
                             LambdaExpression(lambda):
                                 match site.body_context(written.span):
@@ -2165,7 +2178,7 @@ private pure func elaborate_value(
                                             _:
                                                 void
 
-                                        match value.callable_permission(hint, slots):
+                                        match value.callable_permission(hint, pooled, slots):
                                             Ok(viewed):
                                                 operands = operands.push_at(
                                                     operand_count,
@@ -2287,7 +2300,9 @@ private pure func elaborate_value(
                                             PlannedCallable(value, callable_hint):
                                                 work = work.push_at(
                                                     work_count,
-                                                    Some(EnterCallable(value, callable_hint))
+                                                    Some(
+                                                        EnterCallable(value, callable_hint, False)
+                                                    )
                                                 )
 
                                                 work_count = work_count + 1
@@ -2431,7 +2446,8 @@ private pure func elaborate_value(
                                                     target = PendingStored(callee),
                                                     signature = contract.signature,
                                                     span = contract.span,
-                                                    variable_start = slots.length()
+                                                    variable_start = slots.length(),
+                                                    pooled_callbacks = contract.pooled_callbacks
                                                 }
 
                                                 work = work.push_at(
@@ -3175,7 +3191,8 @@ private pure func elaborate_value(
                                             target = target,
                                             signature = contract.signature,
                                             span = contract.span,
-                                            variable_start = slots.length()
+                                            variable_start = slots.length(),
+                                            pooled_callbacks = contract.pooled_callbacks
                                         }
 
                                         for parameter in contract.signature.type_parameters:
@@ -3207,6 +3224,7 @@ private pure func elaborate_value(
                                                 hints
                                                     .get(0)
                                                     .get_or(None),
+                                                False,
                                                 slots
                                             )
                                             .map(pure func(viewed): ReceiverPlacement(viewed, span))
@@ -3303,7 +3321,7 @@ private pure func elaborate_value(
                                 failure = Some(error)
                             Ok(current):
                                 if position == postfixes.length():
-                                    match current.callable_permission(expected, slots):
+                                    match current.callable_permission(expected, False, slots):
                                         Ok(viewed):
                                             operands = operands.push_at(
                                                 operand_count,
