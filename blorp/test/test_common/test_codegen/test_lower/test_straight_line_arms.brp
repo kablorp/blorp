@@ -1,0 +1,348 @@
+import:
+    test: TestSuite
+    ../../../../src/common/codegen/lower/lower as lower
+    ../../../../src/common/syntax/source: label_text
+    ../../../support/list_update_inputs: lowered, UPDATE_DECLARATIONS
+
+
+-- `Stem` and `Counter` are erased: one variant, one payload. `Pair` has two
+-- payloads, so it keeps its tag and its payloads are read by projection.
+-- `Unit` has one variant and no payload.
+private PROGRAM: String =
+    |union Stem:
+    |    Init(List[Int])
+    |union Pair:
+    |    Init(List[Int], Int)
+    |union Counter:
+    |    Init(Int)
+    |union Unit:
+    |    Only
+    |pure func add(left: Int, right: Int) -> Int:
+    |    builtin("int.add")
+    |pure func matched(stem: Stem) -> Int:
+    |    match stem:
+    |        Stem.Init(items): length(items)
+    |pure func bound(stem: Stem) -> Int:
+    |    items = match stem:
+    |        Stem.Init(found): found
+    |    length(items)
+    |pure func paired(pair: Pair) -> Int:
+    |    match pair:
+    |        Pair.Init(items, _): length(items)
+    |pure func carried(stem: Stem) -> Int:
+    |    var count = 0
+    |    match stem:
+    |        Stem.Init(items):
+    |            count = length(items)
+    |    count
+    |pure func summed(stems: List[Stem]) -> Int:
+    |    var total = 0
+    |    for stem in stems:
+    |        match stem:
+    |            Stem.Init(items):
+    |                total = add(total, length(items))
+    |    total
+    |pure func first(stems: List[Stem]) -> Int:
+    |    var found = 0
+    |    for stem in stems:
+    |        match stem:
+    |            Stem.Init(items):
+    |                found = length(items)
+    |                break
+    |    found
+    |pure func skipped(stems: List[Stem]) -> Int:
+    |    var seen = 0
+    |    for stem in stems:
+    |        seen = add(seen, 1)
+    |        match stem:
+    |            Stem.Init(_):
+    |                continue
+    |    seen
+    |@tail_recursive
+    |pure func countdown(counter: Counter, total: Int) -> Int:
+    |    remaining = match counter:
+    |        Counter.Init(value): value
+    |    match less_than(remaining, 1):
+    |        True: total
+    |        False: countdown(Counter.Init(add(remaining, -1)), add(total, 2))
+    |@tail_recursive
+    |pure func spin(counter: Counter) -> Int:
+    |    match counter:
+    |        Counter.Init(value): spin(Counter.Init(value))
+    |pure func ignored(pair: Pair, unit: Unit, both: (Int, Int)) -> Int:
+    |    tagged = match pair:
+    |        Pair.Init(_, _): 1
+    |    bare = match unit:
+    |        Only: 2
+    |    paired_up = match both:
+    |        (_, _): 3
+    |    add(add(tagged, bare), paired_up)
+    |func main() -> Int:
+    |    stem = Stem.Init([1, 2])
+    |    stems = [stem, Stem.Init([3])]
+    |    counter = Counter.Init(3)
+    |    sizes = [matched(stem), bound(stem), paired(Pair.Init([4], 5)), ignored(Pair.Init([], 0), Only, (1, 2)), carried(stem), summed(stems), first(stems), skipped(stems), countdown(counter, 0)]
+    |    if less_than(length(sizes), 0):
+    |        spin(counter)
+    |    else:
+    |        length(sizes)
+    |
+
+
+private pure func lowered_function(name: String) -> Option[lower.LoweredFunction]:
+    match lowered(UPDATE_DECLARATIONS + PROGRAM):
+        Err(_):
+            None
+        Ok(program):
+            lower.lowered_functions(program).functions.find(
+                pure func(function): label_text(function.label) == "module_0." + name
+            )
+
+
+-- The joins in `steps` and in every block nested in them.
+private pure func joins(steps: List[lower.LoweredStep]) -> List[lower.LoweredJoin]:
+    var found: List[lower.LoweredJoin] = []
+
+    for step in steps:
+        match step:
+            lower.Join(join):
+                found = found.append(join)
+
+                for arm in join.arms:
+                    found = found.concat(joins(arm.steps))
+            lower.Loop(loop):
+                found = found.concat(loop_block_joins(loop.body))
+            lower.Define(_):
+                void
+
+    found
+
+
+private pure func loop_block_joins(block: lower.LoopBlock) -> List[lower.LoweredJoin]:
+    var found = joins(block.steps)
+
+    match block.tail:
+        lower.MatchLoop(matched):
+            for arm in matched.arms:
+                found = found.concat(loop_block_joins(arm.body))
+        lower.ExitLoop(_):
+            void
+
+    found
+
+
+private pure func join_count(name: String) -> Int:
+    match lowered_function(name):
+        Some(function): joins(function.steps).length()
+        None: -1
+
+
+private pure func first_loop(name: String) -> Option[lower.LoweredLoop]:
+    steps = match lowered_function(name):
+        Some(function): function.steps
+        None: []
+
+    var found: Option[lower.LoweredLoop] = None
+
+    for step in steps:
+        match step:
+            lower.Loop(loop):
+                found = Some(loop)
+                break
+            _:
+                void
+
+    found
+
+
+-- A for loop's body is the arm its condition enters when an element is present.
+private pure func element_arm(name: String) -> Option[lower.LoopBlock]:
+    match first_loop(name):
+        Some(loop):
+            match loop.body.tail:
+                lower.MatchLoop(matched):
+                    matched.arms
+                        .get(0)
+                        .map(pure func(arm): arm.body)
+                lower.ExitLoop(_):
+                    None
+        None:
+            None
+
+
+-- Whether a call in `steps` defines `value`.
+private pure func defined_by_call(steps: List[lower.LoweredStep], value: lower.ValueId) -> Bool:
+    steps.any(pure func(step: lower.LoweredStep) -> Bool:
+        match step:
+            lower.Define(definition):
+                match definition.operation:
+                    lower.CallValue(_, _): definition.id == value
+                    _: False
+            _:
+                False
+    )
+
+
+-- `length(items)` reads the parameter itself: the arm's input is the scrutinee.
+private pure func reads_its_parameter(name: String) -> Bool:
+    match lowered_function(name):
+        Some(function):
+            match function.steps:
+                [lower.Define(parameter), lower.Define(call)]:
+                    match call.operation:
+                        lower.CallValue(_, [argument]):
+                            (argument == parameter.id).and(function.result == call.id)
+                        _:
+                            False
+                _:
+                    False
+        None:
+            False
+
+
+func test_an_erased_arm_continues_its_block() -> Bool:
+    reads_its_parameter("matched").and(join_count("matched") == 0)
+
+
+func test_an_erased_match_binding_continues_its_block() -> Bool:
+    reads_its_parameter("bound").and(join_count("bound") == 0)
+
+
+func test_a_tagged_one_variant_union_keeps_its_selection() -> Bool:
+    match lowered_function("paired"):
+        Some(function):
+            match joins(function.steps):
+                [join]:
+                    join.selection.nodes.any(pure func(node: lower.LoweredDecisionNode) -> Bool:
+                        match node:
+                            lower.EnterArm(edge):
+                                match edge.definitions:
+                                    [lower.BorrowUnionField(_, _, _)]: True
+                                    _: False
+                            _:
+                                False
+                    )
+                _:
+                    False
+        None:
+            False
+
+
+-- The var's new value reaches the result directly, with no join output.
+-- A tagged union's wildcards, a payload-free variant and a tuple of wildcards.
+func test_a_pattern_that_binds_nothing_continues_its_block() -> Bool:
+    join_count("ignored") == 0
+
+
+func test_a_var_an_arm_assigns_continues_without_a_join_output() -> Bool:
+    match lowered_function("carried"):
+        Some(function):
+            (joins(function.steps).length() == 0).and(
+                function.steps.defined_by_call(function.result)
+            )
+        None:
+            False
+
+
+-- The loop's backedge carries the total the arm computed.
+func test_a_var_an_arm_assigns_in_a_loop_reaches_the_backedge() -> Bool:
+    match element_arm("summed"):
+        Some(body):
+            match body.tail:
+                lower.ExitLoop(lower.Recur(values, _)):
+                    match values.last():
+                        Some(total):
+                            (loop_block_joins(body).length() == 0).and(
+                                body.steps.defined_by_call(total)
+                            )
+                        None:
+                            False
+                _:
+                    False
+        None:
+            False
+
+
+func test_an_arm_that_breaks_ends_the_loop_body() -> Bool:
+    match element_arm("first"):
+        Some(body):
+            match body.tail:
+                lower.ExitLoop(lower.Break(_)): True
+                _: False
+        None:
+            False
+
+
+func test_an_arm_that_continues_ends_the_loop_body() -> Bool:
+    match element_arm("skipped"):
+        Some(body):
+            match body.tail:
+                lower.ExitLoop(lower.Recur(_, _)): True
+                _: False
+        None:
+            False
+
+
+-- The binding is in the self-tail loop's body; the final Bool match stays.
+func test_an_erased_binding_continues_a_self_tail_loop_body() -> Bool:
+    match first_loop("countdown"):
+        Some(loop):
+            match loop.body.tail:
+                lower.MatchLoop(_): loop_block_joins(loop.body).length() == 0
+                lower.ExitLoop(_): False
+        None:
+            False
+
+
+-- A self-tail function's final one-arm match is always its self call, so it
+-- keeps its selection.
+func test_a_self_tail_final_one_arm_match_keeps_its_selection() -> Bool:
+    match first_loop("spin"):
+        Some(loop):
+            match loop.body.tail:
+                lower.MatchLoop(matched):
+                    match matched.selection.nodes:
+                        [lower.EnterArm(_)]: True
+                        _: False
+                lower.ExitLoop(_):
+                    False
+        None:
+            False
+
+
+TESTS: TestSuite = {
+    description = "Straight-line arms of selections with no test",
+    tests = [
+        ("an erased arm continues its block", test_an_erased_arm_continues_its_block),
+        (
+            "an erased match binding continues its block",
+            test_an_erased_match_binding_continues_its_block
+        ),
+        (
+            "a tagged one-variant union keeps its selection",
+            test_a_tagged_one_variant_union_keeps_its_selection
+        ),
+        (
+            "a pattern that binds nothing continues its block",
+            test_a_pattern_that_binds_nothing_continues_its_block
+        ),
+        (
+            "a var an arm assigns continues without a join output",
+            test_a_var_an_arm_assigns_continues_without_a_join_output
+        ),
+        (
+            "a var an arm assigns in a loop reaches the backedge",
+            test_a_var_an_arm_assigns_in_a_loop_reaches_the_backedge
+        ),
+        ("an arm that breaks ends the loop body", test_an_arm_that_breaks_ends_the_loop_body),
+        ("an arm that continues ends the loop body", test_an_arm_that_continues_ends_the_loop_body),
+        (
+            "an erased binding continues a self-tail loop body",
+            test_an_erased_binding_continues_a_self_tail_loop_body
+        ),
+        (
+            "a self-tail final one-arm match keeps its selection",
+            test_a_self_tail_final_one_arm_match_keeps_its_selection
+        )
+    ]
+}

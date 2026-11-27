@@ -282,7 +282,68 @@ The raw output is in `build/destructuring-removal/spike-cost.log`.
        borrowed projections (83 production and 707 test lines).
    - **Estimate:** +60 to +120 production, +300 to +600 tests. The ceiling is
      set from the spike before implementation.
+   - **Ceilings:** +125 / +700, coordinator, set from the spike (+106
+     measured in the draft). Tests +700 -> +860, routine (coordinator):
+     independent verifier tests.
    - **Model:** use Opus. This is the plan's subtle ownership work.
+   - **Spike (`spike/flatten-selection`, never lands):** scope (a). Every one
+     of the 204 sites is an erased union; scope (b) flattens only 2 more
+     selections in `src` and needs a new verify rule, so it is a follow-up
+     (below). `lower_match` serves only `@tail_recursive` functions, whose
+     final one-arm match must be the self call and never ends, so it keeps
+     its selection.
+   - **Results (`4fb81b64f..`, measured at `fa50eb082`):**
+     - Lower only. Own, verify and emit need no change: a straight-line arm's
+       inputs are the scrutinee's own value, which is destructuring's IR.
+       Lower checks the arm's input count, which verify checks on an edge.
+     - Patterns that bind nothing flatten too: `_`, `(_, _)`, `Unit.Only` and
+       all-wildcard patterns on tagged unions.
+     - **A known small difference, accepted:** a flattened statement match
+       still defines its arm's Void value, so its C keeps a constant that
+       nothing reads (`const uint8_t ...=0;`), which -O2 removes.
+     - The repro's `size_matched` and `m/`'s binding form emit their
+       destructured counterparts' C, temporaries included.
+     - With flattening disabled, exactly the flattening tests fail (8 lower,
+       3 own, 2 verify, 2 emit); the guards for a tagged one-variant union and
+       a self-tail final match pass either way.
+     - **Measurement 1, the stop condition.** Landing 2's stage-1 compiler
+       built landing 2 and landing 2 plus `build/destructuring-removal/migrate.py`
+       (157 arm form, 47 binding form, 0 skipped), each at -O2, given landing
+       2's source:
+
+       | Metric | landing 2 | + migration | Change |
+       | --- | ---: | ---: | ---: |
+       | allocations | 13,538,155 | 13,538,155 | 0 |
+       | peak heap, bytes | 192,458,904 | 192,458,922 | +18 |
+       | instructions, macOS median of 11 | 13,764,930,042 | 13,771,790,324 | +0.0498% |
+       | instructions, callgrind (Linux arm64) | 12,291,921,880 | 12,291,922,051 | +0.0000% |
+
+       The macOS reading sat at the edge of the 0.05% band, so callgrind
+       settled it: +171 instructions. The fixed-input C is identical.
+     - **Measurement 2, this landing's own cost.** Each side built by itself
+       (stage 2), given the base's source:
+
+       | Metric | `4fb81b64f` | landing 2 | Change |
+       | --- | ---: | ---: | ---: |
+       | allocations | 13,515,368 | 13,514,539 | -0.0061% |
+       | peak heap, bytes | 192,360,289 | 192,263,408 | -0.0504% |
+       | instructions, macOS median of 5 | 13,760,289,611 | 13,749,885,211 | -0.0756% |
+
+     - **`self-compile-cost 4fb81b64f fa50eb082 --rounds 3`:** fixed input
+       allocations -0.0061%, peak heap -0.0504%, instructions -0.0855%; own
+       source allocations +0.1686%, instructions +0.0642%. The fixed-input C
+       differs only in the 27 derived equalities of erased id types
+       (`ModuleId`, `ValueId` and the rest), whose 54 one-arm selections are
+       flattened.
+     - **Lines** (against `04a7ceff7`, the origin/main merged as
+       `abed4171e`): production +137/-14 (net +123, ceiling +125); tests +816
+       (ceiling +860). The growth audit cut a two-variant guard that
+       `test_match_arms` covers, a generic verifier rejection and the
+       destructured e2e twin (+923 before); the review then dropped the e2e
+       store case, which allocated 2 either way, and added the arity check
+       (+15 production) and a wildcard assertion. README +4/-1.
+     - Raw evidence: `build/destructuring-removal/landing2/` (`stage2/`,
+       `callgrind/`, `self-compile-cost/`, `gate.log`).
 3. **Landing 3: rotate the seed** to landing 2's commit, as
    `PRIVATE_VARIANTS_PLAN.md`'s landing 3 did. It runs the fixpoint and
    `test_bootstrap.sh`.
@@ -384,6 +445,18 @@ Without landing 2, the expected cost is the spike's +0.66%. Taking that cost
 would be Keith's decision, not a routine correction.
 
 ## Out of scope
+
+- **Flattening an edge that projects (landing 2's scope (b)).** The spike
+  (`spike/flatten-selection-b`, never lands) flattened edges with definitions
+  too: +45 lower, +2 own (`PayloadDefinition` on the `Projection` plan, and
+  `borrowed_extents` following `PayloadValue`) and +96 verify (a payload read
+  of a one-variant union in an ordinary block). `[...rest]` (`CopyListSuffix`)
+  also becomes straight-line and fails verify's `value_place` outside a
+  selection, so it needs a second rule or an exclusion. It flattens 2 more
+  selections in `src` (`declarations.resolved_uses` and
+  `resolved_value_type`), and in users' programs tagged one-variant unions,
+  tuple patterns and the per-binder selections of a tagged destructuring.
+  The codegen suites passed with it; the full gate was not run.
 
 - Tuple destructuring.
 - **Lending an arm input whose root is a borrowed parameter.** It would

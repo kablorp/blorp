@@ -90,8 +90,9 @@ done.
     module, lower flattening a selection with no test, a rotation, the
     migration of 204 sites, then deleting destructuring. The net is about −75
     to −135 lines.
-  - **Next:** landing 1, a resource union matched in its module. Keith
-    accepted the plan's three decisions on 2026-11-26.
+  - **Landed:** landing 1, a resource union matched in its module, and
+    landing 2, lower flattening a selection with no test.
+  - **Next:** landing 3, the seed rotation to landing 2.
 - **UInt8 and Bytes:** [`UINT8_BYTES_PLAN.md`](UINT8_BYTES_PLAN.md).
   - **Status:** U1 to U9 and B1 to B3 are decided. L0, the
     `IntegerType(Int64Format)` refactor, and L1, the compiler's `UInt8` with

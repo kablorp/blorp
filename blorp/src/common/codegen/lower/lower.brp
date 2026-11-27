@@ -7,7 +7,8 @@ import:
         DecisionNodeId,
         ListLengthTest,
         match_arm_id,
-        decision_node_id
+        decision_node_id,
+        decision_node_number
     ../../analysis/namespace/builtins as builtins:
         DesignatedBoolean,
         DesignatedOption,
@@ -20,7 +21,8 @@ import:
         FunctionExecution(OrdinaryCalls, SelfTailLoop),
         LiteralPattern,
         Span,
-        internal_error
+        internal_error,
+        or_internal_error
     ../../utils/results: translated_list
     ../specialize/specialize as specialized:
         ConcreteArm,
@@ -1105,9 +1107,46 @@ private pure func lower_prepared_join(
     binding_facts: List[ConcreteBinding],
     context: Option[SourceLoopContext]
 ) -> Result[BuiltBlockValue, Diagnostic]:
+    scrutinee ?= builder.lower_block_value(bindings, join.scrutinee, binding_facts, None)
+
+    straight ?= join.straight_line_arm()
+
+    match straight:
+        Some(arm): scrutinee.lower_straight_line_join(arm, binding_facts, context)
+        None: scrutinee.lower_pending_join(join, binding_facts, context)
+
+
+-- A join whose selection has no test continues the block with its one arm,
+-- whose value is the join's.
+private pure func lower_straight_line_join(
+    scrutinee: BuiltBlockValue,
+    arm: PreparedArm,
+    facts: List[ConcreteBinding],
+    context: Option[SourceLoopContext]
+) -> Result[BuiltBlockValue, Diagnostic]:
+    block ?= scrutinee.lower_straight_line_arm(arm, facts, context)
+
+    value: PreparedValue ?= match arm.body.tail:
+        ProducesValue(value): Ok(value)
+        _: Err(internal_error(arm.span, "join arm yields no value"))
+
+    lower_prepared_value(
+        { next_value = block.next_value, entries = block.entries },
+        block.bindings,
+        value,
+        facts,
+        context
+    )
+
+
+private pure func lower_pending_join(
+    scrutinee: BuiltBlockValue,
+    join: PreparedSelection,
+    binding_facts: List[ConcreteBinding],
+    context: Option[SourceLoopContext]
+) -> Result[BuiltBlockValue, Diagnostic]:
     span = join.span
     value_type = join.value_type
-    scrutinee ?= builder.lower_block_value(bindings, join.scrutinee, binding_facts, None)
     id = ValueId.Init(scrutinee.builder.next_value)
     var next_value = scrutinee.builder.next_value + 1
     var carried: List[ValueParameter] = []
@@ -1689,19 +1728,25 @@ private pure func prepare_terminal_match(
         None
     )
 
-    Ok({
-        next_value = scrutinee.builder.next_value,
-        entries = scrutinee.builder.entries,
-        bindings = scrutinee.bindings,
-        completion = Abrupt(
-            SourceMatch({
-                join = join,
-                scrutinee = scrutinee.value,
+    straight ?= join.straight_line_arm()
+
+    match straight:
+        Some(arm):
+            scrutinee.lower_straight_line_arm(arm, facts, context)
+        None:
+            Ok({
+                next_value = scrutinee.builder.next_value,
+                entries = scrutinee.builder.entries,
                 bindings = scrutinee.bindings,
-                context = loop
+                completion = Abrupt(
+                    SourceMatch({
+                        join = join,
+                        scrutinee = scrutinee.value,
+                        bindings = scrutinee.bindings,
+                        context = loop
+                    })
+                )
             })
-        )
-    })
 
 
 private pure func lower_continuing_statement(
@@ -2003,6 +2048,84 @@ private pure func lower_selection(
         next_value = cursor,
         selection = { scrutinee = scrutinee, nodes = nodes, entry = selection.entry }
     }
+
+
+-- A selection whose entry enters an arm has no test: it always enters that
+-- arm. When the arm's pattern binds nothing or only the scrutinee itself, every
+-- argument of the edge borrows the root place and the edge defines nothing.
+-- That holds for `_`, `(_, _)`, a payload-free `Unit.Only`, an all-wildcard
+-- pattern on a tagged union and any pattern on an erased union, whose payload
+-- is the scrutinee (specialize's `translate_place`). Lower then continues the
+-- enclosing block with the arm, its inputs bound to the scrutinee's value, so
+-- the match costs what a plain binding does (UNION_DESTRUCTURING_REMOVAL_PLAN.md,
+-- landing 2). An edge that reads a payload or a field keeps its selection: own
+-- borrows a payload only within its edge. A self-tail function's final match
+-- (`lower_match`) keeps its selection too: with one arm, that arm must be the
+-- self call, so the loop never ends and there is nothing to gain. Flattening
+-- skips verify's check that an edge passes one argument per arm input, so the
+-- count is checked here.
+private pure func straight_line_arm(
+    join: PreparedSelection
+) -> Result[Option[PreparedArm], Diagnostic]:
+    match join.selection.nodes.get(join.selection.entry.decision_node_number()):
+        Some(specialized.EnterArm(entered, arguments)):
+            if arguments.all(borrows_root):
+                join.arms
+                    .find(pure func(arm: PreparedArm) -> Bool: arm.id == entered)
+                    .or_internal_error(join.span, "a selection enters an arm it does not have")
+                    .and_then(
+                        pure func(arm: PreparedArm) -> Result[Option[PreparedArm], Diagnostic]:
+                            if arm.inputs.length() == arguments.length():
+                                Ok(Some(arm))
+                            else:
+                                Err(
+                                    internal_error(
+                                        arm.span,
+                                        "selection edge argument count does not match its arm inputs"
+                                    )
+                                )
+                    )
+            else:
+                Ok(None)
+        _:
+            Ok(None)
+
+
+private pure func borrows_root(argument: specialized.ConcretePatternArgument) -> Bool:
+    match argument:
+        specialized.BorrowPlace(place):
+            match place.route:
+                specialized.MatchRoot: True
+                _: False
+        specialized.CopyListSuffix(_, _):
+            False
+
+
+-- The block that continues with a straight-line arm, its inputs bound to the
+-- scrutinee's value rather than to the parameters `bind_inputs` makes.
+private pure func lower_straight_line_arm(
+    scrutinee: BuiltBlockValue,
+    arm: PreparedArm,
+    facts: List[ConcreteBinding],
+    context: Option[SourceLoopContext]
+) -> Result[BuiltBlock, Diagnostic]:
+    var values = scrutinee.bindings
+    var failure: Option[Diagnostic] = None
+
+    for id in arm.inputs:
+        match values.binding_slot(id, arm.span):
+            Ok(slot):
+                values = values.set(slot, Some(scrutinee.value))
+            Err(error):
+                failure = Some(error)
+                break
+
+    bound: Void ?= match failure:
+        Some(error): Err(error)
+        None: Ok(void)
+
+    block ?= lower_statements(scrutinee.builder.next_value, values, arm.body, facts, context)
+    Ok({ block | entries = scrutinee.builder.entries.concat(block.entries) })
 
 
 -- One complete block: its definitions, with its joins' arms numbered after

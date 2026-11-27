@@ -1865,7 +1865,10 @@ the output may already be new.
    definitions with function-owned `ValueId`s, separate from the bindings that
    name them. Matches become selection graphs over typed places that enter one
    shared body per arm; bound matches and `if` become joins with typed carried
-   values, and loops carry values through their headers.
+   values, and loops carry values through their headers. A match with no test
+   whose pattern binds nothing or only the scrutinee itself, as `_`, `(_, _)`,
+   `Unit.Only` and any pattern on an erased union do, instead continues its
+   block with that arm, so it costs what a plain binding does.
 8. **Own** ([`own`](src/common/codegen/own/own.brp)) inserts reference counting: acquisitions,
    drops, borrows and transfers, each obligation named by an `OwnerId`. Every
    stored managed occurrence gets its own obligation, and an argument stays

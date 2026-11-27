@@ -1,0 +1,152 @@
+import:
+    test: TestSuite
+    ../../../../src/common/codegen/lower/lower as lower
+    ../../../../src/common/codegen/own/own as own
+    ../../../../src/common/codegen/specialize/specialize as specialized
+    ../../../../src/common/codegen/verify/verify: verify
+    ../../../../src/common/syntax/source: label_text
+    ../../../../src/common/syntax/syntax:
+        IntegerFormat(Int64Format),
+        Entrypoint(NoArguments),
+        EntryResult(IntegerExitStatus),
+        entry_function
+    ../../../support/list_update_inputs: lowered, placeholder_label, span
+
+
+-- Lowering mints the identities of a straight-line arm that returns its
+-- binder: the binder is the erased scrutinee's own value, the function's only
+-- definition. Every ownership fact below is written by hand, independently of
+-- insertion.
+private SEED: String =
+    |union Stem:
+    |    Init(List[Int])
+    |pure func returned(stem: Stem) -> List[Int]:
+    |    match stem:
+    |        Stem.Init(items): items
+    |func main() -> Int:
+    |    kept = returned(Stem.Init([]))
+    |    0
+    |
+
+
+private record Seed {
+    binder: lower.ValueDefinition,
+    entrypoint: specialized.FunctionInstanceId
+}
+
+
+private pure func seed() -> Option[Seed]:
+    match lowered(SEED).map(lower.lowered_functions):
+        Err(_):
+            None
+        Ok(program):
+            match program.functions.find(
+                pure func(function): label_text(function.label) == "module_0.returned"
+            ):
+                Some(function):
+                    match function.steps:
+                        [lower.Define(binder)]:
+                            if binder.id == function.result:
+                                Some({
+                                    binder = binder,
+                                    entrypoint = entry_function(program.entrypoint)
+                                })
+                            else:
+                                None
+                        _:
+                            None
+                None:
+                    None
+
+
+-- The verdict on `returned`, its parameter borrowed, with these operations
+-- after the parameter's definition and the binder returned with owner 0; None
+-- when the seed is not a straight-line arm.
+private pure func verified(
+    operations: List[own.OwnershipOperation]
+) -> Option[Result[Void, String]]:
+    seed().map(pure func(found: Seed) -> Result[Void, String]:
+        binder = found.binder
+
+        parameter: own.OwnedDefinition = {
+            id = binder.id,
+            value_type = binder.value_type,
+            operation = own.ParameterDefinition(0),
+            result = own.BorrowedResult(own.ParameterBorrow(binder.id)),
+            span = span(1)
+        }
+
+        returned: own.OwnedFunction = {
+            label = placeholder_label("returned"),
+            parameters = [own.ManagedParameter({ value_type = binder.value_type, owned = False })],
+            return_type = binder.value_type,
+            operations = [own.DefineValue(parameter)].concat(operations),
+            result = own.OwnedReturn(binder.id, own.owner_id(0))
+        }
+
+        zero: own.OwnedDefinition = {
+            id = binder.id,
+            value_type = specialized.IntegerType(Int64Format),
+            operation = own.IntegerDefinition(Int64Format, 0),
+            result = own.UnmanagedResult,
+            span = span(2)
+        }
+
+        main: own.OwnedFunction = {
+            label = placeholder_label("main"),
+            parameters = [],
+            return_type = specialized.IntegerType(Int64Format),
+            operations = [own.DefineValue(zero)],
+            result = own.UnmanagedReturn(binder.id)
+        }
+
+        program: own.OwnershipProgram = {
+            records = [],
+            unions = [],
+            functions = [main, returned],
+            entrypoint = NoArguments(found.entrypoint, IntegerExitStatus)
+        }
+
+        verify(program)
+            .map(pure func(_) -> Void: void)
+            .map_err(pure func(error) -> String: error.message)
+    )
+
+
+private pure func acquisition(binder: lower.ValueId) -> own.OwnershipOperation:
+    own.AcquireOwner(
+        own.owner_id(0),
+        { value = binder, source = own.ParameterBorrow(binder) },
+        span(3)
+    )
+
+
+func test_a_borrowed_binder_returns_after_one_acquisition() -> Bool:
+    match seed():
+        Some(found):
+            match verified([acquisition(found.binder.id)]):
+                Some(Ok(_)): True
+                _: False
+        None:
+            False
+
+
+func test_a_borrowed_binder_returned_unacquired_is_rejected() -> Bool:
+    match verified([]):
+        Some(Err(message)): message == "ownership verification failed: owner 0 is not defined"
+        _: False
+
+
+TESTS: TestSuite = {
+    description = "Verification of straight-line arm binders",
+    tests = [
+        (
+            "a borrowed binder returns after one acquisition",
+            test_a_borrowed_binder_returns_after_one_acquisition
+        ),
+        (
+            "a borrowed binder returned unacquired is rejected",
+            test_a_borrowed_binder_returned_unacquired_is_rejected
+        )
+    ]
+}
