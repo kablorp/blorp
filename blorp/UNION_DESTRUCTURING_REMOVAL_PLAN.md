@@ -231,6 +231,17 @@ The raw output is in `build/destructuring-removal/spike-cost.log`.
      - a test that reads a file through a matched `Reader`.
    - **Estimate:** +30 production, +100 tests. **Ceiling:** +45 production,
      +150 tests. Fixed-input C identical.
+   - **Results (`ac72cd96a`, base `4f9260e16`):**
+     - `self-compile-cost`: fixed-input C identical; fixed-input allocations
+       13,507,896 and peak heap 192,303,197 bytes unchanged; fixed-input
+       instructions -0.0504%.
+     - Production +71/-19 (net +52); tests +136/-8 (net +128, ceiling
+       +150). Production ceiling +45 -> +55, routine (coordinator): one check
+       function and one render function for the outside-module error. The
+       error carries a `UnionId`; check narrows the `AggregateId` once and
+       keeps one invariant for a record, which is never a resource.
+     - Lower, own, verify and emit needed no change. The C of an in-module
+       `match` is a selection on the handle, where destructuring is a copy.
 2. **Landing 2: lower flattens a selection with no test.**
    - **Scope:** erased unions first. Flattening a non-erased union puts a
      `PayloadValue` in a block.

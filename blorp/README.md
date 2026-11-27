@@ -689,9 +689,9 @@ func read_chunk(reader: Reader, limit: Int) -> Int:
 It has exactly one variant, private by its mark or, in a `private resource
 union`, through its union, with exactly one payload, and no type parameters;
 any other shape is one error. Only its module builds or reads one, by
-destructuring: nothing matches a resource ("a resource cannot be matched"),
-and a resource has no `==`. Its one payload is the handle, so it is stored as
-that payload.
+destructuring or `match`: another module's `match` is rejected ("Reader can
+be matched only in module ./reader"), and a resource has no `==`. Its one
+payload is the handle, so it is stored as that payload.
 
 ```blorp
 resource union Reader:

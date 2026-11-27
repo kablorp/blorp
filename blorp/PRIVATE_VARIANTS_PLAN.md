@@ -185,7 +185,7 @@ function exists, the help is the generic form.
 | A destructuring of a value of another type | `this binding destructures UserId.Init, but the value is an Email` | `destructure the value's own union` |
 | A generic build without an expected type | `cannot infer T for Id.Init` | `add a type annotation, such as id: Id[User] = Id.Init(1)` |
 | A resource union with a second variant, a second payload, a public variant or type parameters | `a resource union has exactly one private variant with one payload` | `declare resource union Reader: private Init(Int)`; for a private union, `private resource union Writer: Init(Int)` |
-| A `match` on a resource union | `a resource cannot be matched` | `destructure it in its module, as in Reader.Init(handle) = reader` |
+| A `match` on a resource union outside its module | `Reader can be matched only in module ./reader` | `use the functions ./reader exports` |
 
 **One report per conflict.** Each rejection is reported once, at its cause:
 
@@ -267,7 +267,7 @@ Each fact has one enforcement site, and every other phase reads it.
 | In one union, variant names are unique and differ from the union's, and a private union's variants carry no `private` | The parser, for one declaration |
 | Outside its module, only `_` covers a union's private variants | The pattern domain's hidden head |
 | A union is stored one way | `UnionStorage`, classified once in check; specialize publishes each union's erasure from it once, at sealing, so lower, own, verify and emit never see an erased union |
-| A resource union has one private variant with one payload, and is never matched | The parser, for its shape, which one declaration decides; check, at `match`, for the rejection |
+| A resource union has one private variant with one payload, and is matched only in its declaring module | The parser, for its shape, which one declaration decides; check, at `match`, for the rejection outside that module |
 | A destructuring always matches | Check, which rejects a union with several variants; a single-variant union is destructured by a single-arm `match` per binder |
 
 ### Not in this change
@@ -295,8 +295,10 @@ Keith settled these on 2026-11-23:
 1. **Resource unions.** A resource union has exactly one variant, it is
    private, and it has exactly one payload, so it is always erased. The
    variant is marked `private` in a public union, and is private through
-   the union in a private one (rule 4). It is never matched, only
-   destructured, and only in its own module:
+   the union in a private one (rule 4). It is read only in its own
+   module. (`UNION_DESTRUCTURING_REMOVAL_PLAN.md` changed "never matched":
+   the module reads it by destructuring or by `match`, and that plan removes
+   destructuring.)
 
    ```blorp
    resource union Reader:
