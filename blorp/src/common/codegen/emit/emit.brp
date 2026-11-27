@@ -356,25 +356,56 @@ private pure func append_integer(output: String, value: Int) -> String:
         "${output}INT64_C(${value})"
 
 
--- Function-local static data has fixed syntactic depth and no C string-token
--- length limit or automatic array storage. Existing ValueIds distinguish the
--- backing bytes and the site, whose shared String the runtime creates on the
--- site's first evaluation; each evaluation acquires one reference to it.
-private pure func c_literal_bytes(id: ValueId) -> String:
-    "blorp_bytes_".append_int(id.value_number())
-
-
-private pure func c_literal_site(id: ValueId) -> String:
+-- A String literal is a function-local writable static String at the literal
+-- base (BLORP_STATIC_STRING in runtime/string.brp), whose bytes are an
+-- initializer list: C limits a string token's length, not a list's. A read is
+-- its address. Its name is its value's: an identity belongs to one function.
+private pure func c_literal_name(id: ValueId) -> String:
     "blorp_literal_".append_int(id.value_number())
 
 
-private pure func append_string_literal_site(output: String, id: ValueId, bytes: String) -> String:
-    data = output.append_byte_array(id.c_literal_bytes(), bytes)
-    "${data}static struct blorp_string_literal_site ${id.c_literal_site()};"
+-- RFC 3629: a UTF-8 continuation byte is 10xxxxxx, 128 up to but excluding 192.
+-- Every other byte starts a code point.
+private CONTINUATION_BYTE_FIRST: Int = 128
+private CONTINUATION_BYTE_END: Int = 192
 
 
-private pure func append_byte_array(output: String, name: String, bytes: String) -> String:
-    var projected = "${output}static const unsigned char ${name}[]={"
+private pure func code_point_count(bytes: String) -> Int:
+    var count = 0
+    var position = 0
+
+    while True:
+        match bytes.byte_at(position):
+            Some(byte):
+                number = byte.to_int()
+
+                if (number < CONTINUATION_BYTE_FIRST).or(number >= CONTINUATION_BYTE_END):
+                    count = count + 1
+
+                position = position + 1
+            None:
+                break
+
+    count
+
+
+private pure func append_static_literal(output: String, id: ValueId, bytes: String) -> String:
+    output
+        .concat("BLORP_STATIC_STRING(")
+        .concat(id.c_literal_name())
+        .concat(",")
+        .append_int(bytes.length())
+        .concat(",")
+        .append_int(bytes.code_point_count())
+        .concat(",{")
+        .append_byte_list(bytes)
+        .concat("});")
+
+
+-- The bytes as C integers. ISO C forbids an empty initializer, so an empty
+-- String is `0`, and its logical length remains zero.
+private pure func append_byte_list(output: String, bytes: String) -> String:
+    var projected = output
     var position = 0
 
     while True:
@@ -389,10 +420,15 @@ private pure func append_byte_array(output: String, name: String, bytes: String)
                 break
 
     if position == 0:
-        -- ISO C forbids an empty initializer; logical length remains zero.
         projected = "${projected}0"
 
-    "${projected}};"
+    projected
+
+
+private pure func append_byte_array(output: String, name: String, bytes: String) -> String:
+    "${output}static const unsigned char ${name}[]={"
+        .append_byte_list(bytes)
+        .concat("};")
 
 
 private pure func has_payload(declaration: ConcreteUnion) -> Bool:
@@ -1274,10 +1310,8 @@ private pure func append_operation(
             Ok("${output}((uint8_t)${value})")
         FloatDefinition(value):
             Ok(output.concat(value.c_float_literal()))
-        StringDefinition(bytes):
-            constructor = "${output}blorp_string_literal(&${id.c_literal_site()},(const char *)${id.c_literal_bytes()}"
-            length = "${constructor},".append_integer(bytes.length())
-            Ok("${length})")
+        StringDefinition(_):
+            Ok("${output}blorp_string_literal_acquire(&${id.c_literal_name()}.value)")
         FreeCallableDefinition(body):
             match (
                 output
@@ -2313,7 +2347,7 @@ private pure func append_regular_value(
     span: Span
 ) -> Result[String, Diagnostic]:
     prepared = match operation:
-        StringDefinition(bytes): output.append_string_literal_site(id, bytes)
+        StringDefinition(bytes): output.append_static_literal(id, bytes)
         _: output
 
     declared ?= prepared.append_local_declaration(value_type, InitializedLocal, unions, span)

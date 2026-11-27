@@ -4,7 +4,9 @@
 memo on 2026-11-23, and on 2026-11-24 accepted every recommendation for K2 to
 K6, K8, K9 and T1 to T6 (see [Decisions](#decisions)). A soundness review and
 an ergonomics review both approved it with fixes, which are folded in here.
-Nothing is implemented. L1 is next.
+L1 (static string literals) is implemented, see
+[Measurements](#l1-static-string-literals-measured-2026-11-26). L2 is next, after
+private-variants landing 3.
 
 **The direction:**
 
@@ -381,16 +383,24 @@ fewer than 2^30 fit in a 32-bit address space.
 
 **Links between static objects.** A link from a static object to a static
 child is not counted. So the strict leak check can require every static
-object to be back at its base at exit, using a static table of them.
+object to be back at its base at exit. L1 does it with no table: a
+diagnostics-only counter of objects off their base, which each retain and
+release moves by the change in that object's own count, as the `[]` roots'
+owner counter does (`list.brp:270-279`). A String's terms telescope, so after
+the joins the counter is the number of unbalanced Strings. L2 decides whether
+Lists and records get the same counter.
 
-**The C form.** Bytes and elements are written as initializer lists, as
-literal sites are today (`src/common/codegen/emit/emit.brp:342-345,359`),
-never as C string tokens. The union of a sized image with the managed struct
-avoids the GNU extension for initializing a flexible array member. It
-compiles with no diagnostic under:
+**The C form.** Bytes and elements are written as initializer lists, never
+as C string tokens. The union of a sized image with the managed struct
+avoids the GNU extension for initializing a flexible array member. L1 writes
+a String's image once, as the runtime macro `BLORP_STATIC_STRING`, because
+writing it per literal grew the compiler's peak heap by 0.41%. A String's
+bytes are `unsigned char`: a `char` image overflows on GCC's signed-char
+targets for any byte above 127. It compiles with no diagnostic under:
 
 - `-std=c11 -pedantic` with Apple clang 21;
-- `-O2 -fstrict-aliasing` with GCC 13.3, which the soundness review ran.
+- `-std=c11 -pedantic -Werror` and `-O2` with GCC 13.3, for ASCII and
+  multibyte literals once the bytes are `unsigned char`.
 
 The decoder prototype runs clean under `-fsanitize=address,undefined`.
 
@@ -408,8 +418,7 @@ The read form follows the layout (`specialize.brp:110-134,218-236`):
 ```c
 /* constant probe.KEYWORDS: "if" hashes to slot 0 of 7 and "else" to slot 3,
    by dict.brp's home_slot. blorp_r_0 is DictContents[String, Keyword]. */
-static union {struct {atomic_size_t references;int64_t length;int64_t code_points;size_t capacity;char bytes[3];} image;struct blorp_string value;}
- blorp_k_0_0={.image={BLORP_STRING_LITERAL_REFERENCES,2,2,2,{105,102,0}}};
+BLORP_STATIC_STRING(blorp_k_0_0,2,2,{105,102});
 /* blorp_k_0_1 "else"; blorp_k_0_2 keys; blorp_k_0_3 values; blorp_k_0_4 live, likewise */
 static union {struct {atomic_size_t references;int64_t length;size_t capacity;int64_t values[7];} image;struct blorp_l_0_i value;}
  blorp_k_0_5={.image={BLORP_STRING_LITERAL_REFERENCES,7,7,{INT64_C(0),INT64_C(-1),INT64_C(-1),INT64_C(1),INT64_C(-1),INT64_C(-1),INT64_C(-1)}}};
@@ -959,7 +968,7 @@ elements are evaluated as a constant, then the same at double the size.
 
 ## Acceptance criteria
 
-- [ ] **L1:**
+- [x] **L1:**
   - e2e outputs are unchanged;
   - the stage-2 compiler writes the same C, and makes at least 1,000 fewer
     allocations;
@@ -1092,6 +1101,55 @@ the literal base:
   it makes the README's promise that a read is free true.
 - **The compiler itself** gains little from L2: its constant reads are
   0.001% of its allocations.
+
+### L1, static string literals, measured 2026-11-27
+
+**Setup.** Apple M4, macOS 26.7.1, Apple clang 21.0.0 `-O2`. Base
+`4fb81b64f`, candidate the head of `claude/ctfe-l1`, both built from seed
+`blorp-seed-aad181bcdc73`. Raw samples are in the ignored `build/l1-cost/`
+and `build/l1-stage2/` of the implementing worktree, with the logs
+`build/l1-cost3.log` and `build/l1-test-r2.log`.
+
+**Fixed-input row**, `scripts/self-compile-cost 4fb81b64f HEAD --rounds 5`:
+
+| | Base | Candidate | Change | Ceiling |
+| --- | --- | --- | --- | --- |
+| Allocations | 13,515,368 | 13,502,375 | -0.0961% | +0.05% |
+| Peak heap, bytes | 192,369,876 | 191,915,602 | -0.2361% | +0.1% |
+| Instructions, median of 5 | 13,715,730,094 | 13,707,978,140 | -0.0565% | +0.1% |
+
+The own-source row is reported, not held: allocations -0.0787%, peak heap
+-0.2266%, instructions -0.1216%. The fixed-input C differs, as it must: the
+candidate writes static literals.
+
+**Stage 2.** The L1 compiler built from the seed writes `s2.c` from L1's
+source. Clang builds it into the static compiler, and `blorp/build/blorp.c`
+(lazy sites, the same source) into the lazy one. Both compile L1's source and
+write `s2.c` byte for byte, and their strict runs leak nothing.
+
+| | Lazy | Static | Change |
+| --- | --- | --- | --- |
+| Allocations | 13,504,732 | 13,503,202 | -1,530 (bound: at least 1,000) |
+| Instructions, median of 5, alternating order | 13,733,260,283 | 13,686,331,800 | -0.342% |
+
+**The recount.** A diagnostics read of a literal recounts its code points
+under a strict run. On the static compiler's strict self-compile it costs
++2.33% of instructions (median of 3: 16,184,896,307 without, 16,562,114,941
+with). Normal and non-strict runs pay nothing.
+
+**Two designs it replaced.** The first draft wrote each declaration's union
+image in full, which grew the compiler's peak heap by 0.41%, so the image
+became the macro `BLORP_STATIC_STRING`. It then kept a file-scope table of
+literals for the strict check, which needed the function number in every
+name, an inventory of literals and a table in `program_finish`: +65 net
+production lines against a ceiling of +20. The diagnostics-only counter of
+literals off their base replaced it (+16).
+
+**Lines against the ceilings.** Production +16 net, tests +143 net, of which
+about 300 changed lines are one-line allocation-count resets. A literal no
+longer allocates, so 270 or more e2e programs' exact counts fell (for
+example `append_reuse` 27 to 21, and `effects_hello` 1 to 0), and one
+compile ceiling rose by 3 (59,775 to 59,778).
 
 ## Handback
 

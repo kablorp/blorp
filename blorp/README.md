@@ -418,7 +418,7 @@ has the same indentation before its `|`. The text starts after the single
 marker, so `||x` is the text `|x`. `raw` alone on a line before the marker
 lines makes a raw block, in which `${` is text.
 
-A literal allocates its String once, on its first evaluation, and every later
+A literal is a static String that no evaluation allocates, and every
 evaluation shares it. Single-quoted Char literals are lexed but rejected
 ("Char literals are not supported yet").
 
@@ -1878,11 +1878,13 @@ the output may already be new.
   union is a struct of an enum tag and a C union of one field struct per
   variant with fields. Inline and by-value records are structs passed by
   value; counted records, Lists and Strings are counted heap objects.
-- A String literal is a static byte array plus a
-  `struct blorp_string_literal_site`, from which the runtime makes the shared
-  String on first use, once even when threads race it. Its count starts at a
-  base with the top bit set; without memory diagnostics nothing writes it
-  again, since retain and release skip a String whose count is at or above it.
+- A String literal is a function-local writable static String
+  (`BLORP_STATIC_STRING`, bytes as an `unsigned char` initializer list), read
+  as its address. Its count starts at a base with the top bit set; without
+  memory diagnostics nothing writes it again, since retain and release skip a
+  String whose count is at or above it. With them, a read retains, and a
+  counter of literals off the base lets a strict leak check require each to be
+  back at it at exit.
 - Floating-point contraction is off (`#pragma STDC FP_CONTRACT OFF` for Clang,
   GCC's `fp-contract=off` pragma), so each operation rounds separately.
 - A wrapper calls the entrypoint as `int main(void)` or

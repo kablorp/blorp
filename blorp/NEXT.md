@@ -45,8 +45,8 @@ done.
       round trip's remaining gap.
     - Landing 5 changes `parallel_map`'s impure-callback help to "use
       concurrent_map for impure work".
-  - **Overlap:** `CTFE_PLAN.md`'s L1 replaces landing 1's lazy literal site
-    with static literals. Keep the threaded literal test when it does.
+  - **Overlap:** `CTFE_PLAN.md`'s L1 replaced landing 1's lazy literal site
+    with static literals, and the threaded literal test now reads them.
 - **Compile-time evaluation:** [`CTFE_PLAN.md`](CTFE_PLAN.md).
   - **Status:** planned on 2026-11-23. Constants become computed values that
     the compiler evaluates once, by interpreting the lowered program with
@@ -55,9 +55,11 @@ done.
     in `check`. Keith settled the direction, the delegation and the LSP gap
     on 2026-11-23, and accepted every recommendation for K2 to K6, K8, K9 and
     T1 to T6 on 2026-11-24, after both reviews' fixes.
-  - **Next:** L1, static string literals (1,520 fewer allocations in a
-    self-compile, measured on a prototype). The sizes half moves to its own
-    plan before T1 (T6).
+  - **Done:** L1, static string literals: a literal is a writable static
+    String at the literal base (1,537 fewer allocations in a self-compile
+    built from L1's own C, peak heap -0.20%).
+  - **Next:** L2, static constants, after private-variants landing 3. The
+    sizes half moves to its own plan before T1 (T6).
 - **Private variants:** [`PRIVATE_VARIANTS_PLAN.md`](PRIVATE_VARIANTS_PLAN.md).
   - **Status:** planned on 2026-11-23. Opaque types become unions with private
     variants (`union UserId: private Init(Int)`) in nine landings: enable

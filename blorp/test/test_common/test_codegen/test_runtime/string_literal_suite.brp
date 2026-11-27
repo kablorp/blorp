@@ -3,6 +3,7 @@ import:
     test: TestSuite
     ../../../../src/common/codegen/runtime/memory: MEMORY_RUNTIME
     ../../../../src/common/codegen/runtime/string: STRING_RUNTIME
+    ../../../../src/common/codegen/runtime/string_concat: string_concat_runtime
     ../../../driver/file_access: write_file
     ../../../driver/harness: isolated, run_expecting
     ../../../driver/reports: without_peak_heap
@@ -12,11 +13,12 @@ private COMPILE_TIMEOUT_MS: Int = 600000
 private CHILD_TIMEOUT_MS: Int = 10000
 -- The memory runtime's BLORP_STRICT_LEAK_EXIT_STATUS.
 private STRICT_LEAK_EXIT_STATUS: Int = 99
--- The probe creates two literal Strings, one per site; teardown frees both.
-private STRICT_TOTAL: String = "blorp: leak check: 2 allocs, 2 releases, 0 leaked, 0 bytes\n"
+-- Static literals are never allocated, so a strict run has nothing to free.
+private STRICT_TOTAL: String = "blorp: leak check: 0 allocs, 0 releases, 0 leaked, 0 bytes\n"
 private UNBALANCED_LINE: String = "blorp: leak check: unbalanced string literals: 1\n"
--- The threaded probe's 64 sites make one String each, however many threads race.
-private THREADED_TOTAL: String = "blorp: leak check: 64 allocs, 64 releases, 0 leaked, 0 bytes\n"
+private TWO_UNBALANCED_LINE: String = "blorp: leak check: unbalanced string literals: 2\n"
+-- The append's copy is the one allocation.
+private COPY_TOTAL: String = "blorp: leak check: 1 allocs, 1 releases, 0 leaked, 0 bytes\n"
 
 
 -- Builds the probe from the runtime files in `directory`, with memory
@@ -67,6 +69,7 @@ private func build_probe(
 private func ready(c_compiler: String, directory: String) -> Result[(String, String), String]:
     _ ?= write_file(directory + "/memory_runtime.c", MEMORY_RUNTIME)
     _ ?= write_file(directory + "/string_runtime.c", STRING_RUNTIME)
+    _ ?= write_file(directory + "/string_concat.c", string_concat_runtime())
     diagnostic ?= build_probe(c_compiler, directory, directory + "/string_literal_probe", True)
     normal ?= build_probe(c_compiler, directory, directory + "/string_literal_probe_normal", False)
     Ok((diagnostic, normal))
@@ -143,10 +146,10 @@ func suite(c_compiler: String, directory: String) -> TestSuite:
             }
         Ok((diagnostic, normal)):
             {
-                description = "Shared String literals",
+                description = "Static String literals",
                 tests = [
                     (
-                        "balanced literals are freed once at exit",
+                        "balanced static literals pass the strict check without being freed",
                         func(): outcome(diagnostic, "balanced", True, 0, STRICT_TOTAL)
                     ),
                     (
@@ -174,12 +177,30 @@ func suite(c_compiler: String, directory: String) -> TestSuite:
                         func(): outcome(diagnostic, "under_release", False, 0, "")
                     ),
                     (
-                        "threads racing each site's first use make one String per site",
-                        func(): outcome(diagnostic, "threaded_publish", True, 0, THREADED_TOTAL)
+                        "a leak in one literal and an over-release of another both count",
+                        func(): outcome(
+                            diagnostic,
+                            "two_unbalanced",
+                            True,
+                            STRICT_LEAK_EXIT_STATUS,
+                            TWO_UNBALANCED_LINE + STRICT_TOTAL
+                        )
                     ),
                     (
-                        "without diagnostics threads racing a site's first use share one String",
-                        func(): outcome(normal, "threaded_publish", False, 0, "")
+                        "appending to a literal copies it and leaves the literal at its base",
+                        func(): outcome(diagnostic, "copies_on_append", True, 0, COPY_TOTAL)
+                    ),
+                    (
+                        "without diagnostics appending to a literal copies it",
+                        func(): outcome(normal, "copies_on_append", False, 0, "")
+                    ),
+                    (
+                        "threads reading a static literal allocate nothing and leave it balanced",
+                        func(): outcome(diagnostic, "threaded_reads", True, 0, STRICT_TOTAL)
+                    ),
+                    (
+                        "without diagnostics threads reading a static literal share it",
+                        func(): outcome(normal, "threaded_reads", False, 0, "")
                     ),
                     (
                         "without diagnostics no evaluation, retain or release writes a literal's count",
