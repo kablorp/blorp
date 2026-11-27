@@ -311,7 +311,8 @@ pure func start_server(library: LibraryLayout) -> Server:
 
 -- Some once `exit` has arrived.
 pure func exit_status(server: Server) -> Option[Int]:
-    Server.Init(lifecycle) = server
+    lifecycle = match server:
+        Server.Init(lifecycle): lifecycle
 
     match lifecycle:
         Exited(status): Some(status)
@@ -320,7 +321,8 @@ pure func exit_status(server: Server) -> Option[Int]:
 
 -- The open documents, which an analysis reads instead of the disk.
 pure func snapshots(server: Server) -> List[SourceFile]:
-    Server.Init(lifecycle) = server
+    lifecycle = match server:
+        Server.Init(lifecycle): lifecycle
 
     match lifecycle:
         Serving(session):
@@ -343,130 +345,147 @@ private pure func replying(lifecycle: Lifecycle, replies: List[Json]) -> Step:
 -- A body that is not UTF-8 JSON gets -32700 with a null id in any state:
 -- nothing in it says what was asked.
 pure func receive_body(server: Server, body: Bytes) -> Step:
-    Server.Init(lifecycle) = server
-
-    match body.to_text():
-        None:
-            lifecycle.replying([error_response(None, ParseError, "the message body is not UTF-8")])
-        Some(text):
-            match parse(text):
-                Ok(message):
-                    server.receive(message)
-                Err(error):
+    match server:
+        Server.Init(lifecycle):
+            match body.to_text():
+                None:
                     lifecycle.replying([
-                        error_response(None, ParseError, "the message body is not JSON: ${error}")
+                        error_response(None, ParseError, "the message body is not UTF-8")
                     ])
+                Some(text):
+                    match parse(text):
+                        Ok(message):
+                            server.receive(message)
+                        Err(error):
+                            lifecycle.replying([
+                                error_response(
+                                    None,
+                                    ParseError,
+                                    "the message body is not JSON: ${error}"
+                                )
+                            ])
 
 
 pure func receive(server: Server, message: Json) -> Step:
-    Server.Init(lifecycle) = server
-
-    match (lifecycle, client_message(message)):
-        (Exited(_), _) | (_, ClientResponse):
-            lifecycle.replying([])
-        (_, InvalidMessage(id)):
-            lifecycle.replying([
-                error_response(
-                    id,
-                    InvalidRequest,
-                    "the message is not a JSON-RPC request or notification"
-                )
-            ])
-        (AwaitingInitialize(library), Request(id, call)):
-            if call.method == "initialize":
-                encoding = call.params.agreed_encoding()
-
-                session: Session = {
-                    encoding = encoding,
-                    library = library,
-                    documents = {},
-                    library_documents = {},
-                    roots = {},
-                    registers_watchers = call.params.watches_files(),
-                    refreshes_tokens = call.params.refreshes_tokens(),
-                    serves_library_documents = call.params.fetches_documents(),
-                    inserts_snippets = call.params.reads_snippets(),
-                    requests_sent = 0
-                }
-
-                replying(Serving(session), [
-                    response(id, initialize_result(encoding, session.serves_library_documents))
-                ])
-            else:
-                lifecycle.replying([
-                    error_response(
-                        Some(id),
-                        ServerNotInitialized,
-                        "the server has not been initialized"
-                    )
-                ])
-        (ShutDown, Request(id, _)):
-            lifecycle.replying([
-                error_response(Some(id), InvalidRequest, "the server has shut down")
-            ])
-        (Serving(session), Request(id, call)):
-            match call.method:
-                "shutdown":
-                    replying(ShutDown, [response(id, Null)])
-                "workspace/textDocumentContent":
-                    lifecycle.replying([content_response(id, call.params)])
-                "textDocument/semanticTokens/full":
-                    session.document_requested(id, call.params, Some(TokensQuery))
-                "textDocument/definition":
-                    session.document_requested(
-                        id,
-                        call.params,
-                        call.params
-                            .requested_position()
-                            .map(pure func(at: Position) -> DocumentQuery: DefinitionQuery(at))
-                    )
-                "textDocument/references":
-                    includes_declaration: Bool = match (
-                        call.params
-                            .field("context")
-                            .field("includeDeclaration")
-                    ):
-                        Some(Boolean(True)): True
-                        _: False
-
-                    session.document_requested(
-                        id,
-                        call.params,
-                        call.params
-                            .requested_position()
-                            .map(
-                                pure func(at: Position) -> DocumentQuery: ReferencesQuery({
-                                    position = at,
-                                    includes_declaration = includes_declaration
-                                })
-                            )
-                    )
-                "textDocument/completion":
-                    session.completion_requested(id, call.params)
-                "initialize":
+    match server:
+        Server.Init(lifecycle):
+            match (lifecycle, client_message(message)):
+                (Exited(_), _) | (_, ClientResponse):
+                    lifecycle.replying([])
+                (_, InvalidMessage(id)):
                     lifecycle.replying([
                         error_response(
-                            Some(id),
+                            id,
                             InvalidRequest,
-                            "the server is already initialized"
+                            "the message is not a JSON-RPC request or notification"
                         )
                     ])
-                _:
+                (AwaitingInitialize(library), Request(id, call)):
+                    if call.method == "initialize":
+                        encoding = call.params.agreed_encoding()
+
+                        session: Session = {
+                            encoding = encoding,
+                            library = library,
+                            documents = {},
+                            library_documents = {},
+                            roots = {},
+                            registers_watchers = call.params.watches_files(),
+                            refreshes_tokens = call.params.refreshes_tokens(),
+                            serves_library_documents = call.params.fetches_documents(),
+                            inserts_snippets = call.params.reads_snippets(),
+                            requests_sent = 0
+                        }
+
+                        replying(Serving(session), [
+                            response(
+                                id,
+                                initialize_result(encoding, session.serves_library_documents)
+                            )
+                        ])
+                    else:
+                        lifecycle.replying([
+                            error_response(
+                                Some(id),
+                                ServerNotInitialized,
+                                "the server has not been initialized"
+                            )
+                        ])
+                (ShutDown, Request(id, _)):
                     lifecycle.replying([
-                        error_response(Some(id), MethodNotFound, "unknown method `${call.method}`")
+                        error_response(Some(id), InvalidRequest, "the server has shut down")
                     ])
-        (ShutDown, Notification(call)):
-            if call.method == "exit":
-                replying(Exited(EXIT_AFTER_SHUTDOWN), [])
-            else:
-                lifecycle.replying([])
-        (AwaitingInitialize(_), Notification(call)):
-            if call.method == "exit":
-                replying(Exited(EXIT_ABANDONED), [])
-            else:
-                lifecycle.replying([])
-        (Serving(session), Notification(call)):
-            session.notified(call)
+                (Serving(session), Request(id, call)):
+                    match call.method:
+                        "shutdown":
+                            replying(ShutDown, [response(id, Null)])
+                        "workspace/textDocumentContent":
+                            lifecycle.replying([content_response(id, call.params)])
+                        "textDocument/semanticTokens/full":
+                            session.document_requested(id, call.params, Some(TokensQuery))
+                        "textDocument/definition":
+                            session.document_requested(
+                                id,
+                                call.params,
+                                call.params
+                                    .requested_position()
+                                    .map(
+                                        pure func(at: Position) -> DocumentQuery: DefinitionQuery(
+                                            at
+                                        )
+                                    )
+                            )
+                        "textDocument/references":
+                            includes_declaration: Bool = match (
+                                call.params
+                                    .field("context")
+                                    .field("includeDeclaration")
+                            ):
+                                Some(Boolean(True)): True
+                                _: False
+
+                            session.document_requested(
+                                id,
+                                call.params,
+                                call.params
+                                    .requested_position()
+                                    .map(
+                                        pure func(at: Position) -> DocumentQuery: ReferencesQuery({
+                                            position = at,
+                                            includes_declaration = includes_declaration
+                                        })
+                                    )
+                            )
+                        "textDocument/completion":
+                            session.completion_requested(id, call.params)
+                        "initialize":
+                            lifecycle.replying([
+                                error_response(
+                                    Some(id),
+                                    InvalidRequest,
+                                    "the server is already initialized"
+                                )
+                            ])
+                        _:
+                            lifecycle.replying([
+                                error_response(
+                                    Some(id),
+                                    MethodNotFound,
+                                    "unknown method `${call.method}`"
+                                )
+                            ])
+                (ShutDown, Notification(call)):
+                    if call.method == "exit":
+                        replying(Exited(EXIT_AFTER_SHUTDOWN), [])
+                    else:
+                        lifecycle.replying([])
+                (AwaitingInitialize(_), Notification(call)):
+                    if call.method == "exit":
+                        replying(Exited(EXIT_ABANDONED), [])
+                    else:
+                        lifecycle.replying([])
+                (Serving(session), Notification(call)):
+                    session.notified(call)
 
 
 -- UTF-8 when the client offers it, which saves converting; otherwise UTF-16,
@@ -970,7 +989,8 @@ private pure func checked_analysis(session: Session, root: Path) -> Option[Analy
 -- and changes nothing else: the probe's text is not the document's, so the
 -- root keeps its analysis, its staleness and its diagnostics.
 pure func probed(server: Server, asked: ProbeRequest, outcome: ProbeOutcome) -> Step:
-    Server.Init(lifecycle) = server
+    lifecycle = match server:
+        Server.Init(lifecycle): lifecycle
 
     match lifecycle:
         Serving(session):
@@ -1488,7 +1508,8 @@ private pure func handed_over(session: Session, leaving: Path, files: List[Path]
 -- Closes the document at `path` once the transport has read the saved text
 -- it reverts to, `saved`, which is None when the file could not be read.
 pure func reverted(server: Server, path: Path, saved: Option[String]) -> Step:
-    Server.Init(lifecycle) = server
+    lifecycle = match server:
+        Server.Init(lifecycle): lifecycle
 
     match lifecycle:
         Serving(session): session.closed(path, saved)
@@ -1547,7 +1568,9 @@ private pure func closed(session: Session, path: Path, saved: Option[String]) ->
 -- analysis came back is no longer a root: the result is dropped, and the
 -- request gets `null`.
 pure func analysed(server: Server, asked: AnalysisRequest, result: DocumentAnalysis) -> Step:
-    Server.Init(lifecycle) = server
+    lifecycle = match server:
+        Server.Init(lifecycle): lifecycle
+
     root = asked.root
 
     match lifecycle:

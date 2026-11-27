@@ -371,6 +371,21 @@ The raw output is in `build/destructuring-removal/spike-cost.log`.
      - +1 where a `match` line would pass 100 columns.
 
      **Ceiling:** +130 production, and the cost ceiling below.
+   - **Result (2026-11-27):** `migrate.py` rewrote 208 sites, more than the 204
+     counted, because main had gained new ones: 152 in the arm form and 56 in
+     the binding form.
+     - A site whose rest is a `match` on its binder keeps the old flat shape
+       in the binding form. The review caught the first run nesting those.
+     - Production +122 (`src` +91, library +31), within the +130 ceiling.
+     - `self-compile-cost 4081c6d53 792dec4e4`, on the rotated seed:
+       - fixed-input C identical;
+       - fixed-input allocations and peak heap identical;
+       - fixed-input instructions −0.067%, against the spike's +0.66%
+         without landing 2;
+       - own-source allocations +0.24%, for the larger source.
+     - One e2e compile ceiling rose (alias destructuring, 59,779 → 60,780) for
+       the migrated library. Landing 5 deletes that case.
+     - Raw evidence: `build/destructuring-removal/landing4/`.
 5. **Landing 5: delete union destructuring** (rule 1).
    - **Deleted from syntax and parse:**
      - `ParsedVariantBinding` and `VariantBinding`;
