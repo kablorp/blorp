@@ -1,5 +1,7 @@
 import:
     dict as dict_ops
+    list: repeat
+    uint8: to_uint8
     ../../analysis/check/check: CheckedProgram
     ../../analysis/check/declarations as declarations
     ../../analysis/check/equality: tuple_equality_template
@@ -12,7 +14,13 @@ import:
         FieldId,
         LambdaId,
         TypeParameterId
-    ../../analysis/ids as declared: FunctionId, RecordId, UnionId, VariantId
+    ../../analysis/ids as declared:
+        ConstantId,
+        FunctionId,
+        RecordId,
+        UnionId,
+        VariantId,
+        constant_number
     ../../analysis/namespace/builtins as builtins:
         DesignatedBoolean,
         DesignatedOption,
@@ -100,6 +108,17 @@ import:
 -- Instance identities are issued only by this compilation's specialization builder.
 union FunctionInstanceId:
     private Underlying(Int)
+
+
+-- Constants are monomorphic, so each constant a reached body reads has one
+-- instance, numbered densely in order of first reach, as functions are.
+union ConstantInstanceId:
+    private Underlying(Int)
+
+
+pure func constant_instance_number(id: ConstantInstanceId) -> Int:
+    match id:
+        ConstantInstanceId.Underlying(number): number
 
 
 fixed union UnionInstanceId:
@@ -376,6 +395,7 @@ union ConcreteForm:
     FreeCallable(FunctionInstanceId)
     CapturedCallable(FunctionInstanceId, ConcreteExpr)
     ReadRecordField(ConcreteExpr, FieldInstanceId)
+    ReadConstant(ConstantInstanceId)
 
 
 -- One evaluated expression. `span` is the checked node's own occurrence span,
@@ -510,9 +530,54 @@ record ConcreteFunction {
 }
 
 
+-- A constant's value, which emission writes as static data. It carries no
+-- type: its constant's TypeRef and the layouts give it. An erased union's value
+-- is its payload's.
+union ConstantValue:
+    VoidConstant
+    Int64Constant(Int)
+    UInt8Constant(UInt8)
+    FloatConstant(Float)
+    StringConstant(String)
+    -- Fields in layout order.
+    RecordConstant(List[ConstantValue])
+    VariantConstant(VariantInstanceId, List[ConstantValue])
+    ListConstant(List[ConstantValue])
+    FunctionConstant(FunctionInstanceId)
+
+
+-- A reached constant: its type, and each instance its value holds as a
+-- callable. Invoking a callable lends its arguments, so ownership pins those
+-- instances, as it pins every instance a body takes as a callable. The
+-- callables are an index of the value, built with it.
+record ConcreteConstant {
+    value_type: TypeRef,
+    callables: List[FunctionInstanceId]
+}
+
+
+-- Every reached constant's value, dense by ConstantInstanceId. It travels
+-- beside the IR, from specialization to emission.
+union ConstantTable:
+    private Underlying(List[ConstantValue])
+
+
+pure func constant_values(table: ConstantTable) -> List[ConstantValue]:
+    match table:
+        ConstantTable.Underlying(values): values
+
+
+-- The table of a program that reads no constant.
+NO_CONSTANT_VALUES: ConstantTable = ConstantTable.Underlying([])
+
+
 record SpecializedContents {
     records: List[ConcreteRecord],
     unions: List[ConcreteUnion],
+    -- Each reached constant, dense by ConstantInstanceId. Lowering carries
+    -- these into the IR; the values stay beside it, for emission.
+    constants: List[ConcreteConstant],
+    constant_values: ConstantTable,
     functions: List[ConcreteFunction],
     entrypoint: Entrypoint[FunctionInstanceId]
 }
@@ -1452,7 +1517,12 @@ private record PreparedInstances {
     unions: IndexedList[UnionSlot],
     records: IndexedList[RecordSlot],
     -- Each capture environment some instance turns into a runtime closure, once.
-    converted_environments: List[RecordInstanceId]
+    converted_environments: List[RecordInstanceId],
+    -- Each constant a body reads, in order of first reach: a ConstantInstanceId
+    -- is a position here.
+    constants: List[ConstantId],
+    -- An index of `constants` by ConstantId number: each reached one's instance.
+    constant_instances: List[Option[ConstantInstanceId]]
 }
 
 
@@ -1482,7 +1552,9 @@ private record SealedRecords {
 private record SealedInstances {
     functions: IndexedList[FunctionRequest],
     unions: SealedUnions,
-    records: SealedRecords
+    records: SealedRecords,
+    constants: List[ConstantId],
+    constant_instances: List[Option[ConstantInstanceId]]
 }
 
 
@@ -3298,7 +3370,7 @@ private pure func append_node_types(
             types = types.append_value_types(receiver)
         model.ReadRecordField(receiver, _):
             types = types.append_value_types(receiver)
-        model.LiteralVoid | model.LiteralInteger(_) | model.LiteralFloat(_) | model.LiteralString(_) | model.ReadBinding(_) | model.ReadCapture(_):
+        model.LiteralVoid | model.LiteralInteger(_) | model.LiteralFloat(_) | model.LiteralString(_) | model.ReadBinding(_) | model.ReadCapture(_) | model.ReadConstant(_):
             void
 
     types
@@ -3810,8 +3882,58 @@ private pure func prepare_creation(
                 initial,
                 value.span
             )
+        model.ReadConstant(id):
+            initial.reach_constant(id, request, checked, value.span)
         _:
             Ok(initial)
+
+
+-- A constant's instance, at its first read: its template's layouts and the
+-- instances of the functions it holds. A template is ground, as checking
+-- accepted it with no type parameters in scope, so nothing in it depends on
+-- the reading body.
+private pure func reach_constant(
+    prepared: PreparedInstances,
+    id: ConstantId,
+    request: FunctionRequest,
+    checked: model.CheckedFunctions,
+    span: Span
+) -> Result[PreparedInstances, Diagnostic]:
+    row ?= checked.constants
+        .get(id.constant_number())
+        .or_internal_error(span, "unknown constant")
+
+    if prepared.constant_instances.get(id.constant_number()) != Some(None):
+        Ok(prepared)
+    else:
+        instance = ConstantInstanceId.Underlying(prepared.constants.length())
+
+        var outcome: Result[PreparedInstances, Diagnostic] = Ok(
+            { prepared |
+                constants = prepared.constants.append(id),
+                constant_instances = prepared.constant_instances.set(
+                    id.constant_number(),
+                    Some(instance)
+                )
+            }
+        )
+
+        for written in row.value.value_types():
+            outcome = outcome.prepare_written_type(written, [], False, request.source, checked)
+
+        for value in model.expression_instance_requests(row.value):
+            outcome = outcome.prepare_creation(value, request, ground_substitution(), [], checked)
+
+        outcome
+
+
+-- A constant's template is ground, so this substitution replaces nothing. A
+-- substitution names the owner of the parameters it replaces, and a constant
+-- has none: the zero-arity tuple's template, which owns no parameter, stands
+-- in, so any parameter that reached it would be reported as foreign. L3
+-- deletes this stand-in with the template translation.
+private pure func ground_substitution() -> declarations.Substitution:
+    { owner = model.TupleDeclaration(0), values = [] }
 
 
 private pure func method_callable(
@@ -3881,7 +4003,7 @@ private pure func prepare_function(
             Ok(_): void
             Err(_): break
 
-    for value in model.body_callable_creations(function.statements, function.body):
+    for value in model.body_instance_requests(function.statements, function.body):
         outcome = outcome.prepare_creation(value, request, semantic, storage_arguments, checked)
 
         match outcome:
@@ -4432,7 +4554,8 @@ private record TranslationContext {
     callables: TranslationBindings,
     keys: IndexedList[FunctionRequest],
     unions: SealedUnions,
-    records: SealedRecords
+    records: SealedRecords,
+    constant_instances: List[Option[ConstantInstanceId]]
 }
 
 
@@ -5499,6 +5622,10 @@ private pure func translate_expr(
             match context.callables.translated_binding(id, value.span):
                 Err(error): Err(error)
                 Ok(binding): binding.callable_binding_value(context.keys, value.span)
+        model.ReadConstant(id):
+            match context.constant_instances.get(id.constant_number()):
+                Some(Some(instance)): translate_leaf(context, ReadConstant(instance), value)
+                _: Err(internal_error(value.span, "a constant read has no instance"))
 
 
 -- A leaf keeps its checked form; only its type is made concrete.
@@ -6134,7 +6261,7 @@ private pure func admit_scalar_value(
             receiver.admit_scalar_value(bindings, unions, records)
         Match(join):
             join.scrutinee.admit_scalar_value(bindings, unions, records)
-        LiteralVoid | LiteralInteger(_) | LiteralFloat(_) | LiteralString(_) | ReadBinding(_):
+        LiteralVoid | LiteralInteger(_) | LiteralFloat(_) | LiteralString(_) | ReadBinding(_) | ReadConstant(_):
             Ok(void)
 
     span = match value.form:
@@ -6538,13 +6665,13 @@ private pure func translate_match(
 private pure func translate_function(
     function: SelectedBody,
     key: InstanceKey,
-    keys: IndexedList[FunctionRequest],
-    unions: SealedUnions,
-    records: SealedRecords,
+    prepared: SealedInstances,
     traits: AcceptedTraits
 ) -> Result[ConcreteFunction, Diagnostic]:
     span = function.return_type.span
     substitution ?= function.function_substitution(key.arguments, span)
+    unions = prepared.unions
+    records = prepared.records
 
     runtime ?= translate_parameters(function, key, substitution, unions, records, traits)
     parameters = runtime.parameters
@@ -6553,9 +6680,10 @@ private pure func translate_function(
     context: TranslationContext = {
         substitution = substitution,
         callables = runtime.translation,
-        keys = keys,
+        keys = prepared.functions,
         unions = unions,
-        records = records
+        records = records,
+        constant_instances = prepared.constant_instances
     }
 
     return_type ?= context.translated_type(
@@ -6595,6 +6723,90 @@ private pure func translate_function(
     Ok(concrete)
 
 
+private record TranslatedConstant {
+    row: ConcreteConstant,
+    value: ConstantValue
+}
+
+
+-- A reached constant's row and value. Its template reads no binding, so its
+-- translation context holds none.
+private pure func translate_constant(
+    context: TranslationContext,
+    id: ConstantId,
+    rows: List[model.CheckedConstant]
+) -> Result[TranslatedConstant, Diagnostic]:
+    row ?= rows
+        .get(id.constant_number())
+        .or_internal_error(compiler_span(), "unknown constant")
+
+    concrete ?= translate_expr(context, row.value)
+    value ?= concrete.constant_value()
+
+    Ok({
+        row = { value_type = concrete.value_type, callables = value.held_callables() },
+        value = value
+    })
+
+
+-- The instances `value` holds as callables, in value order.
+pure func held_callables(value: ConstantValue) -> List[FunctionInstanceId]:
+    match value:
+        FunctionConstant(body):
+            [body]
+        RecordConstant(children) | VariantConstant(_, children) | ListConstant(children):
+            var held: List[FunctionInstanceId] = []
+
+            for child in children:
+                held = held.concat(child.held_callables())
+
+            held
+        VoidConstant | Int64Constant(_) | UInt8Constant(_) | FloatConstant(_) | StringConstant(_):
+            []
+
+
+-- A translated closed template's value. Checking admitted only literals,
+-- constructions and named functions, so any other form is a compiler fault.
+-- Computed constants replace this translation (CTFE_PLAN.md, L3).
+private pure func constant_value(value: ConcreteExpr) -> Result[ConstantValue, Diagnostic]:
+    match value.form:
+        LiteralVoid:
+            Ok(VoidConstant)
+        LiteralInteger(number):
+            match value.value_type:
+                IntegerType(UInt8Format):
+                    number
+                        .to_uint8()
+                        .map(pure func(byte: UInt8) -> ConstantValue: UInt8Constant(byte))
+                        .or_internal_error(value.span, "a UInt8 constant does not fit")
+                _:
+                    Ok(Int64Constant(number))
+        LiteralFloat(number):
+            Ok(FloatConstant(number))
+        LiteralString(text):
+            Ok(StringConstant(text))
+        FreeCallable(body):
+            Ok(FunctionConstant(body))
+        ConstructList(elements):
+            elements
+                .translated_list(constant_value)
+                .map(pure func(values): ListConstant(values))
+        ConstructVariant(variant, payload):
+            payload
+                .translated_list(constant_value)
+                .map(pure func(values): VariantConstant(variant, values))
+        ConstructRecord(_, fields):
+            fields
+                .sort_by(pure func(field: ConcreteRecordField) -> Int: field.field.field_number())
+                .translated_list(
+                    pure func(field: ConcreteRecordField) -> Result[ConstantValue, Diagnostic]:
+                        constant_value(field.value)
+                )
+                .map(pure func(values): RecordConstant(values))
+        _:
+            Err(internal_error(value.span, "a closed constant computes its value"))
+
+
 pure func specialize(program: CheckedProgram) -> Result[SpecializedProgram, Diagnostic]:
     checked = program.checked_functions()
 
@@ -6606,6 +6818,8 @@ pure func specialize(program: CheckedProgram) -> Result[SpecializedProgram, Diag
         callables = []
     }
 
+    unreached: Option[ConstantInstanceId] = None
+
     initial: PreparedInstances = {
         functions = empty_indexed_list().append_entry(
             { key = entry_key, source = EntrypointRoot },
@@ -6613,7 +6827,9 @@ pure func specialize(program: CheckedProgram) -> Result[SpecializedProgram, Diag
         ),
         unions = empty_indexed_list(),
         records = empty_indexed_list(),
-        converted_environments = []
+        converted_environments = [],
+        constants = [],
+        constant_instances = repeat(unreached, checked.constants.length())
     }
 
     expanded ?= checked.expand_instances(initial)
@@ -6623,23 +6839,30 @@ pure func specialize(program: CheckedProgram) -> Result[SpecializedProgram, Diag
     prepared: SealedInstances = {
         functions = expanded.functions,
         unions = sealed_unions,
-        records = sealed_records
+        records = sealed_records,
+        constants = expanded.constants,
+        constant_instances = expanded.constant_instances
     }
 
     functions ?= prepared.functions.entries.translated_list(
         pure func(request: FunctionRequest) -> Result[ConcreteFunction, Diagnostic]:
             match checked.selected_body(request.key.body, request.source):
-                Err(error):
-                    Err(error)
-                Ok(function):
-                    translate_function(
-                        function,
-                        request.key,
-                        prepared.functions,
-                        prepared.unions,
-                        prepared.records,
-                        checked.traits
-                    )
+                Err(error): Err(error)
+                Ok(function): translate_function(function, request.key, prepared, checked.traits)
+    )
+
+    constant_context: TranslationContext = {
+        substitution = ground_substitution(),
+        callables = { traits = checked.traits, bindings = [], capture = NoCaptureBinding },
+        keys = prepared.functions,
+        unions = prepared.unions,
+        records = prepared.records,
+        constant_instances = prepared.constant_instances
+    }
+
+    constants ?= prepared.constants.translated_list(
+        pure func(id: ConstantId) -> Result[TranslatedConstant, Diagnostic]:
+            constant_context.translate_constant(id, checked.constants)
     )
 
     entry_span: Span = compiler_span()
@@ -6654,6 +6877,10 @@ pure func specialize(program: CheckedProgram) -> Result[SpecializedProgram, Diag
         SpecializedProgram.Underlying({
             records = prepared.records.layouts,
             unions = prepared.unions.layouts,
+            constants = constants.map(pure func(constant) -> ConcreteConstant: constant.row),
+            constant_values = ConstantTable.Underlying(
+                constants.map(pure func(constant) -> ConstantValue: constant.value)
+            ),
             functions = functions,
             entrypoint = accepted
         })

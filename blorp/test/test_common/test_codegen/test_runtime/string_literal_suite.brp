@@ -1,67 +1,23 @@
 import:
-    io/process: Captured
     test: TestSuite
     ../../../../src/common/codegen/runtime/memory: MEMORY_RUNTIME
     ../../../../src/common/codegen/runtime/string: STRING_RUNTIME
     ../../../../src/common/codegen/runtime/string_concat: string_concat_runtime
     ../../../driver/file_access: write_file
-    ../../../driver/harness: isolated, run_expecting
-    ../../../driver/reports: without_peak_heap
+    ./static_probes: build_static_probe, static_probe_outcome
 
 
-private COMPILE_TIMEOUT_MS: Int = 600000
-private CHILD_TIMEOUT_MS: Int = 10000
 -- The memory runtime's BLORP_STRICT_LEAK_EXIT_STATUS.
 private STRICT_LEAK_EXIT_STATUS: Int = 99
 -- Static literals are never allocated, so a strict run has nothing to free.
 private STRICT_TOTAL: String = "blorp: leak check: 0 allocs, 0 releases, 0 leaked, 0 bytes\n"
-private UNBALANCED_LINE: String = "blorp: leak check: unbalanced string literals: 1\n"
-private TWO_UNBALANCED_LINE: String = "blorp: leak check: unbalanced string literals: 2\n"
+private UNBALANCED_LINE: String = "blorp: leak check: unbalanced static objects: 1\n"
+private TWO_UNBALANCED_LINE: String = "blorp: leak check: unbalanced static objects: 2\n"
 -- The append's copy is the one allocation.
 private COPY_TOTAL: String = "blorp: leak check: 1 allocs, 1 releases, 0 leaked, 0 bytes\n"
 
 
--- Builds the probe from the runtime files in `directory`, with memory
--- diagnostics when `diagnostics`.
-private func build_probe(
-    c_compiler: String,
-    directory: String,
-    executable: String,
-    diagnostics: Bool
-) -> Result[String, String]:
-    definition = if diagnostics:
-        "-DBLORP_MEMORY_DIAGNOSTICS=1"
-    else:
-        "-DBLORP_MEMORY_DIAGNOSTICS=0"
-
-    build ?= isolated(
-        c_compiler,
-        [
-            "-std=c11",
-            "-O0",
-            "-Wall",
-            "-Wextra",
-            "-Werror",
-            "-pedantic",
-            "-pthread",
-            "-fsanitize=address,undefined",
-            "-fno-sanitize-recover=all",
-            definition,
-            "-I",
-            directory,
-            "blorp/test/test_common/test_codegen/test_runtime/fixtures/string_literal_test.c",
-            "-o",
-            executable
-        ],
-        COMPILE_TIMEOUT_MS
-    )
-
-    built ?= run_expecting("string literal native build", build, 0)
-
-    if built.stderr == "":
-        Ok(executable)
-    else:
-        Err("string literal native build: " + built.stderr)
+private FIXTURE: String = "blorp/test/test_common/test_codegen/test_runtime/fixtures/string_literal_test.c"
 
 
 -- The probe built with memory diagnostics, which count every allocation and
@@ -70,69 +26,24 @@ private func ready(c_compiler: String, directory: String) -> Result[(String, Str
     _ ?= write_file(directory + "/memory_runtime.c", MEMORY_RUNTIME)
     _ ?= write_file(directory + "/string_runtime.c", STRING_RUNTIME)
     _ ?= write_file(directory + "/string_concat.c", string_concat_runtime())
-    diagnostic ?= build_probe(c_compiler, directory, directory + "/string_literal_probe", True)
-    normal ?= build_probe(c_compiler, directory, directory + "/string_literal_probe_normal", False)
+
+    diagnostic ?= build_static_probe(
+        c_compiler,
+        directory,
+        FIXTURE,
+        directory + "/string_literal_probe",
+        True
+    )
+
+    normal ?= build_static_probe(
+        c_compiler,
+        directory,
+        FIXTURE,
+        directory + "/string_literal_probe_normal",
+        False
+    )
+
     Ok((diagnostic, normal))
-
-
--- Strict runs set BLORP_LEAK_CHECK; the others run without it.
-private func run_probe(
-    executable: String,
-    mode: String,
-    strict: Bool,
-    status: Int
-) -> Result[Captured, String]:
-    leak_check: Option[String] = if strict:
-        Some("strict")
-    else:
-        None
-
-    run ?= isolated(executable, [mode], CHILD_TIMEOUT_MS)
-
-    environment = run.environment
-        .set("BLORP_ALLOCATION_SITES", None)
-        .set("BLORP_LEAK_CHECK", leak_check)
-
-    run_expecting(mode, { run | environment = environment }, status)
-
-
-private func expect(label: String, actual: String, expected: String) -> Result[Void, String]:
-    if actual.equals(expected):
-        Ok(void)
-    else:
-        Err(label + ": expected [" + expected + "] got [" + actual + "]")
-
-
-private func outcome(
-    executable: String,
-    mode: String,
-    strict: Bool,
-    status: Int,
-    stderr: String
-) -> Bool:
-    checked: Result[Void, String] = match run_probe(executable, mode, strict, status):
-        Err(error):
-            Err(error)
-        Ok(run):
-            -- A strict run ends with the peak heap line. Its figure follows the
-            -- String layout, which this suite does not test, so only its form is
-            -- checked here.
-            reported: Result[String, String] = if strict:
-                without_peak_heap(run.stderr)
-            else:
-                Ok(run.stderr)
-
-            match (expect(mode + " stdout", run.stdout, ""), reported):
-                (Err(error), _): Err(error)
-                (_, Err(error)): Err(mode + " stderr: " + error + ": " + run.stderr)
-                (Ok(_), Ok(before_peak)): expect(mode + " stderr", before_peak, stderr)
-
-    match checked:
-        Ok(_):
-            True
-        Err(error):
-            print_error(error)
-            False
 
 
 func suite(c_compiler: String, directory: String) -> TestSuite:
@@ -150,11 +61,11 @@ func suite(c_compiler: String, directory: String) -> TestSuite:
                 tests = [
                     (
                         "balanced static literals pass the strict check without being freed",
-                        func(): outcome(diagnostic, "balanced", True, 0, STRICT_TOTAL)
+                        func(): static_probe_outcome(diagnostic, "balanced", True, 0, STRICT_TOTAL)
                     ),
                     (
                         "an over-released literal fails the strict check",
-                        func(): outcome(
+                        func(): static_probe_outcome(
                             diagnostic,
                             "over_release",
                             True,
@@ -164,7 +75,7 @@ func suite(c_compiler: String, directory: String) -> TestSuite:
                     ),
                     (
                         "an under-released literal fails the strict check",
-                        func(): outcome(
+                        func(): static_probe_outcome(
                             diagnostic,
                             "under_release",
                             True,
@@ -174,11 +85,11 @@ func suite(c_compiler: String, directory: String) -> TestSuite:
                     ),
                     (
                         "without the strict check an unbalanced literal still exits 0",
-                        func(): outcome(diagnostic, "under_release", False, 0, "")
+                        func(): static_probe_outcome(diagnostic, "under_release", False, 0, "")
                     ),
                     (
                         "a leak in one literal and an over-release of another both count",
-                        func(): outcome(
+                        func(): static_probe_outcome(
                             diagnostic,
                             "two_unbalanced",
                             True,
@@ -188,23 +99,35 @@ func suite(c_compiler: String, directory: String) -> TestSuite:
                     ),
                     (
                         "appending to a literal copies it and leaves the literal at its base",
-                        func(): outcome(diagnostic, "copies_on_append", True, 0, COPY_TOTAL)
+                        func(): static_probe_outcome(
+                            diagnostic,
+                            "copies_on_append",
+                            True,
+                            0,
+                            COPY_TOTAL
+                        )
                     ),
                     (
                         "without diagnostics appending to a literal copies it",
-                        func(): outcome(normal, "copies_on_append", False, 0, "")
+                        func(): static_probe_outcome(normal, "copies_on_append", False, 0, "")
                     ),
                     (
                         "threads reading a static literal allocate nothing and leave it balanced",
-                        func(): outcome(diagnostic, "threaded_reads", True, 0, STRICT_TOTAL)
+                        func(): static_probe_outcome(
+                            diagnostic,
+                            "threaded_reads",
+                            True,
+                            0,
+                            STRICT_TOTAL
+                        )
                     ),
                     (
                         "without diagnostics threads reading a static literal share it",
-                        func(): outcome(normal, "threaded_reads", False, 0, "")
+                        func(): static_probe_outcome(normal, "threaded_reads", False, 0, "")
                     ),
                     (
                         "without diagnostics no evaluation, retain or release writes a literal's count",
-                        func(): outcome(normal, "uncounted", False, 0, "")
+                        func(): static_probe_outcome(normal, "uncounted", False, 0, "")
                     )
                 ]
             }

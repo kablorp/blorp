@@ -4,9 +4,9 @@
 memo on 2026-11-23, and on 2026-11-24 accepted every recommendation for K2 to
 K6, K8, K9 and T1 to T6 (see [Decisions](#decisions)). A soundness review and
 an ergonomics review both approved it with fixes, which are folded in here.
-L1 (static string literals) is implemented, see
-[Measurements](#l1-static-string-literals-measured-2026-11-26). L2 is next, after
-private-variants landing 3.
+L1 (static string literals) and L2 (static constants) are implemented, see
+[L1](#l1-static-string-literals-measured-2026-11-27) and
+[L2](#l2-static-constants-measured-2026-11-28). L3 is next.
 
 **The direction:**
 
@@ -404,27 +404,30 @@ targets for any byte above 127. It compiles with no diagnostic under:
 
 The decoder prototype runs clean under `-fsanitize=address,undefined`.
 
-The read form follows the layout (`specialize.brp:110-134,218-236`):
+Every reached constant is one `static const` C value, `blorp_k_N`, of the
+constant's C type, and a read copies it, so the read names the instance
+alone. What that value holds follows the layout
+(`specialize.brp:110-134,218-236`); a read of a managed constant borrows it:
 
-| Layout | Static form | A read |
+| Layout | The value holds | Static objects |
 | --- | --- | --- |
-| Scalars, `Void`, payload-free enums | none | the literal |
-| `InlineFields` records, `PlainCases` unions | a `static const` C value | a copy of it |
-| `ValueFields` records, `OwningCases` unions | a static C value whose counted children are static objects | a copy, borrowed |
-| `CountedFields` records, `BoxedCases` unions, Lists, Strings | a static object at the base count | its address, borrowed |
-| An empty List | the layout's `[]` root | as `[]` today |
-| A function constant | none | `{&entry,(void*)0}`, as `emit.brp:1200-1213` writes a free callable |
+| Scalars, `Void`, payload-free enums | the literal | none |
+| `InlineFields` records, `PlainCases` unions | its initializer | none |
+| `ValueFields` records, `OwningCases` unions | its initializer, whose counted children link to static objects | the children's |
+| `CountedFields` records, `BoxedCases` unions, Lists, Strings | the address of a static object at the base count | that object and its children's |
+| An empty List | the address of the layout's `[]` root | none |
+| A function constant | `{&entry,(void*)0}`, as `emit.brp` writes a free callable | none |
 
 ```c
 /* constant probe.KEYWORDS: "if" hashes to slot 0 of 7 and "else" to slot 3,
    by dict.brp's home_slot. blorp_r_0 is DictContents[String, Keyword]. */
 BLORP_STATIC_STRING(blorp_k_0_0,2,2,{105,102});
 /* blorp_k_0_1 "else"; blorp_k_0_2 keys; blorp_k_0_3 values; blorp_k_0_4 live, likewise */
-static union {struct {atomic_size_t references;int64_t length;size_t capacity;int64_t values[7];} image;struct blorp_l_0_i value;}
- blorp_k_0_5={.image={BLORP_STRING_LITERAL_REFERENCES,7,7,{INT64_C(0),INT64_C(-1),INT64_C(-1),INT64_C(1),INT64_C(-1),INT64_C(-1),INT64_C(-1)}}};
-static struct blorp_r_0 blorp_k_0={UINT64_MAX/2,&blorp_k_0_2.value,&blorp_k_0_3.value,&blorp_k_0_4.value,&blorp_k_0_5.value,INT64_C(0)};
-/* A read borrows: no call, no allocation, no count change. */
-const blorp_r_0 blorp_vl_3=&blorp_k_0;
+BLORP_STATIC_LIST(blorp_k_0_5,blorp_l_0_i,int64_t,7,{INT64_C(0),INT64_C(-1),INT64_C(-1),INT64_C(1),INT64_C(-1),INT64_C(-1),INT64_C(-1)});
+static struct blorp_r_0 blorp_k_0_6={BLORP_STATIC_RECORD_REFERENCES,.blorp_rf_0_0=&blorp_k_0_2.value,.blorp_rf_0_1=&blorp_k_0_3.value,.blorp_rf_0_2=&blorp_k_0_4.value,.blorp_rf_0_3=&blorp_k_0_5.value,.blorp_rf_0_4=INT64_C(0)};
+static const blorp_r_0 blorp_k_0=&blorp_k_0_6;
+/* A read copies the pointer and borrows: no call, no allocation, no count change. */
+const blorp_r_0 blorp_vl_3=blorp_k_0;
 ```
 
 ### Ownership: `StaticBorrow`, paired
@@ -896,9 +899,21 @@ the landing for a growth audit (`../AGENTS.md`).
 | Landing | Instructions | Allocations | Peak heap | Production lines | Test lines |
 | --- | --- | --- | --- | --- | --- |
 | L1 | +0.1% | +0.05% | +0.1% | +20 | +150 |
-| L2 | +0.2% | +0.1% | +0.2% | +650 | +700 |
+| L2 | +0.2% | +0.1% | +0.2% | +720 (was +650) | +1,240 (was +700) |
 | L3 | +0.5% | +0.5% | +0.5% | +1,300 | +1,900 |
 | L4 | reported | reported | reported | 0 | 0 |
+
+**L2's line ceilings were corrected on 2026-11-28** by the coordinator, under
+the standing delegation for routine budget corrections (`../AGENTS.md`):
+production from +650 to +720, and tests from +700 to +1,240. The growth
+audit found the overrun to be work the estimate missed, not bloat:
+
+- **Production.** The pinning row took about 45 lines, the counter shared with
+  L1 about 15, and the code entries of held functions about 10. The audit's
+  trims were made first.
+- **Tests.** The +700 estimate predated the testing list, which asks for one
+  exact-C test per read form. The review's malformed-IR tests then added
+  about 90 lines.
 
 **Stage-2 bounds.**
 
@@ -974,7 +989,7 @@ elements are evaluated as a constant, then the same at double the size.
     allocations;
   - `blorp_string_literal` and its site struct are gone;
   - the gates pass.
-- [ ] **L2:**
+- [x] **L2:**
   - the decoder witness makes 1 allocation;
   - reading a closed List constant allocates nothing, under an e2e ceiling;
   - both verify malformed-IR tests fail when the pairing is loosened.
@@ -1150,6 +1165,164 @@ about 300 changed lines are one-line allocation-count resets. A literal no
 longer allocates, so 270 or more e2e programs' exact counts fell (for
 example `append_reuse` 27 to 21, and `effects_hello` 1 to 0), and one
 compile ceiling rose by 3 (59,775 to 59,778).
+
+### L2, static constants, measured 2026-11-28
+
+**Setup.** Apple M4, macOS 26.7.1, Apple clang 21.0.0 `-O2`. Base
+`21422d6d2`, candidate the head of `claude/ctfe-l2`, both built from seed
+`blorp-seed-94b463fdaa55`, which predates L2. Raw samples are in the ignored
+`build/l2-cost/`, `build/l2-stage2/`, `build/l2-attribution/`,
+`build/math-ceiling/`, `build/l2-counter/` and `build/l2-counter-variants/`
+of the implementing worktree, with the logs `build/l2-cost.log`,
+`build/l2-stage2.log`, `build/l2-attribution.log`, `build/math-sites.log`,
+`build/l2-counter*.log`, `build/l2-test.log` and `build/l2-gcc.log`. The
+counter's figures were taken on the earlier base `94b463fda` with seed
+`blorp-seed-aad181bcdc73`. GCC 13.3 in the Linux Docker image compiles the
+e2e constant fixtures, a probe of every read form and the static object
+runtime probe with `-std=c11 -pedantic -Wall -Wextra -Werror`, at `-O2` and
+at `-O0` with ASan and UBSan, with no diagnostic, and runs them correctly.
+
+**Fixed-input row**, `scripts/self-compile-cost 21422d6d2 HEAD --rounds 5`:
+
+| | Base | Candidate | Change | Ceiling |
+| --- | --- | --- | --- | --- |
+| Allocations | 13,685,669 | 13,680,614 | -0.0369% | +0.1% |
+| Peak heap, bytes | 190,826,924 | 190,300,772 | -0.2757% | +0.2% |
+| Instructions, median of 5 | 13,911,104,511 | 13,876,917,671 | -0.2458% | +0.2% |
+
+The own-source row is reported, not held: allocations +1.1126%, peak heap
++0.4907%, instructions +0.9798%, for L2's larger source. The fixed-input C
+differs, as it must: the candidate writes static constants. The first
+candidate measured +0.6883% allocations and +0.2004% instructions: emit's
+inventory matched each definition's operation and type as one pair, a cell
+per definition (+107,763 allocations, found with `BLORP_ALLOCATION_SITES`).
+Matching them apart removed it.
+
+**Stage 2.** The L2 compiler built from the seed writes `s2.c` from L2's
+source. Clang builds it into the static compiler, and `blorp/build/blorp.c`
+into the rebuilding one: the seed's C of the same source, which has L1's
+static literals and rebuilds each constant at each read, so the two differ in
+L2 alone. Both compile L2's source and write `s2.c` byte for byte, and their
+strict runs leak nothing.
+
+| | Rebuilt at each read | Static | Change |
+| --- | --- | --- | --- |
+| Allocations | 13,837,930 | 13,836,770 | -1,160 |
+| Instructions, median of 5, alternating order | 14,042,172,885 | 14,033,334,093 | -0.063% |
+
+The census at `f9423ade5` counted about 117 allocations from constant reads.
+The two compilers, rebuilt at `-O0 -g` so that no inlining moves a site, with
+`BLORP_ALLOCATION_SITES` (`build/l2-attribution.log`) place the 1,160:
+
+- -1,044 in `load.stem_is_ambiguous`, which passes the List constant
+  `EMBEDDED_LIBRARY_PATHS` to `embedded_stem_ambiguity` once per module
+  stem it resolves. The census predates that call.
+- -114 in `parse.builtin_operation`, the census's reads of the builtin table.
+- -1 each in `emit.emit` and `main.parse_command`.
+
+An attribution of the `-O2` builds put the sites in their inlined callers and
+did not add up.
+
+**The decoder witness** prints `208896` with 1 allocation, from 8,193; the
+read-loop fixture makes 1, from 2,001. Both are exact e2e counts.
+
+**What the design added.**
+
+- **Read forms.** Every reached constant is one `static const` C value,
+  `blorp_k_N`, and a read copies it, so emission's read form names the
+  instance alone and needs no value. A scalar, enum or function constant is
+  that value's literal; a by-value record or union its initializer; a
+  String, nonempty List, counted record or boxed union a pointer to its
+  static object at its base count; an empty List the `[]` root. The C
+  compiler folds these reads at `-O1` and above.
+- **Pinning.** A function that only a constant's value holds is invoked
+  through its callable, which lends its arguments, but nothing in any body
+  takes it as a callable, so ownership could give it an owned parameter: the
+  first draft freed an argument twice (`held_callable.brp`). Each constant's
+  row in the IR, `ConcreteConstant`, therefore lists the instances its value
+  holds; `own` pins them, `verify` checks they are pinned, and `emit` checks
+  the value against the row. L3's initializer bodies take them as callables,
+  so L3 drops the list.
+- **One counter.** L1's counter of literals off their base became one
+  counter of static objects in the memory runtime, which every String,
+  List, counted record and boxed union count change moves in diagnostics
+  builds, and which `blorp_memory_finish` checks. Normal builds expand each
+  count macro to the bare atomic operation, so their retain and release
+  paths are unchanged. Each change tests in line whether its count was at
+  or beside a base, and only then calls the counter. On a strict self-compile
+  of L2's source, against the same C with the four count macros bare:
+
+  | Build | Bare | L1's String counter (the parent's C) | In-line test | Out-of-line call |
+  | --- | --- | --- | --- | --- |
+  | `-O0`, the test compiler's | 81,007,117,749 | 82,076,706,753 (+1.3%) | 84,228,093,379 (+4.0%) | 91,266,967,034 (+12.7%) |
+  | `-O2` | 16,409,266,599 | 16,970,137,779 (+3.4%) | 18,595,966,918 (+13.3%) | 19,145,504,000 (+16.7%) |
+
+  The variants are the same C with the helpers edited
+  (`build/l2-counter-variants/`); the landed C measures the same, +4.0% at
+  `-O0` (84,297,183,422 against 81,030,419,712, `build/l2-counter.log`). So
+  the counter adds about 2.6% to a strict `-O0` run over L1's, and 9.6% at
+  `-O2`: the plan's spike found the same effect of a test in every dup
+  and drop on inlining. Normal builds pay nothing. The in-line test is
+  compiled into every diagnostics build and runs on every count change,
+  whether or not the run is strict. The test compiler is the seed's C of the
+  current source, so after the next rotation the `-O0` diagnostics test
+  compiler, which does every e2e compile, pays L1's and L2's costs together:
+  +4.0% over bare. An exit check of each constant's static objects, which
+  emission can name, would cost no count change, and is the alternative if
+  that cost matters.
+- **The bases** are `BLORP_STATIC_REFERENCES` (`SIZE_MAX/2+1`, Strings and
+  Lists; L1's `BLORP_STRING_LITERAL_REFERENCES`) and
+  `BLORP_STATIC_RECORD_REFERENCES` (`UINT64_MAX/2`), both in the memory
+  runtime, so a List constant needs no String runtime.
+- **A called constant** still calls its template as a stored callee, so the
+  C of `DOUBLE(3)` is unchanged.
+
+**Lines against the ceilings.** Production +720 net and tests +1,234 net,
+against the ceilings of +650 and +700, after the growth audit's trims. The
+coordinator then corrected the ceilings to +720 and +1,240 (see
+[Ceilings](#ceilings)).
+
+- **Production, by phase.** `emit` +374: the static data walk, one function
+  per row of the read-form table (about 250), the code entries of functions
+  that constants hold (about 30), and the read and placement. `specialize`
+  +227: the identity, value, row and table types (about 65), reaching a
+  constant through a table indexed by constant (about 50) and translating its
+  template (about 85; the plan estimated 150 for the translation). `verify`
+  +49, the memory runtime +44 (the counter and both bases; the String runtime
+  -30), `own` +19, the List runtime +14, `check` +12, `lower` +10. The
+  pinning row, which the plan did not foresee, is about 45 of these lines
+  across four phases. Renaming `check`'s `callable_creations` to
+  `instance_requests`, about 40 lines for net 0, is preparatory: the walk now
+  also collects constant reads.
+- **Tests.** The suites of [Testing](#testing) for L2: `check` 90,
+  `specialize` 113, `own` 153 (with a record constant that holds a
+  function), `verify` 201, `emit` 260 (one test per read form, with its
+  exact C), the static object runtime suite and fixture 275, its probe
+  helpers 107 (shared with the String literal suite, which shrank by 77),
+  and three e2e fixtures with their cases 103. `verify`'s malformed-IR tests reject a managed constant read
+  that is not a static borrow, a row's held function that is not pinned, and
+  an unknown constant instance, each by its exact message; loosening
+  `verify`'s pinning check fails only the pinning test of every component
+  suite (`build/loosen-verify-all.log`). Fourteen further lines are one-line
+  allocation resets, net 0, the largest `fs_lines` 148,364 to 148,059,
+  `fs_directories` 329 to 306, `forty nested managed constants` 82 to 2 and
+  `control.brp`'s grouped suites 21 to 12. Two compile ceilings rose, each
+  keeping its original headroom. They pay for reaching, translating and
+  emitting the constants the fixture reads:
+  - `math_functions`, which reads `PI`, `INT_MAX` and `INT_MIN`: 75,031 to
+    75,077 allocations, ceiling 75,040 to 75,086 (`build/math-sites.log`);
+  - `math/bits`, which arrived on main during the landing and reads
+    `INT_MAX` and `INT_MIN`: 65,509 to 65,551, ceiling 65,510 to 65,552.
+
+**Found, not done.**
+
+- A constant's C carries no label: `blorp_k_2` does not say it is `LABELS`,
+  while each function has its `/* module.name */` comment.
+- The values travel beside the IR, in `ConstantTable`, as the brief directs
+  for L3's evaluator. Carrying them inside `ConcreteConstant` would remove
+  the table, emit's cross-check of a value against its row and `emit`'s
+  second parameter, about 40 production and 25 test lines by the review's
+  estimate. L3 decides which form its evaluated values take.
 
 ## Handback
 

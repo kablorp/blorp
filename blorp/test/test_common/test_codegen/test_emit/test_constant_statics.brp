@@ -1,0 +1,247 @@
+---
+Each constant is a `static const` C value named for its instance, and a read
+copies it. A String, a nonempty List, a counted record and a boxed union are
+static objects at their base counts, which that value links to by address;
+an empty List links to its layout's `[]` root; a by-value record or union is
+an initializer, whose counted children are static objects; a function is its
+code entry with no environment.
+---
+import:
+    test: TestSuite
+    ../../../support/compilation: compile
+    ../../../support/text_search: has_text
+
+
+-- Each constant's C, after the read in `main` that names it.
+private pure func emits(source: String, statics: List[String], read: String) -> Bool:
+    match compile(source):
+        Err(_):
+            False
+        Ok(code):
+            statics
+                .all(pure func(text): has_text(code, text))
+                .and(has_text(code, read))
+
+
+pure func test_scalar_constant_is_a_static_value() -> Bool:
+    source: String =
+        |LIMIT: Int = 7
+        |func main() -> Int:
+        |    LIMIT
+        |
+
+    emits(
+        source,
+        ["static const int64_t blorp_k_0=INT64_C(7);\n"],
+        "const int64_t blorp_vl_0=blorp_k_0;"
+    )
+
+
+pure func test_enum_constant_is_its_tag() -> Bool:
+    source: String =
+        |union Color:
+        |    Red
+        |    Green
+        |GREEN: Color = Green
+        |pure func code(color: Color) -> Int:
+        |    0
+        |func main() -> Int:
+        |    code(GREEN)
+        |
+
+    emits(source, ["static const enum blorp_u_0 blorp_k_0=blorp_v_0_1;\n"], "=blorp_k_0;")
+
+
+pure func test_inline_record_is_a_static_initializer() -> Bool:
+    source: String =
+        |record Point { x: Int, y: Int }
+        |ORIGIN: Point = { y = 2, x = 1 }
+        |func main() -> Int:
+        |    ORIGIN.x
+        |
+
+    emits(
+        source,
+        ["static const blorp_r_0 blorp_k_0={.blorp_rf_0_0=INT64_C(1),.blorp_rf_0_1=INT64_C(2)};\n"],
+        "const blorp_r_0 blorp_vl_0=blorp_k_0;"
+    )
+
+
+pure func test_value_record_links_its_static_string() -> Bool:
+    source: String =
+        |record Named { name: String, count: Int }
+        |LABEL: Named = { name = "label", count = 3 }
+        |func main() -> Int:
+        |    LABEL.count
+        |
+
+    emits(
+        source,
+        [
+            "BLORP_STATIC_STRING(blorp_k_0_0,5,5,{108,97,98,101,108});\n",
+            "static const blorp_r_0 blorp_k_0={.blorp_rf_0_0=&blorp_k_0_0.value,.blorp_rf_0_1=INT64_C(3)};\n"
+        ],
+        "const blorp_r_0 blorp_vl_0=blorp_k_0;"
+    )
+
+
+pure func test_owning_union_links_its_static_string() -> Bool:
+    source: String =
+        |union Tagged:
+        |    Text(String)
+        |    Nothing
+        |TAGGED: Tagged = Text("t")
+        |pure func code(value: Tagged) -> Int:
+        |    0
+        |func main() -> Int:
+        |    code(TAGGED)
+        |
+
+    emits(
+        source,
+        [
+            "BLORP_STATIC_STRING(blorp_k_0_0,1,1,{116});\n",
+            "static const struct blorp_u_0 blorp_k_0={.tag=blorp_v_0_0,.payload.blorp_up_0={.blorp_uf_0=&blorp_k_0_0.value}};\n"
+        ],
+        "=blorp_k_0;"
+    )
+
+
+pure func test_counted_record_is_a_static_object() -> Bool:
+    source: String =
+        |record Pair { left: String, right: String }
+        |PAIR: Pair = { left = "l", right = "r" }
+        |pure func code(pair: Pair) -> Int:
+        |    0
+        |func main() -> Int:
+        |    code(PAIR)
+        |
+
+    emits(
+        source,
+        [
+            "static struct blorp_r_0 blorp_k_0_2={BLORP_STATIC_RECORD_REFERENCES,.blorp_rf_0_0=&blorp_k_0_0.value,.blorp_rf_0_1=&blorp_k_0_1.value};\n",
+            "static const blorp_r_0 blorp_k_0=&blorp_k_0_2;\n"
+        ],
+        "const blorp_r_0 blorp_vl_0=blorp_k_0;"
+    )
+
+
+pure func test_boxed_union_is_a_chain_of_static_objects() -> Bool:
+    source: String =
+        |union Chain:
+        |    Link(Int, Chain)
+        |    End
+        |CHAIN: Chain = Link(1, End)
+        |pure func code(chain: Chain) -> Int:
+        |    0
+        |func main() -> Int:
+        |    code(CHAIN)
+        |
+
+    emits(
+        source,
+        [
+            "static struct blorp_u_0 blorp_k_0_0={BLORP_STATIC_RECORD_REFERENCES,.tag=blorp_v_0_1};\n",
+            "static struct blorp_u_0 blorp_k_0_1={BLORP_STATIC_RECORD_REFERENCES,.tag=blorp_v_0_0,.payload.blorp_up_0={.blorp_uf_0=INT64_C(1),.blorp_uf_1=&blorp_k_0_0}};\n",
+            "static struct blorp_u_0* const blorp_k_0=&blorp_k_0_1;\n"
+        ],
+        "=blorp_k_0;"
+    )
+
+
+pure func test_list_is_a_static_object() -> Bool:
+    source: String =
+        |pure func size(values: List[Int]) -> Int:
+        |    0
+        |NUMBERS: List[Int] = [1, 2]
+        |func main() -> Int:
+        |    size(NUMBERS)
+        |
+
+    emits(
+        source,
+        [
+            "BLORP_STATIC_LIST(blorp_k_0_0,blorp_l_0_i,int64_t,2,{INT64_C(1),INT64_C(2)});\n",
+            "static struct blorp_l_0_i* const blorp_k_0=&blorp_k_0_0.value;\n"
+        ],
+        "struct blorp_l_0_i* const blorp_vl_0=blorp_k_0;"
+    )
+
+
+pure func test_empty_list_links_the_empty_root() -> Bool:
+    source: String =
+        |pure func size(values: List[Int]) -> Int:
+        |    0
+        |NONE: List[Int] = []
+        |func main() -> Int:
+        |    size(NONE)
+        |
+
+    emits(
+        source,
+        [
+            "static struct blorp_l_0_i* const blorp_k_0=(struct blorp_l_0_i*)&blorp_list_empty_0_i;\n"
+        ],
+        "struct blorp_l_0_i* const blorp_vl_0=blorp_k_0;"
+    )
+
+
+pure func test_string_is_a_static_object() -> Bool:
+    source: String =
+        |pure func size(text: String) -> Int:
+        |    0
+        |GREETING: String = "hi"
+        |func main() -> Int:
+        |    size(GREETING)
+        |
+
+    emits(
+        source,
+        [
+            "BLORP_STATIC_STRING(blorp_k_0_0,2,2,{104,105});\n",
+            "static struct blorp_string* const blorp_k_0=&blorp_k_0_0.value;\n"
+        ],
+        "struct blorp_string* const blorp_vl_0=blorp_k_0;"
+    )
+
+
+pure func test_function_constant_is_its_entry() -> Bool:
+    source: String =
+        |pure func double(value: Int) -> Int:
+        |    value
+        |DOUBLE: pure (Int) -> Int = double
+        |func main() -> Int:
+        |    f = DOUBLE
+        |    f(2)
+        |
+
+    emits(
+        source,
+        [
+            "const struct blorp_co_p1_i_r_i_e blorp_ce_1_0_cp1_i_r_i_e=",
+            "static const struct blorp_c_p1_i_r_i_e blorp_k_0={&blorp_ce_1_0_cp1_i_r_i_e,(void*)0};\n"
+        ],
+        "const struct blorp_c_p1_i_r_i_e blorp_vl_0=blorp_k_0;"
+    )
+
+
+TESTS: TestSuite = {
+    description = "Constant static data",
+    tests = [
+        ("a scalar constant is a static value", test_scalar_constant_is_a_static_value),
+        ("an enum constant is its tag", test_enum_constant_is_its_tag),
+        ("an inline record is a static initializer", test_inline_record_is_a_static_initializer),
+        ("a by-value record links its static String", test_value_record_links_its_static_string),
+        ("an owning union links its static String", test_owning_union_links_its_static_string),
+        ("a counted record is a static object", test_counted_record_is_a_static_object),
+        (
+            "a boxed union is a chain of static objects",
+            test_boxed_union_is_a_chain_of_static_objects
+        ),
+        ("a List is a static object", test_list_is_a_static_object),
+        ("an empty List links the empty root", test_empty_list_links_the_empty_root),
+        ("a String is a static object", test_string_is_a_static_object),
+        ("a function constant is its code entry", test_function_constant_is_its_entry)
+    ]
+}

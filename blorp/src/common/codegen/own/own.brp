@@ -46,7 +46,8 @@ import:
             ListElementValue,
             ListSuffixValue,
             ConstructRecordValue,
-            ReadRecordFieldValue
+            ReadRecordFieldValue,
+            ReadConstantValue
         ),
         block_value_count,
         step_reads,
@@ -55,8 +56,10 @@ import:
         CallTarget(RuntimeFunction, UserFunction, JoinTasks, MapElements),
         MapCallback(DirectCallback),
         ConcretePatternPlace,
+        ConcreteConstant,
         ConcreteRecord,
         ConcreteUnion,
+        ConstantInstanceId,
         FieldInstanceId,
         FunctionInstanceId,
         RecordInstanceId,
@@ -84,6 +87,9 @@ fixed union BorrowSource:
     ParameterBorrow(ValueId)
     OwnerBorrow(OwnerId)
     PayloadBorrow(ValueId)
+    -- A read of a constant's static storage: never freed, so a borrow of it
+    -- needs no owner and a borrowing use needs no count operation.
+    StaticBorrow
 
 
 record BorrowedValue {
@@ -132,6 +138,7 @@ union OwnedValueOperation:
     PayloadDefinition(VariantFieldInstanceId, ValueId)
     ListElementDefinition(Int, ValueId)
     ListSuffixDefinition(OwnedArgument, Int)
+    ReadConstantDefinition(ConstantInstanceId)
 
 
 record OwnedDefinition {
@@ -319,6 +326,8 @@ record OwnedFunction {
 record OwnershipProgram {
     records: List[ConcreteRecord],
     unions: List[ConcreteUnion],
+    -- Each reached constant, dense by ConstantInstanceId.
+    constants: List[ConcreteConstant],
     functions: List[OwnedFunction],
     entrypoint: Entrypoint[FunctionInstanceId]
 }
@@ -824,6 +833,8 @@ private pure func build_definition(
                 .map(pure func(argument): ListSuffixDefinition(argument, skipped))
         FreeCallableValue(body):
             Ok(FreeCallableDefinition(body))
+        ReadConstantValue(id):
+            Ok(ReadConstantDefinition(id))
         CapturedCallableValue(body, environment):
             match [environment].store_payloads(
                 sources,
@@ -904,6 +915,8 @@ private pure func build_definition(
                         BorrowedArgument(borrow): borrow.value
 
                     Ok(BorrowedResult(PayloadBorrow(parent)))
+                ReadConstantDefinition(_):
+                    Ok(BorrowedResult(StaticBorrow))
                 StringDefinition(_) | CallDefinition(_, _) | InvokeCallableDefinition(_, _) | FreeCallableDefinition(_) | CapturedCallableDefinition(_, _) | ConstructDefinition(_, _) | ConstructListDefinition(_) | ListSuffixDefinition(_, _) | ConstructRecordDefinition(_, _):
                     Ok(OwnedResult(owner_id(next)))
                 _:
@@ -3865,7 +3878,7 @@ private pure func reached_parameters(inserted: InsertedFunction) -> Result[List[
                             backer: Result[Option[Int], Diagnostic] = match borrow.source:
                                 OwnerBorrow(source): Ok(Some(source.owner_number()))
                                 PayloadBorrow(parent): backing.row_at(parent.value_number())
-                                ParameterBorrow(_): Ok(None)
+                                ParameterBorrow(_) | StaticBorrow: Ok(None)
 
                             match backer:
                                 Err(error):
@@ -4620,6 +4633,11 @@ private pure func inserted_instances(
         True
     )
 
+    -- A constant's callables are taken as callables, as a body's are.
+    for constant in contents.constants:
+        for body in constant.callables:
+            pinned = pinned.set(body.function_number(), True)
+
     var scanned: List[CallFacts] = []
     var borrowed: List[List[OwnedParameter]] = []
     var failure: Option[Diagnostic] = None
@@ -4722,6 +4740,7 @@ pure func insert_ownership(
     Ok({
         records = contents.records,
         unions = contents.unions,
+        constants = contents.constants,
         functions = inserted.map(pure func(function): function.function),
         entrypoint = contents.entrypoint
     })

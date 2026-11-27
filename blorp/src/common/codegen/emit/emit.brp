@@ -99,7 +99,8 @@ import:
             ListElementDefinition,
             ListSuffixDefinition,
             ConstructRecordDefinition,
-            ReadRecordFieldDefinition
+            ReadRecordFieldDefinition,
+            ReadConstantDefinition
         ),
         OwnerId,
         OwnershipOperation(DefineValue, ExecuteJoin, ExecuteLoop, AcquireOwner, DropOwner),
@@ -126,6 +127,7 @@ import:
         consuming_helper_name,
         list_element_key,
         list_empty_root,
+        list_empty_root_address,
         list_release_name,
         list_root_allocation,
         list_slot_store,
@@ -178,7 +180,10 @@ import:
         UnionInstanceId,
         VariantFieldInstanceId,
         VariantInstanceId,
-        function_number
+        constant_instance_number,
+        constant_values,
+        function_number,
+        held_callables
     ../verify/verify:
         AggregateDefinition(RecordDefinition, UnionDefinition),
         VerifiedProgram,
@@ -200,7 +205,9 @@ import:
             MissingAggregateLayout,
             MissingInPlaceHelper,
             MissingJoinedTask,
-            InvalidMapCallback
+            InvalidMapCallback,
+            ConstantValueMismatch,
+            NonCallableEntry
         ),
         render
     ./float_literal: c_float_literal
@@ -411,10 +418,10 @@ private pure func code_point_count(bytes: String) -> Int:
     count
 
 
-private pure func append_static_literal(output: String, id: ValueId, bytes: String) -> String:
+private pure func append_static_string(output: String, name: String, bytes: String) -> String:
     output
         .concat("BLORP_STATIC_STRING(")
-        .concat(id.c_literal_name())
+        .concat(name)
         .concat(",")
         .append_int(bytes.length())
         .concat(",")
@@ -785,88 +792,91 @@ private pure func callable_ops(
         None: Ok(fragments.join(""))
 
 
+-- A callable's code entry, which its pair's ops name: the instance it runs at
+-- one concrete callable type, passing the environment when it captures one.
+-- Entries are disposable emission rows, keyed by instance and type.
+private record CallableEntry {
+    body: specialized.FunctionInstanceId,
+    value_type: TypeRef,
+    captures: Bool
+}
+
+
+-- Verification proved every callable definition's type a callable type.
 private pure func append_callable_entry(
-    definition: OwnedDefinition,
+    entry: CallableEntry,
     program: OwnershipProgram
 ) -> Result[String, Diagnostic]:
-    selected: Result[specialized.FunctionInstanceId, Diagnostic] = match definition.operation:
-        FreeCallableDefinition(id): Ok(id)
-        CapturedCallableDefinition(id, _): Ok(id)
-        _: Err(render(definition.span, InvalidOperationShape(definition.id)))
+    match entry.value_type:
+        CallableType(parameters, result):
+            entry.append_callable_adapters(parameters, result, program)
+        _:
+            Err(render(compiler_span(), NonCallableEntry(entry.body.function_number())))
 
-    body ?= selected
+
+private pure func append_callable_adapters(
+    entry: CallableEntry,
+    parameters: List[TypeRef],
+    result: TypeRef,
+    program: OwnershipProgram
+) -> Result[String, Diagnostic]:
+    body = entry.body
+    span = compiler_span()
 
     function: OwnedFunction ?= match program.functions.get(body.function_number()):
         Some(present): Ok(present)
-        None: Err(render(definition.span, MissingFunctionRow(definition.id)))
+        None: Err(render(span, MissingFunctionRow(body.function_number())))
 
-    match definition.value_type:
-        CallableType(parameters, result):
-            name = "".append_callable_entry_name(body, definition.value_type)
+    name = "".append_callable_entry_name(body, entry.value_type)
+    returned ?= "".append_type_name(result, program.unions, span)
+    arguments ?= parameters.callable_parameters(program.unions)
+    var invocation = "${body.function_number().c_name()}("
+    var retain = "(void)environment;"
+    var drop = "(void)environment;(void)depth;"
+    var prefix = "(void)environment;"
 
-            match "".append_type_name(result, program.unions, definition.span):
-                Err(error):
-                    Err(error)
-                Ok(returned):
-                    match parameters.callable_parameters(program.unions):
-                        Err(error):
-                            Err(error)
-                        Ok(arguments):
-                            var invocation = "${body.function_number().c_name()}("
-                            var retain = "(void)environment;"
-                            var drop = "(void)environment;(void)depth;"
-                            var prefix = "(void)environment;"
+    if entry.captures:
+        match (
+            function.parameters
+                .get(0)
+                .map(parameter_type)
+        ):
+            Some(RecordType(owner)):
+                cast = ""
+                    .concat("(")
+                    .append_record_type_name(owner)
+                    .concat(")environment")
 
-                            match definition.operation:
-                                CapturedCallableDefinition(_, _):
-                                    match (
-                                        function.parameters
-                                            .get(0)
-                                            .map(parameter_type)
-                                    ):
-                                        Some(RecordType(owner)):
-                                            cast = ""
-                                                .concat("(")
-                                                .append_record_type_name(owner)
-                                                .concat(")environment")
+                invocation = invocation.concat(cast)
+                retain = "blorp_record_dup_${owner.record_number()}(${cast});"
+                drop = "blorp_record_drop_at_${owner.record_number()}(${cast},depth);"
+                prefix = ""
+            _:
+                void
 
-                                            invocation = invocation.concat(cast)
-                                            retain = "blorp_record_dup_${owner.record_number()}(${cast});"
-                                            drop = "blorp_record_drop_at_${owner.record_number()}(${cast},depth);"
-                                            prefix = ""
-                                        _:
-                                            void
-                                _:
-                                    void
+    var separator: Bool = entry.captures
+    var ordinal = 0
 
-                            var separator: Bool = match definition.operation:
-                                CapturedCallableDefinition(_, _): True
-                                _: False
+    for _ in parameters:
+        if separator:
+            invocation = "${invocation},"
 
-                            var ordinal = 0
+        invocation = invocation.append_parameter_name(ordinal)
+        separator = True
+        ordinal = ordinal + 1
 
-                            for _ in parameters:
-                                if separator:
-                                    invocation = "${invocation},"
+    invoke_adapter = "${returned} ${name}_invoke${arguments}{${prefix}return ${invocation});}"
+    retain_adapter = "void ${name}_retain(void* environment){${retain}}"
+    drop_adapter = "void ${name}_drop(void* environment,unsigned depth){${drop}}"
+    ops_type = "const struct blorp_co_${parameters.callable_suffix(result)} ${name}"
+    ops_initializer = "${ops_type}={${name}_invoke,${name}_retain,${name}_drop};\n"
 
-                                invocation = invocation.append_parameter_name(ordinal)
-                                separator = True
-                                ordinal = ordinal + 1
-
-                            invoke_adapter = "${returned} ${name}_invoke${arguments}{${prefix}return ${invocation});}"
-                            retain_adapter = "void ${name}_retain(void* environment){${retain}}"
-                            drop_adapter = "void ${name}_drop(void* environment,unsigned depth){${drop}}"
-                            ops_type = "const struct blorp_co_${parameters.callable_suffix(result)} ${name}"
-                            ops_initializer = "${ops_type}={${name}_invoke,${name}_retain,${name}_drop};\n"
-
-                            Ok(
-                                invoke_adapter
-                                    .concat(retain_adapter)
-                                    .concat(drop_adapter)
-                                    .concat(ops_initializer)
-                            )
-        _:
-            Err(render(definition.span, InvalidOperationShape(definition.id)))
+    Ok(
+        invoke_adapter
+            .concat(retain_adapter)
+            .concat(drop_adapter)
+            .concat(ops_initializer)
+    )
 
 
 private pure func integer_c_type(format: IntegerFormat) -> String:
@@ -1183,7 +1193,7 @@ private pure func append_record_ownership(
             else:
                 DestroyValue
 
-            var result = "${prefix}(void)atomic_fetch_add_explicit(&value->references,UINT64_C(1),memory_order_relaxed);}${body}"
+            var result = "${prefix}(void)blorp_record_count_add(&value->references);}${body}"
             var position = 0
             var invalid: Option[Diagnostic] = None
 
@@ -1207,7 +1217,7 @@ private pure func append_record_ownership(
                 Some(error):
                     Err(error)
                 None:
-                    decrement = "if(atomic_fetch_sub_explicit(&value->references,UINT64_C(1),memory_order_acq_rel)!=UINT64_C(1))return;"
+                    decrement = "if(blorp_record_count_subtract(&value->references)!=UINT64_C(1))return;"
                     drop = "void blorp_record_drop_${index}(blorp_r_${index} value)"
                     nested = "void blorp_record_drop_at_${index}(blorp_r_${index} value,unsigned depth){"
 
@@ -1334,6 +1344,8 @@ private pure func append_operation(
             Ok(output.concat(value.c_float_literal()))
         StringDefinition(_):
             Ok("${output}blorp_string_literal_acquire(&${id.c_literal_name()}.value)")
+        ReadConstantDefinition(constant):
+            Ok("${output}blorp_k_".append_int(constant.constant_instance_number()))
         FreeCallableDefinition(body):
             match (
                 output
@@ -2369,7 +2381,7 @@ private pure func append_regular_value(
     span: Span
 ) -> Result[String, Diagnostic]:
     prepared = match operation:
-        StringDefinition(bytes): output.append_static_literal(id, bytes)
+        StringDefinition(bytes): output.append_static_string(id.c_literal_name(), bytes)
         _: output
 
     declared ?= prepared.append_local_declaration(value_type, InitializedLocal, unions, span)
@@ -2683,7 +2695,7 @@ private pure func append_boxed_union_retain(output: String, index: Int) -> Strin
     node = "".append_boxed_union_struct(index)
 
     "${output}void blorp_union_dup_${index}(${node}* value){".concat(
-        "(void)atomic_fetch_add_explicit(&value->references,UINT64_C(1),memory_order_relaxed);}"
+        "(void)blorp_record_count_add(&value->references);}"
     )
 
 
@@ -2733,7 +2745,7 @@ private pure func append_boxed_union_release(
     )
 
     nested = "void blorp_union_drop_at_${index}(${node}* value,unsigned depth){".concat(
-        "if(atomic_fetch_sub_explicit(&value->references,UINT64_C(1),memory_order_acq_rel)!=UINT64_C(1))return;"
+        "if(blorp_record_count_subtract(&value->references)!=UINT64_C(1))return;"
     )
 
     drop = top_level_drop(
@@ -4050,7 +4062,7 @@ private record ProgramInventory {
     callable_types: List[TypeRef],
     runtime_calls: List[RuntimeOperation[VariantInstanceId, TypeRef]],
     list_updates: List[ListUpdateHelper],
-    callable_entries: List[OwnedDefinition],
+    callable_entries: List[CallableEntry],
     -- Each job the pool runs, once, in the walk's order: one list, since the
     -- walk's loop dups and drops every list it carries once per operation.
     pool_jobs: List[PoolJob]
@@ -4064,11 +4076,26 @@ private union PoolJob:
     MapJob(MapCallback)
 
 
+-- `entries` with `entry`, unless one already runs its instance at its type.
+private pure func with_entry(
+    entries: List[CallableEntry],
+    entry: CallableEntry
+) -> List[CallableEntry]:
+    duplicate = entries.any(pure func(previous):
+        (previous.body == entry.body).and(previous.value_type == entry.value_type)
+    )
+
+    if duplicate:
+        entries
+    else:
+        entries.append(entry)
+
+
 private pure func program_inventory(program: OwnershipProgram) -> ProgramInventory:
     var types: List[TypeRef] = []
     var runtime_calls: List[RuntimeOperation[VariantInstanceId, TypeRef]] = []
     var list_updates: List[ListUpdateHelper] = []
-    var callable_entries: List[OwnedDefinition] = []
+    var callable_entries: List[CallableEntry] = []
     var pool_jobs: List[PoolJob] = []
 
     for layout in program.records:
@@ -4093,33 +4120,26 @@ private pure func program_inventory(program: OwnershipProgram) -> ProgramInvento
                     DefineValue(definition):
                         types = types.append(definition.value_type)
 
-                        body: Option[specialized.FunctionInstanceId] = match definition.operation:
-                            FreeCallableDefinition(id): Some(id)
-                            CapturedCallableDefinition(id, _): Some(id)
-                            _: None
+                        -- Matched apart, as a pair would be a cell for every definition.
+                        entry: Option[CallableEntry] = match definition.operation:
+                            FreeCallableDefinition(id):
+                                Some({
+                                    body = id,
+                                    value_type = definition.value_type,
+                                    captures = False
+                                })
+                            CapturedCallableDefinition(id, _):
+                                Some({
+                                    body = id,
+                                    value_type = definition.value_type,
+                                    captures = True
+                                })
+                            _:
+                                None
 
-                        match body:
-                            None:
-                                void
-                            Some(id):
-                                -- These verified definitions are disposable emission entries,
-                                -- keyed by their code entry and full concrete signature.
-                                duplicate = callable_entries.any(pure func(previous):
-                                    match previous.operation:
-                                        FreeCallableDefinition(other):
-                                            (id == other).and(
-                                                definition.value_type == previous.value_type
-                                            )
-                                        CapturedCallableDefinition(other, _):
-                                            (id == other).and(
-                                                definition.value_type == previous.value_type
-                                            )
-                                        _:
-                                            False
-                                )
-
-                                if duplicate.not():
-                                    callable_entries = callable_entries.append(definition)
+                        match entry:
+                            Some(found): callable_entries = callable_entries.with_entry(found)
+                            None: void
 
                         match definition.operation:
                             CallDefinition(target, _):
@@ -4633,6 +4653,335 @@ private pure func has_boxed_union(unions: List[ConcreteUnion]) -> Bool:
     boxed
 
 
+-- The static data of a program's constants: each static object, children
+-- before the parents that link to them, then each constant, and the callable
+-- entries their functions need.
+private record StaticData {
+    objects: List[String],
+    entries: List[CallableEntry],
+    -- The position of the current constant's first object.
+    first: Int
+}
+
+
+-- A value's C initializer, after the static objects it links to.
+private record StaticInitializer {
+    data: StaticData,
+    initializer: String
+}
+
+
+private record StaticInitializers {
+    data: StaticData,
+    initializers: List[String]
+}
+
+
+-- `data` with one more static object of constant `constant`, named for the
+-- constant and its position among the constant's objects, after its children.
+-- `declare` writes the object's declaration from its name and `link` the
+-- parent's link to it.
+private pure func with_object(
+    data: StaticData,
+    constant: Int,
+    declare: pure (String) -> String,
+    link: pure (String) -> String
+) -> StaticInitializer:
+    name = "blorp_k_${constant}_${data.objects.length() - data.first}"
+    { data = { data | objects = data.objects.append(declare(name)) }, initializer = link(name) }
+
+
+-- A fact of constant `constant` that its type's layout lacks.
+private pure func or_mismatch[T](found: Option[T], constant: Int) -> Result[T, Diagnostic]:
+    match found:
+        Some(present): Ok(present)
+        None: Err(render(compiler_span(), ConstantValueMismatch(constant)))
+
+
+-- The read forms of CTFE_PLAN.md: a String, a nonempty List, a counted record
+-- or a boxed union is a static object at its base count, and a link to it is
+-- its address; an empty List links to its layout's `[]` root; any other value
+-- is a C initializer, written in its parent's. The objects of constant
+-- `constant` are named for it and their position among the objects.
+private pure func static_initializer(
+    data: StaticData,
+    value: specialized.ConstantValue,
+    value_type: TypeRef,
+    constant: Int,
+    program: OwnershipProgram
+) -> Result[StaticInitializer, Diagnostic]:
+    match (value_type, value):
+        (VoidType, specialized.VoidConstant):
+            Ok({ data = data, initializer = "((uint8_t)0)" })
+        (IntegerType(Int64Format), specialized.Int64Constant(number)):
+            Ok({ data = data, initializer = "".append_integer(number) })
+        (IntegerType(UInt8Format), specialized.UInt8Constant(byte)):
+            Ok({ data = data, initializer = "((uint8_t)${byte})" })
+        (FloatType, specialized.FloatConstant(number)):
+            Ok({ data = data, initializer = number.c_float_literal() })
+        (StringType, specialized.StringConstant(text)):
+            Ok(
+                data.with_object(
+                    constant,
+                    pure func(name): "${"".append_static_string(name, text)}\n",
+                    pure func(name): "&${name}.value"
+                )
+            )
+        (ListType(element), specialized.ListConstant([])):
+            Ok({
+                data = data,
+                initializer = element
+                    .list_element_key()
+                    .list_empty_root_address()
+            })
+        (ListType(element), specialized.ListConstant(items)):
+            data.static_list(element, items, constant, program)
+        (RecordType(id), specialized.RecordConstant(fields)):
+            data.static_record(id, fields, constant, program)
+        (UnionType(id), specialized.VariantConstant(variant, payload)):
+            data.static_variant(variant, payload, constant, program)
+        (CallableType(_, _), specialized.FunctionConstant(body)):
+            entry: CallableEntry = { body = body, value_type = value_type, captures = False }
+
+            Ok({
+                data = { data | entries = data.entries.with_entry(entry) },
+                initializer = "{&${"".append_callable_entry_name(body, value_type)},(void*)0}"
+            })
+        _:
+            Err(render(compiler_span(), ConstantValueMismatch(constant)))
+
+
+private pure func static_list(
+    data: StaticData,
+    element: TypeRef,
+    items: List[specialized.ConstantValue],
+    constant: Int,
+    program: OwnershipProgram
+) -> Result[StaticInitializer, Diagnostic]:
+    types = items.map(pure func(_) -> TypeRef: element)
+    elements ?= data.static_initializers(items, types, constant, program)
+    element_type ?= "".append_type_name(element, program.unions, compiler_span())
+
+    suffix = element
+        .list_element_key()
+        .list_suffix()
+
+    values = elements.initializers.join(",")
+
+    Ok(
+        elements.data.with_object(
+            constant,
+            pure func(name): "BLORP_STATIC_LIST(${name},blorp_l_${suffix},${element_type},${items.length()},{${values}});\n",
+            pure func(name): "&${name}.value"
+        )
+    )
+
+
+-- A record's fields by designator; Void fields have no C member.
+private pure func static_record(
+    data: StaticData,
+    id: RecordInstanceId,
+    fields: List[specialized.ConstantValue],
+    constant: Int,
+    program: OwnershipProgram
+) -> Result[StaticInitializer, Diagnostic]:
+    index = id.record_number()
+
+    layout ?= program.records
+        .get(index)
+        .or_mismatch(constant)
+
+    layout_fields = layout.record_fields()
+    built ?= data.static_initializers(fields, layout_fields, constant, program)
+    var designated: List[String] = []
+    var position = 0
+
+    for initializer in built.initializers:
+        if layout_fields.get(position) != Some(VoidType):
+            designated = designated.append(".blorp_rf_${index}_${position}=${initializer}")
+
+        position = position + 1
+
+    match layout:
+        CountedFields(_):
+            initial = ["BLORP_STATIC_RECORD_REFERENCES"]
+                .concat(designated)
+                .join(",")
+
+            Ok(
+                built.data.with_object(
+                    constant,
+                    pure func(name): "static struct blorp_r_${index} ${name}={${initial}};\n",
+                    pure func(name): "&${name}"
+                )
+            )
+        InlineFields(_) | ValueFields(_):
+            -- C has no empty initializer; an all-Void record's unit byte takes 0.
+            text = if designated.is_empty():
+                "0"
+            else:
+                designated.join(",")
+
+            Ok({ data = built.data, initializer = "{${text}}" })
+
+
+-- A payload-free union is an enum, and its value its tag's name.
+private pure func static_variant(
+    data: StaticData,
+    variant: VariantInstanceId,
+    payload: List[specialized.ConstantValue],
+    constant: Int,
+    program: OwnershipProgram
+) -> Result[StaticInitializer, Diagnostic]:
+    index = variant
+        .variant_owner()
+        .union_number()
+
+    layout ?= program.unions
+        .get(index)
+        .or_mismatch(constant)
+
+    payload_types ?= layout
+        .union_variants()
+        .get(variant.variant_number())
+        .or_mismatch(constant)
+
+    built ?= data.static_initializers(payload, payload_types, constant, program)
+    tag = "".append_variant_name(variant)
+    var designated: List[String] = []
+    var position = 0
+
+    for initializer in built.initializers:
+        designated = designated.append(".blorp_uf_${position}=${initializer}")
+        position = position + 1
+
+    fields = if payload.is_empty():
+        ""
+    else:
+        ",.payload.blorp_up_${variant.variant_number()}={${designated.join(",")}}"
+
+    if (
+        layout
+            .has_payload()
+            .not()
+    ):
+        Ok({ data = built.data, initializer = tag })
+    else if layout.union_is_boxed():
+        Ok(
+            built.data.with_object(
+                constant,
+                pure func(name): "static struct blorp_u_${index} ${name}={BLORP_STATIC_RECORD_REFERENCES,.tag=${tag}${fields}};\n",
+                pure func(name): "&${name}"
+            )
+        )
+    else:
+        Ok({ data = built.data, initializer = "{.tag=${tag}${fields}}" })
+
+
+-- Each value's initializer at the type in the same position. A record value
+-- short of a field would leave it zero in C, so the lengths must agree.
+private pure func static_initializers(
+    data: StaticData,
+    values: List[specialized.ConstantValue],
+    types: List[TypeRef],
+    constant: Int,
+    program: OwnershipProgram
+) -> Result[StaticInitializers, Diagnostic]:
+    var built = data
+    var initializers: List[String] = []
+    var failure: Option[Diagnostic] = None
+    var position = 0
+
+    if values.length() != types.length():
+        failure = Some(render(compiler_span(), ConstantValueMismatch(constant)))
+
+    for value in values:
+        if failure.is_some():
+            break
+
+        match types.get(position):
+            Some(value_type):
+                match built.static_initializer(value, value_type, constant, program):
+                    Ok(child):
+                        built = child.data
+                        initializers = initializers.append(child.initializer)
+                    Err(error):
+                        failure = Some(error)
+            None:
+                failure = Some(render(compiler_span(), ConstantValueMismatch(constant)))
+
+        position = position + 1
+
+    match failure:
+        Some(error): Err(error)
+        None: Ok({ data = built, initializers = initializers })
+
+
+-- `data` with constant `constant`: a `static const` C value named for its
+-- instance, which a read copies, after the static objects it links to. Its
+-- counts live in those objects, never in it, so only they are writable.
+private pure func with_constant(
+    data: StaticData,
+    value: specialized.ConstantValue,
+    row: specialized.ConcreteConstant,
+    constant: Int,
+    program: OwnershipProgram
+) -> Result[StaticData, Diagnostic]:
+    value_type = row.value_type
+
+    -- Ownership pinned the row's callables, so the value may hold no others.
+    _: Void ?= if value.held_callables() == row.callables:
+        Ok(void)
+    else:
+        Err(render(compiler_span(), ConstantValueMismatch(constant)))
+
+    built ?= { data | first = data.objects.length() }.static_initializer(
+        value,
+        value_type,
+        constant,
+        program
+    )
+
+    declared ?= "static ".append_local_declaration(
+        value_type,
+        InitializedLocal,
+        program.unions,
+        compiler_span()
+    )
+
+    declaration = "${declared}blorp_k_${constant}=${built.initializer};\n"
+    Ok({ built.data | objects = built.data.objects.append(declaration) })
+
+
+-- Every constant's static data, in instance order.
+private pure func constant_statics(
+    program: OwnershipProgram,
+    table: specialized.ConstantTable
+) -> Result[StaticData, Diagnostic]:
+    values = table.constant_values()
+    var data: StaticData = { objects = [], entries = [], first = 0 }
+    var failure: Option[Diagnostic] = None
+    var position = 0
+
+    for constant in program.constants:
+        if failure.is_some():
+            break
+
+        match values.get(position):
+            Some(value):
+                match data.with_constant(value, constant, position, program):
+                    Ok(next): data = next
+                    Err(error): failure = Some(error)
+            None:
+                failure = Some(render(compiler_span(), ConstantValueMismatch(position)))
+
+        position = position + 1
+
+    match failure:
+        Some(error): Err(error)
+        None: Ok(data)
+
+
 pure func aggregate_runtime(program: VerifiedProgram) -> Result[String, Diagnostic]:
     checked = program.verified_contents()
     inventory = checked.program_inventory()
@@ -4645,29 +4994,29 @@ pure func aggregate_runtime(program: VerifiedProgram) -> Result[String, Diagnost
 
 
 -- Every exit from main reports through this one function. A diagnostic build
--- of a program with Strings first retires its shared literals, so strict
--- accounting can check them and count each one's release; one with Lists
--- checks that every owner of an immortal empty root was dropped.
-private pure func program_finish_definition(string_types: Bool, list_types: Bool) -> String:
-    strings = if string_types:
-        "blorp_string_literals_finish(status)"
+-- of a program with Lists checks that every owner of an immortal empty root
+-- was dropped; blorp_memory_finish checks every static object's count.
+private pure func program_finish_definition(list_types: Bool) -> String:
+    finished_status = if list_types:
+        "blorp_list_empty_finish(status)"
     else:
         "status"
-
-    finished_status = if list_types:
-        "blorp_list_empty_finish(${strings})"
-    else:
-        strings
 
     "static int blorp_program_finish(int status){return blorp_memory_finish(${finished_status});}\n"
 
 
-pure func emit(program: VerifiedProgram) -> Result[String, Diagnostic]:
+-- `constants` is the table of the constants `program` reads, which travels
+-- beside the IR.
+pure func emit(
+    program: VerifiedProgram,
+    constants: specialized.ConstantTable
+) -> Result[String, Diagnostic]:
     checked = program.verified_contents()
     records = checked.records
     inventory = checked.program_inventory()
     requirements = inventory.runtime_requirements()
     lists = inventory.list_layouts()
+    statics ?= checked.constant_statics(constants)
 
     aggregates ?= program.aggregate_runtime_contents(
         lists,
@@ -4832,13 +5181,29 @@ pure func emit(program: VerifiedProgram) -> Result[String, Diagnostic]:
                     failure = Some(error)
                     break
 
-        for entry in inventory.callable_entries:
+        var entries = inventory.callable_entries
+
+        for entry in statics.entries:
+            entries = entries.with_entry(entry)
+
+        for entry in entries:
             match entry.append_callable_entry(checked):
                 Ok(adapter):
                     fragments = fragments.append(adapter)
                 Err(error):
                     failure = Some(error)
                     break
+
+    -- Constants follow the callable entries their functions' pairs name, and
+    -- precede the functions that read them, each on its own line.
+    if (
+        statics.objects
+            .is_empty()
+            .not()
+    ):
+        fragments = fragments
+            .append("\n")
+            .concat(statics.objects)
 
     if (
         failure
@@ -4867,11 +5232,10 @@ pure func emit(program: VerifiedProgram) -> Result[String, Diagnostic]:
         None:
             output = fragments
                 .append(
-                    requirements.string_types.program_finish_definition(
-                        lists
-                            .is_empty()
-                            .not()
-                    )
+                    lists
+                        .is_empty()
+                        .not()
+                        .program_finish_definition()
                 )
                 .join("")
 

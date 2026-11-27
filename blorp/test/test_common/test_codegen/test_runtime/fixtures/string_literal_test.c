@@ -33,10 +33,10 @@ static int copies_on_append(void) {
     struct blorp_string *grown = blorp_string_append_bytes_take_left(literal, "!", 1, 1);
     assert(grown != &shared.value && grown->length == 7 && memcmp(grown->bytes, "shared!", 8) == 0);
     assert(shared.value.length == 6 && memcmp(shared.value.bytes, "shared", 7) == 0);
-    assert(reference_count(&shared.value) == BLORP_STRING_LITERAL_REFERENCES);
+    assert(reference_count(&shared.value) == BLORP_STATIC_REFERENCES);
     blorp_string_release(grown);
     read_accented();
-    return blorp_memory_finish(blorp_string_literals_finish(0));
+    return blorp_memory_finish(0);
 }
 
 /* Every thread reads and releases the one literal many times, all starting
@@ -62,8 +62,8 @@ static int threaded_reads(void) {
         if (pthread_create(&threads[thread], NULL, read_repeatedly, NULL) != 0) abort();
     for (size_t thread = 0; thread < READING_THREADS; thread++)
         if (pthread_join(threads[thread], NULL) != 0) abort();
-    assert(reference_count(&shared.value) == BLORP_STRING_LITERAL_REFERENCES);
-    return blorp_memory_finish(blorp_string_literals_finish(0));
+    assert(reference_count(&shared.value) == BLORP_STATIC_REFERENCES);
+    return blorp_memory_finish(0);
 }
 
 #if BLORP_MEMORY_DIAGNOSTICS
@@ -77,13 +77,13 @@ static int release_shared(int releases) {
     assert(first == second && first != third);
     assert(blorp_memory_counts.allocations == 0);
     assert(first->length == 6 && memcmp(first->bytes, "shared", 7) == 0);
-    assert(reference_count(first) == BLORP_STRING_LITERAL_REFERENCES + 2);
+    assert(reference_count(first) == BLORP_STATIC_REFERENCES + 2);
     for (int index = 0; index < releases; index++) blorp_string_release(first);
     blorp_string_release(third);
     /* No release frees a literal, balanced or not, and the exit teardown has
      * nothing to free. */
     assert(blorp_memory_counts.releases == 0);
-    return blorp_memory_finish(blorp_string_literals_finish(0));
+    return blorp_memory_finish(0);
 }
 
 /* One literal is read and never released, and another is released without a
@@ -91,7 +91,7 @@ static int release_shared(int releases) {
 static int two_unbalanced(void) {
     (void)blorp_string_literal_acquire(&shared.value);
     blorp_string_release(&other.value);
-    return blorp_memory_finish(blorp_string_literals_finish(0));
+    return blorp_memory_finish(0);
 }
 
 /* Each diagnostic mode releases the shared literal's two reads this many times. */
@@ -104,23 +104,23 @@ static int uncounted(void) {
     struct blorp_string *literal = NULL;
     for (int index = 0; index < READS; index++) literal = blorp_string_literal_acquire(&shared.value);
     assert(literal == &shared.value);
-    assert(reference_count(literal) == BLORP_STRING_LITERAL_REFERENCES);
+    assert(reference_count(literal) == BLORP_STATIC_REFERENCES);
     for (int index = 0; index < RETAINS; index++) blorp_string_retain(literal);
-    assert(reference_count(literal) == BLORP_STRING_LITERAL_REFERENCES);
+    assert(reference_count(literal) == BLORP_STATIC_REFERENCES);
     for (int index = 0; index < READS + RETAINS + 1; index++) blorp_string_release(literal);
-    assert(reference_count(literal) == BLORP_STRING_LITERAL_REFERENCES);
+    assert(reference_count(literal) == BLORP_STATIC_REFERENCES);
     /* The literal's bytes are still there, so nothing freed it. */
     assert(memcmp(literal->bytes, "shared", 7) == 0);
     /* Another literal reads as itself, and is no more counted. */
     assert(blorp_string_literal_acquire(&other.value) == &other.value);
-    assert(reference_count(&other.value) == BLORP_STRING_LITERAL_REFERENCES);
+    assert(reference_count(&other.value) == BLORP_STATIC_REFERENCES);
     struct blorp_string *made = blorp_string_from_bytes("other", 5);
     blorp_string_retain(made);
     assert(reference_count(made) == 2);
     blorp_string_release(made);
     assert(reference_count(made) == 1);
     blorp_string_release(made);
-    return blorp_memory_finish(blorp_string_literals_finish(0));
+    return blorp_memory_finish(0);
 }
 #endif
 

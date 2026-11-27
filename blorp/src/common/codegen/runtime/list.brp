@@ -282,6 +282,14 @@ LIST_SHARED_RUNTIME: String =
         |#define blorp_list_empty_release() ((void)0)
         |#define blorp_list_empty_finish(requested_exit_status) (requested_exit_status)
         |#endif
+        |/* A constant's nonempty List: a writable static object at BLORP_STATIC_REFERENCES, whose elements are
+        |   a braced initializer list of exactly count values. As for a static String, a union of a sized image
+        |   with the managed struct initializes the flexible array member without a compiler extension, and the
+        |   assertion checks that the image lays out like the List. Its capacity is its length: it is never
+        |   unique, so nothing grows it in place. */
+        |#define BLORP_STATIC_LIST(name,list,element,count,...) union name##_image {struct {atomic_size_t references;int64_t length;size_t capacity;element values[count];} image;struct list value;};\
+        |_Static_assert(offsetof(union name##_image,image.values)==offsetof(struct list,values),"a static List image must lay out like its List");\
+        |static union name##_image name={.image={BLORP_STATIC_REFERENCES,(count),(count),__VA_ARGS__}}
         |
 
 
@@ -310,6 +318,12 @@ private pure func empty_root_name(suffix: String) -> String:
 -- size_t is 32 bits.
 pure func list_empty_root(key: ListElementKey) -> String:
     "(${key.list_c_type()})blorp_list_empty_acquire(&${key.list_suffix().empty_root_name()})"
+
+
+-- `[]`'s root as a static object's link to an empty List. A link between
+-- static objects holds no count, so it claims no owner of the root.
+pure func list_empty_root_address(key: ListElementKey) -> String:
+    "(${key.list_c_type()})&${key.list_suffix().empty_root_name()}"
 
 
 private pure func allocate_root(type_name: String, count: String) -> String:
@@ -371,7 +385,7 @@ pure func list_runtime(
     nested = "void blorp_list_drop_at_${suffix}(${type_name} value,unsigned depth){"
 
     dead = "if(value==&${empty}){blorp_list_empty_release();return;}".concat(
-        "if(atomic_fetch_sub_explicit(&value->references,1,memory_order_acq_rel)!=1)return;"
+        "if(blorp_size_count_subtract(&value->references)!=1)return;"
     )
 
     each = "for(int64_t index=0;index<value->length;index++){${element_type} element=value->values[index];(void)element;"
@@ -391,7 +405,7 @@ pure func list_runtime(
         .concat(
             "void blorp_list_dup_${suffix}(${type_name} value){if(value==&${empty})(void)blorp_list_empty_acquire(value);"
         )
-        .concat("else atomic_fetch_add_explicit(&value->references,1,memory_order_relaxed);}")
+        .concat("else (void)blorp_size_count_add(&value->references);}")
         .concat(released)
         .concat("${type_name} blorp_list_repeat_${suffix}(${element_type} element,int64_t count){")
         .concat("const uint64_t requested=count<=0?UINT64_C(0):(uint64_t)count;")

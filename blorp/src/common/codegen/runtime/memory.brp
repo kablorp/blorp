@@ -15,17 +15,53 @@ MEMORY_RUNTIME: String =
         |#error BLORP_MEMORY_DIAGNOSTICS must be 0 or 1
         |#endif
         |/* BLORP_COLD keeps a rarely taken path out of line, so that callers inline only the test before it.
-        |   BLORP_NOINLINE keeps a common path out of line, so that the callers that inline its test stay small. */
+        |   BLORP_NOINLINE keeps a common path out of line, so that the callers that inline its test stay small.
+        |   BLORP_ALWAYS_INLINE inlines a short test even at -O0, where a call would cost more than it; a program
+        |   that never uses one raises no unused-function warning. */
         |#if defined(__GNUC__)
         |#define BLORP_COLD __attribute__((noinline,cold))
         |#define BLORP_NOINLINE __attribute__((noinline))
+        |#define BLORP_ALWAYS_INLINE static inline __attribute__((always_inline,unused))
         |#else
         |#define BLORP_COLD
         |#define BLORP_NOINLINE
+        |#define BLORP_ALWAYS_INLINE static inline
         |#endif
+        |/* A static object lives for the whole run: a String literal, or a constant's String, List, counted
+        |   record or boxed union node. Its count starts at a base far from 0, 1 and overflow, since no program
+        |   holds half the address space in references: Strings and Lists count in size_t from the top
+        |   bit, which one bit test finds, and records and nodes in uint64_t. So release never frees a static
+        |   object, and it is never unique, so every update copies it. */
+        |#define BLORP_STATIC_REFERENCES (SIZE_MAX/2+1)
+        |#define BLORP_STATIC_RECORD_REFERENCES (UINT64_MAX/2)
         |#if BLORP_MEMORY_DIAGNOSTICS
         |#include <sched.h>
         |enum {BLORP_STRICT_LEAK_EXIT_STATUS=99};
+        |/* The number of static objects whose count is not their base. Each retain and release adds whether it
+        |   leaves its object off its base, less whether it found it off, from the counts its own atomic
+        |   operation saw. One object's operations are ordered, so its terms telescope to whether it ends off its
+        |   base, and no object cancels another. An object made at run time is never at a base, so it adds
+        |   nothing. Under the strict leak check, blorp_memory_finish requires zero. Only a change that finds
+        |   its count at or beside a base can move it, so each change tests that range in line, in every
+        |   diagnostics run, strict or not: at -O0 an out-of-line call cost three times as much (CTFE_PLAN.md, L2). */
+        |static atomic_llong blorp_static_off_base;
+        |BLORP_COLD void blorp_static_moved(int was_off,int is_off){
+        |if(is_off!=was_off)atomic_fetch_add_explicit(&blorp_static_off_base,(long long)is_off-(long long)was_off,memory_order_relaxed);
+        |}
+        |BLORP_ALWAYS_INLINE size_t blorp_size_count_moved(size_t previous,int added){
+        |if(previous-(BLORP_STATIC_REFERENCES-1)<=2)blorp_static_moved(previous!=BLORP_STATIC_REFERENCES,(added?previous+1:previous-1)!=BLORP_STATIC_REFERENCES);
+        |return previous;
+        |}
+        |BLORP_ALWAYS_INLINE uint64_t blorp_record_count_moved(uint64_t previous,int added){
+        |if(previous-(BLORP_STATIC_RECORD_REFERENCES-1)<=2)blorp_static_moved(previous!=BLORP_STATIC_RECORD_REFERENCES,(added?previous+1:previous-1)!=BLORP_STATIC_RECORD_REFERENCES);
+        |return previous;
+        |}
+        |/* Every count change of a String, List, counted record or boxed union node, each giving the count it
+        |   found. Normal builds expand to the bare atomic operation. */
+        |#define blorp_size_count_add(count) blorp_size_count_moved(atomic_fetch_add_explicit((count),1,memory_order_relaxed),1)
+        |#define blorp_size_count_subtract(count) blorp_size_count_moved(atomic_fetch_sub_explicit((count),1,memory_order_acq_rel),0)
+        |#define blorp_record_count_add(count) blorp_record_count_moved(atomic_fetch_add_explicit((count),UINT64_C(1),memory_order_relaxed),1)
+        |#define blorp_record_count_subtract(count) blorp_record_count_moved(atomic_fetch_sub_explicit((count),UINT64_C(1),memory_order_acq_rel),0)
         |union blorp_memory_header {max_align_t alignment;size_t requested;};
         |struct blorp_memory_counts {size_t allocations,releases,live,bytes;};
         |static struct blorp_memory_counts blorp_memory_counts;
@@ -236,18 +272,26 @@ MEMORY_RUNTIME: String =
         |}
         |blorp_allocation_sites_start();
         |}
+        |/* Every program value is dead at exit, so each static object must be back at its base: drift is an
+        |   ownership bug its base would otherwise hide. Runs after every thread has been joined. */
         |int blorp_memory_finish(int requested_exit_status){
         |const int report_status=blorp_allocation_sites_finish(requested_exit_status);
         |if(!blorp_memory_strict)return report_status;
+        |const long long off_base=atomic_load_explicit(&blorp_static_off_base,memory_order_relaxed);
+        |if(off_base!=0)fprintf(stderr,"blorp: leak check: unbalanced static objects: %lld\n",off_base);
         |blorp_memory_enter();
         |const struct blorp_memory_counts counts=blorp_memory_counts;
         |const size_t peak_bytes=blorp_memory_peak_bytes;
         |blorp_memory_leave();
         |fprintf(stderr,"blorp: leak check: %zu allocs, %zu releases, %zu leaked, %zu bytes\n",counts.allocations,counts.releases,counts.live,counts.bytes);
         |fprintf(stderr,"blorp: peak heap: %zu bytes\n",peak_bytes);
-        |return counts.allocations==counts.releases&&counts.live==0&&counts.bytes==0?report_status:BLORP_STRICT_LEAK_EXIT_STATUS;
+        |return off_base==0&&counts.allocations==counts.releases&&counts.live==0&&counts.bytes==0?report_status:BLORP_STRICT_LEAK_EXIT_STATUS;
         |}
         |#else
+        |#define blorp_size_count_add(count) atomic_fetch_add_explicit((count),1,memory_order_relaxed)
+        |#define blorp_size_count_subtract(count) atomic_fetch_sub_explicit((count),1,memory_order_acq_rel)
+        |#define blorp_record_count_add(count) atomic_fetch_add_explicit((count),UINT64_C(1),memory_order_relaxed)
+        |#define blorp_record_count_subtract(count) atomic_fetch_sub_explicit((count),UINT64_C(1),memory_order_acq_rel)
         |#define blorp_memory_allocate malloc
         |#define blorp_memory_resize realloc
         |#define blorp_memory_release free

@@ -1,0 +1,153 @@
+---
+A read of a managed constant borrows its static storage, which is never freed:
+it introduces no owner, a borrowing use costs no count operation, and an owning
+use acquires, as from any borrow. A read of an unmanaged constant is unmanaged.
+---
+import:
+    bool: and
+    test: TestSuite
+    ../../../../src/common/codegen/own/own as own
+    ../../../../src/common/codegen/verify/verify: verify
+    ../../../../src/common/syntax/source: label_text
+    ../../../support/list_update_inputs: lowered
+
+
+-- `main` reads KINDS three times: passed borrowed to `size`, stored in a List,
+-- and on its own; and LIMIT once.
+private SOURCE: String =
+    |KINDS: List[Int] = [1, 2]
+    |LIMIT: Int = 7
+    |pure func size(values: List[Int]) -> Int:
+    |    0
+    |func main() -> Int:
+    |    measured = size(KINDS)
+    |    stored = [KINDS]
+    |    read = KINDS
+    |    LIMIT
+    |
+
+
+private pure func main_operations() -> List[own.OwnershipOperation]:
+    match lowered(SOURCE).and_then(own.own):
+        Err(_):
+            []
+        Ok(program):
+            match program.functions.find(pure func(function: own.OwnedFunction) -> Bool:
+                label_text(function.label) == "module_0.main"
+            ):
+                Some(function): function.operations
+                None: []
+
+
+-- The ownership of each constant read in `main`, in order.
+private pure func read_results() -> List[own.ResultOwnership]:
+    var results: List[own.ResultOwnership] = []
+
+    for operation in main_operations():
+        match operation:
+            own.DefineValue(definition):
+                match definition.operation:
+                    own.ReadConstantDefinition(_): results = results.append(definition.result)
+                    _: void
+            _:
+                void
+
+    results
+
+
+pure func test_managed_read_borrows_static_storage() -> Bool:
+    match read_results():
+        [own.BorrowedResult(own.StaticBorrow), own.BorrowedResult(own.StaticBorrow), own.BorrowedResult(own.StaticBorrow), own.UnmanagedResult]:
+            True
+        _:
+            False
+
+
+-- Storing KINDS in a List acquires it from its static borrow, once; passing it
+-- to `size` and binding it acquire nothing, and no read is dropped.
+pure func test_only_an_owning_use_acquires() -> Bool:
+    var static_acquisitions = 0
+    var drops = 0
+
+    for operation in main_operations():
+        match operation:
+            own.AcquireOwner(_, borrow, _):
+                match borrow.source:
+                    own.StaticBorrow: static_acquisitions = static_acquisitions + 1
+                    _: void
+            own.DropOwner(_, _):
+                drops = drops + 1
+            _:
+                void
+
+    -- The one drop is the List the store made.
+    (static_acquisitions == 1).and(drops == 1)
+
+
+pure func test_static_borrows_verify() -> Bool:
+    verified = lowered(SOURCE)
+        .and_then(own.own)
+        .and_then(verify)
+
+    match verified:
+        Ok(_): True
+        Err(_): False
+
+
+-- `grow` and `extend` could reuse their arguments in place, but constants hold
+-- them as callables, in a List and inside a record, and a callable's
+-- invocation lends its arguments, so their parameters stay borrowed.
+private HELD: String =
+    |pure func append[T](values: List[T], element: T) -> List[T]:
+    |    builtin("list.append")
+    |pure func grow(values: List[Int]) -> List[Int]:
+    |    append(values, 1)
+    |pure func extend(values: List[Int]) -> List[Int]:
+    |    append(values, 2)
+    |record Step { run: pure (List[Int]) -> List[Int], count: Int }
+    |GROWERS: List[pure (List[Int]) -> List[Int]] = [grow]
+    |STEP: Step = { run = extend, count = 1 }
+    |func main() -> Int:
+    |    growers = GROWERS
+    |    step = STEP
+    |    0
+    |
+
+
+private pure func pinned_borrowed(program: own.OwnershipProgram, label: String) -> Bool:
+    match program.functions.find(pure func(function: own.OwnedFunction) -> Bool:
+        label_text(function.label) == label
+    ):
+        Some(function):
+            match function.parameters:
+                [parameter]: own.parameter_owned(parameter).not()
+                _: False
+        None:
+            False
+
+
+pure func test_held_callables_are_pinned_borrowed() -> Bool:
+    match lowered(HELD).and_then(own.own):
+        Err(_):
+            False
+        Ok(program):
+            program
+                .pinned_borrowed("module_0.grow")
+                .and(program.pinned_borrowed("module_0.extend"))
+
+
+TESTS: TestSuite = {
+    description = "Static borrows of constants",
+    tests = [
+        (
+            "a managed constant read borrows its static storage",
+            test_managed_read_borrows_static_storage
+        ),
+        ("only an owning use acquires a constant", test_only_an_owning_use_acquires),
+        ("static borrows verify", test_static_borrows_verify),
+        (
+            "functions a constant holds, in a List or a record, are pinned borrowed",
+            test_held_callables_are_pinned_borrowed
+        )
+    ]
+}

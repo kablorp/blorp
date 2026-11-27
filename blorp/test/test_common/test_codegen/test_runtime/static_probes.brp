@@ -1,0 +1,107 @@
+---
+The native probes of static objects that the String literal and static
+object suites share. A probe is built with memory diagnostics and without, and
+each mode runs with the strict leak check or without it.
+---
+import:
+    ../../../driver/harness: isolated, run_expecting
+    ../../../driver/reports: without_peak_heap
+
+
+private COMPILE_TIMEOUT_MS: Int = 600000
+private CHILD_TIMEOUT_MS: Int = 10000
+
+
+-- `fixture` built against the runtime files in `directory`, with memory
+-- diagnostics when `diagnostics`.
+func build_static_probe(
+    c_compiler: String,
+    directory: String,
+    fixture: String,
+    executable: String,
+    diagnostics: Bool
+) -> Result[String, String]:
+    definition = if diagnostics:
+        "-DBLORP_MEMORY_DIAGNOSTICS=1"
+    else:
+        "-DBLORP_MEMORY_DIAGNOSTICS=0"
+
+    build ?= isolated(
+        c_compiler,
+        [
+            "-std=c11",
+            "-O0",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            "-pedantic",
+            "-pthread",
+            "-fsanitize=address,undefined",
+            "-fno-sanitize-recover=all",
+            definition,
+            "-I",
+            directory,
+            fixture,
+            "-o",
+            executable
+        ],
+        COMPILE_TIMEOUT_MS
+    )
+
+    built ?= run_expecting(fixture + " native build", build, 0)
+
+    if built.stderr == "":
+        Ok(executable)
+    else:
+        Err(fixture + " native build: " + built.stderr)
+
+
+-- Whether `mode` exits with `status`, prints nothing, and writes `stderr`,
+-- which for a strict run is what precedes its peak heap line: that figure
+-- follows the layouts, which these suites do not test.
+func static_probe_outcome(
+    executable: String,
+    mode: String,
+    strict: Bool,
+    status: Int,
+    stderr: String
+) -> Bool:
+    leak_check: Option[String] = if strict:
+        Some("strict")
+    else:
+        None
+
+    checked: Result[Void, String] = match isolated(executable, [mode], CHILD_TIMEOUT_MS):
+        Err(error):
+            Err(error)
+        Ok(run):
+            environment = run.environment
+                .set("BLORP_ALLOCATION_SITES", None)
+                .set("BLORP_LEAK_CHECK", leak_check)
+
+            match run_expecting(mode, { run | environment = environment }, status):
+                Err(error):
+                    Err(error)
+                Ok(ran):
+                    reported: Result[String, String] = if strict:
+                        without_peak_heap(ran.stderr)
+                    else:
+                        Ok(ran.stderr)
+
+                    match reported:
+                        Err(error):
+                            Err(mode + " stderr: " + error + ": " + ran.stderr)
+                        Ok(before_peak):
+                            if (ran.stdout == "").and(before_peak == stderr):
+                                Ok(void)
+                            else:
+                                Err(
+                                    "${mode}: expected [${stderr}] got [${ran.stdout}${ran.stderr}]"
+                                )
+
+    match checked:
+        Ok(_):
+            True
+        Err(error):
+            print_error(error)
+            False

@@ -197,48 +197,31 @@ STRING_RUNTIME: String =
         |*result=blorp_string_from_counted_bytes(bytes,length,1);
         |return (uint8_t)1;
         |}
-        |/* A literal is a writable static String that lives for the whole run. Its
-        | * count starts at this base, the count's top bit, so one bit test finds
-        | * it, and no other String's count reaches it: no program holds half the
-        | * address space in references. So copy-on-write copies a literal and
-        | * release never frees one. Normal builds never write the count again, so
-        | * threads that share a literal never write its cache line: a read does not
-        | * retain, and retain and release skip an uncounted String, one whose count
-        | * is at or above the base. Diagnostic builds count every reference. */
-        |#define BLORP_STRING_LITERAL_REFERENCES (SIZE_MAX/2+1)
-        |/* One literal's static object. Its bytes are a braced initializer list of
+        |/* A literal is a writable static String, as is a constant's String, with its
+        | * count at BLORP_STATIC_REFERENCES. Normal builds never write that count
+        | * again, so threads that share one never write its cache line: a read does
+        | * not retain, and retain and release skip an uncounted String, one whose
+        | * count is at or above the base. Diagnostic builds count every reference.
+        | * Its bytes are a braced initializer list of
         | * at most length bytes, and the rest, including the NUL, are zero. The union of
         | * a sized image with the managed struct initializes the flexible array member
         | * without a compiler extension. The image repeats struct blorp_string's fields,
         | * as the assertion checks, with a capacity equal to the length, which is safe
-        | * because a literal is never unique, so nothing grows it in place. The bytes are
+        | * because a static String is never unique, so nothing grows it in place. The bytes are
         | * unsigned char, so no byte above 127 overflows a signed char. A literal's
         | * list has far more than C11's 127 macro arguments, which compilers accept. */
         |#define BLORP_STRING_IMAGE(byte_count) struct {atomic_size_t references;int64_t length;int64_t code_points;size_t capacity;unsigned char bytes[(byte_count)+1];}
-        |#define BLORP_STATIC_STRING(name,byte_count,scalar_count,...) static union {BLORP_STRING_IMAGE(byte_count) image;struct blorp_string value;} name={.image={BLORP_STRING_LITERAL_REFERENCES,(byte_count),(scalar_count),(byte_count),__VA_ARGS__}}
+        |#define BLORP_STATIC_STRING(name,byte_count,scalar_count,...) static union {BLORP_STRING_IMAGE(byte_count) image;struct blorp_string value;} name={.image={BLORP_STATIC_REFERENCES,(byte_count),(scalar_count),(byte_count),__VA_ARGS__}}
         |typedef BLORP_STRING_IMAGE(0) blorp_string_image_probe;
         |_Static_assert(offsetof(blorp_string_image_probe,length)==offsetof(struct blorp_string,length)&&offsetof(blorp_string_image_probe,code_points)==offsetof(struct blorp_string,code_points)&&offsetof(blorp_string_image_probe,capacity)==offsetof(struct blorp_string,capacity)&&offsetof(blorp_string_image_probe,bytes)==offsetof(struct blorp_string,bytes),"a static String image must lay out like struct blorp_string");
         |#if BLORP_MEMORY_DIAGNOSTICS
         |#define blorp_string_is_uncounted(value) 0
-        |/* The number of literals whose count is not the base. Each retain and release
-        | * adds one for a literal it moves off the base and subtracts one for one it
-        | * moves back, from the counts its own atomic operation saw. A literal's
-        | * operations are ordered, so these terms telescope and the sum is exactly the
-        | * unbalanced literals, with none cancelling another. Every other String is
-        | * never at the base, so adds nothing. blorp_string_literals_finish checks it. */
-        |static atomic_llong blorp_string_literals_off_base;
-        |static void blorp_string_track_literal(size_t previous,size_t next) {
-        |const long long moved=(long long)(next!=BLORP_STRING_LITERAL_REFERENCES)-(long long)(previous!=BLORP_STRING_LITERAL_REFERENCES);
-        |if(moved!=0){atomic_fetch_add_explicit(&blorp_string_literals_off_base,moved,memory_order_relaxed);}
-        |}
         |#else
-        |#define blorp_string_is_uncounted(value) (atomic_load_explicit(&(value)->references,memory_order_relaxed)>=BLORP_STRING_LITERAL_REFERENCES)
-        |#define blorp_string_track_literal(previous,next) ((void)(previous),(void)(next))
+        |#define blorp_string_is_uncounted(value) (atomic_load_explicit(&(value)->references,memory_order_relaxed)>=BLORP_STATIC_REFERENCES)
         |#endif
         |void blorp_string_retain(struct blorp_string *value) {
         |if(blorp_string_is_uncounted(value)){return;}
-        |const size_t previous=atomic_fetch_add_explicit(&value->references,1,memory_order_relaxed);
-        |blorp_string_track_literal(previous,previous+1);
+        |(void)blorp_size_count_add(&value->references);
         |}
         |#if BLORP_MEMORY_DIAGNOSTICS
         |/* A writer that forgot code_points leaves a count its bytes disagree with.
@@ -261,9 +244,7 @@ STRING_RUNTIME: String =
         | * used (CONCURRENCY_PLAN.md, landing 1b). Diagnostics count every String,
         | * so there this is the whole release. */
         |BLORP_NOINLINE void blorp_string_release_counted(struct blorp_string *value) {
-        |const size_t previous=atomic_fetch_sub_explicit(&value->references,1,memory_order_acq_rel);
-        |blorp_string_track_literal(previous,previous-1);
-        |if(previous==1){
+        |if(blorp_size_count_subtract(&value->references)==1){
         |blorp_string_check_code_points(value);
         |blorp_memory_release(value);
         |}
@@ -283,19 +264,8 @@ STRING_RUNTIME: String =
         |blorp_string_retain(literal);
         |return literal;
         |}
-        |/* Every program value is dead at exit, so each literal must be back at its
-        | * base; drift is an ownership bug the base would otherwise hide. Returns the
-        | * exit status to report. Runs after every thread that may read a literal has
-        | * been joined. */
-        |int blorp_string_literals_finish(int requested_exit_status) {
-        |const long long unbalanced=atomic_load_explicit(&blorp_string_literals_off_base,memory_order_relaxed);
-        |if(!blorp_memory_strict||unbalanced==0){return requested_exit_status;}
-        |fprintf(stderr,"blorp: leak check: unbalanced string literals: %lld\n",unbalanced);
-        |return BLORP_STRICT_LEAK_EXIT_STATUS;
-        |}
         |#else
         |#define blorp_string_literal_acquire(literal) (literal)
-        |#define blorp_string_literals_finish(requested_exit_status) (requested_exit_status)
         |#endif
         |
 

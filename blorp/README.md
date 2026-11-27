@@ -297,9 +297,10 @@ A module constant has an explicit annotation, as in `LIMIT: Int = 7`. Its
 initializer is closed: a scalar or `void` literal (including a negative
 number), a constructor, record, List or tuple of closed values, or a named
 function. Calls, operators, other constants, lambdas and control expressions
-are rejected; name a callback as a function instead. Each read builds an
-ordinary value, with no global storage. A callable constant can be called;
-constants obey privacy, cannot be shadowed and take no part in UFCS.
+are rejected; name a callback as a function instead. The compiler writes
+each constant's value once, as static data, and a read borrows it, so reading
+a constant allocates nothing. A callable constant can be called; constants
+obey privacy, cannot be shadowed and take no part in UFCS.
 
 ### Numbers and operators
 
@@ -1891,7 +1892,9 @@ the output may already be new.
    fields: an inline record, a record by value that owns one counted value, a
    counted record (one that contains itself or whose copy would acquire more
    than one counted value), a boxed union, or an inline union with or without
-   owned children.
+   owned children. Each constant a reached body reads gets one instance, in
+   order of first reach, and its value, which travels beside the program to
+   emission.
 7. **Lower** ([`lower`](src/common/codegen/lower/lower.brp)) publishes ordered value
    definitions with function-owned `ValueId`s, separate from the bindings that
    name them. Matches become selection graphs over typed places that enter one
@@ -1915,7 +1918,8 @@ the output may already be new.
    owner still holds it; otherwise it copies. A record or tuple that is a
    heap object (one that holds more than one String, List, function or
    heap-stored value, or contains itself), and a lambda bound to a name,
-   allocate each time they are built.
+   allocate each time they are built. A constant read borrows the constant's
+   static storage, which is never freed.
 9. **Verify** ([`verify`](src/common/codegen/verify/verify.brp)) checks the ownership IR
    independently and alone produces a `VerifiedProgram`. It rejects dead or
    wrong owners, invalid borrows, undischarged obligations, calls that disagree
@@ -1927,7 +1931,7 @@ the output may already be new.
 10. **Emit** ([`emit`](src/common/codegen/emit/emit.brp)) projects the verified program to C
    without repeating any check; retains and releases are exactly the explicit
    operations, and record and union definitions follow the verified aggregate
-   order.
+   order. Each constant's value becomes static data.
 
 ### C conventions
 
@@ -1945,8 +1949,13 @@ the output may already be new.
   as its address. Its count starts at a base with the top bit set; without
   memory diagnostics nothing writes it again, since retain and release skip a
   String whose count is at or above it. With them, a read retains, and a
-  counter of literals off the base lets a strict leak check require each to be
-  back at it at exit.
+  counter of static objects off their bases lets a strict leak check require
+  each to be back at its base at exit.
+- A constant is a `static const` C value named `blorp_k_N`, which a read
+  copies. A String, a nonempty List (`BLORP_STATIC_LIST`), a counted record or
+  a boxed union in it is a writable static object at a base count, linked by
+  its address, and an empty List is its layout's `[]` root. A read borrows the
+  value, so nothing counts it until an owning use acquires it.
 - Floating-point contraction is off (`#pragma STDC FP_CONTRACT OFF` for Clang,
   GCC's `fp-contract=off` pragma), so each operation rounds separately.
 - A wrapper calls the entrypoint as `int main(void)` or
@@ -1972,13 +1981,12 @@ With `BLORP_LEAK_CHECK=strict`, a diagnostic build prints two lines to stderr
 as it exits, `blorp: leak check: N allocs, N releases, N leaked, N bytes` and
 then `blorp: peak heap: N bytes`, and exits with status 99 unless allocations
 and releases balance and nothing is live. Any other value of
-`BLORP_LEAK_CHECK` is an error. Two immortal objects are checked too: every
-String literal must be back at its base reference count (else
-`blorp: leak check: unbalanced string literals: N`), and the shared empty List
+`BLORP_LEAK_CHECK` is an error. Immortal objects are checked too: every
+static object, a String literal or a constant's String, List, record or union,
+must be back at its base reference count (else
+`blorp: leak check: unbalanced static objects: N`), and the shared empty List
 must have no owners left (else
-`blorp: leak check: unbalanced empty list owners: N`). A diagnostic build
-frees each literal at exit, so the report counts every used literal as one
-allocation and one release.
+`blorp: leak check: unbalanced empty list owners: N`).
 
 The peak heap is the most bytes the program had requested and not yet
 released at any one time, counted at each allocation and resize. It leaves out

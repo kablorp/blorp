@@ -21,7 +21,7 @@ import:
     ../../utils/text: concat
     ../lower/lower: LoopTarget, ValueParameter, ValueId
     ../own/own:
-        BorrowSource(ParameterBorrow, OwnerBorrow, PayloadBorrow),
+        BorrowSource(ParameterBorrow, OwnerBorrow, PayloadBorrow, StaticBorrow),
         BorrowedValue,
         OwnedArgument(UnmanagedArgument, BorrowedArgument, ConsumedArgument),
         OwnedDefinition,
@@ -58,7 +58,8 @@ import:
             ListElementDefinition,
             ListSuffixDefinition,
             ConstructRecordDefinition,
-            ReadRecordFieldDefinition
+            ReadRecordFieldDefinition,
+            ReadConstantDefinition
         ),
         OwnerId,
         OwnershipOperation(DefineValue, ExecuteJoin, ExecuteLoop, AcquireOwner, DropOwner),
@@ -72,6 +73,7 @@ import:
         TaskJoin,
         ConcretePatternPlace,
         ConcretePatternRoute(MatchRoot, UnionField, RecordField, ListElement),
+        ConcreteConstant,
         ConcreteRecord(InlineFields, ValueFields, CountedFields),
         ConcreteUnion(PlainCases, OwningCases, BoxedCases),
         FieldInstanceId,
@@ -91,6 +93,7 @@ import:
         UnionInstanceId,
         VariantFieldInstanceId,
         VariantInstanceId,
+        constant_instance_number,
         runtime_signature,
         runtime_type_ref
 
@@ -206,7 +209,9 @@ private record VerificationFacts {
     first_value: Int,
     values: List[KnownValue],
     first_owner: Int,
-    parameters: List[ValueId]
+    parameters: List[ValueId],
+    -- The program's constant catalogue, which every block shares.
+    constants: List[ConcreteConstant]
 }
 
 
@@ -462,6 +467,10 @@ private pure func verify_borrow(
                         Err(verification_error(span, "payload borrow has the wrong parent value"))
                 _:
                     Err(verification_error(span, "payload borrow requires a borrowed projection"))
+        StaticBorrow:
+            match borrowed.result:
+                BorrowedResult(StaticBorrow): Ok(void)
+                _: Err(verification_error(span, "static borrow requires a constant read"))
 
 
 -- The signature a call's target declares, after its types are shown to exist.
@@ -1496,6 +1505,10 @@ private pure func operation_value(
             definition.definition_value(VoidType, None, None)
         StringDefinition(_):
             definition.definition_value(StringType, None, None)
+        ReadConstantDefinition(id):
+            match state.constants.get(id.constant_instance_number()):
+                Some(expected): definition.definition_value(expected.value_type, None, None)
+                None: Err(verification_error(definition.span, "constant read names no constant"))
         IntegerDefinition(format, value):
             if integer_fits(format, value):
                 definition.definition_value(IntegerType(format), None, None)
@@ -2010,6 +2023,18 @@ private pure func verify_definition_result(
                     definition.verify_projection_borrow(parent)
                 ReadRecordFieldDefinition(_, argument):
                     definition.verify_projection_borrow(argument.argument_value())
+                -- A constant's static storage is never freed, so its read borrows it.
+                ReadConstantDefinition(_):
+                    match definition.result:
+                        BorrowedResult(StaticBorrow):
+                            Ok(None)
+                        _:
+                            Err(
+                                verification_error(
+                                    definition.span,
+                                    "managed constant read must borrow its static storage"
+                                )
+                            )
                 StringDefinition(_) | CallDefinition(_, _) | InvokeCallableDefinition(_, _) | FreeCallableDefinition(_) | CapturedCallableDefinition(_, _) | ConstructDefinition(_, _) | ConstructListDefinition(_) | ConstructRecordDefinition(_, _) | ListSuffixDefinition(_, _):
                     match definition.result:
                         OwnedResult(owner):
@@ -4828,12 +4853,21 @@ private pure func verify_loop_block(
 
 private pure func verify_function(
     function: OwnedFunction,
-    functions: List[OwnedFunction],
-    unions: List[ConcreteUnion],
-    records: List[ConcreteRecord]
+    program: OwnershipProgram
 ) -> Result[Void, Diagnostic]:
+    functions = program.functions
+    unions = program.unions
+    records = program.records
+
     initial: VerificationState = {
-        facts = { enclosing = [], first_value = 0, values = [], first_owner = 0, parameters = [] },
+        facts = {
+            enclosing = [],
+            first_value = 0,
+            values = [],
+            first_owner = 0,
+            parameters = [],
+            constants = program.constants
+        },
         discharged = [],
         owners = []
     }
@@ -4974,6 +5008,21 @@ pure func verify(program: OwnershipProgram) -> Result[VerifiedProgram, Diagnosti
         Some(error): Err(error)
         None: program.records.verify_layout_graph(program.unions)
 
+    -- A constant's callables are invoked, so each is pinned, as any callable.
+    for constant in program.constants:
+        match constant.value_type.verify_type_membership(
+            program.unions,
+            program.records,
+            compiler_span()
+        ):
+            Ok(_): void
+            Err(error): invalid = Some(error)
+
+        for body in constant.callables:
+            match body.pinned_callable(program.functions, compiler_span()):
+                Ok(_): void
+                Err(error): invalid = Some(error)
+
     for function in program.functions:
         match function.return_type.verify_type_membership(
             program.unions,
@@ -5024,7 +5073,7 @@ pure func verify(program: OwnershipProgram) -> Result[VerifiedProgram, Diagnosti
         if invalid.is_some():
             break
 
-        match function.verify_function(program.functions, program.unions, program.records):
+        match function.verify_function(program):
             Ok(_):
                 void
             Err(error):

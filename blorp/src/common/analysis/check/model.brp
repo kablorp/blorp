@@ -1019,6 +1019,8 @@ union CheckedForm:
     LiteralString(String)
     ReadBinding(BindingId)
     ReadCapture(CaptureId)
+    -- A read of a module constant's value, which its CheckedConstant row holds.
+    ReadConstant(ConstantId)
     ConstructVariant(VariantId, List[CheckedExpr])
     ConstructRecord(RecordId, List[CheckedRecordField])
     ConstructList(List[CheckedExpr])
@@ -1255,7 +1257,8 @@ union LambdaRow:
     CheckedLambdaRow(CheckedLambda)
 
 
--- A checked construction template; every runtime read gets ordinary value identities.
+-- A constant's checked value, a closed construction template. Bodies read it
+-- as ReadConstant; specialization reads the template once, for its static value.
 record CheckedConstant {
     id: ConstantId,
     annotation: Span,
@@ -1273,6 +1276,8 @@ record CheckedFunctions {
     unions: List[CheckedUnion],
     functions: List[CheckedFunction],
     lambdas: List[CheckedLambda],
+    -- Every constant, dense by ConstantId.
+    constants: List[CheckedConstant],
     entrypoint: Entrypoint[FunctionId]
 }
 
@@ -1392,7 +1397,7 @@ pure func child_expressions(form: CheckedForm) -> List[CheckedExpr]:
                         children = children.concat(choice.choice_expressions())
 
             children
-        LiteralVoid | LiteralInteger(_) | LiteralFloat(_) | LiteralString(_) | ReadBinding(_) | ReadCapture(_):
+        LiteralVoid | LiteralInteger(_) | LiteralFloat(_) | LiteralString(_) | ReadBinding(_) | ReadCapture(_) | ReadConstant(_):
             []
 
 
@@ -1462,9 +1467,9 @@ pure func function_calls(function: CheckedFunction) -> List[CheckedCall]:
         BodyNotReached: []
 
 
-pure func function_callable_creations(function: CheckedFunction) -> List[CheckedExpr]:
+pure func function_instance_requests(function: CheckedFunction) -> List[CheckedExpr]:
     match function.elaboration:
-        ElaboratedBody(elaborated): body_callable_creations(elaborated.statements, elaborated.body)
+        ElaboratedBody(elaborated): body_instance_requests(elaborated.statements, elaborated.body)
         BodyNotReached: []
 
 
@@ -1518,30 +1523,31 @@ pure func has_callable_parameters(signature: FunctionSignature) -> Bool:
     )
 
 
--- Value creation requests a body instance but does not execute it. This walk
--- follows only evaluated operands; each lambda's body is a separate request.
-private pure func callable_creations(values: List[CheckedExpr]) -> List[CheckedExpr]:
+-- The values that request an instance without running it: a created callable
+-- requests its body's, and a constant read its constant's. This walk follows
+-- only evaluated operands; each lambda's body is a separate request.
+private pure func instance_requests(values: List[CheckedExpr]) -> List[CheckedExpr]:
     var found: List[CheckedExpr] = []
 
     for value in values:
         match value.form:
-            MakeCallable(_): found = found.append(value)
+            MakeCallable(_) | ReadConstant(_): found = found.append(value)
             _: void
 
         found = found.concat(
             value.form
                 .child_expressions()
-                .callable_creations()
+                .instance_requests()
         )
 
     found
 
 
-pure func body_callable_creations(
+pure func body_instance_requests(
     statements: List[CheckedStatement],
     body: CheckedBody
 ) -> List[CheckedExpr]:
-    body_expressions(statements, body).callable_creations()
+    body_expressions(statements, body).instance_requests()
 
 
 -- The callable parameters a body uses as values: a read of a parameter's own
@@ -1583,5 +1589,5 @@ private pure func callable_parameter_values(
     found
 
 
-pure func expression_callable_creations(value: CheckedExpr) -> List[CheckedExpr]:
-    [value].callable_creations()
+pure func expression_instance_requests(value: CheckedExpr) -> List[CheckedExpr]:
+    [value].instance_requests()

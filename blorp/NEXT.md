@@ -69,10 +69,12 @@ done.
     on 2026-11-23, and accepted every recommendation for K2 to K6, K8, K9 and
     T1 to T6 on 2026-11-24, after both reviews' fixes.
   - **Done:** L1, static string literals: a literal is a writable static
-    String at the literal base (1,537 fewer allocations in a self-compile
-    built from L1's own C, peak heap -0.20%).
-  - **Next:** L2, static constants, after private-variants landing 3. The
-    sizes half moves to its own plan before T1 (T6).
+    String at the literal base (1,530 fewer allocations in a self-compile
+    built from L1's own C, peak heap -0.20%). L2, static constants: each
+    reached constant is static C data, and a read borrows it (the decoder
+    witness makes 1 allocation, from 8,193).
+  - **Next:** L3, computed constants. The sizes half moves to its own plan
+    before T1 (T6).
 - **Private variants:** [`PRIVATE_VARIANTS_PLAN.md`](PRIVATE_VARIANTS_PLAN.md).
   - **Status:** planned on 2026-11-23. Opaque types become unions with private
     variants (`union UserId: private Underlying(Int)`) in nine landings: enable
@@ -299,11 +301,6 @@ None of these is planned yet. Each wants its own short design or brief.
   - **A test-visible form of `private`.** Operation decoders and the native
     protocol helpers in `io/_errors` are public for tests that pass literal
     codes; they are internal APIs by convention.
-  - **List constants.** The compiler currently rebuilds a module List at each
-    use. The typed-error witness measures one temporary allocation per positive
-    error decode; see the accepted debt in FILESYSTEM_DECISIONS. No compiler
-    workaround or cache is part of the library refactor.
-    [`CTFE_PLAN.md`](CTFE_PLAN.md)'s L2 makes such constants static data.
   - **An opaque `DeclaredName`,** so a declaring site cannot skip its naming
     check even by calling the token reader directly. It needs the syntax
     tree's declaration fields (about 12 in `syntax.brp`, read in 22 files) to

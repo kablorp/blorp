@@ -1,0 +1,162 @@
+---
+A constant's static List and counted record start at their base counts. A C
+probe drives the helpers emitted for SOURCE on statics written as the emitter
+writes them: retains and releases never free them, an update copies them and
+leaves them as they were, threads share them, and the strict leak check fails
+when one is left off its base. It runs with memory diagnostics and without.
+---
+import:
+    test: TestSuite
+    ../../../../src/common/codegen/emit/emit: aggregate_runtime
+    ../../../../src/common/codegen/own/own: own
+    ../../../../src/common/codegen/runtime/memory: MEMORY_RUNTIME
+    ../../../../src/common/codegen/runtime/string: STRING_RUNTIME
+    ../../../../src/common/codegen/specialize/specialize as specialized
+    ../../../../src/common/codegen/verify/verify: verify, verified_contents, VerifiedProgram
+    ../../../driver/file_access: write_file
+    ../../../support/list_update_inputs: lowered
+    ./static_probes: build_static_probe, static_probe_outcome
+
+
+-- The memory runtime's BLORP_STRICT_LEAK_EXIT_STATUS.
+private STRICT_LEAK_EXIT_STATUS: Int = 99
+private NOTHING_ALLOCATED: String = "blorp: leak check: 0 allocs, 0 releases, 0 leaked, 0 bytes\n"
+-- The appended and the replaced Lists' copies, the replacement String and the
+-- updated record.
+private UPDATE_TOTAL: String = "blorp: leak check: 4 allocs, 4 releases, 0 leaked, 0 bytes\n"
+private UNBALANCED_LINE: String = "blorp: leak check: unbalanced static objects: 2\n"
+
+
+-- Entry holds two Strings, so it is a counted record; the updates make the
+-- consuming append and set helpers.
+private SOURCE: String =
+    |record Entry { text: String, note: String }
+    |pure func append[T](values: List[T], element: T) -> List[T]:
+    |    builtin("list.append")
+    |pure func set[T](values: List[T], index: Int, element: T) -> List[T]:
+    |    builtin("list.set")
+    |func main() -> Int:
+    |    entry: Entry = { text = "text", note = "note" }
+    |    entries = append([entry], entry)
+    |    texts = set(["a"], 0, "b")
+    |    0
+    |
+
+
+private pure func catalogue(program: VerifiedProgram) -> Bool:
+    match verified_contents(program).records:
+        [specialized.CountedFields([specialized.StringType, specialized.StringType])]: True
+        _: False
+
+
+private FIXTURE: String = "blorp/test/test_common/test_codegen/test_runtime/fixtures/static_object_test.c"
+
+
+private func ready(c_compiler: String, directory: String) -> Result[(String, String), String]:
+    program ?= lowered(SOURCE)
+        .and_then(own)
+        .and_then(verify)
+        .map_err(pure func(error): error.message + "; " + error.help)
+
+    _: Void ?= if catalogue(program):
+        Ok(void)
+    else:
+        Err("static object concrete catalogue differs")
+
+    aggregates ?= aggregate_runtime(program).map_err(
+        pure func(error): error.message + "; " + error.help
+    )
+
+    _ ?= write_file(directory + "/static_memory.c", MEMORY_RUNTIME)
+    _ ?= write_file(directory + "/static_values.c", (STRING_RUNTIME + aggregates) + "\n")
+
+    diagnostic ?= build_static_probe(
+        c_compiler,
+        directory,
+        FIXTURE,
+        directory + "/static_object_probe",
+        True
+    )
+
+    normal ?= build_static_probe(
+        c_compiler,
+        directory,
+        FIXTURE,
+        directory + "/static_object_probe_normal",
+        False
+    )
+
+    Ok((diagnostic, normal))
+
+
+func suite(c_compiler: String, directory: String) -> TestSuite:
+    match ready(c_compiler, directory):
+        Err(error):
+            print_error(error)
+
+            {
+                description = "Static object setup",
+                tests = [("native probe builds", func(): False)]
+            }
+        Ok((diagnostic, normal)):
+            {
+                description = "Static constant objects",
+                tests = [
+                    (
+                        "a static List and record are never freed",
+                        func(): static_probe_outcome(
+                            diagnostic,
+                            "never_freed",
+                            True,
+                            0,
+                            NOTHING_ALLOCATED
+                        )
+                    ),
+                    (
+                        "without diagnostics a static List and record are never freed",
+                        func(): static_probe_outcome(normal, "never_freed", False, 0, "")
+                    ),
+                    (
+                        "an update copies a static List or record and leaves it unchanged",
+                        func(): static_probe_outcome(
+                            diagnostic,
+                            "copies_on_update",
+                            True,
+                            0,
+                            UPDATE_TOTAL
+                        )
+                    ),
+                    (
+                        "without diagnostics an update copies a static List or record",
+                        func(): static_probe_outcome(normal, "copies_on_update", False, 0, "")
+                    ),
+                    (
+                        "threads sharing a static List and record leave them at their bases",
+                        func(): static_probe_outcome(
+                            diagnostic,
+                            "threaded_reads",
+                            True,
+                            0,
+                            NOTHING_ALLOCATED
+                        )
+                    ),
+                    (
+                        "without diagnostics threads share a static List and record",
+                        func(): static_probe_outcome(normal, "threaded_reads", False, 0, "")
+                    ),
+                    (
+                        "a static List and record left off their bases fail the strict check",
+                        func(): static_probe_outcome(
+                            diagnostic,
+                            "unbalanced",
+                            True,
+                            STRICT_LEAK_EXIT_STATUS,
+                            UNBALANCED_LINE + NOTHING_ALLOCATED
+                        )
+                    ),
+                    (
+                        "without the strict check unbalanced statics still exit 0",
+                        func(): static_probe_outcome(diagnostic, "unbalanced", False, 0, "")
+                    )
+                ]
+            }
