@@ -90,9 +90,10 @@ done.
     module, lower flattening a selection with no test, a rotation, the
     migration of 204 sites, then deleting destructuring. The net is about −75
     to −135 lines.
-  - **Landed:** landing 1, a resource union matched in its module, and
-    landing 2, lower flattening a selection with no test.
-  - **Next:** landing 3, the seed rotation to landing 2.
+  - **Landed:** landing 1, a resource union matched in its module;
+    landing 2, lower flattening a selection with no test; and landing 3, the
+    rotation to `blorp-seed-94b463fdaa55`.
+  - **Next:** landing 4, the migration, then landing 5, the deletion.
 - **UInt8 and Bytes:** [`UINT8_BYTES_PLAN.md`](UINT8_BYTES_PLAN.md).
   - **Status:** U1 to U9 and B1 to B3 are decided. L0, the
     `IntegerType(Int64Format)` refactor, and L1, the compiler's `UInt8` with

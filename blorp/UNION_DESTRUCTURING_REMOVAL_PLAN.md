@@ -1,8 +1,9 @@
 # Union destructuring removal plan
 
 **Status: approved, 2026-11-26.** Keith asked for this plan on 2026-11-26 and
-accepted its three decisions the same day ("Accept all three"). Each landing
-waits for his word.
+accepted its three decisions the same day ("Accept all three"). On 2026-11-26
+he asked for landings 2 to 5 to go straight through, stopping only for a stop
+condition.
 
 **The direction.** On 2026-11-26 Keith compared an accessor written both
 ways, after the help fixes landed:
@@ -347,6 +348,14 @@ The raw output is in `build/destructuring-removal/spike-cost.log`.
 3. **Landing 3: rotate the seed** to landing 2's commit, as
    `PRIVATE_VARIANTS_PLAN.md`'s landing 3 did. It runs the fixpoint and
    `test_bootstrap.sh`.
+   - **Result (2026-11-27):** pinned `blorp-seed-94b463fdaa55`.
+     - The full gate, the fixpoint and `test_bootstrap.sh` passed, and no e2e
+       ceiling moved.
+     - `self-compile-cost 94b463fda c96d03f7b`:
+       - fixed-input C identical;
+       - fixed-input allocations −0.011%, peak heap −0.095%, instructions
+         −0.187%, from the seed's own flattened matches.
+     - Raw evidence: `build/destructuring-removal/landing3/`.
 4. **Landing 4: migrate every union destructuring to `match`.**
    - **What changes:** `src`, the library, the test programs that destructure
      a union only incidentally, and the README's examples.
