@@ -348,6 +348,25 @@ false, and NaN is unequal to itself. `float` also has `abs`, `copysign`,
 digits that round-trips: `(6.5 * 2.0).to_string()` is `13` and `0.1 + 0.2`
 prints as `0.30000000000000004`.
 
+The `math` module has the Float functions and the conversions between Int and
+Float, from C's math library. Import them by name, or as methods with
+`math: Float methods, Int methods` to write `x.sqrt()` and `count.to_float()`:
+
+- `sqrt` (NaN below zero), `floor`, `ceil`, `round` (halves away from zero, so
+  `2.5` is `3` and `-2.5` is `-3`) and `trunc`;
+- `sin`, `cos` and `tan` in radians, `atan2(y, x)`, `exp`, `log` (natural:
+  `-inf` at 0, NaN below it), `pow(base, exponent)` and the constant `PI`;
+- `to_int(Float) -> Int` truncates toward zero and saturates at `INT_MIN` and
+  `INT_MAX`; an infinity is the nearer limit and NaN is 0;
+- `to_float(Int) -> Float` is the nearest Float, exact up to 2^53 in magnitude.
+
+`sqrt`, `floor`, `ceil`, `round`, `trunc` and both conversions are exact or
+correctly rounded, so every platform gives the same bits. The other functions
+are the platform's libm, which may differ in the last bit between macOS and
+glibc, so a result that must replay bit for bit on every platform should not
+depend on them. They live in `math`, not `float`, because the pinned seed
+compiler reads `float.brp` and does not know their builtin labels.
+
 `UInt8` is an unsigned byte, 0 to 255, declared by the base and available
 everywhere. Its operations wrap and never fail, like Int's:
 

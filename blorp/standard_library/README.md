@@ -121,6 +121,11 @@ The original modules are preserved in the legacy
 Pass `blorp/standard_library` explicitly as the argument to `blorp compile --library-root`. Bare `int: add` imports resolve here; relative
 imports still resolve beside their importer. There is no host-library fallback.
 
+`math.brp` has the Float functions `sqrt`, `floor`, `ceil`, `round`, `trunc`,
+`sin`, `cos`, `tan`, `atan2`, `exp`, `log`, `pow` and `PI`, and the saturating
+`to_int(Float)` and nearest `to_float(Int)`; see
+[Numbers and operators](../README.md#numbers-and-operators).
+
 `io/console/` has one module per error type, and reads and writes `Bytes`:
 
 - `output.brp`: `print` and `print_error`, and the byte writes `write`,
