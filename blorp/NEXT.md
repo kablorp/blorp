@@ -34,10 +34,12 @@ done.
       once (3.2× on 4 threads for four CPU-bound tasks);
     - landing 3: `parallel_map`, a native specialized per callback that
       splits its List adaptively on the pool (3.48× on 4 threads for
-      CPU-bound elements, and one allocation for the result).
-  - **Next:** landing 4, the kernel's runtime support, split into slices 4a
-    to 4g with no seed rotation. 4a makes the process and print natives
-    safe on several threads.
+      CPU-bound elements, and one allocation for the result);
+    - landing 4a: the process and print natives are safe on several
+      threads, with a fork lock, a counted SIGINT and SIGQUIT swap and
+      whole lines.
+  - **Next:** the rest of landing 4, the kernel's runtime support, in slices
+    4b to 4g with no seed rotation. 4b is the fiber primitives.
     - Before landing 6's channels: in-place reuse of a uniquely owned
       record, a compiler change of its own, and a decision on the buffered
       round trip's remaining gap.

@@ -2560,6 +2560,229 @@ and 5.
   timer in C;
 - the plan's lock-after-switch parking, and fiber migration.
 
+### Landing 4a results
+
+**What landed:** the process and print natives are correct on any number of
+threads, and a program on one thread behaves as before. It is runtime C and
+one emission rule, with no seed rotation: no label or contract changed.
+- **The fork lock,** `blorp_process_fork_lock`, a `pthread_rwlock_t` in
+  `PROCESS_HELPERS_RUNTIME`, as Go's `syscall.ForkLock`.
+  - `blorp_process_pipe` holds the read side from `pipe()` until both ends
+    are `FD_CLOEXEC`. macOS has no `pipe2`.
+  - Both forks hold the write side. The parent releases it as soon as `fork`
+    returns, and the child, which runs only async-signal-safe code until it
+    execs, never touches it. So no `pthread_atfork` is needed.
+  - No wait, poll or read holds it.
+  - Every other descriptor a native makes is close-on-exec atomically
+    (`O_CLOEXEC`, `F_DUPFD_CLOEXEC`), so only the pipe needed the read side.
+  - Taking or releasing it aborts on any failure, as the literal lock does,
+    through three helpers: take the read side, take the write side, and
+    release.
+- **The counted swap,** `blorp_process_interrupt_swap`: a count of the runs
+  waiting with SIGINT and SIGQUIT ignored, and the caller's dispositions.
+  - The first run in saves and ignores both; the last one out restores them,
+    as glibc's `system` counts. Every run's child resets both from the saved
+    ones, as before.
+  - Entering and leaving happen under the fork lock's write side, so a fork
+    sees no swap or a whole one. Every path of `run` after a successful enter
+    reaches its one leave, and leaving more often than entering is a runtime
+    defect, which aborts with its message.
+  - `capture` reads the count under the same write side, just before its
+    fork. While a run holds the signals, its child takes the caller's
+    dispositions back before exec, as it would have inherited them.
+  - `exit_interrupted` holds the write side from its `sigaction` to its
+    `raise`, so no run on another thread ignores SIGINT again in between.
+- **Whole lines.** `print` and `print_error` hold their stream with
+  `flockfile` from the text to the LF. A console write is one `fwrite`,
+  which C11's stream lock keeps whole; the line case checks it too.
+- **Change 9.** A program that prints or prints errors requests
+  `PROCESS_POSIX_PRELUDE`, since glibc declares `flockfile` under `-std=c11`
+  only with `_POSIX_C_SOURCE`. The prelude is the first fragment whenever it
+  is requested, so it precedes the file's first `#include` in every fragment
+  order. Its `#error` now names the Blorp runtime, not only process and fs.
+
+**One difference from the brief.** The brief gave the swap a mutex of its own
+for `exit_interrupted` to hold. Every change to the count and the
+dispositions already holds the fork lock's write side, so a second lock would
+guard the same fact. `exit_interrupted` takes the write side instead, across
+a `sigaction` and a `raise` only.
+
+**The window, measured** with the case's own timings, on macOS under ASan:
+
+| | A's capture of `cat` | Descriptors B's child holds beyond its own |
+| --- | ---: | ---: |
+| Main | 3,037 ms | 2, the ends of A's stdin pipe |
+| Without the read side | 3,018 to 3,036 ms | 2 |
+| This landing | 206 to 236 ms | 0 |
+
+**A reader-preferring lock.** glibc's default rwlock prefers readers, so a
+stream of pipe creations could hold a fork off. In the window case the
+waiting fork began 8 to 12 µs after A's window closed on macOS, 56 to 108
+µs on emulated x86-64 with GCC, and 48 to 87 µs on arm64 with Clang, in five
+runs each. Readers hold the lock only for a `pipe()` and a few `fcntl`s.
+
+**Tests,** in the existing direct-C suites, with the probes' macro
+interposition. `raise` joins it, and `exec_ready_writer` now announces any
+child about to exec, not only the stalled one.
+
+| Case | What it checks | Fails without |
+| --- | --- | --- |
+| `capture-fork-window` | B's child holds no more descriptors than it does alone, the exact check; and A, held 200 ms in its stdin pipe's window, finishes within half of B's child's 3 s life | the read side: A took 3,018 to 3,036 ms, and B's child held A's two ends |
+| `run-overlapping-interrupts` | two runs overlap with the caller at the defaults, ignoring both, and with a handler: each child finds the caller's, both stay ignored while the second waits, and the caller's stand after both | the count: with a save per call, B's child found both ignored and SIGINT stayed ignored after both runs |
+| `capture-during-run` | the same three callers: a capture's child finds the caller's dispositions while a run waits | the snapshot: its child found both ignored |
+| `exit-interrupted-during-run` | the process ends by SIGINT while a run waits, and while a run starts between the `sigaction` and the `raise` | the write side in `exit_interrupted`: the starting run ignored SIGINT again, and the native returned |
+| `run-exec-failure` | a failed exec is `LaunchFailed(NotFound)` and leaves no holder: the next run ignores both while it waits and restores them | a leave skipped after a failed exec |
+| `whole_lines` (console) | four threads, 10,000 iterations each, of `print`, `print_error` and a console write, with an `fputc` that yields before the LF: every line whole | `flockfile` on either stream: lines tore every run |
+| `print requests the POSIX declarations before any header` | a printing program's C starts with the prelude | the two print requirements in `needs_posix` |
+
+The requirement table now includes the prelude, so every case there also
+says whether a program gets it: print, print_error and both do, and the rest
+do not. `test_unused_declarations_select_no_fs_fragments` still holds.
+
+**Evidence:**
+- **Bites.** Each runtime break above ran 3 times against the final
+  runtime and failed 3 of 3, and the unbroken build passed 3 of 3. The
+  window, swap and exec breaks are in the generated process runtime, the
+  line breaks, one per stream, in the console runtime. The emission break,
+  in `emit.brp`, failed the four print cases of the requirement suite.
+- **Stress,** with the suites' flags (ASan and UBSan): each new process case
+  20 of 20 on macOS, and each new case, the line case included, 10 of 10 on
+  both Linux targets.
+- **ThreadSanitizer,** by hand, on the line case: 0 reports in 23 runs on
+  macOS and 3 on arm64 Linux. The fork cases run under ASan and UBSan only, since TSan with
+  `fork` in a threaded process is unreliable.
+- **Linux,** in the cached images, with the suites' flags: GCC 13.3 on
+  x86-64 and Clang 18.1 on arm64 built the three probes and passed 24
+  process modes, including every new one and the pty probe, seven console
+  cases including `whole_lines`, and the three print cases. Every fixture's
+  C compiled in both memory modes with `-std=c11 -Wall -Wextra -Werror
+  -pedantic`, but `generic/lambda/capture_managed`, whose empty struct
+  main's C has too and which the e2e does not run (`surface.brp`). Both
+  libcs declare `flockfile` under the prelude.
+- **No new compiler output.** GCC prints its column-tracking note for the
+  same 228 of those compiles with main's C and with this landing's, and
+  Clang its errors for the same 2.
+- **Rough edge.** In the x86-64 image, which runs emulated on this host, a
+  `poll` in the probes' handshake returned EINTR with no handler installed,
+  and the four cases that start a run on a second thread failed at once.
+  The probe now retries EINTR, as it should anyway.
+- **The gate,** `make -C blorp test INSTRUCTION_CHECK=on`, at `90e7a7528`
+  and again at `3eb2d36a3`, after the review's fixups: 3,582 cases passed
+  and one failed, an e2e allocation ceiling, since raised. Every instruction ceiling
+  held.
+  `variants_alias_destructure` (`surface.brp`), whose ceiling main's
+  previous commit set at exactly its count, compiles with 59,776
+  allocations against 59,775.
+  - **Measured, matched:** both diagnostic compilers at equal-length
+    absolute paths, an empty environment, and a fresh output file, as the
+    harness has. A printing program's compile makes one more allocation:
+    59,775 to 59,776 for this fixture, 63,308 to 63,309 for
+    `variants/erased_equality` and 64,203 to 64,204 for
+    `argument_input/basic`. `arithmetic/nesting`, which neither prints nor
+    has the prelude, and `process/natives_run`, which had it already, do
+    not change.
+  - **Why:** a printing program's compile now reads the
+    `PROCESS_POSIX_PRELUDE` literal, whose site makes its String once. With
+    `BLORP_ALLOCATION_SITES` on this fixture, base against candidate, the
+    one allocation row that differs is `emit.emit <- blorp_string_literal`:
+    11 allocations and 29,818 bytes, then 12 and 30,241, the extra one the
+    423-byte prelude String. The fragment list is two allocations either
+    way, and its growth is a resize, which is not counted.
+  - **Raised to 59,776,** which Keith approved on 2026-11-26, as the
+    repository's remedy for a measured change.
+  - **Reproducing a count by hand** needs the harness's conditions: the
+    count changes with the output path's length, and with whether the
+    output file already exists.
+
+**Fixture C,** every e2e fixture compiled by main's compiler and by this
+one, at `90e7a7528` and again at `3eb2d36a3`, after the review's fixups,
+with the same result. Status, stdout and stderr are identical for all 782. Each differing hunk was
+required to be one contiguous run of an old fragment's lines and of a new
+one's, and none was not; a stray line injected into a copy of one file is
+reported. The classes:
+
+| Class | Fixtures |
+| --- | ---: |
+| Identical C | 311 |
+| Rejected, no C | 136 |
+| The prelude only (its `#error` text) | 6 |
+| The prelude and the print bodies | 321 |
+| The prelude, the print bodies and the process fragments | 8 |
+
+281 of these gained the prelude, because they print; 54 had it already. None
+lost it.
+
+**Cost,** `self-compile-cost 34008c1cf HEAD --rounds 3`, fixed-input row:
+
+| Measure | Base `34008c1cf` | Candidate `90e7a7528` | Change | Ceiling |
+| --- | ---: | ---: | ---: | ---: |
+| Allocations | 13,507,896 | 13,507,896 | +0.0000% | +0.05% |
+| Peak heap, bytes | 192,302,220 | 190,860,498 | −0.7497% | +0.1% |
+| Instructions, median of 3 | 13,748,313,887 | 13,734,764,878 | −0.0986% | +0.1% |
+
+The own-source row: allocations +0.0033%, peak heap −0.7110%, instructions
+−0.0759%. The fixed-input C differs from the base's in 11 lines, the
+prelude's `#error` and the print bodies, 70 bytes in all.
+
+**Why peak heap fell 0.75%.** `join` copies its first fragment, the prelude,
+then doubles that buffer until the whole file fits, 2^17 times here. The new
+`#error` line is 11 bytes shorter, so the prelude is 350 bytes, not 361, and
+the final buffer is 45,875,200 bytes, not 47,316,992: 1,441,792 fewer, less
+the 70 the file grew, which is the measured 1,441,722.
+- **The bisect,** one round each: the process slice alone, and with only
+  `emit.brp` added, leave the fixed-input C and its peak identical; with
+  only `string.brp` added, the print bodies, the peak moves by +81 bytes.
+- **What it says about the metric:** every byte of the first fragment moves
+  this peak by 131,072 bytes. A `join` that reserved the total first would
+  remove that, as a change of its own.
+
+The script runs the seed's runtime, so it does not see the print change. The
+compiler prints only diagnostics, so that is acceptable. What it does see is
+the compiler's own output, which had the prelude already, since the compiler
+reads files.
+
+**Lines,** against ceilings of +220 and +550:
+- production: +160 and −62, so +98 net, all in `process.brp` (+87),
+  `emit.brp` (+4) and `string.brp` (+7);
+- test: +552 and −24, so +528 net, most of it the probes: `process_child.c`
+  +361 and `console_test.c` +109.
+
+**The audit: state an impure native touches.** Landing 1 covered what a pure
+task can reach.
+
+| State | Natives | Verdict |
+| --- | --- | --- |
+| Pipe ends between `pipe()` and `FD_CLOEXEC` | `capture`, `run` | made safe: the fork lock's read side |
+| `fork` | `capture`, `run` | made safe: the write side, and a child that runs only async-signal-safe code until exec |
+| Other descriptors | fs opens, `/dev/null`, `blorp_process_private`, `fdopendir`'s copy | safe: close-on-exec atomically |
+| SIGINT and SIGQUIT dispositions | `run`, `capture`'s child, `exit_interrupted` | made safe: the counted swap under the write side |
+| SIGCHLD's disposition | `capture`, `run` | safe: only read |
+| SIGPIPE and the signal mask | `capture`, console writes and flushes | safe: blocked in the calling thread only, and a write's SIGPIPE goes to the thread that wrote |
+| The forking thread's signal mask | `capture`, `run`, `exit_interrupted` | left to 4c and landing 5: a child inherits the mask of the thread that forks it, and `exit_interrupted`'s `raise` reaches only its own thread. Safe while natives run on the main thread; once they run on helpers, either the helpers keep the main thread's mask, or the child's mask is set explicitly, as glibc's `system` does with `posix_spawnattr_setsigmask` |
+| The children, and `blorp_process_reap`'s reservation | `capture`, `run` | safe: each native waits only for its own child by PID, and `capture` keeps its child unreaped until its group is killed; no Blorp code waits for any child. `run` reaping through the reservation, so a canceller can kill its child, is landing 5 |
+| Process groups and the terminal's foreground group | `capture`, `run` | safe: `capture`'s child makes its own group, and `run` changes neither. Two runs at once share the terminal, a question for landing 5's API |
+| stdout and stderr | `print`, `print_error`, console writes and flushes, `run`'s and `exit_interrupted`'s flushes | made safe: whole lines. Output from two threads is ordered by who takes the stream first, and `run`'s "the caller's output first" holds for the calling thread's own output |
+| stdin's buffer, and `ferror` and `clearerr` on it | `read_line`, `read_exact` | left to 4d: two readers interleave characters, and one's `clearerr` can hide the other's error |
+| The console's exit handler | console helpers, `run`, `exit_interrupted` | safe: registered once through `pthread_once`. It closes stdout at exit, so landing 5 must have every helper idle by then, as landing 2 did for pool workers |
+| The current directory | `current_directory`; `capture`'s and `run`'s `directory` | safe: only read in the parent; the `chdir` is the child's |
+| The environment | `capture` and `run` read `environ`; `find_program` reads `PATH` | safe: only read. No native writes it, so a later one that sets a variable needs a lock around every reader |
+| `errno` | every native | safe: thread-local |
+| The temporary-name counter | `write_text`, `write_bytes` | safe: `_Atomic` |
+| `realpath`, `mkdtemp`, `readdir` | fs | safe: reentrant on glibc and macOS; each `readdir` reads its own stream |
+| Open files and writers | `open_read`, `next_lines`, `read_chunk`, `close`, the writer natives | safe: each handle is one owner's loan, and the natives keep no state between calls (D37) |
+| Reads of a FIFO, `/dev/stdin` or a terminal | fs reads | left to 4e: unbounded, so a helper may wait without bound |
+| The allocation-sites file | `blorp_memory_start`, in diagnostics builds | unchanged: opened at the start, without close-on-exec, so every child inherits it, as before |
+| A cancelled native's child | `capture`, `run` | left to 4c and landing 5 |
+
+**Not covered:**
+- helper threads themselves, which landing 4c brings; these cases use
+  pthreads directly;
+- a fork that does not take the lock, as foreign code's would; the exec
+  report still defends `capture` and `run` against it, as the
+  `capture-stray-report` case shows;
+- a measured fork wait under many concurrent readers, beyond the window
+  case.
+
 ## Landings
 
 Each is a vertical slice that can be tested on its own. Every one runs
@@ -2630,6 +2853,8 @@ compiled code.
      - whole lines from `print` and `print_error`;
      - feature macros before the first include (Spike K's change 9);
      - an audit of the globals that impure natives touch.
+
+     Done: see "Landing 4a results".
    - **4b. The fiber primitives:**
      - kernel locks that spin, then block (change 4);
      - the switch for arm64 and x86-64, with CET and BTI;
