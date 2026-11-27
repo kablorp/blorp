@@ -5,7 +5,8 @@
 -- version), jobs on the joining thread's stack, and a thread that waits for a
 -- stolen half runs other work meanwhile. The pool starts on the first join, and
 -- allocates nothing through the Blorp allocator, so allocation counts, the
--- leak report and the peak heap do not change.
+-- leak report and the peak heap do not change. It follows THREAD_RUNTIME,
+-- whose stack size, guard and pause its threads use.
 JOIN_RUNTIME: String =
     raw
         |
@@ -16,7 +17,6 @@ JOIN_RUNTIME: String =
         |#include <stdio.h>
         |#include <stdlib.h>
         |#include <string.h>
-        |#include <sys/resource.h>
         |#include <unistd.h>
         |/* The most threads the pool runs, the caller included. A machine with more cores uses this many; far above any
         |   machine Spike P measured, which scaled to 7.5 on 8 threads. */
@@ -38,13 +38,6 @@ JOIN_RUNTIME: String =
         |/* Keeps each deque's indices on their own cache lines: Apple M-series lines are 128 bytes, x86-64 lines 64, so 128
         |   covers both. */
         |enum {BLORP_JOIN_CACHE_LINE_BYTES=128};
-        |/* A pool thread's stack when RLIMIT_STACK is unlimited or unreadable: the 8 MiB Linux and macOS give the main thread. */
-        |#define BLORP_JOIN_STACK_CAP_BYTES ((size_t)8<<20)
-        |/* Guard below each pool thread's stack, so running out of stack faults instead of writing into other memory
-        |   (CONCURRENCY_PLAN.md, "Stack overflow"). It catches a frame up to this size; a larger frame can step over it,
-        |   which -fstack-clash-protection, left to the build, would stop. A multiple of every supported page size, 4 KiB
-        |   and Apple's 16 KiB. */
-        |#define BLORP_JOIN_GUARD_BYTES ((size_t)64<<10)
         |/* The right half of a join, offered to the other threads. It lives on the joining thread's stack. */
         |enum {BLORP_JOIN_NO_THIEF=-1};
         |struct blorp_join_task {
@@ -76,13 +69,6 @@ JOIN_RUNTIME: String =
         |static void blorp_join_fail(const char *step,int code){
         |fprintf(stderr,"error: cannot start the thread pool: %s failed: %s\n",step,strerror(code));
         |abort();
-        |}
-        |static void blorp_join_pause(void){
-        |#if defined(__aarch64__)
-        |__asm__ __volatile__("yield");
-        |#elif defined(__x86_64__)||defined(__i386__)
-        |__asm__ __volatile__("pause");
-        |#endif
         |}
         |/* ---- the deque ---- */
         |/* Owner only. Returns 0 when the deque is full. */
@@ -208,7 +194,7 @@ JOIN_RUNTIME: String =
         |/* Spins, then sleeps, when a thread found nothing to run. */
         |static void blorp_join_idle(int *idle_rounds,struct blorp_join_task *awaited){
         |if(++*idle_rounds<BLORP_JOIN_SPIN_ROUNDS){
-        |blorp_join_pause();
+        |blorp_thread_pause();
         |}else{
         |blorp_join_sleep(awaited);
         |*idle_rounds=0;
@@ -275,15 +261,6 @@ JOIN_RUNTIME: String =
         |}
         |return requested>BLORP_JOIN_MAX_THREADS?BLORP_JOIN_MAX_THREADS:(int)requested;
         |}
-        |/* The main thread's stack size, so deep pure recursion does not overflow on a pool thread where it would not on the
-        |   main one: macOS gives secondary threads 512 KiB by default. A whole number of pages, as macOS requires. */
-        |static size_t blorp_join_stack_bytes(void){
-        |struct rlimit limit;
-        |size_t bytes=BLORP_JOIN_STACK_CAP_BYTES;
-        |if(getrlimit(RLIMIT_STACK,&limit)==0&&limit.rlim_cur!=RLIM_INFINITY&&limit.rlim_cur<=SIZE_MAX)bytes=(size_t)limit.rlim_cur;
-        |const long page=sysconf(_SC_PAGESIZE);
-        |return page>0?bytes-bytes%(size_t)page:bytes;
-        |}
         |static void blorp_join_start(void){
         |blorp_join_threads=blorp_join_requested_threads();
         |if(blorp_join_threads==1)return;
@@ -294,9 +271,9 @@ JOIN_RUNTIME: String =
         |pthread_attr_t attributes;
         |int code=pthread_attr_init(&attributes);
         |if(code!=0)blorp_join_fail("pthread_attr_init",code);
-        |code=pthread_attr_setstacksize(&attributes,blorp_join_stack_bytes());
+        |code=pthread_attr_setstacksize(&attributes,blorp_thread_stack_bytes());
         |if(code!=0)blorp_join_fail("pthread_attr_setstacksize",code);
-        |code=pthread_attr_setguardsize(&attributes,BLORP_JOIN_GUARD_BYTES);
+        |code=pthread_attr_setguardsize(&attributes,BLORP_THREAD_GUARD_BYTES);
         |if(code!=0)blorp_join_fail("pthread_attr_setguardsize",code);
         |/* Detached: the pool lives until the process ends, and exit does not wait for it. */
         |code=pthread_attr_setdetachstate(&attributes,PTHREAD_CREATE_DETACHED);

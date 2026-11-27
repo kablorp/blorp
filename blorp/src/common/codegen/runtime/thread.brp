@@ -1,0 +1,39 @@
+-- What the runtime's own threads and fibers share: a stack of the main
+-- thread's size, with a guard below it, and the pause of a spinning wait. Pool
+-- threads (JOIN_RUNTIME) and fibers (FIBER_RUNTIME) follow it, so a function
+-- that runs on the main thread does not overflow on either
+-- (CONCURRENCY_PLAN.md, "Stack overflow"). It comes before the fragments that
+-- use it.
+THREAD_RUNTIME: String =
+    raw
+        |
+        |#include <stddef.h>
+        |#include <stdint.h>
+        |#include <sys/resource.h>
+        |#include <unistd.h>
+        |/* A stack's size when RLIMIT_STACK is unlimited or unreadable: the 8 MiB Linux and macOS give the main thread. */
+        |#define BLORP_THREAD_STACK_CAP_BYTES ((size_t)8<<20)
+        |/* Guard below each pool thread's and fiber's stack, so running out of stack faults instead of writing into other
+        |   memory (CONCURRENCY_PLAN.md, "Stack overflow"). It catches a frame up to this size; a larger frame can step over
+        |   it, which -fstack-clash-protection, left to the build, would stop. A multiple of every supported page size,
+        |   4 KiB and Apple's 16 KiB. */
+        |#define BLORP_THREAD_GUARD_BYTES ((size_t)64<<10)
+        |/* The main thread's stack size, so deep recursion does not overflow on a pool thread or a fiber where it would
+        |   not on the main one: macOS gives secondary threads 512 KiB by default. A whole number of pages, as macOS
+        |   requires. */
+        |static size_t blorp_thread_stack_bytes(void){
+        |struct rlimit limit;
+        |size_t bytes=BLORP_THREAD_STACK_CAP_BYTES;
+        |if(getrlimit(RLIMIT_STACK,&limit)==0&&limit.rlim_cur!=RLIM_INFINITY&&limit.rlim_cur<=SIZE_MAX)bytes=(size_t)limit.rlim_cur;
+        |const long page=sysconf(_SC_PAGESIZE);
+        |return page>0?bytes-bytes%(size_t)page:bytes;
+        |}
+        |/* One round of a spinning wait, which tells the core that this thread is only waiting. */
+        |static void blorp_thread_pause(void){
+        |#if defined(__aarch64__)
+        |__asm__ __volatile__("yield");
+        |#elif defined(__x86_64__)||defined(__i386__)
+        |__asm__ __volatile__("pause");
+        |#endif
+        |}
+        |

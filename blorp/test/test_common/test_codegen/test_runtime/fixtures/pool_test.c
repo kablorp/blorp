@@ -26,6 +26,7 @@ static void pause_before_leapfrog_steal(void) {
 #define BLORP_JOIN_BEFORE_LEAPFROG_STEAL() pause_before_leapfrog_steal()
 
 #include "memory_runtime.c"
+#include "thread_runtime.c"
 #include "join_runtime.c"
 
 /* Every case joins through a job like this one, in which each half writes only its own result slot. */
