@@ -4,10 +4,12 @@
     self-compile-cost BASE CANDIDATE [--rounds N] [--optimize LEVEL] [--output DIR]
 
 BASE and CANDIDATE are git revisions. Each is checked out as a detached
-worktree under blorp/build/self-compile-cost/ and built from the pinned seed
-with the Makefile's own recipes (generate-compiler, link-compiler,
-link-test-compiler), once normally and once with -DBLORP_MEMORY_DIAGNOSTICS=1.
-Two workloads are measured:
+worktree and built from the pinned seed with the Makefile's own recipes
+(generate-compiler, link-compiler, link-test-compiler), once normally and once
+with -DBLORP_MEMORY_DIAGNOSTICS=1. The worktrees are in the run's own directory,
+blorp/build/self-compile-cost/<base>-<candidate>/run-<random>/, so concurrent
+runs share none of them, and are removed when it ends. Two workloads are
+measured:
 
   fixed input   both compilers compile the base's blorp/src/main.brp and
                 library from the same working directory, so only the compiler
@@ -21,7 +23,9 @@ requested and not yet released at once) come from one BLORP_LEAK_CHECK=strict
 run of the diagnostic binary, which is deterministic; a leak fails the script.
 A compiler's runtime comes from the pinned seed, so the peak is reported as
 missing for a revision whose seed predates the peak heap line. Raw samples are
-written under --output. Python 3 standard library only.
+written under --output, by default the run's directory; the run prints which.
+Concurrent runs need different --output directories. Python 3 standard library
+only.
 """
 
 import argparse
@@ -32,6 +36,7 @@ import shutil
 import statistics
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -150,12 +155,17 @@ def main():
     revisions = dict(zip(SIDES, (git("rev-parse", "--verify", arguments.base + "^{commit}"),
                                  git("rev-parse", "--verify", arguments.candidate + "^{commit}"))))
     label = "%s-%s" % (revisions["base"][:9], revisions["candidate"][:9])
-    scratch = ROOT / "blorp/build/self-compile-cost" / label
-    output = Path(arguments.output).resolve() if arguments.output else scratch
-    shutil.rmtree(scratch, ignore_errors=True)
-    git("worktree", "prune")
+    pair_directory = ROOT / "blorp/build/self-compile-cost" / label
+    pair_directory.mkdir(parents=True, exist_ok=True)
+    # Another run of this pair may be using the pair's directory, so this one
+    # touches only a directory it creates. The compiler's peak heap depends on
+    # the length of its paths, and mkdtemp's names all have one length, so the
+    # figures repeat from run to run.
+    run_directory = Path(tempfile.mkdtemp(prefix="run-", dir=pair_directory))
+    output = Path(arguments.output).resolve() if arguments.output else run_directory
     output.mkdir(parents=True, exist_ok=True)
-    worktrees = {side: scratch / ("worktree-" + side) for side in SIDES}
+    print("raw samples: %s" % output, flush=True)
+    worktrees = {side: run_directory / ("worktree-" + side) for side in SIDES}
     try:
         for side in SIDES:
             git("worktree", "add", "--detach", str(worktrees[side]), revisions[side])
@@ -166,6 +176,9 @@ def main():
         for side in SIDES:
             subprocess.run(["git", "-C", str(ROOT), "worktree", "remove", "--force",
                             str(worktrees[side])], capture_output=True)
+        if output != run_directory:
+            # With --output, the run's directory held only the worktrees.
+            shutil.rmtree(run_directory, ignore_errors=True)
     print(report)
     (output / "report.txt").write_text(report + "\n")
 

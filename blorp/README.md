@@ -1996,9 +1996,17 @@ the run) and peak heap, and the median retired instructions of `--rounds`
 (default 11) alternating runs from `/usr/bin/time -l` or `perf stat`. It also
 says whether both compilers emit identical C for the fixed input. A compiler's
 own runtime comes from the pinned seed, so the peak heap reads `missing`, with
-a note, for a revision whose seed predates the peak heap line. Raw samples
-stay under `--output`, by default
-`blorp/build/self-compile-cost/<base>-<candidate>/`.
+a note, for a revision whose seed predates the peak heap line.
+
+Each run has its own directory,
+`blorp/build/self-compile-cost/<base>-<candidate>/run-<random>/`, so
+concurrent runs, of one pair or of several, do not touch each other's
+worktrees or binaries. Raw samples stay under `--output`, by default that
+directory; the run prints which before it builds. Concurrent runs need
+different `--output` directories. Nothing deletes old samples (a run keeps
+about 240 MB, mostly emitted C), so delete the `run-*` directories you no
+longer need. A run removes its worktrees when it ends; after a killed one,
+`git worktree remove --force` those left in its directory.
 
 ### Self-compile attribution
 

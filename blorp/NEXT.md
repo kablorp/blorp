@@ -320,9 +320,9 @@ None of these is planned yet. Each wants its own short design or brief.
   reports the compiler's peak. The e2e driver requires the line from every
   compile (`positive_allocations`). Plans can set peak heap ceilings from the
   script's table.
-- **`scripts/self-compile-cost` leaves its worktrees behind when killed.** The
-  next run with the same revisions then fails because
-  `build/self-compile-cost/<label>/worktree-*` already exists.
+- **`scripts/self-compile-cost` leaves its worktrees behind when killed,** in
+  `build/self-compile-cost/<label>/run-*`. Later runs are unaffected, but
+  nothing removes them.
 - **No never-returning type.** `process.brp`'s `fault` calls the `process.fault`
   native, which aborts, and then a second function that is never reached, to
   give the call every type. A never-returning builtin result, or a bottom type,
