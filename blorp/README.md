@@ -367,6 +367,12 @@ glibc, so a result that must replay bit for bit on every platform should not
 depend on them. They live in `math`, not `float`, because the pinned seed
 compiler reads `float.brp` and does not know their builtin labels.
 
+The `bits` module works on an Int's 64 two's-complement bits: `bit_and`,
+`bit_or`, `bit_xor`, `bit_not`, `shift_left` and the logical `shift_right`,
+which fills with zeros whatever the sign. They are functions, not operators,
+and `bits: Int methods` selects them as methods. Every operand is defined: a
+shift count outside 0 to 63 gives 0, as shifting every bit out would.
+
 `UInt8` is an unsigned byte, 0 to 255, declared by the base and available
 everywhere. Its operations wrap and never fail, like Int's:
 

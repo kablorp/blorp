@@ -126,6 +126,9 @@ imports still resolve beside their importer. There is no host-library fallback.
 `to_int(Float)` and nearest `to_float(Int)`; see
 [Numbers and operators](../README.md#numbers-and-operators).
 
+`bits.brp` has `bit_and`, `bit_or`, `bit_xor`, `bit_not`, `shift_left` and the
+logical `shift_right` on Int; a shift count outside 0 to 63 gives 0.
+
 `io/console/` has one module per error type, and reads and writes `Bytes`:
 
 - `output.brp`: `print` and `print_error`, and the byte writes `write`,
