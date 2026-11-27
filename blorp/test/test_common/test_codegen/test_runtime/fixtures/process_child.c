@@ -9,6 +9,7 @@
 #endif
 /* Before the renaming macros below, so that they rewrite the runtime's calls and not
  * these headers' declarations. */
+#include <signal.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -18,7 +19,8 @@ enum { SLEEP_SECONDS = 3600 };
 static int host_sleeping = 0;
 static int sleeps = 0;
 static int probe_clock_gettime(clockid_t clock, struct timespec *now);
-/* Only the startup-timeout probe stalls at the native exec boundary. */
+/* A child about to exec writes one byte here, so a probe knows its native has forked; the
+ * startup-timeout probe also stalls the child there. */
 static int stall_exec = 0;
 static int exec_ready_writer = -1;
 static int probe_execve(const char *path, char *const arguments[], char *const environment[]);
@@ -30,25 +32,35 @@ static int interrupts_at_exec = -1;
  * the same group. */
 static int lose_group_race = 0;
 static int probe_setpgid(pid_t process, pid_t group);
-/* The capture probes count forks, and writes that fail with EPIPE. */
-static int fork_count = 0;
+/* The capture probes count forks, on any thread, and writes that fail with EPIPE. */
+static _Atomic int fork_count = 0;
 static int broken_writes = 0;
 static pid_t probe_fork(void);
-/* The exec-report race: another thread's fork can land between pipe() and the
- * FD_CLOEXEC fix-up and keep that pipe's write end open. The probe forks a stray
- * process right after the numbered pipe() call, which inherits every end open. */
+/* A fork that does not take the runtime's fork lock, as foreign code's would, can land
+ * between pipe() and the FD_CLOEXEC fix-up and keep that pipe's write end open; only the
+ * exec report defends against it. The probe forks a stray process right after the
+ * numbered pipe() call, which inherits every end open. */
 enum { STRAY_LIFETIME_SECONDS = 4 };
 static int pipes_until_stray = 0;
 static pid_t stray = -1;
+/* The fork-window probe holds its capturing thread in the window after the pipe() this
+ * many calls on, counted per thread, and lets another thread's capture fork meanwhile. */
+static _Thread_local int pipes_until_window = 0;
 static int probe_pipe(int ends[2]);
 static ssize_t probe_write(int descriptor, const void *bytes, size_t length);
+/* The exit_interrupted probe lets a run start on another thread inside the native, just
+ * before its raise. */
+static int run_before_raise = 0;
+static int probe_raise(int signal_number);
 #define execve probe_execve
 #define setpgid probe_setpgid
 #define fork probe_fork
 #define pipe probe_pipe
 #define write probe_write
 #define clock_gettime probe_clock_gettime
+#define raise probe_raise
 #include "process_runtime.c"
+#undef raise
 #undef clock_gettime
 #undef write
 #undef pipe
@@ -57,6 +69,44 @@ static ssize_t probe_write(int descriptor, const void *bytes, size_t length);
 #undef execve
 #include <sys/ioctl.h>
 #include <sys/resource.h>
+
+/* Opened once, by one probe thread, for others waiting on it. */
+struct gate {
+    pthread_mutex_t lock;
+    pthread_cond_t opened;
+    int open;
+};
+
+static void gate_open(struct gate *gate) {
+    (void)pthread_mutex_lock(&gate->lock);
+    gate->open = 1;
+    (void)pthread_cond_broadcast(&gate->opened);
+    (void)pthread_mutex_unlock(&gate->lock);
+}
+
+static void gate_wait(struct gate *gate) {
+    (void)pthread_mutex_lock(&gate->lock);
+    while (!gate->open) (void)pthread_cond_wait(&gate->opened, &gate->lock);
+    (void)pthread_mutex_unlock(&gate->lock);
+}
+
+/* How long a probe holds a native inside its window, for another thread to act. */
+enum { WINDOW_HOLD_MS = 200 };
+static struct gate window_gate = {PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER, 0};
+
+static void sleep_milliseconds(long milliseconds) {
+    struct timespec interval = {milliseconds / 1000, (milliseconds % 1000) * 1000000};
+    while (nanosleep(&interval, &interval) != 0 && errno == EINTR) {}
+}
+
+/* Milliseconds since `started`, or -1 when the clock fails or runs backwards. */
+static long milliseconds_since(const struct timespec *started) {
+    struct timespec now;
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) return -1;
+    const long elapsed = (long)(now.tv_sec - started->tv_sec) * 1000 +
+                         (long)((now.tv_nsec - started->tv_nsec) / 1000000);
+    return elapsed < 0 ? -1 : elapsed;
+}
 
 /* CLOCK_REALTIME counts time asleep everywhere, and so does Darwin's CLOCK_MONOTONIC
  * (clock_gettime(3)); Linux's CLOCK_MONOTONIC stops during suspend (clock_gettime(2)). */
@@ -84,7 +134,21 @@ static int probe_pipe(int ends[2]) {
             _exit(0);
         }
     }
+    if (made == 0 && pipes_until_window > 0 && --pipes_until_window == 0) {
+        gate_open(&window_gate);
+        sleep_milliseconds(WINDOW_HOLD_MS);
+    }
     return made;
+}
+
+/* Called inside exit_interrupted, after it set SIGINT to its default: a run another thread
+ * starts now must not ignore SIGINT again before the raise. */
+static int probe_raise(int signal_number) {
+    if (run_before_raise) {
+        gate_open(&window_gate);
+        sleep_milliseconds(WINDOW_HOLD_MS);
+    }
+    return raise(signal_number);
 }
 
 static int fork_failure = 0;
@@ -113,6 +177,14 @@ static int probe_setpgid(pid_t process, pid_t group) {
 }
 
 static int probe_execve(const char *path, char *const arguments[], char *const environment[]) {
+    if (exec_ready_writer >= 0) {
+        const unsigned char ready = 1;
+        ssize_t written;
+        do {
+            written = write(exec_ready_writer, &ready, sizeof ready);
+        } while (written < 0 && errno == EINTR);
+        if (written != (ssize_t)sizeof ready) return -1;
+    }
     if (interrupts_at_exec >= 0) {
         const int numbers[] = {SIGINT, SIGQUIT};
         for (size_t index = 0; index < 2; index++) {
@@ -125,12 +197,6 @@ static int probe_execve(const char *path, char *const arguments[], char *const e
         }
     }
     if (stall_exec) {
-        const unsigned char ready = 1;
-        ssize_t written;
-        do {
-            written = write(exec_ready_writer, &ready, sizeof ready);
-        } while (written < 0 && errno == EINTR);
-        if (written != (ssize_t)sizeof ready) return -1;
         for (;;) pause();
     }
     return execve(path, arguments, environment);
@@ -364,6 +430,73 @@ static int capture_stray_report_holder(const char *program) {
                             (long)((ended.tv_nsec - started.tv_nsec) / 1000000);
     return succeeded && exit == BLORP_PROCESS_EXITED * BLORP_PROCESS_EXIT_SPAN &&
            elapsed_ms < STRAY_LIFETIME_SECONDS * 1000 / 2 ? 0 : 1;
+}
+
+/* One capture on its own thread, and what it returned. */
+struct capture_call {
+    const char *program;
+    const char *const *arguments;
+    int count;
+    const char *input;
+    int64_t exit;
+    int64_t error;
+    uint8_t succeeded;
+    long elapsed_ms;
+};
+
+static void capture_call_run(struct capture_call *call) {
+    struct timespec started;
+    if (clock_gettime(CLOCK_MONOTONIC, &started) != 0) return;
+    call->succeeded = run_capture(call->program, call->count, call->arguments, call->input,
+                                  call->input == NULL ? 0 : strlen(call->input), INT64_C(10000),
+                                  &call->exit, &call->error);
+    call->elapsed_ms = milliseconds_since(&started);
+}
+
+/* Capture opens the stdout, stderr and stdin pipes, in that order, so the window is the
+ * stdin pipe's. */
+static void *capture_through_window(void *call) {
+    pipes_until_window = 3;
+    capture_call_run(call);
+    return NULL;
+}
+
+static void *capture_in_window(void *call) {
+    gate_wait(&window_gate);
+    capture_call_run(call);
+    return NULL;
+}
+
+/* The fork window, between pipe() and FD_CLOEXEC. Thread A captures cat with input, and is
+ * held in the window of its stdin pipe while thread B captures a child that counts the
+ * descriptors it holds, then lives for LEAK_HOLD_SECONDS. Forked in the window, B's child
+ * would also hold both ends of A's stdin pipe, so A's cat would wait that long for the end of
+ * its input. Alone, the same child counts what this probe itself inherited. That count is the
+ * exact check; A's time is bounded by half the holder's life, as the stray-report probe's is. */
+enum { LEAK_HOLD_SECONDS = 3 };
+
+static int capture_fork_window(const char *program) {
+    char hold[16];
+    (void)snprintf(hold, sizeof hold, "%d", LEAK_HOLD_SECONDS);
+    const char *const counting[] = {"descriptors", "0"};
+    const char *const holding[] = {"descriptors", hold};
+    struct capture_call alone = {.program = program, .arguments = counting, .count = 2};
+    struct capture_call through = {.program = "/bin/cat", .input = "window\n"};
+    struct capture_call in_window = {.program = program, .arguments = holding, .count = 2};
+    capture_call_run(&alone);
+    pthread_t first, second;
+    if (pthread_create(&second, NULL, capture_in_window, &in_window) != 0) return 1;
+    if (pthread_create(&first, NULL, capture_through_window, &through) != 0) {
+        gate_open(&window_gate);
+        (void)pthread_join(second, NULL);
+        return 1;
+    }
+    (void)pthread_join(first, NULL);
+    (void)pthread_join(second, NULL);
+    return alone.succeeded && through.succeeded &&
+           through.exit == BLORP_PROCESS_EXITED * BLORP_PROCESS_EXIT_SPAN &&
+           through.elapsed_ms >= 0 && through.elapsed_ms < LEAK_HOLD_SECONDS * 1000 / 2 &&
+           in_window.succeeded && in_window.exit == alone.exit ? 0 : 1;
 }
 
 /* find_program on a PATH of an empty entry, a relative one, a non-executable file,
@@ -620,6 +753,207 @@ static int run_fork_failure(const char *program) {
            disposition_of(SIGQUIT) == DISPOSITION_DEFAULT && no_child() ? 0 : 1;
 }
 
+/* One run on its own thread, and what it returned. */
+struct run_call {
+    const char *program;
+    const char *arguments[2];
+    int64_t ended;
+    int64_t error;
+    uint8_t succeeded;
+};
+
+static void *run_on_thread(void *argument) {
+    struct run_call *call = argument;
+    call->succeeded = run_program(call->program, 2, call->arguments, &call->ended, &call->error);
+    return NULL;
+}
+
+/* A pipe neither end of which a child keeps past exec. */
+static int private_pipe(int ends[2]) {
+    return pipe(ends) == 0 && fcntl(ends[0], F_SETFD, FD_CLOEXEC) == 0 &&
+           fcntl(ends[1], F_SETFD, FD_CLOEXEC) == 0;
+}
+
+/* A pipe whose read end a child keeps past exec, to wait on. The write end stays here, so
+ * the child reads the end of input once this process writes or goes. */
+static int release_pipe(int ends[2]) {
+    return pipe(ends) == 0 && fcntl(ends[1], F_SETFD, FD_CLOEXEC) == 0;
+}
+
+enum { HANDSHAKE_MS = 5000 };
+
+/* Whether a byte arrived on `descriptor` within HANDSHAKE_MS of waiting. */
+static int arrived(int descriptor) {
+    struct pollfd ready = {descriptor, POLLIN, 0};
+    int polled;
+    do {
+        polled = poll(&ready, 1, HANDSHAKE_MS);
+    } while (polled < 0 && errno == EINTR);
+    unsigned char byte = 0;
+    return polled == 1 && read(descriptor, &byte, sizeof byte) == 1;
+}
+
+/* A run on its own thread whose child, once exec'd, waits for its release, then reports how
+ * it found SIGINT and SIGQUIT, as observe-signals does. */
+struct waiting_run {
+    struct run_call call;
+    int ready[2];
+    int release[2];
+    char descriptor[16];
+    pthread_t thread;
+    int started;
+};
+
+static int prepare_waiting_run(struct waiting_run *run, const char *program) {
+    run->started = 0;
+    run->ready[0] = run->ready[1] = run->release[0] = run->release[1] = -1;
+    if (!private_pipe(run->ready) || !release_pipe(run->release)) return 0;
+    (void)snprintf(run->descriptor, sizeof run->descriptor, "%d", run->release[0]);
+    run->call = (struct run_call){.program = program, .arguments = {"await-observe", run->descriptor}};
+    return 1;
+}
+
+/* Starts the run, and returns whether its child reached exec, which it does only after the
+ * run has ignored SIGINT and SIGQUIT. Always pair it with finish_waiting_run. */
+static int start_waiting_run(struct waiting_run *run, const char *program) {
+    if (!prepare_waiting_run(run, program)) return 0;
+    exec_ready_writer = run->ready[1];
+    run->started = pthread_create(&run->thread, NULL, run_on_thread, &run->call) == 0;
+    const int reached = run->started && arrived(run->ready[0]);
+    exec_ready_writer = -1;
+    return reached;
+}
+
+/* Releases the child, waits for the run, and returns whether its child found `found`. */
+static int finish_waiting_run(struct waiting_run *run, int found) {
+    const unsigned char release = 1;
+    const int released = write(run->release[1], &release, sizeof release) == (ssize_t)sizeof release;
+    if (run->started) (void)pthread_join(run->thread, NULL);
+    const int descriptors[] = {run->ready[0], run->ready[1], run->release[0], run->release[1]};
+    for (size_t index = 0; index < sizeof descriptors / sizeof *descriptors; index++) {
+        if (descriptors[index] >= 0) (void)close(descriptors[index]);
+    }
+    return released && run->started && run->call.succeeded && run->call.ended == RUN_EXITED(found);
+}
+
+static int interrupts_are(int disposition) {
+    return disposition_of(SIGINT) == disposition && disposition_of(SIGQUIT) == disposition;
+}
+
+/* Two runs overlap. A's child has reached exec, so A has ignored SIGINT and SIGQUIT, when B
+ * starts, and A's child exits first. Both children find the signals as the caller had them,
+ * `found` as observe-signals reports it; both stay ignored while B still waits; and the
+ * caller's `disposition` stands again once both have returned. */
+static int overlapping_runs(const char *program, void (*caller)(int), int found, int disposition) {
+    struct waiting_run first, second;
+    const int set = set_interrupts(caller);
+    const int first_ready = start_waiting_run(&first, program);
+    const int second_ready = start_waiting_run(&second, program);
+    const int first_found = finish_waiting_run(&first, found);
+    const int held = interrupts_are(DISPOSITION_IGNORED);
+    const int second_found = finish_waiting_run(&second, found);
+    return set && first_ready && second_ready && first_found && held && second_found &&
+           interrupts_are(disposition);
+}
+
+/* With the caller at the defaults, ignoring both, and with a handler, which no child keeps. */
+static int run_overlapping_interrupts(const char *program) {
+    const int correct = overlapping_runs(program, SIG_DFL, 0, DISPOSITION_DEFAULT) &&
+                        overlapping_runs(program, SIG_IGN, 3, DISPOSITION_IGNORED) &&
+                        overlapping_runs(program, nothing, 0, DISPOSITION_OTHER);
+    return set_interrupts(SIG_DFL) && correct ? 0 : 1;
+}
+
+/* A capture while a run waits: the capture's child, too, finds SIGINT and SIGQUIT as the
+ * caller has them, and not as the run does. */
+static int capture_while_running(const char *program, void (*caller)(int), int found, int disposition) {
+    const char *const observe[] = {"observe-signals"};
+    int64_t exit = -1, error = 0;
+    struct waiting_run waiting;
+    const int set = set_interrupts(caller);
+    const int ready = start_waiting_run(&waiting, program);
+    const uint8_t captured = run_capture(program, 1, observe, NULL, 0, INT64_C(10000), &exit, &error);
+    const int waited = finish_waiting_run(&waiting, found);
+    return set && ready && captured && exit == RUN_EXITED(found) && waited && interrupts_are(disposition);
+}
+
+static int capture_during_run(const char *program) {
+    const int correct = capture_while_running(program, SIG_DFL, 0, DISPOSITION_DEFAULT) &&
+                        capture_while_running(program, SIG_IGN, 3, DISPOSITION_IGNORED) &&
+                        capture_while_running(program, nothing, 0, DISPOSITION_OTHER);
+    return set_interrupts(SIG_DFL) && correct ? 0 : 1;
+}
+
+/* A run whose exec fails is LaunchFailed and leaves no run holding SIGINT and SIGQUIT: the
+ * next run ignores them while it waits, and restores them after. `missing` is the path the
+ * suite offers the probe to create, which this probe never creates. */
+static int run_exec_failure(const char *program, const char *missing) {
+    int64_t ended = -1, error = 0;
+    struct waiting_run next;
+    const int set = start_from_defaults();
+    const uint8_t launched = run_program(missing, 0, NULL, &ended, &error);
+    const int refused = !launched && error == blorp_process_launch_error(ENOENT) &&
+                        interrupts_are(DISPOSITION_DEFAULT);
+    const int ready = start_waiting_run(&next, program);
+    const int held = interrupts_are(DISPOSITION_IGNORED);
+    const int found = finish_waiting_run(&next, 0);
+    return set && refused && ready && held && found && interrupts_are(DISPOSITION_DEFAULT) ? 0 : 1;
+}
+
+/* How a forked copy of this process that runs `act` ends: its wait status, or -1. */
+static int forked_ending(int (*act)(const char *program), const char *program) {
+    if (fflush(NULL) != 0) return -1;
+    const pid_t child = fork();
+    if (child < 0) return -1;
+    if (child == 0) _exit(act(program));
+    int status = 0;
+    pid_t waited;
+    do {
+        waited = waitpid(child, &status, 0);
+    } while (waited < 0 && errno == EINTR);
+    return waited == child ? status : -1;
+}
+
+/* exit_interrupted while a run waits on another thread with SIGINT ignored. It returns only
+ * when it did not end the process. Its run's child reads the end of input once this process
+ * has gone, and exits. */
+static int exit_interrupted_while_running(const char *program) {
+    struct waiting_run waiting;
+    if (!start_waiting_run(&waiting, program)) return 1;
+    int64_t error = 0;
+    (void)blorp_process_exit_interrupted(&error);
+    return 1;
+}
+
+static void *run_when_raising(void *call) {
+    gate_wait(&window_gate);
+    return run_on_thread(call);
+}
+
+/* exit_interrupted while a run starts on another thread, between its sigaction and its
+ * raise. The run must not ignore SIGINT again before the raise; it would hold it ignored
+ * until its child, which waits, had exited. */
+static int exit_interrupted_while_starting(const char *program) {
+    struct waiting_run starting;
+    if (!prepare_waiting_run(&starting, program) ||
+        pthread_create(&starting.thread, NULL, run_when_raising, &starting.call) != 0) return 1;
+    run_before_raise = 1;
+    int64_t error = 0;
+    (void)blorp_process_exit_interrupted(&error);
+    return 1;
+}
+
+static int ended_by_interrupt(int status) {
+    return status != -1 && WIFSIGNALED(status) && WTERMSIG(status) == SIGINT;
+}
+
+static int exit_interrupted_during_run(const char *program) {
+    if (!start_from_defaults()) return 1;
+    const int waiting = forked_ending(exit_interrupted_while_running, program);
+    const int starting = forked_ending(exit_interrupted_while_starting, program);
+    return ended_by_interrupt(waiting) && ended_by_interrupt(starting) ? 0 : 1;
+}
+
 /* The session of the pty probe: runs `mode` of the child on this terminal and reports how it
  * ended and how SIGINT and SIGQUIT stand afterwards. */
 static int run_session(const char *program, const char *mode) {
@@ -728,6 +1062,17 @@ static int run_terminal(const char *program) {
            terminal_case(program, "wait", "\003", "child: waiting", interrupted) == 0 &&
            terminal_case(program, "wait", "\034", "child: waiting", quit) == 0 ? 0 : 1;
 }
+
+/* How a run's child found SIGINT and SIGQUIT, as its status: 1 for SIGINT ignored, 2 for
+ * SIGQUIT, and 4 for a handler, which exec never keeps. */
+static int observed_signals(void) {
+    return (disposition_of(SIGINT) == DISPOSITION_IGNORED ? 1 : 0) +
+           (disposition_of(SIGQUIT) == DISPOSITION_IGNORED ? 2 : 0) +
+           (disposition_of(SIGINT) == DISPOSITION_OTHER || disposition_of(SIGQUIT) == DISPOSITION_OTHER ? 4 : 0);
+}
+
+/* Well above any descriptor a probe opens, which are the lowest free numbers. */
+enum { DESCRIPTOR_SCAN_LIMIT = 1024 };
 
 static int child_case(int argc, char **argv) {
     if (argc < 2) return 0;
@@ -846,10 +1191,21 @@ static int child_case(int argc, char **argv) {
     if (strcmp(argv[1], "env-unset") == 0 && argc == 3) return getenv(argv[2]) == NULL ? 0 : 1;
     if (strcmp(argv[1], "file-exists") == 0 && argc == 3) return access(argv[2], F_OK) == 0 ? 0 : 1;
     /* The children of the run probes, which share the probe's terminal and group. */
-    if (strcmp(argv[1], "observe-signals") == 0) {
-        return (disposition_of(SIGINT) == DISPOSITION_IGNORED ? 1 : 0) +
-               (disposition_of(SIGQUIT) == DISPOSITION_IGNORED ? 2 : 0) +
-               (disposition_of(SIGINT) == DISPOSITION_OTHER || disposition_of(SIGQUIT) == DISPOSITION_OTHER ? 4 : 0);
+    if (strcmp(argv[1], "observe-signals") == 0) return observed_signals();
+    /* Waits until the probe writes to descriptor argv[2] or goes, then observes. */
+    if (strcmp(argv[1], "await-observe") == 0 && argc == 3) {
+        unsigned char byte = 0;
+        while (read((int)strtol(argv[2], NULL, 10), &byte, sizeof byte) < 0 && errno == EINTR) {}
+        return observed_signals();
+    }
+    /* After a wait of argv[2] seconds, the count of descriptors above stderr it holds. */
+    if (strcmp(argv[1], "descriptors") == 0 && argc == 3) {
+        sleep((unsigned)strtol(argv[2], NULL, 10));
+        int count = 0;
+        for (int descriptor = STDERR_FILENO + 1; descriptor < DESCRIPTOR_SCAN_LIMIT; descriptor++) {
+            count += fcntl(descriptor, F_GETFD) != -1;
+        }
+        return count;
     }
     if (strcmp(argv[1], "interrupt-group") == 0) {
         if (kill(0, SIGINT) != 0) return 1;
@@ -910,6 +1266,11 @@ static int child_case(int argc, char **argv) {
         if (strcmp(argv[1], "capture-closed-stdio") == 0) return capture_closed_stdio(argv[2]);
         if (strcmp(argv[1], "capture-group-race") == 0) return capture_group_race(argv[2]);
         if (strcmp(argv[1], "capture-stray-report") == 0) return capture_stray_report_holder(argv[2]);
+        if (strcmp(argv[1], "capture-fork-window") == 0) return capture_fork_window(argv[2]);
+        if (strcmp(argv[1], "capture-during-run") == 0) return capture_during_run(argv[2]);
+        if (strcmp(argv[1], "run-overlapping-interrupts") == 0) return run_overlapping_interrupts(argv[2]);
+        if (strcmp(argv[1], "run-exec-failure") == 0) return run_exec_failure(argv[2], argv[3]);
+        if (strcmp(argv[1], "exit-interrupted-during-run") == 0) return exit_interrupted_during_run(argv[2]);
         if (strcmp(argv[1], "find-program") == 0) return find_program_case(argv[3]);
         if (strcmp(argv[1], "run-signals") == 0) return run_signals(argv[2]);
         if (strcmp(argv[1], "run-interrupt-group") == 0) return run_interrupt_group(argv[2]);

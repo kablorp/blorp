@@ -438,9 +438,16 @@ reads and writes files does: `Exit.Exited(status)` beside
   script's background job), which the child then inherits, as from a
   shell. A signal sent to the caller alone, such as SIGTERM, is not
   intercepted: the caller ends and the child runs on, as under `system(3)`.
-  The save and restore are exact because a Blorp program has one thread;
-  the landing that brings threads makes them a counted section under a
-  lock, as glibc's `system` does.
+  Runs can overlap once natives run on helper threads, so the swap is a
+  counted section, as glibc's `system` makes it: the first run in saves the
+  caller's dispositions and the last one out restores them, so every run's
+  child starts with the caller's, and they stand again once the last run
+  returns.
+  The count changes under the write side of the runtime's fork lock, so a
+  fork on another thread sees no swap or a whole one. A `capture` that
+  starts while a run waits gives its child the caller's dispositions back
+  before exec, and `exit_interrupted` holds the same lock from setting
+  SIGINT to its default until it raises it.
 - **Job control.** SIGTSTP, SIGTTIN and SIGTTOU are left alone. Ctrl-Z stops
   the caller with the child, so the shell, which waits only on the caller,
   reports the job stopped, and `fg` continues both. A child of a background
@@ -450,10 +457,13 @@ reads and writes files does: `Exit.Exited(status)` beside
   ends.
 - **Buffered output** (P10). Before the fork, the caller flushes its stdout
   and stderr buffers, so what it printed comes before what the child prints,
-  on a pipe or a file as on a terminal. A failed flush is ignored, as `print`
-  ignores a failed write. Input that the caller read ahead and did not
-  consume is not the child's; Blorp cannot read stdin today, and the byte
-  console (`LSP_PLAN.md`) must say so when its reads buffer.
+  on a pipe or a file as on a terminal. With natives on several threads this
+  holds per thread: what the calling thread printed comes first, and another
+  thread's output lands wherever it takes the stream. A failed flush is
+  ignored, as `print` ignores a failed write. Input that the caller read
+  ahead and did not consume is not the child's; Blorp cannot read stdin
+  today, and the byte console (`LSP_PLAN.md`) must say so when its reads
+  buffer.
 - **Ctrl-C.** The child ends by SIGINT, the caller survives it, and `run`
   returns `Ok(Signaled(INTERRUPT_SIGNAL))` after restoring the dispositions;
   Ctrl-\ is `Signaled(3)`. Ctrl-C ends only the current child, so a caller

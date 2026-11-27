@@ -1,3 +1,5 @@
+/* print calls flockfile, which glibc declares only under POSIX. */
+#define _POSIX_C_SOURCE 200809L
 #include <assert.h>
 #include <inttypes.h>
 #include <stdatomic.h>

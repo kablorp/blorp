@@ -1,4 +1,4 @@
-/* Native probe of the console natives, built with the unmodified production
+/* Native probe of the console natives and print, built with the unmodified production
  * fragments and the List[UInt8] layout a program that uses them emits. Each case
  * is one argument, after which comes a directory the case may use; a case that
  * passes returns 0 and prints nothing on standard output.
@@ -19,6 +19,8 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
+#include <pthread.h>
+#include <sched.h>
 #include <signal.h>
 #include <stdio.h>
 #include <string.h>
@@ -27,7 +29,20 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+/* The whole-lines case yields to the other threads inside print, between its text and its
+ * LF, where a print that is not one locked operation tears. */
+static int yield_before_newline = 0;
+static int probe_fputc(int character, FILE *stream);
+#define fputc probe_fputc
 #include "console_runtime.c"
+#undef fputc
+
+static int probe_fputc(int character, FILE *stream) {
+    if (yield_before_newline) {
+        (void)sched_yield();
+    }
+    return fputc(character, stream);
+}
 
 typedef struct blorp_l_0_b *bytes_list;
 
@@ -378,6 +393,98 @@ static int output_order(void) {
     return 0;
 }
 
+/* Each of LINE_THREADS threads prints a line of its own, prints it again with print_error,
+ * and writes a second line of its own with the console's write, LINES_PER_THREAD times. Every
+ * line arrives whole: print and print_error hold their stream from the text to the LF, and
+ * the console's write is one fwrite, which the stream's own lock keeps whole. */
+enum { LINE_THREADS = 4, LINES_PER_THREAD = 10000, LINE_TEXT = 48, LINE_KINDS = 2 * LINE_THREADS };
+
+struct line_writer {
+    struct blorp_string *printed;
+    bytes_list written;
+};
+
+static void *write_lines(void *argument) {
+    const struct line_writer *writer = argument;
+    for (int index = 0; index < LINES_PER_THREAD; index++) {
+        int64_t error = -1;
+        assert(blorp_string_print(writer->printed) == (uint8_t)0);
+        assert(blorp_string_print_error(writer->printed) == (uint8_t)0);
+        assert(blorp_console_write(writer->written, &error) == BLORP_FS_SUCCEEDED);
+    }
+    return NULL;
+}
+
+/* Every line of the file on `descriptor` is one of the first `kinds` lines, each `each` times. */
+static void expect_whole_lines(int descriptor, char lines[][LINE_TEXT], int kinds, int each) {
+    struct stat status;
+    assert(fstat(descriptor, &status) == 0);
+    char *text = malloc((size_t)status.st_size + 1);
+    assert(text != NULL);
+    assert(pread(descriptor, text, (size_t)status.st_size, 0) == status.st_size);
+    text[status.st_size] = '\0';
+    int counts[LINE_KINDS] = {0};
+    for (char *line = text; *line != '\0';) {
+        char *end = strchr(line, '\n');
+        assert(end != NULL);
+        *end = '\0';
+        int kind = 0;
+        while (kind < kinds && strcmp(line, lines[kind]) != 0) {
+            kind++;
+        }
+        assert(kind < kinds);
+        counts[kind]++;
+        line = end + 1;
+    }
+    for (int kind = 0; kind < kinds; kind++) {
+        assert(counts[kind] == each);
+    }
+    free(text);
+}
+
+static int whole_lines(void) {
+    FILE *out = tmpfile();
+    FILE *errors = tmpfile();
+    assert(out != NULL && errors != NULL);
+    const int saved_error = dup(STDERR_FILENO);
+    assert(saved_error >= 0);
+    assert(dup2(fileno(out), STDOUT_FILENO) == STDOUT_FILENO);
+    assert(dup2(fileno(errors), STDERR_FILENO) == STDERR_FILENO);
+    /* The printed lines, then the written ones, each without its LF. */
+    char lines[LINE_KINDS][LINE_TEXT];
+    struct line_writer writers[LINE_THREADS];
+    for (int index = 0; index < LINE_THREADS; index++) {
+        const int printed = snprintf(lines[index], LINE_TEXT, "thread %d printed this line", index);
+        const int written = snprintf(lines[LINE_THREADS + index], LINE_TEXT, "thread %d wrote this line\n", index);
+        assert(printed > 0 && printed < LINE_TEXT && written > 0 && written < LINE_TEXT);
+        writers[index].printed = blorp_string_from_bytes(lines[index], printed);
+        writers[index].written = bytes_of(lines[LINE_THREADS + index], (size_t)written);
+        lines[LINE_THREADS + index][written - 1] = '\0';
+    }
+    pthread_t threads[LINE_THREADS];
+    yield_before_newline = 1;
+    for (int index = 0; index < LINE_THREADS; index++) {
+        assert(pthread_create(&threads[index], NULL, write_lines, &writers[index]) == 0);
+    }
+    for (int index = 0; index < LINE_THREADS; index++) {
+        assert(pthread_join(threads[index], NULL) == 0);
+    }
+    yield_before_newline = 0;
+    assert(fflush(stdout) == 0);
+    assert(dup2(saved_error, STDERR_FILENO) == STDERR_FILENO);
+    close(saved_error);
+    clearerr(stderr);
+    expect_whole_lines(fileno(out), lines, LINE_KINDS, LINES_PER_THREAD);
+    expect_whole_lines(fileno(errors), lines, LINE_THREADS, LINES_PER_THREAD);
+    for (int index = 0; index < LINE_THREADS; index++) {
+        blorp_string_release(writers[index].printed);
+        blorp_list_drop_0_b(writers[index].written);
+    }
+    fclose(errors);
+    fclose(out);
+    return 0;
+}
+
 /* A reader that answers only once it has seen the prompt, so the read must flush
  * standard output before it waits. */
 static int flush_before_read(void) {
@@ -508,6 +615,8 @@ int main(int argc, char **argv) {
         failed = closed_exit_without_write(1);
     } else if (strcmp(name, "output_order") == 0) {
         failed = output_order();
+    } else if (strcmp(name, "whole_lines") == 0) {
+        failed = whole_lines();
     } else if (strcmp(name, "flush_before_read") == 0) {
         failed = flush_before_read();
     } else if (strcmp(name, "interrupted_read") == 0) {

@@ -3,17 +3,18 @@ import:
     ./list: list_root_allocation, list_slot_store
 
 
--- The process and fs operations must request declarations before any headers.
--- glibc declares realpath only with _XOPEN_SOURCE, and macOS hides
--- F_BARRIERFSYNC unless _DARWIN_C_SOURCE is defined; fs.write_text uses both.
--- glibc also hides readdir's DT_ codes, which fs.list_directory reads, unless
--- _DEFAULT_SOURCE is defined.
+-- The process and fs operations, the thread pool, and print and print_error
+-- must request declarations before any headers. glibc declares realpath only
+-- with _XOPEN_SOURCE, and flockfile, which the prints lock their stream with,
+-- only with _POSIX_C_SOURCE. macOS hides F_BARRIERFSYNC unless _DARWIN_C_SOURCE
+-- is defined; fs.write_text uses both. glibc also hides readdir's DT_ codes,
+-- which fs.list_directory reads, unless _DEFAULT_SOURCE is defined.
 PROCESS_POSIX_PRELUDE: String =
     raw
         |#ifndef _POSIX_C_SOURCE
         |#define _POSIX_C_SOURCE 200809L
         |#elif _POSIX_C_SOURCE < 200809L
-        |#error the process and fs operations require POSIX.1-2008 declarations
+        |#error the Blorp runtime requires POSIX.1-2008 declarations
         |#endif
         |#ifndef _XOPEN_SOURCE
         |#define _XOPEN_SOURCE 700
@@ -137,6 +138,44 @@ PROCESS_HELPERS_RUNTIME: String =
         |    }
         |    return private_descriptor;
         |}
+        |/* Making descriptors holds the read side; fork holds the write side, as Go's ForkLock
+        | * does, so no child is forked between pipe() and FD_CLOEXEC. Never held while waiting
+        | * for a child. External linkage: a program that never forks would warn on an unused
+        | * static. A native that forks without exec must not inherit it held. */
+        |pthread_rwlock_t blorp_process_fork_lock = PTHREAD_RWLOCK_INITIALIZER;
+        |/* Taking or releasing the fork lock aborts on any failure, as the literal lock does: a
+        | * lock that fails is corrupt, and going on would hang or race later. */
+        |void blorp_process_fork_lock_read(void) {
+        |    if (pthread_rwlock_rdlock(&blorp_process_fork_lock) != 0) {
+        |        abort();
+        |    }
+        |}
+        |void blorp_process_fork_lock_write(void) {
+        |    if (pthread_rwlock_wrlock(&blorp_process_fork_lock) != 0) {
+        |        abort();
+        |    }
+        |}
+        |void blorp_process_fork_lock_release(void) {
+        |    if (pthread_rwlock_unlock(&blorp_process_fork_lock) != 0) {
+        |        abort();
+        |    }
+        |}
+        |/* SIGINT and SIGQUIT as the caller had them (PROCESS_DECISIONS.md, P9). */
+        |struct blorp_process_dispositions {
+        |    struct sigaction interrupt;
+        |    struct sigaction quit;
+        |};
+        |/* run ignores SIGINT and SIGQUIT, process-wide, from before its fork until its child is
+        | * reaped, and runs on several threads overlap. So the swap is counted, as glibc's system()
+        | * counts it: the first run in saves the caller's dispositions and the last one out
+        | * restores them. The count and the dispositions change only under the fork lock's write
+        | * side, which exit_interrupted holds too, so a fork sees no swap or a whole one. `saved`
+        | * is the caller's while `holders` is above 0. */
+        |struct blorp_process_interrupts {
+        |    int64_t holders;
+        |    struct blorp_process_dispositions saved;
+        |};
+        |struct blorp_process_interrupts blorp_process_interrupt_swap;
         |/* A timeout counts only time the host is awake, since no child runs while it sleeps.
         | * Linux's CLOCK_MONOTONIC stops during suspend; Darwin's keeps counting, and its
         | * CLOCK_UPTIME_RAW stops. */
@@ -226,19 +265,22 @@ PROCESS_LAUNCH_RUNTIME: String =
         |    return blorp_process_error(blorp_fs_errno_code_within(number, BLORP_PROCESS_SYSTEM_CALL_KINDS), BLORP_PROCESS_LAUNCH_FAILED);
         |}
         |/* A fresh pipe with both ends private. Returns 0 or the errno; either end may be
-        | * left open for the caller's cleanup. */
+        | * left open for the caller's cleanup. macOS has no pipe2, so the ends are made private
+        | * after pipe(), under the fork lock's read side. */
         |static int blorp_process_pipe(int ends[2]) {
+        |    blorp_process_fork_lock_read();
         |    int made[2];
-        |    if (pipe(made) != 0) {
-        |        return errno;
+        |    int number = pipe(made) == 0 ? 0 : errno;
+        |    if (number == 0) {
+        |        ends[0] = blorp_process_private(made[0]);
+        |        number = ends[0] < 0 ? errno : 0;
+        |        ends[1] = blorp_process_private(made[1]);
+        |        if (number == 0 && ends[1] < 0) {
+        |            number = errno;
+        |        }
         |    }
-        |    ends[0] = blorp_process_private(made[0]);
-        |    const int first = ends[0] < 0 ? errno : 0;
-        |    ends[1] = blorp_process_private(made[1]);
-        |    if (first != 0) {
-        |        return first;
-        |    }
-        |    return ends[1] < 0 ? errno : 0;
+        |    blorp_process_fork_lock_release();
+        |    return number;
         |}
         |static int blorp_process_nonblocking(int descriptor) {
         |    const int flags = fcntl(descriptor, F_GETFL);
@@ -368,6 +410,23 @@ PROCESS_LAUNCH_RUNTIME: String =
         |static void blorp_process_release_launch(struct blorp_process_launch *launch) {
         |    blorp_memory_release(launch->argv);
         |    blorp_memory_release(launch->envp);
+        |}
+        |/* What a signal is in the child until exec: ignored if the caller had it ignored, else the
+        | * default, so that a handler of the caller's never runs in the forked child. Async-signal-safe. */
+        |static int blorp_process_child_signal(int number, const struct sigaction *saved) {
+        |    if ((saved->sa_flags & SA_SIGINFO) == 0 && saved->sa_handler == SIG_IGN) {
+        |        return 0;
+        |    }
+        |    struct sigaction action;
+        |    memset(&action, 0, sizeof action);
+        |    action.sa_handler = SIG_DFL;
+        |    return sigemptyset(&action.sa_mask) == 0 && sigaction(number, &action, NULL) == 0 ? 0 : errno;
+        |}
+        |/* Sets SIGINT and SIGQUIT in the child as the caller had them, from a run's swap. Returns 0,
+        | * or the errno. Async-signal-safe. */
+        |static int blorp_process_child_interrupts(const struct blorp_process_dispositions *caller) {
+        |    const int interrupt = blorp_process_child_signal(SIGINT, &caller->interrupt);
+        |    return interrupt != 0 ? interrupt : blorp_process_child_signal(SIGQUIT, &caller->quit);
         |}
         |/* The end of every child: only async-signal-safe operations execute between fork and
         | * execve/_exit. `failure` is the errno of the setup the caller's child already did, or 0.
@@ -516,14 +575,19 @@ private CAPTURE_SUPPORT: String =
         |/* The child leads its own group, then takes its streams. Only the child creates its
         | * group: when the parent also called setpgid, Darwin returned EPERM to whichever call
         | * lost the race. Until the child's call runs, a group signal finds no group and the
-        | * direct signal kills it. */
+        | * direct signal kills it. `swapped` is the caller's SIGINT and SIGQUIT while a run on
+        | * another thread ignores them, which the child takes back, or NULL. */
         |static void blorp_process_capture_child(int input, int output, int errors, int report,
+        |                                        const struct blorp_process_dispositions *swapped,
         |                                        const char *directory, char *const arguments[],
         |                                        char *const environment[]) {
         |    int failure = setpgid(0, 0) == 0 ? 0 : errno;
         |    if (failure == 0 && (dup2(input, STDIN_FILENO) < 0 || dup2(output, STDOUT_FILENO) < 0 ||
         |                         dup2(errors, STDERR_FILENO) < 0)) {
         |        failure = errno;
+        |    }
+        |    if (failure == 0 && swapped != NULL) {
+        |        failure = blorp_process_child_interrupts(swapped);
         |    }
         |    blorp_process_child_tail(failure, report, directory, arguments, environment);
         |}
@@ -592,13 +656,23 @@ private CAPTURE_BODY: String =
         |            number = blorp_process_nonblocking(parent_ends[index]);
         |        }
         |    }
+        |    struct blorp_process_dispositions caller;
+        |    const struct blorp_process_dispositions *swapped = NULL;
         |    if (number == 0) {
+        |        blorp_process_fork_lock_write();
+        |        if (blorp_process_interrupt_swap.holders > 0) {
+        |            caller = blorp_process_interrupt_swap.saved;
+        |            swapped = &caller;
+        |        }
         |        child = fork();
         |        number = child < 0 ? errno : 0;
+        |        if (child != 0) {
+        |            blorp_process_fork_lock_release();
+        |        }
         |    }
         |    if (child == 0) {
         |        blorp_process_capture_child(stdin_pipe[0], stdout_pipe[1], stderr_pipe[1], report[1],
-        |                                    place, launch.argv, launch.envp);
+        |                                    swapped, place, launch.argv, launch.envp);
         |    }
         |    if (number != 0) {
         |        failure = blorp_process_launch_error(number);
@@ -774,16 +848,10 @@ pure func process_capture_runtime(list_type: String) -> String:
         .concat(CAPTURE_BODY)
 
 
--- What run needs beside the launch helpers: the caller's two dispositions. Only run
--- calls these.
+-- What run needs beside the launch helpers: the counted swap of the caller's two
+-- dispositions. Only run calls these.
 private RUN_SUPPORT: String =
     raw
-        |/* SIGINT and SIGQUIT as the caller had them, while run ignores them. Saving and restoring
-        | * them is exact only because a Blorp program has one thread (PROCESS_DECISIONS.md, P9). */
-        |struct blorp_process_dispositions {
-        |    struct sigaction interrupt;
-        |    struct sigaction quit;
-        |};
         |/* Ignores both, saving how they were. Returns 0, or the errno; after a failure neither has
         | * changed. */
         |static int blorp_process_ignore_interrupts(struct blorp_process_dispositions *saved) {
@@ -806,16 +874,27 @@ private RUN_SUPPORT: String =
         |    const int quit = sigaction(SIGQUIT, &saved->quit, NULL) == 0 ? 0 : errno;
         |    return interrupt != 0 ? interrupt : quit;
         |}
-        |/* What a signal is in the child until exec: ignored if the caller had it ignored, else the
-        | * default, so that a handler of the caller's never runs in the forked child. Async-signal-safe. */
-        |static int blorp_process_child_signal(int number, const struct sigaction *saved) {
-        |    if ((saved->sa_flags & SA_SIGINFO) == 0 && saved->sa_handler == SIG_IGN) {
-        |        return 0;
+        |/* The first run in ignores both, saving the caller's; every run gets those in `caller`, for
+        | * its child. Under the fork lock's write side. Returns 0, or the errno; after a failure
+        | * nothing has changed. */
+        |static int blorp_process_enter_interrupts(struct blorp_process_dispositions *caller) {
+        |    struct blorp_process_interrupts *swap = &blorp_process_interrupt_swap;
+        |    const int number = swap->holders == 0 ? blorp_process_ignore_interrupts(&swap->saved) : 0;
+        |    if (number == 0) {
+        |        swap->holders++;
+        |        *caller = swap->saved;
         |    }
-        |    struct sigaction action;
-        |    memset(&action, 0, sizeof action);
-        |    action.sa_handler = SIG_DFL;
-        |    return sigemptyset(&action.sa_mask) == 0 && sigaction(number, &action, NULL) == 0 ? 0 : errno;
+        |    return number;
+        |}
+        |/* The last run out restores the caller's. Under the fork lock's write side. Returns 0, or
+        | * the errno of the first failure. */
+        |static int blorp_process_leave_interrupts(void) {
+        |    struct blorp_process_interrupts *swap = &blorp_process_interrupt_swap;
+        |    if (swap->holders <= 0) {
+        |        blorp_process_defect("a run restored SIGINT and SIGQUIT that no run had ignored");
+        |    }
+        |    swap->holders--;
+        |    return swap->holders == 0 ? blorp_process_restore_interrupts(&swap->saved) : 0;
         |}
         |
 
@@ -823,7 +902,8 @@ private RUN_SUPPORT: String =
 -- Validation, the launch and the wait. The child shares the caller's descriptors and
 -- process group, so there are no pipes, no poll loop and no group kill. SIGINT and
 -- SIGQUIT are ignored from before the fork until the child is reaped; the child
--- starts with each as the caller had it.
+-- starts with each as the caller had it. Once the swap is entered, every path
+-- reaches the one leave after the wait.
 private RUN_BODY: String =
     raw
         |    const struct blorp_process_strings argument_strings = {arguments->values, arguments->length};
@@ -844,7 +924,7 @@ private RUN_BODY: String =
         |    }
         |    struct blorp_process_dispositions caller;
         |    int report[2] = {-1, -1};
-        |    int ignoring = 0, status = 0;
+        |    int entered = 0, status = 0;
         |    pid_t child = -1;
         |    int number = blorp_process_pipe(report);
         |    if (number == 0) {
@@ -857,19 +937,20 @@ private RUN_BODY: String =
         |         * Standard error is unbuffered, so its flush sends nothing and needs no guard. */
         |        (void)blorp_console_flush_stream(stdout);
         |        (void)fflush(stderr);
-        |        number = blorp_process_ignore_interrupts(&caller);
-        |        ignoring = number == 0;
-        |    }
-        |    if (number == 0) {
-        |        child = fork();
-        |        number = child < 0 ? errno : 0;
+        |        blorp_process_fork_lock_write();
+        |        number = blorp_process_enter_interrupts(&caller);
+        |        entered = number == 0;
+        |        if (entered) {
+        |            child = fork();
+        |            number = child < 0 ? errno : 0;
+        |        }
+        |        if (child != 0) {
+        |            blorp_process_fork_lock_release();
+        |        }
         |    }
         |    if (child == 0) {
-        |        int setup = blorp_process_child_signal(SIGINT, &caller.interrupt);
-        |        if (setup == 0) {
-        |            setup = blorp_process_child_signal(SIGQUIT, &caller.quit);
-        |        }
-        |        blorp_process_child_tail(setup, report[1], place, launch.argv, launch.envp);
+        |        blorp_process_child_tail(blorp_process_child_interrupts(&caller), report[1], place,
+        |                                 launch.argv, launch.envp);
         |    }
         |    (void)blorp_process_close(&report[1]);
         |    if (number == 0) {
@@ -879,8 +960,10 @@ private RUN_BODY: String =
         |        } while (waited < 0 && errno == EINTR);
         |        number = waited == child ? 0 : errno;
         |    }
-        |    if (ignoring) {
-        |        const int problem = blorp_process_restore_interrupts(&caller);
+        |    if (entered) {
+        |        blorp_process_fork_lock_write();
+        |        const int problem = blorp_process_leave_interrupts();
+        |        blorp_process_fork_lock_release();
         |        number = number != 0 ? number : problem;
         |    }
         |    /* The child is gone and the descriptor is nonblocking, so one read takes the report or
@@ -976,6 +1059,8 @@ PROCESS_FAULT_RUNTIME: String =
 -- as when a parent left SIGINT blocked across exec; the library discards the error, which
 -- is the errno of the failed call, or 0 when the signal was raised and did nothing.
 -- It flushes as run does, so a reader that has gone cannot turn SIGINT into SIGPIPE.
+-- It holds the fork lock's write side from its sigaction to its raise, so no run on
+-- another thread ignores SIGINT again in between.
 PROCESS_EXIT_INTERRUPTED_RUNTIME: String =
     raw
         |uint8_t blorp_process_exit_interrupted(int64_t *error) {
@@ -985,10 +1070,12 @@ PROCESS_EXIT_INTERRUPTED_RUNTIME: String =
         |    memset(&default_action, 0, sizeof default_action);
         |    default_action.sa_handler = SIG_DFL;
         |    int number = 0;
+        |    blorp_process_fork_lock_write();
         |    if (sigemptyset(&default_action.sa_mask) != 0 || sigaction(SIGINT, &default_action, NULL) != 0 ||
         |        raise(SIGINT) != 0) {
         |        number = errno;
         |    }
+        |    blorp_process_fork_lock_release();
         |    *error = number;
         |    return BLORP_PROCESS_ERROR;
         |}
