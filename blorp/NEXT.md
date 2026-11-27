@@ -85,15 +85,16 @@ done.
     the cost follow-ups the plan lists.
 - **Union destructuring removal:**
   [`UNION_DESTRUCTURING_REMOVAL_PLAN.md`](UNION_DESTRUCTURING_REMOVAL_PLAN.md).
-  - **Status:** approved on 2026-11-26. Keith chose `match` as the one way to
-    read a union. The plan has five landings: a resource union matched in its
-    module, lower flattening a selection with no test, a rotation, the
-    migration of 204 sites, then deleting destructuring. The net is about −75
-    to −135 lines.
-  - **Landed:** landing 1, a resource union matched in its module;
-    landing 2, lower flattening a selection with no test; and landing 3, the
-    rotation to `blorp-seed-94b463fdaa55`.
-  - **Next:** landing 4, the migration, then landing 5, the deletion.
+  - **Status:** done on 2026-11-27. Keith chose `match` as the one way to
+    read a union. Five landings, net −114 production lines (+52, +123, 0,
+    +122, −411).
+  - **Landed:** landing 1, a resource union matched in its module; landing 2,
+    lower flattening a selection with no test; landing 3, the rotation to
+    `blorp-seed-94b463fdaa55`; landing 4, the migration of 208 sites; and
+    landing 5, the deletion. `match` is the one way to read a union.
+  - **Next:** nothing in the plan. Waiting as follow-ups: flattening one-variant
+    selections of unions that are not erased, and lending an arm input whose
+    root is a borrowed parameter.
 - **UInt8 and Bytes:** [`UINT8_BYTES_PLAN.md`](UINT8_BYTES_PLAN.md).
   - **Status:** U1 to U9 and B1 to B3 are decided. L0, the
     `IntegerType(Int64Format)` refactor, and L1, the compiler's `UInt8` with

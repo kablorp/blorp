@@ -1,9 +1,10 @@
 # Union destructuring removal plan
 
-**Status: approved, 2026-11-26.** Keith asked for this plan on 2026-11-26 and
-accepted its three decisions the same day ("Accept all three"). On 2026-11-26
-he asked for landings 2 to 5 to go straight through, stopping only for a stop
-condition.
+**Status: done, 2026-11-27.** Keith asked for this plan on 2026-11-26 and
+accepted its three decisions the same day ("Accept all three"), then asked for
+landings 2 to 5 to go straight through. All five landed. The net is −114
+production lines: +52, +123, 0, +122 and −411. `match` is the one way to read
+a union.
 
 **The direction.** On 2026-11-26 Keith compared an accessor written both
 ways, after the help fixes landed:
@@ -438,6 +439,19 @@ The raw output is in `build/destructuring-removal/spike-cost.log`.
 
      **Ceiling:** at most −265, which is 80% of the estimate, as
      `PRIVATE_VARIANTS_PLAN.md` set its deletions.
+   - **Results (on landing 4, `c86d3f81e`):**
+     - Production −411 lines after the review's fixes (−421 before them),
+       within the ceiling.
+       Tests −638 (348 added, 986 deleted), with the rejection suite added.
+     - `blorp/scripts/self-compile-cost`: fixed-input C identical,
+       fixed-input allocations and peak heap identical, fixed-input
+       instructions −0.03%. The compiler's own source: allocations −0.50%,
+       instructions −0.55%.
+     - Landing 2's straight-line suites compare each flattened `match` with
+       the same function written over the payload type, since the erased
+       union is represented as its payload.
+     - Two e2e accounting counts moved: the managed-payload fixture to 21
+       allocations, and the tuple-task fixture to 4 with threads unset.
 
 **Net:** about −135 to −75 production lines across the five landings (+30,
 +60 to +120, 0, +105, −330). The language has one way to read a union. A

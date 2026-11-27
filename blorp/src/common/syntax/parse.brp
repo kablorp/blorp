@@ -144,7 +144,6 @@ import:
         SystemOperation,
         SYSTEM_OPERATIONS,
         ParsedPropagation,
-        ParsedVariantBinding,
         ParsedWhile,
         ParsedFor,
         ParsedConcurrentBlock,
@@ -152,7 +151,6 @@ import:
         ParsedStatement(
             BindingStatement,
             TupleBinding,
-            VariantBinding,
             PropagatingBinding,
             ExpressionStatement,
             WhileLoop,
@@ -4235,12 +4233,6 @@ private pure func consume_tuple_binding(enclosed: ParsedEnclosed) -> Result[Line
     Ok(StatementForm(TupleBinding(binders, initializer.body, enclosed.span), initializer.next))
 
 
-private VARIANT_BINDER_MESSAGE: String = "destructuring binds a name or '_' for each payload"
-
-
-private VARIANT_BINDER_HELP: String = "bind the payload to a name, then compare or use that name"
-
-
 private pure func at_variant_name(state: ParserState, position: Int) -> Bool:
     match state.input.tokens.get(position):
         Some(token):
@@ -4262,17 +4254,26 @@ private pure func at_module_alias(state: ParserState, position: Int) -> Bool:
             False
 
 
--- Whether the line is `Name(...) =`, `Union.Name(...) =` or
--- `alias.Name(...) =`: a variant, then a '(' whose matching ')' is followed by
--- '=' or '?='. Like a line that starts with '(', it commits at that ')'. Every
--- line that starts with a value reaches this test: one that starts with no
--- head reads one token, and the rest are read by position, since a shifted
--- ParserState is a new record. A lower-case first name heads only when it is
--- a declared alias, as for a qualified value, so `list.append(x)` stays a call.
-private pure func at_variant_binding(state: ParserState) -> Bool:
+-- Where `Variant(binders) =` ends: the source offset after its ')' and the
+-- position of the '=' or '?=' token.
+private record VariantBindingEnd {
+    closing_end: Int,
+    equals_position: Int
+}
+
+
+-- The end of the binding head when the line is `Name(...) =`,
+-- `Union.Name(...) =` or `alias.Name(...) =`: a variant, then a '(' whose
+-- matching ')' is followed by '=' or '?='. A union is read with `match`, so
+-- the parser rejects the line. Every line that starts with a value reaches this
+-- test: one that starts with no head reads one token, and the rest are read by
+-- position, since a shifted ParserState is a new record. A lower-case first
+-- name heads only when it is a declared alias, as for a qualified value, so
+-- `list.append(x)` stays a call.
+private pure func variant_binding_equals(state: ParserState) -> Option[VariantBindingEnd]:
     var position = state.position + 1
     var depth: Int = 0
-    var closed: Bool = False
+    var closing_end: Option[Int] = None
     var headed: Bool = state.at_variant_name(state.position)
 
     if and(state.symbol_at(position) == Some(Dot), state.at_variant_name(position + 1)):
@@ -4281,107 +4282,69 @@ private pure func at_variant_binding(state: ParserState) -> Bool:
             position = position + 2
 
     if and(headed, state.symbol_at(position) == Some(LeftParen)):
-        while and(closed.not(), position < state.input.tokens.length()):
-            match state.symbol_at(position):
-                Some(LeftParen):
-                    depth = depth + 1
-                Some(RightParen):
-                    depth = depth - 1
-                    closed = depth == 0
-                _:
+        while and(closing_end == None, position < state.input.tokens.length()):
+            match state.input.tokens.get(position):
+                Some(token):
+                    match token.kind:
+                        SymbolToken(LeftParen):
+                            depth = depth + 1
+                        SymbolToken(RightParen):
+                            depth = depth - 1
+
+                            if depth == 0:
+                                closing_end = Some(token.span.end)
+                        _:
+                            void
+                None:
                     void
 
             position = position + 1
 
-    if closed:
-        match state.symbol_at(position):
-            Some(Equals) | Some(QuestionEquals): True
-            _: False
-    else:
-        False
+    match (closing_end, state.symbol_at(position)):
+        (Some(end), Some(Equals)) | (Some(end), Some(QuestionEquals)):
+            Some({ closing_end = end, equals_position = position })
+        _:
+            None
 
 
-private pure func consume_payload_binder(
-    _: Int,
-    state: ParserState
-) -> Result[ParsedItem[ParsedBinder], Diagnostic]:
-    member ?= state.consume_enclosed_member()
-    binder ?= member.item.member_binder(state, VARIANT_BINDER_MESSAGE, VARIANT_BINDER_HELP)
-    Ok({ item = binder, next = member.next })
+-- The spelling of a value that is one bare name, with no call, field read or
+-- parentheses.
+private pure func plain_name_spelling(value: ValueExpression, names: NameTable) -> Option[String]:
+    match (value.base, value.applications, value.parentheses):
+        (NameExpression(name), [], []): names.name_spelling(name.id)
+        _: None
 
 
--- The head `at_variant_binding` found, after its first name.
-private pure func consume_variant_head(
-    head: ParsedName
-) -> Result[ParsedItem[PatternHead], Diagnostic]:
-    match head.variant_after():
-        Some(variant):
-            Ok({
-                item = UnionVariantHead({ union_name = head.name, variant = variant.name }),
-                next = variant.next
-            })
-        None:
-            if head.next.at_dot():
-                match (
-                    head.next
-                        .shifted(1)
-                        .consume_used_name("expected a variant name after the module alias and '.'")
-                ):
-                    Ok(member):
-                        Ok({
-                            item = QualifiedHead({ module = head.name, name = member.name }),
-                            next = member.next
-                        })
-                    Err(error):
-                        Err(error)
-            else:
-                Ok({ item = BareHead(head.name), next = head.next })
+-- Rejects `Variant(binders) = value`, whose head ends at `head`. The
+-- help names the value only when it is a plain name, so a long initializer is
+-- never echoed, and repeats the written variant and binders as the arm.
+private pure func reject_variant_binding(state: ParserState, head: VariantBindingEnd) -> Diagnostic:
+    span = { state.parser_span() | end = head.closing_end }
+    arm = state.input.source_text.slice(span.start, span.end)
 
+    operator: BindingOperator = match state.symbol_at(head.equals_position):
+        Some(QuestionEquals): Propagate
+        _: Assign
 
--- `Name(binders) = value`, `Union.Name(binders) = value` or
--- `alias.Name(binders) = value`, which `at_variant_binding` found. Its binders
--- are read as a tuple's are.
-private pure func consume_variant_binding(state: ParserState) -> Result[LineForm, Diagnostic]:
-    head ?= state.consume_used_name("expected a variant name")
+    subject = match (
+        state
+            .shifted(head.equals_position + 1 - state.position)
+            .consume_initializer(operator, BINDING_LINE_MESSAGE, BINDING_LINE_HELP)
+    ):
+        Ok(value): value.body.plain_name_spelling(state.input.names)
+        Err(_): None
 
-    written ?= head.consume_variant_head()
+    -- The head's offsets come from tokens of this source, so the slice exists;
+    -- the fallback names no arm rather than inventing one.
+    help = match (subject, arm):
+        (Some(name), Some(written)):
+            "use match ${name}: with an arm such as ${written}: on the next line"
+        (None, Some(written)):
+            "use match with an arm such as ${written}: on the next line"
+        (_, None):
+            "use match with an arm for the variant on the next line"
 
-    listed ?= written.next
-        .shifted(1)
-        .with_enclosure(Bracketed)
-        .consume_parenthesized_items([], consume_payload_binder)
-
-    closed ?= listed.next.expect(
-        listed.next.at_right_paren(),
-        "expected ')' after the destructured names",
-        VARIANT_BINDER_HELP
-    )
-
-    span = { head.name.span | end = listed.next.parser_span().end }
-
-    _: Void ?= if listed.items.is_empty():
-        Err(diagnostic(span, VARIANT_BINDER_MESSAGE, "name the payload, or write _ to discard it"))
-    else:
-        Ok(void)
-
-    after = closed.with_enclosure(state.enclosure)
-
-    equals ?= after.expect(
-        after.at_equals(),
-        "destructuring requires '='",
-        "propagate into a name first, then destructure the result"
-    )
-
-    initializer ?= equals.consume_initializer(Assign, BINDING_LINE_MESSAGE, BINDING_LINE_HELP)
-
-    binding: ParsedVariantBinding = {
-        variant = written.item,
-        binders = listed.items,
-        initializer = initializer.body,
-        span = span
-    }
-
-    Ok(StatementForm(VariantBinding(binding), initializer.next))
+    diagnostic(span, "a union is read with match, not destructured", help)
 
 
 -- A line beginning with '(' shares the ordinary expression parser's rest
@@ -4504,27 +4467,33 @@ private pure func consume_line_form(state: ParserState) -> Result[LineForm, Diag
         state.consume_binding()
     else if state.at_left_paren():
         state.consume_parenthesized_line()
-    else if state.at_variant_binding():
-        state.consume_variant_binding()
     else if state.at_keyword(WhileKeyword):
         state.consume_while()
     else if state.at_for():
         state.consume_for()
     else:
-        match state.at_loop_control():
-            Some(control):
-                state.consume_loop_control(control)
-            None:
-                value_result: Result[ParsedValue, Diagnostic] = if state.at_if():
-                    state.consume_if()
-                else if state.at_keyword(MatchKeyword):
-                    state.consume_match_value()
-                else:
-                    state.consume_value()
+        match variant_binding_equals(state):
+            Some(head): Err(state.reject_variant_binding(head))
+            None: state.consume_loop_control_or_value_line()
 
-                match value_result:
-                    Ok(value): value.value_line_form()
-                    Err(error): Err(error)
+
+private pure func consume_loop_control_or_value_line(
+    state: ParserState
+) -> Result[LineForm, Diagnostic]:
+    match state.at_loop_control():
+        Some(control):
+            state.consume_loop_control(control)
+        None:
+            value_result: Result[ParsedValue, Diagnostic] = if state.at_if():
+                state.consume_if()
+            else if state.at_keyword(MatchKeyword):
+                state.consume_match_value()
+            else:
+                state.consume_value()
+
+            match value_result:
+                Ok(value): value.value_line_form()
+                Err(error): Err(error)
 
 
 -- `concurrent` heads a block only before `:` and a line end, so

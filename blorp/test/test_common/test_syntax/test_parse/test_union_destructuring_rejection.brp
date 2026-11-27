@@ -1,0 +1,227 @@
+---
+A union is read with `match`, so the parser rejects `Name(binders) = value`,
+`Union.Name(binders) = value`, `alias.Name(binders) = value` and each with `?=`.
+The rejection names the replacement. The rejected span runs from the variant to
+its `)`, marked with `[[` and `]]`. A line that starts with a variant and has
+no `) =` is still a value, and a tuple destructuring still parses.
+---
+import:
+    test: TestSuite
+    ../../../../src/common/syntax/parse: module_contents
+    ../../../../src/common/syntax/syntax:
+        ParsedFunctionGroup(FreeFunction),
+        ParsedStatement(ExpressionStatement, TupleBinding)
+    ./parse_rejection: parse_rejects, parsed
+
+
+private REJECTION: String = "a union is read with match, not destructured"
+
+
+-- The first function's statements, or none when the module does not parse.
+private pure func statements_of(source: String) -> List[ParsedStatement]:
+    match parsed(source):
+        Err(_):
+            []
+        Ok(module):
+            match module_contents(module).functions:
+                [FreeFunction(function), ..._]: function.statements
+                _: []
+
+
+pure func test_a_bare_variant_destructuring_is_rejected() -> Bool:
+    marked: String =
+        |pure func number(id: UserId) -> Int:
+        |    [[Init(value)]] = id
+        |    value
+        |
+
+    parse_rejects(
+        marked,
+        REJECTION,
+        "use match id: with an arm such as Init(value): on the next line"
+    )
+
+
+pure func test_a_variant_through_its_union_is_rejected() -> Bool:
+    marked: String =
+        |pure func number(pair: Pair) -> Int:
+        |    [[Pair.Init(number, word)]] = pair
+        |    number
+        |
+
+    parse_rejects(
+        marked,
+        REJECTION,
+        "use match pair: with an arm such as Pair.Init(number, word): on the next line"
+    )
+
+
+pure func test_a_variant_through_an_alias_is_rejected() -> Bool:
+    marked: String =
+        |import:
+        |    ./ids as ids
+        |
+        |
+        |pure func number(length: ids.Length) -> Int:
+        |    [[ids.Len(value)]] = length
+        |    value
+        |
+
+    parse_rejects(
+        marked,
+        REJECTION,
+        "use match length: with an arm such as ids.Len(value): on the next line"
+    )
+
+
+pure func test_a_propagating_variant_destructuring_is_rejected() -> Bool:
+    marked: String =
+        |func number(id: Result[UserId, Int]) -> Result[Int, Int]:
+        |    [[Init(value)]] ?= id
+        |    Ok(value)
+        |
+
+    parse_rejects(
+        marked,
+        REJECTION,
+        "use match id: with an arm such as Init(value): on the next line"
+    )
+
+
+-- A long initializer is not echoed: the help names no value.
+pure func test_a_call_value_is_not_named_in_the_help() -> Bool:
+    marked: String =
+        |pure func left(pair: Pair) -> Int:
+        |    [[Pair.Init(first, _)]] = pair.swapped()
+        |    first
+        |
+
+    parse_rejects(
+        marked,
+        REJECTION,
+        "use match with an arm such as Pair.Init(first, _): on the next line"
+    )
+
+
+pure func test_a_value_on_the_next_line_is_named_when_it_is_a_name() -> Bool:
+    marked: String =
+        |pure func number(id: UserId) -> Int:
+        |    [[Init(value)]] =
+        |        id
+        |    value
+        |
+
+    parse_rejects(
+        marked,
+        REJECTION,
+        "use match id: with an arm such as Init(value): on the next line"
+    )
+
+
+-- Without `) =`, a line that starts with a variant is a value, as before.
+pure func test_a_variant_line_without_equals_is_a_value() -> Bool:
+    source: String =
+        |pure func same(id: UserId) -> Bool:
+        |    Init(value) == id
+        |    True
+        |
+
+    match statements_of(source):
+        [ExpressionStatement(_)]: True
+        _: False
+
+
+-- Only a declared alias qualifies, and only a variant name follows it.
+pure func test_a_call_on_a_name_that_is_not_an_alias_is_a_value() -> Bool:
+    source: String =
+        |pure func total(list: List[Int], x: Int) -> Int:
+        |    list.append(x)
+        |    x
+        |
+
+    match statements_of(source):
+        [ExpressionStatement(_)]: True
+        _: False
+
+
+pure func test_a_tuple_destructuring_still_parses() -> Bool:
+    source: String =
+        |pure func left(pair: (Int, Int)) -> Int:
+        |    (first, second) = pair
+        |    first
+        |
+
+    match statements_of(source):
+        [TupleBinding(_, _, _)]: True
+        _: False
+
+
+-- Tuple destructuring stays, so its own rejections stay tested.
+pure func test_a_tuple_name_takes_no_annotation() -> Bool:
+    marked: String =
+        |pure func left(pair: (Int, Int)) -> Int:
+        |    (first[[:]] Int, second) = pair
+        |    first
+        |
+
+    parse_rejects(
+        marked,
+        "destructuring names cannot have type annotations",
+        "annotate the value before destructuring it"
+    )
+
+
+pure func test_a_tuple_destructuring_needs_flat_names() -> Bool:
+    marked: String =
+        |pure func left(pair: (Int, (Int, Int))) -> Int:
+        |    (first, [[(second, third)]]) = pair
+        |    first
+        |
+
+    parse_rejects(
+        marked,
+        "tuple destructuring requires flat names or '_'",
+        "bind a nested tuple to a name, then destructure it separately"
+    )
+
+
+pure func test_a_tuple_destructuring_needs_two_names() -> Bool:
+    marked: String =
+        |pure func left(pair: (Int, Int)) -> Int:
+        |    [[(first)]] = pair
+        |    first
+        |
+
+    parse_rejects(
+        marked,
+        "tuple destructuring requires two to four names",
+        "write two to four comma-separated names or '_', such as (first, _) = value"
+    )
+
+
+TESTS: TestSuite = {
+    description = "Union destructuring rejection",
+    tests = [
+        ("a bare variant destructuring is rejected", test_a_bare_variant_destructuring_is_rejected),
+        ("a variant through its union is rejected", test_a_variant_through_its_union_is_rejected),
+        ("a variant through an alias is rejected", test_a_variant_through_an_alias_is_rejected),
+        (
+            "a propagating variant destructuring is rejected",
+            test_a_propagating_variant_destructuring_is_rejected
+        ),
+        ("a call value is not named in the help", test_a_call_value_is_not_named_in_the_help),
+        (
+            "a value on the next line is named when it is a name",
+            test_a_value_on_the_next_line_is_named_when_it_is_a_name
+        ),
+        ("a variant line without '=' is a value", test_a_variant_line_without_equals_is_a_value),
+        (
+            "a call on a name that is not an alias is a value",
+            test_a_call_on_a_name_that_is_not_an_alias_is_a_value
+        ),
+        ("a tuple destructuring still parses", test_a_tuple_destructuring_still_parses),
+        ("a tuple name takes no annotation", test_a_tuple_name_takes_no_annotation),
+        ("a tuple destructuring needs flat names", test_a_tuple_destructuring_needs_flat_names),
+        ("a tuple destructuring needs two names", test_a_tuple_destructuring_needs_two_names)
+    ]
+}

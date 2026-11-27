@@ -583,13 +583,19 @@ are not forms. Write `read.Empty` for a variant through a module alias. A
 pattern's union must be the matched value's: matching a `Shape` with
 `Other.Empty` reports that `Other.Empty` is a variant of `Other`.
 
-A union with one variant is read by destructuring, as a tuple is:
-`Meters.Init(length) = distance`, `units.Init(length) = distance` through a
-module alias, or `Init(length) = distance` where the bare name is unambiguous,
-binds one new name or `_` for each payload, and always matches. A union with
-several variants is read with `match` instead: destructuring one reports that
-it could fail to match. Another module cannot destructure a private variant;
-the error says to read the union through the functions its module exports.
+A union is read with `match`, however many variants it has. Unlike a tuple,
+it is not destructured: `Meters.Init(length) = distance` (also through a module
+alias, bare, or with `?=`) is rejected with "a union is read with match, not
+destructured", and the help names the arm to write:
+
+```blorp
+length = match distance:
+    Meters.Init(length): length
+```
+
+The arm's binder may reuse the name it binds: the outer `length` comes into
+scope after the `match`. A function whose body is the read ends with the
+`match` itself.
 
 Variant names share one namespace with the module's functions and constants.
 In one union each variant name is unique, and none is spelled like its union:
@@ -639,13 +645,13 @@ union UserId:
 private pure func user_id(value: Int) -> UserId:
     Init(value)
 pure func number(id: UserId) -> Int:
-    Init(value) = id
-    value
+    match id:
+        Init(value): value
 func main() -> Int:
     number(user_id(7))
 ```
 
-This exits 7. A variant marked `private` is built, matched and destructured
+This exits 7. A variant marked `private` is built and matched
 only in the module that declares it. `UserId` has one variant and one
 payload, so it is stored as its `Int`. `Init` is the convention for a type's one private
 variant; the language does not require the name. A private variant's payload
@@ -682,14 +688,14 @@ resource union Reader:
     private Init(Int)
 
 func read_chunk(reader: Reader, limit: Int) -> Int:
-    Reader.Init(handle) = reader
-    handle + limit
+    match reader:
+        Reader.Init(handle): handle + limit
 ```
 
 It has exactly one variant, private by its mark or, in a `private resource
 union`, through its union, with exactly one payload, and no type parameters;
 any other shape is one error. Only its module builds or reads one, by
-destructuring or `match`: another module's `match` is rejected ("Reader can
+`match`: another module's `match` is rejected ("Reader can
 be matched only in module ./reader"), and a resource has no `==`. Its one
 payload is the handle, so it is stored as that payload.
 
@@ -961,8 +967,8 @@ func main() -> Int:
 
 This prints `14 52`. Each line of a `concurrent:` block is a task, and the
 tasks may run at once on a pool of threads. A task is
-a binding (`name = value`, `name: T = value`, `var name = value`, a tuple or a
-variant destructuring), an expression, a loop or another block, which binds
+a binding (`name = value`, `name: T = value`, `var name = value`, or a tuple
+destructuring), an expression, a loop or another block, which binds
 what its own tasks bind. The block has no value, so a last line that is an
 expression is a task too, and its value must be Void ("this concurrent task's
 value is unused").

@@ -38,7 +38,6 @@ import:
         statement_end,
         ParsedStatement(
             TupleBinding,
-            VariantBinding,
             BindingStatement,
             PropagatingBinding,
             ExpressionStatement,
@@ -52,14 +51,13 @@ import:
         ValueExpression,
         WrittenName,
         TypeSyntax,
-        ParsedVariantBinding,
         Purity(Pure)
     ../assemble: ParsedModuleRow
     ../ids: DeclarationInventory, FunctionId, TraitId, TraitMethodId, UnionId, VariantId
     ../namespace/builtins: DesignatedResult, DesignatedBoolean, DesignatedOption, RuntimeOperation
     ../namespace/namespace: Namespace
     ./callables: ResolutionContext
-    ./constructors: VariantContract, ConstructionContext, construction_context, destructured_variant
+    ./constructors: VariantContract, ConstructionContext, construction_context
     ./declarations: CheckedDeclarations, ResolvedType(ResolvedTypeTerm), occurrence_fields
     ./errors:
         CheckError,
@@ -122,8 +120,6 @@ import:
         checker_invariant,
         match_error,
         statement_error,
-        ConstructorError(DestructuringRejected),
-        DestructuringProblem(SeveralVariants, PayloadCountMismatch, ValueOfOtherType),
         constructor_error,
         ResourceError(ResourceMatchedOutsideModule),
         resource_error,
@@ -186,7 +182,6 @@ import:
             ReadBinding,
             ConstructVariant,
             ReadTupleElement,
-            ReadPayload,
             ConstructTuple
         ),
         CheckedCallOperand(ValueOperand, CallableOperand),
@@ -993,8 +988,6 @@ private pure func resolve_statement(
     match statement:
         TupleBinding(binders, initializer, span):
             binders.resolve_tuple_binding(initializer, span, block, context)
-        VariantBinding(binding):
-            binding.resolve_variant_binding(block, context)
         BindingStatement(binding):
             binding.resolve_assignment(block, context)
         PropagatingBinding(propagation):
@@ -1570,220 +1563,6 @@ private pure func bind_projection(
     )
 
 
--- `Union.Variant(binders) = value` reads a union with one variant (rule 7).
--- Its variant resolves as a construction's does, so the access and ambiguity
--- rules apply unchanged. A union stored as its payload reads that payload and
--- binds nothing else, so a resource union's handle is read without an alias.
--- Any other union is bound once and read with a `match` per binder.
-private pure func resolve_variant_binding(
-    written: ParsedVariantBinding,
-    block: ResolvedStatements,
-    context: ResolutionContext
-) -> Result[ResolvedStatements, CheckError]:
-    head ?= context
-        .construction_context()
-        .destructured_variant(written.variant)
-
-    variant = head[0]
-    owner = variant.variant_owner()
-
-    rejected = pure func(span: Span, problem: DestructuringProblem) -> CheckError: constructor_error(
-        span,
-        DestructuringRejected(variant, problem)
-    )
-
-    declaration ?= context.unions
-        .get(owner.union_number())
-        .or_checker_invariant(written.span, InvalidCheckedUnion(owner))
-
-    fields: List[TypeUse] ?= match declaration.variants:
-        [only]: Ok(only.fields)
-        _: Err(rejected(written.span, SeveralVariants(declaration.variants.length())))
-
-    _: Void ?= if fields.length() == written.binders.length():
-        Ok(void)
-    else:
-        Err(rejected(written.span, PayloadCountMismatch(fields.length(), written.binders.length())))
-
-    resolved ?= block.resolve_value(written.initializer, UntypedValue, context)
-    value_type = resolved.value.value_type
-
-    occurrence: UnionOccurrence ?= match value_type.union_occurrence():
-        Some(found):
-            if found.owner == owner:
-                Ok(found)
-            else:
-                Err(rejected(written.initializer.span, ValueOfOtherType(value_type)))
-        None:
-            Err(rejected(written.initializer.span, ValueOfOtherType(value_type)))
-
-    payloads ?= fields.occurrence_fields(occurrence)
-
-    next: ResolvedStatements = { block |
-        lambdas = resolved.lambdas,
-        bindings = resolved.bindings,
-        reassigned = resolved.reassigned,
-        uses = block.uses
-            .concat(resolved.uses)
-            .with_uses(head[1])
-    }
-
-    match declaration.storage:
-        StoredAsPayload:
-            written.binders.bind_erased_payload(
-                variant,
-                payloads,
-                resolved.value,
-                written.span,
-                next,
-                context
-            )
-        StoredByValue | StoredOnHeap:
-            written.binders.bind_payload_matches(
-                variant,
-                payloads,
-                resolved.value,
-                written.span,
-                next,
-                context
-            )
-
-
--- Destructures a union stored as its payload: the arity check leaves exactly
--- one payload and binder, and a `_` binder still evaluates the read.
-private pure func bind_erased_payload(
-    binders: List[ParsedBinder],
-    variant: VariantId,
-    payloads: List[TypeUse],
-    value: CheckedExpr,
-    span: Span,
-    block: ResolvedStatements,
-    context: ResolutionContext
-) -> Result[ResolvedStatements, CheckError]:
-    read: CheckedExpr ?= match payloads:
-        [payload]:
-            Ok({
-                form = ReadPayload(variant, value, 0),
-                value_type = payload.value_type,
-                span = span
-            })
-        _:
-            Err(checker_invariant(span, InvalidCheckedUnion(variant.variant_owner())))
-
-    match binders:
-        [NamedBinder(name)]: block.bind_projection(name, read, context)
-        _: Ok({ block | statements = block.statements.append(DiscardExpression(read)) })
-
-
--- Destructures a union that is not stored as its payload: the value is bound
--- once, unnamed, and each named binder reads its payload with a single-arm
--- `match`. The union has one variant, so the match needs no tag test, as in
--- derived equality's singleton selection.
-private pure func bind_payload_matches(
-    binders: List[ParsedBinder],
-    variant: VariantId,
-    payloads: List[TypeUse],
-    value: CheckedExpr,
-    span: Span,
-    block: ResolvedStatements,
-    context: ResolutionContext
-) -> Result[ResolvedStatements, CheckError]:
-    subject_id = binding_id(block.bindings.length())
-
-    subject_definition: BindingDefinition = {
-        origin = BodyLocal,
-        mutable = False,
-        named = False,
-        value_type = value.value_type,
-        span = span
-    }
-
-    var resolved: ResolvedStatements = { block |
-        bindings = block.bindings.append(subject_definition),
-        statements = block.statements.append(InitializeBinding(subject_id, value))
-    }
-
-    root: CheckedPatternPlace = { route = MatchRoot, value_type = value.value_type }
-    var position = 0
-    var failure: Option[CheckError] = None
-
-    for binder in binders:
-        match binder:
-            DiscardBinder(_):
-                void
-            NamedBinder(name):
-                match payloads.get(position):
-                    None:
-                        failure = Some(
-                            checker_invariant(name.span, UnsupportedPatternReachedResolution)
-                        )
-                    Some(payload):
-                        input = binding_id(resolved.bindings.length())
-
-                        input_definition: BindingDefinition = {
-                            origin = MatchCapture,
-                            mutable = False,
-                            named = False,
-                            value_type = payload.value_type,
-                            span = name.span
-                        }
-
-                        arm = match_arm_id(0)
-
-                        projection: CheckedExpr = {
-                            form = Match({
-                                scrutinee = {
-                                    form = ReadBinding(subject_id),
-                                    value_type = value.value_type,
-                                    span = span
-                                },
-                                selection = {
-                                    nodes = [
-                                        EnterArm(arm, [
-                                            BorrowPlace({
-                                                route = UnionField(root, variant, position),
-                                                value_type = payload.value_type
-                                            })
-                                        ])
-                                    ],
-                                    entry = decision_node_id(0)
-                                },
-                                arms = [
-                                    {
-                                        id = arm,
-                                        inputs = [input],
-                                        statements = [],
-                                        value = {
-                                            form = ReadBinding(input),
-                                            value_type = payload.value_type,
-                                            span = name.span
-                                        }
-                                    }
-                                ],
-                                carried = []
-                            }),
-                            value_type = payload.value_type,
-                            span = name.span
-                        }
-
-                        resolved = { resolved |
-                            bindings = resolved.bindings.append(input_definition)
-                        }
-
-                        match resolved.bind_projection(name, projection, context):
-                            Err(error): failure = Some(error)
-                            Ok(bound): resolved = bound
-
-        if failure.is_some():
-            break
-
-        position = position + 1
-
-    match failure:
-        Some(error): Err(error)
-        None: Ok(resolved)
-
-
 private pure func bind_for_binder(
     binder: ForBinder,
     element: TypeRef,
@@ -1895,7 +1674,6 @@ private pure func task_names(tasks: List[ParsedStatement]) -> List[NameId]:
         bound: List[NameId] = match task:
             BindingStatement(binding): [binding.name.id]
             TupleBinding(binders, _, _): binders.binder_names()
-            VariantBinding(binding): binding.binders.binder_names()
             ConcurrentBlock(block): block.tasks.task_names()
             _: []
 
