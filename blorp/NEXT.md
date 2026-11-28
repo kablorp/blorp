@@ -37,9 +37,13 @@ done.
       CPU-bound elements, and one allocation for the result);
     - landing 4a: the process and print natives are safe on several
       threads, with a fork lock, a counted SIGINT and SIGQUIT swap and
-      whole lines.
+      whole lines;
+    - landing 4b: the fiber primitives, a context switch, stacks behind a
+      guard in a bounded cache, and the kernel's lock, in `FIBER_RUNTIME`
+      with a direct-C suite; nothing emits it yet.
   - **Next:** the rest of landing 4, the kernel's runtime support, in slices
-    4b to 4g with no seed rotation. 4b is the fiber primitives.
+    4c to 4g with no seed rotation. 4c is parking and the blocking
+    pool.
     - Before landing 6's channels: in-place reuse of a uniquely owned
       record, a compiler change of its own, and a decision on the buffered
       round trip's remaining gap.

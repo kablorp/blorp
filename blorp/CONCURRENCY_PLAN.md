@@ -2783,6 +2783,347 @@ task can reach.
 - a measured fork wait under many concurrent readers, beyond the window
   case.
 
+### Landing 4b results
+
+**What landed:** `FIBER_RUNTIME`, in `src/common/codegen/runtime/fiber.brp`,
+proven by a direct-C suite, `test_runtime/fiber_suite.brp` with
+`fixtures/fiber_test.c`. Nothing emits it yet; landing 5 is its first user.
+- **The shared stack rule.** The pool's stack size, guard and pause moved
+  from `JOIN_RUNTIME` to a new `THREAD_RUNTIME`, which emit places before
+  it, renamed from `blorp_join_` to `blorp_thread_`. Fibers follow it.
+- **The interface:**
+  - `struct blorp_fiber_context`, what a switch saves and resumes, a fiber's
+    or a thread's own, and `struct blorp_fiber`, a context with its stack and
+    entry;
+  - `blorp_fiber_create(entry, argument)`, `blorp_fiber_switch(from, to)`,
+    `blorp_fiber_destroy(fiber)` and `blorp_fiber_thread_context()`;
+  - `struct blorp_kernel_lock`, `BLORP_KERNEL_LOCK_INITIALIZER`,
+    `blorp_kernel_lock` and `blorp_kernel_unlock`.
+
+**Differences from the brief:**
+- **A thread's context and a fiber are two types.** The switch takes
+  contexts and destroy takes a fiber, so destroying a thread's own context
+  does not compile.
+- **Create never returns NULL.** A stack that cannot be mapped stops the
+  program with its cause, as the pool's thread start does, so no caller can
+  forget a check: "error: cannot start a fiber: mmap failed: Cannot allocate
+  memory".
+- **The record lives at the top of its stack's mapping,** as Boost.Context
+  places its control structure. So a fiber allocates nothing beyond its
+  mapping, and the strict leak check sees nothing.
+- **arm64 saves FPCR too.** The brief's register list leaves it out, but its
+  test asks that fibers keep their own rounding modes. AAPCS64 leaves FPCR to
+  the program as global state, and glibc's aarch64 `swapcontext` saves it.
+  A fiber starts with its creator's control state, as C11 starts a thread.
+- **The switch refuses what a kernel must never do,** with "fiber runtime
+  invariant broken": leaving a context that is not running or that runs on
+  another thread, resuming one that is neither new nor suspended, destroying
+  one that is neither new nor finished, and resuming a fiber on a thread
+  other than the one it first ran on. The last two turn the thread-local
+  comment at the switch into a checked rule.
+- **A destroyed fiber is `BLORP_FIBER_CACHED`,** set under the cache's lock
+  before the stack can be taken, so a second destroy, or a switch to it,
+  meets the refusals above. Without it a double destroy cached one stack
+  twice and two creates then shared it; the review's probe showed it.
+- **The lock spins, yields, then blocks,** in the three phases of Go's
+  runtime locks, on a word of its own rather than a pthread mutex taken by
+  trylock. The lock measurement below gives the reasons.
+- **Fresh stacks are advised `MADV_NOHUGEPAGE` on Linux,** so that a
+  stack's size costs address space and not memory where transparent huge
+  pages are `always`. The fiber limits below give the measurement.
+- **ASan.** A stack is poisoned when it is cached and unpoisoned when it is
+  handed out again.
+  - **A fresh mapping is not unpoisoned.** `__asan_unpoison_memory_region`
+    clears shadow with `memset`, which made an eighth of each 8 MiB stack
+    resident: 9.7 GB at 10,000 fibers, until the OOM killer ended the run on
+    arm64 Linux. Without it, that case peaks at 87 MiB with Clang and 110
+    MiB with GCC.
+  - **Before a stack is unmapped,** only the frames live at its fiber's last
+    switch are cleaned, from its saved stack pointer to the top. Every
+    deeper frame returned, and so unpoisoned itself.
+
+**The switch.**
+- **The registers.** arm64 saves x19 to x29, x30, d8 to d15 and FPCR in a
+  176-byte frame, and never touches x18. x86-64 saves rbx, rbp, r12 to r15,
+  MXCSR and the x87 control word. Any other target is an `#error`.
+- **A first entry** returns into `blorp_fiber_enter`, which puts the fiber
+  in the first argument register, clears the return address, and jumps to
+  `blorp_fiber_start` through x16 on arm64 and r12 on x86-64. The frame
+  pointer is null too, so `backtrace()` stops at the entry.
+- **When an entry returns,** its fiber switches to the context that last
+  resumed it, and is finished.
+- **Landing pads:** `bti c` under `__ARM_FEATURE_BTI_DEFAULT`, and `endbr64`
+  under `__CET__`'s IBT bit. The entry stub is reached by `ret`, which
+  neither checks.
+- **Pointer authentication:** x30 is saved and restored as it is, and each
+  frame authenticates with its own stack pointer, which never moves.
+
+**BTI and PAC on arm64 Linux.** The Docker VM's CPU, on an M4, has both.
+Neither of the image's compilers turns branch protection on by default.
+- **A forced BTI link cannot start.** Ubuntu's `crt1.o` and libc are not
+  BTI-marked, so a `-z force-bti` program dies with SIGILL before `main`.
+- **So a probe maps its own text with `PROT_BTI` once it runs.** It is
+  `build/concurrency/landing4b-evidence/tools/bti.c`, in the main checkout's
+  ignored evidence directory, with the landing's other scripts. Built with
+  `-mbranch-protection=standard` and bound at startup (`-z now`, since the
+  unmarked link's lazy-binding PLT stub has no landing pad), a first entry
+  and an indirect call to the switch both pass, with Clang and with GCC. Without `bti c` in the switch,
+  the indirect call dies with SIGILL. With the entry stub branching through
+  x15, which `bti c` does not accept, the first entry dies with SIGILL.
+- **The whole probe passes with `-mbranch-protection=standard`,** so with
+  every C frame signing its return address.
+
+**Shadow stacks.**
+- **CI runs with them off.** CI's "Linux x64 GCC" job compiles with Ubuntu's
+  GCC 13.3, whose `-fcf-protection` default sets `__CET__` to 3, and every
+  library in the image is marked for IBT and SHSTK.
+  - **glibc 2.39 never marks SHSTK usable by default:**
+    `sysdeps/x86/cpu-features.c` has `#if CET_ENABLED && 0` around it, so
+    `dl_cet_check_startup` clears it.
+  - **They come on only with a tunable,** and then only on a CPU and kernel
+    (6.6 or later) that support them. `glibc.cpu.hwcaps=SHSTK` alone
+    enables them only in a binary marked for them, which Clang's builds are
+    not; `glibc.cpu.hwcaps=SHSTK:glibc.cpu.x86_shstk=on` always enables them
+    (glibc's `manual_tunables.texi`).
+  - **The Seed jobs compile with Clang,** which does not set `__CET__`.
+- **So the runtime detects them and stops.** This is the brief's
+  recommended choice.
+  - **The first fiber reads `rdsspq`,** a no-op that leaves 0 when shadow
+    stacks are off. When they are on, it stops with "error: cannot start a
+    fiber: this process runs with shadow stacks, which Blorp fibers do not
+    support yet".
+  - **arm64 Linux's guarded control stack** is the same hazard, so it is
+    read with `chkfeat` (`hint #40`).
+- **The test.** The suite runs its `registers` case with both tunables set,
+  which must either pass or stop with that message and its hint. If the
+  runtime missed shadow stacks, the first `ret` of a switch would fault,
+  which the case rejects. Emulated x86-64 has no CET, so only the first ran
+  here; CI's native run is the one that can reach the second.
+- **Switching shadow stacks,** as glibc's `swapcontext` does, waits for a
+  platform that turns them on by default.
+
+**Fiber limits.** Each fiber touches one page and parks. Stacks are the main
+thread's 8 MiB, which is 8,176 KiB on macOS, plus the 64 KiB guard.
+
+| | macOS, arm64 (16 KiB pages) | Linux, arm64 (4 KiB pages) |
+| --- | --- | --- |
+| Mappings per live fiber | 2.0 | 2.0 |
+| Resident per parked fiber | 16.4 KB | 4.1 to 4.3 KB |
+| Page tables per parked fiber | not reported | 4.1 KB |
+| 10,000 parked | 165 MB resident; parked in 45 ms | 42 MB resident and 41 MB of page tables; parked in 34 ms |
+| 100,000 parked | 1.64 GB resident and 806 GB reserved, granted; parked in 0.67 s | 412 MB resident and 413 MB of page tables, 806 GB reserved, granted; parked in 0.33 s |
+| Where it stops | not on mappings or address space at 100,000 | at half of `vm.max_map_count`: about 131,000 live fibers at this VM's 262,144, where `mprotect` fails with ENOMEM and the program stops with "error: cannot start a fiber: mprotect failed: Cannot allocate memory"; about 32,700 at the default 65,530 |
+
+- **Spike K measured 16.6 KB and 4.3 KB per parked fiber** with 256 KiB
+  stacks, so the larger stacks cost address space, not resident pages.
+- **On Linux they cost page tables,** 4.1 KB per parked fiber, as much as
+  its page. Each fiber's touched page is in its own 2 MiB region, so it
+  needs a page-table page of its own; Spike K's 256 KiB stacks shared one
+  among 8.
+- **Transparent huge pages.** The VM's are `always`, as on RHEL; Ubuntu's
+  are `madvise`. A first touch then commits a whole 2 MiB page wherever the
+  2 MiB block is inside the mapping. A mapping of 8 MiB and 64 KiB shifts
+  the next by 64 KiB against that grid, so one fiber in 32 got one for its
+  top page: 656 MB of the 696 MB resident at 10,000 parked fibers. So each
+  fresh mapping is advised `MADV_NOHUGEPAGE` before its guard is set, which
+  took that to 42 MB with the same two mappings per fiber; JDK 21 has a
+  mitigation for thread stacks for the same reason.
+
+**The cache keeps its stacks' touched pages.** Its bound,
+`BLORP_FIBER_CACHED_STACKS`, is 64.
+
+| | macOS | Linux, arm64 |
+| --- | ---: | ---: |
+| A cycle of create, switch, finish and destroy, from the cache | 92 to 102 ns | 42 to 64 ns |
+| The same, when each fiber touched 64 KiB | 868 to 935 ns | 417 to 570 ns |
+| A cycle that releases the cached stack's pages | 6,039 to 6,159 ns | 332 to 598 ns |
+| Releasing, when each fiber touched 64 KiB | 14,328 to 15,820 ns | 15,969 to 18,707 ns |
+| A cycle with no cache: mmap, mprotect, first touch, munmap | 13,929 to 14,999 ns | 4,002 to 5,691 ns |
+| The cache, after 128 fibers that touched 1 MiB each | 72.7 MB resident | 70.8 MB resident |
+| 10,000 shallow fibers parked after them | 236 MB resident, 277 MB footprint | 112 MB resident |
+| The same, releasing cached pages | 236 MB resident, 206 MB footprint | 42 MB resident |
+
+- **Releasing costs 6 to 60 times a cached cycle,** and on macOS most of
+  what the cache saves, while the memory it frees is bounded already: at
+  most the bound's 64 stacks, each holding what its fiber touched. That is
+  a page or two for a fiber that waits on natives, and 512 MiB in the worst
+  case, 64 stacks touched to their full 8 MiB.
+- **glibc releases a dead thread's stack before caching it**
+  (`advise_stack_range`), but a thread costs far more than a fiber.
+- **macOS's `MADV_FREE_REUSABLE`** lowers the footprint, but leaves the
+  pages resident until memory is short.
+
+**The kernel lock.** It spins 64 rounds reading the word with a pause, then
+yields 16 times, then sleeps on a mutex and condition variable.
+- **Against Spike K's spin-then-yield lock,** on Spike K's C baseline cases,
+  medians of 5 interleaved runs:
+
+| Case | macOS, 4 carriers | Linux arm64, 4 carriers | Linux arm64, 8 carriers on 4 CPUs |
+| --- | ---: | ---: | ---: |
+| ping-pong | 1.11 | 1.01 | 1.05 |
+| half-full | 1.09 | 1.09 | 1.20 |
+| pipeline | 1.51 | 1.05 | 0.92 |
+| tasks | 0.97 | 1.04 | 1.03 |
+| task-batches | 1.02 | 0.87 | 1.13 |
+
+- **Why a word of its own.** A pthread mutex taken by trylock while spinning
+  cost 1.63 times Spike K's lock on the uncontended `half-full` on macOS:
+  `pthread_mutex_trylock` and `unlock` are calls with checks of their own.
+  The word, read before it is tried, cost 1.08.
+- **Why it yields before sleeping.** On macOS's `pipeline`, 2,000,000
+  messages on 4 carriers, with 64 spins:
+  - **with 1 yield,** it slept about 21,000 times, and every unlock after a
+    sleep signals, about 186,000 times; 200 to 234 ms;
+  - **with 4,** about 5,000 sleeps; 146 to 170 ms;
+  - **with 16,** 6 to 8 sleeps; 93 to 120 ms, against Spike K's 61 to 72 ms
+    in that run.
+- **Why the word is last.** The structure is 116 bytes on macOS and 96 on
+  Linux, against Spike K's 4. With the word last, taking the lock and
+  touching what it guards share a cache line when a lock heads a structure.
+  Moving it from first to last took macOS's `pipeline` from 397 to 649 ms
+  down to 253 to 429 ms, before the yields were added.
+- **What remains is the lock's size.** macOS's `pipeline` is the one case
+  over 1.5. Spike K's own algorithm, padded to the same size with its word
+  last, ran it at 1.69, so the rest is the size, not the algorithm. In a
+  kernel cell, the lock sits beside a pointer to the Blorp value, so the
+  size should matter less there. A smaller lock would need a table of
+  sleepers keyed by address, as Go's semaphore table and WebKit's ParkingLot
+  have.
+- **`pipeline` is layout-sensitive on macOS.** Two builds of Spike K's
+  identical code ran it at 40 ms and 190 ms. So it was measured against
+  Spike K's algorithm at the same size, as above.
+- **It does not burn cores.** Eight threads on 4 CPUs (`taskset`), one
+  holding the lock asleep for 20 ms at a time: Spike K's lock used 4.00 CPUs
+  while waiting, this one 0.00. The harness is
+  `build/concurrency/landing4b-evidence/tools/lock_bench.c`.
+  - **Sleeping costs throughput behind a sleeping holder:** with that 20 ms
+    holder this lock made 43 acquisitions a second against Spike K's 53,
+    about 19% fewer (`lock/burn-linux-arm64-8-on-4.txt`): a waiter that
+    sleeps must be woken after the unlock.
+  - **Under full contention,** with no holder, this one did 2 to 5% fewer
+    acquisitions than Spike K's, on about 3 CPUs instead of 4.
+
+**Tests,** in the new suite. Each "bite" was a single change to the fragment,
+run against every case: it failed the case named, and only that one, on
+macOS, and in both Linux images where it applies.
+
+| Case | What it checks | Fails without |
+| --- | --- | --- |
+| registers | three contexts each set every callee-saved register and its own rounding mode, switch through each other, and find them all unchanged | restoring x25, d12 or FPCR (arm64), or r13, MXCSR or the x87 control word (x86-64) |
+| depth | 1,000 frames of 4 KiB on a fiber | |
+| deep drop | a million-node chain released on a fiber through the release scheduler; the strict leak check balances | |
+| overflow | a fiber recursing without end faults inside its guard, which the fault handler checks | the guard: the overflow writes below the stack, so the fault is outside the guard, or, on x86-64 under ASan, ASan reports the write into the mapping below as a stack-buffer-overflow |
+| scale | 10,000 fibers created, switched through and destroyed, allocating nothing | |
+| cache | a destroyed fiber's stack is reused without a mapping, and the cache unmaps beyond its bound | the bound: stacks past it stay mapped; the cache |
+| backtrace | `backtrace()` on a fiber ends two frames after its caller's caller, at `blorp_fiber_start` | the entry's null return address |
+| lock totals | 4 and 8 threads incrementing under the lock | the lock |
+| lock sleeps | a waiter behind a holder asleep for 300 ms uses under a quarter of that in CPU time | the sleep: it spins and yields without end |
+| shadow stacks | `registers` under the shadow-stack tunables passes, or stops with the runtime's message | |
+| refusals | mmap and mprotect failures stop with their causes; destroying a suspended fiber, from a fiber, destroying one twice, switching to a destroyed or finished one, switching away from another thread's context, and resuming one on another thread stop with their rules | the ASan hooks (the abort on a fiber makes ASan warn that it ignores `__asan_handle_no_return`; this is the destroy-suspended case's abort); the thread checks; the cached state (a double destroy and a switch to a destroyed fiber both pass without it, and cache-never fails them too) |
+
+- **Two probes run every case that can:** `-O0` with ASan and UBSan, and
+  `-O2` as a program is built. Frames whose size a case relies on keep it by
+  escaping to an empty `asm`, since Clang splits a 4 KiB volatile array it
+  can see whole into its two used bytes.
+- **Fake stacks.** Each ASan case runs with `detect_stack_use_after_return`
+  set, so every switch saves and restores them; Linux turns them on by
+  default and macOS does not. The deep drop runs without them, since they
+  would move its frames off the fiber's stack, and GCC's took 42 to 56 s on
+  it, on the main thread as on a fiber.
+- **ThreadSanitizer,** by hand on arm64 Linux: the register, depth, cache,
+  backtrace and both lock cases, at `-O1` and `-O2`, 3 times each with Clang
+  and GCC, with no report.
+
+**Evidence:**
+- **Platforms.** Every case passed on macOS with Apple Clang 21, on arm64
+  Linux with Clang 18.1 and GCC 13.3, and on emulated x86-64 Linux with GCC
+  13.3, CET on, and Clang 18.1. No x86-64 case ran natively here; CI's Linux
+  x64 jobs are the native run.
+- **Which fragment.** The cases, TSan and the BTI runs used the final
+  fragment. The bites used the one before the huge-page advice, which adds
+  one `madvise` to the mapping path and changes no code a bite breaks.
+- **Fixture C,** every e2e fixture compiled by main's compiler and by this
+  one: status, stdout and stderr are identical for all 784. 632 emit
+  identical C and 136 are rejected. The other 16, the programs with the
+  pool, differ exactly by the old `JOIN_RUNTIME` text being replaced by the
+  new `THREAD_RUNTIME` and `JOIN_RUNTIME`, byte for byte; a stray change
+  planted in one is reported.
+- **The gate,** on the rebased head (`make -C blorp test
+  INSTRUCTION_CHECK=on`, with the pool and fiber suites in it): exit 0, 3,658
+  passed and none failed. `git diff --check` is clean. The fiber probe,
+  built as the suite builds it, also passed on arm64 Linux, with Clang 18.1
+  and GCC 13.3: 27 runs each. The new bites, `no-cached-state` and
+  `wrong-context`, fail only their own cases on macOS, and the register,
+  guard and ASan-hook bites still fail theirs.
+
+**Cost,** `self-compile-cost 94b463fda 6544584d3 --rounds 3`, fixed-input
+row:
+
+| Measure | Base `94b463fda` | Candidate `6544584d3` | Change |
+| --- | ---: | ---: | ---: |
+| Allocations | 13,693,537 | 13,693,537 | +0.0000% |
+| Peak heap, bytes | 192,204,970 | 192,204,970 | +0.0000% |
+| Instructions, median of 3 | 13,945,447,181 | 13,939,642,242 | −0.0416% |
+
+The fixed-input C is identical. The own-source row: allocations +0.0047%,
+peak heap −0.0054%, instructions +0.0421%, as the compiler's source grew.
+The final commit, `282a5d207`, differs from the measured one only in
+`fiber.brp`, which no compiler module imports, and the compiler's C it
+builds is byte for byte the same.
+
+**Lines,** against ceilings of +500 and +600, from `origin/main` after the
+rebase:
+- **production:** +451 and −29, so +422 net: `fiber.brp` +403; `thread.brp` +39; `join.brp` +5 and −28;
+  `emit.brp` +4 and −1;
+- **test:** +865, within the corrected ceiling below. `fiber_test.c` is 506
+  lines and `fiber_suite.brp` 353; the driver
+  and the pool suite take 6. The review's fixes cut the fixture's own
+  shadow-stack detector (27 lines) and added three refusal cases (double
+  destroy, a switch to a destroyed fiber, a switch from another thread's
+  context: 36 fixture lines and 20 suite lines), so they net +26 from the
+  +839 the review measured.
+  - **Beyond the brief's list,** about 165 lines: the lock-sleeps case, the
+    mapping failures, and the invariant refusals. One refusal, destroying a
+    suspended fiber from a fiber, is also the case that the ASan-hook bite
+    fails.
+
+**The test ceiling, corrected by the coordinator on 2026-11-27:**
+
+| Ceiling | Old | New |
+| --- | ---: | ---: |
+| Test lines | +600 | +815, then +870 |
+
+- **The first correction** follows the review's growth audit. The estimate
+  left out about 105 lines of fixture infrastructure, and about 165 lines
+  are necessary cases beyond the brief: the mapping failures, the invariant
+  refusals and lock-sleeps. 27 duplicate lines were cut.
+- **The second** pays for the three refusal cases the review asked for
+  (about 56 lines).
+
+**Not covered:**
+- native x86-64 hardware, and with it CET's IBT and shadow stacks;
+- switching shadow stacks;
+- a fiber that migrates between carriers, which landing 7 would need with
+  thread-local accessors;
+- a carrier that exits while its fibers live: each fiber records its
+  carrier's context, a thread-local, so landing 5's carriers must outlive
+  their fibers;
+- parking, permits and the blocking pool, which are 4c's;
+- a measured kernel workload in Blorp with this lock, since Spike K's
+  Blorp kernel was not rebuilt; the comparison used its C baseline.
+
+**Follow-ups for landing 5:**
+- **A program stops at about 32,700 live fibers** at Linux's default
+  `vm.max_map_count` (65,530, two mappings per fiber), with "mprotect failed:
+  Cannot allocate memory", which does not name the real cause. Landing 5
+  should say that the map count is the limit.
+- **`THREAD_RUNTIME` is emitted only under the pool requirement,** with no
+  include guard, so landing 5 must emit it once for the pool and the fibers.
+- **TSan has no repeatable gate.** Its runs here were by hand.
+- **The `PTHREAD_STACK_MIN` floor** is in `fiber.brp`, a second stack rule
+  beside `THREAD_RUNTIME`'s. Moving it into the shared rule changes the
+  pool's C, so it stays out of 4b.
+
 ## Landings
 
 Each is a vertical slice that can be tested on its own. Every one runs
@@ -2860,6 +3201,8 @@ compiled code.
      - the switch for arm64 and x86-64, with CET and BTI;
      - fiber stacks with a lazy commit, a guard and a cache;
      - the ASan and TSan switch hooks.
+
+     See "Landing 4b results".
    - **4c. Parking and the blocking pool:**
      - park and unpark with permits;
      - the wait word and its claim, with one waker per wait (change 3's C
