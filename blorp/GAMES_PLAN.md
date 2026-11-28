@@ -1,104 +1,113 @@
-# Graphics and games plan
+# Making Blorp ready for games
 
-Status: revision 6, 2026-11-27.
-- **Round 1** of soundness and ergonomics review: 5 blockers and 32
-  should-fixes, all taken in revision 2.
-- **Round 2:** blockers only. All 5 were resolved, with none new. It also
-  found 5 soundness should-fixes, taken in revision 3, with their C
-  behaviour probed.
-- **Revision 4** took Keith's first FFI decisions (one type set both ways,
-  and copies) and had a focused soundness review.
-- **Revision 5** follows Keith's "minimize complexity and maximize safety".
-  W2 is now eight rules:
-  - always copy, with no opt-out;
-  - C returns List results in memory from `malloc`;
-  - every foreign function is impure;
-  - binding is only through declared C adapters;
-  - decoders exist only for the supported types.
-
-  A quick soundness check covered the rewrite.
-- **Revision 6** moves Int32 and Float32 (W5) ahead of the FFI, at Keith's
-  word.
-
-Where a finding changed a recommendation, the section says so.
-
-This plan turns what the gravity prototype taught into the work Blorp needs
-before the game comes back:
-- an FFI, then a window;
-- 32-bit numbers;
-- the pool's cost on small maps;
-- the library gaps;
-- the language and tooling friction the game logged.
+Status: revision 7, 2026-11-27.
+- **Revisions 1 to 6:** two rounds of soundness and ergonomics review, then
+  focused soundness reviews of each FFI change.
+- **Revision 7** reframes the plan, at Keith's word:
+  - It makes Blorp ready for games in general. It builds no particular game,
+    and favours no type of game.
+  - The prototype that found these needs is evidence, not a goal.
+  - Its code is reference, not a deliverable.
 
 Keith decides the items marked **G**. The rest are recommendations.
 
-## Problem
+## Goal
 
-Keith asked for a game written in Blorp, to hone decisions about graphics,
-concurrency and efficiency. It is a gravity simulation in which players
-launch comets to seed or sterilize worlds, while black holes and quasars
-form. A prototype exists:
-- **The library it needed:** branch `gravity/prototype`, 13 commits on
-  `94b463fda` up to `daddbed48`, gated and reviewed, not pushed. It adds
-  Float math, bit operations, a pure generator with OS seeds, a clock, and
-  terminal raw mode and input.
-- **The game:** 1,770 lines of Blorp and 668 of tests, in
-  `.claude/worktrees/gravity/scratch/gravity/game/`. Its review notes are
-  `.claude/worktrees/gravity/scratch/gravity/REVIEW.md`, and every rough edge it met is in
-  `.claude/worktrees/gravity/scratch/gravity/game/FRICTION.md`.
-- **Those files exist only on Keith's machine.** They are ignored by git, in
-  the worktree of the `gravity/prototype` branch, and so is the evidence in
-  `build/gravity-evidence/` in the main checkout. This plan quotes what an
-  implementer needs from them.
+Blorp should be a good language for writing games of any kind: real-time or
+turn-based, in a terminal or a window, simple or simulation-heavy. This plan
+lists the capabilities that takes, as general language, library and tooling
+work. Each one is useful outside games too.
 
-The game plays at 30 frames a second in a terminal, with half-block
-characters as pixels. That was always a proof of concept. Keith wants the
-game in its own window, with as much of the graphics in Blorp as possible.
-That needs:
-- **An FFI,** to call the OS's window system.
-- **Cheaper parallel work:** the pool made the game's step slower, not
-  faster.
-- **Fixes for the friction** that cost the game's author the most time.
+**What "ready for games" means here:**
+1. **Numbers and math:** Float functions, conversions, bit operations, and
+   32-bit numbers.
+2. **Randomness:** a pure, seeded, reproducible generator, and a way to get
+   a seed.
+3. **Time:** durations, a monotonic clock, and sleeping to a deadline.
+4. **The terminal:** raw input with a timeout, the window size, and a
+   full-screen mode that restores the terminal on every exit the runtime
+   controls.
+5. **A window:** open one, present a frame, read keyboard and mouse events.
+6. **Drawing in Blorp:** frames, shapes, text and images, as libraries.
+7. **Parallel work** that pays off at the sizes games use.
+8. **C libraries,** called safely, through an FFI.
+9. **Everyday ergonomics:** library conveniences, and the language and
+   tooling friction that slows writing such programs.
 
-### What the prototype measured
+**The principle** (Keith, 2026-11-27): as much as possible in Blorp. The OS
+appears only behind small C adapters.
 
-On an Apple M4 with 4 performance and 6 efficiency cores, at `-O2`.
+**Not in scope yet:**
+- audio;
+- networking;
+- GPU rendering;
+- asset pipelines;
+- engines;
+- gamepads and touch input;
+- any particular game.
 
-| What | Figure | Source |
-| --- | --- | --- |
-| 1,024 bodies, 20 steps of direct gravity, 1 thread | 0.0192 s, 1.09× C with libm | `build/gravity-evidence/probe/timing-final.txt` |
-| The same on 4 threads | 0.0072 s | the same |
-| The game's step per frame (about 250 bodies, 6 attractors, 16 maps a frame) | 0.13 ms on 1 thread, 0.29 ms on 4, 2.8 ms at the default 10; 8.1 s of system CPU in a 1.7 s run | FRICTION, "Slow" |
-| One `parallel_map` of 4,096 elements of about 8 square roots each | 31 µs on 1 thread, 14.9 µs on 2, 27.7 µs on 4, 329 µs on 10 | the same |
-| `map` of the same | 61 µs, twice `parallel_map` on one thread | the same |
-| The game's tests | 0.6 s on 1 thread, 14 s at the default thread count | the same |
-| One frame at 160×48 cells | step and path 4.6 ms, drawing 0.43 ms, output 0.09 ms and 6.8 KB; 29.7 fps | the game's HUD, in a pty |
-| Determinism | the same world hash at 1, 2, 4 and 10 threads | `--headless 600` |
-| Compiling the game | `blorp compile` 0.23 s; clang `-O2` 0.80 s for 984 KB of C | the game's measurements |
+Saving and loading is already covered by `io/files`. Images are decoded and
+encoded in W9; asset pipelines are not.
 
-What worked is in FRICTION's last section:
-- fixed records and unions inline;
+Int32, Float32 and the FFI prepare the ground for audio and the GPU.
+
+## Evidence
+
+A prototype found these needs. It was a real-time 2D simulation played in a
+terminal, written against an unmerged branch. It exercised capabilities 1 to
+4 and 7, and logged every rough edge it met. This plan uses its findings,
+not its code.
+
+**What it measured,** on an Apple M4 with 4 performance and 6 efficiency
+cores, at `-O2`:
+
+| What | Figure |
+| --- | --- |
+| 1,024 bodies, 20 steps of direct gravity, 1 thread | 0.0192 s, 1.09× C with libm |
+| The same on 4 threads | 0.0072 s |
+| A per-frame update of about 250 bodies, 16 `parallel_map`s a frame | 0.13 ms on 1 thread, 0.29 ms on 4, 2.8 ms at the default 10; 8.1 s of system CPU in a 1.7 s run |
+| One `parallel_map` of 4,096 elements of about 8 square roots each | 31 µs on 1 thread, 14.9 µs on 2, 27.7 µs on 4, 329 µs on 10 |
+| `map` of the same | 61 µs, twice `parallel_map` on one thread |
+| Its tests | 0.6 s on 1 thread, 14 s at the default thread count |
+| One frame at 160×48 terminal cells | update 4.6 ms, drawing 0.43 ms, output 0.09 ms and 6.8 KB; 29.7 fps |
+| Determinism | the same state hash at 1, 2, 4 and 10 threads |
+| Compiling it | `blorp compile` 0.23 s; clang `-O2` 0.80 s for 984 KB of C |
+
+**What worked, and should stay:**
+- fixed records and unions held inline;
 - determinism with no effort;
 - `concurrent:` reading naturally;
 - updates in place through a private-variant wrapper;
 - help lines that were mostly right.
 
-This plan keeps all of those.
+**Where the evidence lives:** only on Keith's machine, in ignored files:
+- the friction log,
+  `.claude/worktrees/gravity/scratch/gravity/game/FRICTION.md`;
+- its review notes, `.claude/worktrees/gravity/scratch/gravity/REVIEW.md`;
+- the measurements, in `build/gravity-evidence/`.
+
+This plan quotes what an implementer needs.
+
+**Reference code:**
+- Branch `gravity/prototype` (13 commits on `94b463fda`, unpushed) has a
+  reviewed implementation of most of W0: math, bits, random, a clock, and
+  terminal input.
+- A W0 landing may borrow from it, but nothing here depends on it.
+- Main has moved since: union destructuring is gone, and a new seed is
+  pinned.
 
 ## Decisions so far
 
 **Keith, 2026-11-27:**
-- **Randomness:** pure functions, given one seed from IO. Done on the branch.
-- **Graphics:** as much as possible in Blorp, starting with a terminal
-  view. That view is a proof of concept.
-- **Math:** the math functions are wanted. Done on the branch.
-- **The four terminal fixes** from review are wanted. Done on the branch.
+- **Randomness:** pure functions, given one seed from IO.
+- **Graphics:** as much as possible in Blorp. A terminal view came first, as
+  a proof of concept.
+- **Math:** the math functions are wanted.
 - **A window needs an FFI,** and the FFI goes in this plan.
-- **Order:** the needs and friction here are worked first, in other
-  sessions. Then the game resumes.
-- **Int32 and Float32** are to be considered.
-- **What C returns:** C could return only bytes, which Blorp validates into
-  the shape it wants. G6 below generalizes this.
+- **Order:** this work comes first, in other sessions.
+- **Int32 and Float32** land before the FFI (G13).
+- **The FFI:** minimal and safe (G3 to G11).
+- **Revision 7:** the plan is game-agnostic.
 
 **Earlier decisions this plan must respect:**
 - **2026-10-02, reconfirmed 2026-10-15** ("let's enforce it"): no
@@ -112,31 +121,36 @@ This plan keeps all of those.
 
 ## The workstreams
 
-They are in the recommended order. Each names its owning document, where
-one already exists.
+Each names its owning document, where one already exists.
 
-| # | Workstream | Size | Depends on | Owner decisions |
-| --- | --- | --- | --- | --- |
-| W0 | Land the gravity library on main | medium: main moved | Seed CI | G1, G2 |
-| W1 | Spike W: a window in plain C | small | none | none |
-| W2 | The FFI, in its own plan | large | W1, W5; F3 after `RUN_AND_TEST_PLAN.md`'s CLI landing | G3 to G11 |
-| W3 | The window library | medium | W1, W2 | none |
-| W4 | The pool on small maps, and `map`'s cost | medium | W0, for the probe's imports; `CONCURRENCY_PLAN.md` | none |
-| W5 | Int32 and Float32, in their own plan, before W2 | medium, with a seed rotation | `UINT8_BYTES_PLAN.md`'s pattern | G12, G13 |
-| W6 | Library gaps | small, several landings | W0, for the rows that edit branch code | G14 |
-| W7 | Language friction | one landing per item | the items | G15 to G21 |
-| W8 | Tooling friction | small | none | G22 |
-| W9 | The game, back in a window | game code | W0, W3 | none |
+| # | Workstream | Capability | Size | Depends on | Owner decisions |
+| --- | --- | --- | --- | --- | --- |
+| W0 | Core libraries: math, bits, randomness, time, terminal input | 1 to 4 | medium, several landings | none | G1, G2 |
+| W1 | Spike W: a window in plain C | 5 | small | none | none |
+| W2 | The FFI, in its own plan | 8 | large | W1, W5; W0's `bits` and W6's `float_from_bits` for its decoding toolkit; F3 after `RUN_AND_TEST_PLAN.md`'s CLI landing | G3 to G11 |
+| W3 | The window library | 5 | medium | W1, W2 | none |
+| W4 | The pool on small maps, and `map`'s cost | 7 | medium | `CONCURRENCY_PLAN.md`; W0's clock for an in-process probe | none |
+| W5 | Int32 and Float32, in their own plan, before W2 | 1 | medium, with a seed rotation | `UINT8_BYTES_PLAN.md`'s pattern | G12, G13 |
+| W6 | Library gaps | 9 | small, several landings | W0, for rows that extend its modules | G14 |
+| W7 | Language friction | 9 | one landing per item | the items | G15 to G21 |
+| W8 | Tooling friction | 9 | small | none | G22 |
+| W9 | Drawing in Blorp | 6 | medium | W0; W3 for windows | none |
 
-**The order of the large pieces:** W0, then W5 and W1, then W2, W3 and W9.
+**The order of the large pieces:**
+1. W0;
+2. W5 and W1, beside each other;
+3. W2;
+4. W3;
+5. W9, whose terminal half can start after W0.
+
 Int32 and Float32 come before the FFI, so that the FFI's first version
 carries them (Keith, 2026-11-27).
 
 **What can run beside what:**
-- W7, W8 and W6's rows on code main already has can run beside everything.
-- W5 and W1 can run beside each other.
-- W4 needs W0 first, because its probe imports `io/clock`, `math` and
-  `time`.
+- W7, W8, and W6's rows that need nothing from W0, beside everything.
+- W4 once W0's clock has landed, or earlier if its probe times whole runs
+  from outside.
+- W5 and W1 beside each other.
 
 ## Handing this plan to an implementer
 
@@ -150,14 +164,14 @@ this plan. Landings then fall into two groups.
 
 **Ready to brief and implement now.** Each has a settled design, and its
 work is mostly mechanical:
-- **W0,** the library replay and landing.
+- **W0,** one landing per area, against the requirements below.
 - **W6:**
   - `zip`, `enumerate`, `fold` and `sum`;
   - `Int.abs`, `UInt8.to_float`, `to_bits` and `float_from_bits`;
-  - `print_inline` and `print_error_inline`;
-  - the `read_input` union;
-  - the review nits;
-  - the terminal's SIGTSTP, SIGCONT and IXON.
+  - `print_inline` and `print_error_inline`.
+
+  Each goes in a module chosen under W0's placement rule, since the seed
+  reads `int`, `uint8`, `float` and the console modules.
 - **G12, as it applies to UInt8:** `wrapped_to_uint8` and
   `clamped_to_uint8`.
 - **The help lines:** G15 (a) and G17.
@@ -172,75 +186,158 @@ work is mostly mechanical:
 - **W3,** after W2.
 - **W4,** which is an investigation, in the concurrency plan.
 - **W5,** in its own plan.
+- **W9:** its module and type names need ergonomics input.
 - **G18, G19 and G20,** each a small design with parser or ergonomics input.
 - **G22:** measure the corpus diff first.
-- **W6's rows that depend on G2 or the system-call interface:**
-  - `sleep_until`;
-  - `elapsed`'s origin;
-  - `with_alternate_screen`, whose signal handling needs a design;
-  - the infallible system-call form for `fault`.
+- **W0's `with_alternate_screen`,** whose restore on a signal needs a
+  design: leaving and re-entering the alternate screen and the cursor on
+  SIGTSTP and SIGCONT, not only raw mode.
+- **W6's infallible system-call form for `fault`.**
 
-## W0: land the gravity library
+## W0: core libraries
 
-**What lands:** the branch's `blorp/` changes, against `94b463fda`:
+Capabilities 1 to 4, each a small landing with its own tests. This section
+states what each must provide, not how. The requirements include what
+review of a prototype implementation found.
 
-| Change | Lines |
-| --- | --- |
-| Source | +682 / −15 |
-| Library | +597 / −6 |
-| Tests | +2,663 / −12 |
-| README | +132 |
+**Placement.** The pinned seed reads every module the compiler imports,
+including `float`, `int`, `bytes` and the prelude, and it rejects a builtin
+label it does not know. So:
+- new natives go in modules the compiler does not import;
+- or they wait for a seed rotation.
 
-**Review:** two rounds, ending with 0 open blockers and 0 should-fixes. Four
-nits stay open; they move to W6 and W8.
-
-**Main has moved since the branch was cut.** The replay is real work:
-1. **The seed is new.** `96b2cbaac` pinned a seed built from `94b463fda`.
-2. **Union destructuring is gone.**
-   - Main deleted it in `2c906685b` (`UNION_DESTRUCTURING_REMOVAL_PLAN.md`),
-     and the branch uses it, as in `random.brp`'s `Init(state) = generator`
-     and in `time.brp`.
-   - Migrate every such read to `match`.
-3. **One ceiling no longer exists.** `variants/alias_destructure`, whose
-   allocation ceiling the branch raised, is gone from main. That raise
-   drops.
-4. **Concurrency landing 4b has landed:** `217ecff10` and `d6b3cdbe1`.
-
-So redo the cost rows on the replayed commits:
-- **Self-compile, with stage-2 compilers.** `self-compile-cost` runs the
-  seed's runtime, so it misses runtime-fragment changes, and the branch
-  changes several.
-- **Every ceiling.**
-- **The full gate.**
-- **A dispatched `blorp.yml` run for Seed CI.** Nothing was compiled on
-  Linux.
-
-**The math functions are in a new `math.brp`.** The prelude imports
-`float`, so the seed reads `float.brp` and rejects new labels there.
+**Math (`math`).**
+- **Functions:** `PI`, `sqrt`, `floor`, `ceil`, `round` (half away from
+  zero), `trunc`, `sin`, `cos`, `tan`, `atan2`, `exp`, `log` and `pow`.
+- **`to_int(Float) -> Int`:** truncates, saturates at Int's limits, and
+  gives 0 for NaN.
+- **`to_float(Int) -> Float`.**
+- **Docs:** they state which functions are exact on every platform (`sqrt`,
+  the rounding functions, the conversions), and which come from libm and may
+  differ in the last bit (G14).
 
 **G1. The math functions' home.**
-- **Moving them into `float.brp` later is not free.** Modules do not
+- **They cannot go in `float.brp`,** which the prelude imports and so the
+  seed reads.
+- **Moving them there after a rotation is not free:** modules do not
   re-export, so every call site's import would change.
-- **Recommended:** keep `math.brp` as their home. After the next rotation,
-  the prelude selects `math: Float methods` (README, "`module: Shape
-  methods`"), so `x.sqrt()` needs no import. Call sites keep working.
+- **Recommended:** a `math` module. After the next rotation, the prelude
+  selects `math: Float methods` (README, "`module: Shape methods`"), so
+  `x.sqrt()` needs no import.
+
+**Bits (`bits`).** `bit_and`, `bit_or`, `bit_xor`, `bit_not`, `shift_left`
+and `shift_right`. Shifts are logical, a count outside 0 to 63 gives 0, and
+nothing reaches C's undefined behaviour. A sign-preserving shift waits for a
+need.
+
+**Randomness (`random` and `io/random`).**
+- **The generator:** `Random`, a union with a private variant, so only its
+  module builds or reads one. Every draw returns the value and the next
+  generator:
+  - `seeded(Int)`;
+  - `next_int`;
+  - `next_below(bound)`, unbiased, by rejection. A bound of 0 or less gives
+    0 and the generator unchanged, so the function is total;
+  - `next_float`, in [0, 1) from 53 random bits;
+  - `split`, giving two separate streams for separate work, such as
+    parallel tasks.
+- **The algorithm:** a small, fast, published non-cryptographic generator,
+  written in Blorp, so that a seed gives the same stream on every platform.
+  - Tests check a published test vector.
+  - `split` must give streams that do not overlap in practice. SplitMix64
+    with a gamma derived per split, as Java's `SplittableRandom` does, meets
+    that. A fixed gamma does not, since its streams are offsets on one
+    cycle, and the prototype's implementation used one.
+- **IO:** `random_seed() -> Int` from the OS, plus the conveniences
+  `random_generator()`, `random_below(bound)` and `random_float()`. They are
+  named like the pure forms, with `random_` for "uses the OS". After the
+  seed, everything is pure.
+- **Reading a draw:**
+
+  ```blorp
+  var generator = seeded(42)
+
+  for turn in 0..3:
+      (roll, advanced) = generator.next_below(6)
+      generator = advanced
+      print("rolled ${roll + 1}")
+  ```
+
+**Time (`time`, and a clock).**
+- `Duration`: never negative, with saturating arithmetic, and the
+  constructors `nanoseconds`, `milliseconds` and `seconds`.
+- A monotonic clock reading, `elapsed() -> Duration`, counted from program
+  start, as the concurrency plan's `elapsed()` is, so that replacing it
+  later keeps behaviour.
+- A `sleep`, and a `sleep_until(deadline: Duration)`, whose deadline is a
+  `Duration` on that clock. A frame loop writes `deadline = deadline +
+  frame`, then sleeps until it.
 
 **G2. Where the clock lives.**
-- **The branch adds `io/clock`.** Its `elapsed()` counts from its first
-  call, and its `sleep(Duration)` blocks the thread.
-- **The concurrency plan defines both in `concurrency`.**
-  - `sleep` parks the fiber.
+- **The concurrency plan defines `sleep` and `elapsed` in `concurrency`.**
+  - There, `sleep` parks the fiber.
   - `elapsed()` is "the time since the runtime started", virtual under
     `simulate`.
-- **Once fibers run, a blocking `sleep` stalls its carrier, and real time
-  inside `simulate` breaks determinism.**
+- **A blocking `sleep` would stall a carrier** once fibers run, and real
+  time inside `simulate` would break determinism.
 - **Options:**
   - (a) Land `io/clock` now as the pre-fiber form, documented as such.
-    Concurrency landing 5 then replaces it with `concurrency.sleep` and
+    Concurrency landing 5 replaces it with `concurrency.sleep` and
     `concurrency.elapsed`, and deletes `io/clock`.
-  - (b) Hold the clock out of W0, and land it with landing 5.
-- **Recommended: (a).** The game needs a clock now. The concurrency plan
-  then owns the move. W0 records it there.
+  - (b) Wait for landing 5.
+- **Recommended: (a).** Real-time programs need a clock before landing 5.
+  Record the move in the concurrency plan.
+
+**Terminal input (`io/terminal`).**
+- **The interface:**
+  - `with_raw_mode[T, E](body, on_error)`, the scoped primitive, after
+    `with_reader`;
+  - `with_alternate_screen[T, E](body, on_error)`: raw mode, the alternate
+    screen and a hidden cursor, all restored together;
+  - the manual `enter_raw_mode` and `leave_raw_mode`, which the scopes are
+    built on, are private;
+  - `read_input(timeout)`, whose result is a union of four cases:
+    - input;
+    - nothing yet;
+    - resumed: the program was stopped and continued, so the screen must be
+      redrawn;
+    - end of input.
+  - `terminal_size() -> Option[TerminalSize]`, a record of `columns` and
+    `rows`.
+- **What review of the prototype's implementation found:**
+  - **Restoring.** Raw mode is restored at exit, and on SIGINT, SIGQUIT,
+    SIGTERM, SIGHUP and SIGABRT:
+    - in async-signal-safe handlers;
+    - installed only over a default disposition;
+    - with an interrupted restore retried.
+  - **Re-raising.** After restoring, a handler re-raises the signal, so the
+    program still ends as that signal would end it, which the exit statuses
+    of `RUN_AND_TEST_PLAN.md` R5 rely on.
+  - **`exit_interrupted`** restores raw mode before it re-raises.
+  - **Arming the handlers.** They are installed on every entry, not once.
+    While a `process.run` holds its counted signal swap, the handler goes
+    into the swap's saved dispositions, so the run cannot lose it.
+  - **Ctrl-Z and Ctrl-S:**
+    - SIGTSTP restores the terminal before stopping: raw mode, and in
+      `with_alternate_screen` also the main screen and the cursor.
+    - SIGCONT re-enters them all, and the next `read_input` reports
+      "resumed". Re-entering the alternate screen clears it on common
+      terminals, so whatever was drawn is gone;
+    - IXON is turned off, so Ctrl-S does not pause output.
+  - **Documenting the limits:**
+    - the timeout's cap;
+    - that leaving raw mode discards typed-ahead input;
+    - that a `process.run` inside raw mode would hand its child the raw
+      terminal, so the scope is left first.
+  - **Tests:** every one of those paths has a pty test, and each test fails
+    when its fix is reverted.
+
+**Every W0 landing:**
+- runs the full gate;
+- dispatches Seed CI, since this adds natives;
+- is reviewed;
+- measures runtime-fragment changes with stage-2 compilers, since
+  `self-compile-cost` runs the seed's runtime.
 
 ## W1: Spike W, a window in plain C
 
@@ -353,7 +450,7 @@ the rest:
 | --- | --- | --- |
 | `Int` | `int64_t` | `int64_t` |
 | `Float` | `double` | `double` |
-| `Bool` | `uint8_t`, 0 or 1 | `uint8_t`; nonzero is `True`, a total conversion |
+| `Bool` | `uint8_t`, 0 or 1 | `uint8_t`; nonzero is `True`, a total conversion. `binary`'s `bool_at` is strict instead, since a byte layout is a format to check |
 | `UInt8` | `uint8_t` | `uint8_t` |
 | `List[Int]` | `int64_t *data, int64_t length`: a fresh copy | returns the length, and sets an `int64_t **data` out-parameter, the function's last parameter |
 | `List[Float]` | `double *data, int64_t length` | the same, with `double **data` |
@@ -419,6 +516,12 @@ NaN goes quiet with no trap, as long as C leaves the FP environment alone
   "conflicting types" error, as probed with Apple clang 21 on 2026-11-27.
   Without the forced header it would compile and link silently, because a
   source file is its own translation unit.
+- **Showing a C author the expected signature.** A List result's C form
+  differs from its Blorp form: it adds an out-parameter, and returns a
+  count. So:
+  - the CLI writes the prototypes header beside the sources;
+  - a "conflicting types" error is followed by a note naming Blorp's
+    declaration and the expected C prototype.
 - **The symbol check.** Before linking, the CLI checks that each declared
   symbol is defined by the declared sources' objects. So no foreign function
   can bind a library symbol unchecked.
@@ -464,8 +567,17 @@ foreign:
     link macos "-framework AppKit" "-framework CoreGraphics"
     link linux "-lX11"
 
-private foreign func native_open(width: Int, height: Int, title: List[UInt8]) -> Int = "blorp_window_open"
-private foreign func native_present(window: Int, pixels: List[UInt8], width: Int, height: Int) -> Int = "blorp_window_present"
+private foreign func native_open(
+    width: Int,
+    height: Int,
+    title: List[UInt8]
+) -> Int = "blorp_window_open"
+private foreign func native_present(
+    window: Int,
+    pixels: List[UInt8],
+    width: Int,
+    height: Int
+) -> Int = "blorp_window_present"
 private foreign func native_poll(window: Int) -> List[UInt8] = "blorp_window_poll"
 private foreign func native_close(window: Int) -> Int = "blorp_window_close"
 ```
@@ -611,7 +723,7 @@ int64_t blorp_window_poll(int64_t window, uint8_t **data) {
                   events.x[index], events.y[index]);
     }
     *data = out; /* Blorp copies it, then frees it */
-    return events.count * EVENT_SIZE;
+    return events.count * EVENT_SIZE; /* a count of elements: bytes, for a List[UInt8] */
 }
 ```
 
@@ -645,6 +757,8 @@ private pure func decoded_event(record: Bytes) -> Result[WindowEvent, DecodeErro
         _: Err(UnknownTag(kind))
 
 
+-- A named function, because a variant constructor is not a function value
+-- (W7 lists it as friction).
 private pure func malformed_events(error: DecodeError) -> WindowError:
     MalformedEvents(error)
 
@@ -661,7 +775,10 @@ func poll_events(window: Window) -> Result[List[WindowEvent], WindowError]:
 
 ```blorp
 -- A typed List needs no decoding: every value C can return is valid.
-private foreign func native_samples(stream: Int, count: Int) -> List[Float] = "blorp_audio_samples"
+private foreign func native_histogram(
+    data: List[Float],
+    buckets: Int
+) -> List[Float] = "blorp_stats_histogram"
 
 -- Text comes back as bytes, and String's own constructor checks the UTF-8.
 private foreign func native_clipboard(window: Int) -> List[UInt8] = "blorp_window_clipboard"
@@ -673,7 +790,11 @@ func clipboard_text(window: Window) -> Option[String]:
 
 -- A record going out is encoded with the same layout rules.
 private pure func encoded_rectangle(data: Bytes, area: Rectangle) -> Bytes:
-    data.append_float(area.x).append_float(area.y).append_float(area.width).append_float(area.height)
+    data
+        .append_float(area.x)
+        .append_float(area.y)
+        .append_float(area.width)
+        .append_float(area.height)
 ```
 
 **Not planned:**
@@ -799,8 +920,15 @@ size. macOS first.
   example shows;
 - a `Key` union, whose `key_of` is total, with `Other(Int)` for a code it
   does not know;
-- `present(window, frame) -> Result[Void, WindowError]`, which copies the
-  frame like any List.
+- `present(window, pixels: List[UInt8], width, height) ->
+  Result[Void, WindowError]`, as `native_present` takes it, with the pixels
+  copied like any List. W9 adds a frame-level wrapper, so W3 does not
+  depend on W9.
+- **Design questions for W3's landing,** not settled by the example below:
+  - whether `with_window` also gets a one-type form, so that a program whose
+    errors are all `WindowError` needs no identity mapper;
+  - whether a lost window should arrive as an event, so that `present` can
+    return `Void` and the loop loses its error plumbing.
 
 **How `with_window` works.** The same way `with_reader` works in
 `io/files/read.brp`:
@@ -819,7 +947,11 @@ resource union Window:
     private Init(Int)
 
 
-private foreign func native_open(width: Int, height: Int, title: List[UInt8]) -> Int = "blorp_window_open"
+private foreign func native_open(
+    width: Int,
+    height: Int,
+    title: List[UInt8]
+) -> Int = "blorp_window_open"
 private foreign func native_close(window: Int) -> Int = "blorp_window_close"
 
 
@@ -851,17 +983,19 @@ func with_window[T, E](
 Each public function, such as W2's `poll_events`, reads the handle with
 `match`, since union destructuring is gone from main.
 
-The game's side:
+A program's side: any real-time loop, here with the program's own `State`,
+`handled`, `advanced` and `drawn`. `unchanged` is a one-line identity
+mapper, `pure func unchanged(error: WindowError) -> WindowError: error`:
 
 ```blorp
 import:
     io/console/output: print_error
-    window: Window, WindowError, WindowEvent(KeyDown, CloseRequested), Key(Space), with_window, present, poll_events
+    window: Window, WindowError, WindowEvent(CloseRequested), with_window, present, poll_events
 
 -- `?=` may not appear inside a loop (Keith, 2026-10-15), so a failure
 -- ends the loop and becomes the result.
-func play(window: Window) -> Result[Void, WindowError]:
-    var world = starting_world()
+func run(window: Window) -> Result[Void, WindowError]:
+    var state = initial_state()
     var running: Bool = True
     var outcome: Result[Void, WindowError] = Ok(void)
 
@@ -871,15 +1005,14 @@ func play(window: Window) -> Result[Void, WindowError]:
                 for event in events:
                     match event:
                         CloseRequested: running = False
-                        KeyDown(Space): world = world.launched()
-                        _: void
+                        _: state = state.handled(event)
             Err(error):
                 outcome = Err(error)
                 running = False
 
-        world = world.stepped()
+        state = state.advanced()
 
-        match window.present(world.drawn()):
+        match window.present(state.drawn(), WIDTH, HEIGHT):
             Ok(_): void
             Err(error):
                 outcome = Err(error)
@@ -889,7 +1022,7 @@ func play(window: Window) -> Result[Void, WindowError]:
 
 
 func main() -> Int:
-    match with_window("gravity", 1280, 720, play, pure func(error: WindowError) -> WindowError: error):
+    match with_window("example", 1280, 720, run, unchanged):
         Ok(_): 0
         Err(error):
             print_error(error.to_string())
@@ -903,11 +1036,7 @@ func main() -> Int:
 - **The macOS-15 runner** may not be able to open a window. Spike W checks.
 - **The C layer** gets tests that stub the OS calls, as the terminal's do.
 
-**Later, all in Blorp:**
-- a `graphics` module, which lifts the game's discs, glows and lines out of
-  its view;
-- a bitmap font, as data;
-- image encoders for screenshots, such as BMP and QOI.
+Drawing what is presented is W9's.
 
 ## W4: the pool on small maps, and `map`'s cost
 
@@ -918,18 +1047,20 @@ evidence. Its Spike P results already note two things:
 - The serial `map` "retires 2.25× the instructions of a loop into a List
   sized up front".
 
-**The game shows both costs in a real program:**
+**The prototype shows both costs in a real program:**
 - **The pool on small maps.**
   - A `parallel_map` of 4,096 elements is ten times slower on the default
     ten threads than on one, with 13.7 s of system CPU in a 3.1 s run.
-  - No list size in the game gains from more than two threads.
-  - Even 2,000 dust motes take 1.0 ms on 1 thread and 5.1 ms on 10.
+  - No list size in its per-frame update gains from more than two threads.
+  - Even 2,000 light elements take 1.0 ms on 1 thread and 5.1 ms on 10.
 - **`map` itself:** it is half the speed of `parallel_map` on one thread.
 
 **Recommended:**
 1. **Measure where the system time goes:** idle workers spinning, waking,
-   or sleeping in the kernel. Use the game's probe,
-   `.claude/worktrees/gravity/build/gravity/measure/parallel_map_cost.brp`, after W0.
+   or sleeping in the kernel. Use a probe that times one `parallel_map`
+   against `map` per list size and thread count. The prototype's version is
+   `.claude/worktrees/gravity/build/gravity/measure/parallel_map_cost.brp`,
+   for reference only.
 2. **Split on demand, not by a fixed minimum.**
    - Spike P found that a nested map needs pieces of one element, so a fixed
      minimum piece size is wrong.
@@ -937,7 +1068,8 @@ evidence. Its Spike P results already note two things:
      not expose.
    - Instead: split only when another worker is idle to steal the piece,
      and otherwise run in place.
-   - Measure it on the game and on Spike P's nested map.
+   - Measure it on a small-map, per-frame workload like the prototype's,
+     and on Spike P's nested map.
 3. **Choose a default thread count that suits mixed cores,** such as the
    performance cores from `hw.perflevel0.physicalcpu` on macOS, until the
    pool handles mixed cores well.
@@ -976,8 +1108,11 @@ by naming only the conversion that was needed first.
 
 - **UInt8 gets the same family:** add `wrapped_to_uint8` and
   `clamped_to_uint8`.
-- **Float to an integer width saturates,** with NaN giving 0, as `to_int`
-  does. That fits principle 1.
+- **On a Float, every conversion to an integer width is total.**
+  `x.to_int32()` and `x.to_uint8()` truncate and saturate, with NaN giving
+  0, as `to_int` does. That fits principle 1.
+- **The checked and wrapping forms exist only on integer receivers,** where
+  a value can be out of range without being a rounding question.
 - **Recommended.**
 
 **G13. Literals and order.**
@@ -999,21 +1134,17 @@ by naming only the conversion that was needed first.
 
 ## W6: library gaps
 
-Each is a small landing, in Blorp unless noted. A row that edits branch code
-waits for W0.
+Each is a small landing, in Blorp unless noted. A row that extends a W0
+module waits for W0.
 
 | Gap | Evidence | Proposal |
 | --- | --- | --- |
-| `zip`, `enumerate`, `fold`, `sum` | the game counts indexes by hand 5 times and sums by hand 7 times | `zip` stops at the shorter list, as in Rust and Python. `fold(values, initial, step)` puts the initial value first, like `fold_lines`. `sum` takes `List[Int]` or `List[Float]` and adds left to right, so a Float sum is deterministic. Measure the List of pairs that `zip` and `enumerate` build; if `for (index, value) in values.enumerate():` is hot, give that loop a form that builds nothing. |
-| `Int.abs` | the game writes `difference.max(-difference)` | add it, wrapping at INT_MIN as negation does |
+| `zip`, `enumerate`, `fold`, `sum` | the prototype counts indexes by hand 5 times and sums by hand 7 times | `zip` stops at the shorter list, as in Rust and Python. `fold(values, initial, step)` puts the initial value first, like `fold_lines`. `sum` takes `List[Int]` or `List[Float]`, and after W5 `List[Int32]` and `List[Float32]`. It adds left to right, so a Float sum is deterministic, and an integer sum wraps. Measure the List of pairs that `zip` and `enumerate` build; if `for (index, value) in values.enumerate():` is hot, give that loop a form that builds nothing. |
+| `Int.abs` | the prototype writes `difference.max(-difference)` | add it, wrapping at INT_MIN as negation does |
 | `UInt8.to_float` | `channel.to_int().to_float()` | add it |
-| Float bits | the world hash spells every Float as text, about 40 KB per hash | `to_bits(Float) -> Int` and `float_from_bits(Int) -> Float`, natives. A name of its own avoids a clash with a later `float32_from_bits`, since both take an Int. A negative Float gives a negative Int. NaN's sign differs between x86-64 and arm64 (`CTFE_PLAN.md`), so the bits are exact but not the same everywhere for NaN. |
+| Float bits | a state hash spells every Float as text, about 40 KB per hash | `to_bits(Float) -> Int` and `float_from_bits(Int) -> Float`, natives. A name of its own avoids a clash with a later `float32_from_bits`, since both take an Int. A negative Float gives a negative Int. NaN's sign differs between x86-64 and arm64 (`CTFE_PLAN.md`), so the bits are exact but not the same everywhere for NaN. |
 | Text to stdout without a newline | a frame goes through `write(to_bytes(text))`, a copy | `print_inline(text)` and `print_error_inline(text)` in `io/console/output`, which pair with `print` and `print_error` and do not read like `io/files`' `write_text(path, text)` |
-| A deadline sleep | a loop that sleeps and then compares ran at 28 fps, not 30 | `sleep_until(deadline: Duration)`, on the clock `elapsed()` reads, so a deadline is a `Duration` since that clock's origin; moves with G2 |
-| An alternate-screen scope | Ctrl-C leaves the alternate screen and a hidden cursor, and the game's `run` script works around it | `with_alternate_screen[T, E](body, on_error)`: raw mode, the alternate screen and a hidden cursor, restored on return and exit, and on a signal or an abort by the same handler that restores raw mode, which writes the escapes with `write(2)`, an async-signal-safe call. Best-effort until a pty test proves each path. |
-| Terminal gaps | Ctrl-Z leaves the terminal raw; IXON pauses output | handle SIGTSTP and SIGCONT; turn IXON off |
-| `read_input`'s result | "nothing yet" is `Some` of empty bytes | a three-case union |
-| Review nits from W0 | `split`'s "independent" wording; the undocumented INT_MAX-millisecond cap and TCSAFLUSH | fix the docs |
+| An alternate-screen scope's restore | Ctrl-C leaves a full-screen program's alternate screen and hidden cursor behind, and the prototype needed a shell wrapper | W0 names `with_alternate_screen`. Its restore on a signal or an abort runs in the same handler that restores raw mode, which writes the escapes with `write(2)`, an async-signal-safe call. It is best-effort until a pty test proves each path. |
 | `fault` | lives in `io/_launch` and prints "process runtime defect" | an infallible system-call form, so `elapsed`, `sleep` and `random_seed` lose the error arms they can never take |
 | Portable transcendental functions | libm's `sin`, `cos`, `exp`, `log` and `pow` may differ in the last bit between macOS and glibc | G14 |
 
@@ -1031,7 +1162,9 @@ waits for W0.
 - (b) Ship portable implementations in Blorp, so a replay matches on every
   platform.
 
-**Recommended: (a) now.** The game's step uses only exact operations.
+**Recommended: (a) now.** A program that needs replays to match across
+platforms can keep its simulation to exact operations meanwhile:
+arithmetic, `sqrt` and the conversions.
 
 ## W7: language friction
 
@@ -1039,8 +1172,9 @@ Each item is its own design and landing. An item that adds syntax gets
 parser and ergonomics input first, and documenter review after.
 
 **G15. Shadowing.**
-- **The evidence:** seven renames: `attractors`, `merged`, `camera`,
-  `starfield`, `length`, `energy` and `quasars_in_reach`.
+- **The evidence:** in the prototype, seven names a program wanted for a
+  value collided with a function it also defined or imported. One was
+  `length`.
 - **What is already possible:** the `length` collision can be avoided
   today. Selecting `vector: Vector methods` gives UFCS access without
   importing the name `length` (README, "`module: Shape methods`").
@@ -1064,7 +1198,7 @@ parser and ergonomics input first, and documenter review after.
 **G16. Bare constructors and `==`.** Revision 1 bundled three changes. Split:
 - (a) The prelude's `True`, `False`, `Some`, `None`, `Ok` and `Err` need no
   expected type.
-  - They are unambiguous today, and this is the largest win: the game needed
+  - They are unambiguous today, and this is the largest win: the prototype needed
     17 annotations, most of them here.
   - `x = None` still cannot infer its `T`. Its help says to annotate the
     binding.
@@ -1092,8 +1226,8 @@ precedence" was not decidable. Operators need:
   line break after an operator outside brackets ends the expression.
 - **Keywords.**
   - The words become reserved. `bool.brp` declares functions of those
-    names, and `.and(` appears 78 times in the game, and throughout the
-    library and the compiler.
+    names, and `.and(` appears throughout programs, the library and the
+    compiler.
   - So either a method name after `.` may be a keyword, or the functions
     are renamed.
 - **The compiler's source.** It calls the `bool` functions (`blorp/AGENTS.md`,
@@ -1185,7 +1319,8 @@ precedence" was not decidable. Operators need:
 | Constants cannot be computed from constants (`HALF_STEP: Float = TIME_STEP * 0.5`) | already planned: `CTFE_PLAN.md` L3, computed constants |
 | A tuple destructuring cannot be annotated | `(kind, events): (Kind, List[Event]) = …`, or less need once G16 lands |
 | `from: Vector = …` reports "expected a return expression" | the typed binding's parse path reports the reserved word, as `from = 3` already does; consider unreserving `from` |
-| Positional arguments only: `habitat_lived(…, flux, …, duration)` takes two Floats a caller can swap | later; named arguments are a larger design |
+| Positional arguments only: a call that takes two Floats in a row lets a caller swap them silently | later; named arguments are a larger design |
+| A variant constructor is not a function value: `result.map_err(Wrapped)` reports "variant does not belong to the expected type", which does not say why | allow a constructor as a function value, or at least say so in the help |
 
 ## W8: tooling friction
 
@@ -1203,8 +1338,8 @@ precedence" was not decidable. Operators need:
     first.
   - (b) Keep the rule. When an operand's chain must break, break at the
     operators first, and indent the chain under its operand.
-- **Exempting `.not()` would be a special case,** and G17's operators would
-  make it moot.
+- **Exempting `.not()` would be a special case.** With no operators (G17),
+  the chain rule is the fix.
 - **Recommended: (a),** if the measured diff is acceptable. Otherwise (b).
 
 **Test failures:**
@@ -1220,24 +1355,68 @@ precedence" was not decidable. Operators need:
 `blorp compile`'s exit codes. The language server's analysis does this
 already.
 
-## W9: the game, back in a window
+## W9: drawing in Blorp
 
-After W0 and W3, the game's half-block view becomes:
-- a framebuffer it presents;
-- aiming with the mouse;
-- the HUD drawn with a bitmap font;
-- an end to a round.
+Capability 6. Everything here is Blorp, with no foreign code, and serves
+any program that draws: a window through W3, or a terminal.
 
-Its terminal view stays, behind W6's alternate-screen scope. The game stays
-in `.claude/worktrees/gravity/scratch/gravity/` until Keith decides whether it ships as an
-example.
+- **A frame:**
+  - an RGBA image held as a `List[UInt8]`, with its width and height;
+  - plotting, filling and blending:
+    - fading darkens every pixel by a share, which leaves trails;
+    - additive blending adds colours, saturating, which makes glows;
+  - all updating in place when the frame is uniquely owned.
+- **Shapes:** lines, rectangles, circles and discs, clipped silently at the
+  frame's edges.
+- **Text:** a bitmap font, and drawing a String in it. A first-time user
+  needs no font files.
+  - The font is constant data. Until CTFE L2, each read of an aggregate
+    constant rebuilds it, so read it once per frame.
+- **Images:** decoders and encoders for simple formats, such as BMP, which
+  is uncompressed, and QOI, which is small and simple.
+- **Terminal presentation:**
+  - encode a frame as half-block cells, two pixels to a character, in
+    24-bit colour;
+  - send only the cells that differ, within a tolerance, from what the
+    terminal shows. Comparing with the previous frame instead would let a
+    slow fade that stays within the tolerance never appear;
+  - resend every cell after a "resumed" input or a change of
+    `terminal_size()`, which a program reads each frame. Either one leaves
+    the screen no longer matching what the encoder believes it shows.
+
+  The prototype measured this at about 0.4 ms and 7 KB a frame for 160×48
+  cells.
+- **Window presentation:** a wrapper that passes the frame's pixels, width
+  and height to W3's `present`.
+
+**Its first landing** needs ergonomics input first. It brings a 10-line
+sketch of a reading such as `frame.fill(BLACK).disc(x, y, radius, color)`,
+settling:
+- the module and type names;
+- the coordinate origin and direction;
+- the colour type, a fixed record of four `UInt8`s or the raw bytes;
+- whether a frame is a record or a union with a private variant.
+
+On the last question: today, updating a field of a record rebuilds the
+record, which takes every other field (`RECORDS_PLAN.md`). So a record-based
+frame would copy its whole pixel List on each plot until `own`'s field moves
+land. The prototype's in-place updates used a union read by destructuring,
+which main has since removed.
+
+**Measuring,** on current main, against a bare `List[UInt8]`:
+- the per-frame cost of a fade and a few thousand plots at 640×360;
+- encoding at 160×48 cells.
+
+**References only:** the prototype's view module and its tests are one way
+to do the terminal half, under the ignored
+`.claude/worktrees/gravity/scratch/gravity/game/`.
 
 ## Process
 
 **Briefs and plans:**
 - **Briefs:** every landing gets a brief within `docs/HANDOFF_SPEC.md`.
 - **Own plans:** W2 and W5 each get one, reviewed for soundness and
-  ergonomics. So does G17's operators plan.
+  ergonomics.
 - **Syntax:** every W7 item that adds syntax takes parser and ergonomics
   input first, and documenter review after.
 
@@ -1258,10 +1437,12 @@ its landings in this file, or in its own plan once it has one.
 - **Revision 5:** a quick soundness check of the minimal FFI found 0
   blockers and 5 should-fixes. All were taken, and checked by the
   coordinator.
+- **Revision 7:** the game-agnostic reframing, signed off by a soundness
+  reviewer and an ergonomics reviewer.
 
 ## Decisions
 
-**Keith, 2026-11-27, on revision 3:**
+**Keith, 2026-11-27:**
 - "Otherwise sounds good": the recommendations below are accepted.
 - G17 is decided as no operators.
 - G18 is clarified: constants keep `UPPER_SNAKE_CASE`.
@@ -1275,12 +1456,15 @@ its landings in this file, or in its own plan once it has one.
   - decoders only for the supported types.
 - After revision 5: Int32 and Float32 move before the FFI (G13), so the
   FFI's first version carries them.
+- After revision 6: the plan makes Blorp ready for games in general. It
+  builds no particular game, and the prototype's branch is reference only
+  (revision 7).
 
 
 | # | Decision | Accepted |
 | --- | --- | --- |
-| G1 | The math functions stay in `math.brp`; the prelude selects their methods after the next rotation | yes |
-| G2 | Land `io/clock` now as the pre-fiber form; concurrency landing 5 replaces it | (a) yes |
+| G1 | The math functions live in a `math` module; the prelude selects their methods after the next rotation | yes |
+| G2 | A clock lands as `io/clock`, the pre-fiber form; concurrency landing 5 replaces it | (a) yes |
 | G3 | `foreign func`, one declaration each, plus one module stanza for sources and flags; `= "symbol"` and `private` required | yes; spelling in the FFI plan |
 | G4 | Every List copied in both directions, with no opt-out; C returns List results in memory from `malloc`, which Blorp copies and frees | decided |
 | G5 | Every foreign function is impure | decided |
