@@ -1,6 +1,6 @@
 # Graphics and games plan
 
-Status: revision 5, 2026-11-27.
+Status: revision 6, 2026-11-27.
 - **Round 1** of soundness and ergonomics review: 5 blockers and 32
   should-fixes, all taken in revision 2.
 - **Round 2:** blockers only. All 5 were resolved, with none new. It also
@@ -17,6 +17,8 @@ Status: revision 5, 2026-11-27.
   - decoders exist only for the supported types.
 
   A quick soundness check covered the rewrite.
+- **Revision 6** moves Int32 and Float32 (W5) ahead of the FFI, at Keith's
+  word.
 
 Where a finding changed a recommendation, the section says so.
 
@@ -117,17 +119,22 @@ one already exists.
 | --- | --- | --- | --- | --- |
 | W0 | Land the gravity library on main | medium: main moved | Seed CI | G1, G2 |
 | W1 | Spike W: a window in plain C | small | none | none |
-| W2 | The FFI, in its own plan | large | W1; F3 after `RUN_AND_TEST_PLAN.md`'s CLI landing | G3 to G11 |
+| W2 | The FFI, in its own plan | large | W1, W5; F3 after `RUN_AND_TEST_PLAN.md`'s CLI landing | G3 to G11 |
 | W3 | The window library | medium | W1, W2 | none |
 | W4 | The pool on small maps, and `map`'s cost | medium | W0, for the probe's imports; `CONCURRENCY_PLAN.md` | none |
-| W5 | Int32 and Float32, in their own plan | medium, with a seed rotation | `UINT8_BYTES_PLAN.md`'s pattern | G12, G13 |
+| W5 | Int32 and Float32, in their own plan, before W2 | medium, with a seed rotation | `UINT8_BYTES_PLAN.md`'s pattern | G12, G13 |
 | W6 | Library gaps | small, several landings | W0, for the rows that edit branch code | G14 |
 | W7 | Language friction | one landing per item | the items | G15 to G21 |
 | W8 | Tooling friction | small | none | G22 |
 | W9 | The game, back in a window | game code | W0, W3 | none |
 
+**The order of the large pieces:** W0, then W5 and W1, then W2, W3 and W9.
+Int32 and Float32 come before the FFI, so that the FFI's first version
+carries them (Keith, 2026-11-27).
+
 **What can run beside what:**
 - W7, W8 and W6's rows on code main already has can run beside everything.
+- W5 and W1 can run beside each other.
 - W4 needs W0 first, because its probe imports `io/clock`, `math` and
   `time`.
 
@@ -284,8 +291,10 @@ cheaper. The FFI is eight rules:
    - CTFE never reaches one, since constant initializers are pure
      (`CTFE_PLAN.md` L3).
 3. **One type set, the same in both directions** (G6):
-   - Int, Float, Bool and UInt8;
-   - Lists of Int, Float and UInt8.
+   - Int, Float, Int32, Float32, Bool and UInt8;
+   - Lists of Int, Float, Int32, Float32 and UInt8.
+
+   W5 lands Int32 and Float32 first.
 4. **Every List is copied, in both directions, always** (G4).
    - C never sees Blorp's memory, and Blorp never keeps C's.
    - There is no opt-out.
@@ -349,8 +358,11 @@ the rest:
 | `List[Int]` | `int64_t *data, int64_t length`: a fresh copy | returns the length, and sets an `int64_t **data` out-parameter, the function's last parameter |
 | `List[Float]` | `double *data, int64_t length` | the same, with `double **data` |
 | `List[UInt8]` | `uint8_t *data, int64_t length` | the same, with `uint8_t **data` |
+| `Int32` | `int32_t` | `int32_t` |
+| `Float32` | `float` | `float` |
+| `List[Int32]` | `int32_t *data, int64_t length` | the same, with `int32_t **data` |
+| `List[Float32]` | `float *data, int64_t length` | the same, with `float **data` |
 | `Void` | — | `void` |
-| After W5 | `Int32`, `Float32` and their Lists | the same |
 
 **A List argument** is a fresh copy, which C may use as scratch during the
 call. Blorp frees it when the call returns, so C must not keep a pointer to
@@ -526,16 +538,20 @@ union DecodeError:
     UnknownTag(Int)             -- a tag the module's decoder does not know
 
 
--- Each reads one value at a byte offset: an Int or a Float as 8 bytes,
--- little-endian, a UInt8 or a Bool as one byte.
+-- Each reads one value at a byte offset, little-endian: an Int or a Float
+-- as 8 bytes, an Int32 or a Float32 as 4, a UInt8 or a Bool as one.
 pure func int_at(data: Bytes, offset: Int) -> Result[Int, DecodeError]
 pure func float_at(data: Bytes, offset: Int) -> Result[Float, DecodeError]
+pure func int32_at(data: Bytes, offset: Int) -> Result[Int32, DecodeError]
+pure func float32_at(data: Bytes, offset: Int) -> Result[Float32, DecodeError]
 pure func uint8_at(data: Bytes, offset: Int) -> Result[UInt8, DecodeError]
 pure func bool_at(data: Bytes, offset: Int) -> Result[Bool, DecodeError]
 
 -- Each appends one value in the same layout.
 pure func append_int(data: Bytes, value: Int) -> Bytes
 pure func append_float(data: Bytes, value: Float) -> Bytes
+pure func append_int32(data: Bytes, value: Int32) -> Bytes
+pure func append_float32(data: Bytes, value: Float32) -> Bytes
 pure func append_uint8(data: Bytes, value: UInt8) -> Bytes
 pure func append_bool(data: Bytes, value: Bool) -> Bytes
 
@@ -974,7 +990,12 @@ by naming only the conversion that was needed first.
 - **The math functions** compute in Float and round back, until a need is
   measured.
 - **`UInt32`** waits. Four `UInt8`s in a List cover pixels.
-- **Order:** after the FFI, for the GPU and audio. **Recommended.**
+- **Order: before the FFI** (Keith, 2026-11-27).
+  - The FFI's first version then carries `Int32`, `Float32` and their
+    Lists, both ways.
+  - The binary toolkit reads and writes them.
+  - W2 waits for W5's seed rotation, since W5 declares the types in
+    `_base`.
 
 ## W6: library gaps
 
@@ -1252,6 +1273,8 @@ its landings in this file, or in its own plan once it has one.
   - G5: no pure foreign functions;
   - Rust and C++ only through C adapters;
   - decoders only for the supported types.
+- After revision 5: Int32 and Float32 move before the FFI (G13), so the
+  FFI's first version carries them.
 
 
 | # | Decision | Accepted |
@@ -1261,14 +1284,14 @@ its landings in this file, or in its own plan once it has one.
 | G3 | `foreign func`, one declaration each, plus one module stanza for sources and flags; `= "symbol"` and `private` required | yes; spelling in the FFI plan |
 | G4 | Every List copied in both directions, with no opt-out; C returns List results in memory from `malloc`, which Blorp copies and frees | decided |
 | G5 | Every foreign function is impure | decided |
-| G6 | One type set in both directions: Int, Float, Bool, UInt8, and Lists of Int, Float and UInt8; everything else as bytes or an Int | decided |
+| G6 | One type set in both directions: Int, Float, Int32, Float32, Bool, UInt8, and Lists of Int, Float, Int32, Float32 and UInt8; everything else as bytes or an Int | decided |
 | G7 | Handles as an `Int` in a `resource union`, behind private declarations; no `Ptr` | yes |
 | G8 | Sources and flags keyed by platform; a missing platform reported before cc | yes |
 | G9 | User modules and the standard library may declare foreign functions; the compiler may not; declared C is embedded and published by `load` | yes |
 | G10 | Foreign calls run inline on their carrier, never on a pool or helper thread; `main`'s carrier is the main thread; a blocking mark decided in the FFI plan | yes |
 | G11 | `blorp run` and `blorp test` build declared sources; `blorp compile` writes them and prints the flags | yes |
 | G12 | One conversion family (checked, `wrapped_to_`, `clamped_to_`) for every fixed-width number, UInt8 included | yes |
-| G13 | Float32 literals round, overflow rejected, context typing; Int32 and Float32 after the FFI | yes |
+| G13 | Float32 literals round, overflow rejected, context typing; Int32 and Float32 before the FFI | decided: before |
 | G14 | libm now, portable functions later | (a) yes |
 | G15 | Shadowing: keep the rule with better help, or relax it for functions and imports | (a) keep, for now |
 | G16 | Prelude constructors need no expected type; `==` types its untyped side | (a) and (b) yes |
