@@ -363,6 +363,29 @@ need.
   - **Follow-up:** fold `FloatCopySign` into `FloatBinary`, which is
     reported, not done.
   - **Evidence:** `build/games/w0-math/` in the main checkout.
+- **Landing 2, `bits`:** `30d898f1a`, 2026-11-28.
+  - **The change:** `bit_and`, `bit_or`, `bit_xor`, `shift_left` and
+    `shift_right` as one operation, `IntegerBitwise(BitwiseOperation)`, whose
+    C fragment is emitted only for a program that calls one. `bit_not` is
+    Blorp, a xor with -1. It was ported unchanged from the prototype
+    branch's `e05937c9a`.
+  - **Cost:** self-compile against `34bb4ee84`, fixed input, allocations
+    +0.0000% and instructions -0.02%, with the fixed-input C identical. The
+    same commit before its rebase, against `21422d6d2`, measured +0.07%.
+  - **Lines:** production +72 net, library +36, tests +143.
+  - **The `math/bits` fixture:** measured at 65,509 allocations and 467 M
+    instructions, with ceilings of 65,510 and 537 M (+15%).
+  - **Gates:**
+    - the full gate passes on the rebased commit;
+    - Seed CI run 46170087335 is green on all targets;
+    - code review: 0 blockers, 0 should-fixes, and 3 nits that needed no
+      change.
+  - **Oracle:** each of five mutations fails `test_bits` or
+    `test_runtime_requirements` on arm64, the two shift guards included,
+    since arm64 masks a shift count to 0 to 63 and so gives nonzero results.
+    Under each guard mutation, the sanitized fixture reports a "shift
+    exponent" error, checked by hand.
+  - **Evidence:** `build/games/w0-bits/` in the main checkout.
 
 ## W1: Spike W, a window in plain C
 

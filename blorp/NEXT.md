@@ -255,8 +255,9 @@ done.
       - library, language and tooling friction.
     - Keith accepted its decisions, G1 to G22.
   - **Next:**
-    - W0's core library landings: landing 1, `math`, landed as `db6f29133`;
-      bits, randomness, time and terminal input are next;
+    - W0's core library landings: landing 1, `math`, landed as `db6f29133`,
+      and landing 2, `bits`, as `30d898f1a`; randomness, time and terminal
+      input are next;
     - W5, Int32 and Float32;
     - Spike W, a window in plain C.
 
