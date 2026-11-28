@@ -253,7 +253,8 @@ done.
       - drawing in Blorp;
       - parallel work at small sizes;
       - library, language and tooling friction.
-    - Keith accepted its decisions, G1 to G22.
+    - Keith accepted its decisions, G1 to G23. G24, a shipped C writer for
+      the FFI's CBOR results, is recommended.
   - **Next:**
     - W0's core library landings: landing 1, `math`, landed as `db6f29133`,
       and landing 2, `bits`, as `30d898f1a`; randomness, time and terminal

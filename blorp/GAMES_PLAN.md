@@ -1,6 +1,6 @@
 # Making Blorp ready for games
 
-Status: revision 7, 2026-11-27.
+Status: revision 8, 2026-11-28.
 - **Revisions 1 to 6:** two rounds of soundness and ergonomics review, then
   focused soundness reviews of each FFI change.
 - **Revision 7** reframes the plan, at Keith's word:
@@ -8,6 +8,8 @@ Status: revision 7, 2026-11-27.
     and favours no type of game.
   - The prototype that found these needs is evidence, not a goal.
   - Its code is reference, not a deliverable.
+- **Revision 8,** at Keith's word: a structured result from C comes back as
+  CBOR, which Blorp decodes, instead of a fixed byte layout (G23, G24).
 
 Keith decides the items marked **G**. The rest are recommendations.
 
@@ -127,7 +129,7 @@ Each names its owning document, where one already exists.
 | --- | --- | --- | --- | --- | --- |
 | W0 | Core libraries: math, bits, randomness, time, terminal input | 1 to 4 | medium, several landings | none | G1, G2 |
 | W1 | Spike W: a window in plain C | 5 | small | none | none |
-| W2 | The FFI, in its own plan | 8 | large | W1, W5; W0's `bits` and W6's `float_from_bits` for its decoding toolkit; F3 after `RUN_AND_TEST_PLAN.md`'s CLI landing | G3 to G11 |
+| W2 | The FFI, in its own plan | 8 | large | W1, W5; W0's `bits` and W6's `to_bits` and `float_from_bits` for its `cbor` decoder and `binary` encoders; F3 after `RUN_AND_TEST_PLAN.md`'s CLI landing | G3 to G11, G23, G24 |
 | W3 | The window library | 5 | medium | W1, W2 | none |
 | W4 | The pool on small maps, and `map`'s cost | 7 | medium | `CONCURRENCY_PLAN.md`; W0's clock for an in-process probe | none |
 | W5 | Int32 and Float32, in their own plan, before W2 | 1 | medium, with a seed rotation | `UINT8_BYTES_PLAN.md`'s pattern | G12, G13 |
@@ -449,9 +451,14 @@ cheaper. The FFI is eight rules:
      and called from those adapters.
 6. **Handles** are an `Int` that only the declaring module sees, wrapped in
    a `resource union` and lent through a `with_` function (G7).
-7. **Everything else crosses as bytes:** String, Bytes, unions and records.
-   It is encoded and decoded in Blorp with a small toolkit, whose decoders
-   cover only the supported types.
+7. **Everything else crosses as bytes:** String, Bytes, unions and records
+   (G23).
+   - **A structured result** comes back as CBOR, which a `cbor` module
+     decodes in Blorp.
+   - **A record or union argument** goes out in a fixed layout, which
+     `binary` writes in Blorp and C reads with `memcpy`. A part whose length
+     varies goes as a List argument of its own.
+   - **C never parses.**
 8. **A short contract** for the C side, listed below.
 
 **What revision 5 removed,** and why each removal is also safer:
@@ -498,7 +505,7 @@ the rest:
 | --- | --- | --- |
 | `Int` | `int64_t` | `int64_t` |
 | `Float` | `double` | `double` |
-| `Bool` | `uint8_t`, 0 or 1 | `uint8_t`; nonzero is `True`, a total conversion. `binary`'s `bool_at` is strict instead, since a byte layout is a format to check |
+| `Bool` | `uint8_t`, 0 or 1 | `uint8_t`; nonzero is `True`, a total conversion. Inside a CBOR result, a Bool is its own item, `false` or `true` |
 | `UInt8` | `uint8_t` | `uint8_t` |
 | `List[Int]` | `int64_t *data, int64_t length`: a fresh copy | returns the length, and sets an `int64_t **data` out-parameter, the function's last parameter |
 | `List[Float]` | `double *data, int64_t length` | the same, with `double **data` |
@@ -642,7 +649,8 @@ private foreign func native_close(window: Int) -> Int = "blorp_window_close"
 - **User modules and the standard library may.** The compiler's own source
   may not: the bootstrap subset has no FFI (`blorp/AGENTS.md`).
 - **The embedder** (`scripts/embed_library.brp`) embeds a library module's
-  declared C sources beside its `.brp` files.
+  declared C sources beside its `.brp` files. With G24 (a), it also embeds
+  `blorp_cbor_writer.h`, from `blorp/standard_library/_ffi/`.
 - **`load`** publishes them in the source inventory, and the CLI writes them
   out to compile them.
 - **Not in scope:** turning the compiler's built-in natives into foreign
@@ -672,142 +680,372 @@ private foreign func native_close(window: Int) -> Int = "blorp_window_close"
   F3 adds CLI scope:
   - `blorp run` and `blorp test` compile the declared sources and pass the
     declared flags;
-  - `blorp compile` writes the C, the prototypes header and the sources, and
-    prints the arguments a user needs.
+  - `blorp compile` writes the C, the prototypes header, the sources and,
+    with G24 (a), `blorp_cbor_writer.h`, and prints the arguments a user
+    needs.
 - **Sources and flags are published once,** for the CLI and the test driver
   both.
 
 ### Encoding and decoding
 
-**The toolkit, in a new `binary` module.**
-- **Why not `bytes.brp`:** the compiler imports `bytes`
-  (`src/lsp/lsp_command.brp`), so the seed reads `bytes.brp`, and it would
-  reject the `bits` and `float_from_bits` labels the toolkit needs. That is
-  G1's `float.brp` problem again.
-- **What it has:** decoders and encoders for the supported types only, plus
-  one function for runs of fixed-size records.
-There is nothing for String, records or unions: modules build those from
-these pieces.
+**G23. What crosses how** (Keith, 2026-11-28):
+
+| Data | Going into C | Coming back from C |
+| --- | --- | --- |
+| Bulk: pixels, vertices, samples, numbers | a typed List | a typed List, ready to use |
+| One String | its UTF-8, as a `List[UInt8]` | the same, checked by `to_text` |
+| A record or union | `binary`'s fixed layout, which C reads with `memcpy` | CBOR (RFC 8949), which `cbor` decodes in Blorp |
+| A shape that varies: optional parts, nesting, text inside | each varying part as a List argument of its own | CBOR |
+
+**Why CBOR for structured results.** Blorp decodes a structured result
+whatever its format, so the format decides only what decoding can catch, and
+how much of the work falls to C:
+- **Every item carries its type.** An Int where a Float belongs is an error.
+  A fixed layout reads a `double`'s 8 bytes as an `int64_t` without
+  complaint.
+- **Items delimit themselves,** so a count that does not match what C wrote
+  leaves the decode short or with bytes left over, and both are errors. An
+  exact-length pattern catches an item missing or extra, as the example
+  below does.
+- **Shapes can vary with no offsets.** An event is an array as long as its
+  kind needs, and text arrives with its UTF-8 checked.
+- **C only writes.** Writing CBOR is a few lines per type. Reading it is the
+  hard direction, and that happens once, in Blorp, where malformed input can
+  only give an `Err`.
+- **It is a standard.** Rust and C++ adapters can use existing encoders, and
+  a result can be read in CBOR's diagnostic notation while debugging.
+
+**Why not CBOR going in.** C would then need a CBOR parser, the riskiest
+code an adapter could hold. C reads a fixed layout with `memcpy` at
+constant offsets, after checking the length.
+
+**Why not CBOR for bulk data.** A typed List crosses with one `memcpy` and
+nothing to decode. A tree of items would cost an allocation or more per
+value.
+
+**The profile.** `decode` accepts exactly one CBOR data item that fills the
+data:
+- integers, major types 0 and 1, within Int. Any other integer is an error,
+  never wrapped;
+- byte strings, and text strings that are valid UTF-8;
+- arrays, and maps whose keys are text strings, each key once;
+- `false`, `true` and `null`, in their one-byte forms `f4`, `f5` and `f6`;
+- floats in half, single and double precision (`f9`, `fa` and `fb`), each
+  widened to Float exactly, NaN and -0.0 included. The widening builds the
+  double's bits with `bits` and `float_from_bits`, never through libm.
+
+An integer or length argument need not be in its shortest form: Blorp only
+decodes, so it has no canonical form to protect.
+
+It rejects, each as a `DecodeErrorKind`:
+- tags, major type 6;
+- indefinite lengths, and the break code, additional information 31;
+- the reserved additional information 28 to 30;
+- every other simple value: `e0` to `f3`, `undefined` (`f7`), and every
+  two-byte form `f8 xx`. RFC 8949 section 3.3 makes `f8` followed by a byte
+  below 32 not well-formed, so `f8 14` is never `false`;
+- nesting deeper than `MAX_NESTING_DEPTH`, measured and set as `json`'s is;
+- any byte after the item.
+
+**Arguments are unsigned 64-bit, and Int is signed.** An argument with its
+top bit set is `TooShort` as a length, since no data is that long, and
+`IntegerOutOfRange` as an integer. Major type 1's -1-n then always fits Int.
+
+**Lengths are checked before anything is allocated.** A length is compared
+with the bytes left, `size - offset`, never as `offset + length`, which
+could overflow. A declared length larger than the bytes left is `TooShort`,
+since every item takes at least one byte. So a forged count of 2^40 costs
+nothing. The data is Blorp's copy of C's result, which C can no longer
+change.
+
+**Which error, and where.** An item's header is checked in order: its major
+type (6 is `Tagged`), then its additional information (28 to 30 are
+`ReservedArgument`, 31 is `IndefiniteLength`), then its argument. Every
+error's offset is the initial byte of the item it concerns. For `TooShort`,
+that is the item whose bytes run out.
+
+**The `cbor` module.** A value model like `json`'s, one reader for each type
+the FFI carries, and errors that say where:
 
 ```blorp
--- What can go wrong reading a value out of bytes.
-union DecodeError:
-    TooShort(Int, Int)          -- the offset read, and the length there is
-    NotABool(Int, UInt8)        -- the offset, and its byte, neither 0 nor 1
-    UnevenLength(Int, Int)      -- the length, and the record size it is not a multiple of
-    UnknownTag(Int)             -- a tag the module's decoder does not know
+-- One CBOR data item, as Blorp's profile decodes it. The names follow
+-- RFC 8949's data model, and `json`'s where it has the same case.
+union Cbor:
+    Null
+    Boolean(Bool)
+    Integer(Int)
+    -- Half, single and double precision, each widened exactly.
+    FloatingPoint(Float)
+    ByteString(Bytes)
+    Text(String)
+    Array(List[Cbor])
+    -- RFC 8949's map, which JSON calls an object: text keys only, each once,
+    -- in their encoded order.
+    Map(Dict[String, Cbor])
 
 
--- Each reads one value at a byte offset, little-endian: an Int or a Float
--- as 8 bytes, an Int32 or a Float32 as 4, a UInt8 or a Bool as one.
-pure func int_at(data: Bytes, offset: Int) -> Result[Int, DecodeError]
-pure func float_at(data: Bytes, offset: Int) -> Result[Float, DecodeError]
-pure func int32_at(data: Bytes, offset: Int) -> Result[Int32, DecodeError]
-pure func float32_at(data: Bytes, offset: Int) -> Result[Float32, DecodeError]
-pure func uint8_at(data: Bytes, offset: Int) -> Result[UInt8, DecodeError]
-pure func bool_at(data: Bytes, offset: Int) -> Result[Bool, DecodeError]
+-- Why decoding stopped. `offset` is the zero-based offset of the initial
+-- byte of the item concerned.
+union DecodeErrorKind:
+    TooShort
+    Tagged
+    IndefiniteLength
+    ReservedArgument
+    UnsupportedSimpleValue
+    IntegerOutOfRange
+    InvalidText
+    KeyNotText
+    DuplicateKey
+    TooDeep
+    TrailingData
 
--- Each appends one value in the same layout.
-pure func append_int(data: Bytes, value: Int) -> Bytes
-pure func append_float(data: Bytes, value: Float) -> Bytes
-pure func append_int32(data: Bytes, value: Int32) -> Bytes
-pure func append_float32(data: Bytes, value: Float32) -> Bytes
-pure func append_uint8(data: Bytes, value: UInt8) -> Bytes
-pure func append_bool(data: Bytes, value: Bool) -> Bytes
 
--- Splits data into records of `size` bytes and decodes each, stopping at
--- the first error. `?=` cannot run inside a loop, so a module needs this to
--- decode a list of records.
-pure func decode_records[T](
-    data: Bytes,
-    size: Int,
-    decode: pure (Bytes) -> Result[T, DecodeError]
-) -> Result[List[T], DecodeError]
+record DecodeError {
+    offset: Int,
+    kind: DecodeErrorKind
+}
+
+
+-- The type a reader asked for.
+fixed union ExpectedType:
+    IntValue
+    Int32Value
+    UInt8Value
+    FloatValue
+    Float32Value
+    BoolValue
+    TextValue
+    BytesValue
+    ArrayValue
+    MapValue
+
+
+-- One step from a result's top item toward the item an error concerns.
+union PathStep:
+    Index(Int)
+    Key(String)
+
+
+union CborErrorKind:
+    Malformed(DecodeError)
+    -- An index past the end of an Array.
+    MissingItem(Int)
+    MissingField(String)
+    -- Not a value of the type asked for: another kind of item, or a number
+    -- outside the type, such as 300 for a UInt8.
+    Mismatched(ExpectedType, Cbor)
+    -- An item that the module's own decoder does not accept, such as an
+    -- event of a kind it does not know.
+    UnknownValue(Cbor)
+
+
+-- Why a module could not read its result, and where. A decoding error has
+-- an empty path and a byte offset. It is one type, so that `decode` and a
+-- module's own readers compose with `?=` and `and_then`.
+record CborError {
+    path: List[PathStep],
+    kind: CborErrorKind
+}
+
+
+pure func decode(data: Bytes) -> Result[Cbor, CborError]
+
+-- The item at an index of an Array, or a field of a Map, read with `read`.
+-- An error from `read` gets this step put first in its path. Items past the
+-- index, and fields not asked for, are ignored: to reject them, match an
+-- exact Array pattern, as the example below does.
+pure func item[T](
+    value: Cbor,
+    index: Int,
+    read: pure (Cbor) -> Result[T, CborError]
+) -> Result[T, CborError]
+pure func field[T](
+    value: Cbor,
+    name: String,
+    read: pure (Cbor) -> Result[T, CborError]
+) -> Result[T, CborError]
+
+-- Every item of an Array, read with `read`, stopping at the first error,
+-- whose path starts with that item's index. `?=` cannot run inside a loop,
+-- so a module needs this for a list.
+pure func as_list[T](
+    value: Cbor,
+    read: pure (Cbor) -> Result[T, CborError]
+) -> Result[List[T], CborError]
+
+-- One reader for each type the FFI carries, and for text and bytes, which
+-- CBOR carries. Each gives Mismatched for any other item.
+pure func as_int(value: Cbor) -> Result[Int, CborError]
+-- An Integer from INT32_MIN to INT32_MAX.
+pure func as_int32(value: Cbor) -> Result[Int32, CborError]
+-- An Integer from 0 to 255.
+pure func as_uint8(value: Cbor) -> Result[UInt8, CborError]
+-- A FloatingPoint, never an Integer: C chose the type it wrote.
+pure func as_float(value: Cbor) -> Result[Float, CborError]
+-- A FloatingPoint that a Float32 holds exactly: any NaN, or a value that
+-- narrows and widens back to the same bits, so -0.0 stays -0.0. Half and
+-- single items always qualify.
+pure func as_float32(value: Cbor) -> Result[Float32, CborError]
+pure func as_bool(value: Cbor) -> Result[Bool, CborError]
+pure func as_text(value: Cbor) -> Result[String, CborError]
+pure func as_bytes(value: Cbor) -> Result[Bytes, CborError]
+
+-- For a module's own decoder: an item it does not accept, with an empty
+-- path, which `item`, `field` and `as_list` extend as the error returns.
+pure func unknown_value(value: Cbor) -> CborError
 ```
 
 **Its rules:**
-- **Total.** A decoder returns a `Result`, so `?=` composes it. A bad value
-  from C is an error result, never a fault.
-- **On Blorp's copy,** which C can no longer change.
-- **The layout is C's native one.** C writes each field with `memcpy` of an
-  `int64_t`, a `double` or a `uint8_t`, at an explicit offset, never by
-  casting a struct, so padding never matters.
-  - That native layout is little-endian on every supported target, x86-64
-    and arm64. A big-endian target would be its own decision.
-  - `bool_at` is strict: only 0 and 1 are Bools. A direct `Bool` result
-    from C is total, as the table says, because a bytes layout is a format
-    to check, and a C `uint8_t` is not.
-- **Needs W0's `bits` and W6's `float_from_bits`.** The toolkit lands with
-  F2.
+- **Total.** Every function returns a `Result`, so a bad result from C is an
+  error value, never a fault. The format is therefore not part of C's
+  contract: an adapter that writes bad CBOR has a bug, not undefined
+  behaviour.
+- **Messages.** `DecodeError` and `CborError` implement `Stringable`, as
+  `json`'s `ParseError` does, and their `to_string` owns the wording. Each
+  message says where and what to do:
+  - "byte 12 of the CBOR result holds a tag, which Blorp's profile does not
+    accept: write the value without its tag";
+  - "at [1]["width"]: expected an Int32, found the Integer 3000000000";
+  - "at [3]: expected a Float, found the Integer 3: the adapter must write a
+    float for this item";
+  - "at [3]: an Array of 2 items that this decoder does not accept".
 
-**The C side of a List result,** in `window_macos.c`. The forced prototypes
-make its signature match `native_poll(window: Int) -> List[UInt8]`:
+  A message shows an item as its kind, plus a number's value or a
+  container's length, never the whole subtree, so its size is bounded.
+- **No generic record or union decoding.** A module matches `Cbor` items
+  into its own types, as the examples below do. Revision 5's rule holds:
+  readers only for the types the FFI carries, plus text and bytes, which
+  CBOR itself carries.
+- **The names** are settled in W2's own plan, with ergonomics input.
+- **Needs** W0's `bits`, W6's `float_from_bits`, and W5 for `as_int32` and
+  `as_float32`. The module has no foreign code, so it lands before F1, and
+  reads CBOR from files or any other bytes as well.
+
+**G24. A C writer.**
+- **(a) Blorp ships `blorp_cbor_writer.h`,** a write-only header.
+  - It lives in `blorp/standard_library/_ffi/`, and is embedded in the
+    compiler with the standard library (G9). The CLI writes it beside the
+    prototypes header, and puts that directory on each
+    adapter's include path (`-I`), which `blorp compile` prints with the
+    other flags (G11).
+  - Its functions are `static inline`, so an adapter that does not include
+    it pays nothing.
+  - It grows a `malloc` buffer. `finish` hands that buffer to Blorp by the
+    List-result rules and leaves the writer empty, so a reused writer never
+    returns the same buffer twice.
+  - It writes every Float as a double. The decoder accepts every width.
+  - It checks nothing that the decoder must check: a wrong count gives a
+    `Malformed` result, and text that is not UTF-8 gives `InvalidText`. A
+    mistake in it is a decode error, never a fault.
+  - It aborts if memory runs out, as Blorp's own allocations do.
+  - About 120 lines of C, tested by the FFI fixture.
+- **(b) No shipped writer.** Each adapter brings an encoder.
+- **Recommended: (a).** One tested writer replaces each adapter's own byte
+  offsets.
+- **The contract is the profile, not the writer.** A Rust or C++ adapter can
+  use an existing encoder that writes definite lengths, text keys, integers
+  within Int and no tags. Check how a crate writes 128-bit integers, and
+  whether it writes a byte vector as a byte string.
 
 ```c
-#include <stdlib.h>
-#include <string.h>
+/* blorp_cbor_writer.h: writes CBOR in Blorp's profile. The header defines
+ * each function below as static inline. Each aborts if memory runs out, as
+ * Blorp's own allocations do. */
+#include <stdbool.h>
+#include <stdint.h>
 
-/* Each event is 32 bytes: kind and key code as int64_t, then x and y as
- * double. memcpy at explicit offsets, so no struct padding is involved. */
-enum { EVENT_SIZE = 32 };
+typedef struct { uint8_t *bytes; int64_t length; int64_t capacity; } blorp_cbor_writer;
 
-static void put_event(uint8_t *at, int64_t kind, int64_t code, double x, double y) {
-    memcpy(at, &kind, 8);
-    memcpy(at + 8, &code, 8);
-    memcpy(at + 16, &x, 8);
-    memcpy(at + 24, &y, 8);
-}
+static inline blorp_cbor_writer blorp_cbor_writer_new(void);
+/* Then `count` items. A wrong count makes the whole result Malformed. */
+static inline void blorp_cbor_array(blorp_cbor_writer *out, int64_t count);
+/* Then `count` pairs: a key written with blorp_cbor_text, then its value. */
+static inline void blorp_cbor_map(blorp_cbor_writer *out, int64_t count);
+static inline void blorp_cbor_int(blorp_cbor_writer *out, int64_t value);
+static inline void blorp_cbor_float(blorp_cbor_writer *out, double value);
+static inline void blorp_cbor_bool(blorp_cbor_writer *out, bool value);
+static inline void blorp_cbor_null(blorp_cbor_writer *out);
+/* Text that is not UTF-8 decodes as InvalidText, not a fault. */
+static inline void blorp_cbor_text(blorp_cbor_writer *out, const char *utf8, int64_t length);
+static inline void blorp_cbor_bytes(blorp_cbor_writer *out, const uint8_t *data, int64_t length);
+/* Hands the buffer over as a List[UInt8] result: sets *data, returns the
+ * length, and leaves the writer empty. A writer never finished leaks. */
+static inline int64_t blorp_cbor_finish(blorp_cbor_writer *out, uint8_t **data);
+```
+
+**The C side of a structured result,** in `window_macos.c`, written with
+G24 (a)'s writer. The forced prototypes make its signature match
+`native_poll(window: Int) -> List[UInt8]`:
+
+```c
+#include "blorp_cbor_writer.h"
+
+/* Each event is an array whose first item is its kind: [1] closed,
+ * [2, code] key down, [3, code] key up, [4, x, y] mouse moved. */
+enum { EVENT_CLOSED = 1, EVENT_KEY_DOWN = 2, EVENT_KEY_UP = 3, EVENT_MOUSE_MOVED = 4 };
 
 int64_t blorp_window_poll(int64_t window, uint8_t **data) {
     struct pending events = drained_events(window); /* the platform code */
-    if (events.count == 0) {
-        *data = NULL;
-        return 0;
-    }
-    uint8_t *out = malloc((size_t)events.count * EVENT_SIZE);
-    if (out == NULL) abort();
+    blorp_cbor_writer out = blorp_cbor_writer_new();
+    blorp_cbor_array(&out, events.count);
     for (int64_t index = 0; index < events.count; index++) {
-        put_event(out + index * EVENT_SIZE, events.kind[index], events.code[index],
-                  events.x[index], events.y[index]);
+        struct event event = events.items[index];
+        switch (event.kind) {
+        case EVENT_CLOSED:
+            blorp_cbor_array(&out, 1);
+            blorp_cbor_int(&out, EVENT_CLOSED);
+            break;
+        case EVENT_KEY_DOWN:
+        case EVENT_KEY_UP:
+            blorp_cbor_array(&out, 2);
+            blorp_cbor_int(&out, event.kind);
+            blorp_cbor_int(&out, event.code);
+            break;
+        case EVENT_MOUSE_MOVED:
+            blorp_cbor_array(&out, 3);
+            blorp_cbor_int(&out, EVENT_MOUSE_MOVED);
+            blorp_cbor_float(&out, event.x);
+            blorp_cbor_float(&out, event.y);
+            break;
+        }
     }
-    *data = out; /* Blorp copies it, then frees it */
-    return events.count * EVENT_SIZE; /* a count of elements: bytes, for a List[UInt8] */
+    return blorp_cbor_finish(&out, data); /* Blorp copies it, then frees it */
 }
 ```
 
-**The Blorp side,** in `window.brp`:
+With no events, this writes an empty array, one byte, so a result is never
+empty.
+
+**The Blorp side,** an excerpt of `window.brp`. A library module gets no
+prelude, only Option's, Result's and Bool's methods, so its import block
+names the rest; this shows the lines the excerpt needs:
 
 ```blorp
 import:
-    binary: DecodeError(UnknownTag), int_at, float_at, decode_records
-    bytes: Bytes, from_list
-
--- Must match window_macos.c's layout.
-EVENT_SIZE: Int = 32
-KIND_AT: Int = 0
-CODE_AT: Int = 8
-X_AT: Int = 16
-Y_AT: Int = 24
+    _base: List, Result(Ok, Err)
+    bytes: from_list
+    cbor: Cbor(Array, Integer, FloatingPoint), CborError, decode, as_list, unknown_value
 
 
-private pure func decoded_event(record: Bytes) -> Result[WindowEvent, DecodeError]:
-    kind ?= record.int_at(KIND_AT)
-    code ?= record.int_at(CODE_AT)
-    x ?= record.float_at(X_AT)
-    y ?= record.float_at(Y_AT)
+-- The kinds are window_macos.c's. Each pattern checks an event's exact
+-- shape, so an item missing, extra or of another type is an unknown value.
+-- key_of is total: a code it does not know is Key.Other(code).
+private pure func decoded_event(event: Cbor) -> Result[WindowEvent, CborError]:
+    match event:
+        Array([Integer(1)]): Ok(CloseRequested)
+        Array([Integer(2), Integer(code)]): Ok(KeyDown(key_of(code)))
+        Array([Integer(3), Integer(code)]): Ok(KeyUp(key_of(code)))
+        Array([Integer(4), FloatingPoint(x), FloatingPoint(y)]): Ok(MouseMoved(x, y))
+        _: Err(unknown_value(event))
 
-    match kind:
-        1: Ok(CloseRequested)
-        -- key_of is total: a code it does not know is Key.Other(code)
-        2: Ok(KeyDown(key_of(code)))
-        3: Ok(KeyUp(key_of(code)))
-        4: Ok(MouseMoved(x, y))
-        _: Err(UnknownTag(kind))
+
+private pure func decoded_events(events: Cbor) -> Result[List[WindowEvent], CborError]:
+    events.as_list(decoded_event)
 
 
 -- A named function, because a variant constructor is not a function value
 -- (W7 lists it as friction).
-private pure func malformed_events(error: DecodeError) -> WindowError:
+private pure func malformed_events(error: CborError) -> WindowError:
     MalformedEvents(error)
 
 
@@ -815,8 +1053,84 @@ func poll_events(window: Window) -> Result[List[WindowEvent], WindowError]:
     match window:
         Underlying(handle):
             from_list(native_poll(handle))
-                .decode_records(EVENT_SIZE, decoded_event)
+                .decode()
+                .and_then(decoded_events)
                 .map_err(malformed_events)
+```
+
+**A result of named fields** is a map, read with `field` and the typed
+readers:
+
+```blorp
+record Monitor {
+    name: String,
+    width: Int32,
+    height: Int32,
+    scale: Float
+}
+
+
+-- Each monitor is {"name": text, "width": int, "height": int, "scale": float}.
+private pure func decoded_monitor(monitor: Cbor) -> Result[Monitor, CborError]:
+    name ?= monitor.field("name", as_text)
+    width ?= monitor.field("width", as_int32)
+    height ?= monitor.field("height", as_int32)
+    scale ?= monitor.field("scale", as_float)
+    Ok({ name = name, width = width, height = height, scale = scale })
+```
+
+**What a mistake in C becomes:**
+
+| C writes | A fixed layout gave | `cbor` gives |
+| --- | --- | --- |
+| `x` as an `int64_t`, where a Float belongs | a nonsense Float | `UnknownValue` for that event, at its index |
+| a mouse event as `[4, x]` | the next event's bytes, read as `y` | `UnknownValue` for that event, at its index |
+| a monitor's `width` past Int32 | a wrapped or cut-off number | `Mismatched(Int32Value, ...)`, at the monitor's index and `"width"` |
+| one event fewer than the count it declared | an uneven length, or the wrong events | `Malformed`, `TooShort` at the end of the data |
+
+**What `check` tells a first-time user** who declares a type outside G6's
+set. Each help line names the encoding for its type and direction:
+
+| Declared | Help |
+| --- | --- |
+| a `String` parameter | "pass its UTF-8: `text.to_bytes().to_list()`, a `List[UInt8]`" |
+| a `String` result | "return its UTF-8 as a `List[UInt8]`, and read it with `from_list(...).to_text()`" |
+| a `Bytes` parameter or result | "pass `data.to_list()`, or return a `List[UInt8]` and wrap it with `from_list`" |
+| a record, union or tuple parameter, or a List of them | "write it with `binary`'s `append_` encoders and pass the `List[UInt8]`, which C reads with `memcpy`" |
+| a List of Strings, or of other items whose length varies, as a parameter | "pass the items' bytes joined as one `List[UInt8]`, and their lengths as a `List[Int]`, which C checks add up to the bytes' length" |
+| a record, union, `Option`, `Dict`, tuple or other List result | "return CBOR as a `List[UInt8]`, and decode it with `cbor`" |
+| any other type, such as a function, a resource or a `Dict` parameter | "a foreign function takes and returns only Int, Float, Int32, Float32, Bool, UInt8 and Lists of them: call it from a Blorp function that converts" |
+
+**`binary`, for structured arguments.**
+- **Why not `bytes.brp`:** the compiler imports `bytes`
+  (`src/lsp/lsp_command.brp`), so the seed reads `bytes.brp`, and it would
+  reject the `bits` and `to_bits` labels the encoders need. That is G1's
+  `float.brp` problem again.
+- **What it has:** one encoder per type the FFI carries.
+- **The layout is C's native one,** little-endian on every supported target,
+  x86-64 and arm64. A big-endian target would be its own decision.
+- **C reads each field with `memcpy`** at an explicit offset, after checking
+  the length, never by casting a struct, so padding never matters.
+  - **A Bool** is read into a `uint8_t`, and anything but 0 or 1 is the
+    adapter's error code. Copying the byte into a C `bool` is undefined
+    behaviour for any other value.
+  - **A union** is a tag that C checks, then a fixed payload for that tag.
+  - **A part whose length varies,** such as a name, goes as a List argument
+    of its own. So C never parses: every record C reads has a fixed size,
+    and a List of records has a length C checks is a multiple of it.
+- **Its readers** (`int_at` and the rest) are not part of W2. They land with
+  their first consumer, such as W9's image formats, whose layouts someone
+  else fixed.
+
+```blorp
+-- Each appends one value: an Int or a Float as 8 bytes, an Int32 or a
+-- Float32 as 4, a UInt8 as one, and a Bool as one byte, 0 or 1.
+pure func append_int(data: Bytes, value: Int) -> Bytes
+pure func append_float(data: Bytes, value: Float) -> Bytes
+pure func append_int32(data: Bytes, value: Int32) -> Bytes
+pure func append_float32(data: Bytes, value: Float32) -> Bytes
+pure func append_uint8(data: Bytes, value: UInt8) -> Bytes
+pure func append_bool(data: Bytes, value: Bool) -> Bytes
 ```
 
 **The other directions:**
@@ -828,7 +1142,8 @@ private foreign func native_histogram(
     buckets: Int
 ) -> List[Float] = "blorp_stats_histogram"
 
--- Text comes back as bytes, and String's own constructor checks the UTF-8.
+-- One String comes back as bytes, and String's own constructor checks the
+-- UTF-8.
 private foreign func native_clipboard(window: Int) -> List[UInt8] = "blorp_window_clipboard"
 
 func clipboard_text(window: Window) -> Option[String]:
@@ -836,7 +1151,7 @@ func clipboard_text(window: Window) -> Option[String]:
         Underlying(handle): from_list(native_clipboard(handle)).to_text()
 
 
--- A record going out is encoded with the same layout rules.
+-- A record going out is written in the fixed layout.
 private pure func encoded_rectangle(data: Bytes, area: Rectangle) -> Bytes:
     data
         .append_float(area.x)
@@ -845,14 +1160,35 @@ private pure func encoded_rectangle(data: Bytes, area: Rectangle) -> Bytes:
         .append_float(area.height)
 ```
 
+```c
+/* Reads encoded_rectangle's four doubles. A wrong length is an error code,
+ * which the module decodes. */
+enum { RECTANGLE_SIZE = 32 };
+
+int64_t blorp_window_fill(int64_t window, uint8_t *data, int64_t length) {
+    if (length != RECTANGLE_SIZE) return -1;
+    double x, y, width, height;
+    memcpy(&x, data, 8);
+    memcpy(&y, data + 8, 8);
+    memcpy(&width, data + 16, 8);
+    memcpy(&height, data + 24, 8);
+    return fill_rectangle(window, x, y, width, height); /* the platform code */
+}
+```
+
 **Not planned:**
 - records or unions crossing directly;
 - generated decoders;
 - `pure` foreign functions;
-- `@no_copy`.
+- `@no_copy`;
+- CBOR going into C, which would need a parser in C;
+- a streaming CBOR reader that builds no tree. A frame's events are tens to
+  hundreds of small items, so it waits for a measured need;
+- typed shorthands such as `int_item(1)`. `item(1, as_int)` keeps the module
+  to about a dozen functions; revisit after its second consumer.
 
-Each would bring back the machinery revision 5 removed. Revisit one only with
-a measured need.
+The first four would bring back the machinery revision 5 removed. Revisit
+any of them only with a measured need.
 
 ### The contract for C
 
@@ -867,7 +1203,8 @@ A foreign function, and anything it calls:
   - the signal mask and handlers;
   - file descriptors it was not given.
 
-  It never calls `exit` or `fork`.
+  It never calls `exit` or `fork`. It may `abort` when memory runs out, as
+  Blorp's own allocations do.
 - **Lets nothing unwind or jump across the boundary:** no exception, no
   panic, and no `longjmp`.
 - **Returns promptly** (G10).
@@ -901,7 +1238,7 @@ These are the risks of any FFI, and none can be removed by design.
 | --- | --- |
 | `lex`, `parse` | The stanza and `foreign func`. `foreign` is reserved already. Teaching messages: `extern "C"`; a nested `foreign func` ("foreign declarations go at the top of a module"; today it reports "expected a return expression"); `Ptr` or `void*`, naming the Int handle and `resource union` pattern; `pure foreign func`, which says foreign functions are impure and their results are decoded by pure functions. |
 | `load` | Resolve sources beside the declaring module. Publish them in the source inventory. |
-| `check` | The one type set (G6). A `String`, `Bytes`, union or record parameter or result gets help naming its encoding: "pass `text.to_bytes().to_list()`", or "return `List[UInt8]` and decode it". `private` and `= "symbol"` are required. |
+| `check` | The one type set (G6). Any other parameter or result type gets the help line for its type and direction, from the table in "Encoding and decoding". `private` and `= "symbol"` are required. |
 | `lower` | A foreign call target, beside `RuntimeFunction` in `own.brp`'s call targets. |
 | `own`, `verify` | Arguments are borrowed, as runtime calls' are. The result is owned. No new fact: the copies are emit's. |
 | `emit` | The prototypes header. The copy of each List argument. `*data` set to NULL. The call. The checks on a List result, its copy, and `free`. Then freeing the argument copies. |
@@ -924,11 +1261,39 @@ These are the risks of any FFI, and none can be removed by design.
     prototypes;
   - a symbol not defined in a declared source, rejected before linking;
   - a handle lent through `with_`;
-  - a String parameter or result, and a `pure foreign func`, each rejected
-    with exact message, help and span;
-  - an adapter calling a small C library through its header.
-- **Decoder tests** against malformed input: too short, an uneven length,
-  a bad Bool, an unknown tag.
+  - each row of the `check` help table, and a `pure foreign func`, each
+    rejected with exact message, help and span;
+  - an adapter calling a small C library through its header;
+  - a structured result holding every kind of item, written with
+    `blorp_cbor_writer.h` if G24 (a) is taken, and decoded by `cbor`;
+  - a structured argument written by `binary` and read back by C, with a
+    Bool byte other than 0 or 1 rejected by the adapter.
+- **`binary` tests:** each encoder's byte order and width, a Bool as 0 or 1,
+  and the bits of -0.0 and of NaN.
+- **`cbor` tests,** in F0:
+  - RFC 8949 Appendix A's examples. Each inside the profile decodes to its
+    listed value. Each outside it (a tag, an indefinite length, `undefined`,
+    another simple value, an integer past Int) gives its error kind at its
+    offset. A NaN example is checked with `is_nan`, since a Float NaN never
+    equals itself;
+  - every proper prefix of every valid example is `TooShort`, and every
+    example with a byte appended is `TrailingData`;
+  - forged lengths of 2^40, 2^63 and 2^64-1 are `TooShort`, with an
+    allocation count that does not grow with the length;
+  - `MAX_NESTING_DEPTH` levels decode, and one more is `TooDeep`;
+  - Int's limits, on both sides, in major types 0 and 1, and 2^63 in each,
+    which is `IntegerOutOfRange`;
+  - `f8 14`, which is `UnsupportedSimpleValue`, not `false`;
+  - a header with two faults, such as a tag with additional information 31,
+    gives the first in the stated order, at the item's initial byte;
+  - half and single floats widened exactly: subnormals, the largest finite
+    values, the infinities, NaN and -0.0;
+  - a repeated key, and a key that is not text;
+  - each reader on each kind of item, including `as_int32` and `as_uint8`
+    at their limits, and `as_float32` on NaN, on -0.0 and on a double it
+    cannot hold;
+  - the path of an error from inside `as_list` and `field`, and each kind's
+    exact message.
 
 **Costs:**
 - **A program without foreign calls pays nothing.** The self-compile
@@ -936,14 +1301,19 @@ These are the risks of any FFI, and none can be removed by design.
   +0.05%.
 - **Each copy** costs one allocation and one `memcpy`, counted by the
   fixture's ceilings.
+- **Decoding** costs a few allocations per item. F0 sets its own ceilings
+  from measurement, and the FFI fixture's ceilings count it.
 
 ### Landings
 
+- **F0:** the `cbor` module. It has no foreign code, so it lands before F1,
+  once W2's own plan has settled its names, and W5 and W6's
+  `float_from_bits` have landed. W0's `bits` is on main (`30d898f1a`).
 - **F1:** the stanza, `foreign func`, the checks and the teaching messages,
   with no emission.
 - **F2:**
   - lowering, emission, the prototypes header and the copies;
-  - the bytes toolkit;
+  - `binary`'s encoders, and `blorp_cbor_writer.h` if G24 (a) is taken;
   - the e2e fixture, built through the one publication.
 - **F3:** the CLI (G11), after `RUN_AND_TEST_PLAN.md`'s CLI landing brings
   `blorp run` and `blorp test`. Neither exists yet.
@@ -1176,7 +1546,8 @@ by naming only the conversion that was needed first.
 - **Order: before the FFI** (Keith, 2026-11-27).
   - The FFI's first version then carries `Int32`, `Float32` and their
     Lists, both ways.
-  - The binary toolkit reads and writes them.
+  - `binary`'s encoders write them, and `cbor`'s `as_int32` and
+    `as_float32` read them.
   - W2 waits for W5's seed rotation, since W5 declares the types in
     `_base`.
 
@@ -1421,7 +1792,8 @@ any program that draws: a window through W3, or a terminal.
   - The font is constant data. Until CTFE L2, each read of an aggregate
     constant rebuilds it, so read it once per frame.
 - **Images:** decoders and encoders for simple formats, such as BMP, which
-  is uncompressed, and QOI, which is small and simple.
+  is uncompressed, and QOI, which is small and simple. Their fixed layouts
+  bring `binary`'s readers (`int_at` and the rest), which W2 does not need.
 - **Terminal presentation:**
   - encode a frame as half-block cells, two pixels to a character, in
     24-bit colour;
@@ -1487,6 +1859,20 @@ its landings in this file, or in its own plan once it has one.
   coordinator.
 - **Revision 7:** the game-agnostic reframing, signed off by a soundness
   reviewer and an ergonomics reviewer.
+- **Revision 8:** CBOR results.
+  - A soundness review found 0 blockers and 8 should-fixes: unsigned
+    arguments, two-byte simple values, NaN in `as_float32`, extra items,
+    union and Bool arguments, the `check` help, shipping the header, and
+    messages.
+  - An ergonomics review found 0 blockers and 6 should-fixes, overlapping
+    on messages and help, and adding error paths, a split of `Unexpected`
+    and the name `as_list`.
+  - All were taken. The soundness reviewer confirmed its eight and signed
+    off, with three nits, also taken. The coordinator checked the
+    ergonomics fixes.
+  - The example's nested exact-length patterns, such as
+    `Array([Integer(2), Integer(code)])`, were probed with main's compiler.
+    They compile, and an item missing or extra falls to the catch-all.
 
 ## Decisions
 
@@ -1508,6 +1894,11 @@ its landings in this file, or in its own plan once it has one.
   builds no particular game, and the prototype's branch is reference only
   (revision 7).
 
+**Keith, 2026-11-28:** a structured result from C is decoded either way, so
+it comes back as CBOR, which Blorp decodes and C only writes (revision 8,
+G23). Bulk data stays in typed Lists, and structured arguments keep the
+fixed layout.
+
 
 | # | Decision | Accepted |
 | --- | --- | --- |
@@ -1521,7 +1912,7 @@ its landings in this file, or in its own plan once it has one.
 | G8 | Sources and flags keyed by platform; a missing platform reported before cc | yes |
 | G9 | User modules and the standard library may declare foreign functions; the compiler may not; declared C is embedded and published by `load` | yes |
 | G10 | Foreign calls run inline on their carrier, never on a pool or helper thread; `main`'s carrier is the main thread; a blocking mark decided in the FFI plan | yes |
-| G11 | `blorp run` and `blorp test` build declared sources; `blorp compile` writes them and prints the flags | yes |
+| G11 | `blorp run` and `blorp test` build declared sources; `blorp compile` writes them, and with G24 (a) the writer header, and prints the flags | yes |
 | G12 | One conversion family (checked, `wrapped_to_`, `clamped_to_`) for every fixed-width number, UInt8 included | yes |
 | G13 | Float32 literals round, overflow rejected, context typing; Int32 and Float32 before the FFI | decided: before |
 | G14 | libm now, portable functions later | (a) yes |
@@ -1533,3 +1924,5 @@ its landings in this file, or in its own plan once it has one.
 | G20 | One-line `if`, as an expression and as a statement | yes, with parser input |
 | G21 | `?=` on an Option; still not inside `if`, `match` or loops | yes |
 | G22 | The chain rule: break only when needed, if the diff is acceptable | (a) yes |
+| G23 | Structured results from C come back as CBOR in Blorp's profile, decoded by a `cbor` module; structured arguments keep `binary`'s fixed layout; bulk data stays in typed Lists; C never parses | decided |
+| G24 | A write-only C writer, `blorp_cbor_writer.h`, on every adapter's include path | recommended (a) |
