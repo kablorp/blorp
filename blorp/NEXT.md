@@ -40,10 +40,14 @@ done.
       whole lines;
     - landing 4b: the fiber primitives, a context switch, stacks behind a
       guard in a bounded cache, and the kernel's lock, in `FIBER_RUNTIME`
-      with a direct-C suite; nothing emits it yet.
+      with a direct-C suite; nothing emits it yet;
+    - landing 4c: parking with permits, a wait that exactly one party ends,
+      the carriers' idle wait, and a blocking pool whose cancels withdraw or
+      signal a job, so no helper touches a job or its waiter after the
+      wait ends; in `FIBER_RUNTIME` and a new `BLOCKING_RUNTIME`, with
+      direct-C suites; nothing emits them yet.
   - **Next:** the rest of landing 4, the kernel's runtime support, in slices
-    4c to 4g with no seed rotation. 4c is parking and the blocking
-    pool.
+    4d to 4g with no seed rotation. 4d is the console.
     - Before landing 6's channels: in-place reuse of a uniquely owned
       record, a compiler change of its own, and a decision on the buffered
       round trip's remaining gap.

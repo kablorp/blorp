@@ -3124,6 +3124,399 @@ rebase:
   beside `THREAD_RUNTIME`'s. Moving it into the shared rule changes the
   pool's C, so it stays out of 4b.
 
+### Landing 4c results
+
+**What landed:** the parts of the runtime that wait, proven by direct-C
+suites. Nothing emits them yet; landing 5 is their first user.
+- **Parking, in `FIBER_RUNTIME`:** `blorp_fiber_run(fiber)` runs a fiber
+  from its carrier's own context and returns how it stopped, `enum
+  blorp_fiber_stop`: parked, yielded or finished. `blorp_fiber_park(self)`
+  consumes a permit and yields, or switches back to the carrier, which
+  publishes the park only after the switch saved the fiber, as Go's
+  `gopark` releases its lock after `mcall`. A fiber that switches back
+  without parking keeps any permit its wait's winner left, as Spike K's
+  yield did.
+- **The wait word and its fused claim, also there:**
+  - `blorp_wait_arm(self)` arms the fiber's next wait and returns its
+    generation;
+  - `blorp_wait_end(fiber, generation, outcome)` is the claim and the wake
+    in one call. It returns `enum blorp_wait_claim`: lost, woken (the fiber
+    was not parked, and its park consumes the permit) or queue (the fiber
+    is parked until the caller queues it). A party that lost has no wake to
+    give, so no permit is ever stale (Spike K's change 3);
+  - `blorp_wait_outcome(self, generation)` reads the winner's outcome, and
+    stops the program with "a fiber woke before its wait was claimed".
+- **The idle wait, also there:** `struct blorp_idle`, with
+  `blorp_idle_init`, `_epoch`, `_wait` and `_notify`. It is Spike K's
+  eventcount, which carriers and helpers share. `BLORP_IDLE_SPINS`, 20,000
+  rounds of the thread pause, is Spike K's spin count.
+- **The blocking pool, a new `BLOCKING_RUNTIME`** in `runtime/blocking.brp`,
+  after `FIBER_RUNTIME` and `PROCESS_HELPERS_RUNTIME`:
+  - `struct blorp_blocking_job`, with its three kinds, `enum
+    blorp_job_kind`: bounded, unbounded and cancellable;
+  - `blorp_blocking_start`, `blorp_blocking_submit` and
+    `blorp_blocking_cancel`, which returns `enum blorp_blocking_cancel`:
+    withdrawn, signalled or not reached;
+  - `blorp_kernel_queue`, declared for the kernel to supply. The suites
+    supply it.
+- **One pure move:** `blorp_process_pipe` moved from `PROCESS_LAUNCH_RUNTIME`
+  into `PROCESS_HELPERS_RUNTIME`, so the cancel pipes reuse it. Its text is
+  unchanged but for `static`, since that fragment's functions are external.
+
+**Change 6, as 4c realizes it.** Spike K's change 6 had a waiter that ends
+without its native's result remove its own job. Here a cancel never claims a
+native's wait. It goes through the job, under the pool's lock:
+- **No helper has taken the job:** it is withdrawn and never runs, and the
+  canceller ends the wait with its own result.
+- **It runs, and is cancellable:** the cancel writes one byte to its
+  helper's cancel pipe, and the job ends the wait as usual.
+- **Otherwise** it runs to its end.
+
+So only a job, or the canceller that withdrew it, ends a native's wait. A
+waiter never moves on while a helper can touch it, and needs no wait for
+its job's release. The completion checks the rule: a job whose wait another
+party ended stops the program with "a blocking job's wait was ended by
+another party". No native was found whose wait needs another party.
+- **One order differs from the brief.** The brief has the completion end the
+  wait and then mark the job finished. A waiter woken by that end may free
+  the job before the mark. So the job is retired first and its wait ended
+  second, both under the lock, and a cancel that finds it retired still
+  knows the wait has ended. The bite that restores the brief's order passes
+  under ASan, since the window is nanoseconds against a resume that takes
+  microseconds; TSan reports it (below).
+- **Landing 5's obligations.** A cancel reads the job, so the canceller must
+  keep it alive: the waiter frees it only after its wait ends, and leaves
+  its wait under a lock the canceller holds while it cancels. The suites'
+  cancellers do so with a `leave` lock. And a job is published to
+  cancellers only once it is submitted: a cancel of a zeroed job stops the
+  program with "a job was cancelled before it was submitted".
+
+**Other differences from the brief:**
+- **The park word has four states:** none, permit, parking and parked.
+  Parking is a fiber that chose to park and switched away, so the carrier
+  reads the fiber's choice from the word itself, where Spike K kept it on
+  the carrier.
+- **The pool starts explicitly.** `blorp_blocking_start` records the signal
+  mask every helper sets. A submit before it stops the program, since the
+  helpers' mask would otherwise be an unset `sigset_t`.
+- **A cancel pipe is made by the submit that starts its helper,** under the
+  fork lock's read side, so the submit that would exceed the descriptor
+  limit stops at once with one message. Made on each new helper, several
+  helpers starting together each printed the failure before the abort.
+- **A job that cannot be cancelled gets -1 for its cancel descriptor,** which
+  `poll` ignores, so its kind is visible to the native.
+- **The cancel pipe's read end does not block,** so a drain that finds no
+  byte, because the job read it against the contract, stops the program
+  with "a cancelled job read its cancel descriptor, which only its helper
+  drains". A blocking drain would hang the helper silently, and strand the
+  job already handed to it (the review's probe). The drain runs before the
+  waiter is queued, so a failed one stops the program before the waiter
+  goes on.
+- **A job state for a job never submitted,** `BLORP_JOB_UNSUBMITTED`, is the
+  zero, so a zeroed job no longer reads as queued.
+- **The wait's phases are `BLORP_WAIT_PHASE_*`,** with the mask derived from
+  the bit count, so no phase reads like a claim's result.
+- **The idle wait counts its sleepers,** where Spike K had a flag, so more
+  than one thread may wait on one. The Dekker pair is unchanged: a waiter
+  counts itself, then reads the epoch; a notify moves the epoch, then reads
+  the count, all four sequentially consistent.
+- **No party touches a fiber record after destroy,** design change 2,
+  which landing 5's scope owns. A cached record keeps its wait word when it
+  is reused, so a party that breaks the rule there holds a generation that
+  loses. That is all it gives: a full cache unmaps a record, a new mapping
+  can come back at the same address with its word at 0, and the review's
+  probe showed a stale claim for generation 1 winning there. So there is no
+  generation floor, and the rule is landing 5's.
+- **A fiber parks exactly once for each wait it arms,** and the wait word
+  says whether a park is owed, so no second field can disagree with it. Its
+  winner moves the word to ended, the fiber's park moves it on to resting,
+  which is also a new fiber's phase, and only a resting word can be armed.
+  That takes no fourth phase. The rule is enforced at the arm, the park and
+  the destroy: the arm refuses a word that is not resting, the park refuses
+  one that is, since no wait is armed for it, and the destroy refuses a
+  fiber that finished with a wait armed or a park owed, whose winner could
+  still touch the record after it goes to another fiber. The park's entry
+  check is one relaxed load of the line it touches anyway.
+  The phases, the bit count and the mask are one enum, so the assertion
+  that the phases fit compares constants of one type, as GCC's
+  `-Wenum-compare` requires. After the end only the fiber writes the word,
+  since every other party's compare-and-swap expects armed and, failing,
+  writes nothing; the park's step is a relaxed load and store. The rule
+  matters across threads: a fiber that armed again without parking never
+  synchronized with the last winner's permit, which could then land during
+  the next wait and queue a fiber parked on it, or leave its outcome
+  unordered (the second review's probe).
+- **Refusals beyond the brief's:** arming a wait before parking for the
+  last, whether that one is still armed or has ended, which replaces the
+  first round's armed-twice check;
+  parking a fiber that another fiber resumed, which nobody would publish;
+  a submit before the pool starts; a completion whose wait another party
+  ended; a helper whose cancel pipe cannot be made; a cancel of a job never
+  submitted; a cancelled job that read its cancel descriptor; a park with no
+  wait armed; and destroying a fiber that finished with a wait armed or a
+  park owed.
+
+**The cap is 16 bounded jobs at once,** `BLORP_BLOCKING_BOUNDED_CAP`.
+Nothing measures it yet. libuv's 4 is a known bottleneck for programs heavy
+in files, and Tokio allows 512, so it is conservative: four times libuv's,
+and 16 helpers' cancel pipes are 32 descriptors, an eighth of macOS's
+default limit. Unbounded and cancellable jobs never count against it.
+
+**Descriptors on a default macOS.** `launchctl limit maxfiles` gives a soft
+limit of 256. With stdin, stdout and stderr open, 253 remain, so 126
+helpers, two descriptors each. Measured: 200 fibers each submitting a job
+that blocks until all have started ran 126 helpers, and the 127th submit
+stopped the program with "error: cannot start a blocking helper: pipe
+failed: Too many open files" (`limits/`). Each running `capture` holds up
+to 8 descriptors more. So a program that waits on more than about 120
+unbounded natives at once needs a higher limit, which landing 5 can raise
+to the hard limit at start, as Go has done since 1.19.
+
+**The helpers' mask.** `blorp_blocking_start` records the calling thread's
+mask, and each helper sets exactly that mask when it starts, so it never
+keeps one its creator had blocked for a moment, as the SIGPIPE guard does.
+Its creator blocks every signal around `pthread_create` and then restores
+its own mask, as Go starts its threads, so the helper never runs with its
+creator's mask, even before its first line. The `starts` case checks that
+the creator then has exactly its own mask back, compared with the mask it
+read before the submit, since a probe inherits its parent's.
+Landing 5 calls it from the main thread before any submit; the code says
+so. Left to landing 5, when natives move to helpers:
+`exit_interrupted`'s `raise`, which reaches only its own thread, and
+resetting a child's mask before `exec`.
+
+**The round trip.** A no-op job through a helper and back, one fiber on one
+carrier, 200,000 in turn, `-O2`, median of 7 runs on macOS at a load of
+about 4.8 (`round-trip/`):
+
+| Idle waits | Round trip | Range |
+| --- | ---: | ---: |
+| Spinning first, as built | 356 ns | 276 to 428 ns |
+| Never spinning (`BLORP_IDLE_SPINS=0`) | 2,340 ns | 2,300 to 2,447 ns |
+
+Spike K's 2.0 µs was its helpers' condition-variable wake, which the second
+row matches. With the spin, neither the carrier nor the helper sleeps
+between back-to-back jobs. Nothing gates on either figure.
+
+**Tests.** Parking and waits are in the fiber suite; the pool is in a new
+`test_runtime/blocking_suite.brp` with `fixtures/blocking_test.c`, run
+after the fiber suite. A shared `fixtures/carrier_harness.h` stands in for
+landing 5's scheduler: carrier threads with locked run queues, idling on
+`blorp_idle`, the `blorp_kernel_queue` the pool calls, and a watchdog that
+ends a run with "watchdog: no progress for 5000 ms with N fibers live: a
+lost wake". Race cases run 100,000 rounds on 1 and 4 carriers, one fiber
+per carrier.
+
+| Case | What it checks | Fails without |
+| --- | --- | --- |
+| permit | a wake before its park leaves a permit, so the park yields; a wake after the park is published finds it parked, and its waker queues it | the permit |
+| yield keeps permit | a fiber whose wait was won while it ran switches back without parking, and its next park still yields | the carrier keeping the permit: the second run parks |
+| stale | a wait ends once, and a party holding an earlier generation never ends a later one | the generation in the claim |
+| wake race | a thread ends each wait while its fiber parks, both jittered: no wake is lost | the permit: the watchdog |
+| claim race | four threads race to end each wait: exactly one wins | the compare-and-swap: two winners |
+| idle race | a notify, jittered against a waiter that jitters before it idles, is never lost | either half of the Dekker pair: the watchdog |
+| idle sleeps | a thread idle for 300 ms uses under a quarter of it in processor time | the sleep |
+| woke unclaimed, armed twice, skipped park, finished owing, parked unarmed, parked by a fiber | each stops with its rule; armed twice and skipped park with "a fiber armed a wait before parking for its last one" | its check; for skipped park, a check that refuses only an armed wait |
+| starts | no helper before the first submit; a helper started from a fiber whose carrier blocked SIGINT has the recorded mask, SIGUSR2 alone; its cancel pipe is above stderr with stdin closed | the mask; the private pipe |
+| never queued | 33 unbounded and cancellable jobs, each blocked until all have started, all complete, on 33 helpers | counting them against the cap: the watchdog |
+| capped | 33 bounded jobs held at a gate: exactly 16 run at once, and a cancel withdraws one queued behind them, which never runs | the cap: 29 at once |
+| cancels | a job its new helper has not taken is withdrawn and never runs; a running cancellable one is signalled, once; the next job on that helper finds the pipe drained; a running unbounded one is not reached and has no descriptor; one helper serves them all | the drain |
+| withdraw race | cancellable jobs, each freed as soon as its wait ends, raced by a canceller from their submit: exactly one of withdrawn and completed, and the wait ended once; then two descriptors per helper, each close-on-exec | the pool's lock in a cancel: double ends; the private pipe |
+| stale cancel | the same, raced from the job's start, around its end: no cancel reaches the next job | the drain; the pool's lock in a cancel |
+| before start, thread fails, pipe fails, ended elsewhere, cancel unsubmitted, drain consumed | each stops with its message | its check; for the drain, the read end's `O_NONBLOCK` |
+
+- **Two probes run every case that can,** as in 4b: `-O0` with ASan and
+  UBSan, and `-O2`. The sanitized probes build with `BLORP_IDLE_SPINS=0`,
+  so every idle wait sleeps and a notify can land between its look and its
+  sleep; the optimized ones spin as programs do.
+- **Each pool race frees its job as soon as its wait ends,** and its
+  canceller holds a `leave` lock while it cancels, which the waiter takes
+  before freeing the job, as landing 5's waiter will leave its wait.
+
+**Which paths the races took,** counted by an evidence-only copy of the
+fixtures (`paths/`), on macOS:
+
+| Race | Probe, carriers | Wakes before the park | Wakes of a parked fiber | Lost claims |
+| --- | --- | ---: | ---: | ---: |
+| wake | sanitized, 1 / 4 | 38,741 / 5,509 | 61,259 / 94,491 | |
+| wake | optimized, 1 / 4 | 36,571 / 19,371 | 63,429 / 80,629 | |
+| claim | sanitized, 1 / 4 | 40,091 / 15,961 | 59,909 / 84,039 | 224,733 / 221,670 |
+| claim | optimized, 1 / 4 | 58,266 / 14,636 | 41,734 / 85,364 | 248,330 / 92,907 |
+
+| Race | Probe, carriers | Withdrawn | Signalled | Not reached | Canceller too late |
+| --- | --- | ---: | ---: | ---: | ---: |
+| withdraw | sanitized, 1 / 4 | 25,869 / 34,503 | 66,800 / 56,408 | 3,094 / 7,734 | 634 / 905 |
+| withdraw | optimized, 1 / 4 | 2,508 / 20,236 | 96,139 / 68,665 | 1,046 / 9,168 | 50 / 581 |
+| stale cancel | sanitized, 1 / 4 | 0 / 0 | 98,193 / 81,467 | 1,466 / 16,044 | 41 / 1,901 |
+| stale cancel | optimized, 1 / 4 | 0 / 0 | 99,648 / 75,510 | 306 / 18,719 | 6 / 1,142 |
+
+**The bites.** Each is one change to a fragment, run against every case of
+both suites, on macOS and in the arm64 image with Clang, with the same
+outcome on both (`bites/`, `linux/final-bites.log`). A failing race failed
+every run of it that is named.
+
+| Bite | Fails | Also fails, through the same path |
+| --- | --- | --- |
+| No permit: a wake that finds the fiber not yet parked is dropped | permit, at its assertion; the wake race, by the watchdog | the claim race and the pool's cases, whose wakes also meet fibers not yet parked |
+| A claim without the compare-and-swap: a load, a test and a store | the claim race: "wait 46 of fiber 0 was ended twice" | nothing |
+| A yield that stores none over the park word, the review's blocker | yield keeps permit: its second run parks | nothing |
+| A claim that ignores the generation | stale | the claim race, whose late parties hold earlier generations |
+| A notify that reads the sleeper count before it moves the epoch | the idle race, sanitized, by the watchdog | the wake and claim races and the pool's cases, whose carriers and helpers idle on it |
+| An idle wait that sleeps without rechecking the epoch | the same | the same |
+| An idle wait that never sleeps | idle sleeps | nothing |
+| Unbounded and cancellable jobs counted against the cap | never queued, by the watchdog | nothing |
+| No cap | capped: "29 bounded jobs ran at once, against a cap of 16", or no job left queued to withdraw | nothing |
+| A cancel outside the pool's lock | the withdraw race: "a blocking job's wait was ended by another party", or its own check | the stale-cancel race: a signal that raced the drain reached the next job |
+| No drain | the stale-cancel race: "a stale cancel reached a job"; cancels; drain consumed | in some runs, the withdraw race on 1 carrier, optimized: undrained bytes filled the pipe, and a cancel's write blocked under the lock |
+| The wait ended before the job is retired, the brief's order | nothing under ASan, so `make -C blorp test` passes with it | only TSan, run by hand: the withdraw race in every run, a data race between the waiter's `free` and the helper's retire |
+| A helper that keeps its creator's mask | starts | nothing |
+| The creator's mask not restored after a helper starts | starts: the carrier keeps every signal blocked | nothing |
+| The arm refusing only a wait still armed, the first round's check | skipped park: the second arm is accepted, and the run ends without the refusal | nothing |
+| A cancel pipe from a plain `pipe()` | starts | the pool races' descriptor check |
+| A cancel pipe's read end left blocking | drain consumed: the helper hangs in its drain, and the run times out | nothing |
+| Each new refusal's check removed, the pipe failure's included | its refusal; the arm's check fails both armed twice and skipped park; the destroy's and the park's entry checks fail finished owing and parked unarmed | nothing |
+
+- **The cascades are expected.** The permit and the idle wait are what the
+  carriers and helpers run on, so breaking either loses wakes in the cases
+  that wait. No bite fails a case that does not use what it breaks.
+
+**Evidence** (in the main checkout's ignored
+`build/concurrency/landing4c-evidence/`, with the scripts in `tools/`):
+- **Platforms.** Both probes passed every case on macOS with Apple Clang
+  21, on arm64 Linux with Clang 18.1 and GCC 13.3, and on emulated x86-64
+  Linux with GCC 13.3. CI's Linux x64 jobs are the native x86-64 run.
+- **GCC's fake stacks on arm64.** GCC's ASan build of the 1-carrier stale
+  race takes 17.7 s with fake stacks and 2.8 s without; Clang's takes 2.7 s
+  either way, and GCC's on x86-64 3.2 s. CI has no arm64 GCC job, and the
+  suite's child timeout is 60 s.
+- **ThreadSanitizer,** by hand in the arm64 image: every case of both probes
+  that does not abort, none of which forks, at `-O1` and `-O2`, 3 times each
+  with Clang and GCC: no report.
+- **Fixture C,** every e2e fixture compiled by main's compiler and by this
+  one: status, stdout and stderr are identical for all 782. 639 emit
+  identical C and 135 are rejected. The other 8 differ exactly by the move,
+  byte for byte, and the classifier first checks that the moved text is the
+  old one less `static`; a stray change planted in one is reported:
+  - **5 move it:** the programs with `capture` or `run`, whose
+    `PROCESS_LAUNCH_RUNTIME` loses it and `PROCESS_HELPERS_RUNTIME` gains it;
+  - **3 gain it unused:** `process/natives_exit_interrupted`,
+    `natives_fault` and `natives_find_program`, which have the helpers but
+    no launch. It is external there, as the helpers' functions are, so no
+    compiler warns.
+- **The gate,** `make -C blorp test INSTRUCTION_CHECK=on` on the final
+  landing commit `3bb258991`, after the review's fixes and on main's
+  `de4d40413`: exit 0, 3,700 passed and none failed. The fiber suite runs
+  31 tests and the pool suite 12. `git diff --check` is clean.
+- **Seed CI** on that commit, run 46134292868: every platform job passes,
+  Linux x64 GCC included, and the Seed job proves the fixpoint on all three
+  targets, with x86-64 run natively. An earlier run failed on Linux x64 GCC,
+  whose `-Wenum-compare` rejected a check comparing two enums' constants;
+  the wait phases and their mask are now one enum.
+- **During the review's rounds,** the implementer ran both probes in the
+  arm64 image with Clang and GCC, under ASan and UBSan and at `-O2`, and
+  built them with GCC in the amd64 image. The non-aborting new case, yield
+  keeps permit, is TSan clean in 3 runs on each probe. The fixes change only
+  `fiber.brp`'s and `blocking.brp`'s fragments, which no compiler module
+  imports, so no program's C changes: `git grep -n
+  "runtime/fiber\|runtime/blocking" -- blorp/src` finds nothing.
+- **The review's probes** (`review-probes/`): after a won wait and a plain
+  switch, the fiber's next park yields; a stale claim on an unmapped
+  record's reused address still wins, as documented above; and a job that
+  reads its cancel byte stops the program with the drain's message.
+
+**Cost,** on the final landing commit after the review's fixes,
+`self-compile-cost de4d40413 3bb258991 --rounds 3`, fixed-input row:
+
+| Measure | Base `de4d40413` | Candidate `3bb258991` | Change |
+| --- | ---: | ---: | ---: |
+| Allocations | 13,685,669 | 13,685,669 | +0.0000% |
+| Peak heap, bytes | 190,820,897 | 190,820,897 | +0.0000% |
+| Instructions, median of 3 | 13,882,225,077 | 13,869,750,045 | −0.0899% |
+
+The fixed-input C is identical (`e251cb8905a09a48`). The own-source row:
+allocations +0.0000%, peak heap +0.0003%, instructions −0.0433%. No compiler
+module imports the new fragments. Raw samples are in
+`build/concurrency/landing4c-evidence/cost-final/`.
+
+**Lines,** from `1b0ee4565`, after three reviews' fixes:
+- **production:** +467 and −24, so +443 net: `blocking.brp` +279;
+  `fiber.brp` +170 and −6; `process.brp` +18 and −18, the move;
+- **test:** +1,159 and −13, so +1,146 net, against the brief's estimate of
+  +900. The growth audit, before the reviews' fixes added 92:
+
+  | Part | Lines | Of which beyond the brief's list |
+  | --- | ---: | ---: |
+  | `fixtures/blocking_test.c` | 425 | about 16: submit before start, pipe fails, ended elsewhere |
+  | `blocking_suite.brp` | 210 | about 23 for those three; about 135 is the probe runner each runtime suite has, building, running and matching |
+  | `fixtures/fiber_test.c` | +232 and −4 | about 22: armed twice, parked by a fiber |
+  | `fixtures/carrier_harness.h` | 140 | none: the brief's carrier loop, run queues and watchdog |
+  | `fiber_suite.brp` | +57 and −9 | about 14 for those two |
+  | `driver.brp` | +3 | |
+
+  The first review's fixes then added the yield-keeps-permit case and two
+  refusals: `blocking_test.c` +14, `blocking_suite.brp` +14,
+  `fiber_test.c` +20 and `fiber_suite.brp` +4. The second's added the
+  skipped-park refusal and the creator's-mask check: `fiber_test.c` +6,
+  `fiber_suite.brp` +4 and `blocking_test.c` +6. The third's added the
+  finished-owing and parked-unarmed refusals: `fiber_test.c` +10 and
+  `fiber_suite.brp` +14.
+
+  - **Where the estimate fell short:** the carrier harness and the second
+    suite's probe runner, about 275 lines, as 4b's estimate left out its
+    fixture infrastructure.
+  - **The refusals beyond the brief,** about 75 lines with their suite
+    entries, make five rules fail loudly. Cutting them, and their nine
+    production lines, would leave about +980, still over.
+
+**The test ceiling, corrected by the coordinator on 2026-11-28:**
+
+| Ceiling | Old | New |
+| --- | ---: | ---: |
+| Test lines | +900 | +1,110, then +1,130, then +1,150 |
+
+- **The first correction:** the review's growth audit found nothing to cut.
+  Both fixtures share the carrier harness, and every case is either a brief
+  item or a refusal the review asked to keep. The estimate left out about
+  275 lines of infrastructure, as 4b's did. The new figure also pays for
+  the review's three regression cases, about 52 lines.
+- **The second** pays for the second review's two cases, about 16 lines:
+  the skipped park, and the creator's mask after a helper starts.
+- **The third** pays for the third review's two refusal cases, about 24
+  lines: a fiber that finishes with a park owed, and a park with no wait
+  armed.
+- **Left for a later change:** `blocking_suite.brp` copies
+  `fiber_suite.brp`'s probe runner, and `pool_suite.brp` follows the same
+  pattern. Sharing it would save about 100 lines across the three suites.
+
+**Not covered:**
+- retiring idle helpers: helpers never exit;
+- native x86-64 hardware; CI's Linux x64 jobs are the native run;
+- the idle spin's length on x86-64, where `pause` takes 10 to 140 cycles by
+  model, so 20,000 rounds may spin for up to about 1 ms;
+- a repeatable TSan gate: its runs here were by hand;
+- a party that keeps a fiber record past its destroy: the kept wait word
+  makes it lose only while the record stays cached;
+- fiber migration: a fiber still stays on the carrier that started it.
+
+**Follow-ups for landing 5:**
+- **Start the pool from the main thread,** with `blorp_blocking_start`,
+  before any other thread runs Blorp code.
+- **Supply `blorp_kernel_queue`,** which queues a fiber on its own carrier.
+- **Park exactly once for each wait armed,** before arming the next and
+  before finishing: the arm, the park and the destroy refuse otherwise.
+- **No party touches a fiber record after destroy,** design change 2: a
+  stale party on an unmapped record's reused address can win a claim.
+- **Publish a job to cancellers only after its submit.**
+- **Hold off a waiter's leaving its wait while cancelling,** under one lock
+  that the canceller holds across `blorp_blocking_cancel` and its own end
+  of a withdrawn wait, as the suites' `leave` lock does.
+- **Raise the descriptor limit** to the hard limit at start, or report it
+  as the cause, since a default macOS allows 126 helpers.
+- **The mask's two rows:** `exit_interrupted`'s `raise`, and a child's mask
+  before `exec`, once natives run on helpers.
+- **`THREAD_RUNTIME` is emitted once** for the pool, the fibers and the
+  helpers, as 4b's follow-up says for two of them.
+
 ## Landings
 
 Each is a vertical slice that can be tested on its own. Every one runs
@@ -3212,6 +3605,8 @@ compiled code.
        native, and caps the bounded ones;
      - withdrawing a job (change 6);
      - one cancel pipe per helper, which bounds descriptors.
+
+     See "Landing 4c results".
    - **4d. The console:** the kernel-owned stdin with its line lock;
      poll-based console reads that can be cancelled; and a job for each
      blocking native.

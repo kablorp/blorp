@@ -1,0 +1,279 @@
+-- The blocking pool, for the concurrency kernel (CONCURRENCY_PLAN.md,
+-- "Concurrency: a kernel written in Blorp"): helper threads that run a fiber's
+-- blocking native while its carrier runs other fibers. Helpers start on
+-- demand and never exit. A native that can wait without bound never queues,
+-- and bounded ones are capped. A cancel withdraws a job that no helper has
+-- taken, or reaches a running cancellable one through its helper's cancel
+-- pipe, so only a job, or the canceller that withdrew it, ends a native's wait
+-- (Spike K's design change 6, as "Landing 4c results" refines it). It comes
+-- after FIBER_RUNTIME and PROCESS_HELPERS_RUNTIME, whose fork lock and private
+-- descriptors its pipes use. Nothing emits it yet: landing 5 is its first
+-- user.
+BLOCKING_RUNTIME: String =
+    raw
+        |
+        |#include <errno.h>
+        |#include <fcntl.h>
+        |#include <pthread.h>
+        |#include <signal.h>
+        |#include <stdatomic.h>
+        |#include <stdint.h>
+        |#include <stdio.h>
+        |#include <stdlib.h>
+        |#include <string.h>
+        |#include <unistd.h>
+        |/* At most this many helpers run bounded natives, reads and writes of regular files, at once; the rest wait in order.
+        |   libuv's 4 is a known bottleneck for programs heavy in files, and Tokio allows 512. Nothing measures it yet, so it is
+        |   conservative: 16 helpers' cancel pipes are 32 descriptors, an eighth of macOS's default limit of 256. */
+        |enum {BLORP_BLOCKING_BOUNDED_CAP=16};
+        |/* The outcome a job's completion ends its wait with; the native's own result is in the job. */
+        |enum {BLORP_BLOCKING_COMPLETED=0};
+        |/* Whether a native can wait without bound, and whether it can be cancelled, are independent facts
+        |   (CONCURRENCY_PLAN.md, "Cancelling natives"). A bounded native that can be cancelled has no use, so there are three
+        |   kinds. */
+        |enum blorp_job_kind {
+        |    BLORP_JOB_BOUNDED,     /* a regular file: counted against the cap, may queue, runs to its end */
+        |    BLORP_JOB_UNBOUNDED,   /* may block without bound, as a write to a full pipe: never queues; runs to its end */
+        |    BLORP_JOB_CANCELLABLE  /* a pipe, console or non-regular-file read, or a child's wait: never queues; a cancel reaches it */
+        |};
+        |/* Where a job is, under the pool's lock. */
+        |enum blorp_job_state {
+        |    BLORP_JOB_UNSUBMITTED, /* zeroed, and not yet submitted: no canceller may see it */
+        |    BLORP_JOB_QUEUED,     /* a bounded job waiting for the cap */
+        |    BLORP_JOB_HANDED,     /* handed to a helper that has not taken it, so a cancel still withdraws it */
+        |    BLORP_JOB_RUNNING,
+        |    BLORP_JOB_SIGNALLED,  /* running, and its helper's cancel descriptor is readable */
+        |    BLORP_JOB_RETIRED     /* finished or withdrawn: no helper touches it again */
+        |};
+        |struct blorp_helper;
+        |/* A blocking native's call, owned by the waiting fiber, usually in its frame. The native's result goes into the job's
+        |   own fields, and the job's completion ends the waiter's wait. */
+        |struct blorp_blocking_job {
+        |    /* On a helper. A cancellable job polls `cancel` beside its own descriptors and returns its cancelled result
+        |       (CONCURRENCY_PLAN.md, "Cancelling natives") once it is readable. It never reads it, since the pool drains it,
+        |       and gets -1 when its kind cannot be cancelled. The descriptor does not block. */
+        |    void (*run)(struct blorp_blocking_job *job,int cancel);
+        |    enum blorp_job_kind kind;
+        |    struct blorp_fiber *waiter;
+        |    uint64_t generation;               /* the waiter's armed wait, which this job ends */
+        |    /* The pool's own, under its lock. */
+        |    enum blorp_job_state state;
+        |    struct blorp_helper *helper;       /* while HANDED, RUNNING or SIGNALLED: handed to, or running on */
+        |    struct blorp_blocking_job *next;   /* while QUEUED: the next in line */
+        |};
+        |struct blorp_helper {
+        |    struct blorp_idle idle;            /* where it waits for a job */
+        |    int cancel[2];                     /* its job polls [0], and a cancel writes [1] */
+        |    /* The pool's, under its lock. */
+        |    struct blorp_blocking_job *handed; /* handed to it and not yet taken */
+        |    struct blorp_helper *next_idle;    /* while it has no job */
+        |};
+        |static struct {
+        |    struct blorp_kernel_lock lock;
+        |    struct blorp_helper *idle;         /* helpers with no job, the latest to finish first */
+        |    struct blorp_blocking_job *queued; /* bounded jobs waiting for the cap, oldest first */
+        |    struct blorp_blocking_job *last_queued;
+        |    int bounded;                       /* helpers holding a bounded job: at most the cap, and the cap while any wait */
+        |} blorp_blocking_pool={BLORP_KERNEL_LOCK_INITIALIZER,NULL,NULL,NULL,0};
+        |/* Written once by blorp_blocking_start, before any helper exists; read-only afterwards. */
+        |static sigset_t blorp_blocking_mask;
+        |static atomic_int blorp_blocking_started;
+        |static pthread_once_t blorp_blocking_once=PTHREAD_ONCE_INIT;
+        |/* Supplied by the kernel, which landing 5 brings, and by the suite: queues a fiber that a won claim found parked. The
+        |   pool never knows the run queues, which are Blorp. */
+        |void blorp_kernel_queue(struct blorp_fiber *fiber);
+        |static void blorp_blocking_fail(const char *step,int code){
+        |fprintf(stderr,"error: cannot start a blocking helper: %s failed: %s\n",step,strerror(code));
+        |abort();
+        |}
+        |static void blorp_blocking_broken(const char *rule){
+        |fprintf(stderr,"error: blocking pool invariant broken: %s\n",rule);
+        |abort();
+        |}
+        |static void blorp_blocking_record_mask(void){
+        |const int code=pthread_sigmask(SIG_SETMASK,NULL,&blorp_blocking_mask);
+        |if(code!=0)blorp_blocking_fail("pthread_sigmask",code);
+        |atomic_store_explicit(&blorp_blocking_started,1,memory_order_release);
+        |}
+        |/* Records the calling thread's signal mask, which every helper then sets for itself. A child inherits the mask of the
+        |   thread that forks it, and natives on helpers will fork, so a helper must not keep a mask its creator had blocked for
+        |   a moment, as the SIGPIPE guard does (runtime/sigpipe.brp). Landing 5 calls this from the main thread, before any
+        |   submit; a later call does nothing. */
+        |void blorp_blocking_start(void){
+        |pthread_once(&blorp_blocking_once,blorp_blocking_record_mask);
+        |}
+        |/* Under the lock. */
+        |static void blorp_blocking_give(struct blorp_helper *helper,struct blorp_blocking_job *job){
+        |helper->handed=job;
+        |job->helper=helper;
+        |job->state=BLORP_JOB_HANDED;
+        |}
+        |/* Under the lock, when `helper` gives up a job of `kind`: a bounded job's place under the cap passes to the oldest
+        |   queued job, which `helper` is handed, and otherwise the helper is idle. Returns whether it was handed one. */
+        |static int blorp_blocking_vacate(struct blorp_helper *helper,enum blorp_job_kind kind){
+        |struct blorp_blocking_job *const next=blorp_blocking_pool.queued;
+        |if(kind==BLORP_JOB_BOUNDED&&next!=NULL){
+        |blorp_blocking_pool.queued=next->next;
+        |if(blorp_blocking_pool.queued==NULL)blorp_blocking_pool.last_queued=NULL;
+        |blorp_blocking_give(helper,next);
+        |return 1;
+        |}
+        |if(kind==BLORP_JOB_BOUNDED)blorp_blocking_pool.bounded--;
+        |helper->next_idle=blorp_blocking_pool.idle;
+        |blorp_blocking_pool.idle=helper;
+        |return 0;
+        |}
+        |/* The job's completion, on its helper. The job is retired and then its wait ended, both under the lock, so a cancel
+        |   that finds it retired knows the wait has ended and that no helper touches the job or its waiter again. Ending the
+        |   wait first would let a waiter it woke free the job before the retire. A parked waiter stays parked until it is
+        |   queued (change 3), so only the drain and that run after the lock, the drain first, so a failed one stops the
+        |   program before a parked waiter is queued. */
+        |static void blorp_blocking_finish(struct blorp_helper *helper,struct blorp_blocking_job *job){
+        |blorp_kernel_lock(&blorp_blocking_pool.lock);
+        |struct blorp_fiber *const waiter=job->waiter;
+        |const uint64_t generation=job->generation;
+        |const enum blorp_job_kind kind=job->kind;
+        |const int signalled=job->state==BLORP_JOB_SIGNALLED;
+        |job->state=BLORP_JOB_RETIRED;
+        |const enum blorp_wait_claim claim=blorp_wait_end(waiter,generation,BLORP_BLOCKING_COMPLETED);
+        |/* Only a job, or the canceller that withdrew it, ends a native's wait, and nothing withdraws a job that runs. */
+        |if(claim==BLORP_WAIT_LOST)blorp_blocking_broken("a blocking job's wait was ended by another party");
+        |(void)blorp_blocking_vacate(helper,kind);
+        |blorp_kernel_unlock(&blorp_blocking_pool.lock);
+        |if(signalled){
+        |/* Before this helper takes another job, the byte its cancel wrote, which no job reads, so no cancel reaches the
+        |   next job. That cancel wrote it under the lock before the retire, so only a job that read it leaves none, and the
+        |   read end does not block: the program stops rather than hang this helper and the job it may already hold. */
+        |char byte;
+        |ssize_t drained;
+        |do drained=read(helper->cancel[0],&byte,1); while(drained<0&&errno==EINTR);
+        |if(drained!=1)blorp_blocking_broken("a cancelled job read its cancel descriptor, which only its helper drains");
+        |}
+        |if(claim==BLORP_WAIT_QUEUE)blorp_kernel_queue(waiter);
+        |}
+        |static void *blorp_blocking_helper_main(void *argument){
+        |struct blorp_helper *const helper=argument;
+        |/* The mask blorp_blocking_start recorded, not its creator's. */
+        |const int code=pthread_sigmask(SIG_SETMASK,&blorp_blocking_mask,NULL);
+        |if(code!=0)blorp_blocking_fail("pthread_sigmask",code);
+        |for(;;){
+        |const uint64_t observed=blorp_idle_epoch(&helper->idle);
+        |blorp_kernel_lock(&blorp_blocking_pool.lock);
+        |struct blorp_blocking_job *const job=helper->handed;
+        |if(job!=NULL){
+        |helper->handed=NULL;
+        |job->state=BLORP_JOB_RUNNING;
+        |}
+        |blorp_kernel_unlock(&blorp_blocking_pool.lock);
+        |if(job==NULL){
+        |blorp_idle_wait(&helper->idle,observed);
+        |continue;
+        |}
+        |job->run(job,job->kind==BLORP_JOB_CANCELLABLE?helper->cancel[0]:-1);
+        |blorp_blocking_finish(helper,job);
+        |}
+        |return NULL;
+        |}
+        |/* A helper that cannot start stops the program, as a pool thread does, since the native has nowhere else to run. Its
+        |   thread has THREAD_RUNTIME's stack and guard, and is detached: helpers never exit, and exit does not wait for them. */
+        |static void blorp_blocking_spawn(struct blorp_helper *helper){
+        |/* One cancel pipe per helper, so descriptors grow with helpers, not with calls: made under the fork lock's read side,
+        |   close-on-exec and above stderr. Made here, so a submit that would exceed the descriptor limit stops at once, and
+        |   before any cancel can read it: only once the helper has taken a job, under the lock. */
+        |int code=blorp_process_pipe(helper->cancel);
+        |if(code!=0)blorp_blocking_fail("pipe",code);
+        |const int flags=fcntl(helper->cancel[0],F_GETFL);
+        |if(flags<0||fcntl(helper->cancel[0],F_SETFL,flags|O_NONBLOCK)!=0)blorp_blocking_fail("fcntl",errno);
+        |pthread_attr_t attributes;
+        |code=pthread_attr_init(&attributes);
+        |if(code!=0)blorp_blocking_fail("pthread_attr_init",code);
+        |code=pthread_attr_setstacksize(&attributes,blorp_thread_stack_bytes());
+        |if(code!=0)blorp_blocking_fail("pthread_attr_setstacksize",code);
+        |code=pthread_attr_setguardsize(&attributes,BLORP_THREAD_GUARD_BYTES);
+        |if(code!=0)blorp_blocking_fail("pthread_attr_setguardsize",code);
+        |code=pthread_attr_setdetachstate(&attributes,PTHREAD_CREATE_DETACHED);
+        |if(code!=0)blorp_blocking_fail("pthread_attr_setdetachstate",code);
+        |/* Every signal blocked until the helper sets the recorded mask, as Go starts its threads, so the helper never runs
+        |   with its creator's. */
+        |sigset_t all,creator;
+        |(void)sigfillset(&all);
+        |code=pthread_sigmask(SIG_SETMASK,&all,&creator);
+        |if(code!=0)blorp_blocking_fail("pthread_sigmask",code);
+        |pthread_t thread;
+        |code=pthread_create(&thread,&attributes,blorp_blocking_helper_main,helper);
+        |if(code!=0)blorp_blocking_fail("pthread_create",code);
+        |code=pthread_sigmask(SIG_SETMASK,&creator,NULL);
+        |if(code!=0)blorp_blocking_fail("pthread_sigmask",code);
+        |pthread_attr_destroy(&attributes);
+        |}
+        |/* On the waiter, after arming its wait and before parking. A job that can wait without bound goes to an idle helper,
+        |   or else a new one, and never queues: behind a cap it could wait for the very write queued after it. A bounded job
+        |   goes to an idle or new helper while fewer than the cap hold one, and otherwise waits in order. */
+        |void blorp_blocking_submit(struct blorp_blocking_job *job){
+        |if(!atomic_load_explicit(&blorp_blocking_started,memory_order_acquire))blorp_blocking_broken("a job was submitted before the pool started");
+        |struct blorp_helper *helper=NULL;
+        |int fresh=0;
+        |blorp_kernel_lock(&blorp_blocking_pool.lock);
+        |if(job->kind==BLORP_JOB_BOUNDED&&blorp_blocking_pool.bounded==BLORP_BLOCKING_BOUNDED_CAP){
+        |job->state=BLORP_JOB_QUEUED;
+        |job->next=NULL;
+        |if(blorp_blocking_pool.queued==NULL)blorp_blocking_pool.queued=job;
+        |else blorp_blocking_pool.last_queued->next=job;
+        |blorp_blocking_pool.last_queued=job;
+        |}else{
+        |if(job->kind==BLORP_JOB_BOUNDED)blorp_blocking_pool.bounded++;
+        |helper=blorp_blocking_pool.idle;
+        |fresh=helper==NULL;
+        |if(fresh){
+        |helper=calloc(1,sizeof *helper);
+        |if(helper==NULL)blorp_blocking_fail("calloc",ENOMEM);
+        |blorp_idle_init(&helper->idle);
+        |}else{
+        |blorp_blocking_pool.idle=helper->next_idle;
+        |}
+        |blorp_blocking_give(helper,job);
+        |}
+        |blorp_kernel_unlock(&blorp_blocking_pool.lock);
+        |if(fresh)blorp_blocking_spawn(helper);
+        |else if(helper!=NULL)blorp_idle_notify(&helper->idle);
+        |}
+        |enum blorp_blocking_cancel {
+        |    BLORP_CANCEL_WITHDRAWN,     /* no helper had taken it, and none will: the caller now ends the wait itself */
+        |    BLORP_CANCEL_SIGNALLED,     /* running: its helper's cancel descriptor is readable, and the job ends the wait */
+        |    BLORP_CANCEL_NOT_REACHED    /* not cancellable, or signalled already, or finished: the job ends the wait as usual */
+        |};
+        |/* A cancel never claims a native's wait, as change 5 says a cancel must not claim a join's: it goes through the job,
+        |   under the pool's lock. So a waiter never moves on while a helper can still touch it. The caller keeps the job alive
+        |   through the call: its waiter frees it only after its wait ends, so landing 5's canceller must hold off the waiter's
+        |   leaving its wait while it cancels. A job is published to cancellers only once it is submitted. */
+        |enum blorp_blocking_cancel blorp_blocking_cancel(struct blorp_blocking_job *job){
+        |struct blorp_helper *notified=NULL;
+        |enum blorp_blocking_cancel result=BLORP_CANCEL_NOT_REACHED;
+        |blorp_kernel_lock(&blorp_blocking_pool.lock);
+        |if(job->state==BLORP_JOB_UNSUBMITTED)blorp_blocking_broken("a job was cancelled before it was submitted");
+        |if(job->state==BLORP_JOB_QUEUED){
+        |struct blorp_blocking_job **link=&blorp_blocking_pool.queued,*previous=NULL;
+        |for(;*link!=job;link=&(*link)->next)previous=*link;
+        |*link=job->next;
+        |if(blorp_blocking_pool.last_queued==job)blorp_blocking_pool.last_queued=previous;
+        |job->state=BLORP_JOB_RETIRED;
+        |result=BLORP_CANCEL_WITHDRAWN;
+        |}else if(job->state==BLORP_JOB_HANDED){
+        |job->helper->handed=NULL;
+        |job->state=BLORP_JOB_RETIRED;
+        |result=BLORP_CANCEL_WITHDRAWN;
+        |if(blorp_blocking_vacate(job->helper,job->kind))notified=job->helper;
+        |}else if(job->state==BLORP_JOB_RUNNING&&job->kind==BLORP_JOB_CANCELLABLE){
+        |/* At most once per job, and only while it runs on this helper, which drains the byte before taking another. The
+        |   pipe never holds more than this one byte, so the write never blocks. */
+        |ssize_t written;
+        |do written=write(job->helper->cancel[1],"",1); while(written<0&&errno==EINTR);
+        |if(written!=1)blorp_blocking_broken("a cancel could not write its helper's cancel descriptor");
+        |job->state=BLORP_JOB_SIGNALLED;
+        |result=BLORP_CANCEL_SIGNALLED;
+        |}
+        |blorp_kernel_unlock(&blorp_blocking_pool.lock);
+        |if(notified!=NULL)blorp_idle_notify(&notified->idle);
+        |return result;
+        |}
+        |

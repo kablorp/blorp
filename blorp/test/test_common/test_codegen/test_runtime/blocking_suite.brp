@@ -1,0 +1,224 @@
+import:
+    io/process: CaptureError, Exit(Exited, Signaled), capture
+    test: TestSuite
+    ../../../../src/common/codegen/runtime/blocking: BLOCKING_RUNTIME
+    ../../../../src/common/codegen/runtime/fiber: FIBER_RUNTIME
+    ../../../../src/common/codegen/runtime/process: PROCESS_HELPERS_RUNTIME
+    ../../../../src/common/codegen/runtime/thread: THREAD_RUNTIME
+    ../../../driver/file_access: write_file
+    ../../../driver/harness: ending, isolated, run_expecting
+
+
+private COMPILE_TIMEOUT_MS: Int = 600000
+private CHILD_TIMEOUT_MS: Int = 60000
+
+
+private PROBE_SOURCE: String = "blorp/test/test_common/test_codegen/test_runtime/fixtures/blocking_test.c"
+
+
+-- As the fiber suite's probes: the sanitized one runs under ASan and UBSan,
+-- and its idle waits, the carriers' and the helpers', never spin; the
+-- optimized one is built as a program is.
+private SANITIZED: List[String] = [
+    "-O0",
+    "-fsanitize=address,undefined",
+    "-fno-sanitize-recover=all",
+    "-DBLORP_IDLE_SPINS=0"
+]
+
+
+private OPTIMIZED: List[String] = ["-O2"]
+-- ASan's fake stacks, which every switch must save and restore, as in the
+-- fiber suite.
+private FAKE_STACKS: String = "detect_stack_use_after_return=1"
+private RACE_CARRIERS: List[String] = ["1", "4"]
+-- SIGABRT, which a refused job or helper ends the program with.
+private ABORT_SIGNAL: Int = 6
+
+
+private BEFORE_START_MESSAGE: String = "error: blocking pool invariant broken: a job was submitted before the pool started\n"
+
+
+-- The probe's wrappers fail a thread's start with EAGAIN and a pipe with
+-- EMFILE.
+private THREAD_FAILURE_MESSAGE: String = "error: cannot start a blocking helper: pthread_create failed: Resource temporarily unavailable\n"
+
+
+private PIPE_FAILURE_MESSAGE: String = "error: cannot start a blocking helper: pipe failed: Too many open files\n"
+
+
+private ENDED_ELSEWHERE_MESSAGE: String = "error: blocking pool invariant broken: a blocking job's wait was ended by another party\n"
+
+
+private UNSUBMITTED_MESSAGE: String = "error: blocking pool invariant broken: a job was cancelled before it was submitted\n"
+
+
+private DRAIN_MESSAGE: String = "error: blocking pool invariant broken: a cancelled job read its cancel descriptor, which only its helper drains\n"
+
+
+private record Probes {
+    sanitized: String,
+    optimized: String
+}
+
+
+private func build_probe(
+    c_compiler: String,
+    directory: String,
+    name: String,
+    flags: List[String]
+) -> Result[String, String]:
+    executable = directory + "/" + name
+
+    command ?= isolated(
+        c_compiler,
+        ["-std=c11", "-Wall", "-Wextra", "-Werror", "-pedantic", "-pthread"]
+            .concat(flags)
+            .concat(["-I", directory, PROBE_SOURCE, "-o", executable]),
+        COMPILE_TIMEOUT_MS
+    )
+
+    built ?= run_expecting("blocking native build", command, 0)
+
+    if built.stderr == "":
+        Ok(executable)
+    else:
+        Err("blocking native build: " + built.stderr)
+
+
+private func ready(c_compiler: String, directory: String) -> Result[Probes, String]:
+    _ ?= write_file(directory + "/thread_runtime.c", THREAD_RUNTIME)
+    _ ?= write_file(directory + "/fiber_runtime.c", FIBER_RUNTIME)
+    _ ?= write_file(directory + "/process_helpers_runtime.c", PROCESS_HELPERS_RUNTIME)
+    _ ?= write_file(directory + "/blocking_runtime.c", BLOCKING_RUNTIME)
+    sanitized ?= build_probe(c_compiler, directory, "blocking_probe", SANITIZED)
+    optimized ?= build_probe(c_compiler, directory, "blocking_probe_optimized", OPTIMIZED)
+    Ok({ sanitized = sanitized, optimized = optimized })
+
+
+-- A run of `arguments` that must end as `exit`, print `stderr` and print
+-- nothing to stdout.
+private func matches(
+    executable: String,
+    arguments: List[String],
+    exit: Exit,
+    stderr: String
+) -> Result[Void, String]:
+    run ?= isolated(executable, arguments, CHILD_TIMEOUT_MS)
+    label = arguments.join(" ")
+
+    invocation = { run | environment = run.environment.set("ASAN_OPTIONS", Some(FAKE_STACKS)) }
+
+    captured ?= capture(invocation).map_err(
+        pure func(error: CaptureError) -> String: "${label}: ${error}"
+    )
+
+    if (
+        (captured.exit == exit)
+            .and(captured.stdout == "")
+            .and(captured.stderr == stderr)
+    ):
+        Ok(void)
+    else:
+        Err(
+            "${label}: expected ${exit.ending(None)} and stderr [${stderr}]; got ${captured.exit.ending(invocation.timeout_ms)}, stderr [${captured.stderr}] and stdout [${captured.stdout}]"
+        )
+
+
+private func report(checked: Result[Void, String]) -> Bool:
+    match checked:
+        Ok(_):
+            True
+        Err(error):
+            print_error(error)
+            False
+
+
+-- `arguments` pass on both probes; each reports its own failure.
+private func passes_on_both(probes: Probes, arguments: List[String]) -> Bool:
+    report(matches(probes.sanitized, arguments, Exited(0), "")).and(
+        report(matches(probes.optimized, arguments, Exited(0), ""))
+    )
+
+
+-- `mode` passes on both probes, on 1 carrier and on 4.
+private func races(probes: Probes, mode: String) -> Bool:
+    var passed: Bool = True
+
+    for carriers in RACE_CARRIERS:
+        if passed:
+            passed = passes_on_both(probes, [mode, carriers])
+
+    passed
+
+
+-- `mode` stops the program with `message`.
+private func stops(executable: String, mode: String, message: String) -> Bool:
+    report(matches(executable, [mode], Signaled(ABORT_SIGNAL), message))
+
+
+func suite(c_compiler: String, directory: String) -> TestSuite:
+    match ready(c_compiler, directory):
+        Err(error):
+            print_error(error)
+
+            {
+                description = "Blocking pool setup",
+                tests = [("native probes build", func(): False)]
+            }
+        Ok(probes):
+            sanitized = probes.sanitized
+
+            {
+                description = "Blocking pool",
+                tests = [
+                    (
+                        "no helper starts before the first submit, and a helper sets the recorded signal mask and makes its cancel pipe above stderr",
+                        func(): passes_on_both(probes, ["starts"])
+                    ),
+                    (
+                        "33 jobs that can wait without bound, each blocked until all have started, all complete",
+                        func(): passes_on_both(probes, ["never_queued", "4"])
+                    ),
+                    (
+                        "no more than the cap of bounded jobs run at once, and a cancel withdraws one queued behind them",
+                        func(): passes_on_both(probes, ["capped", "4"])
+                    ),
+                    (
+                        "a cancel withdraws a job no helper has taken, signals a running cancellable one once, and does not reach an unbounded one",
+                        func(): passes_on_both(probes, ["cancels"])
+                    ),
+                    (
+                        "a cancel racing a job's start withdraws it or lets it end the wait, never both, on 1 and 4 carriers",
+                        func(): races(probes, "withdraw_race")
+                    ),
+                    (
+                        "a cancel racing a job's end never reaches the next job, and each helper holds two descriptors, on 1 and 4 carriers",
+                        func(): races(probes, "stale_cancel")
+                    ),
+                    (
+                        "a job submitted before the pool starts stops the program",
+                        func(): stops(sanitized, "before_start", BEFORE_START_MESSAGE)
+                    ),
+                    (
+                        "a helper whose thread cannot start stops the program",
+                        func(): stops(sanitized, "thread_fails", THREAD_FAILURE_MESSAGE)
+                    ),
+                    (
+                        "a helper whose cancel pipe cannot be made stops the program",
+                        func(): stops(sanitized, "pipe_fails", PIPE_FAILURE_MESSAGE)
+                    ),
+                    (
+                        "a job whose wait another party ended stops the program",
+                        func(): stops(sanitized, "ended_elsewhere", ENDED_ELSEWHERE_MESSAGE)
+                    ),
+                    (
+                        "cancelling a job that was never submitted stops the program",
+                        func(): stops(sanitized, "cancel_unsubmitted", UNSUBMITTED_MESSAGE)
+                    ),
+                    (
+                        "a cancelled job that reads its cancel descriptor stops the program rather than hang its helper",
+                        func(): stops(sanitized, "drain_consumed", DRAIN_MESSAGE)
+                    )
+                ]
+            }

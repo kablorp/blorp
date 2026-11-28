@@ -2,10 +2,11 @@
 -- "Concurrency: a kernel written in Blorp"): the context switch, stacks of
 -- the main thread's size behind a guard, kept in a bounded cache, the ASan and
 -- TSan hooks on every switch, and the kernel's lock, which spins, yields, then
--- blocks.
--- It follows Spike K's runtime, with the changes "Landing 4b results"
--- records. Fibers stay on the carrier that started them. It comes after
--- THREAD_RUNTIME, and a program with it also needs PROCESS_POSIX_PRELUDE,
+-- blocks. Then what waits: parking with permits, a wait word that exactly one
+-- party ends, and the idle wait of a thread with nothing to run.
+-- It follows Spike K's runtime, with the changes "Landing 4b results" and
+-- "Landing 4c results" record. Fibers stay on the carrier that started them.
+-- It comes after THREAD_RUNTIME, and a program with it also needs PROCESS_POSIX_PRELUDE,
 -- since glibc declares MAP_ANON and MAP_NORESERVE under -std=c11 only with
 -- _DEFAULT_SOURCE. Nothing emits it yet: landing 5 is its first user.
 FIBER_RUNTIME: String =
@@ -91,6 +92,62 @@ FIBER_RUNTIME: String =
         |pthread_cond_signal(&lock->wake);
         |pthread_mutex_unlock(&lock->sleep);
         |}
+        |/* ---- the idle wait ---- */
+        |/* Spike K's eventcount. A thread with nothing to do reads the epoch, looks for work, and waits with what it read, so
+        |   a notify that lands between its look and its sleep moves the epoch and is not lost. Carriers and blocking helpers
+        |   both idle here. It spins first, since work often comes back within a sleep's cost: Spike K's 20,000 rounds are
+        |   about 5 us on Apple M-series, but x86-64's pause takes 10 to 140 cycles by model, so up to about 1 ms there. A
+        |   test may override it. */
+        |#ifndef BLORP_IDLE_SPINS
+        |#define BLORP_IDLE_SPINS 20000
+        |#endif
+        |struct blorp_idle {
+        |    pthread_mutex_t sleep;
+        |    pthread_cond_t wake;
+        |    atomic_int sleepers;
+        |    _Atomic uint64_t epoch;
+        |};
+        |static void blorp_idle_fail(const char *step,int code){
+        |fprintf(stderr,"error: cannot make an idle wait: %s failed: %s\n",step,strerror(code));
+        |abort();
+        |}
+        |void blorp_idle_init(struct blorp_idle *idle){
+        |int code=pthread_mutex_init(&idle->sleep,NULL);
+        |if(code!=0)blorp_idle_fail("pthread_mutex_init",code);
+        |code=pthread_cond_init(&idle->wake,NULL);
+        |if(code!=0)blorp_idle_fail("pthread_cond_init",code);
+        |atomic_init(&idle->sleepers,0);
+        |atomic_init(&idle->epoch,0);
+        |}
+        |/* Read before looking for work. Acquire: an epoch a notify moved follows the work it announces. */
+        |uint64_t blorp_idle_epoch(struct blorp_idle *idle){
+        |return atomic_load_explicit(&idle->epoch,memory_order_acquire);
+        |}
+        |/* Spins, then sleeps, until the epoch moves from `observed`. The sleeper count and the epoch are Spike K's Dekker
+        |   pair, its sleeping flag counted so that any number of threads may wait: a waiter counts itself, then reads the
+        |   epoch, and a notify moves the epoch, then reads the count, all four sequentially consistent. So one sees the
+        |   other's write: the waiter finds the epoch moved and does not sleep, or the notify finds it counted and wakes it,
+        |   once the waiter has released the mutex by sleeping. */
+        |void blorp_idle_wait(struct blorp_idle *idle,uint64_t observed){
+        |for(int round=0;round<BLORP_IDLE_SPINS;round++){
+        |if(atomic_load_explicit(&idle->epoch,memory_order_acquire)!=observed)return;
+        |blorp_thread_pause();
+        |}
+        |pthread_mutex_lock(&idle->sleep);
+        |atomic_fetch_add_explicit(&idle->sleepers,1,memory_order_seq_cst);
+        |while(atomic_load_explicit(&idle->epoch,memory_order_seq_cst)==observed)pthread_cond_wait(&idle->wake,&idle->sleep);
+        |/* Relaxed: a notify that still counts this waiter only takes the mutex for nothing. */
+        |atomic_fetch_sub_explicit(&idle->sleepers,1,memory_order_relaxed);
+        |pthread_mutex_unlock(&idle->sleep);
+        |}
+        |/* After making work visible. */
+        |void blorp_idle_notify(struct blorp_idle *idle){
+        |atomic_fetch_add_explicit(&idle->epoch,1,memory_order_seq_cst);
+        |if(atomic_load_explicit(&idle->sleepers,memory_order_seq_cst)==0)return;
+        |pthread_mutex_lock(&idle->sleep);
+        |pthread_cond_broadcast(&idle->wake);
+        |pthread_mutex_unlock(&idle->sleep);
+        |}
         |/* ---- contexts ---- */
         |enum blorp_fiber_state {
         |    BLORP_FIBER_NEW,       /* created, and never run */
@@ -115,12 +172,30 @@ FIBER_RUNTIME: String =
         |    void *tsan_fiber;
         |#endif
         |};
-        |/* A fiber: its context, and what it runs. It lives at the top of its stack's mapping, as Boost.Context places its
-        |   control structure, so a fiber costs no allocation beyond its stack. */
+        |/* How far a fiber has parked, in its park word. A wake that comes before the park leaves PERMIT, which the park
+        |   consumes instead of sleeping, so no wake is lost. PARKING is a fiber that chose to park and switched away, which its
+        |   carrier has not yet published: only PARKED tells a waker that it must queue the fiber. */
+        |enum {BLORP_PARK_NONE,BLORP_PARK_PERMIT,BLORP_PARK_PARKING,BLORP_PARK_PARKED};
+        |/* A wait word is the wait's generation shifted left by the phase's bits, with its phase below, as Spike K's. Only its
+        |   fiber arms a wait, and only a compare-and-swap from ARMED in that generation ends it, so a party holding an earlier
+        |   generation always loses. A fiber parks exactly once for each wait it arms: the winner moves the word to ENDED, the
+        |   fiber's park moves it on to RESTING, a new fiber's phase too, and only a RESTING word can be armed. So the one word
+        |   says whether a park is owed. 62 bits of generations do not wrap. */
+        |/* One enum, so the assertion compares constants of one type, which GCC's -Wenum-compare requires. */
+        |enum {BLORP_WAIT_PHASE_RESTING,BLORP_WAIT_PHASE_ARMED,BLORP_WAIT_PHASE_ENDED,BLORP_WAIT_PHASE_BITS=2,BLORP_WAIT_PHASE_MASK=(1<<BLORP_WAIT_PHASE_BITS)-1};
+        |_Static_assert(BLORP_WAIT_PHASE_ENDED<=BLORP_WAIT_PHASE_MASK,"a wait's phases must fit below its generation");
+        |/* A fiber: its context, what it runs, and its waits. It lives at the top of its stack's mapping, as Boost.Context
+        |   places its control structure, so a fiber costs no allocation beyond its stack. */
         |struct blorp_fiber {
         |    struct blorp_fiber_context context;
         |    void (*entry)(void *argument);
         |    void *argument;
+        |    atomic_int park;
+        |    /* No party touches a record once its fiber is destroyed (Spike K's design change 2). A cached record keeps the
+        |       word when it is reused only so that a party breaking that rule there holds a generation that loses; a record
+        |       that was unmapped can come back at the same address with the word at 0. */
+        |    _Atomic uint64_t wait;
+        |    int64_t outcome;                      /* the winner's, written before its permit */
         |};
         |/* The record's bytes, rounded so that the stack below it starts 16-byte aligned, as both ABIs require. */
         |#define BLORP_FIBER_RECORD_BYTES ((sizeof(struct blorp_fiber)+15)&~(size_t)15)
@@ -337,6 +412,7 @@ FIBER_RUNTIME: String =
         |fiber->context.state=BLORP_FIBER_NEW;
         |fiber->entry=entry;
         |fiber->argument=argument;
+        |atomic_store_explicit(&fiber->park,BLORP_PARK_NONE,memory_order_relaxed);
         |#ifdef BLORP_FIBER_ASAN
         |char *const bottom=blorp_fiber_mapping(fiber)+BLORP_THREAD_GUARD_BYTES;
         |fiber->context.stack_bottom=bottom;
@@ -373,6 +449,9 @@ FIBER_RUNTIME: String =
         |   entry returned: a suspended one still has frames, which may own memory. */
         |void blorp_fiber_destroy(struct blorp_fiber *fiber){
         |if(fiber->context.state!=BLORP_FIBER_NEW&&fiber->context.state!=BLORP_FIBER_FINISHED)blorp_fiber_broken("only a new or finished fiber can be destroyed");
+        |/* A fiber parks once for each wait it arms, so its last wait has rested; one armed or ended could still be ended or
+        |   woken by a winner in flight, after its record goes to another fiber or is unmapped. */
+        |if((atomic_load_explicit(&fiber->wait,memory_order_relaxed)&BLORP_WAIT_PHASE_MASK)!=BLORP_WAIT_PHASE_RESTING)blorp_fiber_broken("a fiber finished with a wait armed or a park owed");
         |#ifdef BLORP_FIBER_TSAN
         |__tsan_destroy_fiber(fiber->context.tsan_fiber);
         |#endif
@@ -399,5 +478,90 @@ FIBER_RUNTIME: String =
         |fprintf(stderr,"error: cannot release a fiber's stack: munmap failed: %s\n",strerror(errno));
         |abort();
         |}
+        |}
+        |/* ---- parking ---- */
+        |/* How a fiber stopped running, as its carrier sees it. */
+        |enum blorp_fiber_stop {
+        |    BLORP_FIBER_STOP_PARKED,   /* saved, and parked: only its wait's winner queues it again */
+        |    BLORP_FIBER_STOP_YIELDED,  /* it can run again at once: it did not park, or its wait ended before the park was published */
+        |    BLORP_FIBER_STOP_FINISHED  /* its entry returned: the carrier may destroy it */
+        |};
+        |/* On a carrier's own context: runs `fiber` until it parks, yields or finishes. A park is published here, after the
+        |   switch saved the fiber, as Go's gopark releases its lock after mcall: a waker that sees PARKED may queue the fiber
+        |   at once, and its context is whole. */
+        |enum blorp_fiber_stop blorp_fiber_run(struct blorp_fiber *fiber){
+        |blorp_fiber_switch(blorp_fiber_thread_context(),&fiber->context);
+        |if(fiber->context.state==BLORP_FIBER_FINISHED)return BLORP_FIBER_STOP_FINISHED;
+        |int expected=BLORP_PARK_PARKING;
+        |/* Release publishes the saved context to the waker that reads PARKED and queues the fiber. Acquire, when a wake took
+        |   the word first, makes its outcome visible to the fiber, which next runs on this thread. */
+        |if(atomic_compare_exchange_strong_explicit(&fiber->park,&expected,BLORP_PARK_PARKED,memory_order_acq_rel,memory_order_acquire))return BLORP_FIBER_STOP_PARKED;
+        |/* The fiber switched back without parking, or a wake came after it chose to park. Either way the word keeps any
+        |   permit, which a wait's winner may have left while the fiber ran: its park consumes it when it runs again. */
+        |return BLORP_FIBER_STOP_YIELDED;
+        |}
+        |/* On `self`, the running fiber, exactly once after each wait it arms: switches back to its carrier until the wait's
+        |   winner queues it. A permit already there is consumed instead, and the fiber yields, so a wait that ends at once
+        |   still lets the others run (CONCURRENCY_PLAN.md, "Concurrency: a kernel written in Blorp"). */
+        |void blorp_fiber_park(struct blorp_fiber *self){
+        |/* Only a carrier publishes a park: another fiber that resumed this one would leave it parked with nobody to queue it. */
+        |if(self->context.resumer!=self->context.thread)blorp_fiber_broken("a fiber parks only when its carrier ran it");
+        |/* Only a park makes a word resting, so a resting one has no wait for a party to end: the fiber would park for good.
+        |   One relaxed load, of the line this park touches anyway. */
+        |if((atomic_load_explicit(&self->wait,memory_order_relaxed)&BLORP_WAIT_PHASE_MASK)==BLORP_WAIT_PHASE_RESTING)blorp_fiber_broken("a fiber parked with no wait armed");
+        |int expected=BLORP_PARK_NONE;
+        |/* Acquire, when it finds the permit: the winner's outcome, written before it, is then visible here. */
+        |if(!atomic_compare_exchange_strong_explicit(&self->park,&expected,BLORP_PARK_PARKING,memory_order_acquire,memory_order_acquire))atomic_store_explicit(&self->park,BLORP_PARK_NONE,memory_order_relaxed);
+        |blorp_fiber_switch(&self->context,self->context.resumer);
+        |/* Queued by the winner, which left its permit, or run again after a yield, with any permit left for it: either way its
+        |   wait has ended, so nothing wakes it again before it arms. */
+        |atomic_store_explicit(&self->park,BLORP_PARK_NONE,memory_order_relaxed);
+        |/* Parked for the ended wait, so the next may be armed. Only this fiber writes an ENDED word: every other party's
+        |   compare-and-swap expects ARMED and, failing, writes nothing. An unclaimed wake keeps ARMED, which the outcome
+        |   refuses. A relaxed load and store, plain on both targets, of a line this park already touched. */
+        |const uint64_t word=atomic_load_explicit(&self->wait,memory_order_relaxed);
+        |if((word&BLORP_WAIT_PHASE_MASK)==BLORP_WAIT_PHASE_ENDED)atomic_store_explicit(&self->wait,(word&~(uint64_t)BLORP_WAIT_PHASE_MASK)|BLORP_WAIT_PHASE_RESTING,memory_order_relaxed);
+        |}
+        |/* ---- waits ---- */
+        |static uint64_t blorp_wait_word(uint64_t generation,int phase){
+        |return generation<<BLORP_WAIT_PHASE_BITS|(uint64_t)phase;
+        |}
+        |/* Arms `self`'s next wait and returns its generation. Whoever may end the wait records the fiber and this generation;
+        |   a claim for any other generation fails. */
+        |uint64_t blorp_wait_arm(struct blorp_fiber *self){
+        |/* Relaxed: only this fiber writes the generation, and each party learns of the wait through the kernel's own
+        |   synchronization after this store, such as a submit under the blocking pool's lock, so it reads this word or a
+        |   later one. */
+        |const uint64_t word=atomic_load_explicit(&self->wait,memory_order_relaxed);
+        |/* A park owed for the last wait, armed or ended, means its winner's permit may still land during this one, and queue
+        |   a fiber parked on it or leave its outcome unordered. */
+        |if((word&BLORP_WAIT_PHASE_MASK)!=BLORP_WAIT_PHASE_RESTING)blorp_fiber_broken("a fiber armed a wait before parking for its last one");
+        |const uint64_t generation=(word>>BLORP_WAIT_PHASE_BITS)+1;
+        |atomic_store_explicit(&self->wait,blorp_wait_word(generation,BLORP_WAIT_PHASE_ARMED),memory_order_relaxed);
+        |return generation;
+        |}
+        |/* What a party that tried to end a wait must do next. */
+        |enum blorp_wait_claim {
+        |    BLORP_WAIT_LOST,   /* another party ended it, or it is not this generation: touch nothing of the fiber again */
+        |    BLORP_WAIT_WOKEN,  /* won, and the fiber was not parked: its park consumes the permit */
+        |    BLORP_WAIT_QUEUE   /* won, and the fiber is parked, and stays so until the caller queues it */
+        |};
+        |/* Ends `fiber`'s wait `generation` with `outcome` if no other party has. The claim and the wake are one call, so only
+        |   the winner wakes the fiber and no permit is ever stale (Spike K's design change 3). WOKEN's permit is the caller's
+        |   last touch of the fiber. */
+        |enum blorp_wait_claim blorp_wait_end(struct blorp_fiber *fiber,uint64_t generation,int64_t outcome){
+        |uint64_t armed=blorp_wait_word(generation,BLORP_WAIT_PHASE_ARMED);
+        |/* Relaxed: the compare-and-swap alone picks the one winner, and the permit below orders its outcome. */
+        |if(!atomic_compare_exchange_strong_explicit(&fiber->wait,&armed,blorp_wait_word(generation,BLORP_WAIT_PHASE_ENDED),memory_order_relaxed,memory_order_relaxed))return BLORP_WAIT_LOST;
+        |fiber->outcome=outcome;
+        |/* Release publishes the outcome to the fiber's park or its carrier. Acquire, when it finds PARKED, carries the saved
+        |   context on to the carrier the caller queues the fiber to. */
+        |return atomic_exchange_explicit(&fiber->park,BLORP_PARK_PERMIT,memory_order_acq_rel)==BLORP_PARK_PARKED?BLORP_WAIT_QUEUE:BLORP_WAIT_WOKEN;
+        |}
+        |/* On `self`, once its park returned: the winner's outcome. Relaxed: the acquire that resumed the fiber, its park's or
+        |   its carrier's on the permit, or its run queue's, already follows the winner's end. */
+        |int64_t blorp_wait_outcome(struct blorp_fiber *self,uint64_t generation){
+        |if(atomic_load_explicit(&self->wait,memory_order_relaxed)!=blorp_wait_word(generation,BLORP_WAIT_PHASE_RESTING))blorp_fiber_broken("a fiber woke before its wait was claimed");
+        |return self->outcome;
         |}
         |

@@ -1,7 +1,7 @@
 /* Native probe of FIBER_RUNTIME, built with the unmodified production fragments: the switch, fiber stacks and their
- * cache, and the kernel lock. The suite writes memory_runtime.c, release_runtime.c, thread_runtime.c and
- * fiber_runtime.c. Each case is the first argument, and the lock's thread count the second; a case that passes
- * returns 0 and prints nothing. */
+ * cache, the kernel lock, parking, waits and the idle wait. The suite writes memory_runtime.c, release_runtime.c,
+ * thread_runtime.c and fiber_runtime.c. Each case is the first argument, and the lock's thread count or the race's
+ * carrier count the second; a case that passes returns 0 and prints nothing. */
 #define _POSIX_C_SOURCE 200809L
 #define _XOPEN_SOURCE 700
 #define _DEFAULT_SOURCE
@@ -61,6 +61,7 @@ enum blorp_release_kind { node_kind, blorp_release_kinds };
 #include "release_runtime.c"
 #include "thread_runtime.c"
 #include "fiber_runtime.c"
+#include "carrier_harness.h"
 
 /* The main thread's own context. */
 static struct blorp_fiber_context *thread;
@@ -406,6 +407,213 @@ static int lock_sleeps(void) {
     return 1;
 }
 
+/* ---- parking and waits ------------------------------------------------------------- */
+
+/* The main thread is the carrier. A wake before the park leaves a permit, which the park consumes, and the fiber yields;
+ * a wake after the park is published finds it parked, and the waker queues it. */
+enum { FIRST_OUTCOME = 7, SECOND_OUTCOME = 9 };
+static uint64_t second_wait;
+static void permit_entry(void *argument) {
+    struct blorp_fiber *const self = *(struct blorp_fiber **)argument;
+    const uint64_t first = blorp_wait_arm(self);
+    assert(blorp_wait_end(self, first, FIRST_OUTCOME) == BLORP_WAIT_WOKEN);
+    blorp_fiber_park(self);
+    assert(blorp_wait_outcome(self, first) == FIRST_OUTCOME);
+    second_wait = blorp_wait_arm(self);
+    blorp_fiber_park(self);
+    assert(blorp_wait_outcome(self, second_wait) == SECOND_OUTCOME);
+}
+static int permit(void) {
+    struct blorp_fiber *fiber;
+    fiber = blorp_fiber_create(permit_entry, &fiber);
+    assert(blorp_fiber_run(fiber) == BLORP_FIBER_STOP_YIELDED);
+    assert(blorp_fiber_run(fiber) == BLORP_FIBER_STOP_PARKED);
+    assert(blorp_wait_end(fiber, second_wait, SECOND_OUTCOME) == BLORP_WAIT_QUEUE);
+    assert(blorp_fiber_run(fiber) == BLORP_FIBER_STOP_FINISHED);
+    blorp_fiber_destroy(fiber);
+    return 0;
+}
+
+/* A fiber whose wait was won while it ran switches back to its carrier without parking. The permit survives, so its next
+ * park yields. */
+static void yield_then_park(void *argument) {
+    struct blorp_fiber *const self = *(struct blorp_fiber **)argument;
+    const uint64_t generation = blorp_wait_arm(self);
+    assert(blorp_wait_end(self, generation, FIRST_OUTCOME) == BLORP_WAIT_WOKEN);
+    blorp_fiber_switch(&self->context, self->context.resumer);
+    blorp_fiber_park(self);
+    assert(blorp_wait_outcome(self, generation) == FIRST_OUTCOME);
+}
+static int yield_keeps_permit(void) {
+    struct blorp_fiber *fiber;
+    fiber = blorp_fiber_create(yield_then_park, &fiber);
+    assert(blorp_fiber_run(fiber) == BLORP_FIBER_STOP_YIELDED && blorp_fiber_run(fiber) == BLORP_FIBER_STOP_YIELDED);
+    assert(blorp_fiber_run(fiber) == BLORP_FIBER_STOP_FINISHED);
+    blorp_fiber_destroy(fiber);
+    return 0;
+}
+
+/* A wait ends once, and a party holding an earlier generation never ends a later wait. */
+static uint64_t waits[2];
+static void two_waits(void *argument) {
+    struct blorp_fiber *const self = *(struct blorp_fiber **)argument;
+    for (int index = 0; index < 2; index++) {
+        waits[index] = blorp_wait_arm(self);
+        blorp_fiber_park(self);
+        assert(blorp_wait_outcome(self, waits[index]) == index);
+    }
+}
+static int stale(void) {
+    struct blorp_fiber *fiber;
+    fiber = blorp_fiber_create(two_waits, &fiber);
+    assert(blorp_fiber_run(fiber) == BLORP_FIBER_STOP_PARKED);
+    assert(blorp_wait_end(fiber, waits[0], 0) == BLORP_WAIT_QUEUE);
+    assert(blorp_wait_end(fiber, waits[0], 1) == BLORP_WAIT_LOST);
+    assert(blorp_fiber_run(fiber) == BLORP_FIBER_STOP_PARKED);
+    assert(blorp_wait_end(fiber, waits[0], 1) == BLORP_WAIT_LOST);
+    assert(blorp_wait_end(fiber, waits[1], 1) == BLORP_WAIT_QUEUE);
+    assert(blorp_fiber_run(fiber) == BLORP_FIBER_STOP_FINISHED);
+    blorp_fiber_destroy(fiber);
+    return 0;
+}
+
+/* Waits that parties on other threads end while their fibers park, RACE_ROUNDS of them over the carriers' fibers, one
+ * fiber per carrier. Each fiber publishes its wait's generation, jitters, and parks; each party polls the fibers it
+ * serves, jitters, and ends every new wait it sees. A party that ends a wait records it, and two records for one wait
+ * fail at once; a lost wake leaves a fiber parked, which the watchdog reports. With one party per fiber, the wake races
+ * the park; with PARTIES per fiber, the parties also race each other to end it. */
+enum { RACE_ROUNDS = 100000, PARTIES = 4, JITTER_MASK = 1023, DOUBLE_END_EXIT = 4 };
+static _Atomic uint64_t published[MAX_CARRIERS];
+static struct blorp_fiber *racers[MAX_CARRIERS];
+static atomic_char *ends;
+static atomic_int racing;
+static int party_count, rounds_each;
+static void race_entry(struct task *task) {
+    struct blorp_fiber *const self = task->fiber;
+    uint64_t random = RANDOM_SEED * (uint64_t)(task->index + 1);
+    for (int round = 0; round < rounds_each; round++) {
+        const uint64_t generation = blorp_wait_arm(self);
+        assert(generation == (uint64_t)round + 1);
+        atomic_store_explicit(&published[task->index], generation, memory_order_release);
+        jitter(&random, JITTER_MASK);
+        blorp_fiber_park(self);
+        const int64_t winner = blorp_wait_outcome(self, generation);
+        assert(winner >= 0 && winner < party_count);
+    }
+    atomic_fetch_sub(&racing, 1);
+}
+static void *party_main(void *argument) {
+    const int party = (int)(intptr_t)argument;
+    uint64_t seen[MAX_CARRIERS] = {0}, random = RANDOM_SEED * (uint64_t)(party + MAX_CARRIERS + 1);
+    while (atomic_load(&racing) > 0) {
+        int found = 0;
+        for (int fiber = 0; fiber < carrier_count; fiber++) {
+            /* With one party, each fiber has its own; with more, every party races for every fiber. */
+            if (party_count == 1 && fiber != party) continue;
+            const uint64_t generation = atomic_load_explicit(&published[fiber], memory_order_acquire);
+            if (generation == seen[fiber]) continue;
+            seen[fiber] = generation;
+            found = 1;
+            jitter(&random, JITTER_MASK);
+            const enum blorp_wait_claim claim = blorp_wait_end(racers[fiber], generation, party_count == 1 ? 0 : party);
+            if (claim == BLORP_WAIT_LOST) continue;
+            if (atomic_fetch_add(&ends[(size_t)fiber * (size_t)rounds_each + generation - 1], 1) != 0) {
+                fprintf(stderr, "wait %llu of fiber %d was ended twice\n", (unsigned long long)generation, fiber);
+                _exit(DOUBLE_END_EXIT);
+            }
+            if (claim == BLORP_WAIT_QUEUE) blorp_kernel_queue(racers[fiber]);
+        }
+        if (!found) sched_yield();
+    }
+    return NULL;
+}
+static int race(int carriers_used, int parties) {
+    use_carriers(carriers_used);
+    party_count = parties;
+    rounds_each = RACE_ROUNDS / carriers_used;
+    ends = calloc((size_t)RACE_ROUNDS, sizeof *ends);
+    atomic_store(&racing, carriers_used);
+    for (int index = 0; index < carriers_used; index++) racers[index] = spawn(index, race_entry);
+    const int threads = parties == 1 ? carriers_used : parties;
+    pthread_t ids[MAX_CARRIERS + PARTIES];
+    for (int index = 0; index < threads; index++) pthread_create(&ids[index], NULL, party_main, (void *)(intptr_t)index);
+    run_carriers();
+    for (int index = 0; index < threads; index++) pthread_join(ids[index], NULL);
+    for (size_t index = 0; index < (size_t)rounds_each * (size_t)carriers_used; index++) assert(atomic_load(&ends[index]) == 1);
+    free(ends);
+    return 0;
+}
+
+/* A notify racing the idle wait. A waiter thread takes items from a locked count, as a carrier pops its run queue, and
+ * idles when there is none; a notifier spins until the last item was taken, then posts the next and notifies. Both
+ * jitter, the waiter before it idles, so the notify lands before, inside and after the waiter's read of the epoch, its
+ * look and its sleep. A lost notify leaves the waiter asleep with an item waiting, which the watchdog reports. */
+static struct blorp_idle items_idle;
+static struct blorp_kernel_lock items_lock = BLORP_KERNEL_LOCK_INITIALIZER;
+static int items_posted; /* guarded by items_lock */
+static atomic_int items_taken;
+static void *take_items(void *argument) {
+    (void)argument;
+    uint64_t random = RANDOM_SEED * 2;
+    while (atomic_load(&items_taken) < RACE_ROUNDS) {
+        const uint64_t observed = blorp_idle_epoch(&items_idle);
+        blorp_kernel_lock(&items_lock);
+        const int posted = items_posted > atomic_load(&items_taken);
+        blorp_kernel_unlock(&items_lock);
+        if (posted) {
+            atomic_fetch_add(&items_taken, 1);
+            atomic_fetch_add(&progress, 1);
+            continue;
+        }
+        jitter(&random, JITTER_MASK);
+        blorp_idle_wait(&items_idle, observed);
+    }
+    return NULL;
+}
+static int idle_race(void) {
+    blorp_idle_init(&items_idle);
+    uint64_t random = RANDOM_SEED;
+    pthread_t waiter;
+    watch();
+    pthread_create(&waiter, NULL, take_items, NULL);
+    for (int item = 0; item < RACE_ROUNDS; item++) {
+        while (atomic_load(&items_taken) < item) blorp_thread_pause();
+        jitter(&random, JITTER_MASK);
+        blorp_kernel_lock(&items_lock);
+        items_posted++;
+        blorp_kernel_unlock(&items_lock);
+        blorp_idle_notify(&items_idle);
+    }
+    pthread_join(waiter, NULL);
+    unwatch();
+    return 0;
+}
+
+/* A thread idles until a notify HOLD_MS later, and must use less processor time than a quarter of that. */
+static int64_t idler_cpu_ms;
+static void *idle_once(void *argument) {
+    (void)argument;
+    const int64_t start = thread_cpu_ms();
+    const uint64_t observed = blorp_idle_epoch(&items_idle);
+    atomic_store(&items_taken, 1);
+    blorp_idle_wait(&items_idle, observed);
+    idler_cpu_ms = thread_cpu_ms() - start;
+    return NULL;
+}
+static int idle_sleeps(void) {
+    blorp_idle_init(&items_idle);
+    pthread_t idler;
+    pthread_create(&idler, NULL, idle_once, NULL);
+    while (atomic_load(&items_taken) == 0) {}
+    const struct timespec hold = {0, (long)HOLD_MS * NANOSECONDS_PER_MILLISECOND};
+    nanosleep(&hold, NULL);
+    blorp_idle_notify(&items_idle);
+    pthread_join(idler, NULL);
+    if (idler_cpu_ms < HOLD_MS / 4) return 0;
+    fprintf(stderr, "an idle thread used %lld ms of processor time in %d ms\n", (long long)idler_cpu_ms, HOLD_MS);
+    return 1;
+}
+
 /* ---- refusals -------------------------------------------------------------------- */
 
 /* A fiber destroys another that is suspended, which the runtime refuses. It does so on the fiber's stack, so ASan
@@ -469,6 +677,40 @@ static int wrong_context(void) {
     return 11;
 }
 
+/* A fiber parks, and its carrier runs it again though no party ended its wait. */
+static void park_unclaimed(void *argument) {
+    struct blorp_fiber *const self = *(struct blorp_fiber **)argument;
+    const uint64_t generation = blorp_wait_arm(self);
+    blorp_fiber_park(self);
+    (void)blorp_wait_outcome(self, generation);
+}
+static void arm_twice(void *argument) {
+    struct blorp_fiber *const self = *(struct blorp_fiber **)argument;
+    (void)blorp_wait_arm(self);
+    (void)blorp_wait_arm(self);
+}
+/* A fiber whose wait was won while it ran skips that wait's park and arms its next. */
+static void skip_park(void *argument) {
+    struct blorp_fiber *const self = *(struct blorp_fiber **)argument;
+    assert(blorp_wait_end(self, blorp_wait_arm(self), FIRST_OUTCOME) == BLORP_WAIT_WOKEN);
+    (void)blorp_wait_arm(self);
+}
+/* A fiber that finishes with its ended wait unparked, and one that parks with no wait armed. */
+static void finish_owing(void *argument) {
+    struct blorp_fiber *const self = *(struct blorp_fiber **)argument;
+    assert(blorp_wait_end(self, blorp_wait_arm(self), FIRST_OUTCOME) == BLORP_WAIT_WOKEN);
+}
+static void park_unarmed(void *argument) { blorp_fiber_park(*(struct blorp_fiber **)argument); }
+/* A fiber that another fiber resumed parks. */
+static void park_parked(void *argument) {
+    (void)argument;
+    blorp_fiber_park(parked);
+}
+static void resume_parked(void *argument) {
+    struct blorp_fiber *const self = *(struct blorp_fiber **)argument;
+    blorp_fiber_switch(&self->context, &parked->context);
+}
+
 int main(int argc, char **argv) {
     blorp_memory_start();
     if (argc < 2) return 2;
@@ -488,9 +730,31 @@ int main(int argc, char **argv) {
     if (strcmp(mode, "double_destroy") == 0) return double_destroy();
     if (strcmp(mode, "resume_destroyed") == 0) return resume_destroyed();
     if (strcmp(mode, "wrong_context") == 0) return wrong_context();
+    if (strcmp(mode, "permit") == 0) return permit();
+    if (strcmp(mode, "stale") == 0) return stale();
+    if (strcmp(mode, "yield_keeps_permit") == 0) return yield_keeps_permit();
+    if (strcmp(mode, "wake_race") == 0 && argc == 3) return race(atoi(argv[2]), 1);
+    if (strcmp(mode, "claim_race") == 0 && argc == 3) return race(atoi(argv[2]), PARTIES);
+    if (strcmp(mode, "idle_race") == 0) return idle_race();
+    if (strcmp(mode, "idle_sleeps") == 0) return idle_sleeps();
     /* The rest must stop the program with a message. */
     struct blorp_fiber *fiber;
-    if (strcmp(mode, "map_fails") == 0) {
+    if (strcmp(mode, "woke_unclaimed") == 0) {
+        fiber = blorp_fiber_create(park_unclaimed, &fiber);
+        assert(blorp_fiber_run(fiber) == BLORP_FIBER_STOP_PARKED);
+        (void)blorp_fiber_run(fiber);
+    } else if (strcmp(mode, "armed_twice") == 0 || strcmp(mode, "skipped_park") == 0) {
+        fiber = blorp_fiber_create(strcmp(mode, "armed_twice") == 0 ? arm_twice : skip_park, &fiber);
+        (void)blorp_fiber_run(fiber);
+    } else if (strcmp(mode, "finished_owing") == 0 || strcmp(mode, "parked_unarmed") == 0) {
+        fiber = blorp_fiber_create(strcmp(mode, "parked_unarmed") == 0 ? park_unarmed : finish_owing, &fiber);
+        (void)blorp_fiber_run(fiber);
+        blorp_fiber_destroy(fiber);
+    } else if (strcmp(mode, "parked_by_fiber") == 0) {
+        parked = blorp_fiber_create(park_parked, NULL);
+        fiber = blorp_fiber_create(resume_parked, &fiber);
+        (void)blorp_fiber_run(fiber);
+    } else if (strcmp(mode, "map_fails") == 0) {
         fail_map = 1;
     } else if (strcmp(mode, "protect_fails") == 0) {
         fail_protect = 1;

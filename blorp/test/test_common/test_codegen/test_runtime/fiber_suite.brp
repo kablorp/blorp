@@ -17,13 +17,16 @@ private PROBE_SOURCE: String = "blorp/test/test_common/test_codegen/test_runtime
 
 
 -- The sanitized probe runs under ASan and UBSan, with memory diagnostics for
--- the strict leak check. The optimized one is built as a program is, so the
--- switch also meets what an optimizer does around a call.
+-- the strict leak check, and its idle waits never spin, so every one sleeps and
+-- a notify can land between its look and its sleep. The optimized one is built
+-- as a program is, so the switch also meets what an optimizer does around a
+-- call.
 private SANITIZED: List[String] = [
     "-O0",
     "-fsanitize=address,undefined",
     "-fno-sanitize-recover=all",
-    "-DBLORP_MEMORY_DIAGNOSTICS=1"
+    "-DBLORP_MEMORY_DIAGNOSTICS=1",
+    "-DBLORP_IDLE_SPINS=0"
 ]
 
 
@@ -37,6 +40,7 @@ private NO_FAKE_STACKS: String = "detect_stack_use_after_return=0"
 -- kernel that have them.
 private SHADOW_STACKS: String = "glibc.cpu.hwcaps=SHSTK:glibc.cpu.x86_shstk=on"
 private LOCK_THREADS: List[String] = ["4", "8"]
+private RACE_CARRIERS: List[String] = ["1", "4"]
 -- SIGABRT, which a refused fiber ends the program with, as an allocation
 -- failure does.
 private ABORT_SIGNAL: Int = 6
@@ -69,6 +73,21 @@ private WRONG_CONTEXT_MESSAGE: String = "error: fiber runtime invariant broken: 
 
 
 private OTHER_THREAD_MESSAGE: String = "error: fiber runtime invariant broken: a fiber must stay on the thread it first ran on\n"
+
+
+private WOKE_UNCLAIMED_MESSAGE: String = "error: fiber runtime invariant broken: a fiber woke before its wait was claimed\n"
+
+
+private PARK_OWED_MESSAGE: String = "error: fiber runtime invariant broken: a fiber armed a wait before parking for its last one\n"
+
+
+private PARKED_BY_FIBER_MESSAGE: String = "error: fiber runtime invariant broken: a fiber parks only when its carrier ran it\n"
+
+
+private FINISHED_OWING_MESSAGE: String = "error: fiber runtime invariant broken: a fiber finished with a wait armed or a park owed\n"
+
+
+private PARKED_UNARMED_MESSAGE: String = "error: fiber runtime invariant broken: a fiber parked with no wait armed\n"
 
 
 private record Probes {
@@ -250,12 +269,14 @@ private func stops(executable: String, mode: String, message: String) -> Bool:
     report(matches(executable, [mode], False, Signaled(ABORT_SIGNAL), message))
 
 
-private func lock_totals(executable: String) -> Bool:
+-- `mode` passes on both probes with each of `counts` as its second argument.
+private func passes_each(probes: Probes, mode: String, counts: List[String]) -> Bool:
     var checked: Result[Void, String] = Ok(void)
 
-    for threads in LOCK_THREADS:
-        if checked.is_ok():
-            checked = matches(executable, ["lock_totals", threads], False, Exited(0), "")
+    for executable in [probes.sanitized, probes.optimized]:
+        for count in counts:
+            if checked.is_ok():
+                checked = matches(executable, [mode, count], False, Exited(0), "")
 
     report(checked)
 
@@ -273,7 +294,7 @@ func suite(c_compiler: String, directory: String) -> TestSuite:
             sanitized = probes.sanitized
 
             {
-                description = "Fiber switch, stacks and kernel lock",
+                description = "Fiber switch, stacks, kernel lock, parking, waits and the idle wait",
                 tests = [
                     (
                         "callee-saved registers and rounding modes survive switches",
@@ -307,12 +328,37 @@ func suite(c_compiler: String, directory: String) -> TestSuite:
                     ),
                     (
                         "the kernel lock keeps exact totals on 4 and 8 threads",
-                        func(): lock_totals(sanitized).and(lock_totals(probes.optimized))
+                        func(): passes_each(probes, "lock_totals", LOCK_THREADS)
                     ),
                     (
                         "a thread waiting for the kernel lock sleeps",
                         func(): passes(probes.optimized, "lock_sleeps")
                     ),
+                    (
+                        "a wake before its park leaves a permit, so the park yields, and a wake after it queues the fiber",
+                        func(): passes_on_both(probes, "permit")
+                    ),
+                    (
+                        "a permit survives a fiber that switches back without parking, so its next park yields",
+                        func(): passes_on_both(probes, "yield_keeps_permit")
+                    ),
+                    (
+                        "a wait ends once, and a party holding an earlier generation never ends a later wait",
+                        func(): passes_on_both(probes, "stale")
+                    ),
+                    (
+                        "a thread ending a wait while its fiber parks loses no wake, on 1 and 4 carriers",
+                        func(): passes_each(probes, "wake_race", RACE_CARRIERS)
+                    ),
+                    (
+                        "of four parties racing to end each of 100,000 waits exactly one wins, on 1 and 4 carriers",
+                        func(): passes_each(probes, "claim_race", RACE_CARRIERS)
+                    ),
+                    (
+                        "a notify racing the idle wait is never lost",
+                        func(): passes_on_both(probes, "idle_race")
+                    ),
+                    ("an idle thread sleeps", func(): passes(probes.optimized, "idle_sleeps")),
                     (
                         "a fiber stops the program under shadow stacks, and a switch otherwise keeps registers under the tunable",
                         func(): report(registers_under_shadow_stacks(sanitized))
@@ -348,6 +394,30 @@ func suite(c_compiler: String, directory: String) -> TestSuite:
                     (
                         "switching to a destroyed fiber stops the program",
                         func(): stops(sanitized, "resume_destroyed", RESUME_FINISHED_MESSAGE)
+                    ),
+                    (
+                        "a fiber run again before its wait was ended stops the program",
+                        func(): stops(sanitized, "woke_unclaimed", WOKE_UNCLAIMED_MESSAGE)
+                    ),
+                    (
+                        "a fiber arming a wait while its last one is armed stops the program",
+                        func(): stops(sanitized, "armed_twice", PARK_OWED_MESSAGE)
+                    ),
+                    (
+                        "a fiber arming a wait before parking for its last, ended one stops the program",
+                        func(): stops(sanitized, "skipped_park", PARK_OWED_MESSAGE)
+                    ),
+                    (
+                        "destroying a fiber that finished with a park owed for its wait stops the program",
+                        func(): stops(sanitized, "finished_owing", FINISHED_OWING_MESSAGE)
+                    ),
+                    (
+                        "a fiber parking with no wait armed stops the program",
+                        func(): stops(sanitized, "parked_unarmed", PARKED_UNARMED_MESSAGE)
+                    ),
+                    (
+                        "a fiber that another fiber resumed parking stops the program",
+                        func(): stops(sanitized, "parked_by_fiber", PARKED_BY_FIBER_MESSAGE)
                     )
                 ]
             }
