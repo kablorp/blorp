@@ -240,6 +240,18 @@ done.
   - **Next:** raising the bound, after field moves in own, borrowed records
     by address and `static` functions each measure (the plan's last
     section).
+- **Graphics and games:** [`GRAPHICS_PLAN.md`](GRAPHICS_PLAN.md).
+  - **Status:** planned on 2026-11-27, from the gravity game prototype,
+    after two rounds of review.
+    - Keith accepted the recommendations (G1 to G22), with no `and`/`or`/`not`
+      operators.
+    - The prototype's library is on the unpushed branch `gravity/prototype`.
+  - **Next:**
+    - W0, landing that library; it must first move its union reads to
+      `match`.
+    - Spike W, a window in plain C.
+    - The plan's "Handing this plan to an implementer" lists which landings
+      are ready to brief.
 
 ## Smaller follow-ups
 
