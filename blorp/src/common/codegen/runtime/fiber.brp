@@ -1,0 +1,403 @@
+-- The C a fiber needs, for the concurrency kernel (CONCURRENCY_PLAN.md,
+-- "Concurrency: a kernel written in Blorp"): the context switch, stacks of
+-- the main thread's size behind a guard, kept in a bounded cache, the ASan and
+-- TSan hooks on every switch, and the kernel's lock, which spins, yields, then
+-- blocks.
+-- It follows Spike K's runtime, with the changes "Landing 4b results"
+-- records. Fibers stay on the carrier that started them. It comes after
+-- THREAD_RUNTIME, and a program with it also needs PROCESS_POSIX_PRELUDE,
+-- since glibc declares MAP_ANON and MAP_NORESERVE under -std=c11 only with
+-- _DEFAULT_SOURCE. Nothing emits it yet: landing 5 is its first user.
+FIBER_RUNTIME: String =
+    raw
+        |
+        |#include <errno.h>
+        |#include <limits.h>
+        |#include <pthread.h>
+        |#include <sched.h>
+        |#include <stdatomic.h>
+        |#include <stdint.h>
+        |#include <stdio.h>
+        |#include <stdlib.h>
+        |#include <string.h>
+        |#include <sys/mman.h>
+        |#if defined(__has_feature)
+        |#if __has_feature(address_sanitizer)
+        |#define BLORP_FIBER_ASAN 1
+        |#endif
+        |#if __has_feature(thread_sanitizer)
+        |#define BLORP_FIBER_TSAN 1
+        |#endif
+        |#endif
+        |#if defined(__SANITIZE_ADDRESS__)&&!defined(BLORP_FIBER_ASAN)
+        |#define BLORP_FIBER_ASAN 1
+        |#endif
+        |#if defined(__SANITIZE_THREAD__)&&!defined(BLORP_FIBER_TSAN)
+        |#define BLORP_FIBER_TSAN 1
+        |#endif
+        |#ifdef BLORP_FIBER_ASAN
+        |#include <sanitizer/asan_interface.h>
+        |#include <sanitizer/common_interface_defs.h>
+        |#endif
+        |#ifdef BLORP_FIBER_TSAN
+        |#include <sanitizer/tsan_interface.h>
+        |#endif
+        |static void blorp_fiber_fail(const char *step,int code){
+        |fprintf(stderr,"error: cannot start a fiber: %s failed: %s\n",step,strerror(code));
+        |abort();
+        |}
+        |/* A broken rule of the switch or of a fiber's life is a defect in the kernel that calls this runtime. */
+        |static void blorp_fiber_broken(const char *rule){
+        |fprintf(stderr,"error: fiber runtime invariant broken: %s\n",rule);
+        |abort();
+        |}
+        |/* ---- the kernel lock ---- */
+        |/* Spins, then yields, then blocks: Spike K's design change 4, in the three phases of Go's runtime locks. A waiter
+        |   reads the word until it looks free and only then tries to take it, so the holder keeps its cache line. After
+        |   BLORP_KERNEL_LOCK_SPINS rounds it yields the processor, which lets a holder that was preempted run, and after
+        |   BLORP_KERNEL_LOCK_YIELDS more it sleeps rather than spend its core (CONCURRENCY_PLAN.md, "Landing 4b results").
+        |   The word is the lock, after Drepper's "Futexes Are Tricky": a mutex and a condition variable stand in for the
+        |   futex, which keeps it portable, and are touched only when a thread sleeps. It is never held across a switch. */
+        |enum {BLORP_KERNEL_LOCK_SPINS=64,BLORP_KERNEL_LOCK_YIELDS=16};
+        |enum {BLORP_KERNEL_LOCK_FREE,BLORP_KERNEL_LOCK_HELD,BLORP_KERNEL_LOCK_SLEEPERS};
+        |/* The word is last, beside what the lock guards when it heads a structure, so that taking the lock and touching that
+        |   data usually share a cache line. */
+        |struct blorp_kernel_lock {
+        |    pthread_mutex_t sleep;
+        |    pthread_cond_t wake;
+        |    atomic_int state;
+        |};
+        |#define BLORP_KERNEL_LOCK_INITIALIZER {PTHREAD_MUTEX_INITIALIZER,PTHREAD_COND_INITIALIZER,BLORP_KERNEL_LOCK_FREE}
+        |void blorp_kernel_lock(struct blorp_kernel_lock *lock){
+        |for(int round=0;round<BLORP_KERNEL_LOCK_SPINS+BLORP_KERNEL_LOCK_YIELDS;round++){
+        |int expected=BLORP_KERNEL_LOCK_FREE;
+        |if(atomic_load_explicit(&lock->state,memory_order_relaxed)==BLORP_KERNEL_LOCK_FREE&&
+        |atomic_compare_exchange_weak_explicit(&lock->state,&expected,BLORP_KERNEL_LOCK_HELD,memory_order_acquire,memory_order_relaxed))return;
+        |if(round<BLORP_KERNEL_LOCK_SPINS)blorp_thread_pause();
+        |else sched_yield();
+        |}
+        |/* Marks the lock as having sleepers, so that its unlock wakes one. A thread that finds it free this way holds it. */
+        |while(atomic_exchange_explicit(&lock->state,BLORP_KERNEL_LOCK_SLEEPERS,memory_order_acquire)!=BLORP_KERNEL_LOCK_FREE){
+        |pthread_mutex_lock(&lock->sleep);
+        |/* Read under the mutex, which an unlock takes after freeing the word, so its wake cannot fall between read and
+        |   wait. */
+        |while(atomic_load_explicit(&lock->state,memory_order_relaxed)==BLORP_KERNEL_LOCK_SLEEPERS)pthread_cond_wait(&lock->wake,&lock->sleep);
+        |pthread_mutex_unlock(&lock->sleep);
+        |}
+        |}
+        |void blorp_kernel_unlock(struct blorp_kernel_lock *lock){
+        |if(atomic_exchange_explicit(&lock->state,BLORP_KERNEL_LOCK_FREE,memory_order_release)!=BLORP_KERNEL_LOCK_SLEEPERS)return;
+        |pthread_mutex_lock(&lock->sleep);
+        |pthread_cond_signal(&lock->wake);
+        |pthread_mutex_unlock(&lock->sleep);
+        |}
+        |/* ---- contexts ---- */
+        |enum blorp_fiber_state {
+        |    BLORP_FIBER_NEW,       /* created, and never run */
+        |    BLORP_FIBER_RUNNING,   /* running on its thread */
+        |    BLORP_FIBER_SUSPENDED, /* switched away from; a switch resumes it */
+        |    BLORP_FIBER_FINISHED,  /* its entry returned */
+        |    BLORP_FIBER_CACHED      /* destroyed, and its stack kept for a later fiber: the record is not a fiber until create */
+        |};
+        |/* What a switch saves and resumes: a fiber's, or a thread's own. Only the thread a context runs on touches it, so its
+        |   fields need no atomics; a destroy on another thread is ordered by the kernel's own synchronization. */
+        |struct blorp_fiber_context {
+        |    void *stack_pointer;                  /* saved while suspended */
+        |    struct blorp_fiber_context *resumer;  /* the context that last switched to this one; a finished fiber goes back */
+        |    struct blorp_fiber_context *thread;   /* the context of the thread it runs on, set when it first runs */
+        |    enum blorp_fiber_state state;
+        |#ifdef BLORP_FIBER_ASAN
+        |    void *fake_stack;                     /* ASan's frames for this context while it is suspended */
+        |    const void *stack_bottom;
+        |    size_t stack_size;
+        |#endif
+        |#ifdef BLORP_FIBER_TSAN
+        |    void *tsan_fiber;
+        |#endif
+        |};
+        |/* A fiber: its context, and what it runs. It lives at the top of its stack's mapping, as Boost.Context places its
+        |   control structure, so a fiber costs no allocation beyond its stack. */
+        |struct blorp_fiber {
+        |    struct blorp_fiber_context context;
+        |    void (*entry)(void *argument);
+        |    void *argument;
+        |};
+        |/* The record's bytes, rounded so that the stack below it starts 16-byte aligned, as both ABIs require. */
+        |#define BLORP_FIBER_RECORD_BYTES ((sizeof(struct blorp_fiber)+15)&~(size_t)15)
+        |/* ---- the switch ---- */
+        |/* blorp_fiber_swap saves the callee-saved registers and the floating-point control state on the running stack, stores
+        |   the stack pointer in *save, then makes `load` the stack pointer and restores what that stack holds. Each target's
+        |   frame holds BLORP_FIBER_FRAME_WORDS words; a new fiber's first frame returns into blorp_fiber_enter, which jumps to the
+        |   start function in one callee-saved slot with the fiber in another, a null frame pointer and a null return address,
+        |   so backtrace(), lldb and gdb stop there. Pointer authentication needs nothing here: the return address is saved and
+        |   restored as it was, and each frame authenticates it with its own stack pointer, which never moves. */
+        |void blorp_fiber_swap(void **save,void *load);
+        |void blorp_fiber_enter(void);
+        |#if defined(__APPLE__)
+        |#define BLORP_FIBER_SECTION ".pushsection __TEXT,__text,regular,pure_instructions\n"
+        |#define BLORP_FIBER_FUNCTION(name,align,type) ".globl _" #name "\n.p2align " #align "\n_" #name ":\n"
+        |#define BLORP_FIBER_END(name) ""
+        |#else
+        |#define BLORP_FIBER_SECTION ".pushsection .text\n"
+        |#define BLORP_FIBER_FUNCTION(name,align,type) ".globl " #name "\n.type " #name "," type "\n.p2align " #align "\n" #name ":\n"
+        |#define BLORP_FIBER_END(name) ".size " #name ",.-" #name "\n"
+        |#endif
+        |#if defined(__aarch64__)
+        |#if defined(__has_feature)
+        |#if __has_feature(ptrauth_calls)
+        |#error "Blorp fibers do not support arm64e: the jump to the start function would fail its pointer authentication"
+        |#endif
+        |#endif
+        |/* x19-x28, x29, x30, d8-d15 and FPCR, 21 words, and one of padding so the stack pointer stays 16-byte aligned. x18
+        |   is Darwin's platform register, so it is never touched. FPCR holds the rounding mode, which AAPCS64 leaves to the
+        |   program as global state; glibc's swapcontext saves it too, so each fiber keeps its own, as on x86-64. */
+        |enum {BLORP_FIBER_FRAME_WORDS=22,BLORP_FIBER_START_SLOT=0,BLORP_FIBER_SELF_SLOT=1,BLORP_FIBER_RETURN_SLOT=11,BLORP_FIBER_FPCR_SLOT=20};
+        |/* The assembly below writes these offsets as numbers; this ties them to the slots that create fills. */
+        |_Static_assert(BLORP_FIBER_FRAME_WORDS*8==176&&BLORP_FIBER_FPCR_SLOT*8==160&&BLORP_FIBER_RETURN_SLOT*8==88,"the arm64 frame layout and the assembly disagree");
+        |#if defined(__ARM_FEATURE_BTI_DEFAULT)
+        |#define BLORP_FIBER_LANDING "bti c\n"
+        |#else
+        |#define BLORP_FIBER_LANDING ""
+        |#endif
+        |__asm__(BLORP_FIBER_SECTION BLORP_FIBER_FUNCTION(blorp_fiber_swap,2,"%function") BLORP_FIBER_LANDING
+        |"sub sp,sp,#176\n"
+        |"stp x19,x20,[sp,#0]\nstp x21,x22,[sp,#16]\nstp x23,x24,[sp,#32]\nstp x25,x26,[sp,#48]\nstp x27,x28,[sp,#64]\n"
+        |"stp x29,x30,[sp,#80]\nstp d8,d9,[sp,#96]\nstp d10,d11,[sp,#112]\nstp d12,d13,[sp,#128]\nstp d14,d15,[sp,#144]\n"
+        |"mrs x9,fpcr\nstr x9,[sp,#160]\n"
+        |"mov x9,sp\nstr x9,[x0]\nmov sp,x1\n"
+        |"ldp x19,x20,[sp,#0]\nldp x21,x22,[sp,#16]\nldp x23,x24,[sp,#32]\nldp x25,x26,[sp,#48]\nldp x27,x28,[sp,#64]\n"
+        |"ldp x29,x30,[sp,#80]\nldp d8,d9,[sp,#96]\nldp d10,d11,[sp,#112]\nldp d12,d13,[sp,#128]\nldp d14,d15,[sp,#144]\n"
+        |"ldr x9,[sp,#160]\nmsr fpcr,x9\n"
+        |"add sp,sp,#176\nret\n"
+        |BLORP_FIBER_END(blorp_fiber_swap)
+        |/* Entered by the ret above, which BTI does not check. br through x16 is what a `bti c` landing pad accepts. */
+        |BLORP_FIBER_FUNCTION(blorp_fiber_enter,2,"%function")
+        |"mov x0,x20\nmov x16,x19\nmov x30,xzr\nbr x16\n"
+        |BLORP_FIBER_END(blorp_fiber_enter)
+        |".popsection\n");
+        |#elif defined(__x86_64__)
+        |/* The x87 control word and MXCSR, r15-r12, rbx and rbp, then the return address. The System V ABI makes those
+        |   registers and the two words' control bits callee-saved. A new fiber's frame adds a null word, the start function's
+        |   return address, and is placed so that the start function begins with rsp 8 mod 16, as after a call. */
+        |enum {BLORP_FIBER_FRAME_WORDS=10,BLORP_FIBER_X87_SLOT=0,BLORP_FIBER_MXCSR_SLOT=1,BLORP_FIBER_START_SLOT=5,BLORP_FIBER_SELF_SLOT=6,BLORP_FIBER_RETURN_SLOT=8};
+        |/* The assembly below pushes rbp first and r15 last under 16 bytes of control words, so r12, rbx and the return address
+        |   are at 40, 48 and 64 bytes from the saved stack pointer; this ties that to the slots that create fills. */
+        |_Static_assert(BLORP_FIBER_FRAME_WORDS*8==80&&BLORP_FIBER_START_SLOT*8==40&&BLORP_FIBER_SELF_SLOT*8==48&&BLORP_FIBER_RETURN_SLOT*8==64,"the x86-64 frame layout and the assembly disagree");
+        |#if defined(__CET__)&&(__CET__&1)
+        |#define BLORP_FIBER_LANDING "endbr64\n"
+        |#else
+        |#define BLORP_FIBER_LANDING ""
+        |#endif
+        |__asm__(BLORP_FIBER_SECTION BLORP_FIBER_FUNCTION(blorp_fiber_swap,4,"@function") BLORP_FIBER_LANDING
+        |"pushq %rbp\npushq %rbx\npushq %r12\npushq %r13\npushq %r14\npushq %r15\n"
+        |"subq $16,%rsp\nstmxcsr 8(%rsp)\nfnstcw (%rsp)\n"
+        |"movq %rsp,(%rdi)\nmovq %rsi,%rsp\n"
+        |"fldcw (%rsp)\nldmxcsr 8(%rsp)\naddq $16,%rsp\n"
+        |"popq %r15\npopq %r14\npopq %r13\npopq %r12\npopq %rbx\npopq %rbp\nret\n"
+        |BLORP_FIBER_END(blorp_fiber_swap)
+        |/* Entered by the ret above, which indirect branch tracking does not check; under it, the start function has its own
+        |   endbr64. */
+        |BLORP_FIBER_FUNCTION(blorp_fiber_enter,4,"@function")
+        |"movq %rbx,%rdi\njmpq *%r12\n"
+        |BLORP_FIBER_END(blorp_fiber_enter)
+        |".popsection\n");
+        |#else
+        |#error "Blorp fibers do not support this target"
+        |#endif
+        |/* A switch while shadow stacks are on would fault at its ret, which returns to another stack's caller. x86-64's rdsspq
+        |   reads the shadow stack pointer and is a no-op, leaving 0, when they are off; arm64 Linux's chkfeat clears bit 0 of
+        |   x16 when the guarded control stack is on, and is a no-op otherwise. Switching them as glibc's swapcontext does is
+        |   left until a platform turns them on by default (CONCURRENCY_PLAN.md, "Landing 4b results"). */
+        |static int blorp_fiber_shadow_stack_on(void){
+        |#if defined(__x86_64__)
+        |unsigned long long pointer=0;
+        |__asm__ __volatile__("rdsspq %0":"+r"(pointer));
+        |return pointer!=0;
+        |#elif defined(__aarch64__)&&defined(__linux__)
+        |unsigned long long features;
+        |__asm__ __volatile__("mov x16,#1\nhint #40\nmov %0,x16":"=r"(features)::"x16");
+        |return (features&1)==0;
+        |#else
+        |return 0;
+        |#endif
+        |}
+        |/* ---- stacks ---- */
+        |/* Stacks of fibers that ended, kept for the next ones with the pages their fibers touched. Releasing those pages
+        |   (madvise) made a create-to-destroy cycle about 60 times slower on macOS, and the bound already caps what the cache
+        |   holds (CONCURRENCY_PLAN.md, "Landing 4b results"). 64 is enough for a burst of short fibers on one carrier to
+        |   reuse stacks, and small enough that the worst case, 64 stacks of the main thread's 8 MiB, is 512 MiB of address
+        |   space, which only the pages those fibers touched make resident. */
+        |enum {BLORP_FIBER_CACHED_STACKS=64};
+        |static struct blorp_kernel_lock blorp_fiber_cache_lock=BLORP_KERNEL_LOCK_INITIALIZER;
+        |static struct blorp_fiber *blorp_fiber_cache[BLORP_FIBER_CACHED_STACKS];
+        |static int blorp_fiber_cache_count;
+        |static pthread_once_t blorp_fiber_once=PTHREAD_ONCE_INIT;
+        |/* The guard and a stack of the main thread's size, but never less than PTHREAD_STACK_MIN, a thread's least. Written
+        |   once by blorp_fiber_start_runtime; read-only afterwards. */
+        |static size_t blorp_fiber_mapping_bytes;
+        |static void blorp_fiber_start_runtime(void){
+        |if(blorp_fiber_shadow_stack_on()){
+        |fputs("error: cannot start a fiber: this process runs with shadow stacks, which Blorp fibers do not support yet\nhelp: run it without them, for example with GLIBC_TUNABLES=glibc.cpu.hwcaps=-SHSTK on x86-64 Linux\n",stderr);
+        |abort();
+        |}
+        |/* The pool's threads get this floor from pthread_attr_setstacksize, which refuses less; a fiber's mapping has no such
+        |   call, so it keeps the floor here. The pool's own rule in THREAD_RUNTIME stays as it is (CONCURRENCY_PLAN.md,
+        |   "Landing 4b results", follow-ups). */
+        |size_t stack=blorp_thread_stack_bytes();
+        |if(stack<(size_t)PTHREAD_STACK_MIN)stack=(size_t)PTHREAD_STACK_MIN;
+        |blorp_fiber_mapping_bytes=BLORP_THREAD_GUARD_BYTES+stack;
+        |}
+        |static char *blorp_fiber_mapping(struct blorp_fiber *fiber){
+        |return (char *)fiber+BLORP_FIBER_RECORD_BYTES-blorp_fiber_mapping_bytes;
+        |}
+        |/* One mapping, read and write and committed only where touched; its lowest BLORP_THREAD_GUARD_BYTES then become the
+        |   guard. That splits it in two, the fewest a guard page allows (CONCURRENCY_PLAN.md, "Fiber limits"). */
+        |static struct blorp_fiber *blorp_fiber_map(void){
+        |int flags=MAP_PRIVATE|MAP_ANON;
+        |#ifdef MAP_NORESERVE
+        |flags|=MAP_NORESERVE;
+        |#endif
+        |char *const mapping=mmap(NULL,blorp_fiber_mapping_bytes,PROT_READ|PROT_WRITE,flags,-1,0);
+        |if(mapping==MAP_FAILED)blorp_fiber_fail("mmap",errno);
+        |#ifdef MADV_NOHUGEPAGE
+        |/* Under Linux's transparent huge pages set to always, a first touch commits a whole 2 MiB page wherever one fits: one
+        |   fiber in 32 got one for its top page, 656 MB at 10,000 parked fibers. Advice only, so a refusal changes nothing. */
+        |(void)madvise(mapping,blorp_fiber_mapping_bytes,MADV_NOHUGEPAGE);
+        |#endif
+        |if(mprotect(mapping,BLORP_THREAD_GUARD_BYTES,PROT_NONE)!=0)blorp_fiber_fail("mprotect",errno);
+        |return (struct blorp_fiber *)(mapping+blorp_fiber_mapping_bytes-BLORP_FIBER_RECORD_BYTES);
+        |}
+        |/* ---- fibers ---- */
+        |static _Thread_local struct blorp_fiber_context blorp_fiber_thread={.state=BLORP_FIBER_RUNNING};
+        |/* The calling thread's own context, so a carrier can switch from its native stack to a fiber and back. */
+        |struct blorp_fiber_context *blorp_fiber_thread_context(void){
+        |struct blorp_fiber_context *const thread=&blorp_fiber_thread;
+        |/* Set on the first call, which runs on the thread's own context: nothing else runs on a thread before it has switched
+        |   away from this one. */
+        |if(thread->thread==NULL){
+        |thread->thread=thread;
+        |#ifdef BLORP_FIBER_TSAN
+        |thread->tsan_fiber=__tsan_get_current_fiber();
+        |#endif
+        |}
+        |return thread;
+        |}
+        |/* Switches from `from` to `to`, leaving `from` in `left`: suspended, or finished when its entry has returned. A C
+        |   compiler may keep a thread-local's address in a register across this call. That is sound because a context runs
+        |   only on the thread it first ran on, which this checks: fibers stay on their carrier until landing 7, which needs
+        |   accessors that read thread-locals again (CONCURRENCY_PLAN.md, "Thread-locals"). */
+        |static void blorp_fiber_transfer(struct blorp_fiber_context *from,struct blorp_fiber_context *to,enum blorp_fiber_state left){
+        |if(from->state!=BLORP_FIBER_RUNNING)blorp_fiber_broken("a switch must leave the running context");
+        |if(from->thread!=&blorp_fiber_thread)blorp_fiber_broken("a switch must leave the context running on this thread");
+        |if(to->state!=BLORP_FIBER_NEW&&to->state!=BLORP_FIBER_SUSPENDED)blorp_fiber_broken("a switch must resume a new or suspended fiber");
+        |if(to->thread==NULL)to->thread=from->thread;
+        |else if(to->thread!=from->thread)blorp_fiber_broken("a fiber must stay on the thread it first ran on");
+        |from->state=left;
+        |to->state=BLORP_FIBER_RUNNING;
+        |to->resumer=from;
+        |#ifdef BLORP_FIBER_ASAN
+        |/* No slot for a finished context's fake stack tells ASan to free it. */
+        |__sanitizer_start_switch_fiber(left==BLORP_FIBER_FINISHED?NULL:&from->fake_stack,to->stack_bottom,to->stack_size);
+        |#endif
+        |#ifdef BLORP_FIBER_TSAN
+        |__tsan_switch_to_fiber(to->tsan_fiber,0);
+        |#endif
+        |blorp_fiber_swap(&from->stack_pointer,to->stack_pointer);
+        |#ifdef BLORP_FIBER_ASAN
+        |/* Back on `from`'s stack. The stack ASan reports leaving is its resumer's, which is how a thread's own context learns
+        |   its bounds before anything switches back to it. */
+        |__sanitizer_finish_switch_fiber(from->fake_stack,&from->resumer->stack_bottom,&from->resumer->stack_size);
+        |#endif
+        |}
+        |/* Saves the running context into `from` and resumes `to`; returns when something switches back to `from`. */
+        |void blorp_fiber_switch(struct blorp_fiber_context *from,struct blorp_fiber_context *to){
+        |blorp_fiber_transfer(from,to,BLORP_FIBER_SUSPENDED);
+        |}
+        |/* A fiber's first frame. When its entry returns, it switches to the context that last resumed it, and nothing may
+        |   resume it again, so it never falls off its stack. */
+        |static void blorp_fiber_start(struct blorp_fiber *fiber){
+        |#ifdef BLORP_FIBER_ASAN
+        |__sanitizer_finish_switch_fiber(NULL,&fiber->context.resumer->stack_bottom,&fiber->context.resumer->stack_size);
+        |#endif
+        |fiber->entry(fiber->argument);
+        |blorp_fiber_transfer(&fiber->context,fiber->context.resumer,BLORP_FIBER_FINISHED);
+        |blorp_fiber_broken("a finished fiber was resumed");
+        |}
+        |/* A fiber that runs entry(argument) on a stack of its own the first time it is switched to. It never fails: a stack
+        |   that cannot be mapped stops the program, as running out of memory does. */
+        |struct blorp_fiber *blorp_fiber_create(void (*entry)(void *argument),void *argument){
+        |pthread_once(&blorp_fiber_once,blorp_fiber_start_runtime);
+        |struct blorp_fiber *fiber=NULL;
+        |blorp_kernel_lock(&blorp_fiber_cache_lock);
+        |if(blorp_fiber_cache_count>0)fiber=blorp_fiber_cache[--blorp_fiber_cache_count];
+        |blorp_kernel_unlock(&blorp_fiber_cache_lock);
+        |const int reused=fiber!=NULL;
+        |if(!reused)fiber=blorp_fiber_map();
+        |memset(&fiber->context,0,sizeof fiber->context);
+        |fiber->context.state=BLORP_FIBER_NEW;
+        |fiber->entry=entry;
+        |fiber->argument=argument;
+        |#ifdef BLORP_FIBER_ASAN
+        |char *const bottom=blorp_fiber_mapping(fiber)+BLORP_THREAD_GUARD_BYTES;
+        |fiber->context.stack_bottom=bottom;
+        |fiber->context.stack_size=(size_t)((char *)fiber-bottom);
+        |/* A cached stack was poisoned while cached. A fresh mapping's shadow is clean already, and unpoisoning it would make
+        |   an eighth of its stack resident as shadow: about 10 GB for 10,000 fibers. */
+        |if(reused)__asan_unpoison_memory_region(bottom,fiber->context.stack_size);
+        |#endif
+        |uintptr_t *const frame=(uintptr_t *)fiber-BLORP_FIBER_FRAME_WORDS;
+        |memset(frame,0,BLORP_FIBER_FRAME_WORDS*sizeof *frame);
+        |frame[BLORP_FIBER_START_SLOT]=(uintptr_t)blorp_fiber_start;
+        |frame[BLORP_FIBER_SELF_SLOT]=(uintptr_t)fiber;
+        |frame[BLORP_FIBER_RETURN_SLOT]=(uintptr_t)blorp_fiber_enter;
+        |/* A fiber starts with its creator's floating-point control state, as C11 starts a thread with its creator's
+        |   floating-point environment. */
+        |#if defined(__aarch64__)
+        |uint64_t control;
+        |__asm__ __volatile__("mrs %0,fpcr":"=r"(control));
+        |frame[BLORP_FIBER_FPCR_SLOT]=(uintptr_t)control;
+        |#else
+        |uint32_t mxcsr;
+        |uint16_t x87;
+        |__asm__ __volatile__("stmxcsr %0\nfnstcw %1":"=m"(mxcsr),"=m"(x87));
+        |frame[BLORP_FIBER_MXCSR_SLOT]=mxcsr;
+        |frame[BLORP_FIBER_X87_SLOT]=x87;
+        |#endif
+        |fiber->context.stack_pointer=frame;
+        |#ifdef BLORP_FIBER_TSAN
+        |fiber->context.tsan_fiber=__tsan_create_fiber(0);
+        |#endif
+        |return fiber;
+        |}
+        |/* Returns a fiber's stack to the cache, or unmaps it when the cache is full. Only for a fiber that is new or whose
+        |   entry returned: a suspended one still has frames, which may own memory. */
+        |void blorp_fiber_destroy(struct blorp_fiber *fiber){
+        |if(fiber->context.state!=BLORP_FIBER_NEW&&fiber->context.state!=BLORP_FIBER_FINISHED)blorp_fiber_broken("only a new or finished fiber can be destroyed");
+        |#ifdef BLORP_FIBER_TSAN
+        |__tsan_destroy_fiber(fiber->context.tsan_fiber);
+        |#endif
+        |#ifdef BLORP_FIBER_ASAN
+        |/* The frames live at a finished fiber's last switch, from its saved stack pointer to the top, never returned, so their
+        |   redzones are still poisoned. They are the only ones, so cleaning them leaves the shadow as a fresh mapping's. */
+        |__asan_unpoison_memory_region(fiber->context.stack_pointer,(size_t)((char *)fiber-(char *)fiber->context.stack_pointer));
+        |#endif
+        |blorp_kernel_lock(&blorp_fiber_cache_lock);
+        |const int cached=blorp_fiber_cache_count<BLORP_FIBER_CACHED_STACKS;
+        |if(cached){
+        |/* Under the lock, before the fiber can be taken: a destroy or a switch that meets it later is refused. */
+        |fiber->context.state=BLORP_FIBER_CACHED;
+        |#ifdef BLORP_FIBER_ASAN
+        |/* A cached stack is out of bounds until it is handed out again. Poisoned under the lock, so never after another
+        |   thread has taken it: only an ASan build holds the lock this long. */
+        |__asan_poison_memory_region(fiber->context.stack_bottom,fiber->context.stack_size);
+        |#endif
+        |blorp_fiber_cache[blorp_fiber_cache_count++]=fiber;
+        |}
+        |blorp_kernel_unlock(&blorp_fiber_cache_lock);
+        |if(cached)return;
+        |if(munmap(blorp_fiber_mapping(fiber),blorp_fiber_mapping_bytes)!=0){
+        |fprintf(stderr,"error: cannot release a fiber's stack: munmap failed: %s\n",strerror(errno));
+        |abort();
+        |}
+        |}
+        |

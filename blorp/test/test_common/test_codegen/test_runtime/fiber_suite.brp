@@ -1,0 +1,353 @@
+import:
+    io/process: CaptureError, Exit(Exited, Signaled), capture
+    test: TestSuite
+    ../../../../src/common/codegen/runtime/fiber: FIBER_RUNTIME
+    ../../../../src/common/codegen/runtime/memory: MEMORY_RUNTIME, RELEASE_RUNTIME
+    ../../../../src/common/codegen/runtime/thread: THREAD_RUNTIME
+    ../../../driver/file_access: write_file
+    ../../../driver/harness: ending, isolated, run_expecting
+    ../../../driver/reports: without_peak_heap
+
+
+private COMPILE_TIMEOUT_MS: Int = 600000
+private CHILD_TIMEOUT_MS: Int = 60000
+
+
+private PROBE_SOURCE: String = "blorp/test/test_common/test_codegen/test_runtime/fixtures/fiber_test.c"
+
+
+-- The sanitized probe runs under ASan and UBSan, with memory diagnostics for
+-- the strict leak check. The optimized one is built as a program is, so the
+-- switch also meets what an optimizer does around a call.
+private SANITIZED: List[String] = [
+    "-O0",
+    "-fsanitize=address,undefined",
+    "-fno-sanitize-recover=all",
+    "-DBLORP_MEMORY_DIAGNOSTICS=1"
+]
+
+
+private OPTIMIZED: List[String] = ["-O2", "-DBLORP_MEMORY_DIAGNOSTICS=0"]
+-- ASan keeps the frames whose addresses escape on fake stacks of its own with
+-- these on, and every switch must save and restore the running one. Linux
+-- turns them on by default, macOS does not, so a case says which it runs with.
+private FAKE_STACKS: String = "detect_stack_use_after_return=1"
+private NO_FAKE_STACKS: String = "detect_stack_use_after_return=0"
+-- glibc turns shadow stacks on only when asked, and then only on a CPU and
+-- kernel that have them.
+private SHADOW_STACKS: String = "glibc.cpu.hwcaps=SHSTK:glibc.cpu.x86_shstk=on"
+private LOCK_THREADS: List[String] = ["4", "8"]
+-- SIGABRT, which a refused fiber ends the program with, as an allocation
+-- failure does.
+private ABORT_SIGNAL: Int = 6
+
+
+-- Fibers allocate nothing through the Blorp allocator.
+private NO_ALLOCATIONS_REPORT: String = "blorp: leak check: 0 allocs, 0 releases, 0 leaked, 0 bytes\n"
+
+
+private DEEP_DROP_REPORT: String = "blorp: leak check: 1000000 allocs, 1000000 releases, 0 leaked, 0 bytes\n"
+
+
+-- The probe's wrappers fail with ENOMEM.
+private MAP_FAILURE_MESSAGE: String = "error: cannot start a fiber: mmap failed: Cannot allocate memory\n"
+
+
+private PROTECT_FAILURE_MESSAGE: String = "error: cannot start a fiber: mprotect failed: Cannot allocate memory\n"
+
+
+private SHADOW_STACK_MESSAGE: String = "error: cannot start a fiber: this process runs with shadow stacks, which Blorp fibers do not support yet\nhelp: run it without them, for example with GLIBC_TUNABLES=glibc.cpu.hwcaps=-SHSTK on x86-64 Linux\n"
+
+
+private DESTROY_SUSPENDED_MESSAGE: String = "error: fiber runtime invariant broken: only a new or finished fiber can be destroyed\n"
+
+
+private RESUME_FINISHED_MESSAGE: String = "error: fiber runtime invariant broken: a switch must resume a new or suspended fiber\n"
+
+
+private WRONG_CONTEXT_MESSAGE: String = "error: fiber runtime invariant broken: a switch must leave the context running on this thread\n"
+
+
+private OTHER_THREAD_MESSAGE: String = "error: fiber runtime invariant broken: a fiber must stay on the thread it first ran on\n"
+
+
+private record Probes {
+    sanitized: String,
+    optimized: String
+}
+
+
+-- How a run ended. A strict run's stderr lacks its peak heap line.
+private record Ending {
+    label: String,
+    exit: Exit,
+    stdout: String,
+    stderr: String,
+    timeout_ms: Option[Int]
+}
+
+
+private func build_probe(
+    c_compiler: String,
+    directory: String,
+    name: String,
+    flags: List[String]
+) -> Result[String, String]:
+    executable = directory + "/" + name
+
+    command ?= isolated(
+        c_compiler,
+        ["-std=c11", "-Wall", "-Wextra", "-Werror", "-pedantic", "-pthread"]
+            .concat(flags)
+            .concat(["-I", directory, PROBE_SOURCE, "-o", executable]),
+        COMPILE_TIMEOUT_MS
+    )
+
+    built ?= run_expecting("fiber native build", command, 0)
+
+    if built.stderr == "":
+        Ok(executable)
+    else:
+        Err("fiber native build: " + built.stderr)
+
+
+private func ready(c_compiler: String, directory: String) -> Result[Probes, String]:
+    _ ?= write_file(directory + "/memory_runtime.c", MEMORY_RUNTIME)
+    _ ?= write_file(directory + "/release_runtime.c", RELEASE_RUNTIME)
+    _ ?= write_file(directory + "/thread_runtime.c", THREAD_RUNTIME)
+    _ ?= write_file(directory + "/fiber_runtime.c", FIBER_RUNTIME)
+    sanitized ?= build_probe(c_compiler, directory, "fiber_probe", SANITIZED)
+    optimized ?= build_probe(c_compiler, directory, "fiber_probe_optimized", OPTIMIZED)
+    Ok({ sanitized = sanitized, optimized = optimized })
+
+
+-- Runs the probe with `arguments`, the strict leak check when `strict`, ASan's
+-- fake stacks when `fake_stacks`, and GLIBC_TUNABLES set to `tunables`.
+private func run_case(
+    executable: String,
+    arguments: List[String],
+    strict: Bool,
+    fake_stacks: Bool,
+    tunables: Option[String]
+) -> Result[Ending, String]:
+    leak_check: Option[String] = if strict:
+        Some("strict")
+    else:
+        None
+
+    asan_options = if fake_stacks:
+        FAKE_STACKS
+    else:
+        NO_FAKE_STACKS
+
+    run ?= isolated(executable, arguments, CHILD_TIMEOUT_MS)
+
+    environment = run.environment
+        .set("BLORP_LEAK_CHECK", leak_check)
+        .set("BLORP_ALLOCATION_SITES", None)
+        .set("ASAN_OPTIONS", Some(asan_options))
+        .set("GLIBC_TUNABLES", tunables)
+
+    label = arguments.join(" ")
+    invocation = { run | environment = environment }
+
+    captured ?= capture(invocation).map_err(
+        pure func(error: CaptureError) -> String: "${label}: ${error}"
+    )
+
+    stderr ?= if strict:
+        without_peak_heap(captured.stderr).map_err(
+            pure func(error: String) -> String: label + ": " + error
+        )
+    else:
+        Ok(captured.stderr)
+
+    Ok({
+        label = label,
+        exit = captured.exit,
+        stdout = captured.stdout,
+        stderr = stderr,
+        timeout_ms = invocation.timeout_ms
+    })
+
+
+private pure func ends_as(run: Ending, exit: Exit, stderr: String) -> Bool:
+    (run.exit == exit)
+        .and(run.stdout == "")
+        .and(run.stderr == stderr)
+
+
+private pure func mismatch(run: Ending, expected: String) -> String:
+    "${run.label}: expected ${expected}; got ${run.exit.ending(run.timeout_ms)}, stderr [${run.stderr}] and stdout [${run.stdout}]"
+
+
+-- A run of `arguments`, with ASan's fake stacks, that must end as `exit`,
+-- print `stderr` and print nothing to stdout.
+private func matches(
+    executable: String,
+    arguments: List[String],
+    strict: Bool,
+    exit: Exit,
+    stderr: String
+) -> Result[Void, String]:
+    run ?= run_case(executable, arguments, strict, True, None)
+
+    if run.ends_as(exit, stderr):
+        Ok(void)
+    else:
+        Err(run.mismatch("${exit.ending(None)} and stderr [${stderr}]"))
+
+
+-- `registers` under shadow stacks: where they come on, the first switch would
+-- fault at its ret unless the runtime stopped the program before it. `hwcaps`
+-- alone enables them only in a binary marked for them, and Clang's builds are
+-- not; `x86_shstk=on` always enables them (glibc's manual, "Hardware
+-- Capability Tunables").
+private func registers_under_shadow_stacks(executable: String) -> Result[Void, String]:
+    run ?= run_case(executable, ["registers"], False, True, Some(SHADOW_STACKS))
+
+    if (
+        run
+            .ends_as(Exited(0), "")
+            .or(run.ends_as(Signaled(ABORT_SIGNAL), SHADOW_STACK_MESSAGE))
+    ):
+        Ok(void)
+    else:
+        Err(run.mismatch("exited 0, or the shadow-stack message and SIGABRT"))
+
+
+private func report(checked: Result[Void, String]) -> Bool:
+    match checked:
+        Ok(_):
+            True
+        Err(error):
+            print_error(error)
+            False
+
+
+private func passes(executable: String, mode: String) -> Bool:
+    report(matches(executable, [mode], False, Exited(0), ""))
+
+
+-- `mode` passes on both probes; each reports its own failure.
+private func passes_on_both(probes: Probes, mode: String) -> Bool:
+    passes(probes.sanitized, mode).and(passes(probes.optimized, mode))
+
+
+-- The deep drop runs without fake stacks: they would move its frames off the
+-- fiber's stack, which is what it tests, and GCC's take about 45 s on it.
+private func drops_deep_chain(executable: String) -> Result[Void, String]:
+    run ?= run_case(executable, ["deep_drop"], True, False, None)
+
+    if run.ends_as(Exited(0), DEEP_DROP_REPORT):
+        Ok(void)
+    else:
+        Err(run.mismatch("exited 0 and stderr [${DEEP_DROP_REPORT}]"))
+
+
+-- `mode` stops the program with `message`.
+private func stops(executable: String, mode: String, message: String) -> Bool:
+    report(matches(executable, [mode], False, Signaled(ABORT_SIGNAL), message))
+
+
+private func lock_totals(executable: String) -> Bool:
+    var checked: Result[Void, String] = Ok(void)
+
+    for threads in LOCK_THREADS:
+        if checked.is_ok():
+            checked = matches(executable, ["lock_totals", threads], False, Exited(0), "")
+
+    report(checked)
+
+
+func suite(c_compiler: String, directory: String) -> TestSuite:
+    match ready(c_compiler, directory):
+        Err(error):
+            print_error(error)
+
+            {
+                description = "Fiber runtime setup",
+                tests = [("native probes build", func(): False)]
+            }
+        Ok(probes):
+            sanitized = probes.sanitized
+
+            {
+                description = "Fiber switch, stacks and kernel lock",
+                tests = [
+                    (
+                        "callee-saved registers and rounding modes survive switches",
+                        func(): passes_on_both(probes, "registers")
+                    ),
+                    (
+                        "a fiber recurses 1,000 frames of 4 KiB",
+                        func(): passes_on_both(probes, "depth")
+                    ),
+                    (
+                        "a fiber releases a million-deep chain and the strict leak check balances",
+                        func(): report(drops_deep_chain(sanitized))
+                    ),
+                    (
+                        "running past a fiber's stack faults in its guard",
+                        func(): passes_on_both(probes, "overflow")
+                    ),
+                    (
+                        "10,000 fibers are created, switched through and destroyed with no allocation",
+                        func(): report(
+                            matches(sanitized, ["scale"], True, Exited(0), NO_ALLOCATIONS_REPORT)
+                        ).and(passes(probes.optimized, "scale"))
+                    ),
+                    (
+                        "a destroyed fiber's stack is reused and the cache keeps at most its bound",
+                        func(): passes_on_both(probes, "cache")
+                    ),
+                    (
+                        "backtrace() on a fiber stops at its entry",
+                        func(): passes_on_both(probes, "backtrace")
+                    ),
+                    (
+                        "the kernel lock keeps exact totals on 4 and 8 threads",
+                        func(): lock_totals(sanitized).and(lock_totals(probes.optimized))
+                    ),
+                    (
+                        "a thread waiting for the kernel lock sleeps",
+                        func(): passes(probes.optimized, "lock_sleeps")
+                    ),
+                    (
+                        "a fiber stops the program under shadow stacks, and a switch otherwise keeps registers under the tunable",
+                        func(): report(registers_under_shadow_stacks(sanitized))
+                    ),
+                    (
+                        "a fiber whose stack cannot be mapped stops the program",
+                        func(): stops(sanitized, "map_fails", MAP_FAILURE_MESSAGE)
+                    ),
+                    (
+                        "a fiber whose guard cannot be protected stops the program",
+                        func(): stops(sanitized, "protect_fails", PROTECT_FAILURE_MESSAGE)
+                    ),
+                    (
+                        "destroying a suspended fiber stops the program, which is also how the ASan hook's switch bookkeeping is tested",
+                        func(): stops(sanitized, "destroy_suspended", DESTROY_SUSPENDED_MESSAGE)
+                    ),
+                    (
+                        "resuming a finished fiber stops the program",
+                        func(): stops(sanitized, "resume_finished", RESUME_FINISHED_MESSAGE)
+                    ),
+                    (
+                        "resuming a fiber on another thread stops the program",
+                        func(): stops(sanitized, "other_thread", OTHER_THREAD_MESSAGE)
+                    ),
+                    (
+                        "leaving another thread's context stops the program",
+                        func(): stops(sanitized, "wrong_context", WRONG_CONTEXT_MESSAGE)
+                    ),
+                    (
+                        "destroying a fiber twice stops the program",
+                        func(): stops(sanitized, "double_destroy", DESTROY_SUSPENDED_MESSAGE)
+                    ),
+                    (
+                        "switching to a destroyed fiber stops the program",
+                        func(): stops(sanitized, "resume_destroyed", RESUME_FINISHED_MESSAGE)
+                    )
+                ]
+            }
