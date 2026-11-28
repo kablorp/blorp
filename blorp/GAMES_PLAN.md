@@ -388,6 +388,39 @@ need.
     Under each guard mutation, the sanitized fixture reports a "shift
     exponent" error, checked by hand.
   - **Evidence:** `build/games/w0-bits/` in the main checkout.
+- **Landing 3, randomness:** `d1048b452`, 2026-11-28.
+  - **The change:** `random`, a pure SplitMix64 generator in Blorp that
+    draws what `java.util.SplittableRandom` draws, call for call, with a
+    derived gamma for each `split`. `io/random` gives `random_seed` from
+    `getentropy`, through a new `system.random_seed` native, and the
+    conveniences. It was ported from the prototype branch's `030a21756` and
+    `e3e190e26`, with four required changes:
+    - `match` in place of union destructuring;
+    - the derived-gamma `split`, where the prototype's used a fixed gamma;
+    - `random_below` in place of `random_int`;
+    - the JDK's power-of-two path in `next_below`, so every function has a
+      JDK oracle.
+  - **Oracle:** every function matches values computed by OpenJDK 17, with
+    the programs kept beside the brief. The published `splitmix64.c` vector
+    for seed 1234567 is among them. Eight mutations each fail a named test,
+    the fixed-gamma `split` among them.
+  - **Cost:** self-compile against `63dfb4a23`, fixed input, allocations
+    +0.0000% and instructions -0.006%, with the fixed-input C identical.
+  - **Lines:** production +29 net, against a ceiling of +35. Library +203.
+  - **Ceiling correction** (the coordinator, under the standing delegation):
+    library from +200 to +205. The review asked for the JDK mapping in the
+    docs, and the earlier fit to +200 had come from trimming comments.
+  - **The `random/draws` fixture:** 100,000 draws, measured at 105,844
+    allocations and 733 M instructions to compile, with ceilings of 105,850
+    and 843 M (+15%). Its run allocates 4 times, so a draw allocates
+    nothing.
+  - **Gates:**
+    - the full gate passes on the final commit, rebased onto CTFE landing
+      2;
+    - Seed CI run 46186078791 is green on all targets;
+    - code review: 0 blockers, and 1 should-fix, the JDK mapping, which was
+      taken.
+  - **Evidence:** `build/games/w0-random/` in the main checkout.
 
 ## W1: Spike W, a window in plain C
 

@@ -264,8 +264,8 @@ done.
       the FFI's CBOR results, is recommended.
   - **Next:**
     - W0's core library landings: landing 1, `math`, landed as `db6f29133`,
-      and landing 2, `bits`, as `30d898f1a`; randomness, time and terminal
-      input are next;
+      landing 2, `bits`, as `30d898f1a`, and landing 3, randomness, as
+      `d1048b452`; time and terminal input are next;
     - W5, Int32 and Float32;
     - Spike W, a window in plain C.
 
