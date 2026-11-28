@@ -1,7 +1,7 @@
-/* Native probe of the console natives and print, built with the unmodified production
- * fragments and the List[UInt8] layout a program that uses them emits. Each case
- * is one argument, after which comes a directory the case may use; a case that
- * passes returns 0 and prints nothing on standard output.
+/* Native probe of the console natives and print, and of their blocking jobs, built with
+ * the unmodified production fragments, the pool's included, and the List[UInt8] layout a
+ * program that uses them emits. Each case is one argument, after which comes a directory
+ * the case may use; a case that passes returns 0 and prints nothing on standard output.
  *
  * A case supplies standard input by putting bytes in a file or pipe on
  * descriptor 0 before any read, and takes standard output (or error) to a file or
@@ -9,6 +9,7 @@
  * start empty. A case that must see a process end forks it. */
 #define _POSIX_C_SOURCE 200809L
 #define _XOPEN_SOURCE 700
+#define _DEFAULT_SOURCE
 #ifdef __APPLE__
 #define _DARWIN_C_SOURCE
 #endif
@@ -22,11 +23,15 @@
 #include <pthread.h>
 #include <sched.h>
 #include <signal.h>
+#include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include <sys/ioctl.h>
 #include <sys/stat.h>
 #include <sys/time.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 /* The whole-lines case yields to the other threads inside print, between its text and its
@@ -36,6 +41,7 @@ static int probe_fputc(int character, FILE *stream);
 #define fputc probe_fputc
 #include "console_runtime.c"
 #undef fputc
+#include "carrier_harness.h"
 
 static int probe_fputc(int character, FILE *stream) {
     if (yield_before_newline) {
@@ -564,6 +570,419 @@ static int interrupted_read(void) {
     return 0;
 }
 
+/* ---- standard input as the runtime owns it ---- */
+
+/* Descriptor 0 becomes a pipe's read end, and its write end is returned. `watch` keeps
+ * the read end too, on which FIONREAD counts the bytes no reader has taken. */
+static int pipe_input(int *watch) {
+    int ends[2];
+    assert(pipe(ends) == 0);
+    assert(dup2(ends[0], STDIN_FILENO) == STDIN_FILENO);
+    *watch = ends[0];
+    return ends[1];
+}
+
+/* A blocking write to a pipe or terminal is whole unless a signal interrupts it, and these cases catch none. */
+static void send_bytes(int writer, const void *bytes, size_t length) {
+    assert(write(writer, bytes, length) == (ssize_t)length);
+}
+
+static void send_text(int writer, const char *text) {
+    send_bytes(writer, text, strlen(text));
+}
+
+/* Returns once a reader has taken every byte written to the pipe `watch` reads. */
+static void until_taken(int watch) {
+    for (int unread = 1; unread > 0; sched_yield()) {
+        assert(ioctl(watch, FIONREAD, &unread) == 0);
+    }
+}
+
+/* The read end of a cancel pipe that is readable already. */
+static int readable_cancel(void) {
+    int ends[2];
+    assert(pipe(ends) == 0);
+    assert(write(ends[1], "", 1) == 1);
+    return ends[0];
+}
+
+static void expect_line_cancellable(int cancel, const char *expected) {
+    bytes_list line = NULL;
+    int64_t error = -1;
+    assert(blorp_console_read_line_cancellable(&line, &error, cancel) == BLORP_FS_SUCCEEDED);
+    assert(line->length == (int64_t)strlen(expected));
+    assert(memcmp(line->values, expected, strlen(expected)) == 0);
+    blorp_list_drop_0_b(line);
+}
+
+/* Cancellable reads, each on a thread of its own or in place, which must end as the end of input. */
+enum { PARTIAL_COUNT = 10 };
+static void *line_until_cancelled(void *cancel) {
+    expect_line_cancellable((int)(intptr_t)cancel, "");
+    return NULL;
+}
+static void *exact_until_cancelled(void *cancel) {
+    bytes_list bytes = NULL;
+    int64_t error = -1;
+    assert(blorp_console_read_exact_cancellable(PARTIAL_COUNT, &bytes, &error, (int)(intptr_t)cancel) == BLORP_FS_SUCCEEDED);
+    assert(bytes->length == 0);
+    blorp_list_drop_0_b(bytes);
+    return NULL;
+}
+
+/* Starts `read` on a thread, sends it `length` bytes, cancels it once it has taken them
+ * all, and waits for it to end. */
+static void cancel_after(void *(*read)(void *), int writer, int watch, const void *bytes, size_t length) {
+    int cancel[2];
+    assert(pipe(cancel) == 0);
+    pthread_t reader;
+    assert(pthread_create(&reader, NULL, read, (void *)(intptr_t)cancel[0]) == 0);
+    send_bytes(writer, bytes, length);
+    until_taken(watch);
+    assert(write(cancel[1], "", 1) == 1);
+    assert(pthread_join(reader, NULL) == 0);
+}
+
+/* One write's chunk: each read takes its line, and the rest waits for the next. */
+static int pending_rest(void) {
+    int watch;
+    const int writer = pipe_input(&watch);
+    send_text(writer, "a\nb\nc");
+    close(writer);
+    expect_line_text("a\n");
+    expect_line_text("b\n");
+    expect_line_text("c");
+    expect_line_text("");
+    return 0;
+}
+
+/* An empty pipe that the parent made O_NONBLOCK, with a line written POLL_MILLISECONDS later: the read waits
+ * for it, where a read through stdio failed at once with EAGAIN. */
+static int nonblocking_input(void) {
+    int watch;
+    const int writer = pipe_input(&watch);
+    assert(fcntl(STDIN_FILENO, F_SETFL, fcntl(STDIN_FILENO, F_GETFL) | O_NONBLOCK) == 0);
+    assert(fflush(NULL) == 0);
+    const pid_t late = fork();
+    assert(late >= 0);
+    if (late == 0) {
+        poll(NULL, 0, POLL_MILLISECONDS);
+        _exit(write(writer, "late\n", 5) == 5 ? 0 : 1);
+    }
+    close(writer);
+    alarm(ALARM_SECONDS);
+    expect_line_text("late\n");
+    int status = 0;
+    assert(waitpid(late, &status, 0) == late && WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    return 0;
+}
+
+/* With the writer open and nothing written, a cancel ends both reads at once. */
+static int cancel_while_waiting(void) {
+    int watch;
+    const int writer = pipe_input(&watch);
+    const int cancel = readable_cancel();
+    alarm(ALARM_SECONDS);
+    expect_line_cancellable(cancel, "");
+    (void)exact_until_cancelled((void *)(intptr_t)cancel);
+    close(writer);
+    return 0;
+}
+
+/* A cancelled read gives back what it took, and the next read continues from it. */
+static int cancel_keeps_partial(void) {
+    int watch;
+    const int writer = pipe_input(&watch);
+    alarm(ALARM_SECONDS);
+    cancel_after(line_until_cancelled, writer, watch, "par", 3);
+    send_text(writer, "tial\n");
+    expect_line_text("partial\n");
+    cancel_after(exact_until_cancelled, writer, watch, "abcd", 4);
+    send_text(writer, "efghij");
+    expect_exact_text(PARTIAL_COUNT, "abcdefghij");
+    return 0;
+}
+
+/* The cancel is seen only once a read needs the descriptor, so a line in the buffer wins. */
+static int pending_line_beats_cancel(void) {
+    int watch;
+    const int writer = pipe_input(&watch);
+    send_text(writer, "w\nx\ny");
+    expect_line_text("w\n");
+    const int cancel = readable_cancel();
+    alarm(ALARM_SECONDS);
+    expect_line_cancellable(cancel, "x\n");
+    expect_line_cancellable(cancel, "");
+    close(writer);
+    expect_line_text("y");
+    return 0;
+}
+
+/* A partial larger than the buffer's step goes back whole. */
+enum { GROWN_PARTIAL = 200000 };
+static int cancel_partial_grows(void) {
+    static unsigned char line[GROWN_PARTIAL + 1];
+    memset(line, 'z', GROWN_PARTIAL);
+    line[GROWN_PARTIAL] = '\n';
+    int watch;
+    const int writer = pipe_input(&watch);
+    alarm(ALARM_SECONDS);
+    cancel_after(line_until_cancelled, writer, watch, line, GROWN_PARTIAL);
+    send_text(writer, "\n");
+    expect_line(line, sizeof line);
+    return 0;
+}
+
+/* A terminal holding a partial canonical line is not readable, so a cancel reaches the
+ * read waiting on it. The reader has POLL_MILLISECONDS to reach its wait: a cancel that
+ * comes before then passes without testing the terminal, never wrongly. */
+static int terminal_cancel(void) {
+    const int terminal = posix_openpt(O_RDWR | O_NOCTTY);
+    assert(terminal >= 0 && grantpt(terminal) == 0 && unlockpt(terminal) == 0);
+    const int user = open(ptsname(terminal), O_RDWR | O_NOCTTY);
+    assert(user >= 0 && dup2(user, STDIN_FILENO) == STDIN_FILENO);
+    close(user);
+    send_text(terminal, "par");
+    int cancel[2];
+    assert(pipe(cancel) == 0);
+    alarm(ALARM_SECONDS);
+    pthread_t reader;
+    assert(pthread_create(&reader, NULL, line_until_cancelled, (void *)(intptr_t)cancel[0]) == 0);
+    poll(NULL, 0, POLL_MILLISECONDS);
+    assert(write(cancel[1], "", 1) == 1);
+    assert(pthread_join(reader, NULL) == 0);
+    send_text(terminal, "tial\n");
+    expect_line_text("partial\n");
+    return 0;
+}
+
+/* Two threads read lines in place from 2N lines of WHOLE_LINE bytes, each one letter, which
+ * arrive in writes of random sizes: every line comes back whole, and exactly once. */
+enum { READERS = 2, LINES_PER_READER = 8, WHOLE_LINE = 100000, ALL_LINES = READERS * LINES_PER_READER };
+enum { WRITE_MASK = 8191, WRITE_JITTER_MASK = 1023 };
+static unsigned char whole_input[ALL_LINES][WHOLE_LINE + 1];
+static atomic_int lines_seen[ALL_LINES];
+static void *read_whole_lines(void *argument) {
+    (void)argument;
+    for (int index = 0; index < LINES_PER_READER; index++) {
+        bytes_list line = NULL;
+        int64_t error = -1;
+        assert(blorp_console_read_line(&line, &error) == BLORP_FS_SUCCEEDED);
+        const int letter = line->values[0] - 'a';
+        assert(letter >= 0 && letter < ALL_LINES && line->length == WHOLE_LINE + 1);
+        assert(memcmp(line->values, whole_input[letter], WHOLE_LINE + 1) == 0);
+        atomic_fetch_add(&lines_seen[letter], 1);
+        blorp_list_drop_0_b(line);
+    }
+    return NULL;
+}
+static int whole_reads(void) {
+    for (int index = 0; index < ALL_LINES; index++) {
+        memset(whole_input[index], 'a' + index, WHOLE_LINE);
+        whole_input[index][WHOLE_LINE] = '\n';
+    }
+    int watch;
+    const int writer = pipe_input(&watch);
+    alarm(ALARM_SECONDS);
+    pthread_t readers[READERS];
+    for (int index = 0; index < READERS; index++) {
+        assert(pthread_create(&readers[index], NULL, read_whole_lines, NULL) == 0);
+    }
+    uint64_t random = RANDOM_SEED;
+    for (size_t sent = 0, size; sent < sizeof whole_input; sent += size) {
+        size = 1 + (size_t)(next_random(&random) & WRITE_MASK);
+        if (size > sizeof whole_input - sent) {
+            size = sizeof whole_input - sent;
+        }
+        send_bytes(writer, (const unsigned char *)whole_input + sent, size);
+        jitter(&random, WRITE_JITTER_MASK);
+    }
+    close(writer);
+    for (int index = 0; index < READERS; index++) {
+        assert(pthread_join(readers[index], NULL) == 0);
+    }
+    for (int index = 0; index < ALL_LINES; index++) {
+        assert(atomic_load(&lines_seen[index]) == 1);
+    }
+    return 0;
+}
+
+/* The file on `descriptor` holds exactly `expected`. */
+static void expect_file_text(int descriptor, const char *expected) {
+    char seen[256] = {0};
+    assert(pread(descriptor, seen, sizeof seen, 0) == (ssize_t)strlen(expected));
+    assert(memcmp(seen, expected, strlen(expected)) == 0);
+}
+
+/* A child whose in-place read holds the line lock, waiting for the rest of "par", starts
+ * a cancellable read: the program must stop with the refusal, before its alarm. */
+static const char LOCK_REFUSAL[] = "error: console invariant broken: a cancellable console read found the line lock "
+                                   "held: the kernel admits one console reader at a time\n";
+static void *hold_line_lock(void *argument) {
+    (void)argument;
+    bytes_list line = NULL;
+    int64_t error = -1;
+    (void)blorp_console_read_line(&line, &error);
+    return NULL;
+}
+static int line_lock_refusal(void) {
+    FILE *errors = tmpfile();
+    assert(errors != NULL && fflush(NULL) == 0);
+    const pid_t child = fork();
+    assert(child >= 0);
+    if (child == 0) {
+        alarm(ALARM_SECONDS);
+        assert(dup2(fileno(errors), STDERR_FILENO) == STDERR_FILENO);
+        int watch;
+        const int writer = pipe_input(&watch);
+        pthread_t holder;
+        assert(pthread_create(&holder, NULL, hold_line_lock, NULL) == 0);
+        send_text(writer, "par");
+        until_taken(watch);
+        int cancel[2];
+        assert(pipe(cancel) == 0);
+        bytes_list line = NULL;
+        int64_t error = -1;
+        (void)blorp_console_read_line_cancellable(&line, &error, cancel[0]);
+        _exit(0);
+    }
+    int status = 0;
+    assert(waitpid(child, &status, 0) == child);
+    assert(WIFSIGNALED(status) && WTERMSIG(status) == SIGABRT);
+    expect_file_text(fileno(errors), LOCK_REFUSAL);
+    fclose(errors);
+    blorp_list_drop_0_b(bytes_of("done", 4));
+    return 0;
+}
+
+/* ---- the console's blocking jobs ---- */
+
+/* On a fiber: submits `job`, parks, and checks that the job's completion ended the wait. */
+static void run_job(struct blorp_fiber *self, struct blorp_blocking_job *job) {
+    job->waiter = self;
+    job->generation = blorp_wait_arm(self);
+    blorp_blocking_submit(job);
+    blorp_fiber_park(self);
+    assert(blorp_wait_outcome(self, job->generation) == BLORP_BLOCKING_COMPLETED);
+}
+
+/* A job's bytes and its in-place native's are the same; drops both. */
+static void expect_same_bytes(bytes_list from_job, bytes_list in_place) {
+    assert(from_job->length == in_place->length);
+    assert(memcmp(from_job->values, in_place->values, (size_t)in_place->length) == 0);
+    blorp_list_drop_0_b(from_job);
+    blorp_list_drop_0_b(in_place);
+}
+
+/* Each job, run once in place and then through the pool on the same input, with its kind.
+ * Both output streams go to one file, in place first, so it holds every text twice. */
+static void console_jobs(struct task *task) {
+    struct blorp_fiber *const self = task->fiber;
+    int64_t error = -1;
+    bytes_list in_place = NULL;
+    feed_text("line\n");
+    const uint8_t line_result = blorp_console_read_line(&in_place, &error);
+    feed_text("line\n");
+    struct blorp_console_read_line_job read_line;
+    blorp_console_read_line_job_init(&read_line);
+    assert(read_line.job.kind == BLORP_JOB_CANCELLABLE);
+    run_job(self, &read_line.job);
+    assert(read_line.succeeded == line_result);
+    expect_same_bytes(read_line.line, in_place);
+
+    feed_text("abcdef");
+    const uint8_t exact_result = blorp_console_read_exact(6, &in_place, &error);
+    feed_text("abcdef");
+    struct blorp_console_read_exact_job read_exact;
+    blorp_console_read_exact_job_init(&read_exact, 6);
+    assert(read_exact.job.kind == BLORP_JOB_CANCELLABLE);
+    run_job(self, &read_exact.job);
+    assert(read_exact.succeeded == exact_result);
+    expect_same_bytes(read_exact.bytes, in_place);
+
+    FILE *out = tmpfile();
+    const int saved_error = dup(STDERR_FILENO);
+    assert(out != NULL && saved_error >= 0);
+    assert(dup2(fileno(out), STDOUT_FILENO) == STDOUT_FILENO);
+    assert(dup2(fileno(out), STDERR_FILENO) == STDERR_FILENO);
+    bytes_list data = bytes_of("bytes ", 6);
+    struct blorp_string *text = blorp_string_from_bytes("text", 4);
+    const uint8_t wrote = blorp_console_write(data, &error);
+    struct blorp_console_write_job write_job;
+    blorp_console_write_job_init(&write_job, data);
+    assert(write_job.job.kind == BLORP_JOB_UNBOUNDED);
+    run_job(self, &write_job.job);
+    assert(write_job.succeeded == wrote);
+    (void)blorp_string_print(text);
+    struct blorp_string_print_job print;
+    blorp_string_print_job_init(&print, text);
+    assert(print.job.kind == BLORP_JOB_UNBOUNDED);
+    run_job(self, &print.job);
+    const uint8_t flushed = blorp_console_flush(&error);
+    struct blorp_console_flush_job flush;
+    blorp_console_flush_job_init(&flush);
+    assert(flush.job.kind == BLORP_JOB_UNBOUNDED);
+    run_job(self, &flush.job);
+    assert(flush.succeeded == flushed);
+
+    const uint8_t wrote_error = blorp_console_write_error(data, &error);
+    struct blorp_console_write_job write_error;
+    blorp_console_write_error_job_init(&write_error, data);
+    assert(write_error.job.kind == BLORP_JOB_UNBOUNDED);
+    run_job(self, &write_error.job);
+    assert(write_error.succeeded == wrote_error);
+    (void)blorp_string_print_error(text);
+    struct blorp_string_print_job print_error;
+    blorp_string_print_error_job_init(&print_error, text);
+    assert(print_error.job.kind == BLORP_JOB_UNBOUNDED);
+    run_job(self, &print_error.job);
+    assert(dup2(saved_error, STDERR_FILENO) == STDERR_FILENO);
+    close(saved_error);
+    clearerr(stderr);
+    expect_file_text(fileno(out), "bytes bytes text\ntext\nbytes bytes text\ntext\n");
+    blorp_string_release(text);
+    blorp_list_drop_0_b(data);
+    fclose(out);
+}
+static int jobs_on_helpers(void) {
+    blorp_blocking_start();
+    use_carriers(1);
+    spawn(0, console_jobs);
+    run_carriers();
+    return 0;
+}
+
+/* A read_line job waiting on a pipe holding "par" is signalled, ends its wait with the end
+ * of input, and leaves "par" for the next reader. */
+static struct blorp_console_read_line_job waiting_read;
+static void wait_for_line(struct task *task) {
+    blorp_console_read_line_job_init(&waiting_read);
+    run_job(task->fiber, &waiting_read.job);
+    assert(waiting_read.succeeded == BLORP_FS_SUCCEEDED && waiting_read.line->length == 0);
+    blorp_list_drop_0_b(waiting_read.line);
+}
+static void *cancel_waiting_read(void *watch) {
+    until_taken((int)(intptr_t)watch);
+    assert(blorp_blocking_cancel(&waiting_read.job) == BLORP_CANCEL_SIGNALLED);
+    return NULL;
+}
+static int job_cancel_reaches_read(void) {
+    int watch;
+    const int writer = pipe_input(&watch);
+    send_text(writer, "par");
+    blorp_blocking_start();
+    use_carriers(1);
+    spawn(0, wait_for_line);
+    pthread_t canceller;
+    assert(pthread_create(&canceller, NULL, cancel_waiting_read, (void *)(intptr_t)watch) == 0);
+    run_carriers();
+    assert(pthread_join(canceller, NULL) == 0);
+    send_text(writer, "tial\n");
+    alarm(ALARM_SECONDS);
+    expect_line_text("partial\n");
+    return 0;
+}
+
 int main(int argc, char **argv) {
     assert(argc == 3);
     blorp_memory_start();
@@ -621,6 +1040,28 @@ int main(int argc, char **argv) {
         failed = flush_before_read();
     } else if (strcmp(name, "interrupted_read") == 0) {
         failed = interrupted_read();
+    } else if (strcmp(name, "pending_rest") == 0) {
+        failed = pending_rest();
+    } else if (strcmp(name, "nonblocking_input") == 0) {
+        failed = nonblocking_input();
+    } else if (strcmp(name, "cancel_while_waiting") == 0) {
+        failed = cancel_while_waiting();
+    } else if (strcmp(name, "cancel_keeps_partial") == 0) {
+        failed = cancel_keeps_partial();
+    } else if (strcmp(name, "pending_line_beats_cancel") == 0) {
+        failed = pending_line_beats_cancel();
+    } else if (strcmp(name, "cancel_partial_grows") == 0) {
+        failed = cancel_partial_grows();
+    } else if (strcmp(name, "terminal_cancel") == 0) {
+        failed = terminal_cancel();
+    } else if (strcmp(name, "whole_reads") == 0) {
+        failed = whole_reads();
+    } else if (strcmp(name, "line_lock_refusal") == 0) {
+        failed = line_lock_refusal();
+    } else if (strcmp(name, "jobs_on_helpers") == 0) {
+        failed = jobs_on_helpers();
+    } else if (strcmp(name, "job_cancel_reaches_read") == 0) {
+        failed = job_cancel_reaches_read();
     }
     return blorp_memory_finish(failed);
 }

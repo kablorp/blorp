@@ -3517,6 +3517,317 @@ module imports the new fragments. Raw samples are in
 - **`THREAD_RUNTIME` is emitted once** for the pool, the fibers and the
   helpers, as 4b's follow-up says for two of them.
 
+### Landing 4d results
+
+**What landed:** standard input the runtime owns, console reads a cancel
+can reach, and a blocking job for each console native, in
+`runtime/console.brp`. Nothing submits the jobs yet; landing 5 is their
+first user.
+- **`CONSOLE_INPUT_RUNTIME`,** a shared fragment that only `read_line` and
+  `read_exact` select (`ConsoleInput` in `system.brp`), so a program that
+  only writes emits the C it did. It holds:
+  - one buffer, `pending`, malloc'd and kept until exit, outside the leak
+    check's count;
+  - the line lock, held for each whole read;
+  - the refill, which polls descriptor 0 and the cancel descriptor
+    together and then makes one `read(2)` into the empty buffer;
+  - the give-back, which returns a cancelled read's bytes to the empty
+    buffer and grows it when they need more room.
+- **The reads.** Each has a cancellable body,
+  `blorp_console_read_line_cancellable` and
+  `blorp_console_read_exact_cancellable`, and each native calls its body
+  in place with -1, so its symbol and shape are unchanged.
+  - A read takes from the buffer first, so a line already buffered beats a
+    cancel. It waits only once the buffer is empty, and a cancel then
+    wins, even when input arrives with it.
+  - A cancelled read gives back what it took and returns the end of input,
+    which the library turns into `Ok(None)`.
+  - Each read keeps today's growth code and takes as much as its result
+    has room for on each pass. `read_line` grows only once another byte is
+    known, and `read_exact` once its result is full, as stdio's reads did,
+    so capacities, and the peak heap, are main's. `read_line` finds its LF
+    with `memchr`.
+- **The jobs,** `console_jobs_runtime`, after `BLOCKING_RUNTIME`, the
+  console fragments, `CONSOLE_INPUT_RUNTIME` and both prints. Each job's
+  initializer zeroes it, so it is unsubmitted, and gives it its run, its
+  kind and its arguments:
+
+  | Job | Kind | Runs |
+  | --- | --- | --- |
+  | `read_line`, `read_exact` | cancellable | the cancellable bodies |
+  | `write`, `write_error`, `flush` | unbounded | the natives as they are |
+  | `print`, `print_error` | unbounded | `blorp_string_print`, `blorp_string_print_error` |
+
+**Differences from the brief:**
+- **One refill instead of a wait and a fill.** `blorp_console_refill` polls
+  and then reads, and reports refilled, ended, cancelled or failed, so each
+  read has one refill block and one end, and a signal goes back to the
+  poll, where a cancel can still win.
+- **EAGAIN waits again, when poll can wait.** A stdin whose open file
+  description the parent made `O_NONBLOCK` failed with EAGAIN before; now
+  the read polls first, and an EAGAIN after a poll that reported POLLIN or
+  POLLHUP means another reader drained the input, so the read waits again,
+  as a blocking read should. With no such event, poll cannot wait on the
+  descriptor, as for macOS's `/dev/tty`, and EAGAIN is reported as main
+  reported it. No README sentence changes.
+- **The buffer never drops below one step,** 64 KB, so a small give-back
+  never shrinks the reads that follow it.
+- **The console suite builds two probes,** `-O0` with ASan and UBSan, and
+  `-O2`, where it had one. Both keep the memory diagnostics, for each
+  case's strict allocation report. The probe now includes `THREAD_RUNTIME`,
+  `FIBER_RUNTIME`, `PROCESS_HELPERS_RUNTIME`, `BLOCKING_RUNTIME` and the
+  jobs, and the fixture includes `carrier_harness.h`.
+- **The narrow loop.** The console suite runs in the e2e mode, through
+  `suite(c_compiler, directory)`, so `test-target-components` cannot select
+  it. A scratch driver ran it alone, as 4c's did
+  (`landing4d-evidence/tools/console_suites.brp` and `suites.sh`).
+- **The existing cases** number 26, not 22.
+
+**The soundness review's fixes,** each probed in the review's own harness
+on the fixed runtime (`review-probes/`, rerun in `review-fixes/`):
+- **The blocker: EAGAIN spun.** On macOS, `poll` reports POLLNVAL for
+  `/dev/tty`. With stdin a `/dev/tty` opened `O_NONBLOCK`, each read got
+  EAGAIN and polled again, using 1.30 s of processor time in 1.3 s, where
+  main failed at once with -35. EAGAIN now retries only after a poll that
+  reported POLLIN or POLLHUP. Rerun, the read fails at once with -35 and
+  uses no processor time, as main's does (`review-fixes/devtty-fixed.out`).
+- **`read_line` grew before it knew another byte existed,** so an
+  unterminated last line of 64·2^k bytes came back with twice main's
+  capacity. It now grows after the refill. The review's capacity probe
+  now matches main's at each of its five lengths, and its differential,
+  main's reads against 4d's on 1,000 random inputs from a file and from a
+  pipe, went from 36 differing runs to none (`review-fixes/cap_main.out`
+  and `diff_reads_1000.out`).
+- **The non-blocking input case,** below, and the flush's comment at both
+  cancellable bodies.
+- **Nits:** a `blorp_console_unlock_line` beside the lock; the refill's
+  enum renamed `blorp_console_refill_result`; a message before the
+  buffer's allocation failure aborts; and the suite's fragments in program
+  order, the pool's after the console's.
+
+**Tests.** Eleven new cases in `fixtures/console_test.c`, each run on both
+probes. Where a case must know that a reader has taken bytes off a pipe,
+it reads `FIONREAD` on its own copy of the read end.
+
+| Case | What it checks |
+| --- | --- |
+| pending rest | one write of `"a\nb\nc"` gives `"a\n"`, `"b\n"`, `"c"`, then the end of input |
+| non-blocking input | an empty pipe on stdin that the parent made `O_NONBLOCK`, with a line written 300 ms later: the read waits for it, where main's failed with EAGAIN |
+| cancel while waiting | with the writer open and no input, a readable cancel ends both reads with the end of input at once |
+| cancel keeps partial | `"par"` taken, then a cancel: the end of input; after `"tial\n"`, an in-place read gives `"partial\n"`. `read_exact(10)` the same, over `"abcd"` then `"efghij"` |
+| pending line beats cancel | the buffer holding `"x\ny"` and the cancel readable: `"x\n"`, then the end of input with `"y"` kept, then `"y"` in place once the writer closes |
+| cancel partial grows | 200,000 bytes with no LF, cancelled once taken, then `"\n"`: the next read gives all 200,001 |
+| terminal cancel | stdin a pty holding a partial canonical line: a cancel ends the read with the end of input, then the whole line is read |
+| whole reads | two threads read 8 lines each in place, from 16 lines of 100,000 bytes, each one letter, written in random sizes: every line whole, each exactly once |
+| line lock refusal | a forked child whose in-place read holds the line lock starts a cancellable read: it stops with the refusal, before its alarm |
+| jobs on helpers | each of the seven jobs has its kind, and, run through the pool on the carrier harness, gives what its native gives in place on the same input |
+| job cancel reaches read | a `read_line` job waiting on a pipe holding `"par"` is signalled by `blorp_blocking_cancel`, ends its wait with the end of input, and leaves `"par"` for the next reader |
+
+- **Terminal cancel** gives the reader 300 ms to reach its poll, since
+  `FIONREAD` does not count a partial canonical line. A cancel that comes
+  sooner passes without testing the terminal, and never fails wrongly. The
+  bite below that drops the cancel from the poll fails it on both probes,
+  so in those runs the reader had reached its poll.
+- **The 26 existing cases** run unchanged on both probes.
+
+**The bites.** Each is one change to the suite's generated
+`console_runtime.c`, run against every case of both probes on macOS, and
+again on the review's fixed runtime with the same outcome (`bites/`). Each
+fails its named case on both probes:
+
+| Bite | Fails |
+| --- | --- |
+| A read that drops the buffer's rest after a line | pending rest; also every multi-line read case, `shared_buffer`, `interrupted_read`, pending line beats cancel and whole reads |
+| A cancel that drops the partial instead of giving it back | cancel keeps partial; also pending line beats cancel, cancel partial grows and job cancel reaches read |
+| The cancel checked before taking from the buffer | pending line beats cancel; also cancel partial grows |
+| A give-back that does not grow the buffer | cancel partial grows: ASan's heap overflow, and the assertion at `-O2` |
+| No line lock | whole reads: torn lines; also line lock refusal |
+| A cancellable read that waits on the lock | line lock refusal: the child dies by its alarm after 10 s |
+| A poll without the cancel descriptor | cancel while waiting, by its alarm; also every other case that cancels a read, by its alarm or, for the job, the watchdog |
+| `read_line`'s job made unbounded | job cancel reaches read: the cancel is not reached; also jobs on helpers |
+| `read_exact` left on stdio's `stdin` | `shared_buffer`; also `exact_growth`, `interrupted_read`, cancel while waiting and cancel keeps partial |
+
+**Evidence** (in the main checkout's ignored
+`build/concurrency/landing4d-evidence/`, with the scripts in `tools/`):
+- **Platforms.** On the fixed runtime, both probes passed every case on
+  macOS with Apple Clang 21, on arm64 Linux with Clang 18.1 and GCC 13.3,
+  and on emulated x86-64 Linux with GCC 13.3, 74 runs each
+  (`linux/review-*.log`).
+- **ThreadSanitizer,** by hand in the arm64 image: the eight threaded
+  cases, at `-O1` and `-O2`, 3 times each with Clang and GCC, 96 runs: no
+  report, before the review's fixes and after them
+  (`linux/review-arm64-tsan.log`).
+- **Fixture C,** every e2e fixture compiled by main's compiler,
+  `21422d6d2`, and by this one, `4d28a8a35` (`fixture-diff/`): status,
+  stdout and stderr are identical for all 783. 645 emit identical C and 135
+  are rejected. The other 3 are the fixtures that read the console,
+  `console/lines` and `console/prompt`, with `read_line`, and
+  `console/protocol`, with both reads. Each differs exactly by the console
+  fragments: the classifier rebuilds the candidate's C from the base's,
+  with the old reads replaced by the new and `CONSOLE_INPUT_RUNTIME`
+  inserted after `CONSOLE_HELPERS_RUNTIME`, and matches it byte for byte. A
+  stray change planted in one of them, and one in a fixture that does not
+  read, are both reported. Programs that only write emit the C they did.
+- **Stage B.** `scripts/blorp-fixpoint --prove` on `4d28a8a35` exits 0: B
+  and C emit identical C, and A and B agree on all 783 fixtures. Stage B is
+  linked from A's C, which has the new reads and no `getc(stdin)`, so it is
+  the compiler whose language server reads through 4d's runtime. With B as
+  the compiler under test:
+  - the `test_lsp` components pass, 214 tests
+    (`logs/stage-b-lsp-review.log`);
+  - the console e2e suite passes, 3 tests over its normal and strict
+    binaries, and so does the `blorp` command's suite, 48 tests, whose nine
+    `lsp` cases drive `blorp lsp` on standard input
+    (`logs/stage-b-e2e-review.log`). The `test_lsp` components test the
+    server in process, so the command's suite is the one that reads.
+- **The gate,** `make -C blorp test INSTRUCTION_CHECK=on` on `51674a97d`,
+  after the review's fixes: exit 0, 3,711 passed and none failed, among
+  them the console runtime suite's 37, the console e2e suite's 3 and the
+  `test_io/test_console` component. `git diff --check` is clean. Before the
+  review, on `7a6399421`: exit 0, 3,710 passed.
+- **On the landing commit,** `90d3bf0a2`, replayed onto main's
+  `951842f7e`. Main moved three times during the landing: a union rename;
+  W0's `bits` module, which touches `blorp/src` and the standard library;
+  and a games-plan change to docs alone, after which the code is
+  byte-identical to `90d3bf0a2`. So the gates ran again on the second
+  replay:
+  - **the gate:** exit 0, 3,721 passed and none failed, and `git diff
+    --check` is clean (`land-gate-2.log`);
+  - **Seed CI,** run 46174323899: every platform job passes, Linux x64 GCC
+    included, and the Seed job proves the fixpoint on all three targets;
+  - **`self-compile-cost 951842f7e 90d3bf0a2 --rounds 3`**
+    (`cost-land-2.log`):
+    - allocations +0.0000%;
+    - peak heap +0.0019%;
+    - instructions −0.0256%;
+    - the fixed-input C's 177 changed lines all fall in the console
+      fragments.
+
+  The first replay, onto `34bb4ee84`, also passed: the gate with 3,711,
+  Seed CI run 46170664490, and instructions +0.1506% (`land-gate.log`,
+  `cost-land.log`).
+- **The Problem's `git grep`** for stdio's `stdin` finds nothing in
+  `blorp/src`.
+
+**Cost,** on the code after the review's fixes,
+`self-compile-cost 21422d6d2 4d28a8a35 --rounds 3`, fixed-input row:
+
+| Measure | Base `21422d6d2` | Candidate `4d28a8a35` | Change |
+| --- | ---: | ---: | ---: |
+| Allocations | 13,685,669 | 13,685,669 | +0.0000% |
+| Peak heap, bytes | 190,821,626 | 190,825,234 | +0.0019% |
+| Instructions, median of 3 | 13,882,090,833 | 13,883,690,486 | +0.0115% |
+
+- **The fixed-input C differs** (`46da4eb413292103` against
+  `a418bf862d3e51c2`), since the compiler reads the console in `blorp lsp`,
+  and only by the console fragments: the fixture classifier matches it byte
+  for byte (`cost-review-c/`). That C is 7,140 bytes longer, and the peak
+  3,608 bytes higher, within its ceiling of ±0.01%.
+- **The own-source row:** allocations +0.0142%, peak heap +0.0341%,
+  instructions −0.0041%; the candidate's source holds the new fragments.
+- **Before the review's fixes,** on `84b4d29e5`: allocations +0.0000%, peak
+  heap +0.0019% and instructions +0.0594% (`cost/`).
+- `self-compile-cost` runs the seed's runtime, and a self-compile never
+  reads standard input, so the read path is measured below.
+- Raw samples are in `cost-review/`.
+
+**The read path.** Two programs, each compiled by main's compiler and by
+this one against its own library, built at `-O2` as a program is, and run
+from a pipe, `cat INPUT | program`, 5 times per side in alternating order
+on macOS at a load of about 2.9, with 4d at `4d28a8a35` (`read-path/`).
+Both sides print the same.
+
+| Program | Measure | Main | 4d | Change |
+| --- | --- | ---: | ---: | ---: |
+| `read_line`, 10⁶ lines of 40 bytes | Instructions, median | 23,043,589,215 | 10,822,231,218 | −53.04% |
+| | Wall time, median | 1,085.4 ms | 564.5 ms | −48.0% |
+| `read_exact`, 4 MB in counts of 4,096 | Instructions, median | 20,780,592 | 20,906,336 | +0.61% |
+| | Wall time, median | 6.2 ms | 6.0 ms | −3.9% |
+
+- **`read_line`** called `getc`, which takes the stream's lock, once a byte:
+  the difference is about 305 instructions a byte. It now finds each LF
+  with `memchr` and copies the line at once.
+- **`read_exact`** read through `fread` and now copies from the buffer.
+  Its +0.61% is within the samples' 2% spread, against a ceiling of +5%;
+  before the review's fixes it measured +0.14%.
+
+**Lines,** from `21422d6d2` to `4d28a8a35`, after the review's fixes:
+- **production:** +267 and −41, so +226 net, against a ceiling of +250:
+  `console.brp` +260 and −38, `system.brp` +7 and −3;
+- **test:** +600 and −72, so +528 net, against the corrected +530:
+  `fixtures/console_test.c` +445 and −4, `console_suite.brp` +155 and −68.
+
+  | Part | Lines |
+  | --- | ---: |
+  | The input cases' helpers: the pipe, `FIONREAD`, the cancel pipe, the threads and `cancel_after` | 73 |
+  | The nine input cases | 212 |
+  | The job cases and their two helpers | 128 |
+  | The fixture's dispatch, net of its includes and header | 28 |
+  | The suite's eleven entries | 44 |
+  | The suite's `-O2` probe | about 30 |
+  | The pool's fragments in the probe | about 13 |
+
+**The test ceiling, corrected by the coordinator on 2026-11-28:**
+
+| Ceiling | Old | New |
+| --- | ---: | ---: |
+| Test lines | +450 | +510, then +530 |
+
+- **The first correction:** the estimate left out the second, `-O2` probe,
+  about 30 lines, which the console suite did not have, and the refusal
+  case, which forks in C, 48 lines, since the console suite has no runner
+  for a case that must stop with a message. Every case is one the brief
+  lists, and the job cases reuse `carrier_harness.h` and the suite's
+  runner.
+- **The second** pays for the review's regression case, non-blocking
+  input.
+- Production stays at +250.
+
+**Not covered:**
+- **A shared stdin drained between the poll and the read,** for example by
+  a sibling process reading the same pipe. The read then blocks, and its
+  cancel waits for input. It is inherent without `O_NONBLOCK`.
+- **A stdin that `poll` does not support,** for which macOS reports
+  POLLNVAL: a blocking `/dev/tty`, as `< /dev/tty` or `xargs -o` give a
+  program, and other such character devices. Any event goes to the read,
+  so `/dev/null` and a directory return at once, and a pty works. But a
+  cancellable read on such a stdin blocks in `read(2)`, where its cancel
+  cannot reach it (the review's `/dev/tty` probe, mode 2).
+- **The flush before a read** is unbounded and cannot be cancelled: to a
+  full pipe it waits until the reader drains it, before the read's cancel
+  can reach anything (the review's `flush/` probe). Both cancellable bodies
+  say so.
+- **A read when `poll` itself fails** other than by EINTR, which only a
+  failed kernel allocation can cause: the read goes on, and blocks without
+  its cancel.
+- **4d's reads in `blorp lsp` under the gate:** the gate's compiler is
+  built by the seed, so its own console runtime is the seed's. Stage B runs
+  the language server on 4d's reads (above).
+
+**Landing 5's obligations:**
+- **Admit one console reader at a time,** through a Blorp wait queue that
+  a cancel ends. A cancellable read that finds the line lock held stops
+  the program with "error: console invariant broken: a cancellable console
+  read found the line lock held: the kernel admits one console reader at a
+  time".
+- **Submit the console's jobs from a fiber,** each after its initializer,
+  filling the waiter and the generation, and keep the job and its borrowed
+  arguments alive until its wait ends.
+- **Admit the next console reader only after the previous reader's job has
+  ended its wait,** so the line lock is free when the next read starts.
+- **A read job can be signalled and still return a line,** from the buffer
+  or by racing the cancel. Decide whether a cancelled task's read delivers
+  those bytes to the task, which then runs to its end, or gives them back.
+  Nothing may drop them.
+- **The flush before a cancellable read** can block without its cancel.
+  Landing 5 could flush as its own unbounded job before it submits the
+  read.
+- **A cancel cannot reach a read from a stdin that `poll` does not
+  support,** such as a blocking `/dev/tty` on macOS, so a `first:` timeout
+  around it waits for input.
+- **An in-place read** waits for the lock, so it must not run while the
+  kernel admits readers.
+
 ## Landings
 
 Each is a vertical slice that can be tested on its own. Every one runs
@@ -3578,8 +3889,9 @@ compiled code.
 **Concurrency, after Spike K:**
 
 4. **Kernel support.** The coordinator split it on 2026-11-26 into seven
-   slices, after a survey of the code. Each is tested on its own, most as
-   direct-C suites, as landing 2b's pool was.
+   slices, after a survey of the code, and Keith's decision of 2026-11-28
+   added an eighth, 4h. Each is tested on its own, most as direct-C suites,
+   as landing 2b's pool was.
    - **4a. Natives safe on several threads:**
      - the fork lock;
      - the counted SIGINT and SIGQUIT swap, including `capture`'s child
@@ -3609,10 +3921,15 @@ compiled code.
      See "Landing 4c results".
    - **4d. The console:** the kernel-owned stdin with its line lock;
      poll-based console reads that can be cancelled; and a job for each
-     blocking native.
+     console native, `print` and `print_error` included. Keith decided on
+     2026-11-28 that the other natives' jobs wait for 4e (below).
+
+     See "Landing 4d results".
    - **4e. Non-regular-file reads.** `open` on a FIFO blocks before `fstat`
      can run, so this slice starts with a design for telling which reads
      are unbounded.
+   - **4h. A job for each other blocking native,** in fs and process,
+     after 4e, whose design gives the fs reads their kinds.
    - **4f. The kernel module and its cell:**
      - a `KernelModule` role, designated by its path,
        `concurrency/kernel.brp`, which only the concurrency module may

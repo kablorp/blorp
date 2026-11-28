@@ -105,33 +105,137 @@ CONSOLE_FLUSH_RUNTIME: String =
         |
 
 
--- Both reads take stdin's one stdio buffer, never read(0, ...), so a line read
--- then an exact read continue where the other stopped. Each flushes stdout first,
--- so a prompt shows before the program waits; that failure is the next write's
--- to report. clearerr starts each read so a sticky end of input does not hide
--- later input, as Python's input retries after a terminal's ^D. EINTR clears the
--- flag and continues. An error after some bytes drops them: the Result has room
--- for one or the other.
+-- Standard input as the runtime owns it (CONCURRENCY_PLAN.md, "Cancelling
+-- natives"). Only the two reads select it, so a program that only writes has
+-- none of it, and both call every function here, so they are static. It comes
+-- after CONSOLE_HELPERS_RUNTIME, whose error codes it reports.
+CONSOLE_INPUT_RUNTIME: String =
+    raw
+        |
+        |#include <poll.h>
+        |#include <pthread.h>
+        |#include <stdlib.h>
+        |#include <string.h>
+        |#include <unistd.h>
+        |/* A read holds the line lock from start to end, so two reads never interleave. `pending` holds bytes read from
+        |   descriptor 0 that no read has taken: the rest of a chunk after a line, or a cancelled read's partial input.
+        |   Descriptor 0 is read only into an empty `pending`, so a cancelled read's bytes go back in front of nothing and
+        |   keep their order. The buffer is malloc'd, as the pool's helpers are, and lives until exit: it belongs to the
+        |   runtime, not to any program value, so the leak check does not count it. */
+        |enum {BLORP_CONSOLE_INPUT_STEP=1<<16};
+        |static struct {
+        |    pthread_mutex_t line;
+        |    uint8_t *pending;
+        |    size_t start,length,capacity;
+        |} blorp_console_input={PTHREAD_MUTEX_INITIALIZER,NULL,0,0,0};
+        |static void blorp_console_broken(const char *rule){
+        |fprintf(stderr,"error: console invariant broken: %s\n",rule);
+        |abort();
+        |}
+        |/* Held for a whole read. An in-place read, with no kernel running, may wait for it. A cancellable read never may:
+        |   landing 5's kernel admits one console reader at a time, through a wait a cancel ends, and a read that waited
+        |   here could not see its cancel until the one ahead of it finished. */
+        |static void blorp_console_lock_line(int cancel){
+        |const int code=cancel<0?pthread_mutex_lock(&blorp_console_input.line):pthread_mutex_trylock(&blorp_console_input.line);
+        |if(code==EBUSY)blorp_console_broken("a cancellable console read found the line lock held: the kernel admits one console reader at a time");
+        |if(code!=0)blorp_console_broken("the console's line lock failed");
+        |}
+        |static void blorp_console_unlock_line(void){
+        |(void)pthread_mutex_unlock(&blorp_console_input.line);
+        |}
+        |/* Makes the empty `pending` hold at least `count` bytes, and at least one step, so a read(2) never asks for less. */
+        |static void blorp_console_reserve(size_t count){
+        |if(blorp_console_input.capacity>=count)return;
+        |const size_t capacity=count<BLORP_CONSOLE_INPUT_STEP?BLORP_CONSOLE_INPUT_STEP:count;
+        |free(blorp_console_input.pending);
+        |blorp_console_input.pending=malloc(capacity);
+        |if(blorp_console_input.pending==NULL){
+        |fprintf(stderr,"error: cannot buffer standard input: malloc failed: %s\n",strerror(ENOMEM));
+        |abort();
+        |}
+        |blorp_console_input.capacity=capacity;
+        |}
+        |/* Moves the first `count` bytes of `pending`, which holds at least that many, to `into`. */
+        |static void blorp_console_take(uint8_t *into,size_t count){
+        |memcpy(into,blorp_console_input.pending+blorp_console_input.start,count);
+        |blorp_console_input.start+=count;
+        |blorp_console_input.length-=count;
+        |}
+        |/* A cancelled read's bytes, back into `pending`. It is empty, since a read waits only once it has taken all of it. */
+        |static void blorp_console_give_back(const uint8_t *bytes,size_t count){
+        |blorp_console_reserve(count);
+        |if(count>0)memcpy(blorp_console_input.pending,bytes,count);
+        |blorp_console_input.start=0;
+        |blorp_console_input.length=count;
+        |}
+        |enum blorp_console_refill_result {
+        |    BLORP_CONSOLE_REFILLED,   /* `pending` holds what one read(2) gave */
+        |    BLORP_CONSOLE_ENDED,      /* the end of input, which is not sticky: a terminal's ^D, then more input, is read */
+        |    BLORP_CONSOLE_CANCELLED,
+        |    BLORP_CONSOLE_FAILED      /* the error's code is in *error */
+        |};
+        |/* Refills the empty `pending` with one read(2) of descriptor 0, once poll says the read will not block: bytes, the
+        |   end of input or an error, which the read then reports. Once a read needs the descriptor, a cancel wins, even when
+        |   input arrives with it. A negative `cancel` is an in-place call, which poll ignores. Polling, not O_NONBLOCK,
+        |   leaves the open file description the parent shares untouched. Any event on descriptor 0 goes to the read,
+        |   POLLNVAL included, which macOS reports for a directory, /dev/null and /dev/tty.
+        |   A signal retries. So does EAGAIN, from a description the parent made O_NONBLOCK, but only when poll said the
+        |   descriptor was ready, POLLIN or POLLHUP, so another reader drained it after the poll. Without that, poll cannot
+        |   wait on the descriptor, as for macOS's /dev/tty, and a retry would spin, so EAGAIN is reported, as stdio's read
+        |   reported it. */
+        |static enum blorp_console_refill_result blorp_console_refill(int cancel,int64_t *error){
+        |for(;;){
+        |struct pollfd waits[2]={{STDIN_FILENO,POLLIN,0},{cancel,POLLIN,0}};
+        |if(poll(waits,2,-1)<0){
+        |if(errno==EINTR)continue;
+        |waits[0].revents=waits[1].revents=0; /* the read then reports what is wrong, or blocks without its cancel */
+        |}
+        |if(waits[1].revents!=0)return BLORP_CONSOLE_CANCELLED;
+        |blorp_console_reserve(1);
+        |const ssize_t received=read(STDIN_FILENO,blorp_console_input.pending,blorp_console_input.capacity);
+        |if(received>0){
+        |blorp_console_input.start=0;
+        |blorp_console_input.length=(size_t)received;
+        |return BLORP_CONSOLE_REFILLED;
+        |}
+        |if(received==0)return BLORP_CONSOLE_ENDED;
+        |const int drained=(errno==EAGAIN||errno==EWOULDBLOCK)&&(waits[0].revents&(POLLIN|POLLHUP))!=0;
+        |if(errno!=EINTR&&!drained){
+        |*error=blorp_console_error(errno);
+        |return BLORP_CONSOLE_FAILED;
+        |}
+        |}
+        |}
+        |
+
+
+-- Both reads take standard input through CONSOLE_INPUT_RUNTIME's one buffer,
+-- so a line read then an exact read continue where the other stopped. Each
+-- flushes stdout first, so a prompt shows before the program waits; that
+-- failure is the next write's to report. An error after some bytes drops them:
+-- the Result has room for one or the other. A blocking job runs each read's
+-- cancellable body with its helper's cancel descriptor (console_jobs_runtime),
+-- and the native calls it in place with -1.
 --
 -- The line includes its LF. Any line takes at least that, so an empty result is
 -- end of input and "\n" stays distinct from it.
 pure func console_read_line_runtime(byte_list_type: String) -> String:
     |enum {BLORP_CONSOLE_LINE_CAPACITY=64};
-    |uint8_t blorp_console_read_line(${byte_list_type} *line,int64_t *error){
+    |/* A line with its LF, the last bytes before the end of input, or nothing once input has ended or `cancel` became
+    |   readable. A cancelled read gives back what it took, for the next reader. */
+    |uint8_t blorp_console_read_line_cancellable(${byte_list_type} *line,int64_t *error,int cancel){
+    |/* The flush is unbounded, and no cancel reaches it: to a full pipe, it waits until the reader drains it. */
     |(void)blorp_console_flush_stream(stdout);
-    |clearerr(stdin);
+    |blorp_console_lock_line(cancel);
     |${list_root_allocation(byte_list_type, "result", "BLORP_CONSOLE_LINE_CAPACITY")}
+    |enum blorp_console_refill_result refill=BLORP_CONSOLE_REFILLED;
     |for(;;){
-    |errno=0;
-    |const int next=getc(stdin);
-    |if(next==EOF){
-    |if(!ferror(stdin)){break;}
-    |if(errno==EINTR){clearerr(stdin);continue;}
-    |const int64_t failure=blorp_console_error(errno);
-    |blorp_memory_release(result);
-    |*error=failure;
-    |return BLORP_FS_FAILED;
+    |if(blorp_console_input.length==0){
+    |refill=blorp_console_refill(cancel,error);
+    |if(refill==BLORP_CONSOLE_REFILLED){continue;}
+    |break;
     |}
+    |/* Grown only once another byte is known, as stdio's read grew it, so a line ends with the same capacity. */
     |if(result->length==(int64_t)result->capacity){
     |const size_t grown_capacity=result->capacity*2;
     |${byte_list_type} grown=blorp_memory_resize(result,sizeof *result+grown_capacity*sizeof *result->values);
@@ -139,11 +243,24 @@ pure func console_read_line_runtime(byte_list_type: String) -> String:
     |result=grown;
     |result->capacity=grown_capacity;
     |}
-    |result->values[result->length++]=(uint8_t)next;
-    |if(next=='\n'){break;}
+    |/* Through the first LF of what `pending` holds and the line has room for. */
+    |const uint8_t *const from=blorp_console_input.pending+blorp_console_input.start;
+    |const size_t room=result->capacity-(size_t)result->length;
+    |const size_t most=room<blorp_console_input.length?room:blorp_console_input.length;
+    |const uint8_t *const feed=memchr(from,'\n',most);
+    |const size_t taken=feed==NULL?most:(size_t)(feed-from)+1;
+    |blorp_console_take(result->values+result->length,taken);
+    |result->length+=(int64_t)taken;
+    |if(feed!=NULL){break;}
     |}
+    |if(refill==BLORP_CONSOLE_CANCELLED){blorp_console_give_back(result->values,(size_t)result->length);result->length=0;}
+    |blorp_console_unlock_line();
+    |if(refill==BLORP_CONSOLE_FAILED){blorp_memory_release(result);return BLORP_FS_FAILED;}
     |*line=result;
     |return BLORP_FS_SUCCEEDED;
+    |}
+    |uint8_t blorp_console_read_line(${byte_list_type} *line,int64_t *error){
+    |return blorp_console_read_line_cancellable(line,error,-1);
     |}
     |
 
@@ -153,15 +270,19 @@ pure func console_read_line_runtime(byte_list_type: String) -> String:
 -- received. A count of zero or less reads, and flushes, nothing.
 pure func console_read_exact_runtime(byte_list_type: String) -> String:
     |enum {BLORP_CONSOLE_READ_STEP=1<<16};
-    |uint8_t blorp_console_read_exact(int64_t count,${byte_list_type} *bytes,int64_t *error){
+    |/* `count` bytes, fewer at the end of input, or nothing once `cancel` became readable. A cancelled read gives back
+    |   what it took, for the next reader. */
+    |uint8_t blorp_console_read_exact_cancellable(int64_t count,${byte_list_type} *bytes,int64_t *error,int cancel){
     |const size_t first=count<=0?0:(count<BLORP_CONSOLE_READ_STEP?(size_t)count:(size_t)BLORP_CONSOLE_READ_STEP);
     |${list_root_allocation(byte_list_type, "result", "first")}
-    |uint64_t remaining=count<=0?0:(uint64_t)count;
-    |if(remaining>0){
+    |if(count<=0){*bytes=result;return BLORP_FS_SUCCEEDED;}
+    |/* The flush is unbounded, and no cancel reaches it: to a full pipe, it waits until the reader drains it. */
     |(void)blorp_console_flush_stream(stdout);
-    |clearerr(stdin);
-    |}
+    |blorp_console_lock_line(cancel);
+    |uint64_t remaining=(uint64_t)count;
+    |enum blorp_console_refill_result refill=BLORP_CONSOLE_REFILLED;
     |while(remaining>0){
+    |/* Grown once full, before the next byte is known, as stdio's read grew it, so capacities are the same. */
     |if(result->length==(int64_t)result->capacity){
     |const size_t addition=remaining<result->capacity?(size_t)remaining:result->capacity;
     |const size_t grown_capacity=result->capacity+addition;
@@ -170,22 +291,123 @@ pure func console_read_exact_runtime(byte_list_type: String) -> String:
     |result=grown;
     |result->capacity=grown_capacity;
     |}
-    |size_t room=result->capacity-(size_t)result->length;
-    |if(room>remaining){room=(size_t)remaining;}
-    |errno=0;
-    |const size_t received=fread(result->values+result->length,1,room,stdin);
-    |result->length+=(int64_t)received;
-    |remaining-=received;
-    |if(received<room){
-    |if(!ferror(stdin)){break;}
-    |if(errno==EINTR){clearerr(stdin);continue;}
-    |const int64_t failure=blorp_console_error(errno);
-    |blorp_memory_release(result);
-    |*error=failure;
-    |return BLORP_FS_FAILED;
+    |if(blorp_console_input.length==0){
+    |refill=blorp_console_refill(cancel,error);
+    |if(refill==BLORP_CONSOLE_REFILLED){continue;}
+    |break;
     |}
+    |/* The capacity never passes `count`, so the room is at most what remains. */
+    |size_t taken=result->capacity-(size_t)result->length;
+    |if(taken>blorp_console_input.length){taken=blorp_console_input.length;}
+    |blorp_console_take(result->values+result->length,taken);
+    |result->length+=(int64_t)taken;
+    |remaining-=taken;
     |}
+    |if(refill==BLORP_CONSOLE_CANCELLED){blorp_console_give_back(result->values,(size_t)result->length);result->length=0;}
+    |blorp_console_unlock_line();
+    |if(refill==BLORP_CONSOLE_FAILED){blorp_memory_release(result);return BLORP_FS_FAILED;}
     |*bytes=result;
     |return BLORP_FS_SUCCEEDED;
+    |}
+    |uint8_t blorp_console_read_exact(int64_t count,${byte_list_type} *bytes,int64_t *error){
+    |return blorp_console_read_exact_cancellable(count,bytes,error,-1);
+    |}
+    |
+
+
+-- The seven console natives as blocking jobs (runtime/blocking.brp), print and
+-- print_error included. The reads are cancellable; the writes, the flush and
+-- the prints are unbounded, since a write to a full pipe can block without
+-- bound. It comes after BLOCKING_RUNTIME, the console fragments,
+-- CONSOLE_INPUT_RUNTIME and both prints. Nothing emits it yet: landing 5 is its
+-- first user. The initializers are external, as BLOCKING_RUNTIME's functions
+-- are, so nothing warns as unused.
+pure func console_jobs_runtime(byte_list_type: String) -> String:
+    |/* A console native's call as a blocking job. The waiting fiber owns it, usually in its frame, and fills the waiter
+    |   and the generation before it submits it. Its arguments are borrowed from the fiber, whose frame outlives the wait.
+    |   Its run writes the results, which the waiter reads once its wait ends. Each initializer zeroes the job, so it is
+    |   unsubmitted, and gives it its run, its kind and its arguments. The job comes first in each, so the pool's pointer
+    |   is the call's. */
+    |struct blorp_console_read_line_job {
+    |    struct blorp_blocking_job job;
+    |    ${byte_list_type} line;
+    |    int64_t error;
+    |    uint8_t succeeded;
+    |};
+    |static void blorp_console_read_line_run(struct blorp_blocking_job *job,int cancel){
+    |struct blorp_console_read_line_job *const call=(struct blorp_console_read_line_job *)job;
+    |call->succeeded=blorp_console_read_line_cancellable(&call->line,&call->error,cancel);
+    |}
+    |void blorp_console_read_line_job_init(struct blorp_console_read_line_job *call){
+    |*call=(struct blorp_console_read_line_job){.job={.run=blorp_console_read_line_run,.kind=BLORP_JOB_CANCELLABLE}};
+    |}
+    |struct blorp_console_read_exact_job {
+    |    struct blorp_blocking_job job;
+    |    int64_t count;
+    |    ${byte_list_type} bytes;
+    |    int64_t error;
+    |    uint8_t succeeded;
+    |};
+    |static void blorp_console_read_exact_run(struct blorp_blocking_job *job,int cancel){
+    |struct blorp_console_read_exact_job *const call=(struct blorp_console_read_exact_job *)job;
+    |call->succeeded=blorp_console_read_exact_cancellable(call->count,&call->bytes,&call->error,cancel);
+    |}
+    |void blorp_console_read_exact_job_init(struct blorp_console_read_exact_job *call,int64_t count){
+    |*call=(struct blorp_console_read_exact_job){.job={.run=blorp_console_read_exact_run,.kind=BLORP_JOB_CANCELLABLE},.count=count};
+    |}
+    |/* write's and write_error's. */
+    |struct blorp_console_write_job {
+    |    struct blorp_blocking_job job;
+    |    ${byte_list_type} data;
+    |    int64_t error;
+    |    uint8_t succeeded;
+    |};
+    |static void blorp_console_write_run(struct blorp_blocking_job *job,int cancel){
+    |(void)cancel;
+    |struct blorp_console_write_job *const call=(struct blorp_console_write_job *)job;
+    |call->succeeded=blorp_console_write(call->data,&call->error);
+    |}
+    |static void blorp_console_write_error_run(struct blorp_blocking_job *job,int cancel){
+    |(void)cancel;
+    |struct blorp_console_write_job *const call=(struct blorp_console_write_job *)job;
+    |call->succeeded=blorp_console_write_error(call->data,&call->error);
+    |}
+    |void blorp_console_write_job_init(struct blorp_console_write_job *call,${byte_list_type} data){
+    |*call=(struct blorp_console_write_job){.job={.run=blorp_console_write_run,.kind=BLORP_JOB_UNBOUNDED},.data=data};
+    |}
+    |void blorp_console_write_error_job_init(struct blorp_console_write_job *call,${byte_list_type} data){
+    |*call=(struct blorp_console_write_job){.job={.run=blorp_console_write_error_run,.kind=BLORP_JOB_UNBOUNDED},.data=data};
+    |}
+    |struct blorp_console_flush_job {
+    |    struct blorp_blocking_job job;
+    |    int64_t error;
+    |    uint8_t succeeded;
+    |};
+    |static void blorp_console_flush_run(struct blorp_blocking_job *job,int cancel){
+    |(void)cancel;
+    |struct blorp_console_flush_job *const call=(struct blorp_console_flush_job *)job;
+    |call->succeeded=blorp_console_flush(&call->error);
+    |}
+    |void blorp_console_flush_job_init(struct blorp_console_flush_job *call){
+    |*call=(struct blorp_console_flush_job){.job={.run=blorp_console_flush_run,.kind=BLORP_JOB_UNBOUNDED}};
+    |}
+    |/* print's and print_error's, which return nothing. */
+    |struct blorp_string_print_job {
+    |    struct blorp_blocking_job job;
+    |    const struct blorp_string *text;
+    |};
+    |static void blorp_string_print_run(struct blorp_blocking_job *job,int cancel){
+    |(void)cancel;
+    |(void)blorp_string_print(((struct blorp_string_print_job *)job)->text);
+    |}
+    |static void blorp_string_print_error_run(struct blorp_blocking_job *job,int cancel){
+    |(void)cancel;
+    |(void)blorp_string_print_error(((struct blorp_string_print_job *)job)->text);
+    |}
+    |void blorp_string_print_job_init(struct blorp_string_print_job *call,const struct blorp_string *text){
+    |*call=(struct blorp_string_print_job){.job={.run=blorp_string_print_run,.kind=BLORP_JOB_UNBOUNDED},.text=text};
+    |}
+    |void blorp_string_print_error_job_init(struct blorp_string_print_job *call,const struct blorp_string *text){
+    |*call=(struct blorp_string_print_job){.job={.run=blorp_string_print_error_run,.kind=BLORP_JOB_UNBOUNDED},.text=text};
     |}
     |

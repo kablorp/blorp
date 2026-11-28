@@ -45,9 +45,14 @@ done.
       the carriers' idle wait, and a blocking pool whose cancels withdraw or
       signal a job, so no helper touches a job or its waiter after the
       wait ends; in `FIBER_RUNTIME` and a new `BLOCKING_RUNTIME`, with
-      direct-C suites; nothing emits them yet.
+      direct-C suites; nothing emits them yet;
+    - landing 4d: standard input the runtime owns, behind a line lock,
+      console reads that poll and that a cancel ends with the end of input,
+      keeping any partial for the next reader, and a blocking job for each
+      console native and both prints; nothing submits the jobs yet.
   - **Next:** the rest of landing 4, the kernel's runtime support, in slices
-    4d to 4g with no seed rotation. 4d is the console.
+    4e to 4h with no seed rotation. 4e is non-regular-file reads, and 4h,
+    after it, gives the fs and process natives their jobs.
     - Before landing 6's channels: in-place reuse of a uniquely owned
       record, a compiler change of its own, and a decision on the buffered
       round trip's remaining gap.
