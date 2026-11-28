@@ -1,19 +1,22 @@
 # Graphics and games plan
 
-Status: revision 4, 2026-11-27.
+Status: revision 5, 2026-11-27.
 - **Round 1** of soundness and ergonomics review: 5 blockers and 32
   should-fixes, all taken in revision 2.
 - **Round 2:** blockers only. All 5 were resolved, with none new. It also
   found 5 soundness should-fixes, taken in revision 3, with their C
   behaviour probed.
-- **Revision 4** takes Keith's FFI decisions:
-  - one type set in both directions;
-  - copies in by default, with `@no_copy`;
-  - copies out of a view of C's memory;
-  - encoding as bytes.
+- **Revision 4** took Keith's first FFI decisions (one type set both ways,
+  and copies) and had a focused soundness review.
+- **Revision 5** follows Keith's "minimize complexity and maximize safety".
+  W2 is now eight rules:
+  - always copy, with no opt-out;
+  - C returns List results in memory from `malloc`;
+  - every foreign function is impure;
+  - binding is only through declared C adapters;
+  - decoders exist only for the supported types.
 
-  It adds "Encoding and decoding" and "Risks the FFI leaves", and had a
-  focused soundness review.
+  A quick soundness check covered the rewrite.
 
 Where a finding changed a recommendation, the section says so.
 
@@ -158,9 +161,8 @@ work is mostly mechanical:
 **Needing a design or measurement step first:**
 - **W1,** which is a spike.
 - **W2,** the FFI. Its own plan settles the syntax's spelling with parser
-  input, and the copy and view interface.
+  input.
 - **W3,** after W2.
-- **F5 and F6,** Rust and C++ through the C ABI, after F3, in the FFI plan.
 - **W4,** which is an investigation, in the concurrency plan.
 - **W5,** in its own plan.
 - **G18, G19 and G20,** each a small design with parser or ergonomics input.
@@ -264,182 +266,79 @@ W2 gets its own plan, reviewed for soundness and ergonomics, before F1. This
 section sets that plan's direction and decisions. Its syntax takes parser and
 ergonomics input before implementation (root `AGENTS.md`).
 
-### The earlier design
+### The design
 
-The legacy compiler had an FFI. `docs/GUIDE.md` section 15 describes it,
-and it was removed with that compiler in `e1cae3971`.
-- **Blocks:** `foreign(include:, link:)` blocks, with link flags limited to
-  `-l`, `-L`, `-I`, `-framework` and `-pthread`.
-- **Declarations:** `func name(...) -> T`, with an optional `= "c_symbol"`.
-- **Three modes:**
-  - the default copies String and Bytes arguments;
-  - `pure` copies nothing, and pure code may call it;
-  - `@no_copy` is impure, and copies nothing.
-- **Types:**
-  - an opaque `Ptr`;
-  - String converted to and from `char*` automatically;
-  - fixed arrays expanded to a pointer and a length;
-  - payload-free unions passed as a C `long` tag.
-- **The standard library** could not declare foreign functions.
+**Keith, 2026-11-27: minimize complexity and maximize safety.** Revision 5
+cut every mechanism that existed only to make copies optional or results
+cheaper. The FFI is eight rules:
+1. **Declarations.**
+   - A module declares its foreign functions with `private foreign func`,
+     each naming its C symbol.
+   - One module stanza holds the C sources and link flags, keyed by
+     platform (G3, G8).
+2. **Every foreign function is impure** (G5).
+   - None runs on a pool thread. While impure code runs on one carrier
+     thread, as it will until the concurrency plan's M:N landing (landing
+     7), foreign calls are serialized, so C need not be thread-safe.
+   - Purity cannot be faked.
+   - CTFE never reaches one, since constant initializers are pure
+     (`CTFE_PLAN.md` L3).
+3. **One type set, the same in both directions** (G6):
+   - Int, Float, Bool and UInt8;
+   - Lists of Int, Float and UInt8.
+4. **Every List is copied, in both directions, always** (G4).
+   - C never sees Blorp's memory, and Blorp never keeps C's.
+   - There is no opt-out.
+5. **One way to bind.**
+   - Every foreign function is defined in a C source the module declares.
+   - Anything else (a C library, C++ through `extern "C"`, Rust) is linked,
+     and called from those adapters.
+6. **Handles** are an `Int` that only the declaring module sees, wrapped in
+   a `resource union` and lent through a `with_` function (G7).
+7. **Everything else crosses as bytes:** String, Bytes, unions and records.
+   It is encoded and decoded in Blorp with a small toolkit, whose decoders
+   cover only the supported types.
+8. **A short contract** for the C side, listed below.
 
-### What to keep, and what to change
+**What revision 5 removed,** and why each removal is also safer:
 
-**Keith, 2026-11-27, after revision 3:**
-- **One type set both ways.** The same small set of types crosses in both
-  directions. Anything else is encoded as bytes, and decoded in Blorp.
-- **Copy both ways.**
-  - Arguments are copied by default, and `@no_copy` opts out, as in the
-    legacy design.
-  - Results are copied out of C's memory.
-- Don't strain to support types that don't fit.
+| Removed | Why |
+| --- | --- |
+| `@no_copy`, `const` prototypes, and diagnostics hashing of arguments | Without an opt-out, nothing C does to its copy can reach a Blorp value |
+| The ownership pass's per-argument moved-or-borrowed fact, the run-time uniqueness test, and their verifier rules | No behaviour depends on whether a copy happens |
+| Result view structs, their header, and the rules on thread-local or long-lived result memory | C returns a buffer it got from `malloc`, and Blorp frees it. There is no shared result memory left to race on. A mistake, such as returning static memory, is undefined behaviour that `blorp test`'s sanitizer build reports |
+| `unchecked pure` | Rule 2 |
+| A separate C++ landing, and a check file for prebuilt libraries | Rule 5. The adapter's own compile checks its calls against the library's header |
+| Diagnostics checks of the FP environment and signal state | They stay in the contract, and come back only if a real module needs them |
 
-**Keep:**
-- **Restricted link flags.**
-- **A list passes as a pointer and a length.**
-- **Copying by default, with `@no_copy`.** The legacy default existed for
-  value semantics: C may write into an argument, through a cast or a
-  non-`const` API, and no Blorp binding may see that. Only a copy
-  guarantees it.
-- **No callbacks:** C never calls into Blorp.
-- **A pure foreign function,** as an explicit promise the compiler cannot
-  check (G5).
+**The cost:**
+- **One copy of each List,** each way.
+- **A 640×360 frame** is about 0.9 MB, roughly 0.05 to 0.1 ms to copy, by
+  estimate. A 1280×720 one is about 0.3 ms. Both are small against a 16 ms
+  frame.
+- **Skipping a copy later is not a language change.** It is safe exactly
+  where no Blorp code could see C's writes: a unique List passed as its last
+  use. That is an optimization the compiler may add later, with no syntax
+  and nothing for a user to get wrong. It waits for a measured need.
 
-**Change:**
-1. **Copies in, with two ways to avoid them** (G4).
-   - **By default, a List argument is copied** into a buffer C may use as
-     scratch for the call. C must not keep a pointer to it, since Blorp
-     frees it when the call returns.
-   - **The copy is skipped automatically** when no Blorp code could see a
-     write:
-     - the argument is the value's last use, a move, which the ownership
-       pass already tracks;
-     - and the List is unique at run time, by the same check
-       copy-on-write uses;
-     - and it is not static. Today that is already implied by "unique",
-       since static Lists and literals never carry a count of 1. It is
-       stated so that it stays true once CTFE emits static Lists.
+**The legacy FFI** (`docs/GUIDE.md` section 15, in `e1cae3971^`) had:
+- `foreign(include:, link:)` blocks;
+- a copy by default, with `@no_copy`;
+- `pure`;
+- an opaque `Ptr`;
+- automatic String and `char *` conversion;
+- unions passed as raw tags.
 
-     Then C gets the only reference, and Blorp releases it after the call.
-     So `window.present(world.drawn())` copies nothing.
-   - **`@no_copy`** opts out for a value the caller keeps using, such as a
-     frame kept for diffing. C must then treat the data as read-only.
-     - `@tail_recursive` is the precedent for an attribute.
-     - The prototype marks such pointers `const`. `blorp` generates a header
-       of every foreign function's prototype, and each declared C source is
-       compiled with it forced in (`-include`). A definition that takes a
-       non-`const` pointer, or that disagrees with the declaration in any
-       type, is then a "conflicting types" error. Without the forced header
-       it would compile and link silently, because a source file is its own
-       translation unit.
-     - Declared sources are also compiled with
-       `-Werror=incompatible-pointer-types` and, on clang,
-       `-Werror=incompatible-pointer-types-discards-qualifiers` (gcc:
-       `-Werror=discarded-qualifiers`). Without those flags, these mistakes
-       are only warnings. Probed with Apple clang 21 on 2026-11-27:
-       - a definition that drops `const` is an error by default;
-       - assigning a `const` pointer to a plain one, or returning the wrong
-         view type, is a warning by default and an error with the flags;
-       - an explicit cast passes either way.
-     - A cast that drops `const` breaks value semantics under `@no_copy`.
-       The diagnostics check in "Risks the FFI leaves" catches it in tests.
-   - **What no copy can fix:** writing past the end, keeping a pointer after
-     the call, and freeing Blorp memory. They stay in C's contract, and the
-     test builds' sanitizers look for them ("Risks the FFI leaves").
-2. **Copies out.**
-   - A List result comes back as a *view*: C returns a pointer to its own
-     memory and a length.
-   - The generated call copies the elements, with `memcpy`, into a fresh
-     List on the same thread, straight after the C function returns.
-   - **Order at the call site:**
-     1. the C function returns its view;
-     2. Blorp copies the view;
-     3. only then does Blorp free its scratch copies and release the moved
-        arguments.
+This design keeps the restricted link flags and the default copy. It drops
+the rest:
+- `Ptr`, which is manual memory management against principle 12;
+- the automatic String conversion, which is cut short at a NUL and never
+  checks UTF-8 on the way back;
+- raw union tags, which make an out-of-range value undefined behaviour,
+  against principle 1;
+- `pure` and `@no_copy`.
 
-     So a view may point into an argument's buffer, such as a slice of the
-     input. That is allowed, and tested.
-   - **The view's contract:**
-     - its memory stays valid and unmodified from the C function's return
-       until the same thread next calls a foreign function;
-     - a function that can run on several threads at once must return
-       memory private to the thread or to the call: a thread-local buffer,
-       or the argument it was given. That covers every pure function, which
-       `parallel_map` runs on pool threads. A static buffer shared between
-       threads would let another thread's call overwrite it before this
-       thread's copy, a data race that silently gives wrong results;
-     - the length is not negative;
-     - the pointer is not NULL unless the length is 0. With a length of 0,
-       Blorp never reads it;
-     - it needs no particular alignment, since Blorp copies it with
-       `memcpy`.
-
-     Every other part of the view is C's to manage. A broken check aborts
-     with a message naming the function, as a broken native contract does
-     today.
-   - **So C never holds a pointer into Blorp's heap,** except an argument's,
-     during the call. That is why Blorp needs no allocation interface for C,
-     and no result-ownership checks.
-   - **Validation is sound.** Blorp validates its own copy, which C can no
-     longer change. This copy is what stops a C thread from changing a
-     buffer between the check and its use.
-3. **Every foreign function binds a symbol defined in a declared source.**
-   - Only those sources are compiled with the prototypes forced in.
-   - A symbol taken straight from a linked library, such as `= "read"`,
-     would get no check.
-   - The CLI checks, before it links, that each declared symbol is defined
-     by the declared sources' objects.
-   - F6 adds a second way: a symbol is also bound if a declared library's
-     declared header declares it, checked as F6 describes. Until F6, a
-     one-line adapter in the module's source binds a library function.
-   - F6's check would reject `= "read"` itself: `unistd.h` declares `read`'s
-     buffer `void *`, not `const`, and its count as a `size_t`.
-4. **There is no `Ptr` type** (G7).
-   - A C handle crosses as an `Int`.
-   - Foreign declarations are module-private by rule.
-   - The module wraps the handle in a `resource union`, and lends it through
-     a `with_` function. That is how `with_reader` lends a `Reader` today,
-     through `body(Reader.Init(opened))` in `io/files/read.brp`.
-   - Resources are never copied or returned, and are closed by their owner
-     (README, "Resources and private declarations").
-   - Because no other module can reach the `Int`-taking functions, no one
-     can forge a handle or close one twice.
-   - The legacy advice, "call the wrapper's free function when done", is
-     manual memory management, which principle 12 rules out.
-5. **No automatic conversions.**
-   - **Strings:** the legacy FFI turned a String into a `char*`, which is cut
-     short at an embedded NUL, and turned C text back into a String with no
-     UTF-8 check.
-   - **Unions:** it passed them as raw tags, under a contract saying "any
-     other value violates the contract", which is undefined behaviour,
-     against principle 1.
-   - **Now:** both cross as bytes or an Int, through "Encoding and
-     decoding".
-6. **One declaration per function.**
-   - Each function is declared once, with sources and link flags keyed by
-     platform (G8).
-   - The emitted C is then the same on every platform, and `check` has
-     nothing to compare between platforms.
-7. **C must return the ambient state as it found it.**
-   - **It must leave unchanged:** the floating-point environment (rounding,
-     traps, flush-to-zero), the signal mask, and the signal handlers.
-   - **Why:**
-     - Each persists per thread or fiber. Landing 4b saves FPCR and MXCSR.
-     - A changed one breaks principle 1, and the determinism CTFE relies on.
-     - Signal handlers also interact with landing 4a's counted swap.
-
-### Types at the boundary
-
-**G6. One small set, the same in both directions.**
-- **The rule:** a type crosses only if both are true:
-  - the compiler already knows it as a fact, not by its name;
-  - every value of its C form is a valid Blorp value, so nothing needs
-    validating.
-- `check` designates Bool, Option and Result (`namespace/builtins.brp`), and
-  knows the numbers and List.
-- **`Bytes` is a library type.** Admitting it by name would be the spelling
-  heuristic principle 4 rules out. So it crosses as its `List[UInt8]`, which
-  the module wraps with `from_list` and `to_list`, neither of which copies
-  (`bytes.brp`).
+### Types and copies
 
 | Blorp | C argument | C result |
 | --- | --- | --- |
@@ -447,89 +346,97 @@ and it was removed with that compiler in `e1cae3971`.
 | `Float` | `double` | `double` |
 | `Bool` | `uint8_t`, 0 or 1 | `uint8_t`; nonzero is `True`, a total conversion |
 | `UInt8` | `uint8_t` | `uint8_t` |
-| `List[Int]` | `int64_t *data, int64_t length` (`const` under `@no_copy`) | `blorp_int64_view`: `{ const int64_t *data; int64_t length; }` |
-| `List[Float]` | `double *data, int64_t length` (the same) | `blorp_double_view` |
-| `List[UInt8]` | `uint8_t *data, int64_t length` (the same) | `blorp_uint8_view` |
+| `List[Int]` | `int64_t *data, int64_t length`: a fresh copy | returns the length, and sets an `int64_t **data` out-parameter, the function's last parameter |
+| `List[Float]` | `double *data, int64_t length` | the same, with `double **data` |
+| `List[UInt8]` | `uint8_t *data, int64_t length` | the same, with `uint8_t **data` |
 | `Void` | — | `void` |
 | After W5 | `Int32`, `Float32` and their Lists | the same |
 
-**How a List crosses.**
-- A Blorp List is one array: `struct { references; int64_t length;
-  capacity; T values[]; }`, with the struct's name fixed by its element type
-  (`blorp_l_0_i`, `blorp_l_0_f`, `blorp_l_0_b`, in `runtime/list.brp`).
-- So an argument is its `values` and `length`, copied or not as change 1
-  says.
-- **The view types live in one stable header,** `blorp_ffi_types.h`.
-  - It holds the three view structs, under one include guard, with
-    `__cplusplus` guards, and nothing else.
-  - The CLI and `blorp compile` write it out.
-  - The generated prototypes header includes it, as do F6's check file and
-    any library header that returns a view. cbindgen is configured to use
-    it.
-  - Stable names mean no library has to guess Blorp's spelling of a view.
-- **An argument of length 0** may have any pointer. C must not read it.
+**A List argument** is a fresh copy, which C may use as scratch during the
+call. Blorp frees it when the call returns, so C must not keep a pointer to
+it. With a length of 0, the pointer is unspecified, and C must not read it.
 
-**Float is sound.**
-- NaN payloads cannot be observed today.
-- A signalling NaN goes quiet with no trap, as long as C left the FP
-  environment alone (change 7).
+**A List result:**
+- **Blorp sets `*data` to NULL before the call.**
+- **C** allocates the elements with the C library's `malloc`, sets `*data`,
+  and returns the count. With a count of 0 it may leave `*data` NULL.
+  - A buffer from another allocator, such as a Rust `Vec` or C++ `new[]`, is
+    copied into `malloc` memory by the adapter first.
+- **Blorp** copies the elements into a fresh List with `memcpy`, then calls
+  `free` on `*data`, then frees the argument copies. C keeps no pointer to
+  the result.
+- **Checks before the copy,** each aborting with a message naming the
+  function:
+  - a negative count;
+  - a NULL with a count, which includes C never setting `*data`;
+  - a result that points into one of the call's argument copies, such as a
+    scratch copy sorted and handed back. Without this check, normal and
+    diagnostics builds would fail in different ways, with a double free or
+    an interior `free`. The check is a few pointer comparisons.
+- **A count whose size in bytes would overflow** aborts in the List
+  allocation's existing size guard.
+- **What only a sanitizer build sees,** in `blorp test`:
+  - memory that did not come from `malloc`, such as static or stack memory,
+    whose `free` is undefined behaviour and may corrupt rather than crash;
+  - a `malloc` buffer that C keeps and returns again on a later call, which
+    is used after Blorp freed it.
 
-**Everything else crosses as bytes or an Int,** in both directions:
-- `String`;
-- `Bytes`;
-- unions;
-- records;
-- anything with an invariant.
+**Float is sound.** NaN payloads cannot be observed today, and a signalling
+NaN goes quiet with no trap, as long as C leaves the FP environment alone
+(the contract).
 
-This is Keith's "encode it as bytes if we really need it".
+**Bytes and String are not in the set.**
+- `check` knows Bool, Option, Result, the numbers and List as facts
+  (`namespace/builtins.brp`). `Bytes` and String are library types, and
+  admitting them by name would be the spelling heuristic principle 4 rules
+  out.
+- So the module converts:
+  - `Bytes` crosses as its `List[UInt8]`, through `from_list` and `to_list`,
+    which do not copy (`bytes.brp`);
+  - a String goes out as `text.to_bytes().to_list()`, and comes back through
+    `from_list(...).to_text()`, which checks the UTF-8.
 
-### Encoding and decoding
+### Binding through adapters
 
-A module that declares foreign functions owns its encoders and decoders.
-They follow fixed rules:
-- **Private and pure.** They sit beside the foreign declarations, and the
-  module's public API exposes only decoded types.
-- **Total.** A decoder returns a `Result` or an `Option`. A bad value from
-  C is an error result, never a fault.
-- **On Blorp's copy.** They work on the copied result, so the data cannot
-  change under them (change 2).
-- **Tested against malformed input:** truncated and oversized buffers,
-  unknown tags, invalid UTF-8.
+- **The adapters.** Each foreign function is defined in a C source the module
+  declares. The CLI compiles it:
+  - with Blorp's generated prototypes forced in (`-include`);
+  - with `-Werror=incompatible-pointer-types`.
 
-**The standard forms:**
+  A definition whose signature differs from Blorp's declaration is then a
+  "conflicting types" error, as probed with Apple clang 21 on 2026-11-27.
+  Without the forced header it would compile and link silently, because a
+  source file is its own translation unit.
+- **The symbol check.** Before linking, the CLI checks that each declared
+  symbol is defined by the declared sources' objects. So no foreign function
+  can bind a library symbol unchecked.
+- **Other libraries** are linked through the stanza's flags, and called from
+  an adapter through their own header, so the C compiler checks those calls
+  as ordinary C:
+  - **A C library:** include its header.
+  - **C++:** a library with an `extern "C"` header. Link it with the C++
+    library (`-lc++` on macOS, `-lstdc++` with GNU). Its functions must not
+    let an exception escape: they are `noexcept`, and catch everything.
+  - **Rust:**
+    - a `staticlib` crate built with cargo, whose `#[no_mangle] pub extern
+      "C"` functions get a header from cbindgen;
+    - its native dependencies, from `cargo rustc -- --print
+      native-static-libs`, go in the link flags;
+    - its profile must not set `panic = "abort"`, and each function catches
+      panics with `std::panic::catch_unwind`, returning an error code;
+    - the Blorp CLI does not run cargo.
+- **Cost of the rule:** a library function needs a one-line adapter. In
+  return there is one checking mechanism, the C compiler's, and no
+  Blorp-specific header format.
 
-| Value | Out to C | Back from C |
-| --- | --- | --- |
-| `String` | `text.to_bytes().to_list()` | `from_list(bytes).to_text()`, which validates UTF-8 and returns `Option[String]` (`bytes.brp`) |
-| A union without a payload | an Int tag, from a `match` | a `match` on the Int, with `_` giving an error, as the terminal's decoders do |
-| A record, or a union with a payload | its fields written into a `List[UInt8]`, or a flat `List[Int]` or `List[Float]` | read back field by field, into `Result` |
-| A list of records | one flat list, a fixed number of elements per record | split into groups of that size, and each group decoded |
-
-**What the library needs for this,** as W6 rows that wait on W0's `bits`:
-- little-endian readers and writers for Int and Float over a
-  `List[UInt8]`. A reader returns `Option` when the buffer is too short.
-  Every supported target, x86-64 and arm64, is little-endian, and a
-  big-endian target would be its own decision.
-- `float_from_bits` and `to_bits`, already in W6.
-- splitting a flat list into groups of a fixed size.
-
-**Not planned:**
-- records or unions crossing directly;
-- a generated decoder.
-
-Both would put layout and invariant rules into the compiler for a small
-gain. Revisit with evidence from several foreign modules.
-
-### Declaring foreign functions
+### Declarations, platforms and threads
 
 **G3. The declaration form.**
 - **Principles 13 and 16 say "`foreign func` is one declaration".** Keep
-  that, and add one module-level stanza for the sources and flags a module's
-  declarations share.
-- **The FFI plan settles the spelling** with parser and ergonomics input.
-- **It is the language's first named metadata,** so it is its own small
-  grammar, not a call with named arguments. Platform names are a closed set
-  checked by the parser, whose error lists the valid names.
+  that, with one module stanza for sources and flags.
+- **The FFI plan settles the spelling,** with parser and ergonomics input.
+  The stanza is its own small grammar, not a call with named arguments.
+  Platform names are a closed set, and the parser's error lists them.
 - **`= "symbol"` is required,** so the Blorp name never depends on the C
   name.
 - **Foreign declarations are `private`.** A public one is rejected, with
@@ -539,8 +446,6 @@ gain. Revisit with evidence from several foreign modules.
 A sketch for the FFI plan's reviewers, not a settled spelling:
 
 ```blorp
--- The module's C, per platform. The CLI compiles the matching source with
--- the generated prototypes forced in, and links with the matching flags.
 foreign:
     source macos "window_macos.c"
     source linux "window_x11.c"
@@ -548,369 +453,321 @@ foreign:
     link linux "-lX11"
 
 private foreign func native_open(width: Int, height: Int, title: List[UInt8]) -> Int = "blorp_window_open"
--- The game keeps its frame to diff the next one, so it is not copied.
-@no_copy
 private foreign func native_present(window: Int, pixels: List[UInt8], width: Int, height: Int) -> Int = "blorp_window_present"
-private foreign func native_poll(window: Int) -> List[Int] = "blorp_window_poll"
+private foreign func native_poll(window: Int) -> List[UInt8] = "blorp_window_poll"
 private foreign func native_close(window: Int) -> Int = "blorp_window_close"
 ```
 
-**G4. Arguments copied by default.**
-- **The copy is skipped** for a unique, non-static List passed as its last
-  use.
-- **`@no_copy` opts out,** with `const` prototypes forced into each C source
-  and `-Werror` on pointer mismatches.
-- **Results are copied out of a view of C's memory.**
-- **Recommended.**
-
-**G5. How a foreign function is marked pure.**
-- It is the one place a user can break purity, since a pure foreign function
-  may run on a pool thread inside `parallel_map` or a `concurrent:` block.
-- **Define the promise:**
-  - no effects, and the same result for the same arguments;
-  - safe on any thread;
-  - keeps nothing it was given;
-  - calls nothing impure.
-- **Options:**
-  - (a) `pure`, with its documentation stating that the compiler cannot
-    check it.
-  - (b) `unchecked pure`, which every reader sees, and which grep finds.
-- **Recommended: (b).** Rust marks the same trust `unsafe`.
-- **Either way,** CTFE rejects a foreign call reached from a constant
-  initializer, in its dependency pass (`CTFE_PLAN.md`).
-
-**G6. One type set both ways,** as above. Decided by Keith.
-
-**G7. Handles: an `Int` in a `resource union`,** behind private foreign
-declarations. No `Ptr`. Recommended.
-
 **G8. Platforms.**
-- **One declaration per function,** with sources and flags keyed by
-  platform.
+- **Sources and flags are keyed by platform.**
 - **A platform with no entry** is reported by `blorp run` before it calls
-  the C compiler, naming the module and the platform. It is reported only
-  for a module whose foreign functions the program can reach. Importing a
-  module whose stanza names only macOS does not fail on Linux when nothing
-  calls its foreign functions.
-- **Why not leave it to the C compiler:** that run would fail inside cc,
-  which `RUN_AND_TEST_PLAN.md` R5 maps to exit 4, "a fault in blorp".
-- **Recommended.**
+  the C compiler, naming the module and the platform.
+- **It is reported only for a module whose foreign functions the program can
+  reach.** Otherwise `RUN_AND_TEST_PLAN.md` R5 would map the C compiler's
+  failure to exit 4, "a fault in blorp".
 
-**G9. Who may declare foreign functions, and how their C travels.**
-- **User modules may,** which is principle 16.
-- **So may the standard library,** under the same rules, since a window
-  library belongs there.
-- **The compiler's own source still may not.** The bootstrap subset has no
-  FFI (`blorp/AGENTS.md`).
-- **How the C travels:**
-  - The embedder embeds only `.brp` files (`scripts/embed_library.brp`), so
-    it must also embed the C sources a library module declares.
-  - `load` publishes them in the source inventory.
-  - The CLI writes them out to compile them.
-- **Recommended.**
-- **Not in scope:** turning the compiler's built-in system natives into
-  foreign declarations. It would conflict with the bootstrap subset, and with
-  CTFE's delegation to natives (`CTFE_PLAN.md`, "Floats and natives").
+**G9. Who may declare foreign functions.**
+- **User modules and the standard library may.** The compiler's own source
+  may not: the bootstrap subset has no FFI (`blorp/AGENTS.md`).
+- **The embedder** (`scripts/embed_library.brp`) embeds a library module's
+  declared C sources beside its `.brp` files.
+- **`load`** publishes them in the source inventory, and the CLI writes them
+  out to compile them.
+- **Not in scope:** turning the compiler's built-in natives into foreign
+  declarations.
 
 **G10. Where a foreign call runs.**
-- **Correction:** the concurrency plan's landing 4b results say the fiber
-  runtime is emitted nowhere yet, and landing 5 is its first user. Fibers
-  stay on the thread they first ran on. Revision 1's "`main` is the first
-  fiber today" was wrong.
-- **Recommended:**
-  - An impure foreign call runs inline, on the calling carrier. It never
-    goes to the pool of helper threads, which runs the built-in blocking
-    natives.
-  - The carrier that runs `main` is the process's main thread. AppKit needs
-    that.
-  - A `main_thread` mark waits until there is more than one carrier.
-  - A foreign call is expected to return promptly. A long blocking call
-    stalls every fiber on its carrier.
-  - The FFI plan decides whether a `blocking` mark, which would send the
-    call to a helper, is needed. Spike W says whether the window layer
-    blocks.
-- **Record this in `CONCURRENCY_PLAN.md`** before landing 4c fixes where
-  natives run. That plan already says only kernel carriers and pool threads
-  run Blorp code.
+- **Inline, on the calling carrier,** never on a helper or pool thread.
+- **The carrier that runs `main` is the process's main thread,** which
+  AppKit needs. Fibers stay on their first thread (`CONCURRENCY_PLAN.md`,
+  landing 4b results).
+- **Promptness:** a foreign call is expected to return promptly, since a
+  blocking one stalls every fiber on its carrier. The FFI plan decides
+  whether a `blocking` mark is needed, once Spike W says whether the window
+  layer blocks.
+- **More than one carrier.** The concurrency plan's landing 7 (M:N) would let
+  fibers on different carriers call the same C function at once, and call it
+  off the main thread, which AppKit forbids. Landing 7 must then do one of:
+  - keep every foreign call on `main`'s carrier;
+  - bring a `main_thread` mark, with foreign functions declared thread-safe
+    or not.
+
+  Record that in `CONCURRENCY_PLAN.md`.
+- **Record this in `CONCURRENCY_PLAN.md`** before landing 4c.
 
 **G11. Linking through the CLI.**
-- **`RUN_AND_TEST_PLAN.md` puts foreign link flags out of scope.** Its R5
-  says a program using foreign libraries "gets a link error until a `--link`
-  option exists", and no `blorp build` is planned. So F3 adds CLI scope.
-- **Recommended:**
+- **`RUN_AND_TEST_PLAN.md` puts foreign link flags out of scope** (R5), so
+  F3 adds CLI scope:
   - `blorp run` and `blorp test` compile the declared sources and pass the
-    declared flags.
-  - `blorp compile` writes the C, the prototypes header and the sources. It
-    prints the C compiler and linker arguments a user needs.
-- **Sources and flags are published once.** The test driver and the CLI
-  both read that publication, so F2 does not link by hand.
+    declared flags;
+  - `blorp compile` writes the C, the prototypes header and the sources, and
+    prints the arguments a user needs.
+- **Sources and flags are published once,** for the CLI and the test driver
+  both.
+
+### Encoding and decoding
+
+**The toolkit, in a new `binary` module.**
+- **Why not `bytes.brp`:** the compiler imports `bytes`
+  (`src/lsp/lsp_command.brp`), so the seed reads `bytes.brp`, and it would
+  reject the `bits` and `float_from_bits` labels the toolkit needs. That is
+  G1's `float.brp` problem again.
+- **What it has:** decoders and encoders for the supported types only, plus
+  one function for runs of fixed-size records.
+There is nothing for String, records or unions: modules build those from
+these pieces.
+
+```blorp
+-- What can go wrong reading a value out of bytes.
+union DecodeError:
+    TooShort(Int, Int)          -- the offset read, and the length there is
+    NotABool(Int, UInt8)        -- the offset, and its byte, neither 0 nor 1
+    UnevenLength(Int, Int)      -- the length, and the record size it is not a multiple of
+    UnknownTag(Int)             -- a tag the module's decoder does not know
+
+
+-- Each reads one value at a byte offset: an Int or a Float as 8 bytes,
+-- little-endian, a UInt8 or a Bool as one byte.
+pure func int_at(data: Bytes, offset: Int) -> Result[Int, DecodeError]
+pure func float_at(data: Bytes, offset: Int) -> Result[Float, DecodeError]
+pure func uint8_at(data: Bytes, offset: Int) -> Result[UInt8, DecodeError]
+pure func bool_at(data: Bytes, offset: Int) -> Result[Bool, DecodeError]
+
+-- Each appends one value in the same layout.
+pure func append_int(data: Bytes, value: Int) -> Bytes
+pure func append_float(data: Bytes, value: Float) -> Bytes
+pure func append_uint8(data: Bytes, value: UInt8) -> Bytes
+pure func append_bool(data: Bytes, value: Bool) -> Bytes
+
+-- Splits data into records of `size` bytes and decodes each, stopping at
+-- the first error. `?=` cannot run inside a loop, so a module needs this to
+-- decode a list of records.
+pure func decode_records[T](
+    data: Bytes,
+    size: Int,
+    decode: pure (Bytes) -> Result[T, DecodeError]
+) -> Result[List[T], DecodeError]
+```
+
+**Its rules:**
+- **Total.** A decoder returns a `Result`, so `?=` composes it. A bad value
+  from C is an error result, never a fault.
+- **On Blorp's copy,** which C can no longer change.
+- **The layout is C's native one.** C writes each field with `memcpy` of an
+  `int64_t`, a `double` or a `uint8_t`, at an explicit offset, never by
+  casting a struct, so padding never matters.
+  - That native layout is little-endian on every supported target, x86-64
+    and arm64. A big-endian target would be its own decision.
+  - `bool_at` is strict: only 0 and 1 are Bools. A direct `Bool` result
+    from C is total, as the table says, because a bytes layout is a format
+    to check, and a C `uint8_t` is not.
+- **Needs W0's `bits` and W6's `float_from_bits`.** The toolkit lands with
+  F2.
+
+**The C side of a List result,** in `window_macos.c`. The forced prototypes
+make its signature match `native_poll(window: Int) -> List[UInt8]`:
+
+```c
+#include <stdlib.h>
+#include <string.h>
+
+/* Each event is 32 bytes: kind and key code as int64_t, then x and y as
+ * double. memcpy at explicit offsets, so no struct padding is involved. */
+enum { EVENT_SIZE = 32 };
+
+static void put_event(uint8_t *at, int64_t kind, int64_t code, double x, double y) {
+    memcpy(at, &kind, 8);
+    memcpy(at + 8, &code, 8);
+    memcpy(at + 16, &x, 8);
+    memcpy(at + 24, &y, 8);
+}
+
+int64_t blorp_window_poll(int64_t window, uint8_t **data) {
+    struct pending events = drained_events(window); /* the platform code */
+    if (events.count == 0) {
+        *data = NULL;
+        return 0;
+    }
+    uint8_t *out = malloc((size_t)events.count * EVENT_SIZE);
+    if (out == NULL) abort();
+    for (int64_t index = 0; index < events.count; index++) {
+        put_event(out + index * EVENT_SIZE, events.kind[index], events.code[index],
+                  events.x[index], events.y[index]);
+    }
+    *data = out; /* Blorp copies it, then frees it */
+    return events.count * EVENT_SIZE;
+}
+```
+
+**The Blorp side,** in `window.brp`:
+
+```blorp
+import:
+    binary: DecodeError(UnknownTag), int_at, float_at, decode_records
+    bytes: Bytes, from_list
+
+-- Must match window_macos.c's layout.
+EVENT_SIZE: Int = 32
+KIND_AT: Int = 0
+CODE_AT: Int = 8
+X_AT: Int = 16
+Y_AT: Int = 24
+
+
+private pure func decoded_event(record: Bytes) -> Result[WindowEvent, DecodeError]:
+    kind ?= record.int_at(KIND_AT)
+    code ?= record.int_at(CODE_AT)
+    x ?= record.float_at(X_AT)
+    y ?= record.float_at(Y_AT)
+
+    match kind:
+        1: Ok(CloseRequested)
+        -- key_of is total: a code it does not know is Key.Other(code)
+        2: Ok(KeyDown(key_of(code)))
+        3: Ok(KeyUp(key_of(code)))
+        4: Ok(MouseMoved(x, y))
+        _: Err(UnknownTag(kind))
+
+
+private pure func malformed_events(error: DecodeError) -> WindowError:
+    MalformedEvents(error)
+
+
+func poll_events(window: Window) -> Result[List[WindowEvent], WindowError]:
+    match window:
+        Init(handle):
+            from_list(native_poll(handle))
+                .decode_records(EVENT_SIZE, decoded_event)
+                .map_err(malformed_events)
+```
+
+**The other directions:**
+
+```blorp
+-- A typed List needs no decoding: every value C can return is valid.
+private foreign func native_samples(stream: Int, count: Int) -> List[Float] = "blorp_audio_samples"
+
+-- Text comes back as bytes, and String's own constructor checks the UTF-8.
+private foreign func native_clipboard(window: Int) -> List[UInt8] = "blorp_window_clipboard"
+
+func clipboard_text(window: Window) -> Option[String]:
+    match window:
+        Init(handle): from_list(native_clipboard(handle)).to_text()
+
+
+-- A record going out is encoded with the same layout rules.
+private pure func encoded_rectangle(data: Bytes, area: Rectangle) -> Bytes:
+    data.append_float(area.x).append_float(area.y).append_float(area.width).append_float(area.height)
+```
+
+**Not planned:**
+- records or unions crossing directly;
+- generated decoders;
+- `pure` foreign functions;
+- `@no_copy`.
+
+Each would bring back the machinery revision 5 removed. Revisit one only with
+a measured need.
+
+### The contract for C
+
+A foreign function, and anything it calls:
+- **Keeps no pointer to an argument,** frees none, and writes or reads none
+  past its length.
+- **Returns a List result in fresh memory from the C library's `malloc`.**
+  - It keeps no pointer to it, and never returns the same buffer twice.
+  - It never returns an argument copy, or a pointer into one.
+- **Leaves the process as it found it:**
+  - the FP environment's control state: rounding, traps, flush-to-zero;
+  - the signal mask and handlers;
+  - file descriptors it was not given.
+
+  It never calls `exit` or `fork`.
+- **Lets nothing unwind or jump across the boundary:** no exception, no
+  panic, and no `longjmp`.
+- **Returns promptly** (G10).
+
+### Risks the FFI leaves
+
+These are the risks of any FFI, and none can be removed by design.
+- **Memory errors inside C,** such as writing past a length or using memory
+  after it is freed.
+  - **Limited by:**
+    - `blorp test` builds the declared adapters with AddressSanitizer and
+      UndefinedBehaviorSanitizer on macOS and Linux, and with LeakSanitizer
+      where the platform has it;
+    - the copies, which keep every such error away from Blorp's values.
+  - **What it misses:** linked libraries are not instrumented.
+- **Crashes, hangs and blocking.** One bad function can stop the process,
+  since nothing isolates it.
+- **Process-wide state, leaks inside C, and escaping control flow:** the
+  contract.
+- **Trust in a linked library and its header:** the user's choice, limited by
+  the restricted link flags.
+
+**What contains them:**
+- Only modules with a `foreign` stanza can do any of this.
+- Their declarations are private.
+- `foreign` is greppable.
 
 ### Phases
 
 | Phase | Work |
 | --- | --- |
-| `lex`, `parse` | The stanza, `foreign func` and `@no_copy`. `foreign` is reserved already. Teaching messages: `extern "C"`; a nested `foreign func` ("foreign declarations go at the top of a module"; today it reports "expected a return expression"); and `Ptr` or `void*`, naming the Int handle and `resource union` pattern. |
+| `lex`, `parse` | The stanza and `foreign func`. `foreign` is reserved already. Teaching messages: `extern "C"`; a nested `foreign func` ("foreign declarations go at the top of a module"; today it reports "expected a return expression"); `Ptr` or `void*`, naming the Int handle and `resource union` pattern; `pure foreign func`, which says foreign functions are impure and their results are decoded by pure functions. |
 | `load` | Resolve sources beside the declaring module. Publish them in the source inventory. |
-| `check` | The one type set (G6). A `String`, `Bytes`, union or record parameter or result gets help naming its encoding ("pass `text.to_bytes().to_list()`", "return `List[UInt8]` and decode it with `to_text`"). `private` and `= "symbol"` are required. Purity is impure unless marked (G5). `@no_copy` is allowed only on a foreign function with a List parameter. |
-| `specialize` | The dependency pass rejects a foreign call reached from a constant initializer, transitively (`CTFE_PLAN.md`). |
+| `check` | The one type set (G6). A `String`, `Bytes`, union or record parameter or result gets help naming its encoding: "pass `text.to_bytes().to_list()`", or "return `List[UInt8]` and decode it". `private` and `= "symbol"` are required. |
 | `lower` | A foreign call target, beside `RuntimeFunction` in `own.brp`'s call targets. |
-| `own`, `verify` | A new fact in `own`'s product: for each List argument at each foreign call site, its passing mode, `Moved` or `Borrowed`. Today's ownership contracts are per callee, so this one is new. A last use of an owned value is `Moved`. A last use of a borrowed source, such as a parameter or a projection, is `Borrowed`, and is copied: `own` does not acquire a value only to move it. A result is owned. The verifier checks that a `Moved` argument is released exactly once, after the call and never by the caller, and that a `Borrowed` argument is never released by the call. |
-| `emit` | `blorp_ffi_types.h`, and the prototypes header that includes it, with `const` under `@no_copy`. The copy-in, with its run-time uniqueness and static test for a `Moved` argument. The call. Then the copy-out from the view, with its contract checks. Then freeing the scratch copies and releasing `Moved` arguments, in that order. |
+| `own`, `verify` | Arguments are borrowed, as runtime calls' are. The result is owned. No new fact: the copies are emit's. |
+| `emit` | The prototypes header. The copy of each List argument. `*data` set to NULL. The call. The checks on a List result, its copy, and `free`. Then freeing the argument copies. |
 | CLI | G11. |
 
 ### Tests and costs
 
 **Tests:**
-- **Unit tests at each phase boundary,** as `blorp/AGENTS.md` requires for
-  memory increments. They include malformed ownership IR the verifier must
-  reject.
-- **An e2e fixture with a small C file beside it,** covering:
-  - every type in the set, in both directions;
-  - a C function that writes into a copied argument, with the caller's
-    value unchanged afterwards;
-  - a last-use, unique argument passed with no copy, observed by an
-    allocation count;
-  - a shared argument copied;
-  - a static argument copied, once CTFE emits static Lists;
-  - the same List passed in two positions, one of them its last use;
-  - a List shared through a record field, copied;
-  - an `@no_copy` call;
-  - a non-`const` `@no_copy` definition, rejected;
-  - a view result copied before C changes its buffer on the next call;
-  - each view contract fault: a negative length, and a NULL with a length;
-  - a view into a copied argument, and one into a moved argument, each
-    copied before the argument is freed;
-  - a pure foreign function in `parallel_map` that returns a thread-local
-    view;
-  - an unchecked-pure call from pure code, and from `parallel_map`;
-  - a String parameter or result rejected, with exact message, help and
-    span;
+- **Unit tests at each phase boundary,** as `blorp/AGENTS.md` requires.
+- **An e2e fixture with a small C adapter,** covering:
+  - every type, in both directions;
+  - a C function that writes into its argument copy, with the caller's
+    value unchanged;
+  - a List result, copied and freed, with leak checks clean;
+  - a negative count, a NULL with a count, a result pointing into an
+    argument copy, and a `*data` never set with a count, each aborting with
+    the function's name;
+  - a `*data` never set with a count of 0, which is an empty List;
+  - a definition whose signature differs, rejected by the forced
+    prototypes;
+  - a symbol not defined in a declared source, rejected before linking;
   - a handle lent through `with_`;
-  - a symbol not defined in a declared source, rejected before linking.
-- **A decoder suite** in the window module, against malformed input.
+  - a String parameter or result, and a `pure foreign func`, each rejected
+    with exact message, help and span;
+  - an adapter calling a small C library through its header.
+- **Decoder tests** against malformed input: too short, an uneven length,
+  a bad Bool, an unknown tag.
 
 **Costs:**
 - **A program without foreign calls pays nothing.** The self-compile
-  fixed-input row keeps exactly the same allocations, and instructions
-  within +0.05%, since the compiler declares no foreign function.
-- **Each copied argument or result** costs one allocation and one
-  `memcpy`, counted by the e2e fixture's ceilings.
-
-### Risks the FFI leaves
-
-The FFI is the trust boundary. These are what Blorp still allows, and what
-limits each.
-- **Memory.**
-  - **The risk:** C can write or read past the end, keep a pointer after
-    the call, free Blorp memory, or crash. One bad function can corrupt the
-    whole process, since nothing isolates it.
-  - **Limited by:**
-    - `blorp test` builds declared C and C++ sources with
-      AddressSanitizer and UndefinedBehaviorSanitizer on macOS and Linux,
-      and LeakSanitizer where the platform supports it, which is not
-      everywhere: the FFI plan checks each target;
-    - copies, so a write into a copy never reaches a Blorp value.
-  - **What the sanitizers miss:**
-    - F6's prebuilt libraries and Rust static libraries, which are not
-      instrumented;
-    - a write past a List's length but inside its capacity, which is inside
-      the allocation, so no redzone catches it.
-- **Value semantics under `@no_copy`.**
-  - **The risk:** a cast that drops `const` lets C write into a shared value.
-  - **Limited by:** diagnostics builds hash each `@no_copy` argument before
-    and after the call, and abort naming the function if it changed.
-    Normal builds trust the contract.
-- **Purity.**
-  - **The risk:** an `unchecked pure` function that lies gives pure code
-    hidden effects. Then `parallel_map` can race, and equal inputs can give
-    different results.
-  - **Limited by:** the contract, and an audit by grep for `unchecked
-    pure`.
-- **Threads.**
-  - **The risk:** C with unsynchronized global state is unsafe as a pure
-    function, which can run on pool threads. A thread-bound API, such as
-    AppKit, needs the main thread.
-  - **Limited by:** the documentation. Such functions are impure, and so run
-    on `main`'s carrier (G10). C may start threads of its own, which never
-    run Blorp code.
-- **Liveness.**
-  - **The risk:** a blocking call stalls its carrier's fibers. A `first:`
-    timeout or cancellation waits until the call returns.
-  - **Limited by:** the documentation, and the `blocking` mark G10 leaves to
-    the FFI plan.
-- **Process-wide state.**
-  - **The risk:** the FP environment, the signal mask and handlers, `exit`,
-    `abort`, `fork`, the working directory, the environment, closing a
-    descriptor C was not given, and C's `printf` interleaving with Blorp's
-    output.
-  - **Limited by:**
-    - the contract;
-    - diagnostics builds check after each call that the FP control state
-      is unchanged: rounding mode, trap enables, flush-to-zero and
-      denormals-are-zero.
-      - It is read from MXCSR and the x87 control word, or from FPCR, the
-        registers landing 4b's switch already saves.
-      - Not all of `fenv_t`: its sticky status flags change with ordinary
-        arithmetic.
-    - they also check the signal mask, and the dispositions of the signals
-      the runtime relies on: SIGINT, SIGQUIT, SIGTERM, SIGHUP, SIGABRT and
-      SIGPIPE.
-    - other signals' handlers are trusted.
-- **Control flow.**
-  - **The risk:** a C++ exception or a Rust panic crossing the boundary, or
-    a `longjmp` across Blorp frames, which would skip releases.
-  - **Limited by:** the contract: adapters catch everything (F5, F6), and
-    `longjmp` never crosses the boundary.
-- **Resources.**
-  - **The risk:** C's own allocations and handles are invisible to Blorp's
-    leak check.
-  - **Limited by:** LeakSanitizer in test builds where the platform has it,
-    and resource wrappers for handles.
-- **Trust in others' code.**
-  - **The risk:** a header that disagrees with its library (F6), and
-    anything a declared library does.
-  - **Limited by:** cbindgen for Rust headers, and restricted link flags.
-
-**Contained:**
-- Only modules with a `foreign` stanza can do any of this.
-- Their declarations are private.
-- `foreign`, `unchecked pure` and `@no_copy` are greppable.
-
-**Not planned:** making static literals read-only memory, so that a stray
-write crashes at once. That is `CTFE_PLAN.md`'s choice, since it emits
-them.
+  fixed-input row keeps the same allocations, and instructions within
+  +0.05%.
+- **Each copy** costs one allocation and one `memcpy`, counted by the
+  fixture's ceilings.
 
 ### Landings
 
 - **F1:** the stanza, `foreign func`, the checks and the teaching messages,
   with no emission.
-- **F2:** lowering, ownership, emission, the prototypes header, and the
-  copies in and out, with the e2e fixture built through the one
-  publication.
-- **F3:** the CLI (G11), after `RUN_AND_TEST_PLAN.md`'s CLI landing
-  brings `blorp run` and `blorp test`. Neither exists yet.
-- **F5:** C++ sources, after F3 (see "Other languages through the C ABI").
-- **F6:** a prebuilt library checked against its header, after F3. It
-  covers Rust, and binding an existing C library with no adapter.
+- **F2:**
+  - lowering, emission, the prototypes header and the copies;
+  - the bytes toolkit;
+  - the e2e fixture, built through the one publication.
+- **F3:** the CLI (G11), after `RUN_AND_TEST_PLAN.md`'s CLI landing brings
+  `blorp run` and `blorp test`. Neither exists yet.
 - **README and grammar updates** in each landing, per root `AGENTS.md` rule
   13.
 
-### Other languages through the C ABI
-
-Keith asked on 2026-11-27 for Rust and C++ to be covered. Both reach Blorp
-through the C ABI, as they reach every other language.
-- **C++** exports to C with `extern "C"` functions. Its classes, templates,
-  overloads and exceptions stay behind them.
-- **Rust** has no stable ABI except `extern "C"` and `#[repr(C)]`.
-- **Binding C++ classes or Rust types directly** is not planned. That is
-  the multi-year path Swift and Zig took for C++, and Rust offers nothing
-  stable below its C ABI.
-- **The legacy FFI** worked this way too (`docs/GUIDE.md` section 15, in
-  `e1cae3971^`). The difference now is that handles, copies and the one
-  type set make the boundary safer.
-
-The Blorp side does not change: the same `foreign func` declarations, types,
-copies, views, handles and contract. What changes is where the code
-comes from, how it is checked against the declarations, and how it links.
-
-**F5: C++ sources.**
-- **Declaring them:** a module's stanza may declare a `.cpp` source as it
-  declares a `.c` one, keyed by platform.
-- **Compiling them:**
-  - With the C++ compiler, with the prototypes header forced in.
-  - The header wraps its declarations in `#ifdef __cplusplus` / `extern "C"
-    {`, so they have C linkage.
-- **Checking.** C++ links names differently from C, so the forced header
-  catches less than it does for C. Probed with Apple clang 21 on 2026-11-27:
-  - **A definition with the declared signature,** inside or outside
-    `extern "C"`, keeps C linkage, because the forced declaration fixed it
-    first. It is correct.
-  - **A definition whose signature differs,** for example one that drops
-    `const`, is not an error. C++ makes it a new overload with a mangled
-    name (`__Z1fPll` for `long f(long *, long)`).
-  - So the check that each declared symbol is defined (change 3) is what
-    catches a
-    wrong C++ definition: the C name stays undefined, and the CLI reports it
-    before linking.
-  - **Inside a body,** C++ is stricter than C: passing a `const` pointer
-    where a plain one is expected is an error.
-- **Contract: no exception may escape.**
-  - Each adapter is `noexcept`, and catches everything, returning an error
-    code.
-  - An exception that reaches a `noexcept` boundary calls `std::terminate`,
-    which is defined behaviour. One that unwinds into C frames is undefined.
-- **Headers:** `blorp_ffi_types.h` and the prototypes header carry the
-  `__cplusplus` guards, and use only types that are valid in C++, with no
-  `_Bool` or `restrict`. Rust and C++ both use the view types.
-- **Linking:** with the C++ driver, `clang++` or `g++`, or with the
-  platform's C++ library (`-lc++` on macOS, `-lstdc++` with GNU). The C++
-  standard is a stanza field, defaulting to C++17.
-- **Tests:**
-  - a fixture with a `.cpp` source;
-  - a definition whose signature differs, reported by the symbol check;
-  - an adapter that catches an exception and returns its code.
-
-**F6: a prebuilt library checked against its header.** This is the "library
-plus header" binding that change 3 deferred. It also covers Rust, and binding a
-plain C library function whose C types match Blorp's exactly, such as
-`libm`'s `sqrt`, with no adapter.
-- **Declaring it:** a module's stanza declares, per platform:
-  - the library, a static `.a` or a system library name;
-  - its C header;
-  - its link flags.
-- **Checking.** The CLI compiles one check-only C file per module, with the
-  prototypes header not forced in. In this order, the file:
-  1. Includes `blorp_ffi_types.h`, then the declared header. A header that
-     returns views includes `blorp_ffi_types.h` itself; the include guard
-     makes the second inclusion harmless.
-
-  Then, for each declared symbol:
-  1. Takes the symbol's address, as `(void *)&symbol`. A symbol the header
-     does not declare is then "use of undeclared identifier". That was
-     probed on 2026-11-27. Without this step, Blorp's own declaration would
-     supply the missing one.
-  2. Declares Blorp's prototype for the symbol. A declaration that disagrees
-     with the header's, in any type or in `const`, is then a "conflicting
-     types" error, the rule revision 3's probe showed.
-- **What this proves:** that Blorp's declaration matches the header.
-- **What it trusts:** that the header matches the library. A hand-written
-  header can disagree with its `.a`. So for Rust, generate the header with
-  cbindgen rather than writing it.
-- **Rust specifically:**
-  - The Rust side exports `#[no_mangle] pub extern "C"` functions, with
-    `#[repr(C)]` where a struct is involved.
-  - Its header is written by hand or generated with cbindgen.
-  - The user builds the static library with cargo. The Blorp CLI does not
-    run cargo.
-  - Its native dependencies, which `cargo rustc -- --print
-    native-static-libs` lists, go in the stanza's link flags.
-  - A List argument becomes a slice with `std::slice::from_raw_parts`, or
-    `from_raw_parts_mut` for any function without `@no_copy`.
-  - A List result is the view struct from `blorp_ffi_types.h`, as cbindgen
-    or a hand-written `#[repr(C)]` mirror declares it. It points into
-    memory the view's contract allows, such as a thread-local buffer.
-- **The crate:**
-  - its type is `staticlib`, which `--print native-static-libs` also needs;
-  - its profile must not set `panic = "abort"`, under which
-    `catch_unwind` catches nothing.
-- **Contract: no panic may leave an `extern "C"` function.**
-  - Since Rust 1.81, a panic that unwinds out of one aborts the process.
-  - To turn a panic into a Blorp `Result` instead, the adapter catches it
-    with `std::panic::catch_unwind`, wrapping its closure in
-    `AssertUnwindSafe` where needed, and returns an error code.
-- **Tests:**
-  - a C static library with a header: a matching declaration links, and a
-    mismatched one is rejected;
-  - a Rust fixture, gated on a Rust toolchain on the CI runners. GitHub's
-    images include one; the local Docker images would need it added.
-
-**Not planned: exporting Blorp to other languages.** A Rust or C++ program
-calling into Blorp needs:
-- Blorp functions exported with a C ABI;
-- a way to start Blorp's runtime from a host's `main`;
-- usually, callbacks, which this plan excludes.
-
-It is its own later decision.
+**Not planned:** exporting Blorp functions to Rust or C++ programs. It needs
+exported functions, a way to start Blorp's runtime from a host's `main`, and
+usually callbacks, so it is its own later decision.
 
 ## W3: the window library
 
@@ -922,10 +779,12 @@ size. macOS first.
   `with_reader` and `with_atomic_writer`: a `scoped (Window) ->
   Result[T, E]` body and an `on_error` mapper from `WindowError`;
 - a `Window` resource;
-- a `WindowEvent` union, decoded from `native_poll`'s `List[Int]`;
-- a `Key` union;
-- `present(window, frame) -> Result[Void, WindowError]`, through
-  `@no_copy`, since the game keeps its frame.
+- a `WindowEvent` union, decoded from `native_poll`'s bytes as W2's
+  example shows;
+- a `Key` union, whose `key_of` is total, with `Other(Int)` for a code it
+  does not know;
+- `present(window, frame) -> Result[Void, WindowError]`, which copies the
+  frame like any List.
 
 **How `with_window` works.** The same way `with_reader` works in
 `io/files/read.brp`:
@@ -945,7 +804,6 @@ resource union Window:
 
 
 private foreign func native_open(width: Int, height: Int, title: List[UInt8]) -> Int = "blorp_window_open"
-private foreign func native_poll(window: Int) -> List[Int] = "blorp_window_poll"
 private foreign func native_close(window: Int) -> Int = "blorp_window_close"
 
 
@@ -972,14 +830,10 @@ func with_window[T, E](
     -- Bound because only a Void call can stand alone as a statement.
     closed = native_close(handle)
     outcome
-
-
--- Each public function reads the handle with match, since union
--- destructuring is gone from main.
-func poll_events(window: Window) -> List[WindowEvent]:
-    match window:
-        Init(handle): native_poll(handle).decoded_events()
 ```
+
+Each public function, such as W2's `poll_events`, reads the handle with
+`match`, since union destructuring is gone from main.
 
 The game's side:
 
@@ -988,19 +842,24 @@ import:
     io/console/output: print_error
     window: Window, WindowError, WindowEvent(KeyDown, CloseRequested), Key(Space), with_window, present, poll_events
 
--- `?=` may not appear inside a loop (Keith, 2026-10-15), so a failed
--- present ends the loop and becomes the result.
+-- `?=` may not appear inside a loop (Keith, 2026-10-15), so a failure
+-- ends the loop and becomes the result.
 func play(window: Window) -> Result[Void, WindowError]:
     var world = starting_world()
     var running: Bool = True
     var outcome: Result[Void, WindowError] = Ok(void)
 
     while running:
-        for event in window.poll_events():
-            match event:
-                CloseRequested: running = False
-                KeyDown(Space): world = world.launched()
-                _: void
+        match window.poll_events():
+            Ok(events):
+                for event in events:
+                    match event:
+                        CloseRequested: running = False
+                        KeyDown(Space): world = world.launched()
+                        _: void
+            Err(error):
+                outcome = Err(error)
+                running = False
 
         world = world.stepped()
 
@@ -1375,6 +1234,9 @@ its landings in this file, or in its own plan once it has one.
 - **Revision 4's FFI changes:** one focused soundness review. It found 1
   blocker (a view shared between threads) and 5 should-fixes. All were
   taken, and checked by the coordinator.
+- **Revision 5:** a quick soundness check of the minimal FFI found 0
+  blockers and 5 should-fixes. All were taken, and checked by the
+  coordinator.
 
 ## Decisions
 
@@ -1382,10 +1244,14 @@ its landings in this file, or in its own plan once it has one.
 - "Otherwise sounds good": the recommendations below are accepted.
 - G17 is decided as no operators.
 - G18 is clarified: constants keep `UPPER_SNAKE_CASE`.
-- After revision 3: one type set both ways; copies in by default, with
-  `@no_copy`; copies out; everything else as bytes. G4 and G6 follow.
-- Rust and C++ are covered through the C ABI, as F5 and F6 ("Other
-  languages through the C ABI").
+- After revision 3: one type set both ways, copies, and everything else as
+  bytes. Rust and C++ are to be covered.
+- After revision 4: "minimize complexity and maximize safety". Revision 5's
+  W2 follows:
+  - G4: always copy, with C returning List results from `malloc`;
+  - G5: no pure foreign functions;
+  - Rust and C++ only through C adapters;
+  - decoders only for the supported types.
 
 
 | # | Decision | Accepted |
@@ -1393,13 +1259,13 @@ its landings in this file, or in its own plan once it has one.
 | G1 | The math functions stay in `math.brp`; the prelude selects their methods after the next rotation | yes |
 | G2 | Land `io/clock` now as the pre-fiber form; concurrency landing 5 replaces it | (a) yes |
 | G3 | `foreign func`, one declaration each, plus one module stanza for sources and flags; `= "symbol"` and `private` required | yes; spelling in the FFI plan |
-| G4 | Arguments copied by default, skipped for a unique last use; `@no_copy` opts out, with `const` prototypes forced in; results copied out of a view | yes |
-| G5 | A pure foreign function is marked `unchecked pure` | (b) yes |
+| G4 | Every List copied in both directions, with no opt-out; C returns List results in memory from `malloc`, which Blorp copies and frees | decided |
+| G5 | Every foreign function is impure | decided |
 | G6 | One type set in both directions: Int, Float, Bool, UInt8, and Lists of Int, Float and UInt8; everything else as bytes or an Int | decided |
 | G7 | Handles as an `Int` in a `resource union`, behind private declarations; no `Ptr` | yes |
 | G8 | Sources and flags keyed by platform; a missing platform reported before cc | yes |
 | G9 | User modules and the standard library may declare foreign functions; the compiler may not; declared C is embedded and published by `load` | yes |
-| G10 | Foreign calls run inline on their carrier; `main`'s carrier is the main thread; a blocking mark decided in the FFI plan | yes |
+| G10 | Foreign calls run inline on their carrier, never on a pool or helper thread; `main`'s carrier is the main thread; a blocking mark decided in the FFI plan | yes |
 | G11 | `blorp run` and `blorp test` build declared sources; `blorp compile` writes them and prints the flags | yes |
 | G12 | One conversion family (checked, `wrapped_to_`, `clamped_to_`) for every fixed-width number, UInt8 included | yes |
 | G13 | Float32 literals round, overflow rejected, context typing; Int32 and Float32 after the FFI | yes |
