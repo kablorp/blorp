@@ -374,6 +374,34 @@ which fills with zeros whatever the sign. They are functions, not operators,
 and `bits: Int methods` selects them as methods. Every operand is defined: a
 shift count outside 0 to 63 gives 0, as shifting every bit out would.
 
+The `random` module makes pseudo-random numbers purely. A `Random` generator
+is a value, and each draw returns its number beside the next generator, so a
+run follows from its seed and replays exactly:
+
+```blorp
+import:
+    random: seeded, next_below
+func main() -> Int:
+    (first, generator) = seeded(2026).next_below(6)
+    (second, _) = generator.next_below(6)
+    first + second
+```
+
+This exits 5, on every platform and every run. `seeded(seed)` makes a
+generator from any Int. `next_int` draws any Int,
+`next_below(bound)` an Int from 0 up to `bound` (0 when `bound` is 0 or less),
+unbiased by rejection, and `next_float` a Float in [0, 1) with 53 random bits.
+`split` gives two generators for separate streams, as for parallel work: the
+second has a gamma of its own, derived as Java's `SplittableRandom` derives it,
+so the streams are different sequences and not one cycle from two points. The
+generator is SplitMix64, and it draws what `java.util.SplittableRandom` draws
+from the same seed: `seeded` is `new SplittableRandom(seed)`, `next_int` is
+`nextLong()`, `next_below(bound)` is `nextLong(bound)` (a bound of 0 or less
+gives 0 where the JDK throws), `next_float` is `nextDouble()` and `split` is
+`split()`, returned as (parent, child). It is fast and good for simulations and
+games, and not cryptographic: do not use it for keys or tokens. Only a seed
+comes from outside the program, through [`io/random`](#random-seeds).
+
 `UInt8` is an unsigned byte, 0 to 255, declared by the base and available
 everywhere. Its operations wrap and never fail, like Int's:
 
@@ -1412,6 +1440,17 @@ in order, and ignore extra arguments.
 outside the process's root) or `OtherOs(errno)`; match on the variant, and
 `"${error}"` reads as text. It prints nothing. See the
 [complete program](test/test_compile/fixtures/current_directory/basic.brp).
+
+#### Random seeds
+
+`io/random` makes seeds for [`random`](#numbers-and-operators)'s pure
+generators: `random_seed() -> Int` is 64 bits from the operating system's
+entropy source (getentropy), and `random_generator()` is
+`seeded(random_seed())`. `random_below(bound)` and `random_float()` seed a
+generator and draw once, for a program that needs one number; for many, make
+one generator and draw from it. All four are impure and infallible: the
+entropy source does not fail on a supported system, and if it ever did the
+program would stop with a message, as it does when memory runs out.
 
 #### Paths and the fs library
 

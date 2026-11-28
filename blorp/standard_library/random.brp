@@ -1,0 +1,159 @@
+-- Pseudo-random numbers, all pure. A generator is a value: each draw returns
+-- its number beside the next generator, so a whole run follows from its seed
+-- and replays exactly. io/random makes a seed from the operating system.
+--
+-- The generator is SplitMix64 (Steele, Lea and Flood, OOPSLA 2014), as
+-- splitmix64.c writes it: state stepped by an odd gamma, and each state's bits
+-- mixed into the output. Each function draws what java.util.SplittableRandom
+-- draws from the same seed:
+--   seeded(seed)      new SplittableRandom(seed)
+--   next_int          nextLong(), the 64-bit draw
+--   next_below(bound) nextLong(bound); a bound of 0 or less gives 0, where the
+--                     JDK throws
+--   next_float        nextDouble()
+--   split             split(), returned as (parent, child); the child's gamma
+--                     is derived, as the JDK derives it
+-- It is fast and good for simulations and games, and it is not for cryptography.
+import:
+    _base: Int, Float, Bool(True, False)
+    bits: bit_and, bit_or, bit_xor, shift_right
+    int: INT_MAX
+    math: to_float
+
+
+-- The generator's state, and the odd gamma it adds at each draw. Only this
+-- module builds or reads one.
+union Random:
+    private Underlying(Int, Int)
+
+
+-- The constants, as signed Ints with the same bits, since Blorp has no
+-- hexadecimal literals; Int's wrapping + and * match the unsigned arithmetic.
+-- The gamma, 0x9E3779B97F4A7C15, is 2^64 divided by the golden ratio, made odd.
+private GOLDEN_GAMMA: Int = -7046029254386353131
+-- 0xBF58476D1CE4E5B9 and 0x94D049BB133111EB, the output mix's multipliers.
+private FIRST_MIX: Int = -4658895280553007687
+private SECOND_MIX: Int = -7723592293110705685
+-- 0xFF51AFD7ED558CCD and 0xC4CEB9FE1A85EC53, MurmurHash3's finalizer.
+private FIRST_GAMMA_MIX: Int = -49064778989728563
+private SECOND_GAMMA_MIX: Int = -4265267296055464877
+-- 0xAAAAAAAAAAAAAAAA, which a poorly mixed gamma is flipped against.
+private ALTERNATING_BITS: Int = -6148914691236517206
+-- A gamma with fewer bit changes than this between neighbours is poorly mixed.
+private MINIMUM_GAMMA_TRANSITIONS: Int = 24
+private INT_BITS: Int = 64
+-- 2^-53, exactly: 53 random bits times it fill [0, 1) evenly.
+private FLOAT_UNIT: Float = 1.1102230246251565e-16
+-- The bits of an Int beyond a Float's 53-bit significand.
+private FLOAT_DISCARDED_BITS: Int = 11
+
+
+-- A generator whose draws follow from `seed` alone, as Java's
+-- `new SplittableRandom(seed)`; every Int is a good seed.
+pure func seeded(seed: Int) -> Random:
+    Underlying(seed, GOLDEN_GAMMA)
+
+
+-- Any Int, each with equal chance, and the next generator.
+pure func next_int(generator: Random) -> (Int, Random):
+    match generator:
+        Underlying(state, gamma):
+            advanced = state + gamma
+            (advanced.mixed(), Underlying(advanced, gamma))
+
+
+-- SplitMix64's output mix (Stafford's variant 13), as splitmix64.c and the
+-- JDK's mix64 write it.
+private pure func mixed(state: Int) -> Int:
+    first = state.bit_xor(state.shift_right(30)) * FIRST_MIX
+    second = first.bit_xor(first.shift_right(27)) * SECOND_MIX
+    second.bit_xor(second.shift_right(31))
+
+
+-- An Int from 0 up to, not including, `bound`, each with equal chance, and the
+-- next generator. A bound of 0 or less gives 0 and the generator unchanged. As
+-- the JDK does, a power of two masks one draw, and any other bound rejects.
+pure func next_below(generator: Random, bound: Int) -> (Int, Random):
+    if bound <= 0:
+        (0, generator)
+    else if bound.bit_and(bound - 1) == 0:
+        (drawn, next) = generator.next_int()
+        (drawn.bit_and(bound - 1), next)
+    else:
+        generator.drawn_below(bound)
+
+
+-- Draws 63 bits, from 0 to INT_MAX, and keeps their remainder unless they fall
+-- in the last block of `bound` values, which INT_MAX cuts short: a remainder
+-- from it would make the low values likelier. Then it draws again, which
+-- happens with a chance below one half.
+private @tail_recursive
+pure func drawn_below(generator: Random, bound: Int) -> (Int, Random):
+    (drawn, next) = generator.next_int()
+    candidate = drawn.shift_right(1)
+    remainder = candidate % bound
+
+    match candidate - remainder <= INT_MAX - (bound - 1):
+        True: (remainder, next)
+        False: next.drawn_below(bound)
+
+
+-- A Float from 0.0 up to, not including, 1.0: one of the 2^53 evenly spaced
+-- values, each with equal chance, and the next generator.
+pure func next_float(generator: Random) -> (Float, Random):
+    (drawn, next) = generator.next_int()
+
+    significand = drawn
+        .shift_right(FLOAT_DISCARDED_BITS)
+        .to_float()
+
+    (significand * FLOAT_UNIT, next)
+
+
+-- Two generators for separate streams, as for work that runs in parallel:
+-- the first continues this one, and the second has its own gamma, so the two
+-- walk different sequences rather than one cycle from two points. As the
+-- JDK's `split`, the second starts from the next draw and takes its gamma from
+-- the state after it.
+pure func split(generator: Random) -> (Random, Random):
+    match generator:
+        Underlying(state, gamma):
+            first = state + gamma
+            second = first + gamma
+            (Underlying(second, gamma), Underlying(first.mixed(), second.mixed_gamma()))
+
+
+-- MurmurHash3's finalizer, made odd, and flipped against alternating bits if
+-- too few neighbouring bits differ, as the JDK's mixGamma does.
+private pure func mixed_gamma(state: Int) -> Int:
+    first = state.bit_xor(state.shift_right(33)) * FIRST_GAMMA_MIX
+    second = first.bit_xor(first.shift_right(33)) * SECOND_GAMMA_MIX
+
+    gamma = second
+        .bit_xor(second.shift_right(33))
+        .bit_or(1)
+
+    if (
+        gamma
+            .bit_xor(gamma.shift_right(1))
+            .bit_count()
+        < MINIMUM_GAMMA_TRANSITIONS
+    ):
+        gamma.bit_xor(ALTERNATING_BITS)
+    else:
+        gamma
+
+
+-- How many bits of `value` are set; a loop, since only `split` needs it.
+private pure func bit_count(value: Int) -> Int:
+    var count = 0
+
+    for position in 0..INT_BITS:
+        count = (
+            count
+            + value
+                .shift_right(position)
+                .bit_and(1)
+        )
+
+    count

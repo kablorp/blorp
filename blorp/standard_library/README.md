@@ -129,6 +129,15 @@ imports still resolve beside their importer. There is no host-library fallback.
 `bits.brp` has `bit_and`, `bit_or`, `bit_xor`, `bit_not`, `shift_left` and the
 logical `shift_right` on Int; a shift count outside 0 to 63 gives 0.
 
+`random.brp` has the pure SplitMix64 generator `Random`: `seeded`, `next_int`,
+`next_below`, `next_float` and `split` (which derives a gamma for the second
+generator, as Java's `SplittableRandom` does), each returning the next generator.
+It matches that class draw for draw, and is not cryptographic.
+
+`io/random.brp` has the impure seeds: `random_seed` (getentropy),
+`random_generator`, and `random_below` and `random_float`, which seed and draw once.
+`random_seed` stops the program through `fault` if the OS entropy source fails.
+
 `io/console/` has one module per error type, and reads and writes `Bytes`:
 
 - `output.brp`: `print` and `print_error`, and the byte writes `write`,

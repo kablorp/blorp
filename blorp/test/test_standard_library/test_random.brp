@@ -1,0 +1,317 @@
+import:
+    int: INT_MAX
+    list: repeat
+    random: Random, seeded, next_int, next_below, next_float, split
+    test: TestSuite
+
+
+-- The first `count` Ints a generator draws.
+private pure func drawn_ints(generator: Random, count: Int) -> List[Int]:
+    var current = generator
+    var values: List[Int] = []
+
+    for _ in 0..count:
+        (value, next) = current.next_int()
+        values = values.append(value)
+        current = next
+
+    values
+
+
+-- The first `count` draws below `bound`.
+private pure func drawn_belows(generator: Random, bound: Int, count: Int) -> List[Int]:
+    var current = generator
+    var values: List[Int] = []
+
+    for _ in 0..count:
+        (value, next) = current.next_below(bound)
+        values = values.append(value)
+        current = next
+
+    values
+
+
+-- The first `count` Floats a generator draws.
+private pure func drawn_floats(generator: Random, count: Int) -> List[Float]:
+    var current = generator
+    var values: List[Float] = []
+
+    for _ in 0..count:
+        (value, next) = current.next_float()
+        values = values.append(value)
+        current = next
+
+    values
+
+
+-- Whether `count` draws below `bound` all land in [0, bound).
+private pure func draws_below_in_range(seed: Int, bound: Int, count: Int) -> Bool:
+    var current = seeded(seed)
+    var in_range: Bool = True
+
+    for _ in 0..count:
+        (value, next) = current.next_below(bound)
+
+        in_range = in_range
+            .and(value >= 0)
+            .and(value < bound)
+
+        current = next
+
+    in_range
+
+
+-- Every expected value below comes from java.util.SplittableRandom, run by
+-- build/games/w0-random/Vectors.java (More.java for the constants). Seed
+-- 1234567 is also the reference splitmix64.c's published vector, whose third
+-- and fifth values are unsigned there: these are the same bits as signed Ints.
+private pure func test_seed_1234567_draws_the_published_vector() -> Bool:
+    (
+        drawn_ints(seeded(1234567), 5)
+        == [
+            6457827717110365317,
+            3203168211198807973,
+            -8629252141511181193,
+            4593380528125082431,
+            -2037821214251327795
+        ]
+    )
+
+
+private pure func test_seed_0_draws_the_reference_values() -> Bool:
+    drawn_ints(seeded(0), 3) == [-2152535657050944081, 7960286522194355700, 487617019471545679]
+
+
+private pure func test_the_same_seed_draws_the_same_sequence() -> Bool:
+    drawn_ints(seeded(42), 100) == drawn_ints(seeded(42), 100)
+
+
+private pure func test_neighbouring_seeds_draw_different_sequences() -> Bool:
+    drawn_ints(seeded(42), 100) != drawn_ints(seeded(43), 100)
+
+
+private pure func test_next_below_stays_in_range_for_each_bound() -> Bool:
+    draws_below_in_range(1, 1, 100)
+        .and(draws_below_in_range(2, 2, 1000))
+        .and(draws_below_in_range(3, 7, 1000))
+        .and(draws_below_in_range(4, 1000, 1000))
+        .and(draws_below_in_range(5, INT_MAX, 1000))
+
+
+-- A bound near two thirds of 2^63 leaves a third of the 63-bit draws in the
+-- cut-short second block. Kept, their remainders would put two thirds of the
+-- values in the lower half; rejected and drawn again, half are there. Of
+-- 10,000 draws, 4,700 to 5,300 is a loose bound around 5,000.
+private TWO_THIRDS_BOUND: Int = 6148914691236517205
+
+
+private pure func test_next_below_rejects_the_cut_short_block() -> Bool:
+    var current = seeded(6)
+    var lower_half = 0
+    var in_range: Bool = True
+
+    for _ in 0..10000:
+        (value, next) = current.next_below(TWO_THIRDS_BOUND)
+
+        in_range = in_range
+            .and(value >= 0)
+            .and(value < TWO_THIRDS_BOUND)
+
+        if value < TWO_THIRDS_BOUND / 2:
+            lower_half = lower_half + 1
+
+        current = next
+
+    in_range
+        .and(lower_half > 4700)
+        .and(lower_half < 5300)
+
+
+private pure func test_next_below_one_is_always_zero() -> Bool:
+    var current = seeded(7)
+    var all_zero: Bool = True
+
+    for _ in 0..100:
+        (value, next) = current.next_below(1)
+        all_zero = all_zero.and(value == 0)
+        current = next
+
+    all_zero
+
+
+-- As the JDK's mask path, a bound of 1 still draws once: the generator it
+-- returns is the one after a single next_int.
+private pure func test_next_below_one_advances_the_generator_like_next_int() -> Bool:
+    (_, after_bound) = seeded(5).next_below(1)
+    (_, after_draw) = seeded(5).next_int()
+
+    drawn_ints(after_bound, 3) == drawn_ints(after_draw, 3)
+
+
+private pure func test_next_below_zero_or_less_gives_zero_and_draws_nothing() -> Bool:
+    generator = seeded(8)
+    (zero, unchanged) = generator.next_below(0)
+    (negative, still_unchanged) = unchanged.next_below(-5)
+
+    (zero == 0)
+        .and(negative == 0)
+        .and(drawn_ints(still_unchanged, 3) == drawn_ints(generator, 3))
+
+
+-- 100,000 draws into ten buckets: each expects 10,000, with a standard
+-- deviation near 95, so 9,500 to 10,500 is a loose bound for this fixed seed.
+private pure func test_next_below_fills_ten_buckets_evenly() -> Bool:
+    var counts = repeat(0, 10)
+    var current = seeded(2026)
+
+    for _ in 0..100000:
+        (bucket, next) = current.next_below(10)
+        counts = counts.set(bucket, counts.get_or(bucket, 0) + 1)
+        current = next
+
+    counts.all(pure func(count: Int) -> Bool: (count > 9500).and(count < 10500))
+
+
+private pure func test_next_float_stays_in_zero_to_one() -> Bool:
+    var current = seeded(9)
+    var in_range: Bool = True
+    var total = 0.0
+
+    for _ in 0..10000:
+        (value, next) = current.next_float()
+
+        in_range = in_range
+            .and(value >= 0.0)
+            .and(value < 1.0)
+
+        total = total + value
+        current = next
+
+    -- The mean of 10,000 uniform draws is 0.5 within a few thousandths.
+    mean = total / 10000.0
+
+    in_range
+        .and(mean > 0.49)
+        .and(mean < 0.51)
+
+
+-- Vectors.java: seed 42, nextLong(6), five times.
+private pure func test_next_below_six_matches_the_jdk() -> Bool:
+    drawn_belows(seeded(42), 6, 5) == [0, 3, 3, 0, 5]
+
+
+-- Vectors.java: seed 42, nextLong(8), five times: a power of two keeps the
+-- low bits of one draw.
+private pure func test_next_below_a_power_of_two_matches_the_jdk() -> Bool:
+    drawn_belows(seeded(42), 8, 5) == [5, 3, 2, 4, 2]
+
+
+-- Vectors.java: seed 6, nextLong(6148914691236517205), five times.
+private pure func test_next_below_rejection_matches_the_jdk() -> Bool:
+    (
+        drawn_belows(seeded(6), TWO_THIRDS_BOUND, 5)
+        == [
+            4116517491300691916,
+            519671533888935843,
+            973424072998808904,
+            5079700175466432403,
+            1776608333908760010
+        ]
+    )
+
+
+-- Vectors.java: seed 42, nextLong(Long.MAX_VALUE), three times.
+private pure func test_next_below_int_max_matches_the_jdk() -> Bool:
+    (
+        drawn_belows(seeded(42), INT_MAX, 3)
+        == [6839728766377637706, 1474913046063446145, 2569641874231381929]
+    )
+
+
+-- Vectors.java: seed 42, nextDouble(), three times. Java's spelling of each
+-- reads back as the same double, so == is exact.
+private pure func test_next_float_matches_the_jdk() -> Bool:
+    drawn_floats(seeded(42), 3) == [0.7415648787718233, 0.1599103928769201, 0.27860113025513866]
+
+
+-- Vectors.java: seed 42, split(), then three draws from each.
+private pure func test_split_matches_the_jdk() -> Bool:
+    (parent, child) = seeded(42).split()
+
+    (drawn_ints(parent, 3) == [5139283748462763858, 6349198060258255764, 701532786141963250]).and(
+        drawn_ints(child, 3) == [-7511033593127921611, 5410762927873577580, 1172002037136309321]
+    )
+
+
+-- More.java: seed 11 is the first whose split takes the gamma correction.
+private pure func test_split_corrects_a_poorly_mixed_gamma_like_the_jdk() -> Bool:
+    (parent, child) = seeded(11).split()
+
+    (drawn_ints(child, 3) == [4571796205088123569, 3858759985714206617, -3018208404754226688]).and(
+        drawn_ints(parent, 2) == [-6676940282306817427, -9138258183961285136]
+    )
+
+
+-- More.java: seed 42, split() twice, then three draws from the grandchild.
+private pure func test_a_split_of_a_split_matches_the_jdk() -> Bool:
+    (_, child) = seeded(42).split()
+    (_, grandchild) = child.split()
+
+    drawn_ints(grandchild, 3) == [-2541637959711403433, 8380476641419707743, -7321173624144886280]
+
+
+private pure func test_split_gives_two_different_streams() -> Bool:
+    generator = seeded(10)
+    (continued, started) = generator.split()
+    first = drawn_ints(continued, 100)
+    second = drawn_ints(started, 100)
+
+    (first != second).and(first != drawn_ints(generator, 100))
+
+
+TESTS: TestSuite = {
+    description = "random SplitMix64 generator",
+    tests = [
+        ("seed 1234567 draws the published vector", test_seed_1234567_draws_the_published_vector),
+        ("seed 0 draws the reference values", test_seed_0_draws_the_reference_values),
+        ("the same seed draws the same sequence", test_the_same_seed_draws_the_same_sequence),
+        (
+            "neighbouring seeds draw different sequences",
+            test_neighbouring_seeds_draw_different_sequences
+        ),
+        (
+            "next_below stays in range for bounds 1, 2, 7, 1,000 and INT_MAX",
+            test_next_below_stays_in_range_for_each_bound
+        ),
+        (
+            "next_below rejects the cut-short block, so its values stay uniform",
+            test_next_below_rejects_the_cut_short_block
+        ),
+        ("next_below 1 is always zero", test_next_below_one_is_always_zero),
+        (
+            "next_below 1 advances the generator like next_int",
+            test_next_below_one_advances_the_generator_like_next_int
+        ),
+        (
+            "next_below 0 or less gives zero and draws nothing",
+            test_next_below_zero_or_less_gives_zero_and_draws_nothing
+        ),
+        ("next_below fills ten buckets evenly", test_next_below_fills_ten_buckets_evenly),
+        ("next_float stays in [0, 1)", test_next_float_stays_in_zero_to_one),
+        ("next_below 6 matches the JDK", test_next_below_six_matches_the_jdk),
+        (
+            "next_below a power of two matches the JDK",
+            test_next_below_a_power_of_two_matches_the_jdk
+        ),
+        ("next_below rejection matches the JDK", test_next_below_rejection_matches_the_jdk),
+        ("next_below INT_MAX matches the JDK", test_next_below_int_max_matches_the_jdk),
+        ("next_float matches the JDK", test_next_float_matches_the_jdk),
+        ("split matches the JDK", test_split_matches_the_jdk),
+        (
+            "split corrects a poorly mixed gamma like the JDK",
+            test_split_corrects_a_poorly_mixed_gamma_like_the_jdk
+        ),
+        ("a split of a split matches the JDK", test_a_split_of_a_split_matches_the_jdk),
+        ("split gives two different streams", test_split_gives_two_different_streams)
+    ]
+}
