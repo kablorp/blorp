@@ -152,6 +152,7 @@ work is mostly mechanical:
 - **W2,** the FFI. Its own plan settles the syntax's spelling with parser
   input, and the `blorp_ffi.h` interface.
 - **W3,** after W2.
+- **F5 and F6,** Rust and C++ through the C ABI, after F3, in the FFI plan.
 - **W4,** which is an investigation, in the concurrency plan.
 - **W5,** in its own plan.
 - **G18, G19 and G20,** each a small design with parser or ergonomics input.
@@ -315,11 +316,14 @@ and it was removed with that compiler in `e1cae3971`.
        in. A symbol taken straight from a linked library, such as
        `= "read"`, would get no check: `read` writes into its buffer, which
        here is a borrowed and possibly shared value.
-       - The CLI checks that each declared symbol is defined by the declared
-         sources' objects before it links.
-       - Binding a library symbol directly, checked against its real
-         header, is a later design. Until then a one-line adapter in the
-         module's source does it.
+       - The CLI checks, before it links, that each declared symbol is
+         defined by the declared sources' objects.
+       - F6 adds a second way: a symbol is also bound if a declared
+         library's declared header declares it, checked as F6 describes.
+         Until F6, a one-line adapter in the module's source binds a
+         library function.
+       - F6's check would reject `= "read"` itself: `unistd.h` declares
+         `read`'s buffer `void *`, not `const`, and its count as a `size_t`.
    - **What `const` cannot catch** is C's contract, written in the FFI
      plan:
      - a cast that drops `const`;
@@ -612,8 +616,122 @@ declarations. No `Ptr`. Recommended.
   `blorp_ffi.h`, with the e2e fixture built through the one publication.
 - **F3:** the CLI (G11), after `RUN_AND_TEST_PLAN.md`'s CLI landing
   brings `blorp run` and `blorp test`. Neither exists yet.
+- **F5:** C++ sources, after F3 (see "Other languages through the C ABI").
+- **F6:** a prebuilt library checked against its header, after F3. It
+  covers Rust, and binding an existing C library with no adapter.
 - **README and grammar updates** in each landing, per root `AGENTS.md` rule
   13.
+
+### Other languages through the C ABI
+
+Keith asked on 2026-11-27 for Rust and C++ to be covered. Both reach Blorp
+through the C ABI, as they reach every other language.
+- **C++** exports to C with `extern "C"` functions. Its classes, templates,
+  overloads and exceptions stay behind them.
+- **Rust** has no stable ABI except `extern "C"` and `#[repr(C)]`.
+- **Binding C++ classes or Rust types directly** is not planned. That is
+  the multi-year path Swift and Zig took for C++, and Rust offers nothing
+  stable below its C ABI.
+- **The legacy FFI** worked this way too (`docs/GUIDE.md` section 15, in
+  `e1cae3971^`). The difference now is that handles, borrowing and the
+  result rule make the boundary safer.
+
+The Blorp side does not change: the same `foreign func` declarations, types,
+borrowing, results, handles and contract. What changes is where the code
+comes from, how it is checked against the declarations, and how it links.
+
+**F5: C++ sources.**
+- **Declaring them:** a module's stanza may declare a `.cpp` source as it
+  declares a `.c` one, keyed by platform.
+- **Compiling them:**
+  - With the C++ compiler, with the prototypes header forced in.
+  - The header wraps its declarations in `#ifdef __cplusplus` / `extern "C"
+    {`, so they have C linkage.
+- **Checking.** C++ links names differently from C, so the forced header
+  catches less than it does for C. Probed with Apple clang 21 on 2026-11-27:
+  - **A definition with the declared signature,** inside or outside
+    `extern "C"`, keeps C linkage, because the forced declaration fixed it
+    first. It is correct.
+  - **A definition whose signature differs,** for example one that drops
+    `const`, is not an error. C++ makes it a new overload with a mangled
+    name (`__Z1fPll` for `long f(long *, long)`).
+  - So G4's check that each declared symbol is defined is what catches a
+    wrong C++ definition: the C name stays undefined, and the CLI reports it
+    before linking.
+  - **Inside a body,** C++ is stricter than C: passing a `const` pointer
+    where a plain one is expected is an error.
+- **Contract: no exception may escape.**
+  - Each adapter is `noexcept`, and catches everything, returning an error
+    code.
+  - An exception that reaches a `noexcept` boundary calls `std::terminate`,
+    which is defined behaviour. One that unwinds into C frames is undefined.
+- **Headers:** both the prototypes header and `blorp_ffi.h` carry the
+  `__cplusplus` guards, and use only types that are valid in C++, with no
+  `_Bool` or `restrict`. Rust and C++ both read `blorp_ffi.h`.
+- **Linking:** with the C++ driver, `clang++` or `g++`, or with the
+  platform's C++ library (`-lc++` on macOS, `-lstdc++` with GNU). The C++
+  standard is a stanza field, defaulting to C++17.
+- **Tests:**
+  - a fixture with a `.cpp` source;
+  - a definition whose signature differs, reported by the symbol check;
+  - an adapter that catches an exception and returns its code.
+
+**F6: a prebuilt library checked against its header.** This is the "library
+plus header" binding that G4 deferred. It also covers Rust, and binding a
+plain C library function whose C types match Blorp's exactly, such as
+`libm`'s `sqrt`, with no adapter.
+- **Declaring it:** a module's stanza declares, per platform:
+  - the library, a static `.a` or a system library name;
+  - its C header;
+  - its link flags.
+- **Checking.** The CLI compiles one check-only C file per module, with the
+  prototypes header not forced in. For each declared symbol, in this
+  order, the file:
+  1. Includes the declared header.
+  2. Takes the symbol's address, as `(void *)&symbol`. A symbol the header
+     does not declare is then "use of undeclared identifier". That was
+     probed on 2026-11-27. Without this step, Blorp's own declaration would
+     supply the missing one.
+  3. Declares Blorp's prototype for the symbol. A declaration that disagrees
+     with the header's, in any type or in `const`, is then a "conflicting
+     types" error, the rule revision 3's probe showed.
+- **What this proves:** that Blorp's declaration matches the header.
+- **What it trusts:** that the header matches the library. A hand-written
+  header can disagree with its `.a`. So for Rust, generate the header with
+  cbindgen rather than writing it.
+- **Rust specifically:**
+  - The Rust side exports `#[no_mangle] pub extern "C"` functions, with
+    `#[repr(C)]` where a struct is involved.
+  - Its header is written by hand or generated with cbindgen.
+  - The user builds the static library with cargo. The Blorp CLI does not
+    run cargo.
+  - Its native dependencies, which `cargo rustc -- --print
+    native-static-libs` lists, go in the stanza's link flags.
+  - A borrowed argument becomes a slice with `std::slice::from_raw_parts`.
+  - Results are built through `blorp_ffi.h`, which the Rust side declares as
+    `extern "C"`.
+- **The crate:**
+  - its type is `staticlib`, which `--print native-static-libs` also needs;
+  - its profile must not set `panic = "abort"`, under which
+    `catch_unwind` catches nothing.
+- **Contract: no panic may leave an `extern "C"` function.**
+  - Since Rust 1.81, a panic that unwinds out of one aborts the process.
+  - To turn a panic into a Blorp `Result` instead, the adapter catches it
+    with `std::panic::catch_unwind`, wrapping its closure in
+    `AssertUnwindSafe` where needed, and returns an error code.
+- **Tests:**
+  - a C static library with a header: a matching declaration links, and a
+    mismatched one is rejected;
+  - a Rust fixture, gated on a Rust toolchain on the CI runners. GitHub's
+    images include one; the local Docker images would need it added.
+
+**Not planned: exporting Blorp to other languages.** A Rust or C++ program
+calling into Blorp needs:
+- Blorp functions exported with a C ABI;
+- a way to start Blorp's runtime from a host's `main`;
+- usually, callbacks, which this plan excludes.
+
+It is its own later decision.
 
 ## W3: the window library
 
@@ -1082,6 +1200,8 @@ checked the round-2 should-fixes taken in revision 3.
 - "Otherwise sounds good": the recommendations below are accepted.
 - G17 is decided as no operators.
 - G18 is clarified: constants keep `UPPER_SNAKE_CASE`.
+- Rust and C++ are covered through the C ABI, as F5 and F6 ("Other
+  languages through the C ABI").
 
 
 | # | Decision | Accepted |
