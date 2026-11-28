@@ -603,13 +603,13 @@ pattern's union must be the matched value's: matching a `Shape` with
 `Other.Empty` reports that `Other.Empty` is a variant of `Other`.
 
 A union is read with `match`, however many variants it has. Unlike a tuple,
-it is not destructured: `Meters.Init(length) = distance` (also through a module
+it is not destructured: `Meters.Underlying(length) = distance` (also through a module
 alias, bare, or with `?=`) is rejected with "a union is read with match, not
 destructured", and the help names the arm to write:
 
 ```blorp
 length = match distance:
-    Meters.Init(length): length
+    Meters.Underlying(length): length
 ```
 
 The arm's binder may reuse the name it binds: the outer `length` comes into
@@ -631,7 +631,7 @@ unique and cannot replace a base type.
 `union Result[T, E]:` declares type parameters, and an application such as
 `Result[Box[Int], Int]` supplies all of them in order. A union of bare
 variants compiles to a C enum. A union with one variant and one payload is
-stored as that payload, with no tag and no wrapper: `union Meters: Init(Int)`
+stored as that payload, with no tag and no wrapper: `union Meters: Underlying(Int)`
 is an `int64_t` in C. That holds when the payload never reaches the union
 again by any path, through type arguments (phantom ones included), records,
 Lists and callables. The test is conservative: a rose tree, `union Tree: Node(List[Tree])`, could be stored as
@@ -660,28 +660,28 @@ be `Void`. `Bool` is declared this way.
 
 ```blorp
 union UserId:
-    private Init(Int)
+    private Underlying(Int)
 private pure func user_id(value: Int) -> UserId:
-    Init(value)
+    Underlying(value)
 pure func number(id: UserId) -> Int:
     match id:
-        Init(value): value
+        Underlying(value): value
 func main() -> Int:
     number(user_id(7))
 ```
 
 This exits 7. A variant marked `private` is built and matched
 only in the module that declares it. `UserId` has one variant and one
-payload, so it is stored as its `Int`. `Init` is the convention for a type's one private
-variant; the language does not require the name. A private variant's payload
-may mention private types, since no other module sees it. In a `private
-union` every variant is private already, so a variant there takes no mark:
-`private` on one is rejected.
+payload, so it is stored as its `Int`. `Underlying` is the convention for
+a type's one private variant; the language does not require the name. A
+private variant's payload may mention private types, since no other
+module sees it. In a `private union` every variant is private already, so
+a variant there takes no mark: `private` on one is rejected.
 
 A module's own variants may share a name, as when several unions each have a
-private `Init`. A bare name works wherever it is unambiguous; where two
-variants in scope share it, each bare use is reported and `UserId.Init` names
-the one meant.
+private `Underlying`. A bare name works wherever it is unambiguous; where two
+variants in scope share it, each bare use is reported and `UserId.Underlying`
+names the one meant.
 
 Other modules build the union with the functions its module exports, and
 cannot name a private variant to build it, match it or import it. Their
@@ -704,11 +704,11 @@ A `resource union` declares one:
 
 ```blorp
 resource union Reader:
-    private Init(Int)
+    private Underlying(Int)
 
 func read_chunk(reader: Reader, limit: Int) -> Int:
     match reader:
-        Reader.Init(handle): handle + limit
+        Reader.Underlying(handle): handle + limit
 ```
 
 It has exactly one variant, private by its mark or, in a `private resource
@@ -720,7 +720,7 @@ payload is the handle, so it is stored as that payload.
 
 ```blorp
 resource union Reader:
-    private Init(Int)
+    private Underlying(Int)
 
 func consume(reader: Reader) -> Void:
     void

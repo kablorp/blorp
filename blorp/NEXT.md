@@ -70,7 +70,7 @@ done.
     sizes half moves to its own plan before T1 (T6).
 - **Private variants:** [`PRIVATE_VARIANTS_PLAN.md`](PRIVATE_VARIANTS_PLAN.md).
   - **Status:** planned on 2026-11-23. Opaque types become unions with private
-    variants (`union UserId: private Init(Int)`) in nine landings: enable
+    variants (`union UserId: private Underlying(Int)`) in nine landings: enable
     private variants, rotate the seed, migrate every opaque use, then delete
     the opaque machinery. Keith dropped the promise of no net growth on
     2026-11-24; the estimate after landing 2 is about +400 lines.

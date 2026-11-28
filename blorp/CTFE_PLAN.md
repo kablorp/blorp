@@ -249,7 +249,7 @@ after `evaluate` is a later change, if their C size is measured to matter.
 -- L2. specialize.brp: constants are monomorphic, so each reached constant
 -- has one instance, numbered densely like functions.
 union ConstantInstanceId:
-    private Init(Int)
+    private Underlying(Int)
 
 -- check/model.brp:  CheckedForm (model.brp:975) gains   ReadConstant(ConstantId)
 -- lower.brp:        ValueOperation gains               ReadConstantValue(ConstantInstanceId)
@@ -279,7 +279,7 @@ whose result is the annotation. It deletes the closed mode.
 
 **Private variants.** Inside its module, a constant builds a private
 variant as any body there may. A Dict constant is built by `dict.brp`'s own
-functions through `Dict.Init(...)`.
+functions through `Dict.Underlying(...)`.
 
 ### Value model and publication
 
@@ -305,7 +305,7 @@ union ConstantValue:
 -- walks use an explicit stack: a recursive union chain is bounded only by
 -- the step budget.
 union ConstantTable:
-    private Init(List[ConstantValue])                       -- dense by ConstantInstanceId
+    private Underlying(List[ConstantValue])                       -- dense by ConstantInstanceId
 ```
 
 **`UInt8` in compiler source.** The `UInt8` arms use `UInt8` in compiler
@@ -609,7 +609,7 @@ The teaching errors are in [Errors](#errors).
      parameters are named like type parameters.
    - **How.** `N` is bound by matching a bare `N`: in a parameter's type at a
      call, or in the expected type at a call or at a constructor of a sized
-     union. That is how `Vector.Elements(...)` and `Index.Init(...)` get
+     union. That is how `Vector.Elements(...)` and `Index.Underlying(...)` get
      their `N`. A compound size is computed after binding, never solved.
    - **Without a binding site** the call or construction is rejected.
 3. **Constants in sizes.**
@@ -670,7 +670,7 @@ union Vector[T, N: Size]:
     private Elements(List[T])
 
 union Index[N: Size]:
-    private Init(Int)
+    private Underlying(Int)
 
 pure func filled[T, N: Size](value: T) -> Vector[T, N]:
     Elements(repeat(value, N))                         -- N is an Int here
@@ -801,7 +801,7 @@ Keith accepted each recommendation here on 2026-11-24.
 | Private-variants landing | CTFE |
 | --- | --- |
 | 1 to 3: private variants, erasure, the union-headed `Dict`, the seed rotation | L1 is independent of them. L2 and L3 come after landing 3, so their identity types are unions with a private variant from the start: compiler source cannot use private variants before that rotation. Erasure is in `specialize`, so the evaluator's input is the same either way. L3's Dict constants use `check`'s one Dict-literal path, which landing 2 updates. |
-| 4: migrate | L4 follows it. Its consumers build `NameId`, `NameTable` and `ParsedAssembly`, which use `into_opaque` today (`names.brp:112,217`, `assemble.brp:139`), so L4 writes `NameId.Init(...)`. |
+| 4: migrate | L4 follows it. Its consumers build `NameId`, `NameTable` and `ParsedAssembly`, which use `into_opaque` today (`names.brp:112,217`, `assemble.brp:139`), so L4 writes `NameId.Underlying(...)`. |
 | 5 and 6: delete | Nothing here builds on `ConstructOpaque`, opaque ids or opaque layouts. L2 and L3 leave `resource_free(scope.opaques, ...)` (`check/constants.brp:43`) alone, so landing 6 still changes one site. |
 | Rotations | Each plan rotates separately, and each rotation is judged as a rotation. Every landing is measured against its own parent beforehand, so the costs stay apart. |
 

@@ -1729,7 +1729,7 @@ decides whether to cut, accept or rescope the landing.
   94 and 62 blank, 605 and 335 not. The compiler's 2 non-blank lines over 603
   come from main, not from 17b's behaviour. Main shortened the mutable-capture
   error that 17b's capture rule replaces, so the replacement saves 5 fewer
-  lines. Migrating `from_opaque CheckFailure` to a `CheckFailure.Init` binding
+  lines. Migrating `from_opaque CheckFailure` to a `CheckFailure.Underlying` binding
   adds 1. The lexer's error texts as constants and main's `AggregateId` import
   take 4 back.
 - **Review round 2** found a probe that loops at a member hole in a literal

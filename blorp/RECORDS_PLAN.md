@@ -94,7 +94,7 @@ and for a boxed union. It undercounts an owning union whose widest case holds
 more: a record holding such a union would be a value whose copy acquires two
 counts (`union Shape: Pair(String, String) | Many(List[Wrapper])` with
 `record Wrapper { shape: Shape }`). A cycle can also pass through a type
-argument that its declaration never stores, as in `union Q[U]: Init(Int)`,
+argument that its declaration never stores, as in `union Q[U]: Underlying(Int)`,
 `union A: MkA(Q[B])` and `union B: MkB(A)`. The layout in progress may then
 cost nothing, and B would be an owning union over a plain payload, which
 verify rejects.

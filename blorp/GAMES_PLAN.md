@@ -790,7 +790,7 @@ private pure func malformed_events(error: DecodeError) -> WindowError:
 
 func poll_events(window: Window) -> Result[List[WindowEvent], WindowError]:
     match window:
-        Init(handle):
+        Underlying(handle):
             from_list(native_poll(handle))
                 .decode_records(EVENT_SIZE, decoded_event)
                 .map_err(malformed_events)
@@ -810,7 +810,7 @@ private foreign func native_clipboard(window: Int) -> List[UInt8] = "blorp_windo
 
 func clipboard_text(window: Window) -> Option[String]:
     match window:
-        Init(handle): from_list(native_clipboard(handle)).to_text()
+        Underlying(handle): from_list(native_clipboard(handle)).to_text()
 
 
 -- A record going out is encoded with the same layout rules.
@@ -969,7 +969,7 @@ caller never sees the `Int`.
 ```blorp
 -- In window.brp. Only this module builds or reads a Window.
 resource union Window:
-    private Init(Int)
+    private Underlying(Int)
 
 
 private foreign func native_open(
@@ -999,7 +999,7 @@ func with_window[T, E](
         .opened()
         .map_err(on_error)
 
-    outcome = body(Window.Init(handle))
+    outcome = body(Window.Underlying(handle))
     -- Bound because only a Void call can stand alone as a statement.
     closed = native_close(handle)
     outcome

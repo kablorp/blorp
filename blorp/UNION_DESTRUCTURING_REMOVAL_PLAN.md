@@ -10,13 +10,13 @@ a union.
 ways, after the help fixes landed:
 
 ```blorp
-ModuleStem.Init(text) = stem
+ModuleStem.Underlying(text) = stem
 text
 ```
 
 ```blorp
 match id:
-    ModuleStem.Init(text):
+    ModuleStem.Underlying(text):
        text
 ```
 
@@ -52,13 +52,13 @@ For example:
 ```blorp
 -- blorp/src/common/syntax/source.brp:115, today
 pure func stem_text(stem: ModuleStem) -> String:
-    ModuleStem.Init(text) = stem
+    ModuleStem.Underlying(text) = stem
     text
 
 -- after
 pure func stem_text(stem: ModuleStem) -> String:
     match stem:
-        ModuleStem.Init(text): text
+        ModuleStem.Underlying(text): text
 ```
 
 **47 keep going after the payload.** They bind it with a `match` expression,
@@ -68,14 +68,14 @@ is one:
 ```blorp
 -- today
 pure func set[K: Hashable, V](self: Dict[K, V], key: K, value: V) -> Dict[K, V]:
-    Dict.Init(contents) = self
+    Dict.Underlying(contents) = self
     slot = contents.probe(key)
     ...
 
 -- after
 pure func set[K: Hashable, V](self: Dict[K, V], key: K, value: V) -> Dict[K, V]:
     contents = match self:
-        Dict.Init(contents): contents
+        Dict.Underlying(contents): contents
     slot = contents.probe(key)
     ...
 ```
@@ -94,8 +94,8 @@ cost more lines than the rest.
 
 **Three sites are resources:**
 
-- `Reader.Init(handle) = reader`, twice in `io/files/read.brp`;
-- `Writer.Init(handle) = writer`, once in `io/files/write.brp`.
+- `Reader.Underlying(handle) = reader`, twice in `io/files/read.brp`;
+- `Writer.Underlying(handle) = writer`, once in `io/files/write.brp`.
 
 Today a resource union cannot be matched at all (`MatchedResource`,
 `bodies.brp:296`), so this plan must open one form for them (rule 2).
@@ -115,8 +115,8 @@ Today a resource union cannot be matched at all (`MatchedResource`,
 
    | Case | Message | Help |
    | --- | --- | --- |
-   | value is a plain name: `Pair.Init(left, right) = pair` | `a union is read with match, not destructured` | `use match pair: with an arm such as Pair.Init(left, right): on the next line` |
-   | any other value | the same | `use match with an arm such as Pair.Init(left, right): on the next line` |
+   | value is a plain name: `Pair.Underlying(left, right) = pair` | `a union is read with match, not destructured` | `use match pair: with an arm such as Pair.Underlying(left, right): on the next line` |
+   | any other value | the same | `use match with an arm such as Pair.Underlying(left, right): on the next line` |
 
    The help never suggests a one-line `match`, which the parser rejects, and
    never repeats a long initializer. It says "an arm such as", because the
@@ -150,10 +150,10 @@ an erased union retains nothing, because `ReadPayload` of an erased payload
 is the root itself. The reviewer's probes show both:
 
 ```c
-/* size_destructured: Stem.Init(text) = stem; text.length() */
+/* size_destructured: Stem.Underlying(text) = stem; text.length() */
 int64_t blorp_f_1(struct blorp_string* blorp_p_0){ ... blorp_f_9(blorp_vl_0) ... return blorp_vl_1;}
 
-/* size_matched: match stem: Stem.Init(text): text.length() */
+/* size_matched: match stem: Stem.Underlying(text): text.length() */
 int64_t blorp_f_4(struct blorp_string* blorp_p_0){ ... blorp_string_retain(blorp_vl_0) ... blorp_f_9(blorp_vl_2) ... blorp_string_release ... }
 ```
 
@@ -511,7 +511,7 @@ would be Keith's decision, not a routine correction.
 Keith accepted all three on 2026-11-26.
 
 1. **The binding form for the 47 sites that keep going**
-   (`contents = match self: Dict.Init(contents): contents`), rather than
+   (`contents = match self: Dict.Underlying(contents): contents`), rather than
    nesting the rest of the body.
 2. **A parser rejection with a migration help,** rather than leaving the line
    to today's generic "expected a newline after the return expression".

@@ -58,13 +58,13 @@ match from_opaque DeclarationInventory(inventory).functions.get(id.function_numb
 
 ```blorp
 union UserId:
-    private Init(Int)
+    private Underlying(Int)
 
 private pure func user_id(value: Int) -> UserId:
-    Init(value)                     -- build
+    Underlying(value)                     -- build
 
 pure func number(id: UserId) -> Int:
-    Init(value) = id                -- read: one variant, so the binding always matches
+    Underlying(value) = id                -- read: one variant, so the binding always matches
     value
 ```
 
@@ -79,9 +79,9 @@ pure func number(id: UserId) -> Int:
    mark, for the formatter and rule 4.
 2. **Bare names when unambiguous.** Every variant, public or private, enters
    its module's scope under its bare name, and the module's own variants may
-   share a spelling. A bare `Init` resolves where only one variant in scope
+   share a spelling. A bare `Underlying` resolves where only one variant in scope
    has that spelling; otherwise each bare use is reported as ambiguous, and
-   `UserId.Init` always works. A qualified `email.Unchecked` is ambiguous in
+   `UserId.Underlying` always works. A qualified `email.Unchecked` is ambiguous in
    the same way when module `email` declares several public `Unchecked`
    variants. An imported or prelude variant keeps today's rule: it conflicts
    with any other variant of its spelling, and the conflict is reported once,
@@ -108,16 +108,16 @@ pure func number(id: UserId) -> Int:
    every `*Identity` record, `DeclarationRows`, `NameRows`, `ProgramBuilder`,
    `Lifecycle`, and the library's `DictContents`.
 6. **Same names.** A variant may not share its union's name. The convention
-   for a single private variant is `Init`. The README calls it a convention,
+   for a single private variant is `Underlying`. The README calls it a convention,
    and the language does not require it.
 7. **Destructuring bindings.** These extend from flat tuples to a union with
    exactly one variant, whose binding always matches:
-   `UserId.Init(value) = id` and `Pair.Init(left, right) = pair`. A union with
+   `UserId.Underlying(value) = id` and `Pair.Underlying(left, right) = pair`. A union with
    more than one variant needs `match`.
 8. **Payload layout.** A union with one variant and one payload, whose payload
    never reaches the union again by any path, is stored as that payload, with
    no tag and no wrapper. This is how opaque types are laid out today.
-9. **Resource unions.** `resource union Reader: private Init(Int)` replaces
+9. **Resource unions.** `resource union Reader: private Underlying(Int)` replaces
    `resource type Reader = Int`, under decision 1 below.
 
 The parser owns the parts of these rules that are local to one declaration:
@@ -174,17 +174,17 @@ function exists, the help is the generic form.
 | A private variant named through an alias | `email.Checked is private to module ./email` | the same |
 | A variant of a private union, from another module | today's private-name message, `Secret is private to ./email` | today's help |
 | An import selection of a private variant, bare (`email: Checked`) or under its union (`Email(Checked)`) | `Email.Checked is private to module ./email` | `select Email, and use the functions ./email exports` |
-| A bare name that several variants in scope share, merged with today's `UnimportedVariantValue` | `Init is a variant of several unions in scope: UserId, TypeId` | `write it through one of them: UserId.Init, TypeId.Init` |
+| A bare name that several variants in scope share, merged with today's `UnimportedVariantValue` | `Underlying is a variant of several unions in scope: UserId, TypeId` | `write it through one of them: UserId.Underlying, TypeId.Underlying` |
 | `email.Unchecked`, when `email` declares several public `Unchecked` variants | `Unchecked is a variant of several unions in module ./email: Email, Draft` | `select the union, and write Email.Unchecked` |
 | An outside `match` with no `_` | `this match on Email is not exhaustive: Email has variants private to module ./email` | `add a _ arm to cover them`, naming the position in nested patterns, as in `Some(_)` |
-| A duplicate variant in one union | `UserId already has a variant named Init` | `rename one of them` |
+| A duplicate variant in one union | `UserId already has a variant named Underlying` | `rename one of them` |
 | `private` on a variant of a `private union` | `Step is private, so its variants already are` | `remove private from Shift` |
-| A variant spelled like its union | `variant UserId shares its union's name` | `name the variant, for example UserId.Init, so that UserId always means the type` |
+| A variant spelled like its union | `variant UserId shares its union's name` | `name the variant, for example UserId.Underlying, so that UserId always means the type` |
 | Destructuring a union with several variants | `Email has 2 variants, so Email.Checked(text) = address could fail to match` | `use match to handle each variant` |
-| A destructuring's arity mismatch | `UserId.Init has 1 payload, but this binding names 2` | `bind one name, as in UserId.Init(value) = id` |
-| A destructuring of a value of another type | `this binding destructures UserId.Init, but the value is an Email` | `destructure the value's own union` |
-| A generic build without an expected type | `cannot infer T for Id.Init` | `add a type annotation, such as id: Id[User] = Id.Init(1)` |
-| A resource union with a second variant, a second payload, a public variant or type parameters | `a resource union has exactly one private variant with one payload` | `declare resource union Reader: private Init(Int)`; for a private union, `private resource union Writer: Init(Int)` |
+| A destructuring's arity mismatch | `UserId.Underlying has 1 payload, but this binding names 2` | `bind one name, as in UserId.Underlying(value) = id` |
+| A destructuring of a value of another type | `this binding destructures UserId.Underlying, but the value is an Email` | `destructure the value's own union` |
+| A generic build without an expected type | `cannot infer T for Id.Underlying` | `add a type annotation, such as id: Id[User] = Id.Underlying(1)` |
+| A resource union with a second variant, a second payload, a public variant or type parameters | `a resource union has exactly one private variant with one payload` | `declare resource union Reader: private Underlying(Int)`; for a private union, `private resource union Writer: Underlying(Int)` |
 | A `match` on a resource union outside its module | `Reader can be matched only in module ./reader` | `use the functions ./reader exports` |
 
 **One report per conflict.** Each rejection is reported once, at its cause:
@@ -235,19 +235,19 @@ function exists, the help is the generic form.
   domain with one head compiles without a test, and derived equality
   handles the single variant.
 - **`fixed`.** An identity type held by a `fixed record` field or a `fixed
-  union` payload is declared `fixed union TraitId: private Init(Int)`.
+  union` payload is declared `fixed union TraitId: private Underlying(Int)`.
 
 ### Generic types
 
 ```blorp
 union Id[T]:
-    private Init(Int)
+    private Underlying(Int)
 
 union Dict[K: Hashable, V]:
-    private Init(DictContents[K, V])
+    private Underlying(DictContents[K, V])
 
 pure func first_user() -> Id[User]:
-    Id.Init(1)                      -- T comes from the expected type
+    Id.Underlying(1)                      -- T comes from the expected type
 ```
 
 A generic union's variant needs an expected type, as `Option.None` does.
@@ -302,10 +302,10 @@ Keith settled these on 2026-11-23:
 
    ```blorp
    resource union Reader:
-       private Init(Int)
+       private Underlying(Int)
 
    func read_chunk(reader: Reader, limit: Int) -> Result[Bytes, ReadError]:
-       Reader.Init(handle) = reader
+       Reader.Underlying(handle) = reader
        native_read(handle, limit)
    ```
 
@@ -319,23 +319,23 @@ Keith settled these on 2026-11-23:
    variant, whatever its payload count. Its landing order is set by the
    review (see [Landings](#landings)).
 
-3. **Bare names when unambiguous** (rule 2). Keith wants `Init` usable on its
+3. **Bare names when unambiguous** (rule 2). Keith wants `Underlying` usable on its
    own in its module. A bare use resolves where it is unambiguous, and an
    ambiguous one is reported where it is used. Resolution stays in namespace
    and needs no types. It applies to every variant, so `private` changes only
    access. In the 11 modules that hold 50 of the 67 opaque types, such as
    `model.brp` and `ids.brp`, bare uses stay ambiguous and are written
-   `UserId.Init`.
+   `UserId.Underlying`.
 4. **Rule 4 stands.** The parser review found that rule 4 conflicted with a
    union-scoped private variant: two private unions in one module could not
-   both have an `Init`, and a private resource union needed the mark. Keith
+   both have an `Underlying`, and a private resource union needed the mark. Keith
    dropped the rule on that finding, but rule 2 removed the scope, so the
    conflict is gone. In a private union the mark would do nothing, which was
    Keith's concern, so it is an error again:
 
    ```blorp
    private resource union Writer:
-       Init(Int)                    -- private, because Writer is
+       Underlying(Int)                    -- private, because Writer is
    ```
 
 5. **Imported and prelude variants keep today's conflict.** Keith chose it
@@ -348,7 +348,7 @@ Keith settled these on 2026-11-23:
 
    So only a module's own variants share a spelling. An imported or prelude
    variant still conflicts with any other variant of its spelling, reported
-   once at the import or declaration. `Init` still stands on its own in its
+   once at the import or declaration. `Underlying` still stands on its own in its
    module, those errors stay at their cause, and it saves about 20 lines.
 
 ## Every change, by phase
@@ -402,7 +402,7 @@ Deleting it also removes:
 | `test` | about 90 lines | 129 | 68 |
 
 - **Declarations** grow from one line to two.
-- **Builds** become `X.Init(value)`.
+- **Builds** become `X.Underlying(value)`.
 - **Reads become statements.** In `src`, 184 of 218 reads are not already a
   whole binding, so each needs one. That adds about 220 lines with the
   library. The review judged it worth it: no prefix keyword hides its scope,
@@ -459,9 +459,9 @@ These are outside the compiler source:
 
 - **Variants get a scope table of their own.** One spelling may hold
   several variants, so variants leave the table of one entry per spelling,
-  and their ambiguity is reported at a use, not at a declaration. A second `Init` in a module makes that
-  module's existing bare uses ambiguous, and each is reported where it is
-  used.
+  and their ambiguity is reported at a use, not at a declaration. A second
+  `Underlying` in a module makes that module's existing bare uses
+  ambiguous, and each is reported where it is used.
 - **Exhaustiveness depends on the module.** The same `match` is complete
   inside the declaring module and incomplete outside.
 - **Reads become statements,** as counted above.
@@ -843,7 +843,7 @@ are one follow-up with its own ceiling of +140, counted against the stack:
 - **A public spelling several unions share, through an alias**
   (`mail.Unchecked`) gets "write Email.Unchecked or Letter.Unchecked",
   instead of help that repeats the selection. About +50.
-- **A private spelling several unions share** (`mail.Init`) gets the generic
+- **A private spelling several unions share** (`mail.Underlying`) gets the generic
   "use the functions ./email exports" instead of naming the first union.
   About +25.
 - **A private variant destructured from another module** gets the build
@@ -971,8 +971,8 @@ The gates follow `blorp/AGENTS.md` ("Which gates a change runs"):
     and span, which fails when its rule is removed;
   - another module's `hidden.Secret`, an unmarked variant of a private
     union, is rejected;
-  - in a module where two unions have an `Init`, a bare use reports the
-    ambiguity, and `UserId.Init` resolves;
+  - in a module where two unions have an `Underlying`, a bare use reports the
+    ambiguity, and `UserId.Underlying` resolves;
   - the fixed-input C is byte-identical;
   - the ceilings hold, and the gates pass.
 - [x] **Landing 2:**
@@ -1076,7 +1076,7 @@ Its finding on rule 4 is answered by decisions 3 and 4.
   "did you mean" form, which rule 2's ambiguity message has since replaced;
 - the README outline;
 - the rule-6 help that says why;
-- `Init` as a stated convention;
+- `Underlying` as a stated convention;
 - the generic and resource diagnostics;
 - the field-access idea recorded as rejected for now.
 
@@ -1115,9 +1115,9 @@ The same discussion considered and dropped these designs:
 | Keep the keyword form, and require parentheses before a postfix | It adds noise, and the redundant name stays. |
 | `from_opaque(x)` and `into_opaque(x)` as calls, typed by operand and expected type | Building took its type from context, which is ambiguous with several opaque types in a module (Keith). |
 | An `Opaque[Repr]` container, and `conceal`/`reveal` or `as_opaque`/`as_underlying` | `as_underlying` could not be an ordinary function: no signature fits, and the prelude rule misses library modules. It became a reserved word, and the marker types read as aliases. |
-| A private variant always written through its union, as `UserId.Init` | Keith wanted `Init` usable on its own in its module. |
-| A bare variant resolved by its expected type | A reader would need the types to know which `Init` is meant, and resolution would move into check. |
-| `UserId(position)`: the type's own name as the constructor | Keith found it weird, and preferred a named variant, `UserId.Init`. |
+| A private variant always written through its union, as `UserId.Underlying` | Keith wanted `Underlying` usable on its own in its module. |
+| A bare variant resolved by its expected type | A reader would need the types to know which `Underlying` is meant, and resolution would move into check. |
+| `UserId(position)`: the type's own name as the constructor | Keith found it weird, and preferred a named variant, `UserId.Underlying`. |
 | A variant sharing its union's name | Same reason, and in a multi-variant union it reads as "any value of the type". |
 | Opaque types as their representation inside the module, as in Scala 3 | The seven `Int` ids in `ids.brp` would mix inside the one module whose job is to keep them apart. |
 | Public generic conversions | Any module could forge or open any opaque type, including `Reader` and `Writer`. |
