@@ -339,6 +339,31 @@ need.
 - measures runtime-fragment changes with stage-2 compilers, since
   `self-compile-cost` runs the seed's runtime.
 
+**Landed:**
+- **Landing 1, `math`:** `db6f29133`, 2026-11-28.
+  - **The change:** the Float functions, `PI`, a saturating `to_int` and
+    `to_float`, as `FloatUnary`, `FloatBinary`, `FloatToInt` and
+    `IntToFloat`. It was ported unchanged from the prototype branch's
+    `33209039a`.
+  - **Cost:** self-compile against `1b0ee4565`, fixed input, allocations
+    +0.0000% and instructions -0.02%. The fixed-input C differs only by the
+    10 lines of the two conversions in `FLOAT_RUNTIME`.
+  - **Lines:** production +185 net, library +95, tests about +390.
+  - **The `math/functions` fixture:** measured on main at 75,031 allocations
+    and 507 M instructions, with ceilings of 75,040 and 583 M (+15%).
+  - **Gates:**
+    - the full gate passes;
+    - Seed CI run 46124309012 is green on all targets;
+    - code review: 0 blockers.
+  - **Oracle:** removing `to_int`'s saturation passes `test_math` on arm64,
+    whose conversion saturates in hardware. The `math/functions` fixture
+    catches it on any clang host, under the e2e harness's UBSan: "inf is
+    outside the range of representable values". On x86-64, `test_math`
+    catches it too.
+  - **Follow-up:** fold `FloatCopySign` into `FloatBinary`, which is
+    reported, not done.
+  - **Evidence:** `build/games/w0-math/` in the main checkout.
+
 ## W1: Spike W, a window in plain C
 
 **Question:** what does the platform layer cost and need, before the FFI
